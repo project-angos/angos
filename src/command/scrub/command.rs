@@ -9,13 +9,10 @@ use crate::{
     command::{
         bootstrap,
         scrub::{
-            check::{
-                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, OrphanGrantChecker,
-                OrphanJobChecker, OrphanNamespaceChecker, StoreChecker, list_all,
-            },
+            check::{LayoutChecker, NamespaceChecker, StoreChecker, list_all},
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
-            setup,
+            setup::{self, LabeledStoreCheckers},
         },
         worker::runner::run_once,
     },
@@ -97,15 +94,10 @@ pub struct Command {
     metadata_store: Arc<MetadataStore>,
     namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
     layout_checker: LayoutChecker,
-    blob_checker: Option<BlobChecker>,
-    multipart_checker: Option<MultipartChecker>,
-    orphan_grant_checker: Option<OrphanGrantChecker>,
-    /// Clears every namespace not owned by a configured repository; `None`
-    /// unless `--orphan-namespaces` is set with at least one repository defined.
-    orphan_namespace_checker: Option<OrphanNamespaceChecker>,
-    /// One checker per queue selected by `--replication-orphans` and
-    /// `--cache-orphans`; empty when neither flag is set.
-    orphan_job_checkers: Vec<OrphanJobChecker>,
+    /// Store-wide checkers (blobs, orphan grants/namespaces/jobs, multipart),
+    /// each paired with a stable label for failure attribution, pre-ordered by
+    /// [`setup::store_checkers`] and applied in one pass.
+    store_checkers: LabeledStoreCheckers,
     sink: Box<dyn ActionSink + Send>,
     /// Drains reconcile-enqueued replication jobs in-process, since no running
     /// worker is assumed; a transiently failing push is rescheduled with backoff
@@ -144,14 +136,8 @@ impl Command {
             &repositories,
         )?;
         let layout_checker = setup::layout_checker(&blob_backend);
-        let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
-        let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
-        let orphan_grant_checker =
-            setup::orphan_grant_checker(options, &blob_backend, &metadata_store)?;
-        let orphan_namespace_checker =
-            setup::orphan_namespace_checker(options, &blob_backend, &metadata_store, &repositories);
-        let orphan_job_checkers =
-            setup::orphan_job_checkers(options, &metadata_store, &repositories);
+        let store_checkers =
+            setup::store_checkers(options, &blob_backend, &metadata_store, &repositories)?;
 
         // One `Arc<JobStore>` serves as both producer (Executor enqueue) and
         // consumer (end-of-run drain). Building the queue is cheap, so every
@@ -187,11 +173,7 @@ impl Command {
             metadata_store,
             namespace_checkers,
             layout_checker,
-            blob_checker,
-            multipart_checker,
-            orphan_grant_checker,
-            orphan_namespace_checker,
-            orphan_job_checkers,
+            store_checkers,
             sink,
             replication_drain,
         })
@@ -222,16 +204,11 @@ impl Command {
     pub async fn run(&mut self) -> Result<(), Error> {
         self.migrate_storage_layout().await?;
         self.scrub_metadata().await?;
-        // Run before `--blobs` so it can reclaim the manifest blob bytes the
-        // orphan-namespace link deletions leave unreferenced.
-        self.scrub_orphan_namespaces().await?;
-        self.scrub_blobs().await?;
-        self.scrub_orphan_grants().await?;
-        self.scrub_multipart_uploads().await?;
-        // Orphan jobs (replication and cache queues) must be scrubbed before
-        // the drain: the drain claims any pending replication job and would
-        // churn its orphans through retries first.
-        self.scrub_orphan_jobs().await?;
+        // Store-wide checkers run in the order `setup::store_checkers` built
+        // them: orphan-namespace clearing frees manifest bytes for the blob
+        // reclaim, and the orphan-job sweep precedes the replication drain so
+        // the drain does not churn orphaned jobs through retries first.
+        self.scrub_store().await;
         self.drain_replication_jobs().await;
         self.metadata_store.flush_access_times().await;
         Ok(())
@@ -260,49 +237,15 @@ impl Command {
         Ok(())
     }
 
-    async fn scrub_blobs(&mut self) -> Result<(), Error> {
-        if let Some(checker) = &self.blob_checker
-            && let Err(e) = checker.check_all(self.sink.as_mut()).await
-        {
-            warn!("Blob scrub checker failed: {e}");
-        }
-        Ok(())
-    }
-
-    async fn scrub_orphan_grants(&mut self) -> Result<(), Error> {
-        if let Some(checker) = &self.orphan_grant_checker
-            && let Err(e) = checker.check_all(self.sink.as_mut()).await
-        {
-            warn!("Orphan blob-grant scrub checker failed: {e}");
-        }
-        Ok(())
-    }
-
-    async fn scrub_orphan_namespaces(&mut self) -> Result<(), Error> {
-        if let Some(checker) = &self.orphan_namespace_checker
-            && let Err(e) = checker.check_all(self.sink.as_mut()).await
-        {
-            warn!("Orphan namespace scrub checker failed: {e}");
-        }
-        Ok(())
-    }
-
-    async fn scrub_multipart_uploads(&mut self) -> Result<(), Error> {
-        if let Some(checker) = &self.multipart_checker
-            && let Err(e) = checker.check_all(self.sink.as_mut()).await
-        {
-            warn!("Multipart scrub checker failed: {e}");
-        }
-        Ok(())
-    }
-
-    async fn scrub_orphan_jobs(&mut self) -> Result<(), Error> {
-        for checker in &self.orphan_job_checkers {
+    /// Apply every enabled store-wide checker in order, logging and continuing
+    /// past a failed checker (scrub is best-effort).
+    async fn scrub_store(&mut self) {
+        for i in 0..self.store_checkers.len() {
+            let (name, checker) = &self.store_checkers[i];
             if let Err(e) = checker.check_all(self.sink.as_mut()).await {
-                warn!("Orphan job scrub checker failed: {e}");
+                warn!("Store scrub checker '{name}' failed: {e}");
             }
         }
-        Ok(())
     }
 
     /// Drains reconcile-enqueued replication jobs with up to
@@ -398,6 +341,7 @@ mod tests {
         let cmd = command.unwrap();
         // retention, uploads, tags, manifests = 4 namespace checkers
         assert_eq!(cmd.namespace_checkers.len(), 4);
-        assert!(cmd.blob_checker.is_some());
+        // `blobs` is the only store-wide checker enabled by these options.
+        assert_eq!(cmd.store_checkers.len(), 1);
     }
 }

@@ -9,6 +9,92 @@ export interface TreeNode {
 	attestations: { digest: string; type: AttestationType; artifactType?: string }[];
 }
 
+export type TreeRowKind = 'root' | 'child' | 'attestation' | 'referrer';
+
+export interface TreeRowNode {
+	digest: string;
+	kind: TreeRowKind;
+	/** Whether a following sibling exists (drives the `has-next` connector). */
+	hasNext: boolean;
+	/** Tags for the second column (root rows only). */
+	tags: string[];
+	/** Platform badge for the second column (child rows only). */
+	platform?: Platform;
+	/** Attestation badge for the second column (attestation/referrer rows). */
+	attestationType?: AttestationType;
+	pushed_at?: string;
+	last_pulled_at?: string;
+	/** Whether pushed/pulled columns show timestamps (true for root/child rows). */
+	showDates: boolean;
+	/** Whether this node can be expanded to reveal its children. */
+	canExpand: boolean;
+	children: TreeRowNode[];
+}
+
+/**
+ * Flattens the {@link TreeNode} structure into a uniform recursive shape that a
+ * single recursive `TreeRow` component can render at arbitrary depth.
+ */
+export function buildTreeRows(tree: TreeNode[]): TreeRowNode[] {
+	return tree.map((node) => {
+		const children: TreeRowNode[] = [];
+		node.children.forEach((child) => {
+			const referrers = child.manifest.referrers ?? [];
+			children.push({
+				digest: child.manifest.digest,
+				kind: 'child',
+				hasNext: false,
+				tags: [],
+				platform: child.platform,
+				pushed_at: child.manifest.pushed_at,
+				last_pulled_at: child.manifest.last_pulled_at,
+				showDates: true,
+				canExpand: referrers.length > 0,
+				children: referrers.map((referrer) => ({
+					digest: referrer.digest,
+					kind: 'referrer' as const,
+					hasNext: false,
+					tags: [],
+					attestationType: getAttestationType(referrer),
+					showDates: false,
+					canExpand: false,
+					children: []
+				}))
+			});
+		});
+		node.attestations.forEach((att) => {
+			children.push({
+				digest: att.digest,
+				kind: 'attestation',
+				hasNext: false,
+				tags: [],
+				attestationType: att.type,
+				showDates: false,
+				canExpand: false,
+				children: []
+			});
+		});
+		// Mark connector lines for every sibling except the last.
+		children.forEach((child, idx) => {
+			child.hasNext = idx !== children.length - 1;
+			child.children.forEach((grandchild, gidx) => {
+				grandchild.hasNext = gidx !== child.children.length - 1;
+			});
+		});
+		return {
+			digest: node.manifest.digest,
+			kind: 'root' as const,
+			hasNext: false,
+			tags: node.manifest.tags,
+			pushed_at: node.manifest.pushed_at,
+			last_pulled_at: node.manifest.last_pulled_at,
+			showDates: true,
+			canExpand: children.length > 0,
+			children
+		};
+	});
+}
+
 const SLSA_ARTIFACT_TYPES = new Set([
 	'application/vnd.in-toto+json',
 ]);
@@ -191,6 +277,16 @@ export function buildTree(manifests: ManifestEntry[]): TreeNode[] {
 	});
 
 	return roots;
+}
+
+export function isInteractiveTarget(event: MouseEvent): boolean {
+	const target = event.target as HTMLElement;
+	return (
+		target.tagName === 'BUTTON' ||
+		!!target.closest('button') ||
+		target.tagName === 'A' ||
+		!!target.closest('a')
+	);
 }
 
 export function getTagConfirm(deleteConfirm: string | null): string | null {
