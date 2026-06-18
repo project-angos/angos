@@ -15,19 +15,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use tokio::select;
 use tracing::debug;
 use uuid::Uuid;
 
-use angos_storage::{ConditionalStore, Error as StorageError, Etag, ObjectStore};
+use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 
 use crate::{
     error::Error,
     executor::{
         Outcome, TransactionExecutor,
-        common::{build_intent, finish, stage_bodies, stamp_applied, write_intent},
+        common::{
+            ObjectApplyMode, apply_object_store, build_intent, finish, stage_bodies, stamp_applied,
+            write_intent,
+        },
     },
     intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationRecord},
     lock::{LockSession, primitive::Lock},
@@ -98,94 +100,11 @@ impl LockedExecutor {
 
     /// Apply a single mutation under the pre-acquired lock.
     ///
-    /// `expected` is honored here: for a conditional `Put` or `Delete`, the
-    /// stored `ETag` is fetched via HEAD under the lock and compared to the
-    /// expected [`Etag`], mirroring the CAS executor's `put_if_match` /
-    /// `delete_if_match` semantics. (See module docs.)
-    async fn apply_mutation(&self, mutation: &MutationRecord, idx: usize) -> Result<(), Error> {
-        match mutation {
-            MutationRecord::Put {
-                key,
-                body_ref,
-                expected,
-            } => {
-                if let Some(etag) = expected {
-                    // Conditional put: require the stored object to currently
-                    // match `etag`. Missing key, ETag mismatch, or a backend
-                    // that cannot surface an ETag => Precondition (no write),
-                    // matching `put_if_match`.
-                    self.check_expected_match(key, etag).await?;
-                }
-                let body = self.store.get(body_ref).await?;
-                self.store.put(key, Bytes::from(body)).await?;
-                Ok(())
-            }
-            MutationRecord::PutIfAbsent { key, body_ref, .. } => {
-                match self.store.head(key).await {
-                    // Matches CAS semantics so JobStore::enqueue dedup races resolve as Precondition.
-                    Ok(_) => {
-                        debug!(
-                            key,
-                            idx, "PutIfAbsent: key already exists, signalling Precondition"
-                        );
-                        Err(Error::Precondition)
-                    }
-                    Err(StorageError::NotFound) => {
-                        let body = self.store.get(body_ref).await?;
-                        self.store.put(key, Bytes::from(body)).await?;
-                        Ok(())
-                    }
-                    Err(e) => Err(Error::Storage(e)),
-                }
-            }
-            MutationRecord::Delete { key, expected } => {
-                if let Some(etag) = expected {
-                    // Conditional delete: ETag mismatch => Precondition; a
-                    // missing key is a no-op success, matching
-                    // `delete_if_match`.
-                    match self.store.head(key).await {
-                        Ok(meta) => {
-                            if meta.etag.as_ref() != Some(etag) {
-                                return Err(Error::Precondition);
-                            }
-                        }
-                        Err(StorageError::NotFound) => return Ok(()),
-                        Err(e) => return Err(Error::Storage(e)),
-                    }
-                }
-                self.store.delete(key).await?;
-                Ok(())
-            }
-            MutationRecord::Copy { src, dst, .. } => {
-                self.store.copy(src, dst).await?;
-                Ok(())
-            }
-            MutationRecord::Move { src, dst, .. } => {
-                self.store.move_object(src, dst).await?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Return `Ok(())` only if `key` currently exists and its stored `ETag`
-    /// equals `expected`. Otherwise return [`Error::Precondition`] without
-    /// touching the object.
-    ///
-    /// A missing key, an `ETag` mismatch, or a backend that does not surface an
-    /// `ETag` on HEAD all fail conservatively as a precondition failure, mirroring
-    /// the CAS executor's `put_if_match` behaviour.
-    async fn check_expected_match(&self, key: &str, expected: &Etag) -> Result<(), Error> {
-        match self.store.head(key).await {
-            Ok(meta) => {
-                if meta.etag.as_ref() == Some(expected) {
-                    Ok(())
-                } else {
-                    Err(Error::Precondition)
-                }
-            }
-            Err(StorageError::NotFound) => Err(Error::Precondition),
-            Err(e) => Err(Error::Storage(e)),
-        }
+    /// Delegates to the shared [`apply_object_store`] in `Abort` mode: `expected`
+    /// is honored via a HEAD/ETag compare under the lock, mirroring the CAS
+    /// executor's `put_if_match` / `delete_if_match` semantics.
+    async fn apply_mutation(&self, mutation: &MutationRecord) -> Result<(), Error> {
+        apply_object_store(self.store.as_ref(), mutation, ObjectApplyMode::Abort).await
     }
 
     /// Verify read fingerprints after acquiring the lock.
@@ -225,7 +144,7 @@ impl LockedExecutor {
     async fn apply_all(&self, intent: &mut IntentRecord) -> Result<(), Error> {
         for idx in 0..intent.mutations.len() {
             let mutation = intent.mutations[idx].clone();
-            match self.apply_mutation(&mutation, idx).await {
+            match self.apply_mutation(&mutation).await {
                 Ok(()) => stamp_applied(self.store.as_ref(), intent, idx).await,
                 Err(e) => return Err(e),
             }

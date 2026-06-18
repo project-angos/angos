@@ -208,6 +208,23 @@ pub enum RegistryStorageConfig {
 }
 
 impl RegistryStorageConfig {
+    /// S3 lock strategy requires compare-and-swap (If-None-Match + If-Match). Returns
+    /// a Coordination error when the strategy is S3 but the provider lacks CAS.
+    fn ensure_s3_cas_supported(
+        lock_strategy: &LockStrategy,
+        caps: &ConditionalCapabilities,
+    ) -> Result<(), Error> {
+        if matches!(lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
+            return Err(Error::Coordination(format!(
+                "S3 lock strategy requires If-None-Match and If-Match support, but the provider \
+                 reports put_if_none_match={}, put_if_match={}. Use lock_strategy = redis or \
+                 lock_strategy = memory instead.",
+                caps.put_if_none_match, caps.put_if_match
+            )));
+        }
+        Ok(())
+    }
+
     /// Build a `RegistryStorageConfig` that mirrors the given blob-store config.
     pub fn from_blob_store(blob: &blob_store::BlobStoreConfig) -> Self {
         match blob {
@@ -245,14 +262,7 @@ impl RegistryStorageConfig {
                 let caps = probe_conditional_capabilities(storage.as_ref())
                     .await
                     .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                if matches!(config.lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
-                    return Err(Error::Coordination(format!(
-                        "S3 lock strategy requires If-None-Match and If-Match support, \
-                         but probe found: If-None-Match={}, If-Match={}. \
-                         Use lock_strategy = redis or lock_strategy = memory instead.",
-                        caps.put_if_none_match, caps.put_if_match
-                    )));
-                }
+                Self::ensure_s3_cas_supported(&config.lock_strategy, &caps)?;
                 Ok(Some(caps))
             }
             RegistryStorageConfig::FS(_) => Ok(None),
@@ -311,23 +321,12 @@ impl RegistryStorageConfig {
                     config.lock_strategy
                 );
                 let caps = match &config.capabilities {
-                    Some(declared) => {
-                        if matches!(config.lock_strategy, LockStrategy::S3(_))
-                            && !declared.supports_cas()
-                        {
-                            return Err(Error::Coordination(format!(
-                                "S3 lock strategy requires If-None-Match and If-Match support, \
-                                 but config declares: put_if_none_match={}, put_if_match={}. \
-                                 Use lock_strategy = redis or lock_strategy = memory instead.",
-                                declared.put_if_none_match, declared.put_if_match
-                            )));
-                        }
-                        Some(declared.clone())
-                    }
+                    Some(declared) => Some(declared.clone()),
                     None => self.probe().await?,
                 };
 
                 let caps_resolved = caps.unwrap_or_default();
+                Self::ensure_s3_cas_supported(&config.lock_strategy, &caps_resolved)?;
 
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
                 let backend = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
@@ -336,14 +335,6 @@ impl RegistryStorageConfig {
 
                 let s3_lock_store: Option<Arc<dyn ConditionalStore>> = match &config.lock_strategy {
                     LockStrategy::S3(s3_lock_config) => {
-                        if !caps_resolved.supports_cas() {
-                            return Err(Error::Coordination(format!(
-                                "S3 lock strategy requires If-None-Match and If-Match support, \
-                                 but provider has put_if_none_match={}, put_if_match={}. \
-                                 Use lock_strategy = redis or lock_strategy = memory instead.",
-                                caps_resolved.put_if_none_match, caps_resolved.put_if_match
-                            )));
-                        }
                         let lock_http = S3HttpBackend::new(
                             &config.connection.to_lock_client_config(s3_lock_config),
                         )
