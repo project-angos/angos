@@ -90,7 +90,7 @@ mod tests {
     const MEDIA_TYPE_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 
     fn valid_digest() -> Digest {
-        Digest::Sha256(VALID_HASH.into())
+        Digest::sha256(VALID_HASH).unwrap()
     }
 
     fn demo_manifest() -> Manifest {

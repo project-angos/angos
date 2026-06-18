@@ -31,7 +31,6 @@ use crate::{
         REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP,
         pipeline::{PushContext, PushOutcome, delete_manifest, push_manifest},
     },
-    util::sha256,
 };
 
 const NAMESPACE: &str = "nginx";
@@ -157,7 +156,7 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
 
     // Assert the PUT body is a merged image index so a regression back to
     // "PUT the referrer manifest body" cannot pass silently.
-    let referrer_digest = Digest::Sha256(sha256::hex(&manifest_bytes).into());
+    let referrer_digest = Digest::from_bytes(&manifest_bytes);
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
         .respond_with(move |request: &Request| {
@@ -2076,7 +2075,7 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
     let dir = TempDir::new().unwrap();
     let (blob_store, metadata_store, _store) = test_blob_store(dir.path().to_str().unwrap());
 
-    let absent = Digest::Sha256(sha256::hex(b"never-written-locally").into());
+    let absent = Digest::from_bytes(b"never-written-locally");
     let session = UploadSession {
         url: format!("{}/v2/{NAMESPACE}/blobs/uploads/sess-1", mock_server.uri()),
         auth: None,
@@ -2113,7 +2112,7 @@ fn referrer_manifest(subject: &Digest) -> (Vec<u8>, Digest) {
             "layers": [],
         }))
         .unwrap();
-    let digest = Digest::Sha256(sha256::hex(&body).into());
+    let digest = Digest::from_bytes(&body);
     (body, digest)
 }
 
@@ -2124,7 +2123,7 @@ async fn deleting_last_referrer_removes_the_fallback_tag() {
     let dir = TempDir::new().unwrap();
     let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
 
-    let subject = Digest::Sha256(sha256::hex(b"the-subject").into());
+    let subject = Digest::from_bytes(b"the-subject");
     let (referrer_body, referrer) = referrer_manifest(&subject);
     let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
 
@@ -2191,9 +2190,9 @@ async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
     let dir = TempDir::new().unwrap();
     let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
 
-    let subject = Digest::Sha256(sha256::hex(b"shared-subject").into());
+    let subject = Digest::from_bytes(b"shared-subject");
     let (referrer_body, referrer) = referrer_manifest(&subject);
-    let sibling = Digest::Sha256(sha256::hex(b"sibling-referrer").into());
+    let sibling = Digest::from_bytes(b"sibling-referrer");
     let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
 
     Mock::given(method("GET"))

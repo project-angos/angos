@@ -395,11 +395,11 @@ pub async fn test_datastore_link_operations(m: Arc<MetadataStore>) {
 
     create_link(&m, namespace, &tag_link, &digest).await;
 
-    let read_digest = m.read_link(namespace, &tag_link, false).await.unwrap();
+    let read_digest = m.read_link(namespace, &tag_link).await.unwrap();
     assert_eq!(read_digest.target, digest);
 
     // Test reading reference info
-    let ref_info = m.read_link(namespace, &tag_link, false).await.unwrap();
+    let ref_info = m.read_link(namespace, &tag_link).await.unwrap();
     let created_at = ref_info.created_at.unwrap();
     assert!(Utc::now().signed_duration_since(created_at) < Duration::seconds(1));
 }
@@ -692,9 +692,9 @@ pub async fn test_update_links(m: Arc<MetadataStore>) {
     .await
     .unwrap();
 
-    let meta1 = m.read_link(namespace, &tag1, false).await.unwrap();
+    let meta1 = m.read_link(namespace, &tag1).await.unwrap();
     assert_eq!(meta1.target, digest1);
-    let meta2 = m.read_link(namespace, &tag2, false).await.unwrap();
+    let meta2 = m.read_link(namespace, &tag2).await.unwrap();
     assert_eq!(meta2.target, digest2);
 
     m.update_links(
@@ -707,8 +707,8 @@ pub async fn test_update_links(m: Arc<MetadataStore>) {
     .await
     .unwrap();
 
-    assert!(m.read_link(namespace, &tag1, false).await.is_err());
-    assert!(m.read_link(namespace, &tag2, false).await.is_err());
+    assert!(m.read_link(namespace, &tag1).await.is_err());
+    assert!(m.read_link(namespace, &tag2).await.is_err());
 }
 
 #[tokio::test]
@@ -726,11 +726,14 @@ pub async fn test_datastore_read_link_access_time_update(m: Arc<MetadataStore>) 
     let tag_link = LinkKind::Tag("latest".to_string());
     create_link(&m, namespace, &tag_link, &digest).await;
 
-    // Read with update_access_time=true should set accessed_at
-    let meta = m.read_link(namespace, &tag_link, true).await.unwrap();
+    // A tracked read records accessed_at.
+    let meta = m
+        .read_link_recording_access(namespace, &tag_link)
+        .await
+        .unwrap();
     assert!(
         meta.accessed_at.is_some(),
-        "accessed_at should be set after read with update_access_time=true"
+        "accessed_at should be set after a recording read"
     );
     let accessed_at = meta.accessed_at.unwrap();
     assert!(
@@ -738,8 +741,8 @@ pub async fn test_datastore_read_link_access_time_update(m: Arc<MetadataStore>) 
         "accessed_at should be within 2 seconds of now"
     );
 
-    // Read with update_access_time=false should still see the persisted accessed_at
-    let meta_readonly = m.read_link(namespace, &tag_link, false).await.unwrap();
+    // A plain read still returns the persisted accessed_at.
+    let meta_readonly = m.read_link(namespace, &tag_link).await.unwrap();
     assert!(
         meta_readonly.accessed_at.is_some(),
         "accessed_at should still be persisted after read-only read"
@@ -766,9 +769,7 @@ pub async fn test_datastore_read_link_concurrent_readonly(m: Arc<MetadataStore>)
         let m = m.clone();
         let ns = namespace.to_string();
         let link = tag_link.clone();
-        handles.push(tokio::spawn(
-            async move { m.read_link(&ns, &link, false).await },
-        ));
+        handles.push(tokio::spawn(async move { m.read_link(&ns, &link).await }));
     }
 
     let results: Vec<_> = futures_util::future::join_all(handles).await;
@@ -1053,7 +1054,7 @@ pub async fn test_datastore_parallel_multiple_creates(m: Arc<MetadataStore>) {
     for (i, digest) in digests.iter().enumerate() {
         let tag = format!("t{}", i + 1);
         let meta = m
-            .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
+            .read_link(namespace, &LinkKind::Tag(tag.clone()))
             .await
             .unwrap();
         assert_eq!(
@@ -1110,7 +1111,7 @@ pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) 
     .unwrap();
 
     let err = m
-        .read_link(namespace, &LinkKind::Tag("v1".to_string()), false)
+        .read_link(namespace, &LinkKind::Tag("v1".to_string()))
         .await
         .unwrap_err();
     assert!(
@@ -1119,7 +1120,7 @@ pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) 
     );
 
     let meta_v2 = m
-        .read_link(namespace, &LinkKind::Tag("v2".to_string()), false)
+        .read_link(namespace, &LinkKind::Tag("v2".to_string()))
         .await
         .unwrap();
     assert_eq!(
@@ -1128,7 +1129,7 @@ pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) 
     );
 
     let meta_v3 = m
-        .read_link(namespace, &LinkKind::Tag("v3".to_string()), false)
+        .read_link(namespace, &LinkKind::Tag("v3".to_string()))
         .await
         .unwrap();
     assert_eq!(meta_v3.target, digest_c, "Tag v3 should point to digest_c");
@@ -1243,7 +1244,7 @@ pub async fn test_datastore_tracked_create_with_referrer(m: Arc<MetadataStore>) 
     .unwrap();
 
     let metadata = m
-        .read_link(namespace, &LinkKind::Layer(digest_layer.clone()), false)
+        .read_link(namespace, &LinkKind::Layer(digest_layer.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -1304,7 +1305,7 @@ pub async fn test_datastore_tracked_delete_with_referrer(m: Arc<MetadataStore>) 
     .unwrap();
 
     let metadata = m
-        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
         .await
         .unwrap();
     assert!(
@@ -1327,7 +1328,7 @@ pub async fn test_datastore_tracked_delete_with_referrer(m: Arc<MetadataStore>) 
     .unwrap();
 
     let metadata = m
-        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
         .await
         .unwrap();
     assert!(
@@ -1386,7 +1387,7 @@ pub async fn test_datastore_tracked_delete_removes_when_no_referrers(m: Arc<Meta
     .unwrap();
 
     let err = m
-        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
         .await
         .unwrap_err();
     assert!(
@@ -1439,7 +1440,7 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataSt
     m.update_links(namespace, &ops).await.unwrap();
 
     let tag_meta = m
-        .read_link(namespace, &LinkKind::Tag("v1".into()), false)
+        .read_link(namespace, &LinkKind::Tag("v1".into()))
         .await
         .unwrap();
     assert_eq!(
@@ -1452,7 +1453,7 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataSt
     );
 
     let layer_meta = m
-        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -1465,11 +1466,7 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataSt
     );
 
     let digest_meta = m
-        .read_link(
-            namespace,
-            &LinkKind::Digest(digest_link_digest.clone()),
-            false,
-        )
+        .read_link(namespace, &LinkKind::Digest(digest_link_digest.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -1769,7 +1766,7 @@ async fn test_link_metadata_media_type() {
         .await;
 
         let link = m
-            .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+            .read_link(namespace, &LinkKind::Digest(digest.clone()))
             .await
             .unwrap();
         assert_eq!(link.media_type, Some(media_type.to_string()));
@@ -1788,7 +1785,7 @@ async fn test_link_without_media_type_has_none() {
         create_link(&m, namespace, &LinkKind::Tag("latest".to_string()), &digest).await;
 
         let link = m
-            .read_link(namespace, &LinkKind::Tag("latest".to_string()), false)
+            .read_link(namespace, &LinkKind::Tag("latest".to_string()))
             .await
             .unwrap();
         assert_eq!(link.media_type, None);

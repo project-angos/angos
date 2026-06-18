@@ -142,7 +142,7 @@ impl MetadataStore {
                     if parts.len() < 2 || parts[0] != "sha256" {
                         return None;
                     }
-                    Some(Digest::Sha256(parts[1].into()))
+                    Digest::sha256(parts[1]).ok()
                 })
                 .collect();
 
@@ -205,10 +205,11 @@ impl MetadataStore {
             .list_children(&revisions_dir, n, continuation_token, None)
             .await?;
 
+        // Revision dir names are sha256 hashes; skip any that don't validate.
         let revisions = page
             .sub_prefixes
             .into_iter()
-            .map(|key| Digest::Sha256(key.into()))
+            .filter_map(|key| Digest::sha256(key).ok())
             .collect();
 
         Ok((revisions, page.next_token))

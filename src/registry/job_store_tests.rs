@@ -9,7 +9,7 @@ use angos_tx_engine::transaction::{Mutation, Transaction};
 
 use crate::registry::job_store::{
     CompleteOutcome, FailOutcome, JobEnvelope, JobQueueConfig, JobState, JobStore,
-    MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN, make_storage_key, parse_lock_key_index,
+    MAX_REPORTED_PENDING, Queue, STORAGE_KEY_PREFIX_LEN, make_storage_key, parse_lock_key_index,
     parse_not_before, serialize_dead_letter, serialize_lock_key_index,
 };
 use crate::registry::test_utils::{build_store, locked_executor_over};
@@ -41,7 +41,7 @@ fn build_harness(raw: Arc<dyn ObjectStore>) -> Harness {
 }
 
 fn dummy_envelope(lock_key: &str) -> JobEnvelope {
-    JobEnvelope::new("cache", "test.noop", lock_key, &()).expect("envelope")
+    JobEnvelope::new(Queue::Cache, "test.noop", lock_key, &()).expect("envelope")
 }
 
 // =========================================================================
@@ -56,7 +56,7 @@ async fn run_enqueue_then_claim_succeeds(h: Harness) {
 
     let claimed = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim_one")
         .claimed
@@ -68,7 +68,7 @@ async fn run_enqueue_then_claim_succeeds(h: Harness) {
         .expect("complete");
     assert!(
         h.store
-            .claim_one("cache")
+            .claim_one(Queue::Cache)
             .await
             .expect("claim_one")
             .claimed
@@ -84,7 +84,7 @@ async fn run_retry_writes_pending_with_backoff(h: Harness) {
 
     let claimed = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim")
         .claimed
@@ -95,7 +95,7 @@ async fn run_retry_writes_pending_with_backoff(h: Harness) {
         FailOutcome::Retried { .. }
     ));
 
-    let pending = h.store.list_pending("cache", 10).await.expect("list");
+    let pending = h.store.list_pending(Queue::Cache, 10).await.expect("list");
     assert_eq!(pending.len(), 1, "exactly one retry envelope expected");
     let storage_key = &pending[0];
     let not_before = parse_not_before(storage_key).expect("parse prefix");
@@ -103,7 +103,7 @@ async fn run_retry_writes_pending_with_backoff(h: Harness) {
 
     let updated = h
         .store
-        .read_pending("cache", storage_key)
+        .read_pending(Queue::Cache, storage_key)
         .await
         .expect("read updated");
     assert_eq!(updated.attempts, 1);
@@ -116,7 +116,7 @@ async fn run_dead_letter_after_max_attempts(h: Harness) {
 
     let claimed = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim")
         .claimed
@@ -128,20 +128,20 @@ async fn run_dead_letter_after_max_attempts(h: Harness) {
         FailOutcome::MovedToDeadLetter
     ));
     assert!(matches!(
-        h.store.read_pending("cache", &storage_key).await,
+        h.store.read_pending(Queue::Cache, &storage_key).await,
         Err(crate::registry::job_store::Error::NotFound)
     ));
 }
 
 async fn run_count_failed_reflects_dead_letters(h: Harness) {
-    assert_eq!(h.store.count_failed("cache").await.expect("count"), 0);
+    assert_eq!(h.store.count_failed(Queue::Cache).await.expect("count"), 0);
 
     let mut env = dummy_envelope("cache.ns:sha256:dl-count");
     env.max_attempts = 1;
     h.store.enqueue(env).await.expect("enqueue");
     let claimed = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim")
         .claimed
@@ -152,12 +152,15 @@ async fn run_count_failed_reflects_dead_letters(h: Harness) {
     ));
 
     assert_eq!(
-        h.store.count_failed("cache").await.expect("count"),
+        h.store.count_failed(Queue::Cache).await.expect("count"),
         1,
         "a dead-lettered job must be counted by count_failed",
     );
     assert_eq!(
-        h.store.count_pending("cache", 600).await.expect("count"),
+        h.store
+            .count_pending(Queue::Cache, 600)
+            .await
+            .expect("count"),
         0,
         "a dead-lettered job is no longer pending",
     );
@@ -175,7 +178,11 @@ async fn run_count_pending_saturates_at_cap(h: Harness) {
             .await
             .expect("stub");
     }
-    let count = h.store.count_pending("cache", 600).await.expect("count");
+    let count = h
+        .store
+        .count_pending(Queue::Cache, 600)
+        .await
+        .expect("count");
     assert_eq!(count, MAX_REPORTED_PENDING);
 }
 
@@ -203,7 +210,11 @@ async fn run_count_pending_excludes_envelopes_past_readiness_horizon(h: Harness)
             .expect("future");
     }
 
-    let count = h.store.count_pending("cache", 60).await.expect("count");
+    let count = h
+        .store
+        .count_pending(Queue::Cache, 60)
+        .await
+        .expect("count");
     assert_eq!(count, 2, "only ready envelopes must count");
 }
 
@@ -214,7 +225,7 @@ async fn run_future_storage_key_yields_next_ready_without_claiming(h: Harness) {
 
     let claimed = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim")
         .claimed
@@ -224,7 +235,7 @@ async fn run_future_storage_key_yields_next_ready_without_claiming(h: Harness) {
         FailOutcome::MovedToDeadLetter => panic!("expected retry"),
     };
 
-    let outcome = h.store.claim_one("cache").await.expect("claim");
+    let outcome = h.store.claim_one(Queue::Cache).await.expect("claim");
     assert!(
         outcome.claimed.is_none(),
         "future-scheduled job must not be claimed",
@@ -251,7 +262,7 @@ async fn run_orphan_index_is_self_healed_on_next_lookup(h: Harness) {
 
     let hit = h
         .store
-        .find_pending_with_lock_key("cache", lock_key)
+        .find_pending_with_lock_key(Queue::Cache, lock_key)
         .await
         .expect("lookup");
     assert!(!hit, "orphan index must not register as a hit");
@@ -271,7 +282,7 @@ async fn run_retry_updates_lock_key_index_to_new_storage_key(h: Harness) {
 
     let claimed = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim")
         .claimed
@@ -282,7 +293,7 @@ async fn run_retry_updates_lock_key_index_to_new_storage_key(h: Harness) {
         FailOutcome::Retried { .. }
     ));
 
-    let pending = h.store.list_pending("cache", 10).await.expect("list");
+    let pending = h.store.list_pending(Queue::Cache, 10).await.expect("list");
     assert_eq!(pending.len(), 1);
     let new_storage_key = &pending[0];
     assert_ne!(new_storage_key, &old_storage_key);
@@ -298,14 +309,21 @@ async fn run_enqueue_dedup_skips_existing_lock_key(h: Harness) {
         .enqueue(dummy_envelope("cache.ns:sha256:dup"))
         .await
         .expect("enqueue 1");
-    let before = h.store.count_pending("cache", 600).await.expect("count");
+    let before = h
+        .store
+        .count_pending(Queue::Cache, 600)
+        .await
+        .expect("count");
     h.store
         .enqueue(dummy_envelope("cache.ns:sha256:dup"))
         .await
         .expect("enqueue 2");
     assert_eq!(
         before,
-        h.store.count_pending("cache", 600).await.expect("count")
+        h.store
+            .count_pending(Queue::Cache, 600)
+            .await
+            .expect("count")
     );
 }
 
@@ -319,7 +337,7 @@ async fn run_enqueue_after_claim_creates_second_pending(h: Harness) {
     // Claim without completing: the job is now executing and holds the lock.
     let claimed = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim_one")
         .claimed
@@ -333,7 +351,10 @@ async fn run_enqueue_after_claim_creates_second_pending(h: Harness) {
         .await
         .expect("enqueue 2");
     assert_eq!(
-        h.store.count_pending("cache", 600).await.expect("count"),
+        h.store
+            .count_pending(Queue::Cache, 600)
+            .await
+            .expect("count"),
         2,
         "enqueue during execution must create a second pending job",
     );
@@ -342,7 +363,7 @@ async fn run_enqueue_after_claim_creates_second_pending(h: Harness) {
     // the first releases the lock on complete.
     assert!(
         h.store
-            .claim_one("cache")
+            .claim_one(Queue::Cache)
             .await
             .expect("claim")
             .claimed
@@ -356,7 +377,7 @@ async fn run_enqueue_after_claim_creates_second_pending(h: Harness) {
 
     let second = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim")
         .claimed
@@ -368,7 +389,7 @@ async fn run_enqueue_after_claim_creates_second_pending(h: Harness) {
         .expect("complete 2");
     assert!(
         h.store
-            .claim_one("cache")
+            .claim_one(Queue::Cache)
             .await
             .expect("claim")
             .claimed
@@ -532,7 +553,7 @@ async fn run_concurrent_enqueue_dedup(h: Harness) {
         handle.await.expect("join").expect("enqueue");
     }
 
-    let pending = h.store.list_pending("cache", 64).await.expect("list");
+    let pending = h.store.list_pending(Queue::Cache, 64).await.expect("list");
     assert_eq!(
         pending.len(),
         1,
@@ -566,7 +587,7 @@ async fn run_complete_commit_failure_fails_job_over(h: Harness) {
         .expect("enqueue");
     let claimed = h
         .store
-        .claim_one("cache")
+        .claim_one(Queue::Cache)
         .await
         .expect("claim")
         .claimed
@@ -604,7 +625,7 @@ async fn run_complete_commit_failure_fails_job_over(h: Harness) {
     // The job is re-queued (with backoff and a bumped attempt count) under a new
     // storage key, not deleted, and not left at the original key to be
     // re-claimed immediately.
-    let pending = h.store.list_pending("cache", 10).await.expect("list");
+    let pending = h.store.list_pending(Queue::Cache, 10).await.expect("list");
     assert_eq!(
         pending.len(),
         1,
@@ -616,7 +637,7 @@ async fn run_complete_commit_failure_fails_job_over(h: Harness) {
     );
     let env = h
         .store
-        .read_pending("cache", &pending[0])
+        .read_pending(Queue::Cache, &pending[0])
         .await
         .expect("read requeued envelope");
     assert_eq!(env.attempts, 1, "attempt count bumped on fail-over");
@@ -650,7 +671,7 @@ async fn run_list_pending_page_is_keyset_ordered(h: Harness) {
     loop {
         let (keys, next) = h
             .store
-            .list_pending_page("cache", 2, after.as_deref())
+            .list_pending_page(Queue::Cache, 2, after.as_deref())
             .await
             .expect("page");
         assert!(keys.len() <= 2, "page must not exceed n");
@@ -695,17 +716,20 @@ async fn run_retry_failed_resets_attempts(h: Harness) {
 
     let record = h
         .store
-        .read_failed("cache", &key)
+        .read_failed(Queue::Cache, &key)
         .await
         .expect("read failed");
     assert_eq!(record.last_error, "boom");
     assert_eq!(record.envelope.attempts, 3);
 
-    h.store.retry_failed("cache", &key).await.expect("retry");
+    h.store
+        .retry_failed(Queue::Cache, &key)
+        .await
+        .expect("retry");
 
     assert!(
         matches!(
-            h.store.read_failed("cache", &key).await,
+            h.store.read_failed(Queue::Cache, &key).await,
             Err(crate::registry::job_store::Error::NotFound)
         ),
         "failed record is consumed by retry",
@@ -713,13 +737,13 @@ async fn run_retry_failed_resets_attempts(h: Harness) {
 
     let (pending, _) = h
         .store
-        .list_pending_page("cache", 10, None)
+        .list_pending_page(Queue::Cache, 10, None)
         .await
         .expect("list pending");
     assert_eq!(pending.len(), 1, "exactly one requeued envelope");
     let restored = h
         .store
-        .read_pending("cache", &pending[0])
+        .read_pending(Queue::Cache, &pending[0])
         .await
         .expect("read pending");
     assert_eq!(restored.attempts, 0, "retry resets attempts to zero");
@@ -727,7 +751,7 @@ async fn run_retry_failed_resets_attempts(h: Harness) {
 
     assert!(
         matches!(
-            h.store.retry_failed("cache", &key).await,
+            h.store.retry_failed(Queue::Cache, &key).await,
             Err(crate::registry::job_store::Error::NotFound)
         ),
         "retrying a consumed key is a stale 404",
@@ -747,16 +771,18 @@ async fn run_delete_failed_record(h: Harness) {
         .expect("seed failed");
 
     h.store
-        .delete_job("cache", JobState::Failed, &key)
+        .delete_job(Queue::Cache, JobState::Failed, &key)
         .await
         .expect("delete");
     assert!(matches!(
-        h.store.read_failed("cache", &key).await,
+        h.store.read_failed(Queue::Cache, &key).await,
         Err(crate::registry::job_store::Error::NotFound)
     ));
     assert!(
         matches!(
-            h.store.delete_job("cache", JobState::Failed, &key).await,
+            h.store
+                .delete_job(Queue::Cache, JobState::Failed, &key)
+                .await,
             Err(crate::registry::job_store::Error::NotFound)
         ),
         "deleting a consumed key is a stale 404",
@@ -771,7 +797,7 @@ async fn run_delete_pending_removes_record_and_index(h: Harness) {
         .expect("enqueue");
     assert!(
         h.store
-            .find_pending_with_lock_key("cache", lock_key)
+            .find_pending_with_lock_key(Queue::Cache, lock_key)
             .await
             .expect("find"),
         "enqueue establishes the dedup index",
@@ -779,26 +805,26 @@ async fn run_delete_pending_removes_record_and_index(h: Harness) {
 
     let (pending, _) = h
         .store
-        .list_pending_page("cache", 10, None)
+        .list_pending_page(Queue::Cache, 10, None)
         .await
         .expect("list");
     assert_eq!(pending.len(), 1);
     let key = pending[0].clone();
 
     h.store
-        .delete_job("cache", JobState::Pending, &key)
+        .delete_job(Queue::Cache, JobState::Pending, &key)
         .await
         .expect("delete");
 
     let (after, _) = h
         .store
-        .list_pending_page("cache", 10, None)
+        .list_pending_page(Queue::Cache, 10, None)
         .await
         .expect("list");
     assert!(after.is_empty(), "pending file removed");
     assert!(
         !h.store
-            .find_pending_with_lock_key("cache", lock_key)
+            .find_pending_with_lock_key(Queue::Cache, lock_key)
             .await
             .expect("find"),
         "dedup index is removed alongside the pending file",
@@ -806,7 +832,9 @@ async fn run_delete_pending_removes_record_and_index(h: Harness) {
 
     assert!(
         matches!(
-            h.store.delete_job("cache", JobState::Pending, &key).await,
+            h.store
+                .delete_job(Queue::Cache, JobState::Pending, &key)
+                .await,
             Err(crate::registry::job_store::Error::NotFound)
         ),
         "deleting a consumed key is a stale 404",

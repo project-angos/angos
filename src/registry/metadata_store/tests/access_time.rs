@@ -36,7 +36,10 @@ async fn test_deferred_access_time_returns_data_immediately() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+    let meta = backend
+        .read_link_recording_access(namespace, &tag)
+        .await
+        .unwrap();
     assert_eq!(meta.target, digest);
 
     let raw = backend.read_link_reference(namespace, &tag).await.unwrap();
@@ -65,7 +68,10 @@ async fn test_deferred_access_time_writes_eventually() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    backend.read_link(namespace, &tag, true).await.unwrap();
+    backend
+        .read_link_recording_access(namespace, &tag)
+        .await
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -97,7 +103,10 @@ async fn test_deferred_access_time_coalesces_writes() {
 
     let start = Instant::now();
     for _ in 0..10 {
-        let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+        let meta = backend
+            .read_link_recording_access(namespace, &tag)
+            .await
+            .unwrap();
         assert_eq!(meta.target, digest);
     }
     let elapsed = start.elapsed();
@@ -148,8 +157,14 @@ async fn test_deferred_access_time_different_links_independent() {
     ];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    backend.read_link(namespace, &tag1, true).await.unwrap();
-    backend.read_link(namespace, &tag2, true).await.unwrap();
+    backend
+        .read_link_recording_access(namespace, &tag1)
+        .await
+        .unwrap();
+    backend
+        .read_link_recording_access(namespace, &tag2)
+        .await
+        .unwrap();
 
     backend.flush_access_times().await;
 
@@ -184,7 +199,10 @@ async fn test_deferred_access_time_flush_on_explicit_call() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    backend.read_link(namespace, &tag, true).await.unwrap();
+    backend
+        .read_link_recording_access(namespace, &tag)
+        .await
+        .unwrap();
 
     backend.flush_access_times().await;
 
@@ -214,7 +232,10 @@ async fn test_deferred_access_time_zero_debounce_writes_synchronously() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    backend.read_link(namespace, &tag, true).await.unwrap();
+    backend
+        .read_link_recording_access(namespace, &tag)
+        .await
+        .unwrap();
 
     let raw = backend.read_link_reference(namespace, &tag).await.unwrap();
     assert!(
@@ -249,7 +270,10 @@ async fn test_deferred_access_time_does_not_block_read_path() {
         let tag = tag.clone();
         let digest = digest.clone();
         let handle = tokio::spawn(async move {
-            let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+            let meta = backend
+                .read_link_recording_access(namespace, &tag)
+                .await
+                .unwrap();
             assert_eq!(meta.target, digest);
         });
         handles.push(handle);
@@ -289,7 +313,10 @@ async fn test_flush_processes_entries_concurrently() {
     }
 
     for tag in &tags {
-        backend.read_link(namespace, tag, true).await.unwrap();
+        backend
+            .read_link_recording_access(namespace, tag)
+            .await
+            .unwrap();
     }
 
     let start = Instant::now();
@@ -343,8 +370,14 @@ async fn test_flush_errors_do_not_prevent_other_entries() {
     ];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    backend.read_link(namespace, &tag1, true).await.unwrap();
-    backend.read_link(namespace, &tag2, true).await.unwrap();
+    backend
+        .read_link_recording_access(namespace, &tag1)
+        .await
+        .unwrap();
+    backend
+        .read_link_recording_access(namespace, &tag2)
+        .await
+        .unwrap();
 
     // Inject a bogus entry that will fail during flush (non-existent namespace/tag combo).
     backend
@@ -399,14 +432,20 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+    let meta = backend
+        .read_link_recording_access(namespace, &tag)
+        .await
+        .unwrap();
     assert_eq!(meta.target, digest);
 
     // Delete the storage object to prove the next read must come from cache.
     let link_path = path_builder::link_path(&tag, namespace);
     backend.store().delete(&link_path).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+    let meta = backend
+        .read_link_recording_access(namespace, &tag)
+        .await
+        .unwrap();
     assert_eq!(meta.target, digest);
 
     // Verify writer.record() was still called on cache hit.

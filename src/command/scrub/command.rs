@@ -22,11 +22,11 @@ use crate::{
     configuration::Configuration,
     registry::{
         blob_store::BlobStore,
-        job_store::{JobHandler, JobStore},
+        job_store::{JobHandler, JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
-    replication::{REPLICATION_QUEUE, ReplicationJobHandler},
+    replication::ReplicationJobHandler,
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -321,7 +321,7 @@ impl Command {
         let loops = (0..drain.concurrency.get()).map(|_| async {
             let mut drained: u64 = 0;
             loop {
-                match run_once(&drain.consumer, drain.handler.as_ref(), REPLICATION_QUEUE).await {
+                match run_once(&drain.consumer, drain.handler.as_ref(), Queue::Replication).await {
                     Ok(true) => drained += 1,
                     Ok(false) => break,
                     Err(e) => {

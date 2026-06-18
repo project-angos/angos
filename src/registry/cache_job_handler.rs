@@ -16,10 +16,9 @@ use crate::{
     },
 };
 
-pub const CACHE_QUEUE: &str = "cache";
 pub const CACHE_FETCH_BLOB_KIND: &str = "cache.fetch_blob";
 
-/// JSON payload for a [`CACHE_FETCH_BLOB_KIND`] job on [`CACHE_QUEUE`].
+/// JSON payload for a [`CACHE_FETCH_BLOB_KIND`] job on the `cache` queue.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheFetchBlobPayload {
     pub namespace: String,

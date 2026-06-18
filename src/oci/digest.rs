@@ -5,13 +5,31 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::oci::Error;
+
+/// Per the OCI image spec, a sha256 hash is exactly 64 lowercase hex characters
+/// (`/[a-f0-9]{64}/`; uppercase MUST NOT be used).
+/// REF: <https://github.com/opencontainers/image-spec/blob/v1.0.1/descriptor.md#sha-256>
+const SHA256_HEX_LEN: usize = 64;
 
 #[derive(Debug, Clone, Ord, Eq, Hash, PartialEq, PartialOrd, Deserialize)]
 #[serde(try_from = "String")]
 pub enum Digest {
-    Sha256(Box<str>),
+    Sha256(Sha256Hash),
+}
+
+/// Validated sha256 hash payload. Its inner string is private, so a
+/// `Digest::Sha256` can only be built through [`Digest`]'s validating
+/// constructors. This closes the bypass a public variant field would leave open.
+#[derive(Debug, Clone, Ord, Eq, Hash, PartialEq, PartialOrd)]
+pub struct Sha256Hash(Box<str>);
+
+impl Sha256Hash {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Digest {
@@ -23,15 +41,47 @@ impl Digest {
 
     pub fn hash(&self) -> &str {
         match self {
-            Digest::Sha256(s) => s,
+            Digest::Sha256(s) => s.as_str(),
         }
     }
 
     pub fn hash_prefix(&self) -> &str {
         match self {
-            Digest::Sha256(s) => &s[0..2],
+            Digest::Sha256(s) => &s.as_str()[0..2],
         }
     }
+
+    /// Build a sha256 digest from a bare hash (no `sha256:` prefix), validating
+    /// it is exactly 64 lowercase hex characters.
+    pub fn sha256(hash: impl Into<Box<str>>) -> Result<Self, Error> {
+        let hash = hash.into();
+        validate_sha256_hex(&hash)?;
+        Ok(Digest::Sha256(Sha256Hash(hash)))
+    }
+
+    /// Finalize a sha256 `hasher` into a digest. Infallible: a sha256 finalize
+    /// always yields 32 bytes / 64 lowercase hex chars, so no validation runs.
+    pub fn from_sha256(hasher: Sha256) -> Self {
+        Digest::Sha256(Sha256Hash(hex::encode(hasher.finalize()).into()))
+    }
+
+    /// The sha256 digest of `bytes`, computed in one shot.
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes.as_ref());
+        Self::from_sha256(hasher)
+    }
+}
+
+/// Validate a bare sha256 hash: exactly [`SHA256_HEX_LEN`] lowercase hex chars.
+fn validate_sha256_hex(hash: &str) -> Result<(), Error> {
+    if hash.len() != SHA256_HEX_LEN || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(Error::InvalidDigest(format!(
+            "Invalid sha256 hash '{hash}'"
+        )));
+    }
+    Ok(())
 }
 
 impl FromStr for Digest {
@@ -46,15 +96,6 @@ impl TryFrom<&str> for Digest {
     type Error = Error;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        // As per the image specification:
-        //
-        // "When the algorithm identifier is sha256, the encoded portion MUST match /[a-f0-9]{64}/.
-        // Note that [A-F] MUST NOT be used here."
-        //
-        // REF:
-        // - https://github.com/opencontainers/image-spec/blob/v1.0.1/descriptor.md#sha-256
-        const SHA256_HEX_LEN: usize = 64;
-
         let (algorithm, hash) = s.split_once(':').ok_or_else(|| {
             Error::InvalidDigest(format!(
                 "Digest must be in the format 'algorithm:hash', got '{s}'"
@@ -67,16 +108,7 @@ impl TryFrom<&str> for Digest {
             )));
         }
 
-        // Hash must be exactly SHA256_HEX_LEN lowercase hex characters.
-        if hash.len() != SHA256_HEX_LEN
-            || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        {
-            return Err(Error::InvalidDigest(format!(
-                "Invalid sha256 hash '{hash}'"
-            )));
-        }
-
-        Ok(Digest::Sha256(hash.into()))
+        Self::sha256(hash)
     }
 }
 
@@ -154,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_display() {
-        let digest = Digest::Sha256(VALID_HASH.into());
+        let digest = Digest::sha256(VALID_HASH).unwrap();
         assert_eq!(digest.to_string(), format!("sha256:{VALID_HASH}"));
     }
 

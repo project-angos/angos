@@ -2,7 +2,10 @@ use std::fmt;
 
 use crate::{
     oci::Digest,
-    registry::{job_store::JobState, metadata_store::LinkKind},
+    registry::{
+        job_store::{JobState, Queue},
+        metadata_store::LinkKind,
+    },
 };
 
 /// A single mutation that a scrub checker has decided to perform.
@@ -92,7 +95,7 @@ pub enum Action {
     /// resolves to configured state, so it can never succeed usefully again.
     /// `reason` carries the per-queue explanation for display.
     DeleteOrphanJob {
-        queue: &'static str,
+        queue: Queue,
         state: JobState,
         storage_key: String,
         reason: String,

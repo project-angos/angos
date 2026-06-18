@@ -5,7 +5,7 @@ use crate::{
         ServerContext, error::Error, handlers::build_response, response_body::ResponseBody,
     },
     oci::Namespace,
-    registry::job_store::JobState,
+    registry::job_store::{JobState, Queue},
 };
 
 pub async fn handle_list_repositories(
@@ -61,7 +61,7 @@ pub async fn handle_list_uploads(
 
 pub async fn handle_list_jobs(
     context: &ServerContext,
-    queue: &str,
+    queue: Queue,
     n: Option<u16>,
     after: Option<String>,
 ) -> Result<Response<ResponseBody>, Error> {
@@ -76,7 +76,7 @@ pub async fn handle_list_jobs(
 
 pub async fn handle_list_failed_jobs(
     context: &ServerContext,
-    queue: &str,
+    queue: Queue,
     n: Option<u16>,
     after: Option<String>,
 ) -> Result<Response<ResponseBody>, Error> {
@@ -94,7 +94,7 @@ pub async fn handle_list_failed_jobs(
 
 pub async fn handle_retry_job(
     context: &ServerContext,
-    queue: &str,
+    queue: Queue,
     storage_key: &str,
 ) -> Result<Response<ResponseBody>, Error> {
     context
@@ -109,7 +109,7 @@ pub async fn handle_retry_job(
 
 pub async fn handle_delete_job(
     context: &ServerContext,
-    queue: &str,
+    queue: Queue,
     state: JobState,
     storage_key: &str,
 ) -> Result<Response<ResponseBody>, Error> {

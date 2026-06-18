@@ -20,8 +20,7 @@ use crate::{
         },
     },
     configuration::{Configuration, ServerConfig},
-    registry::{cache_job_handler::CACHE_QUEUE, job_store::queue_depth_refresh_loop},
-    replication::REPLICATION_QUEUE,
+    registry::job_store::{Queue, queue_depth_refresh_loop},
 };
 
 mod notifier;
@@ -85,10 +84,10 @@ impl Command {
             // The server reads queue depth off the shared store, so the
             // replication gauges are published here even though `angos worker`
             // drains that queue.
-            for queue in [CACHE_QUEUE, REPLICATION_QUEUE] {
+            for queue in [Queue::Cache, Queue::Replication] {
                 tracker.spawn(queue_depth_refresh_loop(
                     refresh.store.clone(),
-                    queue.to_string(),
+                    queue,
                     refresh.interval,
                     refresh.ready_horizon_secs,
                     shutdown.clone(),

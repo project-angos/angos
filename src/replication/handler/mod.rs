@@ -17,7 +17,7 @@ use crate::{
     oci::{Digest, Namespace, Reference},
     registry::{
         blob_store::BlobStore,
-        job_store::{Error, JobEnvelope, JobHandler},
+        job_store::{Error, JobEnvelope, JobHandler, Queue},
         metadata_store::{Error as MetadataStoreError, LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
@@ -29,13 +29,12 @@ use crate::{
 
 /// Single queue carrying every replication job; the downstream is encoded in the
 /// `lock_key` and payload.
-pub const REPLICATION_QUEUE: &str = "replication";
 /// Push a manifest (and everything it references) to a downstream.
 pub const REPLICATION_PUSH_MANIFEST_KIND: &str = "replication.push_manifest";
 /// Delete a manifest on a downstream.
 pub const REPLICATION_DELETE_MANIFEST_KIND: &str = "replication.delete_manifest";
 
-/// JSON payload for a replication job on [`REPLICATION_QUEUE`]. The handler
+/// JSON payload for a replication job on [`Queue::Replication`]. The handler
 /// re-resolves the current local `tag -> digest` at execute time and the queue
 /// only coalesces not-yet-claimed jobs, so a write landing mid-push enqueues
 /// its own job instead of being dropped.
@@ -69,13 +68,14 @@ fn lock_key_reference(payload: &ReplicationPushPayload) -> &str {
 }
 
 /// Base delete `lock_key`,
-/// `{REPLICATION_QUEUE}.delete.{downstream}:{namespace}:{tag_or_digest}`, shared
+/// `{Queue::Replication}.delete.{downstream}:{namespace}:{tag_or_digest}`, shared
 /// by the event-path delete (which appends `@{source_ts}`) and the scrub prune
 /// delete (which keys on this bare base). Defining it once keeps the invariant
 /// "the prune key is the event delete key minus the timestamp suffix" in code.
 fn delete_lock_key_base(payload: &ReplicationPushPayload) -> String {
     format!(
-        "{REPLICATION_QUEUE}.delete.{}:{}:{}",
+        "{}.delete.{}:{}:{}",
+        Queue::Replication,
         payload.downstream,
         payload.namespace,
         lock_key_reference(payload)
@@ -83,7 +83,7 @@ fn delete_lock_key_base(payload: &ReplicationPushPayload) -> String {
 }
 
 /// Builds the per-job `lock_key`,
-/// `{REPLICATION_QUEUE}.{op}.{downstream}:{namespace}:{tag_or_digest}` plus
+/// `{Queue::Replication}.{op}.{downstream}:{namespace}:{tag_or_digest}` plus
 /// `@{source_ts}` for deletes, shared by the event path and the scrub push
 /// reconcile so identical pending work coalesces. The `op` segment keeps a
 /// delete from coalescing into a still-pending push, and the delete-only
@@ -102,7 +102,8 @@ fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
         )
     } else {
         format!(
-            "{REPLICATION_QUEUE}.push.{}:{}:{}",
+            "{}.push.{}:{}:{}",
+            Queue::Replication,
             payload.downstream,
             payload.namespace,
             lock_key_reference(payload)
@@ -118,7 +119,7 @@ fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
 /// Returns a [`serde_json::Error`] when the payload cannot be serialized.
 pub fn build_envelope(payload: &ReplicationPushPayload) -> Result<JobEnvelope, serde_json::Error> {
     JobEnvelope::new(
-        REPLICATION_QUEUE,
+        Queue::Replication,
         payload.kind.clone(),
         replication_lock_key(payload),
         payload,
@@ -139,7 +140,7 @@ pub fn build_prune_delete_envelope(
     payload: &ReplicationPushPayload,
 ) -> Result<JobEnvelope, serde_json::Error> {
     JobEnvelope::new(
-        REPLICATION_QUEUE,
+        Queue::Replication,
         payload.kind.clone(),
         delete_lock_key_base(payload),
         payload,

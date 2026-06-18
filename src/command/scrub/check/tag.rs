@@ -39,7 +39,7 @@ impl TagChecker {
         debug!("Checking digest link for tag '{namespace}:{tag}'");
         let tag_metadata = self
             .metadata_store
-            .read_link(namespace, &LinkKind::Tag(tag.to_string()), false)
+            .read_link(namespace, &LinkKind::Tag(tag.to_string()))
             .await?;
 
         match self.blob_store.size(&tag_metadata.target).await {
@@ -132,7 +132,7 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let digest_link = metadata_store
-                .read_link(namespace, &LinkKind::Digest(blob_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(blob_digest.clone()))
                 .await;
 
             assert!(
@@ -175,7 +175,7 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let digest_link = metadata_store
-                .read_link(namespace, &LinkKind::Digest(blob_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(blob_digest.clone()))
                 .await;
 
             assert!(
@@ -221,14 +221,14 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()), false)
+                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()))
                     .await
                     .is_err(),
                 "tag link must be removed when target blob is missing"
             );
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(blob_digest.clone()), false)
+                    .read_link(namespace, &LinkKind::Digest(blob_digest.clone()))
                     .await
                     .is_err(),
                 "digest revision link must be removed when target blob is missing"
@@ -277,14 +277,14 @@ mod tests {
             );
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling-dry".to_string()), false)
+                    .read_link(namespace, &LinkKind::Tag("dangling-dry".to_string()))
                     .await
                     .is_ok(),
                 "tag link must not be touched under Vec sink"
             );
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(blob_digest.clone()), false)
+                    .read_link(namespace, &LinkKind::Digest(blob_digest.clone()))
                     .await
                     .is_ok(),
                 "digest link must not be touched under Vec sink"

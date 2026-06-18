@@ -10,7 +10,6 @@ use crate::{
         DOCKER_UPLOAD_UUID, Error, HeaderMap, Registry, ResponseHeaders,
         blob_ownership::BlobOwnership, blob_store,
     },
-    util::sha256::finalize_digest,
 };
 
 /// Caps the namespaces CEL-evaluated for a from-less mount, bounding an
@@ -131,7 +130,7 @@ where
         .into());
     }
 
-    Ok(finalize_digest(hasher))
+    Ok(Digest::from_sha256(hasher))
 }
 
 impl Registry {
@@ -577,7 +576,6 @@ mod tests {
             },
         },
         test_fixtures::configuration::load_config,
-        util::sha256,
     };
 
     /// Which storage operation the [`FailingStorage`] wrapper turns into a
@@ -1269,7 +1267,7 @@ mod tests {
                 .await
                 .expect("a chunked PATCH (no Content-Length) must be accepted");
 
-            let expected_digest = sha256::digest(content);
+            let expected_digest = Digest::from_bytes(content);
             registry
                 .complete_upload(
                     None,
@@ -1316,7 +1314,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let expected_digest = sha256::digest(content);
+            let expected_digest = Digest::from_bytes(content);
 
             let empty_stream = Cursor::new(Vec::new());
             let response = registry
@@ -1381,7 +1379,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected_digest = sha256::digest(content);
+        let expected_digest = Digest::from_bytes(content);
         let response = registry
             .complete_upload(
                 None,
@@ -1703,7 +1701,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(size, content.len() as u64);
-            assert_eq!(digest, sha256::digest(content));
+            assert_eq!(digest, Digest::from_bytes(content));
 
             let summary = registry
                 .blob_store
@@ -1817,7 +1815,7 @@ mod tests {
                 None,
                 namespace,
                 session_id,
-                &sha256::digest(content),
+                &Digest::from_bytes(content),
                 Some(0),
                 empty_stream,
             )
@@ -1955,7 +1953,7 @@ mod tests {
 
         // A single chunked PUT carrying the whole body must also be bounded.
         let content = b"single chunked PUT over the cap";
-        let digest = sha256::digest(content);
+        let digest = Digest::from_bytes(content);
         let result = registry
             .complete_upload(
                 None,

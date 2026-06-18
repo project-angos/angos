@@ -16,7 +16,7 @@ use crate::{
     registry::{
         Registry, RegistryConfig, Repository,
         blob_store::{self, sha256_ext::Sha256Ext},
-        job_store::JobStore,
+        job_store::{JobStore, Queue},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         path_builder, repository,
@@ -24,9 +24,7 @@ use crate::{
         s3_connection::S3ConnectionConfig,
     },
     registry_client::RegistryClient,
-    replication::{
-        REPLICATION_QUEUE, ReplicationDownstream, ReplicationMode, ReplicationPushPayload,
-    },
+    replication::{ReplicationDownstream, ReplicationMode, ReplicationPushPayload},
     secret::Secret,
 };
 use angos_s3_client::Backend as S3HttpBackend;
@@ -457,17 +455,20 @@ pub fn repository_with_downstream(name: &str, client: Arc<RegistryClient>) -> Re
 /// Decode the payload of the sole pending replication job, panicking unless
 /// exactly one is pending.
 pub async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
-    let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+    let keys = job_store
+        .list_pending(Queue::Replication, 16)
+        .await
+        .unwrap();
     assert_eq!(
         keys.len(),
         1,
         "expected exactly one pending replication job"
     );
     let envelope = job_store
-        .read_pending(REPLICATION_QUEUE, &keys[0])
+        .read_pending(Queue::Replication, &keys[0])
         .await
         .unwrap();
-    assert_eq!(envelope.queue, REPLICATION_QUEUE);
+    assert_eq!(envelope.queue, Queue::Replication);
     serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
 }
 

@@ -10,7 +10,7 @@ use crate::{
     oci::{Digest, Manifest, Reference},
     registry::{
         blob_store::{self, MultipartCleanup},
-        job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore},
+        job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore, Queue},
         manifest::link_plan,
         metadata_store::{
             BlobIndexOperation, Error as MetadataError, LinkKind, LinkOperation, MetadataStore,
@@ -364,7 +364,7 @@ impl Executor {
 
     async fn delete_orphan_job(
         &self,
-        queue: &'static str,
+        queue: Queue,
         state: JobState,
         storage_key: String,
     ) -> Result<(), Error> {
@@ -495,12 +495,12 @@ mod tests {
     use crate::{
         oci::Digest,
         registry::{
-            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
-            job_store::{FailOutcome, JobState},
+            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
+            job_store::{FailOutcome, JobState, Queue},
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{backends, build_store, locked_executor_over, put_blob_direct},
         },
-        replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE},
+        replication::REPLICATION_DELETE_MANIFEST_KIND,
     };
 
     /// A producer `JobStore` over a private store no worker drains. Tests that
@@ -595,7 +595,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                    .read_link(namespace, &LinkKind::Digest(digest.clone()))
                     .await
                     .is_err(),
                 "digest link must be removed even when the blob is missing"
@@ -641,7 +641,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()), false)
+                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()))
                     .await
                     .is_err(),
                 "tag link pointing at missing-blob digest must be removed"
@@ -742,8 +742,7 @@ mod tests {
                 metadata_store
                     .read_link(
                         namespace,
-                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
-                        false,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone())
                     )
                     .await
                     .is_ok(),
@@ -765,8 +764,7 @@ mod tests {
                 metadata_store
                     .read_link(
                         namespace,
-                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
-                        false,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone())
                     )
                     .await
                     .is_err(),
@@ -807,7 +805,7 @@ mod tests {
 
             // Confirm the layer link exists with the phantom referrer.
             let before = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -829,7 +827,7 @@ mod tests {
             // After removing the only referrer the link itself must be gone.
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false,)
+                    .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
                     .await
                     .is_err(),
                 "layer link must be removed when referenced_by becomes empty"
@@ -858,7 +856,7 @@ mod tests {
                 .unwrap();
 
             let claimed = job_store
-                .claim_one(REPLICATION_QUEUE)
+                .claim_one(Queue::Replication)
                 .await
                 .unwrap()
                 .claimed
@@ -904,7 +902,10 @@ mod tests {
             }
 
             assert_eq!(
-                job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+                job_store
+                    .count_pending(Queue::Replication, 0)
+                    .await
+                    .unwrap(),
                 1,
                 "two prune-delete enqueues for the same (downstream, namespace, tag) \
                  must coalesce into a single pending job"
@@ -934,10 +935,16 @@ mod tests {
             digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
         };
-        JobEnvelope::new(CACHE_QUEUE, CACHE_FETCH_BLOB_KIND, "cache.ns/app", &payload).unwrap()
+        JobEnvelope::new(
+            Queue::Cache,
+            CACHE_FETCH_BLOB_KIND,
+            "cache.ns/app",
+            &payload,
+        )
+        .unwrap()
     }
 
-    fn delete_orphan_action(queue: &'static str, state: JobState, storage_key: String) -> Action {
+    fn delete_orphan_action(queue: Queue, state: JobState, storage_key: String) -> Action {
         Action::DeleteOrphanJob {
             queue,
             state,
@@ -956,8 +963,8 @@ mod tests {
             let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             for (queue, envelope) in [
-                (REPLICATION_QUEUE, orphan_push_envelope()),
-                (CACHE_QUEUE, orphan_cache_envelope()),
+                (Queue::Replication, orphan_push_envelope()),
+                (Queue::Cache, orphan_cache_envelope()),
             ] {
                 job_store.enqueue(envelope).await.unwrap();
                 let keys = job_store.list_pending(queue, 10).await.unwrap();
@@ -992,8 +999,8 @@ mod tests {
             let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             for (queue, mut envelope) in [
-                (REPLICATION_QUEUE, orphan_push_envelope()),
-                (CACHE_QUEUE, orphan_cache_envelope()),
+                (Queue::Replication, orphan_push_envelope()),
+                (Queue::Cache, orphan_cache_envelope()),
             ] {
                 // A single-attempt job failed once dead-letters under its
                 // original key.
@@ -1039,7 +1046,7 @@ mod tests {
 
             let mut executor = Executor::new(blob_store, metadata_store, job_store);
 
-            for queue in [REPLICATION_QUEUE, CACHE_QUEUE] {
+            for queue in [Queue::Replication, Queue::Cache] {
                 for state in [JobState::Pending, JobState::Failed] {
                     executor
                         .apply(delete_orphan_action(

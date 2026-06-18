@@ -101,8 +101,12 @@ impl BlobStore {
                     continue;
                 };
                 if let Some(slash_pos) = key_without_data.rfind('/') {
-                    let digest = &key_without_data[slash_pos + 1..];
-                    all_blobs.push(Digest::Sha256(digest.into()));
+                    let hash = &key_without_data[slash_pos + 1..];
+                    // Skip storage keys that aren't valid sha256 blob paths.
+                    match Digest::sha256(hash) {
+                        Ok(digest) => all_blobs.push(digest),
+                        Err(e) => debug!("skipping blob listing entry '{key_without_data}': {e}"),
+                    }
                 }
             }
             list_continuation_token = page.next_token;

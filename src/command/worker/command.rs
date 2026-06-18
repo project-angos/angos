@@ -22,12 +22,12 @@ use crate::{
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
     registry::{
         blob_store::BlobStore,
-        cache_job_handler::{CACHE_QUEUE, CacheJobHandler},
-        job_store::{self, JobHandler, JobStore},
+        cache_job_handler::CacheJobHandler,
+        job_store::{self, JobHandler, JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
-    replication::{REPLICATION_QUEUE, ReplicationJobHandler},
+    replication::ReplicationJobHandler,
 };
 
 /// Process durable background jobs.
@@ -62,7 +62,7 @@ pub struct Command {
 
 struct QueueRunner {
     inner: Arc<ArcSwap<Components>>,
-    queue: String,
+    queue: Queue,
     concurrency: NonZeroUsize,
 }
 
@@ -71,26 +71,29 @@ struct Components {
     handler: Arc<dyn JobHandler>,
 }
 
-fn queue_concurrency(config: &Configuration, queue: &str) -> NonZeroUsize {
-    if queue == REPLICATION_QUEUE {
-        config.global.max_concurrent_replication_jobs
-    } else {
-        config.global.max_concurrent_cache_jobs
+fn queue_concurrency(config: &Configuration, queue: Queue) -> NonZeroUsize {
+    match queue {
+        Queue::Replication => config.global.max_concurrent_replication_jobs,
+        Queue::Cache => config.global.max_concurrent_cache_jobs,
     }
 }
 
-/// De-duplicates `--queue` values preserving command-line order; defaults to
-/// both `cache` and `replication` when none are given.
-fn resolve_queues(requested: &[String]) -> Vec<String> {
+/// Parses and de-duplicates `--queue` values preserving command-line order;
+/// defaults to both `cache` and `replication` when none are given. An unknown
+/// queue name is rejected here (the bad name is reported in the error).
+fn resolve_queues(requested: &[String]) -> Result<Vec<Queue>, Error> {
     if requested.is_empty() {
-        return vec![CACHE_QUEUE.to_string(), REPLICATION_QUEUE.to_string()];
+        return Ok(vec![Queue::Cache, Queue::Replication]);
     }
     let mut seen = HashSet::new();
-    requested
-        .iter()
-        .filter(|queue| seen.insert(queue.as_str()))
-        .cloned()
-        .collect()
+    let mut queues = Vec::new();
+    for name in requested {
+        let queue: Queue = name.parse().map_err(Error::JobQueue)?;
+        if seen.insert(queue) {
+            queues.push(queue);
+        }
+    }
+    Ok(queues)
 }
 
 impl Command {
@@ -99,9 +102,9 @@ impl Command {
         let context = WorkerContext::build(config, Some(engine_maintenance.clone())).await?;
 
         let mut queues = Vec::new();
-        for queue in resolve_queues(&options.queue) {
-            let concurrency = queue_concurrency(config, &queue);
-            let components = context.components_for(&queue)?;
+        for queue in resolve_queues(&options.queue)? {
+            let concurrency = queue_concurrency(config, queue);
+            let components = context.components_for(queue);
             queues.push(QueueRunner {
                 inner: Arc::new(ArcSwap::from_pointee(components)),
                 queue,
@@ -139,7 +142,7 @@ impl Command {
         for runner in &self.queues {
             for _ in 0..runner.concurrency.get() {
                 let inner = Arc::clone(&runner.inner);
-                let queue = runner.queue.clone();
+                let queue = runner.queue;
                 let poll_interval = self.poll_interval;
                 let shutdown = self.shutdown.clone();
                 self.workers.spawn(async move {
@@ -156,7 +159,7 @@ impl Command {
 /// (`JobStore::claim_one`), so a broken backend is not hammered.
 async fn worker_loop(
     inner: Arc<ArcSwap<Components>>,
-    queue: String,
+    queue: Queue,
     poll_interval: Duration,
     shutdown: CancellationToken,
 ) {
@@ -167,7 +170,7 @@ async fn worker_loop(
                 debug!("Worker poll loop stopping");
                 return;
             }
-            result = snapshot.consumer.claim_one(&queue) => match result {
+            result = snapshot.consumer.claim_one(queue) => match result {
                 // `claim_one` self-throttles on a backend error; just log it.
                 Err(e) => error!(error = %e, "claim_one failed; backing off"),
                 Ok(outcome) => match outcome.claimed {
@@ -199,13 +202,9 @@ impl ConfigNotifier for Command {
             }
         };
         for runner in &self.queues {
-            match context.components_for(&runner.queue) {
-                Ok(components) => runner.inner.store(Arc::new(components)),
-                Err(e) => error!(
-                    "Failed to apply worker configuration for queue '{}': {e}",
-                    runner.queue
-                ),
-            }
+            runner
+                .inner
+                .store(Arc::new(context.components_for(runner.queue)));
         }
     }
 
@@ -267,32 +266,25 @@ impl WorkerContext {
 
     /// Builds the [`Components`] for one queue: a fresh `JobStore` consumer
     /// over the shared storage plus the handler bound to that queue.
-    fn components_for(&self, queue: &str) -> Result<Components, Error> {
+    fn components_for(&self, queue: Queue) -> Components {
         let consumer = Arc::new(JobStore::new(
             self.storage.clone(),
             Uuid::new_v4().to_string(),
         ));
-        let handler: Arc<dyn JobHandler> = if queue == REPLICATION_QUEUE {
-            Arc::new(ReplicationJobHandler::new(
+        let handler: Arc<dyn JobHandler> = match queue {
+            Queue::Replication => Arc::new(ReplicationJobHandler::new(
                 self.repositories.clone(),
                 self.blob_store.clone(),
                 self.metadata_store.clone(),
-            ))
-        } else if queue == CACHE_QUEUE {
-            Arc::new(CacheJobHandler::new(
+            )),
+            Queue::Cache => Arc::new(CacheJobHandler::new(
                 self.repositories.clone(),
                 self.blob_store.clone(),
                 self.metadata_store.clone(),
-            ))
-        } else {
-            return Err(bootstrap::Error::JobQueue(
-                job_store::Error::Initialization(format!(
-                    "unknown queue '{queue}'; expected '{CACHE_QUEUE}' or '{REPLICATION_QUEUE}'"
-                )),
-            ));
+            )),
         };
 
-        Ok(Components { consumer, handler })
+        Components { consumer, handler }
     }
 }
 
@@ -309,20 +301,20 @@ mod tests {
         metrics_provider,
         registry::{
             blob_store::BlobStore,
-            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE},
-            job_store::JobEnvelope,
+            cache_job_handler::CACHE_FETCH_BLOB_KIND,
+            job_store::{JobEnvelope, Queue},
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
             test_utils::{build_store, build_test_fs_executor},
         },
-        replication::{REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE},
+        replication::REPLICATION_PUSH_MANIFEST_KIND,
     };
 
     #[test]
     fn resolve_queues_defaults_to_cache_and_replication() {
         assert_eq!(
-            resolve_queues(&[]),
-            vec![CACHE_QUEUE.to_string(), REPLICATION_QUEUE.to_string()]
+            resolve_queues(&[]).unwrap(),
+            vec![Queue::Cache, Queue::Replication]
         );
     }
 
@@ -333,9 +325,21 @@ mod tests {
                 "replication".to_string(),
                 "cache".to_string(),
                 "replication".to_string(),
-            ]),
-            vec!["replication".to_string(), "cache".to_string()],
+            ])
+            .unwrap(),
+            vec![Queue::Replication, Queue::Cache],
             "explicit --queue order must be preserved, duplicates dropped"
+        );
+    }
+
+    #[test]
+    fn resolve_queues_rejects_unknown_queue() {
+        let Err(err) = resolve_queues(&["some-other-queue".to_string()]) else {
+            panic!("an unknown queue must be rejected");
+        };
+        assert!(
+            err.to_string().contains("some-other-queue"),
+            "unknown-queue error did not name the bad queue: {err}"
         );
     }
 
@@ -374,13 +378,13 @@ mod tests {
         let (context, _dir) = worker_context();
 
         let cache_envelope = JobEnvelope::new(
-            CACHE_QUEUE,
+            Queue::Cache,
             CACHE_FETCH_BLOB_KIND,
             "lock",
             &serde_json::json!({}),
         )
         .unwrap();
-        let replication_handler = context.components_for(REPLICATION_QUEUE).unwrap().handler;
+        let replication_handler = context.components_for(Queue::Replication).handler;
         let err = replication_handler
             .execute(&cache_envelope)
             .await
@@ -396,13 +400,13 @@ mod tests {
         let (context, _dir) = worker_context();
 
         let replication_envelope = JobEnvelope::new(
-            REPLICATION_QUEUE,
+            Queue::Replication,
             REPLICATION_PUSH_MANIFEST_KIND,
             "lock",
             &serde_json::json!({}),
         )
         .unwrap();
-        let cache_handler = context.components_for(CACHE_QUEUE).unwrap().handler;
+        let cache_handler = context.components_for(Queue::Cache).handler;
         let err = cache_handler
             .execute(&replication_envelope)
             .await
@@ -413,26 +417,11 @@ mod tests {
         );
     }
 
-    /// An unknown queue must not be silently bound to the cache handler;
-    /// `Components` is not `Debug`, so the `Result` is matched directly.
-    #[tokio::test]
-    async fn components_for_rejects_unknown_queue() {
-        let (context, _dir) = worker_context();
-
-        let Err(err) = context.components_for("some-other-queue") else {
-            panic!("an unknown queue must be rejected");
-        };
-        assert!(
-            err.to_string().contains("some-other-queue"),
-            "unknown-queue error did not name the bad queue: {err}"
-        );
-    }
-
     #[tokio::test]
     async fn components_for_mints_a_fresh_consumer_per_call() {
         let (context, _dir) = worker_context();
-        let a = context.components_for(CACHE_QUEUE).unwrap().consumer;
-        let b = context.components_for(REPLICATION_QUEUE).unwrap().consumer;
+        let a = context.components_for(Queue::Cache).consumer;
+        let b = context.components_for(Queue::Replication).consumer;
         assert!(
             !Arc::ptr_eq(&a, &b),
             "each queue must get its own JobStore consumer"

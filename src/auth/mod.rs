@@ -12,8 +12,15 @@ pub use basic_auth::BasicAuthValidator;
 use hyper::http::request::Parts;
 pub use mtls::{MtlsValidator, PeerCertificate};
 pub use oidc::OidcValidator;
+use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::{command::server::Error, identity::ClientIdentity};
+
+/// Lowercase-hex sha256 of `data`, for deriving stable, bounded-length cache
+/// keys from arbitrary key material.
+pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
+    hex::encode(Sha256::digest(data.as_ref()))
+}
 
 /// Result of authentication attempt
 #[derive(Debug)]

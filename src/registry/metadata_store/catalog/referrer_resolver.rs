@@ -83,7 +83,7 @@ mod tests {
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn digest(hex: &str) -> Digest {
-        Digest::Sha256(hex.into())
+        Digest::sha256(hex).unwrap()
     }
 
     fn descriptor_with(artifact_type: Option<&str>) -> Descriptor {

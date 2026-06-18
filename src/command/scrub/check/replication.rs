@@ -296,7 +296,7 @@ mod tests {
         registry::{
             DOCKER_CONTENT_DIGEST, Repository,
             blob_store::BlobStore,
-            job_store::JobStore,
+            job_store::{JobStore, Queue},
             metadata_store::{LinkKind, LinkOperation, MetadataStore},
             repository_resolver::RepositoryResolver,
             test_utils::{
@@ -305,9 +305,7 @@ mod tests {
             },
         },
         registry_client::RegistryClient,
-        replication::{
-            REPLICATION_QUEUE, ReplicationDownstream, ReplicationJobHandler, ReplicationMode,
-        },
+        replication::{ReplicationDownstream, ReplicationJobHandler, ReplicationMode},
     };
 
     const NAMESPACE: &str = "nginx";
@@ -620,9 +618,9 @@ mod tests {
             .await
             .unwrap();
 
-        let stale = Digest::Sha256(
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
-        );
+        let stale =
+            Digest::sha256("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .unwrap();
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1041,14 +1039,20 @@ mod tests {
         ));
         checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             1,
             "the divergent tag must enqueue exactly one replication job"
         );
 
         checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             1,
             "a second reconcile pass must coalesce on lock_key (no new job)"
         );
@@ -1061,7 +1065,7 @@ mod tests {
 
         let mut drained: u64 = 0;
         loop {
-            let outcome = job_store.claim_one(REPLICATION_QUEUE).await.unwrap();
+            let outcome = job_store.claim_one(Queue::Replication).await.unwrap();
             let Some(claimed) = outcome.claimed else {
                 break;
             };
@@ -1070,7 +1074,10 @@ mod tests {
         }
         assert_eq!(drained, 1, "exactly one coalesced job is drained");
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             0,
             "the queue must be empty after the drain"
         );
@@ -1130,7 +1137,10 @@ mod tests {
         ));
         checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             1,
             "the downstream-only tag must enqueue exactly one delete job"
         );
@@ -1143,7 +1153,7 @@ mod tests {
 
         let mut drained: u64 = 0;
         loop {
-            let outcome = job_store.claim_one(REPLICATION_QUEUE).await.unwrap();
+            let outcome = job_store.claim_one(Queue::Replication).await.unwrap();
             let Some(claimed) = outcome.claimed else {
                 break;
             };
@@ -1152,7 +1162,10 @@ mod tests {
         }
         assert_eq!(drained, 1, "exactly one delete job is drained");
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             0,
             "the queue must be empty after the drain"
         );

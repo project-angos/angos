@@ -118,7 +118,7 @@ impl BlobChecker {
 
         if self
             .metadata_store
-            .read_link(namespace, link, false)
+            .read_link(namespace, link)
             .await
             .is_err()
             && let Err(err) = sink
