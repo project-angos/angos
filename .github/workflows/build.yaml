@@ -190,9 +190,6 @@ jobs:
             done
           fi
 
-          # RustFS backs every S3 variant: it supports the full conditional-write
-          # API the CAS lock needs (If-None-Match + If-Match) and is fast under
-          # the zb load. registry-b is instance B's isolated replication bucket.
           if [[ "${{ matrix.s3 }}" == "true" ]]; then
             docker run --rm -d \
               -e RUSTFS_ACCESS_KEY=root \
