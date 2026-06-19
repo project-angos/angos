@@ -380,18 +380,24 @@ impl Registry {
             return Err(Error::BlobReferenced);
         }
 
-        // Hold the coarse `blob-data:{digest}` lock across the converged revoke
-        // + conditional-reclaim transaction. The transaction is crash-atomic on
-        // its own, but the lock is what serialises it against the upload `grant`
-        // path (which records ownership in the shard without a transactional
-        // coarse lock), so a concurrent reference grant cannot be missed during
-        // the unreferenced check.
+        // Hold the coarse `blob-data:{digest}` lock across the revoke + reclaim.
+        // The revoke transaction is crash-atomic on its own, but the lock is what
+        // serialises it against the upload `grant` path (which records ownership
+        // in the shard without a transactional coarse lock), so a concurrent
+        // reference grant cannot be missed during the unreferenced check, and the
+        // blob-store reclaim cannot race a concurrent push of the same digest.
         let session = self.acquire_blob_data_lock(digest).await?;
-        let result = self
-            .metadata_store
-            .revoke_blob_ownership(namespace.as_ref(), digest)
-            .await
-            .map_err(Error::from);
+        let result = async {
+            if self
+                .metadata_store
+                .revoke_blob_ownership(namespace.as_ref(), digest)
+                .await?
+            {
+                self.blob_store.delete_blob(digest).await?;
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
         session.release().await;
         result
     }

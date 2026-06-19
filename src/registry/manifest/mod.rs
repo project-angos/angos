@@ -2,6 +2,7 @@ pub mod link_plan;
 mod parse;
 mod response;
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 pub use parse::{ParsedManifestDigests, parse_manifest_digests};
@@ -361,16 +362,29 @@ impl Registry {
             ReferencePolicy::Trusted => {}
         }
 
-        let commit = self
-            .metadata_store
-            .store_manifest(namespace.as_ref(), &computed_digest, body, &ops, created_at)
-            .await
-            .map_err(|e| match e {
-                MetadataStoreError::ReplicationSuperseded(message) => {
-                    Error::ReplicationSuperseded(message)
-                }
-                e => Error::from(e),
-            })?;
+        // Write the manifest blob-data to the blob store before the link
+        // transaction (a link must never point at absent bytes) and hold the
+        // blob-data lock across both so a concurrent delete cannot reclaim the
+        // blob between the write and the link. A crash or LWW-supersession in
+        // between leaves at most an orphan blob, which scrub reclaims.
+        let session = self.acquire_blob_data_lock(&computed_digest).await?;
+        let result = async {
+            self.blob_store
+                .put_blob(&computed_digest, Bytes::copy_from_slice(body))
+                .await?;
+            self.metadata_store
+                .store_manifest(namespace.as_ref(), &ops, created_at)
+                .await
+                .map_err(|e| match e {
+                    MetadataStoreError::ReplicationSuperseded(message) => {
+                        Error::ReplicationSuperseded(message)
+                    }
+                    e => Error::from(e),
+                })
+        }
+        .await;
+        session.release().await;
+        let commit = result?;
 
         // Changed-state check from the prior target the committed transaction
         // itself validated; a missing entry fails open so a genuine write is
@@ -518,9 +532,24 @@ impl Registry {
         // set, so a concurrent newer re-put aborts the delete rather than being
         // clobbered by an older replicated delete.
         if let Reference::Digest(digest) = reference {
-            self.metadata_store
-                .delete_manifest(namespace.as_ref(), digest, &ops, source_ts)
-                .await?;
+            // The manifest blob-data is content in the blob store. Hold the
+            // blob-data lock across the unreferenced-check + reclaim so a
+            // concurrent reference grant isn't missed, then reclaim the bytes
+            // when the delete left the blob unreferenced.
+            let session = self.acquire_blob_data_lock(digest).await?;
+            let result = async {
+                if self
+                    .metadata_store
+                    .delete_manifest(namespace.as_ref(), digest, &ops, source_ts)
+                    .await?
+                {
+                    self.blob_store.delete_blob(digest).await?;
+                }
+                Ok::<_, Error>(())
+            }
+            .await;
+            session.release().await;
+            result?;
         } else {
             self.metadata_store
                 .delete_links(namespace.as_ref(), &ops, source_ts)

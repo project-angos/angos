@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use tokio::io::AsyncRead;
 use tracing::{debug, instrument};
@@ -173,6 +174,19 @@ impl BlobStore {
     pub async fn delete_blob(&self, digest: &Digest) -> Result<(), Error> {
         let container = path_builder::blob_container_dir(digest);
         self.store.delete_prefix(&container).await?;
+        Ok(())
+    }
+
+    /// Write `body` directly at the content-addressed blob path. Used for small
+    /// content the registry holds in memory (manifest bodies); layer blobs go
+    /// through the streaming upload lifecycle instead. Idempotent: the digest
+    /// fixes the path and the bytes, so a re-put is a no-op-equivalent. Callers
+    /// serialise against concurrent reclaim with the blob-data lock.
+    #[instrument(skip(self, body))]
+    pub async fn put_blob(&self, digest: &Digest, body: Bytes) -> Result<(), Error> {
+        self.store
+            .put(&path_builder::blob_path(digest), body)
+            .await?;
         Ok(())
     }
 }

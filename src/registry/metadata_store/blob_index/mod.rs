@@ -109,21 +109,23 @@ impl MetadataStore {
         Ok((tx.reads, tx.mutations))
     }
 
-    /// Revoke `namespace`'s ownership of `digest` and, in the same atomic
-    /// transaction, reclaim the blob-data once no namespace references it — like
-    /// `delete_manifest`, so a crash cannot orphan the bytes. The planner's
-    /// `blob-data:{digest}` coarse lock serialises this against concurrent pushes
-    /// of the same digest.
+    /// Revoke `namespace`'s ownership of `digest` in an atomic transaction and
+    /// return whether the blob became unreferenced, so the caller reclaims its
+    /// blob-data from the blob store under the `blob-data:{digest}` lock it must
+    /// hold across this call (serialising against concurrent pushes/deletes of
+    /// the same digest).
     pub async fn revoke_blob_ownership(
         &self,
         namespace: &str,
         digest: &Digest,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let tx = LinksTx::RevokeBlobOwnership {
             blob: digest,
             ops: vec![BlobIndexOperation::Remove(LinkKind::Blob(digest.clone()))],
         };
-        self.execute_links_tx(namespace, &[], tx).await.map(|_| ())
+        self.execute_links_tx(namespace, &[], tx)
+            .await
+            .map(|c| c.reclaim_blob)
     }
 
     #[instrument(skip(self))]

@@ -193,10 +193,16 @@ impl Executor {
                 );
                 return Ok(());
             }
-            self.metadata_store
+            // Revoke the grant, then reclaim the now-unreferenced manifest
+            // blob-data from the blob store under the same lock.
+            if self
+                .metadata_store
                 .revoke_blob_ownership(&namespace, &blob)
-                .await
-                .map_err(Error::from)
+                .await?
+            {
+                self.blob_store.delete_blob(&blob).await?;
+            }
+            Ok(())
         })
         .await
     }

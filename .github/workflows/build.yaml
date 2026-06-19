@@ -208,7 +208,10 @@ jobs:
               sleep 1
             done
 
-            for bucket in registry registry-b; do
+            # registry: primary; registry-b: replication instance B;
+            # registry-split-{blob,meta}: the split-backend e2e scenario, which
+            # needs a blob bucket no prior step has seeded with the test image.
+            for bucket in registry registry-b registry-split-blob registry-split-meta; do
               AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=roottoor AWS_DEFAULT_REGION=us-east-1 \
                 aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket "$bucket"
             done
@@ -234,6 +237,39 @@ jobs:
               -e 's/\(key_prefix = "[^"]*\)"/\1b"/' \
               /tmp/backend.toml > /tmp/backend-b.toml
           cat /tmp/backend-b.toml conformance/e2e/overlay-replication-b.toml > /tmp/e2e-replication-b.toml
+
+          # Split-backend push scenario: put the blob and metadata stores on
+          # distinct key spaces so a manifest stored in the wrong store (the
+          # cross-store isolation bug) is unreadable on pull-back. For S3 both
+          # stores move to fresh buckets, because the blob bucket must NOT be one
+          # a prior step seeded with the test image, or the content-addressed
+          # manifest blob would already be present and mask the bug. For FS each
+          # container's roots are ephemeral, so only the metadata root is moved.
+          # Only meaningful when the variant configures an explicit metadata
+          # store; the "memory" variants inherit the blob store (single store).
+          if grep -q '^\[metadata_store\.' /tmp/backend.toml; then
+            if [[ "${{ matrix.s3 }}" == "true" ]]; then
+              sed -e '/^\[blob_store\.s3\]$/,/^\[/ s/^bucket = .*/bucket = "registry-split-blob"/' \
+                  -e '/^\[metadata_store\.s3\]$/,/^\[/ s/^bucket = .*/bucket = "registry-split-meta"/' \
+                  /tmp/backend.toml > /tmp/backend-split.toml
+            else
+              sed '/^\[metadata_store\.fs\]$/,/^\[/ s#^root_dir = .*#root_dir = "./conformance/metadata-split-data"#' \
+                /tmp/backend.toml > /tmp/backend-split.toml
+            fi
+            cat /tmp/backend-split.toml conformance/e2e/overlay-push.toml > /tmp/e2e-push-split.toml
+
+            # Guard against a future config change silently defeating the rewrite
+            # and turning this into a no-op regression test.
+            blob_space=$(awk '/^\[blob_store\./{f=1} f&&/^(bucket|root_dir) =/{print; exit}' /tmp/backend-split.toml)
+            meta_space=$(awk '/^\[metadata_store\./{f=1} f&&/^(bucket|root_dir) =/{print; exit}' /tmp/backend-split.toml)
+            if [[ -z "$meta_space" || "$blob_space" == "$meta_space" ]]; then
+              echo "split config did not diverge blob [$blob_space] from metadata [$meta_space]"; exit 1
+            fi
+            echo "SPLIT_BACKEND=true" >> "$GITHUB_ENV"
+          else
+            echo "SPLIT_BACKEND=false" >> "$GITHUB_ENV"
+            echo "variant inherits the blob store (single store); skipping split-backend e2e"
+          fi
 
           echo "===== backend fragment ====="
           cat /tmp/backend.toml
@@ -301,6 +337,41 @@ jobs:
 
           docker rm -f angos-push
 
+      - name: E2E - push/pull with split blob+metadata stores
+        if: env.SPLIT_BACKEND == 'true'
+        run: |
+          # Regression for cross-store isolation: the blob and metadata stores
+          # live on different backends (distinct bucket / on-disk root). A
+          # manifest must be stored as a blob in the blob store, or the manifest
+          # GET and pull-back below 404.
+          docker run -d --network host --name angos-push-split \
+            -v "/tmp/e2e-push-split.toml:/config.toml" \
+            ${CONFORMANCE_IMAGE_NAME} server
+
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/v2/ && break
+            [ "$i" -eq 30 ] && { echo "angos did not start"; docker logs angos-push-split; exit 1; }
+            sleep 1
+          done
+
+          docker pull -q alpine:3.20
+          docker tag alpine:3.20 localhost:8000/test/alpine:split
+          docker push localhost:8000/test/alpine:split
+
+          # The manifest must be retrievable from the blob store (404 here was the bug).
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+            http://127.0.0.1:8000/v2/test/alpine/manifests/split)
+          [ "$code" = "200" ] || { echo "manifest GET returned $code (expected 200)"; docker logs angos-push-split; exit 1; }
+
+          # Drop local copies so the pull below re-downloads the blobs from angos.
+          docker rmi -f localhost:8000/test/alpine:split alpine:3.20
+          docker pull -q localhost:8000/test/alpine:split
+          docker run --rm localhost:8000/test/alpine:split /bin/true
+          echo "split-backend push/pull round-trip OK"
+
+          docker rm -f angos-push-split
+
       - name: E2E - pull through the cache from Docker Hub
         run: |
           docker run -d --network host --name angos-cache \
@@ -364,7 +435,7 @@ jobs:
       - name: Dump logs
         if: always()
         run: |
-          for c in conformance-${{ matrix.variant }}-backend angos-push angos-cache angos-repl-a angos-repl-b; do
+          for c in conformance-${{ matrix.variant }}-backend angos-push angos-push-split angos-cache angos-repl-a angos-repl-b; do
             if docker inspect "$c" >/dev/null 2>&1; then
               echo "===== $c ====="
               docker logs "$c" || true

@@ -293,6 +293,40 @@ impl FSRegistryTestCase {
         }
     }
 
+    /// Build the blob and metadata stores over **separate** roots, the
+    /// split-backend topology a deployment can configure (distinct S3
+    /// bucket/`key_prefix`). `blob_path(digest)` then resolves to different
+    /// physical objects per store, so a manifest written through the metadata
+    /// transaction would be invisible to the blob-store read path, the
+    /// cross-store-isolation regression this fixture exercises.
+    pub fn with_split_backends() -> Self {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir for split backends");
+        let blob_path = temp_dir.path().join("blob").to_string_lossy().into_owned();
+        let meta_path = temp_dir.path().join("meta").to_string_lossy().into_owned();
+
+        let config = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+            root_dir: blob_path,
+            sync_to_disk: false,
+        });
+        let blob_store = Arc::new(config.build_backend().expect("fs blob backend"));
+
+        let meta_executor = build_test_fs_executor(&meta_path, false);
+        let meta_storage: Arc<dyn ObjectStore> = Arc::new(
+            StorageFsBackend::builder(&meta_path)
+                .sync_to_disk(false)
+                .build(),
+        );
+        let metadata_store = metadata_store_over_cached(meta_storage, meta_executor, 0);
+        let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
+
+        Self {
+            blob_store,
+            metadata_store,
+            registry,
+            temp_dir,
+        }
+    }
+
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
