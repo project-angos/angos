@@ -72,10 +72,11 @@ pub enum LinksTx<'a> {
         blob: (&'a Digest, Bytes),
         created_at: Option<DateTime<Utc>>,
     },
-    /// `delete_manifest`: removes the links and conditionally `Delete`s the
-    /// `blob-data/<digest>` when the per-namespace shard becomes empty, no other
-    /// namespace references the blob, and the blob still exists (the planner
-    /// resolves the condition). `source_ts` gates each deleted tag via LWW.
+    /// `delete_manifest`: removes the links and conditionally `Delete`s
+    /// `blob-data/<digest>` when the shard is empty, no other namespace
+    /// references the blob, and the blob still exists. `source_ts` gates each
+    /// deleted tag via LWW; the caller's `blob-data:{digest}` lock keeps the
+    /// unreferenced-check from racing a concurrent grant.
     DeleteManifest {
         blob: &'a Digest,
         source_ts: Option<DateTime<Utc>>,
@@ -139,10 +140,13 @@ impl<'a> LinksTx<'a> {
         }
     }
 
-    /// Whether the caller already holds the `blob-data:{digest}` coarse lock, so
-    /// the planner must omit it from the transaction (non-reentrant).
+    /// `delete_manifest` and `revoke_blob_ownership` run under a pre-acquired
+    /// `blob-data:{digest}` lock, so the planner must omit it (non-reentrant).
     fn caller_holds_blob_data_lock(&self) -> bool {
-        matches!(self, LinksTx::RevokeBlobOwnership { .. })
+        matches!(
+            self,
+            LinksTx::DeleteManifest { .. } | LinksTx::RevokeBlobOwnership { .. }
+        )
     }
 
     /// Whether this transaction touches blob-data or the blob-index beyond its

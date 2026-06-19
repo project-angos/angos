@@ -857,6 +857,86 @@ async fn test_delete_manifest() {
     }
 }
 
+/// Regression: a digest `delete_manifest` must hold the `blob-data:{digest}`
+/// lock across its unreferenced-check + reclaim. Otherwise a concurrent grant
+/// from another repository is missed and a shared blob is reclaimed while a tag
+/// still points at it (conformance `MANIFEST_BLOB_UNKNOWN`).
+#[tokio::test]
+async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
+    use std::time::Duration;
+
+    use tokio::time::sleep;
+
+    use crate::registry::blob_ownership::BlobOwnership;
+
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let first = &Namespace::new("test-repo/first").unwrap();
+        let second = &Namespace::new("test-repo/second").unwrap();
+
+        // Push a manifest to `first`; its blob is shared across namespaces.
+        let layer_content = b"shared layer content";
+        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+        let layer_digest = upload_blob(registry, first, layer_content).await;
+        let config_digest = upload_blob(registry, first, config_content).await;
+        let media_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": media_type,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest.to_string(),
+                "size": config_content.len()
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": layer_digest.to_string(),
+                "size": layer_content.len()
+            }]
+        });
+        let manifest_content = serde_json::to_vec(&manifest).unwrap();
+        let response = registry
+            .put_manifest(
+                first,
+                &Reference::Tag("latest".to_string()),
+                Some(&media_type),
+                &manifest_content,
+            )
+            .await
+            .unwrap();
+        let digest = header_digest(&response.headers);
+
+        // Hold the lock, then start the delete: it must block, not reclaim.
+        let session = registry.acquire_blob_data_lock(&digest).await.unwrap();
+        let reference = Reference::Digest(digest.clone());
+        let delete = registry.delete_manifest(None, None, first, &reference);
+        tokio::pin!(delete);
+        tokio::select! {
+            result = &mut delete => {
+                panic!(
+                    "delete_manifest completed while blob-data lock was held (ok={})",
+                    result.is_ok()
+                );
+            }
+            () = sleep(Duration::from_millis(25)) => {}
+        }
+
+        // A second repo grants a reference while the delete is parked.
+        let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+        ownership.grant(second, &digest).await.unwrap();
+        session.release().await;
+        delete.await.unwrap();
+
+        // The blob survives: `second` still references it.
+        assert!(
+            registry.blob_store.read(&digest).await.is_ok(),
+            "shared manifest blob was wrongly reclaimed despite a concurrent grant"
+        );
+
+        test_case.cleanup().await;
+    }
+}
+
 #[tokio::test]
 async fn delete_manifest_then_delete_uploaded_blobs() {
     for test_case in backends() {
