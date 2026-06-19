@@ -1,7 +1,6 @@
 //! `store_manifest` and `delete_manifest`: thin wrappers over the shared
 //! link-transaction planner in [`super::ops`].
 
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 
 use crate::{
@@ -10,45 +9,39 @@ use crate::{
 };
 
 impl MetadataStore {
-    /// Persist a manifest: writes blob-data, all link metadata, and blob-index
-    /// shard updates as a single atomic transaction. Returns the
+    /// Persist a manifest's link metadata and blob-index shard updates as a
+    /// single atomic transaction. The manifest blob-data itself is content and
+    /// is written separately to the blob store by the caller. Returns the
     /// [`LinksCommit`] carrying each created link's commit-validated prior
     /// target.
     pub async fn store_manifest(
         &self,
         namespace: &str,
-        digest: &Digest,
-        manifest_bytes: &[u8],
         operations: &[LinkOperation],
         created_at: Option<DateTime<Utc>>,
     ) -> Result<LinksCommit, Error> {
-        let tx = LinksTx::StoreManifest {
-            blob: (digest, Bytes::from(manifest_bytes.to_vec())),
-            created_at,
-        };
+        let tx = LinksTx::StoreManifest { created_at };
         self.execute_links_tx(namespace, operations, tx).await
     }
 
-    /// Delete a manifest: removes link metadata, cleans up blob-index shards,
-    /// and conditionally deletes the manifest blob-data when no remaining
-    /// namespace holds a reference, all as a single atomic transaction.
+    /// Delete a manifest: removes link metadata and cleans up blob-index shards
+    /// as a single atomic transaction. Returns whether the manifest blob became
+    /// unreferenced, so the caller reclaims its blob-data from the blob store
+    /// under the blob-data lock it must hold across this call (so a concurrent
+    /// reference grant isn't missed; the `ManifestBlobUnknown` race).
     pub async fn delete_manifest(
         &self,
         namespace: &str,
         digest: &Digest,
         operations: &[LinkOperation],
         source_ts: Option<DateTime<Utc>>,
-    ) -> Result<(), Error> {
-        // Hold the blob-data lock across the unreferenced-check + reclaim so a
-        // concurrent reference grant isn't missed (the `ManifestBlobUnknown`
-        // race; see `acquire_blob_data_lock`).
-        let session = self.acquire_blob_data_lock(digest).await?;
+    ) -> Result<bool, Error> {
         let tx = LinksTx::DeleteManifest {
             blob: digest,
             source_ts,
         };
-        let result = self.execute_links_tx(namespace, operations, tx).await;
-        session.release().await;
-        result.map(|_| ())
+        self.execute_links_tx(namespace, operations, tx)
+            .await
+            .map(|c| c.reclaim_blob)
     }
 }

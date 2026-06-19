@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Blob uploads using chunked transfer-encoding without `Content-Length`, as sent by `docker push`, are now accepted and streamed to EOF.
+- Manifests are now stored in the blob store, so a registry with its blob and metadata stores on separate backends no longer returns 404 on manifest read or delete.
 
 ## 1.2.0 - 2026-06-03
 

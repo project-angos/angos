@@ -16,6 +16,7 @@ use crate::{
     registry::{
         Error, Registry,
         metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
+        path_builder::blob_path,
         test_utils::{
             FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct, put_link_raw,
         },
@@ -2017,6 +2018,58 @@ async fn store_manifest_writes_blob_and_links() {
     );
 }
 
+/// Regression for the cross-store isolation bug: with the blob and metadata
+/// stores on separate backends, a manifest must be stored as a blob in the blob
+/// store (where reads look), not inside the metadata transaction. Before the fix
+/// the push "succeeded" but the manifest was unreadable (GET 404), and delete
+/// could not reclaim it.
+#[tokio::test]
+async fn manifest_blob_lives_in_blob_store_with_split_backends() {
+    let test_case = FSRegistryTestCase::with_split_backends();
+    let registry = test_case.registry();
+    let namespace = Namespace::new("split-repo").unwrap();
+
+    let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
+    let digest = Digest::from_bytes(&manifest_bytes);
+
+    registry
+        .put_manifest(
+            &namespace,
+            &Reference::Tag("v1".to_string()),
+            Some(&media_type),
+            &manifest_bytes,
+        )
+        .await
+        .expect("split-backend manifest push must succeed");
+
+    // Reads through the blob store (the path GET uses); 404 before the fix.
+    assert_eq!(
+        registry.blob_store.read(&digest).await.unwrap(),
+        manifest_bytes,
+        "manifest body must be readable from the blob store",
+    );
+    // The bytes must not be written under the metadata store's blob path.
+    assert!(
+        test_case
+            .metadata_store()
+            .store()
+            .get(&blob_path(&digest))
+            .await
+            .is_err(),
+        "manifest body must not land in the metadata store",
+    );
+
+    // Symmetric delete: reclaiming the manifest removes it from the blob store.
+    registry
+        .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
+        .await
+        .expect("delete by digest must succeed");
+    assert!(
+        registry.blob_store.read(&digest).await.is_err(),
+        "manifest blob must be reclaimed from the blob store on delete",
+    );
+}
+
 #[tokio::test]
 async fn store_manifest_is_idempotent() {
     // Pushing the same manifest bytes twice must not fail: PutIfAbsent for
@@ -2455,8 +2508,6 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
     store
         .store_manifest(
             namespace,
-            &old_digest,
-            b"old",
             &[LinkOperation::create(link.clone(), old_digest.clone())],
             None,
         )
@@ -2510,8 +2561,6 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     store
         .store_manifest(
             namespace,
-            &newer_digest,
-            &newer_body,
             &[LinkOperation::create(link.clone(), newer_digest.clone())],
             Some(newer_ts),
         )
@@ -2523,8 +2572,6 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     let result = store
         .store_manifest(
             namespace,
-            &older_digest,
-            &older_body,
             &[LinkOperation::create(link.clone(), older_digest.clone())],
             Some(newer_ts - chrono::Duration::hours(1)),
         )
@@ -2563,8 +2610,6 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
     store
         .store_manifest(
             namespace,
-            &digest,
-            &body,
             &[LinkOperation::create(link.clone(), digest.clone())],
             Some(newer_ts),
         )

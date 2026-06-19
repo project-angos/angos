@@ -26,7 +26,6 @@ use crate::{
     registry::{
         metadata_store::{
             BlobIndexOperation, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore,
-            blob_data_lock_key,
             blob_index::shard::{
                 any_other_namespace_references_blob, append_shard_for_digest, ops_for_digest,
                 shard_will_be_empty,
@@ -65,26 +64,25 @@ pub enum LinksTx<'a> {
     /// last-writer-wins gate (`delete_links`); `None` is a plain local delete.
     /// Unlike [`Self::DeleteManifest`] it does no blob-data reclamation.
     DeleteLinks { source_ts: Option<DateTime<Utc>> },
-    /// `store_manifest`: an unconditional `Put` of the (content-addressed)
-    /// manifest blob-data plus the link writes. `created_at` stamps new link
-    /// metadata; a replicated write passes the author's `source_ts` for LWW.
-    StoreManifest {
-        blob: (&'a Digest, Bytes),
-        created_at: Option<DateTime<Utc>>,
-    },
-    /// `delete_manifest`: removes the links and conditionally `Delete`s
-    /// `blob-data/<digest>` when the shard is empty, no other namespace
-    /// references the blob, and the blob still exists. `source_ts` gates each
-    /// deleted tag via LWW; the caller's `blob-data:{digest}` lock keeps the
-    /// unreferenced-check from racing a concurrent grant.
+    /// `store_manifest`: the link writes for a manifest push. The manifest
+    /// blob-data is written separately to the blob store by the registry before
+    /// this runs. `created_at` stamps new link metadata; a replicated write
+    /// passes the author's `source_ts` for LWW.
+    StoreManifest { created_at: Option<DateTime<Utc>> },
+    /// `delete_manifest`: removes the links and reports via `reclaim_blob`
+    /// whether the blob became unreferenced (the shard is empty and no other
+    /// namespace references it), leaving the blob-data reclaim to the caller.
+    /// `source_ts` gates each deleted tag via LWW; the caller's
+    /// `blob-data:{digest}` lock keeps the unreferenced-check from racing a
+    /// concurrent grant.
     DeleteManifest {
         blob: &'a Digest,
         source_ts: Option<DateTime<Utc>>,
     },
     /// `revoke_blob_ownership`: removes `namespace`'s shard ownership entry and
-    /// conditionally reclaims the blob-data in the same transaction. The caller
-    /// already holds the `blob-data:{digest}` coarse lock, so the planner must
-    /// not re-declare it (the engine lock is non-reentrant).
+    /// reports via `reclaim_blob` whether the blob became unreferenced. The
+    /// caller holds the `blob-data:{digest}` lock across the call and reclaims
+    /// the blob-data from the blob store.
     RevokeBlobOwnership {
         blob: &'a Digest,
         ops: Vec<BlobIndexOperation>,
@@ -92,18 +90,7 @@ pub enum LinksTx<'a> {
 }
 
 impl<'a> LinksTx<'a> {
-    /// Manifest blob-data to `Put` unconditionally.
-    fn blob_data_put(&self) -> Option<(&'a Digest, &Bytes)> {
-        match self {
-            LinksTx::StoreManifest {
-                blob: (digest, body),
-                ..
-            } => Some((*digest, body)),
-            _ => None,
-        }
-    }
-
-    /// Blob-data digest to `Delete` when it becomes unreferenced.
+    /// Blob-data digest to reclaim when it becomes unreferenced.
     fn blob_data_delete_if_unreferenced(&self) -> Option<&'a Digest> {
         match self {
             LinksTx::DeleteManifest { blob, .. } | LinksTx::RevokeBlobOwnership { blob, .. } => {
@@ -140,15 +127,6 @@ impl<'a> LinksTx<'a> {
         }
     }
 
-    /// `delete_manifest` and `revoke_blob_ownership` run under a pre-acquired
-    /// `blob-data:{digest}` lock, so the planner must omit it (non-reentrant).
-    fn caller_holds_blob_data_lock(&self) -> bool {
-        matches!(
-            self,
-            LinksTx::DeleteManifest { .. } | LinksTx::RevokeBlobOwnership { .. }
-        )
-    }
-
     /// Whether this transaction touches blob-data or the blob-index beyond its
     /// link operations, so the empty-no-op short-circuit must not fire.
     fn has_blob_side_effects(&self) -> bool {
@@ -172,6 +150,10 @@ struct LinksTxCaptured {
     /// write; the attempt committed an empty transaction and the caller maps
     /// this to [`Error::ReplicationSuperseded`].
     superseded: Option<String>,
+    /// Whether this transaction left the manifest blob unreferenced, so the
+    /// caller should reclaim its blob-data from the blob store under the
+    /// blob-data lock it already holds.
+    reclaim_blob: bool,
 }
 
 /// Prior link state captured by a committed link transaction. The retry loop
@@ -181,6 +163,9 @@ struct LinksTxCaptured {
 pub struct LinksCommit {
     /// Prior target per `Create` op's link; `None` = the link did not exist.
     pub prior_targets: Vec<(LinkKind, Option<Digest>)>,
+    /// Whether the committed transaction left the manifest blob unreferenced, so
+    /// the caller should reclaim its blob-data from the blob store.
+    pub reclaim_blob: bool,
 }
 
 impl LinksCommit {
@@ -363,12 +348,13 @@ impl MetadataStore {
                     deleted_links,
                 } = build_link_mutations(namespace, &prelock, &mut link_cache, &tx, lww.reads)?;
 
-                // Phase 6: plan the conditional blob-data delete (only when the
-                // namespace shard becomes empty AND no other namespace
-                // references the blob AND the blob currently exists).
+                // Phase 6: decide whether this transaction leaves the manifest
+                // blob unreferenced (its shard becomes empty AND no other
+                // namespace references it). The blob-data itself lives in the
+                // blob store; the caller reclaims it under the blob-data lock.
                 let store = self.store_arc();
-                let include_blob_delete =
-                    plan_blob_data_delete(store.as_ref(), namespace, &tx, &pending_blob_ops)
+                let reclaim_blob =
+                    blob_will_be_unreferenced(store.as_ref(), namespace, &tx, &pending_blob_ops)
                         .await?;
 
                 // Phase 7: append blob-index shard mutations and finalize.
@@ -379,18 +365,6 @@ impl MetadataStore {
                             .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
                 }
 
-                if let Some(digest) = &include_blob_delete {
-                    builder = builder.mutation(Mutation::Delete {
-                        key: path_builder::blob_path(digest),
-                        expected: None,
-                    });
-                    // Skip the engine coarse lock when the caller already holds
-                    // it (`delete_blob`); the lock is not reentrant.
-                    if !tx.caller_holds_blob_data_lock() {
-                        builder = builder.coarse_lock(blob_data_lock_key(digest));
-                    }
-                }
-
                 Ok((
                     builder.build(),
                     LinksTxCaptured {
@@ -398,6 +372,7 @@ impl MetadataStore {
                         deleted_links,
                         prior_targets: capture_prior_targets(&prelock),
                         superseded: None,
+                        reclaim_blob,
                     },
                 ))
             },
@@ -430,6 +405,7 @@ impl MetadataStore {
 
         Ok(LinksCommit {
             prior_targets: result.prior_targets,
+            reclaim_blob: result.reclaim_blob,
         })
     }
 
@@ -651,8 +627,8 @@ fn detect_create_conflicts(
 
 /// Phase 5: turn the validated creates and deletes into transaction mutations,
 /// accumulating the blob-index ops and the written / deleted link sets. Seeds the
-/// builder with the LWW reads, direct blob-index ops and blob-data `Put`, then
-/// threads a [`LinkMutations`] accumulator through the create/delete processors.
+/// builder with the LWW reads and direct blob-index ops, then threads a
+/// [`LinkMutations`] accumulator through the create/delete processors.
 fn build_link_mutations(
     namespace: &str,
     prelock: &[PrelockOp<'_>],
@@ -667,28 +643,13 @@ fn build_link_mutations(
     let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
 
     // Seed direct blob-index ops (e.g. `revoke_blob_ownership`'s ownership
-    // revoke) so the conditional blob-data delete and the shard mutations below
-    // treat them like link-derived ops.
+    // revoke) so the unreferenced check and the shard mutations below treat them
+    // like link-derived ops.
     if let Some((digest, ops)) = tx.blob_index_ops() {
         pending_blob_ops
             .entry(digest.clone())
             .or_default()
             .extend(ops.iter().cloned());
-    }
-
-    // Blob-data Put first when present (manifest bytes are content-addressed, so
-    // the order doesn't matter; colocating it with the rest of the manifest
-    // mutations keeps the txn self-contained).
-    if let Some((blob_digest, body)) = tx.blob_data_put() {
-        builder = builder
-            .mutation(Mutation::Put {
-                key: path_builder::blob_path(blob_digest),
-                body: body.clone(),
-                expected: None,
-            })
-            // Serialise against a concurrent manifest-delete on the same digest
-            // under the CAS executor (which takes no working-set lock).
-            .coarse_lock(blob_data_lock_key(blob_digest));
     }
 
     let acc = LinkMutations {
@@ -822,20 +783,22 @@ fn build_delete_mutations(
     Ok(acc)
 }
 
-/// Phase 6: decide whether to include the conditional `Delete blob-data/<digest>`
-/// mutation, returning the digest to delete when the namespace shard becomes
-/// empty, no other namespace references the blob, and the blob currently exists.
-async fn plan_blob_data_delete(
+/// Phase 6: decide whether this transaction leaves the manifest blob
+/// unreferenced (its namespace shard becomes empty and no other namespace
+/// references it). The caller reclaims the blob-data from the blob store; the
+/// blob's existence is not probed here (the reclaim is an idempotent
+/// blob-store delete).
+async fn blob_will_be_unreferenced(
     store: &Store,
     namespace: &str,
     tx: &LinksTx<'_>,
     pending_blob_ops: &HashMap<Digest, Vec<BlobIndexOperation>>,
-) -> Result<Option<Digest>, TxError> {
+) -> Result<bool, TxError> {
     let Some(digest) = tx.blob_data_delete_if_unreferenced() else {
-        return Ok(None);
+        return Ok(false);
     };
     if !pending_blob_ops.contains_key(digest) {
-        return Ok(None);
+        return Ok(false);
     }
 
     let shard_path_ns = path_builder::blob_index_shard_path(digest, namespace);
@@ -849,22 +812,14 @@ async fn plan_blob_data_delete(
     )
     .await?;
     if !our_shard_will_be_empty {
-        return Ok(None);
+        return Ok(false);
     }
 
     let refs_prefix = path_builder::blob_index_refs_dir(digest);
     let other_refs_exist = any_other_namespace_references_blob(store, namespace, &refs_prefix)
         .await
         .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
-    if other_refs_exist {
-        return Ok(None);
-    }
-
-    match store.head(&path_builder::blob_path(digest)).await {
-        Ok(_) => Ok(Some(digest.clone())),
-        Err(StorageError::NotFound) => Ok(None),
-        Err(e) => Err(TxError::Storage(e)),
-    }
+    Ok(!other_refs_exist)
 }
 
 /// Prior target per `Create` op, from this attempt's conflict-validated reads.
