@@ -121,11 +121,13 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_put_upload<S>(
     context: &ServerContext,
     namespace: &Namespace,
     uuid: Uuid,
     digest: &Digest,
+    start_offset: Option<u64>,
     content_length: Option<u64>,
     body_reader: S,
     identity: &ClientIdentity,
@@ -136,7 +138,15 @@ where
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .complete_upload(actor, namespace, uuid, digest, content_length, body_reader)
+        .complete_upload(
+            actor,
+            namespace,
+            uuid,
+            digest,
+            start_offset,
+            content_length,
+            body_reader,
+        )
         .await?;
 
     build_event_response(StatusCode::CREATED, response.headers, response.events)
@@ -189,6 +199,7 @@ pub async fn dispatch_put_upload(
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
+    let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
     let content_length = headers.content_length()?;
     let body_stream = incoming_into_async_read(incoming);
 
@@ -199,6 +210,7 @@ pub async fn dispatch_put_upload(
             namespace,
             uuid,
             &digest,
+            start_offset,
             content_length,
             body_stream,
             identity,

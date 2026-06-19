@@ -54,10 +54,18 @@ impl Manifest {
     /// separate concern; callers that need filtering call
     /// `artifact_type_matches` first.
     pub fn take_descriptor(&mut self, digest: Digest, size: u64) -> Option<Descriptor> {
+        let media_type = self.media_type.clone()?;
+        // Per the OCI Referrers API a referrer's `artifactType` is the manifest's
+        // own field, falling back to the config `mediaType` for image manifests
+        // without one; an empty value would drop the entry from filtered lists.
+        let artifact_type = self
+            .artifact_type
+            .clone()
+            .or_else(|| self.config.as_ref().map(|c| c.media_type.clone()));
         Some(Descriptor {
-            media_type: self.media_type.clone()?,
+            media_type,
             annotations: std::mem::take(&mut self.annotations),
-            artifact_type: self.artifact_type.clone(),
+            artifact_type,
             platform: None,
             digest,
             size,
@@ -152,6 +160,18 @@ mod tests {
         assert_eq!(d.digest, digest);
         assert_eq!(d.size, 999);
         assert_eq!(d.artifact_type.as_deref(), Some("oci.image.index.v1"));
+    }
+
+    // take_descriptor: an image manifest without its own artifactType advertises
+    // the config mediaType (OCI Referrers API fallback), not an empty value.
+    #[test]
+    fn test_take_descriptor_falls_back_to_config_media_type() {
+        let mut manifest = demo_manifest();
+        manifest.artifact_type = None;
+        let d = manifest
+            .take_descriptor(valid_digest(), 1)
+            .expect("expected Some(Descriptor)");
+        assert_eq!(d.artifact_type.as_deref(), Some(MEDIA_TYPE_CONFIG));
     }
 
     // take_descriptor: media_type absent → None (only reason to return None now)

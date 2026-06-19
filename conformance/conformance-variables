@@ -13,3 +13,6 @@ export OCI_AUTOMATIC_CROSSMOUNT=1
 export OCI_HIDE_SKIPPED_WORKFLOWS=0
 export OCI_DEBUG=0
 export OCI_DELETE_MANIFEST_BEFORE_BLOBS=0 # defaults to OCI_DELETE_MANIFEST_BEFORE_BLOBS=1 if not set
+
+# angos is sha256-only by design; sha512 is optional per the OCI image-spec.
+export OCI_DATA_SHA512=0
