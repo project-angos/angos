@@ -119,6 +119,7 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
             namespace,
             session_id,
             &digest,
+            None,
             Some(body.len() as u64),
             Cursor::new(body),
         )

@@ -660,8 +660,13 @@ impl Registry {
             });
         }
 
+        let content_length = manifest.content.len() as u64;
         Ok(GetManifestResponse::Body {
-            headers: get_manifest_body_headers(manifest.media_type.as_deref(), &manifest.digest),
+            headers: get_manifest_body_headers(
+                manifest.media_type.as_deref(),
+                &manifest.digest,
+                content_length,
+            ),
             content: manifest.content,
         })
     }

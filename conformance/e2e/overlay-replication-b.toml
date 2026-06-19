@@ -1,0 +1,7 @@
+# E2E overlay: replication target (instance B). Receives mirrored pushes from
+# instance A and serves them locally. Instance B runs on port 8001 with an
+# isolated backend (see the workflow's backend-B transform).
+[global.access_policy]
+default_allow = true
+
+[repository."repl"]

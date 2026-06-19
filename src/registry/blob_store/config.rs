@@ -174,8 +174,8 @@ mod tests {
     fn s3_backend_builds_with_presign() {
         let config = BlobStoreConfig::S3(S3BackendConfig {
             connection: S3ConnectionConfig {
-                access_key_id: Secret::new("minioadmin".to_string()),
-                secret_key: Secret::new("minioadmin".to_string()),
+                access_key_id: Secret::new("root".to_string()),
+                secret_key: Secret::new("roottoor".to_string()),
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),

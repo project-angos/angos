@@ -430,12 +430,14 @@ impl Registry {
     }
 
     #[instrument(skip(stream, actor))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_upload<S>(
         &self,
         actor: Option<EventActor>,
         namespace: &Namespace,
         session_id: Uuid,
         digest: &Digest,
+        start_offset: Option<u64>,
         content_length: Option<u64>,
         stream: S,
     ) -> Result<CompleteUploadResponse, Error>
@@ -454,6 +456,15 @@ impl Registry {
             Err(e) => return Err(e.into()),
         };
         let has_prior_writes = committed > 0;
+
+        // A final-chunk PUT carrying a Content-Range must resume from the
+        // committed offset; a gap or rewind is an out-of-order chunk (416), not
+        // a digest mismatch.
+        if let Some(offset) = start_offset
+            && offset != committed
+        {
+            return Err(Error::RangeNotSatisfiable);
+        }
 
         self.reject_oversized_known_length(namespace, &session_key, committed, content_length)
             .await?;
@@ -1275,6 +1286,7 @@ mod tests {
                     session_id,
                     &expected_digest,
                     None,
+                    None,
                     Cursor::new(Vec::new()),
                 )
                 .await
@@ -1323,6 +1335,7 @@ mod tests {
                     namespace,
                     session_id,
                     &expected_digest,
+                    None,
                     Some(0),
                     empty_stream,
                 )
@@ -1386,6 +1399,7 @@ mod tests {
                 namespace,
                 session_id,
                 &expected_digest,
+                None,
                 Some(0),
                 Cursor::new(Vec::new()),
             )
@@ -1445,6 +1459,7 @@ mod tests {
                 second_namespace,
                 session_id,
                 &digest,
+                None,
                 Some(0),
                 Cursor::new(Vec::new()),
             )
@@ -1502,6 +1517,7 @@ mod tests {
                 second_namespace,
                 session_id,
                 &digest,
+                None,
                 Some(content.len() as u64),
                 Cursor::new(content),
             )
@@ -1663,6 +1679,7 @@ mod tests {
                     namespace,
                     session_id,
                     &wrong_digest,
+                    None,
                     Some(0),
                     empty_stream,
                 )
@@ -1816,6 +1833,7 @@ mod tests {
                 namespace,
                 session_id,
                 &Digest::from_bytes(content),
+                None,
                 Some(0),
                 empty_stream,
             )
@@ -1960,6 +1978,7 @@ mod tests {
                 namespace,
                 session_id,
                 &digest,
+                None,
                 None,
                 Cursor::new(content.to_vec()),
             )

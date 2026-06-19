@@ -1,0 +1,8 @@
+# E2E overlay: pull-through cache for Docker Hub.
+# Pulling localhost:8000/docker-io/<repo>:<tag> fetches <repo>:<tag> from
+# registry-1.docker.io on a cache miss and serves it locally thereafter.
+[global.access_policy]
+default_allow = true
+
+[[repository."docker-io".upstream]]
+url = "https://registry-1.docker.io"

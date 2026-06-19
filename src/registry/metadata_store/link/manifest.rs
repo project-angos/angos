@@ -39,12 +39,16 @@ impl MetadataStore {
         operations: &[LinkOperation],
         source_ts: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
+        // Hold the blob-data lock across the unreferenced-check + reclaim so a
+        // concurrent reference grant isn't missed (the `ManifestBlobUnknown`
+        // race; see `acquire_blob_data_lock`).
+        let session = self.acquire_blob_data_lock(digest).await?;
         let tx = LinksTx::DeleteManifest {
             blob: digest,
             source_ts,
         };
-        self.execute_links_tx(namespace, operations, tx)
-            .await
-            .map(|_| ())
+        let result = self.execute_links_tx(namespace, operations, tx).await;
+        session.release().await;
+        result.map(|_| ())
     }
 }

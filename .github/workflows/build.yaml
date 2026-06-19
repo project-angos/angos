@@ -53,28 +53,26 @@ jobs:
               
         CARGO_INCREMENTAL=0 RUSTFLAGS='-Cinstrument-coverage' LLVM_PROFILE_FILE='cargo-test-%p-%m.profraw' cargo build
         
-          mkdir -p ./test/minio-data/registry
-          docker run --rm -d \
-            -v ./test/minio-data:/data \
-            -e MINIO_ROOT_USER=root \
-            -e MINIO_ROOT_PASSWORD=roottoor \
-            -e MINIO_VOLUMES=/data \
-            --network host \
-            --name minio-server \
-            quay.io/minio/minio \
-            minio server /data
+        docker run --rm -d \
+          -e RUSTFS_ACCESS_KEY=root \
+          -e RUSTFS_SECRET_KEY=roottoor \
+          --network host \
+          --name rustfs \
+          rustfs/rustfs:1.0.0-beta.8
 
-        # Ensure minio service is running
-        while ! nc -z localhost 9000; do
-          echo "Waiting for minio to start..."
+        # Ensure the S3 service is running, then create the "registry" bucket.
+        while ! curl -sf -o /dev/null http://127.0.0.1:9000/health; do
+          echo "Waiting for rustfs to start..."
           sleep 1;
         done
+        AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=roottoor AWS_DEFAULT_REGION=us-east-1 \
+          aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket registry
 
         CARGO_INCREMENTAL=0 RUSTFLAGS='-Cinstrument-coverage' LLVM_PROFILE_FILE='cargo-test-%p-%m.profraw' cargo test --workspace
         grcov . --binary-path ./target/debug/deps/ -s . -t html --branch --ignore-not-existing --ignore "target/**" -o target/coverage/html
         grcov . --binary-path ./target/debug/deps/ -s . -t markdown --branch --ignore-not-existing --ignore "../*" --ignore "/*" --ignore "target/**"
-        
-        docker stop minio-server
+
+        docker stop rustfs
     - name: Upload coverage report
       uses: actions/upload-artifact@v7
       with:
@@ -88,12 +86,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+
       - name: Build conformance tool
         run: |
-          git clone https://github.com/opencontainers/distribution-spec.git distribution-spec
+          git clone --depth 1 https://github.com/opencontainers/distribution-spec.git distribution-spec
           cd distribution-spec/conformance && \
-            go test -c && \
-            mv conformance.test ../.. && \
+            go build -o oci-conformance . && \
+            mv oci-conformance ../.. && \
             cd ../..
 
       - name: Download zot benchmark
@@ -111,14 +114,14 @@ jobs:
         with:
           name: conformance-tools
           path: |
-            conformance.test
+            oci-conformance
             zb
             conformance-image.tar
           if-no-files-found: error
           retention-days: 1
 
   conformance:
-    name: Conformance (${{ matrix.variant }})
+    name: Conformance & E2E (${{ matrix.variant }})
     runs-on: ubuntu-latest
     needs: build-conformance
     strategy:
@@ -128,42 +131,42 @@ jobs:
           - variant: fs-memory-variable-parts
             description: filesystem backend with memory lock and variable parts
             config: config-fs-memory-variable-parts.toml
-            minio: false
+            s3: false
             redis: false
           - variant: s3-memory-variable-parts
             description: s3 backend with memory lock and variable parts
             config: config-s3-memory-variable-parts.toml
-            minio: true
+            s3: true
             redis: false
           - variant: s3-cas-variable-parts
             description: s3 CAS backend with variable parts
             config: config-s3-cas-variable-parts.toml
-            minio: true
+            s3: true
             redis: false
           - variant: s3-redis-variable-parts
             description: s3 backend with redis lock and variable parts
             config: config-s3-redis-variable-parts.toml
-            minio: true
+            s3: true
             redis: true
           - variant: s3-memory-uniform-parts
             description: s3 backend with memory lock and uniform parts
             config: config-s3-memory-uniform-parts.toml
-            minio: true
+            s3: true
             redis: false
           - variant: s3-cas-uniform-parts
             description: s3 CAS backend with uniform parts
             config: config-s3-cas-uniform-parts.toml
-            minio: true
+            s3: true
             redis: false
           - variant: s3-redis-uniform-parts
             description: s3 backend with redis lock, uniform parts
             config: config-s3-redis-uniform-parts.toml
-            minio: true
+            s3: true
             redis: true
           - variant: fs-redis-variable-parts
             description: filesystem backend with redis lock and variable parts
             config: config-fs-redis-variable-parts.toml
-            minio: false
+            s3: false
             redis: true
     steps:
       - uses: actions/checkout@v6
@@ -176,9 +179,9 @@ jobs:
       - name: Load container image
         run: |
           docker load -i conformance-image.tar
-          chmod +x conformance.test zb
+          chmod +x oci-conformance zb
 
-      - name: Run conformance test & zot benchmark (${{ matrix.description }})
+      - name: Start backend services
         run: |
           if [[ "${{ matrix.redis }}" == "true" ]]; then
             docker run --rm -d \
@@ -192,24 +195,51 @@ jobs:
             done
           fi
 
-          if [[ "${{ matrix.minio }}" == "true" ]]; then
-            mkdir -p ./conformance/minio-data/registry
+          if [[ "${{ matrix.s3 }}" == "true" ]]; then
             docker run --rm -d \
-              -v ./conformance/minio-data:/data \
-              -e MINIO_ROOT_USER=root \
-              -e MINIO_ROOT_PASSWORD=roottoor \
-              -e MINIO_VOLUMES=/data \
+              -e RUSTFS_ACCESS_KEY=root \
+              -e RUSTFS_SECRET_KEY=roottoor \
               --network host \
-              --name minio-server \
-              quay.io/minio/minio \
-              minio server /data
+              --name rustfs \
+              rustfs/rustfs:1.0.0-beta.8
 
-            while ! nc -z localhost 9000; do
-              echo "Waiting for minio to start..."
+            while ! curl -sf -o /dev/null http://127.0.0.1:9000/health; do
+              echo "Waiting for rustfs to start..."
               sleep 1
+            done
+
+            for bucket in registry registry-b; do
+              AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=roottoor AWS_DEFAULT_REGION=us-east-1 \
+                aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket "$bucket"
             done
           fi
 
+      - name: Generate e2e configs (${{ matrix.description }})
+        run: |
+          # Derive a backend-only fragment from the matrix config by dropping its
+          # trailing access-policy + conformance-repository block, then append
+          # each scenario's repository overlay. This runs the e2e workflows
+          # against the exact backend under test.
+          sed '/^\[global\.access_policy\]/,$d' "conformance/${{ matrix.config }}" > /tmp/backend.toml
+
+          cat /tmp/backend.toml conformance/e2e/overlay-push.toml  > /tmp/e2e-push.toml
+          cat /tmp/backend.toml conformance/e2e/overlay-cache.toml > /tmp/e2e-cache.toml
+          cat /tmp/backend.toml conformance/e2e/overlay-replication-a.toml > /tmp/e2e-replication-a.toml
+
+          # Instance B gets an isolated backend: a distinct port plus, when the
+          # backend is shared across instances (S3 bucket, redis lock keyspace),
+          # a distinct bucket and lock prefix. FS data is per-container already.
+          sed -e 's/^port = 8000$/port = 8001/' \
+              -e 's/bucket = "registry"/bucket = "registry-b"/' \
+              -e 's/\(key_prefix = "[^"]*\)"/\1b"/' \
+              /tmp/backend.toml > /tmp/backend-b.toml
+          cat /tmp/backend-b.toml conformance/e2e/overlay-replication-b.toml > /tmp/e2e-replication-b.toml
+
+          echo "===== backend fragment ====="
+          cat /tmp/backend.toml
+
+      - name: Start angos backend (${{ matrix.description }})
+        run: |
           docker run --rm -d \
             -v ./conformance/${{ matrix.config }}:/config.toml \
             --network host \
@@ -222,22 +252,132 @@ jobs:
             exit 1
           fi
 
+      - name: Run conformance test (${{ matrix.description }})
+        env:
+          OCI_RESULTS_DIR: results
+        run: |
           source ./conformance/conformance-variables
-          ./conformance.test
+          ./oci-conformance
 
+      - name: Upload conformance results (${{ matrix.description }})
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-results-${{ matrix.variant }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Run zot benchmark (${{ matrix.description }})
+        run: |
           zb_workdir="$(mktemp -d "${RUNNER_TEMP}/zb-conformance-${{ matrix.variant }}.XXXXXX")"
           time ./zb --working-dir "$zb_workdir" -c 5 -r conformance -n 100 http://localhost:8000
 
-      - name: Dump registry logs
+          # Release port 8000 so the e2e scenarios can reuse the same backend.
+          docker rm -f conformance-${{ matrix.variant }}-backend
+
+      - name: E2E - push and pull a Hub image
+        run: |
+          docker run -d --network host --name angos-push \
+            -v "/tmp/e2e-push.toml:/config.toml" \
+            ${CONFORMANCE_IMAGE_NAME} server
+
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/v2/ && break
+            [ "$i" -eq 30 ] && { echo "angos did not start"; docker logs angos-push; exit 1; }
+            sleep 1
+          done
+
+          # Pull a real image from Docker Hub, retag it to the local instance and push.
+          docker pull -q alpine:3.20
+          docker tag alpine:3.20 localhost:8000/test/alpine:ci
+          docker push localhost:8000/test/alpine:ci
+
+          # Drop every local copy so the pull below re-downloads the blobs from angos.
+          docker rmi -f localhost:8000/test/alpine:ci alpine:3.20
+          docker pull -q localhost:8000/test/alpine:ci
+          docker run --rm localhost:8000/test/alpine:ci /bin/true
+          echo "push/pull round-trip OK"
+
+          docker rm -f angos-push
+
+      - name: E2E - pull through the cache from Docker Hub
+        run: |
+          docker run -d --network host --name angos-cache \
+            -v "/tmp/e2e-cache.toml:/config.toml" \
+            ${CONFORMANCE_IMAGE_NAME} server
+
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/v2/ && break
+            [ "$i" -eq 30 ] && { echo "angos did not start"; docker logs angos-cache; exit 1; }
+            sleep 1
+          done
+
+          # First pull fetches the image from Docker Hub through angos and caches it.
+          docker pull -q localhost:8000/docker-io/library/alpine:3.20
+          # angos now serves the cached repository's tag list locally.
+          curl -sf http://127.0.0.1:8000/v2/docker-io/library/alpine/tags/list | grep -q '"3.20"'
+          # A second pull is served from the local cache.
+          docker rmi -f localhost:8000/docker-io/library/alpine:3.20
+          docker pull -q localhost:8000/docker-io/library/alpine:3.20
+          docker run --rm localhost:8000/docker-io/library/alpine:3.20 /bin/true
+          echo "pull-through cache OK"
+
+          docker rm -f angos-cache
+
+      - name: E2E - replicate a push from instance A to instance B
+        run: |
+          docker run -d --network host --name angos-repl-b \
+            -v "/tmp/e2e-replication-b.toml:/config.toml" \
+            ${CONFORMANCE_IMAGE_NAME} server
+          docker run -d --network host --name angos-repl-a \
+            -v "/tmp/e2e-replication-a.toml:/config.toml" \
+            ${CONFORMANCE_IMAGE_NAME} server
+
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/v2/ \
+              && curl -sf -o /dev/null http://127.0.0.1:8001/v2/ && break
+            [ "$i" -eq 30 ] && { echo "instances did not start"; docker logs angos-repl-a; docker logs angos-repl-b; exit 1; }
+            sleep 1
+          done
+
+          # Push to A; the event path replicates the tag to B (in-process drain).
+          docker pull -q alpine:3.20
+          docker tag alpine:3.20 localhost:8000/repl/alpine:v1
+          docker push localhost:8000/repl/alpine:v1
+
+          # Wait for the tag to converge on B.
+          for i in $(seq 1 60); do
+            curl -s http://127.0.0.1:8001/v2/repl/alpine/tags/list | grep -q '"v1"' && break
+            [ "$i" -eq 60 ] && { echo "replication did not converge"; docker logs angos-repl-a; exit 1; }
+            sleep 1
+          done
+
+          # Drop local copies and pull the replicated image from B.
+          docker rmi -f localhost:8001/repl/alpine:v1 localhost:8000/repl/alpine:v1 alpine:3.20
+          docker pull -q localhost:8001/repl/alpine:v1
+          docker run --rm localhost:8001/repl/alpine:v1 /bin/true
+          echo "replication A -> B OK"
+
+          docker rm -f angos-repl-a angos-repl-b
+
+      - name: Dump logs
         if: always()
         run: |
-          docker logs conformance-${{ matrix.variant }}-backend || true
-          docker stop conformance-${{ matrix.variant }}-backend || true
+          for c in conformance-${{ matrix.variant }}-backend angos-push angos-cache angos-repl-a angos-repl-b; do
+            if docker inspect "$c" >/dev/null 2>&1; then
+              echo "===== $c ====="
+              docker logs "$c" || true
+              docker rm -f "$c" >/dev/null 2>&1 || true
+            fi
+          done
 
-          if [[ "${{ matrix.minio }}" == "true" ]]; then
-            docker logs minio-server || true
-            docker stop minio-server || true
-          fi
+          for svc in rustfs; do
+            if docker inspect "$svc" >/dev/null 2>&1; then
+              docker logs "$svc" || true
+              docker stop "$svc" || true
+            fi
+          done
 
           if [[ "${{ matrix.redis }}" == "true" ]]; then
             docker logs redis-server || true

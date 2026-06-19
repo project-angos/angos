@@ -381,7 +381,7 @@ mod tests {
                 secret_key: Secret::new("roottoor".to_string()),
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: "registry".to_string(),
-                region: "us-east-1".to_string(),
+                region: "region".to_string(),
                 key_prefix: format!("probe-test-{}", uuid::Uuid::new_v4()),
             },
             lock_strategy,
@@ -392,18 +392,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_probe_s3_lock_strategy_detects_minio_capabilities() {
+    async fn test_probe_s3_lock_strategy_detects_s3_capabilities() {
         let config = s3_config_with_lock_strategy(LockStrategy::S3(S3LockConfig::default()));
         let result = config.probe().await;
         assert!(
             result.is_ok(),
-            "Probe should succeed against MinIO with S3 lock strategy: {result:?}"
+            "Probe should succeed against the S3 backend with S3 lock strategy: {result:?}"
         );
         let caps = result
             .unwrap()
             .expect("S3 lock strategy should return capabilities");
-        assert!(caps.put_if_none_match, "MinIO should support If-None-Match");
-        assert!(caps.put_if_match, "MinIO should support If-Match");
+        assert!(
+            caps.put_if_none_match,
+            "the S3 backend should support If-None-Match"
+        );
+        assert!(caps.put_if_match, "the S3 backend should support If-Match");
     }
 
     #[tokio::test]
@@ -417,8 +420,11 @@ mod tests {
         let caps = result
             .unwrap()
             .expect("S3 metadata store should return detected capabilities");
-        assert!(caps.put_if_none_match, "MinIO should support If-None-Match");
-        assert!(caps.put_if_match, "MinIO should support If-Match");
+        assert!(
+            caps.put_if_none_match,
+            "the S3 backend should support If-None-Match"
+        );
+        assert!(caps.put_if_match, "the S3 backend should support If-Match");
     }
 
     #[tokio::test]

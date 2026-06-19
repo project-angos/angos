@@ -54,8 +54,14 @@ pub fn head_manifest_headers(meta: &ManifestMeta) -> HeaderMap {
     }
 }
 
-pub fn get_manifest_body_headers(media_type: Option<&str>, digest: &Digest) -> HeaderMap {
-    let headers = ResponseHeaders::new().docker_content_digest(digest);
+pub fn get_manifest_body_headers(
+    media_type: Option<&str>,
+    digest: &Digest,
+    content_length: u64,
+) -> HeaderMap {
+    let headers = ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .content_length(content_length);
     match media_type {
         Some(media_type) => headers.content_type(media_type).into_inner(),
         None => headers.into_inner(),
