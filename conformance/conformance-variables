@@ -1,18 +1,54 @@
-export OCI_ROOT_URL="http://127.0.0.1:8000"
-export OCI_NAMESPACE="conformance/test"
-export OCI_CROSSMOUNT_NAMESPACE="conformance/cross-mount-test"
+# OCI distribution-spec conformance configuration.
+#
+# Consumed by the standalone `oci-conformance` binary built from
+# opencontainers/distribution-spec. Environment variables take precedence over
+# any oci-conformance.yaml file and over the binary's built-in defaults.
+# See https://github.com/opencontainers/distribution-spec/blob/main/conformance/README.md
 
-# Which workflows to run
-export OCI_TEST_PULL=1
-export OCI_TEST_PUSH=1
-export OCI_TEST_CONTENT_DISCOVERY=1
-export OCI_TEST_CONTENT_MANAGEMENT=1
-export OCI_AUTOMATIC_CROSSMOUNT=1
+# --- Target registry -------------------------------------------------------
+export OCI_REGISTRY="127.0.0.1:8000"
+export OCI_TLS="disabled"
+export OCI_REPO1="conformance/test"
+export OCI_REPO2="conformance/cross-mount-test"
+export OCI_VERSION="1.1"
+export OCI_LOG="debug"
 
-# Extra settings
-export OCI_HIDE_SKIPPED_WORKFLOWS=0
-export OCI_DEBUG=0
-export OCI_DELETE_MANIFEST_BEFORE_BLOBS=0 # defaults to OCI_DELETE_MANIFEST_BEFORE_BLOBS=1 if not set
+# --- API workflows ---------------------------------------------------------
+export OCI_API_PULL=true
+export OCI_API_PUSH=true
+
+export OCI_API_BLOBS_ATOMIC=true
+export OCI_API_BLOBS_DELETE=true
+export OCI_API_BLOBS_MOUNT_ANONYMOUS=true
+export OCI_API_BLOBS_DIGEST_HEADER=true
+export OCI_API_BLOBS_UPLOAD_CANCEL=true
+
+export OCI_API_MANIFESTS_ATOMIC=true
+export OCI_API_MANIFESTS_DELETE=true
+export OCI_API_MANIFESTS_DIGEST_HEADER=true
+export OCI_API_MANIFESTS_TAG_PARAM=true
+
+export OCI_API_TAGS_ATOMIC=true
+export OCI_API_TAGS_DELETE=true
+export OCI_API_TAGS_LIST=true
+
+export OCI_API_REFERRER=true
+
+# --- Generated test content ------------------------------------------------
+export OCI_DATA_IMAGE=true
+export OCI_DATA_INDEX=true
+export OCI_DATA_INDEX_LIST=true
+export OCI_DATA_ARTIFACT=true
+export OCI_DATA_ARTIFACT_LIST=true
+export OCI_DATA_SUBJECT=true
+export OCI_DATA_SUBJECT_MISSING=true
+export OCI_DATA_SUBJECT_LIST=true
+export OCI_DATA_DATA_FIELD=true
+export OCI_DATA_NONDISTRIBUTABLE=true
+export OCI_DATA_CUSTOM_FIELDS=true
+export OCI_DATA_NO_LAYERS=true
+export OCI_DATA_EMPTY_BLOB=true
+export OCI_DATA_SPARSE=true
 
 # angos is sha256-only by design; sha512 is optional per the OCI image-spec.
-export OCI_DATA_SHA512=0
+export OCI_DATA_SHA512=false

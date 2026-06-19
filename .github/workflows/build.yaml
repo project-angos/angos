@@ -86,12 +86,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+
       - name: Build conformance tool
         run: |
-          git clone https://github.com/opencontainers/distribution-spec.git distribution-spec
+          git clone --depth 1 https://github.com/opencontainers/distribution-spec.git distribution-spec
           cd distribution-spec/conformance && \
-            go test -c && \
-            mv conformance.test ../.. && \
+            go build -o oci-conformance . && \
+            mv oci-conformance ../.. && \
             cd ../..
 
       - name: Download zot benchmark
@@ -109,7 +114,7 @@ jobs:
         with:
           name: conformance-tools
           path: |
-            conformance.test
+            oci-conformance
             zb
             conformance-image.tar
           if-no-files-found: error
@@ -174,7 +179,7 @@ jobs:
       - name: Load container image
         run: |
           docker load -i conformance-image.tar
-          chmod +x conformance.test zb
+          chmod +x oci-conformance zb
 
       - name: Start backend services
         run: |
@@ -233,7 +238,7 @@ jobs:
           echo "===== backend fragment ====="
           cat /tmp/backend.toml
 
-      - name: Run conformance test & zot benchmark (${{ matrix.description }})
+      - name: Start angos backend (${{ matrix.description }})
         run: |
           docker run --rm -d \
             -v ./conformance/${{ matrix.config }}:/config.toml \
@@ -247,9 +252,24 @@ jobs:
             exit 1
           fi
 
+      - name: Run conformance test (${{ matrix.description }})
+        env:
+          OCI_RESULTS_DIR: results
+        run: |
           source ./conformance/conformance-variables
-          ./conformance.test
+          ./oci-conformance
 
+      - name: Upload conformance results (${{ matrix.description }})
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-results-${{ matrix.variant }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Run zot benchmark (${{ matrix.description }})
+        run: |
           zb_workdir="$(mktemp -d "${RUNNER_TEMP}/zb-conformance-${{ matrix.variant }}.XXXXXX")"
           time ./zb --working-dir "$zb_workdir" -c 5 -r conformance -n 100 http://localhost:8000
 
