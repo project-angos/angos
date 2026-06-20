@@ -11,7 +11,7 @@ use crate::{
     configuration::{Configuration, RegexPattern},
     http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
-    oci::Namespace,
+    oci::{Namespace, Tag},
     policy::{AccessMode, PolicyDecision},
     registry::{AccessPolicy, BlobMount, Registry},
 };
@@ -298,7 +298,7 @@ impl Authorizer {
         Ok(())
     }
 
-    pub fn is_tag_mutable(&self, repository_name: Option<&str>, tag: &str) -> bool {
+    pub fn is_tag_mutable(&self, repository_name: Option<&str>, tag: &Tag) -> bool {
         let repository = repository_name.and_then(|name| self.repositories.get(name));
         let immutable_tags =
             self.global_immutable_tags || repository.is_some_and(|repo| repo.immutable_tags);
@@ -313,7 +313,9 @@ impl Authorizer {
             _ => &self.global_immutable_tags_exclusions,
         };
 
-        exclusions.iter().any(|pattern| pattern.is_match(tag))
+        exclusions
+            .iter()
+            .any(|pattern| pattern.is_match(tag.as_ref()))
     }
 }
 

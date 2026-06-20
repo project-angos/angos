@@ -10,7 +10,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Tag,
+    oci::{Namespace, Tag},
     registry::{
         blob_store,
         metadata_store::{LinkKind, MetadataStore},
@@ -38,7 +38,7 @@ impl DigestLinkChecker {
 impl TagChecker for DigestLinkChecker {
     async fn check_tag(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         tag: &Tag,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
@@ -66,7 +66,7 @@ impl TagChecker for DigestLinkChecker {
                     tag_metadata.target
                 );
                 sink.apply(Action::DeleteOrphanManifest {
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     digest: tag_metadata.target,
                 })
                 .await

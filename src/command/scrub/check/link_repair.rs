@@ -4,13 +4,13 @@ use tracing::debug;
 
 use crate::{
     command::scrub::{action::Action, error::Error, executor::ActionSink},
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::metadata_store::{LinkKind, MetadataStore},
 };
 
 pub async fn ensure_link(
     metadata_store: &Arc<MetadataStore>,
-    namespace: &str,
+    namespace: &Namespace,
     link: &LinkKind,
     expected_target: &Digest,
     sink: &mut (dyn ActionSink + Send),
@@ -23,7 +23,7 @@ pub async fn ensure_link(
         _ => {
             debug!("Missing or invalid link: {link} -> {expected_target}");
             sink.apply(Action::RecreateLink {
-                namespace: namespace.to_string(),
+                namespace: namespace.clone(),
                 link: link.clone(),
                 target: expected_target.clone(),
             })

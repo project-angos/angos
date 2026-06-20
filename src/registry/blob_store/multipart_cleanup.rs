@@ -12,9 +12,12 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 
-use crate::registry::{
-    blob_store::{BlobStore, Error},
-    path_builder,
+use crate::{
+    oci::Namespace,
+    registry::{
+        blob_store::{BlobStore, Error},
+        path_builder,
+    },
 };
 
 /// A multipart upload with no live session, eligible to be aborted.
@@ -92,7 +95,10 @@ impl MultipartCleanup for BlobStore {
                 let Some((namespace, uuid)) = parse_upload_key(&upload.key) else {
                     continue;
                 };
-                let startedat_path = path_builder::upload_start_date_path(namespace, uuid);
+                let Ok(namespace) = Namespace::new(namespace) else {
+                    continue;
+                };
+                let startedat_path = path_builder::upload_start_date_path(&namespace, uuid);
                 if self.store.head(&startedat_path).await.is_ok() {
                     continue;
                 }

@@ -18,7 +18,7 @@ use crate::{
         worker::runner::run_once,
     },
     configuration::Configuration,
-    oci::Tag,
+    oci::{Namespace, Tag},
     registry::{
         blob_store::BlobStore,
         job_store::{JobHandler, JobStore, Queue},
@@ -60,6 +60,11 @@ pub struct Options {
     #[argh(switch, short = 'l')]
     /// fix links format inconsistencies
     pub links: bool,
+    #[argh(switch)]
+    /// rebuild blob-index entries missing relative to the manifests that
+    /// reference each blob (repairs an index corrupted out-of-band, e.g. storage
+    /// corruption or manual tampering); reads every manifest, so it is expensive
+    pub reconcile_blob_index: bool,
     #[argh(switch, short = 'M')]
     /// backfill missing `media_type` on manifest links
     pub media_types: bool,
@@ -236,6 +241,13 @@ impl Command {
         let mut namespaces = list_all::namespaces(&metadata_store);
         while let Some(namespace) = namespaces.next().await {
             let namespace = namespace?;
+            let namespace = match Namespace::new(&namespace) {
+                Ok(namespace) => namespace,
+                Err(e) => {
+                    warn!("Skipping invalid enumerated namespace '{namespace}': {e}");
+                    continue;
+                }
+            };
             if let Err(e) = self.scrub_tags(&namespace).await {
                 warn!("Tag scrub failed for namespace '{namespace}': {e}");
             }
@@ -254,7 +266,7 @@ impl Command {
     /// Walks a namespace's tags once: an invalid name is deleted and skipped, a
     /// valid tag is dispatched to each enabled per-tag checker. Runs before the
     /// aggregate namespace checkers.
-    async fn scrub_tags(&mut self, namespace: &str) -> Result<(), Error> {
+    async fn scrub_tags(&mut self, namespace: &Namespace) -> Result<(), Error> {
         let Some(tag_checkers) = &self.tag_checkers else {
             return Ok(());
         };
@@ -268,7 +280,7 @@ impl Command {
                     if let Err(e) = self
                         .sink
                         .apply(Action::DeleteInvalidTag {
-                            namespace: namespace.to_string(),
+                            namespace: namespace.clone(),
                             tag: name,
                         })
                         .await
@@ -376,6 +388,7 @@ mod tests {
             blobs: true,
             retention: true,
             links: false,
+            reconcile_blob_index: false,
             media_types: false,
             referrers: false,
             replicate: false,
@@ -450,6 +463,7 @@ mod tests {
             blobs: false,
             retention: false,
             links: false,
+            reconcile_blob_index: false,
             media_types: false,
             referrers: false,
             replicate: false,

@@ -500,9 +500,10 @@ mod in_process_replication_tests {
         let root = dir.path().to_str().unwrap();
         let client = downstream_client(&mock_server.uri());
         let (registry, blob_store, metadata_store) = build_registry(root, client);
+        let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (manifest_digest, config_digest, layer_digest) =
-            seed_manifest(&blob_store.store, &metadata_store, NAMESPACE).await;
+            seed_manifest(&blob_store.store, &metadata_store, &namespace).await;
 
         // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
         for blob in [&config_digest, &layer_digest] {
@@ -543,8 +544,6 @@ mod in_process_replication_tests {
             .expect(1..)
             .mount(&mock_server)
             .await;
-
-        let namespace = Namespace::new(NAMESPACE).unwrap();
 
         // Enqueue via the production event path.
         let repository = registry.resolver.resolve(&namespace);

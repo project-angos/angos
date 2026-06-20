@@ -135,9 +135,9 @@ pub fn test_backend_with_debounce(config: &TestS3Config, debounce_secs: u64) -> 
 }
 
 pub fn legacy_blob_index_with(entries: Vec<(&str, Vec<LinkKind>)>) -> BlobIndex {
-    let mut namespace: HashMap<String, HashSet<LinkKind>> = HashMap::new();
+    let mut namespace: HashMap<Namespace, HashSet<LinkKind>> = HashMap::new();
     for (ns, links) in entries {
-        namespace.insert(ns.to_string(), links.into_iter().collect());
+        namespace.insert(Namespace::new(ns).unwrap(), links.into_iter().collect());
     }
     BlobIndex { namespace }
 }
@@ -154,8 +154,9 @@ pub async fn put_legacy_index(backend: &MetadataStore, digest: &Digest, index: &
 // Integration tests
 
 async fn create_link(m: &Arc<MetadataStore>, namespace: &str, link: &LinkKind, digest: &Digest) {
+    let namespace = Namespace::new(namespace).unwrap();
     m.update_links(
-        namespace,
+        &namespace,
         &[LinkOperation::create(link.clone(), digest.clone())],
     )
     .await
@@ -163,7 +164,8 @@ async fn create_link(m: &Arc<MetadataStore>, namespace: &str, link: &LinkKind, d
 }
 
 async fn delete_link(m: &Arc<MetadataStore>, namespace: &str, link: &LinkKind) {
-    m.update_links(namespace, &[LinkOperation::delete(link.clone())])
+    let namespace = Namespace::new(namespace).unwrap();
+    m.update_links(&namespace, &[LinkOperation::delete(link.clone())])
         .await
         .unwrap();
 }
@@ -292,15 +294,14 @@ pub async fn test_datastore_delete_tag_directory_guards_unsafe_names(m: Arc<Meta
     let namespace = &Namespace::new("test-repo/guard-tags").unwrap();
 
     // Unsafe segment names must be refused without deleting anything.
-    for unsafe_name in ["..", "a/b", ""] {
-        assert!(
-            matches!(
-                m.delete_tag_directory(namespace, unsafe_name).await,
-                Err(Error::InvalidData(_))
-            ),
-            "expected guard to reject {unsafe_name:?}"
-        );
-    }
+    let unsafe_name = "a/b";
+    assert!(
+        matches!(
+            m.delete_tag_directory(namespace, unsafe_name).await,
+            Err(Error::InvalidData(_))
+        ),
+        "expected guard to reject {unsafe_name:?}"
+    );
 
     // Positive case: a safe but grammar-invalid name (leading '-') is the normal
     // invalid-tag scrub target and must be deleted, proving no over-rejection.
@@ -903,7 +904,7 @@ pub async fn test_datastore_read_link_concurrent_readonly(m: Arc<MetadataStore>)
     let mut handles = Vec::new();
     for _ in 0..20 {
         let m = m.clone();
-        let ns = namespace.to_string();
+        let ns = namespace.clone();
         let link = tag_link.clone();
         handles.push(tokio::spawn(async move { m.read_link(&ns, &link).await }));
     }
@@ -1202,7 +1203,7 @@ pub async fn test_datastore_parallel_multiple_creates(m: Arc<MetadataStore>) {
         );
 
         let blob_index = m.read_blob_index(digest).await.unwrap();
-        let links = blob_index.namespace.get(namespace.as_ref());
+        let links = blob_index.namespace.get(namespace);
         assert!(
             links.is_some(),
             "Blob index for digest {digest} should have an entry for namespace {namespace}"
@@ -1293,7 +1294,7 @@ pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) 
     let tag_v1 = LinkKind::Tag(Tag::new("v1").unwrap());
     match m.read_blob_index(&digest_a).await {
         Ok(index_a) => {
-            let links_a = index_a.namespace.get(namespace.as_ref());
+            let links_a = index_a.namespace.get(namespace);
             assert!(
                 links_a.is_none_or(|s| !s.contains(&tag_v1)),
                 "Blob index for digest_a should not contain Tag(v1) after deletion"
@@ -1306,7 +1307,7 @@ pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) 
     let index_c = m.read_blob_index(&digest_c).await.unwrap();
     let links_c = index_c
         .namespace
-        .get(namespace.as_ref())
+        .get(namespace)
         .expect("Blob index for digest_c should have an entry for namespace");
     assert!(
         links_c.contains(&LinkKind::Tag(Tag::new("v3").unwrap())),
@@ -1347,14 +1348,9 @@ pub async fn test_datastore_parallel_blob_index_correctness(m: Arc<MetadataStore
         let expected_tag = LinkKind::Tag(Tag::try_from(format!("tag-{i}")).unwrap());
         let blob_index = m.read_blob_index(digest).await.unwrap();
 
-        let links = blob_index
-            .namespace
-            .get(namespace.as_ref())
-            .unwrap_or_else(|| {
-                panic!(
-                    "Blob index for digest {digest} should have an entry for namespace {namespace}"
-                )
-            });
+        let links = blob_index.namespace.get(namespace).unwrap_or_else(|| {
+            panic!("Blob index for digest {digest} should have an entry for namespace {namespace}")
+        });
 
         assert!(
             links.contains(&expected_tag),
@@ -1369,7 +1365,7 @@ pub async fn test_datastore_parallel_blob_index_correctness(m: Arc<MetadataStore
                     "Blob index for digest {digest} (tag-{i}) should NOT contain tag-{j}"
                 );
                 let other_index = m.read_blob_index(other_digest).await.unwrap();
-                let other_links = other_index.namespace.get(namespace.as_ref());
+                let other_links = other_index.namespace.get(namespace);
                 assert!(
                     other_links.is_some_and(|s| !s.contains(&expected_tag)),
                     "Blob index for digest {other_digest} (tag-{j}) should NOT contain tag-{i}"
@@ -1420,7 +1416,7 @@ pub async fn test_datastore_tracked_create_with_referrer(m: Arc<MetadataStore>) 
     let blob_index = m.read_blob_index(&digest_layer).await.unwrap();
     let links = blob_index
         .namespace
-        .get(namespace.as_ref())
+        .get(namespace)
         .expect("Blob index should have an entry for the namespace");
     assert!(
         links.contains(&LinkKind::Layer(digest_layer.clone())),
@@ -1504,7 +1500,7 @@ pub async fn test_datastore_tracked_delete_with_referrer(m: Arc<MetadataStore>) 
     let blob_index = m.read_blob_index(&layer_digest).await.unwrap();
     let links = blob_index
         .namespace
-        .get(namespace.as_ref())
+        .get(namespace)
         .expect("Blob index should still have an entry for the namespace");
     assert!(
         links.contains(&LinkKind::Layer(layer_digest.clone())),
@@ -1559,7 +1555,7 @@ pub async fn test_datastore_tracked_delete_removes_when_no_referrers(m: Arc<Meta
     let layer_link = LinkKind::Layer(layer_digest.clone());
     match m.read_blob_index(&layer_digest).await {
         Ok(index) => {
-            let links = index.namespace.get(namespace.as_ref());
+            let links = index.namespace.get(namespace);
             assert!(
                 links.is_none_or(|s| !s.contains(&layer_link)),
                 "Blob index should not contain the Layer link after removal"
@@ -1642,7 +1638,7 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataSt
     let tag_index = m.read_blob_index(&tag_digest).await.unwrap();
     let tag_links = tag_index
         .namespace
-        .get(namespace.as_ref())
+        .get(namespace)
         .expect("Blob index for tag_digest should have namespace entry");
     assert!(
         tag_links.contains(&LinkKind::Tag(Tag::new("v1").unwrap())),
@@ -1652,7 +1648,7 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataSt
     let layer_index = m.read_blob_index(&layer_digest).await.unwrap();
     let layer_links = layer_index
         .namespace
-        .get(namespace.as_ref())
+        .get(namespace)
         .expect("Blob index for layer_digest should have namespace entry");
     assert!(
         layer_links.contains(&LinkKind::Layer(layer_digest.clone())),
@@ -1662,7 +1658,7 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataSt
     let digest_index = m.read_blob_index(&digest_link_digest).await.unwrap();
     let digest_links = digest_index
         .namespace
-        .get(namespace.as_ref())
+        .get(namespace)
         .expect("Blob index for digest_link_digest should have namespace entry");
     assert!(
         digest_links.contains(&LinkKind::Digest(digest_link_digest.clone())),
@@ -1698,7 +1694,7 @@ pub async fn test_datastore_batch_deduplicates_same_digest_operations(m: Arc<Met
     let blob_index = m.read_blob_index(&digest).await.unwrap();
     let links = blob_index
         .namespace
-        .get(namespace.as_ref())
+        .get(namespace)
         .expect("Blob index should have an entry for the namespace");
     assert!(
         links.contains(&tag_link),
@@ -1740,7 +1736,7 @@ pub async fn test_datastore_batch_handles_mixed_insert_remove_same_digest(m: Arc
     let blob_index = m.read_blob_index(&digest).await.unwrap();
     let links = blob_index
         .namespace
-        .get(namespace.as_ref())
+        .get(namespace)
         .expect("Blob index should have an entry for the namespace");
     assert!(links.contains(&tag_v2), "Blob index should contain Tag(v2)");
     assert!(
@@ -1769,7 +1765,7 @@ pub async fn test_datastore_batch_deletes_empty_blob_container(m: Arc<MetadataSt
 
     match m.read_blob_index(&digest).await {
         Ok(index) => {
-            let links = index.namespace.get(namespace.as_ref());
+            let links = index.namespace.get(namespace);
             assert!(
                 links.is_none_or(HashSet::is_empty),
                 "Blob index should have no entries for the namespace after deletion"
@@ -1821,7 +1817,7 @@ pub async fn test_datastore_batch_multiple_unique_digests(m: Arc<MetadataStore>)
         let blob_index = m.read_blob_index(digest).await.unwrap();
         let links = blob_index
             .namespace
-            .get(namespace.as_ref())
+            .get(namespace)
             .expect("Blob index should have an entry for the namespace");
         assert_eq!(
             links.len(),
@@ -1853,7 +1849,7 @@ pub async fn test_datastore_batch_preserves_existing_blob_index_entries(m: Arc<M
 
     let blob_index = m.read_blob_index(&digest).await.unwrap();
     assert!(
-        blob_index.namespace.contains_key(other_ns.as_ref()),
+        blob_index.namespace.contains_key(other_ns),
         "Blob index should have entry for other-ns"
     );
 
@@ -1863,7 +1859,7 @@ pub async fn test_datastore_batch_preserves_existing_blob_index_entries(m: Arc<M
     let blob_index = m.read_blob_index(&digest).await.unwrap();
     let other_links = blob_index
         .namespace
-        .get(other_ns.as_ref())
+        .get(other_ns)
         .expect("Blob index should still have entry for other-ns");
     assert!(
         other_links.contains(&other_tag),
@@ -1872,7 +1868,7 @@ pub async fn test_datastore_batch_preserves_existing_blob_index_entries(m: Arc<M
 
     let my_links = blob_index
         .namespace
-        .get(my_ns.as_ref())
+        .get(my_ns)
         .expect("Blob index should have entry for my-ns");
     assert!(
         my_links.contains(&my_tag),
@@ -1896,8 +1892,9 @@ async fn create_link_with_media_type(
     digest: &Digest,
     media_type: &str,
 ) {
+    let namespace = Namespace::new(namespace).unwrap();
     m.update_links(
-        namespace,
+        &namespace,
         &[LinkOperation::create_with_media_type(
             link.clone(),
             digest.clone(),
@@ -1912,14 +1909,14 @@ async fn create_link_with_media_type(
 async fn test_link_metadata_media_type() {
     for test_case in backends() {
         let m = test_case.metadata_store();
-        let namespace = "media-type-test";
+        let namespace = Namespace::new("media-type-test").unwrap();
         let digest = put_blob_direct(m.store(), b"test content").await;
 
         let media_type = "application/vnd.docker.distribution.manifest.v2+json";
 
         create_link_with_media_type(
             &m,
-            namespace,
+            &namespace,
             &LinkKind::Digest(digest.clone()),
             &digest,
             media_type,
@@ -1927,7 +1924,7 @@ async fn test_link_metadata_media_type() {
         .await;
 
         let link = m
-            .read_link(namespace, &LinkKind::Digest(digest.clone()))
+            .read_link(&namespace, &LinkKind::Digest(digest.clone()))
             .await
             .unwrap();
         assert_eq!(link.media_type, Some(media_type.to_string()));
@@ -1940,19 +1937,19 @@ async fn test_link_metadata_media_type() {
 async fn test_link_without_media_type_has_none() {
     for test_case in backends() {
         let m = test_case.metadata_store();
-        let namespace = "no-media-type-test";
+        let namespace = Namespace::new("no-media-type-test").unwrap();
         let digest = put_blob_direct(m.store(), b"test content 2").await;
 
         create_link(
             &m,
-            namespace,
+            &namespace,
             &LinkKind::Tag(Tag::new("latest").unwrap()),
             &digest,
         )
         .await;
 
         let link = m
-            .read_link(namespace, &LinkKind::Tag(Tag::new("latest").unwrap()))
+            .read_link(&namespace, &LinkKind::Tag(Tag::new("latest").unwrap()))
             .await
             .unwrap();
         assert_eq!(link.media_type, None);

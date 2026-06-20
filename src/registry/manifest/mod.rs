@@ -60,7 +60,7 @@ fn manifest_event(
     reference: &Reference,
     actor: Option<EventActor>,
 ) -> Event {
-    Event::new(kind, namespace.to_string(), repository)
+    Event::new(kind, namespace.clone(), repository)
         .digest(digest)
         .reference(Some(reference.to_string()))
         .actor(actor)
@@ -72,10 +72,10 @@ fn tag_event(
     repository: String,
     digest: Option<String>,
     reference: &Reference,
-    tag: &str,
+    tag: &Tag,
     actor: Option<EventActor>,
 ) -> Event {
-    Event::new(kind, namespace.to_string(), repository)
+    Event::new(kind, namespace.clone(), repository)
         .digest(digest)
         .reference(Some(reference.to_string()))
         .tag(Some(tag.to_string()))
@@ -384,7 +384,7 @@ impl Registry {
                 .put_blob(&computed_digest, Bytes::copy_from_slice(body))
                 .await?;
             self.metadata_store
-                .store_manifest(namespace.as_ref(), &ops, created_at)
+                .store_manifest(namespace, &ops, created_at)
                 .await
                 .map_err(|e| match e {
                     MetadataStoreError::ReplicationSuperseded(message) => {
@@ -506,7 +506,7 @@ impl Registry {
         // for the suppression gate, the LWW guard, and the link plan.
         let pointing_tags = if let Reference::Digest(digest) = reference {
             self.metadata_store
-                .find_tags_pointing_at(namespace.as_ref(), digest)
+                .find_tags_pointing_at(namespace, digest)
                 .await?
         } else {
             Vec::new()
@@ -561,7 +561,7 @@ impl Registry {
             let result = async {
                 if self
                     .metadata_store
-                    .delete_manifest(namespace.as_ref(), digest, &ops, source_ts)
+                    .delete_manifest(namespace, digest, &ops, source_ts)
                     .await?
                 {
                     self.blob_store.delete_blob(digest).await?;
@@ -573,7 +573,7 @@ impl Registry {
             result?;
         } else {
             self.metadata_store
-                .delete_links(namespace.as_ref(), &ops, source_ts)
+                .delete_links(namespace, &ops, source_ts)
                 .await?;
         }
 
@@ -1028,7 +1028,7 @@ impl Registry {
             .map(|downstream| {
                 let payload = ReplicationPushPayload {
                     downstream: downstream.name.clone(),
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     tag: tag.cloned(),
                     digest: digest.map(ToString::to_string),
                     kind: kind.to_string(),

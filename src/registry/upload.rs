@@ -161,7 +161,7 @@ impl Registry {
         }
 
         let repository = self.repository_name_for(namespace);
-        let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
+        let event = Event::new(EventKind::BlobPush, namespace.clone(), repository)
             .digest(Some(digest.to_string()))
             .actor(actor);
 
@@ -285,7 +285,7 @@ impl Registry {
     ) -> Result<(StartUploadResponse, Vec<Event>), Error> {
         if let Some(headers) = self.try_cross_repo_mount(namespace, mount, source).await? {
             let repository = self.repository_name_for(namespace);
-            let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
+            let event = Event::new(EventKind::BlobPush, namespace.clone(), repository)
                 .digest(Some(mount.digest.to_string()))
                 .actor(actor);
             return Ok((StartUploadResponse::ExistingBlob { headers }, vec![event]));
@@ -855,7 +855,7 @@ mod tests {
             assert!(matches!(response, StartUploadResponse::ExistingBlob { .. }));
             assert_eq!(events.len(), 1, "a satisfied mount must emit one event");
             assert_eq!(events[0].kind, EventKind::BlobPush);
-            assert_eq!(events[0].namespace, target.to_string());
+            assert_eq!(events[0].namespace, *target);
             assert_eq!(
                 events[0].digest.as_deref(),
                 Some(digest.to_string().as_str())
@@ -1353,7 +1353,7 @@ mod tests {
                 .read_blob_index(&expected_digest)
                 .await
                 .unwrap();
-            let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            let namespace_links = blob_index.namespace.get(namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(expected_digest.clone())));
 
             test_case.cleanup().await;

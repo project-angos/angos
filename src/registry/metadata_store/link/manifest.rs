@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::{
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::metadata_store::{Error, LinkOperation, LinksCommit, LinksTx, MetadataStore},
 };
 
@@ -16,7 +16,7 @@ impl MetadataStore {
     /// target.
     pub async fn store_manifest(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         operations: &[LinkOperation],
         created_at: Option<DateTime<Utc>>,
     ) -> Result<LinksCommit, Error> {
@@ -31,7 +31,7 @@ impl MetadataStore {
     /// reference grant isn't missed; the `ManifestBlobUnknown` race).
     pub async fn delete_manifest(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
         operations: &[LinkOperation],
         source_ts: Option<DateTime<Utc>>,

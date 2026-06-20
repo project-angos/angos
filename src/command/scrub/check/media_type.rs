@@ -11,7 +11,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Manifest,
+    oci::{Manifest, Namespace},
     registry::{
         blob_store,
         metadata_store::{LinkKind, MetadataStore},
@@ -33,7 +33,7 @@ impl MediaTypeChecker {
 
     async fn backfill_link(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
         display_name: &str,
         sink: &mut (dyn ActionSink + Send),
@@ -54,7 +54,7 @@ impl MediaTypeChecker {
                 );
                 return sink
                     .apply(Action::DeleteOrphanManifest {
-                        namespace: namespace.to_string(),
+                        namespace: namespace.clone(),
                         digest: metadata.target,
                     })
                     .await;
@@ -79,7 +79,7 @@ impl MediaTypeChecker {
         };
 
         sink.apply(Action::SetMediaType {
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
             link: link.clone(),
             target: metadata.target,
             media_type,
@@ -90,7 +90,7 @@ impl MediaTypeChecker {
 
     async fn backfill_all<T, S, F>(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         item_kind: &str,
         mut items: S,
         to_link_and_name: F,
@@ -125,7 +125,7 @@ impl MediaTypeChecker {
 impl NamespaceChecker for MediaTypeChecker {
     async fn check(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking media_type field for namespace '{namespace}'");

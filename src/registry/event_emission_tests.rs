@@ -419,8 +419,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
         "Event repository must not be empty"
     );
     assert_eq!(
-        tag_create.namespace,
-        namespace.to_string(),
+        tag_create.namespace, namespace,
         "Event namespace must match the pushed namespace"
     );
     assert_eq!(tag_create.tag.as_deref(), Some("stable"));

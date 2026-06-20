@@ -10,7 +10,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::{
         blob_store,
         metadata_store::{LinkKind, MetadataStore},
@@ -33,7 +33,7 @@ impl ManifestChecker {
 
     async fn repair_manifest_links(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         revision: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
@@ -61,7 +61,7 @@ impl ManifestChecker {
 impl NamespaceChecker for ManifestChecker {
     async fn check(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking manifest inconsistencies from namespace '{namespace}'");

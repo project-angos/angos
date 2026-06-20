@@ -16,8 +16,8 @@ use angos_tx_engine::store::Store;
 use crate::{
     cache, metrics_provider,
     oci::{
-        DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, Digest, OCI_INDEX_MEDIA_TYPE,
-        OCI_MANIFEST_MEDIA_TYPE, Reference, Tag,
+        DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, Digest, Namespace,
+        OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference, Tag,
     },
     registry::{
         DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
@@ -180,11 +180,12 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -261,11 +262,12 @@ async fn referrers_fallback_put_is_timestamp_less() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
     };
@@ -356,11 +358,12 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -438,11 +441,12 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -536,11 +540,12 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -602,11 +607,12 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
 
     // Any fallback-tag PUT would 404 (no mock) and surface as an error.
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -681,11 +687,12 @@ async fn index_lands_after_its_child_manifest() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -755,11 +762,12 @@ async fn index_lands_after_all_children_when_fanned_out() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -831,7 +839,7 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
     for blob in [&config, &layer] {
         metadata_store
             .update_blob_index(
-                SIBLING,
+                &Namespace::new(SIBLING).unwrap(),
                 blob,
                 BlobIndexOperation::Insert(LinkKind::Blob((*blob).clone())),
             )
@@ -870,11 +878,12 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -916,7 +925,7 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
 
     metadata_store
         .update_blob_index(
-            SIBLING,
+            &Namespace::new(SIBLING).unwrap(),
             &config,
             BlobIndexOperation::Insert(LinkKind::Blob(config.clone())),
         )
@@ -970,11 +979,12 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1029,11 +1039,12 @@ async fn push_manifest_stamps_source_timestamp_header() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
     };
@@ -1072,11 +1083,12 @@ async fn push_manifest_skips_put_when_downstream_already_converged() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1160,11 +1172,12 @@ async fn repeated_layer_digest_uploads_the_blob_once() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1217,11 +1230,12 @@ async fn converged_skip_head_sends_standard_accept_headers() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1309,11 +1323,12 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1396,11 +1411,12 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1460,11 +1476,12 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1543,11 +1560,12 @@ async fn failed_patch_cancels_the_upload_session() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1629,11 +1647,12 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1674,11 +1693,12 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1716,11 +1736,12 @@ async fn push_manifest_puts_when_downstream_head_returns_404() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1756,7 +1777,7 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
     let media_type = "application/vnd.oci.image.manifest.v1+json";
     metadata_store
         .update_links(
-            NAMESPACE,
+            &Namespace::new(NAMESPACE).unwrap(),
             &[LinkOperation::create_with_media_type(
                 LinkKind::Digest(manifest_digest.clone()),
                 manifest_digest.clone(),
@@ -1778,11 +1799,12 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1820,7 +1842,7 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
     // Seed only the child's revision link with its stored media type.
     metadata_store
         .update_links(
-            NAMESPACE,
+            &Namespace::new(NAMESPACE).unwrap(),
             &[LinkOperation::create_with_media_type(
                 LinkKind::Digest(child_digest.clone()),
                 child_digest.clone(),
@@ -1852,11 +1874,12 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1885,11 +1908,12 @@ async fn push_manifest_treats_lww_superseded_409_as_success() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
     };
@@ -1923,11 +1947,12 @@ async fn push_manifest_propagates_immutable_409_as_error() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1967,7 +1992,7 @@ async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
     delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
-        NAMESPACE,
+        &Namespace::new(NAMESPACE).unwrap(),
         &Reference::Tag(Tag::new("v1").unwrap()),
         Some("2026-06-03T00:00:00Z"),
     )
@@ -1994,7 +2019,7 @@ async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
-        NAMESPACE,
+        &Namespace::new(NAMESPACE).unwrap(),
         &Reference::Tag(Tag::new("gone").unwrap()),
         None,
     )
@@ -2026,7 +2051,7 @@ async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
-        NAMESPACE,
+        &Namespace::new(NAMESPACE).unwrap(),
         &Reference::Tag(Tag::new("v1").unwrap()),
         None,
     )
@@ -2053,7 +2078,7 @@ async fn delete_manifest_propagates_non_superseded_409_as_error() {
     let result = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
-        NAMESPACE,
+        &Namespace::new(NAMESPACE).unwrap(),
         &Reference::Tag(Tag::new("v1").unwrap()),
         None,
     )
@@ -2088,11 +2113,12 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
         .await;
 
     let client = downstream_client(&mock_server.uri());
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         downstream: &client,
         blob_store: &blob_store,
         metadata_store: &metadata_store,
-        namespace: NAMESPACE,
+        namespace: &namespace,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -2172,7 +2198,7 @@ async fn deleting_last_referrer_removes_the_fallback_tag() {
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
-        NAMESPACE,
+        &Namespace::new(NAMESPACE).unwrap(),
         &Reference::Digest(referrer.clone()),
         None,
     )
@@ -2240,7 +2266,7 @@ async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
     delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
-        NAMESPACE,
+        &Namespace::new(NAMESPACE).unwrap(),
         &Reference::Digest(referrer.clone()),
         None,
     )

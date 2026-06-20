@@ -1198,7 +1198,7 @@ async fn concurrent_same_digest_pushes_keep_upload_ownership() {
         .unwrap();
 
     for namespace in namespaces {
-        let links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+        let links = blob_index.namespace.get(&namespace).unwrap();
         assert!(links.contains(&LinkKind::Blob(layer_digest.clone())));
         assert!(links.contains(&LinkKind::Layer(layer_digest.clone())));
     }
@@ -2138,7 +2138,7 @@ async fn store_manifest_writes_blob_and_links() {
     // The link should be readable via the metadata store.
     let link = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new("v1").unwrap()))
+        .read_link(&namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
         .await
         .unwrap();
     assert_eq!(link.target, expected_digest);
@@ -2154,7 +2154,7 @@ async fn store_manifest_writes_blob_and_links() {
         .await
         .unwrap();
     assert!(
-        blob_index.namespace.contains_key(namespace.as_ref()),
+        blob_index.namespace.contains_key(&namespace),
         "blob-index must contain namespace after manifest push"
     );
 }
@@ -2245,7 +2245,7 @@ async fn store_manifest_is_idempotent() {
     let digest = Digest::sha256_of_bytes(&manifest_bytes);
     let link = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new("v1").unwrap()))
+        .read_link(&namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
         .await
         .unwrap();
     assert_eq!(link.target, digest);
@@ -2272,7 +2272,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
 
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new("v1").unwrap()))
+        .read_link(&namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
         .await
         .unwrap();
 
@@ -2283,7 +2283,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
 
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Digest(digest.clone()))
+        .read_link(&namespace, &LinkKind::Digest(digest.clone()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2317,7 +2317,7 @@ async fn local_created_at(
 ) -> chrono::DateTime<chrono::Utc> {
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("read seeded tag link")
         .created_at
@@ -2575,7 +2575,7 @@ async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
 
     let target = registry
         .metadata_store
-        .read_link_reference(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link_reference(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("tag link after the tie-break")
         .target;
@@ -2601,7 +2601,7 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
     let store = test_case.metadata_store();
     let link = LinkKind::Tag(Tag::new(tag).unwrap());
     let cached = store
-        .cache_get(namespace.as_ref(), &link)
+        .cache_get(namespace, &link)
         .await
         .expect("seed write must warm the link cache");
     assert_eq!(cached.created_at, Some(created_at));
@@ -2610,12 +2610,12 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
     // process's cache.
     let sibling_ts = created_at + chrono::Duration::seconds(120);
     let mut sibling = store
-        .read_link_reference(namespace.as_ref(), &link)
+        .read_link_reference(namespace, &link)
         .await
         .expect("seeded tag link");
     sibling.created_at = Some(sibling_ts);
     store
-        .write_link_reference(namespace.as_ref(), &link, &sibling)
+        .write_link_reference(namespace, &link, &sibling)
         .await
         .expect("sibling write behind the cache");
 
@@ -2648,7 +2648,7 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
     // omitted because the local cache lags and would then be left dangling.
     let test_case = FSRegistryTestCase::with_link_cache_ttl(300);
     let store = test_case.metadata_store();
-    let namespace = "cascade-repo";
+    let namespace = Namespace::new("cascade-repo").unwrap();
     let link = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let old_digest = Digest::sha256_of_bytes(b"old");
@@ -2656,33 +2656,33 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
 
     store
         .store_manifest(
-            namespace,
+            &namespace,
             &[LinkOperation::create(link.clone(), old_digest.clone())],
             None,
         )
         .await
         .expect("seed the tag and warm the cache");
     assert_eq!(
-        store.cache_get(namespace, &link).await.map(|m| m.target),
+        store.cache_get(&namespace, &link).await.map(|m| m.target),
         Some(old_digest.clone()),
         "seed write must warm the link cache",
     );
 
     // A sibling replica re-points the tag at new_digest behind this cache.
-    let mut sibling = store.read_link_reference(namespace, &link).await.unwrap();
+    let mut sibling = store.read_link_reference(&namespace, &link).await.unwrap();
     sibling.target = new_digest.clone();
     store
-        .write_link_reference(namespace, &link, &sibling)
+        .write_link_reference(&namespace, &link, &sibling)
         .await
         .expect("sibling re-point behind the cache");
     assert_eq!(
-        store.cache_get(namespace, &link).await.map(|m| m.target),
+        store.cache_get(&namespace, &link).await.map(|m| m.target),
         Some(old_digest),
         "cache must still be stale for an honest test",
     );
 
     let pointing = store
-        .find_tags_pointing_at(namespace, &new_digest)
+        .find_tags_pointing_at(&namespace, &new_digest)
         .await
         .unwrap();
     assert_eq!(
@@ -2701,7 +2701,7 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
 async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     let test_case = FSRegistryTestCase::new();
     let store = test_case.metadata_store();
-    let namespace = "lww-tx-repo";
+    let namespace = Namespace::new("lww-tx-repo").unwrap();
     let link = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let newer_body = br#"{"newer":true}"#.to_vec();
@@ -2709,7 +2709,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     let newer_ts = chrono::Utc::now();
     store
         .store_manifest(
-            namespace,
+            &namespace,
             &[LinkOperation::create(link.clone(), newer_digest.clone())],
             Some(newer_ts),
         )
@@ -2720,7 +2720,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     let older_digest = Digest::sha256_of_bytes(&older_body);
     let result = store
         .store_manifest(
-            namespace,
+            &namespace,
             &[LinkOperation::create(link.clone(), older_digest.clone())],
             Some(newer_ts - chrono::Duration::hours(1)),
         )
@@ -2735,7 +2735,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     );
 
     let metadata = store
-        .read_link_reference(namespace, &link)
+        .read_link_reference(&namespace, &link)
         .await
         .expect("the winning link must survive");
     assert_eq!(metadata.target, newer_digest);
@@ -2750,7 +2750,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
 async fn delete_links_enforces_lww_inside_the_link_transaction() {
     let test_case = FSRegistryTestCase::new();
     let store = test_case.metadata_store();
-    let namespace = "lww-tx-repo";
+    let namespace = Namespace::new("lww-tx-repo").unwrap();
     let link = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let body = br#"{"winner":true}"#.to_vec();
@@ -2758,7 +2758,7 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
     let newer_ts = chrono::Utc::now();
     store
         .store_manifest(
-            namespace,
+            &namespace,
             &[LinkOperation::create(link.clone(), digest.clone())],
             Some(newer_ts),
         )
@@ -2767,7 +2767,7 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
 
     let result = store
         .delete_links(
-            namespace,
+            &namespace,
             &[LinkOperation::delete(link.clone())],
             Some(newer_ts - chrono::Duration::hours(1)),
         )
@@ -2782,7 +2782,7 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
     );
 
     let metadata = store
-        .read_link_reference(namespace, &link)
+        .read_link_reference(&namespace, &link)
         .await
         .expect("the tag must survive the superseded delete");
     assert_eq!(metadata.target, digest);
@@ -2942,7 +2942,7 @@ async fn delete_manifest_rejects_lww_older_source_ts() {
 
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("tag must survive a superseded delete");
 }
@@ -2970,7 +2970,7 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
 
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2990,7 +2990,7 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
     registry
         .metadata_store
         .write_link_reference(
-            namespace.as_ref(),
+            namespace,
             &LinkKind::Tag(Tag::new(tag).unwrap()),
             &LinkMetadata {
                 target: Digest::sha256_of_bytes(b"manifest-bytes"),
@@ -3018,7 +3018,7 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
 
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -3074,7 +3074,7 @@ async fn replicated_delete_not_superseded_by_a_legacy_link() {
     let legacy_digest = Digest::sha256_of_bytes(b"legacy-manifest");
     put_link_raw(
         registry.metadata_store.store(),
-        namespace.as_ref(),
+        namespace,
         &link,
         legacy_digest.to_string().as_bytes(),
     )
@@ -3091,10 +3091,7 @@ async fn replicated_delete_not_superseded_by_a_legacy_link() {
         .await
         .expect("a legacy tag (no created_at) must never supersede a replicated write");
 
-    let result = registry
-        .metadata_store
-        .read_link(namespace.as_ref(), &link)
-        .await;
+    let result = registry.metadata_store.read_link(namespace, &link).await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
         "the legacy tag must be gone after the non-superseded delete, got: {result:?}"
@@ -3131,12 +3128,12 @@ async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
 
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("pointing tag must survive a superseded digest delete");
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Digest(digest))
+        .read_link(namespace, &LinkKind::Digest(digest))
         .await
         .expect("revision must survive a superseded digest delete");
 }
@@ -3159,7 +3156,7 @@ async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
 
     let tag_result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
         matches!(tag_result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -3202,7 +3199,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
     );
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("a superseded prune delete must preserve the downstream tag");
 
@@ -3224,7 +3221,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
         .expect("a prune delete must proceed when its source_ts is newer than the tag");
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
+        .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -3781,7 +3778,7 @@ mod noop_suppression_tests {
         registry
             .metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace,
                 &[LinkOperation::delete(LinkKind::Digest(digest.clone()))],
             )
             .await

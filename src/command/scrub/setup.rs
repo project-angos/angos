@@ -6,10 +6,11 @@ use tracing::{info, warn};
 use crate::{
     command::scrub::{
         check::{
-            BlobChecker, DigestLinkChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker,
-            MediaTypeChecker, MultipartChecker, NamespaceChecker, OrphanGrantChecker,
-            OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue, ReferrerChecker,
-            ReplicationChecker, RetentionChecker, StoreChecker, TagChecker, UploadChecker,
+            BlobChecker, BlobIndexChecker, DigestLinkChecker, LayoutChecker, LinkReferencesChecker,
+            ManifestChecker, MediaTypeChecker, MultipartChecker, NamespaceChecker,
+            OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue,
+            ReferrerChecker, ReplicationChecker, RetentionChecker, StoreChecker, TagChecker,
+            UploadChecker,
         },
         command::Options,
         error::Error,
@@ -77,6 +78,13 @@ pub fn namespace_checkers(
 
     if options.links {
         checkers.push(Box::new(LinkReferencesChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+        )));
+    }
+
+    if options.reconcile_blob_index {
+        checkers.push(Box::new(BlobIndexChecker::new(
             blob_store.clone(),
             metadata_store.clone(),
         )));

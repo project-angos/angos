@@ -13,7 +13,7 @@ use angos_tx_engine::store::Store;
 
 use crate::{
     cache, metrics_provider,
-    oci::{Digest, Tag},
+    oci::{Digest, Namespace, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, Repository,
         blob_store::BlobStore,
@@ -43,7 +43,7 @@ const DOWNSTREAM: &str = "eu-region";
 fn sample_payload() -> ReplicationPushPayload {
     ReplicationPushPayload {
         downstream: DOWNSTREAM.to_string(),
-        namespace: NAMESPACE.to_string(),
+        namespace: Namespace::new(NAMESPACE).unwrap(),
         tag: Some(Tag::new("v1").unwrap()),
         digest: Some(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
@@ -300,7 +300,7 @@ async fn execute_pushes_manifest_with_head_before_put() {
     let blob_store = Arc::new(BlobStore::new(store.clone()));
 
     let (manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, NAMESPACE).await;
+        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
     // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
     for blob in [&config_digest, &layer_digest] {
@@ -414,10 +414,11 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
     let current_bytes = serde_json::to_vec(&manifest_json("current")).unwrap();
     let current_digest = put_blob(&store, &current_bytes).await;
 
+    let namespace = Namespace::new(NAMESPACE).unwrap();
     let link = LinkKind::Tag(Tag::new("v1").unwrap());
     metadata_store
         .update_links(
-            NAMESPACE,
+            &namespace,
             &[
                 LinkOperation::create(link.clone(), stale_digest.clone()),
                 LinkOperation::create(
@@ -432,22 +433,22 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
 
     // Warm this process's cache with the stale target, then simulate a
     // sibling process re-pointing the tag behind it.
-    metadata_store.read_link(NAMESPACE, &link).await.unwrap();
+    metadata_store.read_link(&namespace, &link).await.unwrap();
     assert_eq!(
         metadata_store
-            .cache_get(NAMESPACE, &link)
+            .cache_get(&namespace, &link)
             .await
             .expect("the resolve under test must start from a warm cache")
             .target,
         stale_digest
     );
     let mut sibling = metadata_store
-        .read_link_reference(NAMESPACE, &link)
+        .read_link_reference(&namespace, &link)
         .await
         .unwrap();
     sibling.target = current_digest.clone();
     metadata_store
-        .write_link_reference(NAMESPACE, &link, &sibling)
+        .write_link_reference(&namespace, &link, &sibling)
         .await
         .unwrap();
 
@@ -485,7 +486,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
 
     let payload = ReplicationPushPayload {
         downstream: DOWNSTREAM.to_string(),
-        namespace: NAMESPACE.to_string(),
+        namespace: Namespace::new(NAMESPACE).unwrap(),
         tag: Some(Tag::new("v1").unwrap()),
         digest: Some(stale_digest.to_string()),
         kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
@@ -526,7 +527,7 @@ async fn execute_skips_blob_present_on_downstream() {
     let blob_store = Arc::new(BlobStore::new(store.clone()));
 
     let (manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, NAMESPACE).await;
+        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
     // Both blobs already present (200 on HEAD) -> NO upload sequence at all.
     for blob in [&config_digest, &layer_digest] {
@@ -587,11 +588,14 @@ async fn execute_push_stamps_resolved_source_timestamp() {
     let blob_store = Arc::new(BlobStore::new(store.clone()));
 
     let (manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, NAMESPACE).await;
+        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
     // Read back the tag's created_at to assert the exact stamped value.
     let expected_ts = metadata_store
-        .read_link(NAMESPACE, &LinkKind::Tag(Tag::new("v1").unwrap()))
+        .read_link(
+            &Namespace::new(NAMESPACE).unwrap(),
+            &LinkKind::Tag(Tag::new("v1").unwrap()),
+        )
         .await
         .unwrap()
         .created_at
@@ -661,9 +665,12 @@ async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
     let blob_store = Arc::new(BlobStore::new(store.clone()));
 
     let (manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, NAMESPACE).await;
+        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
     let expected_ts = metadata_store
-        .read_link(NAMESPACE, &LinkKind::Tag(Tag::new("v1").unwrap()))
+        .read_link(
+            &Namespace::new(NAMESPACE).unwrap(),
+            &LinkKind::Tag(Tag::new("v1").unwrap()),
+        )
         .await
         .unwrap()
         .created_at
@@ -730,7 +737,7 @@ async fn execute_push_surfaces_immutable_conflict_409_as_error() {
     let blob_store = Arc::new(BlobStore::new(store.clone()));
 
     let (_manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, NAMESPACE).await;
+        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
     for blob in [&config_digest, &layer_digest] {
         Mock::given(method("HEAD"))
@@ -791,7 +798,7 @@ async fn execute_push_treats_superseded_409_as_success() {
     let blob_store = Arc::new(BlobStore::new(store.clone()));
 
     let (_manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, NAMESPACE).await;
+        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
     for blob in [&config_digest, &layer_digest] {
         Mock::given(method("HEAD"))
@@ -893,7 +900,7 @@ async fn handler_with_downstream(
     let blob_store = Arc::new(BlobStore::new(store.clone()));
 
     let (_manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, NAMESPACE).await;
+        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
     let mut repositories = HashMap::new();
     repositories.insert(

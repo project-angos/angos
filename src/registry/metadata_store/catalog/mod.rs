@@ -10,7 +10,7 @@ use tracing::{debug, instrument};
 use angos_tx_engine::StorageError;
 
 use crate::{
-    oci::{Algorithm, Descriptor, Digest, Tag},
+    oci::{Algorithm, Descriptor, Digest, Namespace, Tag},
     registry::{
         metadata_store::{Error, LinkKind, MetadataStore},
         pagination,
@@ -63,7 +63,7 @@ impl MetadataStore {
     #[instrument(skip(self))]
     pub async fn list_tags(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         n: u16,
         last: Option<String>,
     ) -> Result<(Vec<Tag>, Option<String>), Error> {
@@ -90,7 +90,7 @@ impl MetadataStore {
     #[instrument(skip(self))]
     pub async fn list_tag_names(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         n: u16,
         last: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
@@ -105,7 +105,7 @@ impl MetadataStore {
     /// Enumerates every raw tag directory name under `namespace`'s tags dir.
     /// Paginates in memory like `list_namespaces`: backend `start-after`
     /// ordering and exclusive-`last` semantics aren't portable across backends.
-    async fn collect_tag_dir_names(&self, namespace: &str) -> Result<Vec<String>, Error> {
+    async fn collect_tag_dir_names(&self, namespace: &Namespace) -> Result<Vec<String>, Error> {
         let tags_dir = path_builder::manifest_tags_dir(namespace);
 
         let mut names = Vec::new();
@@ -132,7 +132,7 @@ impl MetadataStore {
     #[instrument(skip(self))]
     pub async fn find_tags_pointing_at(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
     ) -> Result<Vec<LinkKind>, Error> {
         let all_tags =
@@ -165,7 +165,7 @@ impl MetadataStore {
     #[instrument(skip(self))]
     pub async fn list_referrers(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
         artifact_type: Option<String>,
     ) -> Result<Vec<Descriptor>, Error> {
@@ -227,7 +227,11 @@ impl MetadataStore {
         Ok(referrers)
     }
 
-    pub async fn has_referrers(&self, namespace: &str, subject: &Digest) -> Result<bool, Error> {
+    pub async fn has_referrers(
+        &self,
+        namespace: &Namespace,
+        subject: &Digest,
+    ) -> Result<bool, Error> {
         let referrers_dir = path_builder::manifest_referrers_dir(namespace, subject);
         let page = self.store().list(&referrers_dir, 1, None).await?;
         Ok(!page.items.is_empty())
@@ -235,7 +239,7 @@ impl MetadataStore {
 
     pub async fn list_revisions(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<Digest>, Option<String>), Error> {
@@ -265,7 +269,7 @@ impl MetadataStore {
         .await
     }
 
-    pub async fn count_manifests(&self, namespace: &str) -> Result<usize, Error> {
+    pub async fn count_manifests(&self, namespace: &Namespace) -> Result<usize, Error> {
         let mut count = 0;
         for &algorithm in Algorithm::supported_algorithms() {
             let revisions_dir =
@@ -299,7 +303,20 @@ impl MetadataStore {
 
     /// Delete an entire tag directory by prefix. Used by scrub for an invalid
     /// tag name, which cannot form a typed `LinkKind::Tag` for a link delete.
-    pub async fn delete_tag_directory(&self, namespace: &str, tag_name: &str) -> Result<(), Error> {
+    ///
+    /// `tag_name` must be a single path segment: a name containing `/`, `..`, or
+    /// `.` could escape the tags directory and delete an unrelated prefix, so it
+    /// is rejected rather than deleted.
+    pub async fn delete_tag_directory(
+        &self,
+        namespace: &Namespace,
+        tag_name: &str,
+    ) -> Result<(), Error> {
+        if tag_name.is_empty() || tag_name.contains('/') || tag_name == "." || tag_name == ".." {
+            return Err(Error::InvalidData(format!(
+                "unsafe tag directory name: '{tag_name}'"
+            )));
+        }
         self.store()
             .delete_prefix(&path_builder::manifest_tag_dir(namespace, tag_name))
             .await

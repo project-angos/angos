@@ -161,7 +161,7 @@ pub fn create_test_registry_with(
 /// Write raw bytes at the canonical link path for `link` in `namespace`,
 /// bypassing the transactional `update_links` path so tests can seed
 /// hand-crafted or deliberately corrupt link files.
-pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body: &[u8]) {
+pub async fn put_link_raw(store: &Store, namespace: &Namespace, link: &LinkKind, body: &[u8]) {
     store
         .put(
             &path_builder::link_path(link, namespace),
@@ -212,8 +212,8 @@ pub async fn create_test_blob(
         .read_blob_index(&digest)
         .await
         .unwrap();
-    assert!(blob_index.namespace.contains_key(namespace.as_ref()));
-    let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+    assert!(blob_index.namespace.contains_key(namespace));
+    let namespace_links = blob_index.namespace.get(namespace).unwrap();
     assert!(namespace_links.contains(&layer_link));
 
     let repository = Repository {
@@ -503,7 +503,7 @@ pub async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayloa
 pub async fn seed_manifest(
     store: &Store,
     metadata_store: &MetadataStore,
-    namespace: &str,
+    namespace: &Namespace,
 ) -> (Digest, Digest, Digest) {
     let config_bytes = br#"{"config":true}"#.to_vec();
     let layer_bytes = b"layer-bytes".to_vec();

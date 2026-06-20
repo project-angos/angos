@@ -1,4 +1,5 @@
 mod blob;
+mod blob_index;
 mod layout;
 mod link_references;
 mod link_repair;
@@ -17,6 +18,7 @@ mod upload;
 
 use async_trait::async_trait;
 pub use blob::BlobChecker;
+pub use blob_index::BlobIndexChecker;
 pub use layout::LayoutChecker;
 pub use link_references::LinkReferencesChecker;
 pub use link_repair::ensure_link;
@@ -34,7 +36,7 @@ pub use upload::UploadChecker;
 
 use crate::{
     command::scrub::{error::Error, executor::ActionSink},
-    oci::Tag,
+    oci::{Namespace, Tag},
 };
 
 /// A checker that operates on a single namespace at a time.
@@ -44,8 +46,11 @@ use crate::{
 /// each one.
 #[async_trait]
 pub trait NamespaceChecker: Send + Sync {
-    async fn check(&self, namespace: &str, sink: &mut (dyn ActionSink + Send))
-    -> Result<(), Error>;
+    async fn check(
+        &self,
+        namespace: &Namespace,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error>;
 }
 
 /// A checker that operates across the entire store (not namespace-scoped).
@@ -64,7 +69,7 @@ pub trait StoreChecker: Send + Sync {
 pub trait TagChecker: Send + Sync {
     async fn check_tag(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         tag: &Tag,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error>;

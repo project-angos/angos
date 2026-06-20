@@ -172,7 +172,7 @@ fn test_is_tag_mutable_with_global_setting() {
 
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(&config, &cache).unwrap();
-    assert!(!authorizer.is_tag_mutable(None, "v1.0.0"));
+    assert!(!authorizer.is_tag_mutable(None, &Tag::new("v1.0.0").unwrap()));
 }
 
 #[test]
@@ -186,9 +186,9 @@ fn test_is_tag_mutable_with_global_exclusions() {
 
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(&config, &cache).unwrap();
-    assert!(authorizer.is_tag_mutable(None, "latest"));
-    assert!(authorizer.is_tag_mutable(None, "dev-branch"));
-    assert!(!authorizer.is_tag_mutable(None, "v1.0.0"));
+    assert!(authorizer.is_tag_mutable(None, &Tag::new("latest").unwrap()));
+    assert!(authorizer.is_tag_mutable(None, &Tag::new("dev-branch").unwrap()));
+    assert!(!authorizer.is_tag_mutable(None, &Tag::new("v1.0.0").unwrap()));
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn test_is_tag_mutable_with_repository_setting() {
 
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(&config, &cache).unwrap();
-    assert!(!authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"));
+    assert!(!authorizer.is_tag_mutable(Some("myrepo"), &Tag::new("v1.0.0").unwrap()));
 }
 
 #[test]
@@ -224,9 +224,9 @@ fn test_is_tag_mutable_with_repository_exclusions() {
 
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(&config, &cache).unwrap();
-    assert!(authorizer.is_tag_mutable(Some("myrepo"), "test-123"));
-    assert!(!authorizer.is_tag_mutable(Some("myrepo"), "latest"));
-    assert!(!authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"));
+    assert!(authorizer.is_tag_mutable(Some("myrepo"), &Tag::new("test-123").unwrap()));
+    assert!(!authorizer.is_tag_mutable(Some("myrepo"), &Tag::new("latest").unwrap()));
+    assert!(!authorizer.is_tag_mutable(Some("myrepo"), &Tag::new("v1.0.0").unwrap()));
 }
 
 #[test]
@@ -243,9 +243,9 @@ fn test_is_tag_mutable_with_repository_name() {
 
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(&config, &cache).unwrap();
-    assert!(!authorizer.is_tag_mutable(Some("docker-io"), "v1.0.0"));
-    assert!(authorizer.is_tag_mutable(Some("docker-io"), "latest"));
-    assert!(authorizer.is_tag_mutable(None, "v1.0.0"));
+    assert!(!authorizer.is_tag_mutable(Some("docker-io"), &Tag::new("v1.0.0").unwrap()));
+    assert!(authorizer.is_tag_mutable(Some("docker-io"), &Tag::new("latest").unwrap()));
+    assert!(authorizer.is_tag_mutable(None, &Tag::new("v1.0.0").unwrap()));
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn test_is_tag_mutable_when_not_immutable() {
 
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(&config, &cache).unwrap();
-    assert!(authorizer.is_tag_mutable(Some("myrepo"), "any-tag"));
+    assert!(authorizer.is_tag_mutable(Some("myrepo"), &Tag::new("any-tag").unwrap()));
 }
 
 // When immutable_tags is true and the tag matches an exclusion pattern, the
@@ -281,11 +281,11 @@ fn is_tag_mutable_returns_true_when_immutable_but_excluded() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(&config, &cache).unwrap();
     assert!(
-        authorizer.is_tag_mutable(Some("myrepo"), "latest"),
+        authorizer.is_tag_mutable(Some("myrepo"), &Tag::new("latest").unwrap()),
         "'latest' must be mutable because it matches the exclusion pattern"
     );
     assert!(
-        authorizer.is_tag_mutable(Some("myrepo"), "dev-feature"),
+        authorizer.is_tag_mutable(Some("myrepo"), &Tag::new("dev-feature").unwrap()),
         "'dev-feature' must be mutable because it matches 'dev-.*'"
     );
 }
@@ -306,7 +306,7 @@ fn is_tag_mutable_returns_false_when_immutable_and_not_excluded() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(&config, &cache).unwrap();
     assert!(
-        !authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"),
+        !authorizer.is_tag_mutable(Some("myrepo"), &Tag::new("v1.0.0").unwrap()),
         "'v1.0.0' must be immutable: immutable_tags=true and not excluded"
     );
 }

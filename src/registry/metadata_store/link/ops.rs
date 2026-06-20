@@ -22,7 +22,7 @@ use angos_tx_engine::{
 };
 
 use crate::{
-    oci::{Descriptor, Digest},
+    oci::{Descriptor, Digest, Namespace},
     registry::{
         metadata_store::{
             BlobIndexOperation, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore,
@@ -235,7 +235,7 @@ impl LinkMutations {
     /// `Put` `metadata` for `link` and record it among the written links.
     fn put_link(
         &mut self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
         metadata: LinkMetadata,
     ) -> Result<(), TxError> {
@@ -253,7 +253,7 @@ impl LinkMutations {
 
     /// `Delete` `link`, queue its blob-index `Remove` against `target`, and
     /// record it among the deleted links.
-    fn delete_link(&mut self, namespace: &str, link: &LinkKind, target: &Digest) {
+    fn delete_link(&mut self, namespace: &Namespace, link: &LinkKind, target: &Digest) {
         self.builder = std::mem::take(&mut self.builder).mutation(Mutation::Delete {
             key: path_builder::link_path(link, namespace),
             expected: None,
@@ -269,7 +269,7 @@ impl MetadataStore {
     /// Thin wrapper over [`Self::execute_links_tx`].
     pub async fn update_links(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         operations: &[LinkOperation],
     ) -> Result<(), Error> {
         if operations.is_empty() {
@@ -286,7 +286,7 @@ impl MetadataStore {
     /// delete (a genuine client request).
     pub async fn delete_links(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         operations: &[LinkOperation],
         source_ts: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
@@ -305,7 +305,7 @@ impl MetadataStore {
     /// the named phases below.
     pub async fn execute_links_tx(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         operations: &[LinkOperation],
         tx: LinksTx<'_>,
     ) -> Result<LinksCommit, Error> {
@@ -413,7 +413,7 @@ impl MetadataStore {
     /// engine lock, in parallel.
     async fn prelock_read_links<'a>(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         operations: &'a [LinkOperation],
     ) -> Vec<PrelockOp<'a>> {
         join_all(operations.iter().map(|op| async move {
@@ -460,7 +460,7 @@ impl MetadataStore {
     /// conflict detection and metadata merging run against current state.
     async fn reread_link_cache(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         prelock: &[PrelockOp<'_>],
     ) -> Result<HashMap<LinkKind, LinkMetadata>, TxError> {
         let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
@@ -508,7 +508,7 @@ impl MetadataStore {
     /// writes report `changed` and skip it.
     async fn validate_lww_reads(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         prelock: &[PrelockOp<'_>],
         tx: &LinksTx<'_>,
     ) -> Result<LwwValidation, TxError> {
@@ -630,7 +630,7 @@ fn detect_create_conflicts(
 /// builder with the LWW reads and direct blob-index ops, then threads a
 /// [`LinkMutations`] accumulator through the create/delete processors.
 fn build_link_mutations(
-    namespace: &str,
+    namespace: &Namespace,
     prelock: &[PrelockOp<'_>],
     link_cache: &mut HashMap<LinkKind, LinkMetadata>,
     tx: &LinksTx<'_>,
@@ -666,7 +666,7 @@ fn build_link_mutations(
 /// Phase 5 (creates): append a link `Put` per `Create` op, recording the
 /// inserted / moved blob-index entries and the written link metadata.
 fn build_create_mutations(
-    namespace: &str,
+    namespace: &Namespace,
     prelock: &[PrelockOp<'_>],
     link_cache: &mut HashMap<LinkKind, LinkMetadata>,
     tx: &LinksTx<'_>,
@@ -741,7 +741,7 @@ fn build_create_mutations(
 /// left becomes a `Put`) or remove the link outright (a `Delete` plus the
 /// blob-index `Remove`).
 fn build_delete_mutations(
-    namespace: &str,
+    namespace: &Namespace,
     prelock: &[PrelockOp<'_>],
     link_cache: &mut HashMap<LinkKind, LinkMetadata>,
     mut acc: LinkMutations,
@@ -790,7 +790,7 @@ fn build_delete_mutations(
 /// blob-store delete).
 async fn blob_will_be_unreferenced(
     store: &Store,
-    namespace: &str,
+    namespace: &Namespace,
     tx: &LinksTx<'_>,
     pending_blob_ops: &HashMap<Digest, Vec<BlobIndexOperation>>,
 ) -> Result<bool, TxError> {

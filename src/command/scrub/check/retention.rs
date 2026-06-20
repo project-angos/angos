@@ -12,7 +12,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::{Digest, Tag},
+    oci::{Digest, Namespace, Tag},
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
         Repository,
@@ -35,7 +35,7 @@ pub struct RetentionChecker {
 
 fn has_link_kind(
     blob_index: &BlobIndex,
-    namespace: &str,
+    namespace: &Namespace,
     predicate: impl Fn(&LinkKind) -> bool,
 ) -> bool {
     blob_index
@@ -159,7 +159,7 @@ impl RetentionChecker {
 impl NamespaceChecker for RetentionChecker {
     async fn check(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking retention policies on '{namespace}'");
@@ -184,7 +184,7 @@ impl NamespaceChecker for RetentionChecker {
 impl RetentionChecker {
     async fn fetch_tag_metadata(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         tag_names: &[Tag],
     ) -> Result<Vec<TagWithMetadata>, Error> {
         const BATCH_SIZE: usize = 100;
@@ -199,7 +199,7 @@ impl RetentionChecker {
 
     async fn fetch_metadata_batch(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         tag_names: &[Tag],
     ) -> Result<Vec<TagWithMetadata>, Error> {
         let results: Result<Vec<TagWithMetadata>, Error> = join_all(
@@ -215,7 +215,7 @@ impl RetentionChecker {
 
     async fn fetch_single_tag_metadata(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         tag: Tag,
     ) -> Result<TagWithMetadata, Error> {
         let metadata = self
@@ -242,7 +242,7 @@ impl RetentionChecker {
 
     fn get_deletable_tags<'a>(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         tags: &'a [TagWithMetadata],
         last_pushed: &[String],
         last_pulled: &[String],
@@ -259,13 +259,13 @@ impl RetentionChecker {
 
     async fn emit_delete_tags(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         tags_to_delete: &[&Tag],
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         for tag in tags_to_delete {
             sink.apply(Action::DeleteTag {
-                namespace: namespace.to_string(),
+                namespace: namespace.clone(),
                 tag: (*tag).clone(),
             })
             .await?;
@@ -275,7 +275,7 @@ impl RetentionChecker {
 
     fn should_retain_tag(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         tag: &TagWithMetadata,
         last_pushed: &[String],
         last_pulled: &[String],
@@ -293,8 +293,8 @@ impl RetentionChecker {
 
     fn evaluate_retention_policies(
         &self,
-        namespace: &str,
-        tag: &str,
+        namespace: &Namespace,
+        tag: &Tag,
         manifest: &ManifestImage,
         last_pushed: &[String],
         last_pulled: &[String],
@@ -331,7 +331,7 @@ impl RetentionChecker {
 
     async fn emit_delete_orphan_manifests(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         last_pushed: &[String],
         last_pulled: &[String],
         sink: &mut (dyn ActionSink + Send),
@@ -352,7 +352,7 @@ impl RetentionChecker {
 
     async fn process_orphan_revision(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
         last_pushed: &[String],
         last_pulled: &[String],
@@ -389,7 +389,7 @@ impl RetentionChecker {
 
     async fn apply_fate(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
         fate: Fate,
         sink: &mut (dyn ActionSink + Send),
@@ -398,7 +398,7 @@ impl RetentionChecker {
             Fate::Skip | Fate::Retain => Ok(()),
             Fate::Delete => {
                 sink.apply(Action::DeleteOrphanManifest {
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
                 .await
@@ -406,7 +406,7 @@ impl RetentionChecker {
         }
     }
 
-    async fn is_protected(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
+    async fn is_protected(&self, namespace: &Namespace, digest: &Digest) -> Result<bool, Error> {
         if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
             && has_link_kind(&blob_index, namespace, |link| {
                 matches!(link, LinkKind::Manifest(_, _))
@@ -422,7 +422,7 @@ impl RetentionChecker {
         Ok(false)
     }
 
-    async fn has_tags(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
+    async fn has_tags(&self, namespace: &Namespace, digest: &Digest) -> Result<bool, Error> {
         if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
             && has_link_kind(&blob_index, namespace, |link| {
                 matches!(link, LinkKind::Tag(_))
@@ -485,7 +485,7 @@ mod tests {
 
     async fn setup_index_scenario(
         metadata_store: &Arc<MetadataStore>,
-        namespace: &str,
+        namespace: &Namespace,
         index_digest: &Digest,
         child_digest: &Digest,
     ) {
@@ -517,7 +517,7 @@ mod tests {
 
     async fn teardown_index_scenario(
         metadata_store: &Arc<MetadataStore>,
-        namespace: &str,
+        namespace: &Namespace,
         index_digest: Digest,
         child_digest: &Digest,
     ) {
@@ -711,14 +711,14 @@ mod tests {
     #[tokio::test]
     async fn test_orphan_manifest_deleted_with_policy() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
             let digest = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
 
             metadata_store
                 .update_links(
-                    namespace,
+                    &namespace,
                     &[LinkOperation::create(
                         LinkKind::Digest(digest.clone()),
                         digest.clone(),
@@ -740,13 +740,13 @@ mod tests {
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
-                .check(namespace, &mut executor)
+                .check(&namespace, &mut executor)
                 .await
                 .unwrap();
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest))
+                    .read_link(&namespace, &LinkKind::Digest(digest))
                     .await
                     .is_err()
             );
@@ -757,14 +757,14 @@ mod tests {
     #[tokio::test]
     async fn test_orphan_manifest_kept_without_policy() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
             let digest = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
 
             metadata_store
                 .update_links(
-                    namespace,
+                    &namespace,
                     &[LinkOperation::create(
                         LinkKind::Digest(digest.clone()),
                         digest.clone(),
@@ -779,13 +779,13 @@ mod tests {
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver, None)
-                .check(namespace, &mut executor)
+                .check(&namespace, &mut executor)
                 .await
                 .unwrap();
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest))
+                    .read_link(&namespace, &LinkKind::Digest(digest))
                     .await
                     .is_ok()
             );
@@ -796,13 +796,13 @@ mod tests {
     #[tokio::test]
     async fn test_index_child_manifest_protected() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
             let child_digest = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
             let index_digest = put_blob_direct(metadata_store.store(), TEST_INDEX).await;
 
-            setup_index_scenario(&metadata_store, namespace, &index_digest, &child_digest).await;
+            setup_index_scenario(&metadata_store, &namespace, &index_digest, &child_digest).await;
 
             let policy = Arc::new(RetentionPolicy::new(
                 &RetentionPolicyConfig {
@@ -817,18 +817,18 @@ mod tests {
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver, Some(policy.clone()))
-                .check(namespace, &mut executor)
+                .check(&namespace, &mut executor)
                 .await
                 .unwrap();
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(child_digest.clone()))
+                    .read_link(&namespace, &LinkKind::Digest(child_digest.clone()))
                     .await
                     .is_ok()
             );
 
-            teardown_index_scenario(&metadata_store, namespace, index_digest, &child_digest).await;
+            teardown_index_scenario(&metadata_store, &namespace, index_digest, &child_digest).await;
 
             let mut executor2 = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver2 = Arc::new(
@@ -836,13 +836,13 @@ mod tests {
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver2, Some(policy))
-                .check(namespace, &mut executor2)
+                .check(&namespace, &mut executor2)
                 .await
                 .unwrap();
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(child_digest))
+                    .read_link(&namespace, &LinkKind::Digest(child_digest))
                     .await
                     .is_err()
             );
@@ -905,7 +905,7 @@ mod tests {
     #[tokio::test]
     async fn retention_checker_continues_after_missing_blob_in_one_revision() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = Namespace::new("test-repo/app").unwrap();
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -913,7 +913,7 @@ mod tests {
             let digest_missing = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
             metadata_store
                 .update_links(
-                    namespace,
+                    &namespace,
                     &[LinkOperation::create(
                         LinkKind::Digest(digest_missing.clone()),
                         digest_missing.clone(),
@@ -927,7 +927,7 @@ mod tests {
             let digest_healthy = put_blob_direct(metadata_store.store(), TEST_INDEX).await;
             metadata_store
                 .update_links(
-                    namespace,
+                    &namespace,
                     &[LinkOperation::create(
                         LinkKind::Digest(digest_healthy.clone()),
                         digest_healthy.clone(),
@@ -949,14 +949,14 @@ mod tests {
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
-                .check(namespace, &mut executor)
+                .check(&namespace, &mut executor)
                 .await
                 .unwrap();
 
             // The healthy revision must be cleaned up: the broken one did not block the loop.
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest_healthy))
+                    .read_link(&namespace, &LinkKind::Digest(digest_healthy))
                     .await
                     .is_err(),
                 "healthy revision after the broken one must still be processed"
@@ -965,7 +965,7 @@ mod tests {
         }
     }
 
-    fn make_manifest(tag: &str) -> ManifestImage {
+    fn make_manifest(tag: &Tag) -> ManifestImage {
         ManifestImage {
             tag: Some(tag.to_string()),
             pushed_at: EpochSeconds::from_seconds(0),
@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn check_global_policy_returns_no_opinion_when_policy_absent() {
-        let manifest = make_manifest("v1");
+        let manifest = make_manifest(&Tag::new("v1").unwrap());
         let result = check_global_policy(None, &manifest, &[], &[]).unwrap();
         assert_eq!(result, PolicyDecision::NoOpinion);
     }
@@ -988,7 +988,7 @@ mod tests {
             },
             Arc::new(SystemClock),
         );
-        let manifest = make_manifest("v1");
+        let manifest = make_manifest(&Tag::new("v1").unwrap());
         let result = check_global_policy(Some(&policy), &manifest, &[], &[]).unwrap();
         assert_eq!(result, PolicyDecision::Retain);
     }
@@ -1001,7 +1001,7 @@ mod tests {
             },
             Arc::new(SystemClock),
         );
-        let manifest = make_manifest("v1");
+        let manifest = make_manifest(&Tag::new("v1").unwrap());
         let result = check_global_policy(Some(&policy), &manifest, &[], &[]).unwrap();
         assert_eq!(result, PolicyDecision::Delete);
     }
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn check_repo_policy_returns_no_opinion_when_repository_absent() {
-        let manifest = make_manifest("v1");
+        let manifest = make_manifest(&Tag::new("v1").unwrap());
         let result = check_repo_policy(None, &manifest, &[], &[]).unwrap();
         assert_eq!(result, PolicyDecision::NoOpinion);
     }
@@ -1030,7 +1030,7 @@ mod tests {
     #[test]
     fn check_repo_policy_returns_no_opinion_when_repo_has_no_rules() {
         let repo = make_repo("r", vec![]);
-        let manifest = make_manifest("v1");
+        let manifest = make_manifest(&Tag::new("v1").unwrap());
         let result = check_repo_policy(Some(&repo), &manifest, &[], &[]).unwrap();
         assert_eq!(result, PolicyDecision::NoOpinion);
     }
@@ -1038,7 +1038,7 @@ mod tests {
     #[test]
     fn check_repo_policy_returns_retain_when_repo_policy_keeps() {
         let repo = make_repo("r", vec![CelRule::compile("image.tag == 'v1'").unwrap()]);
-        let manifest = make_manifest("v1");
+        let manifest = make_manifest(&Tag::new("v1").unwrap());
         let result = check_repo_policy(Some(&repo), &manifest, &[], &[]).unwrap();
         assert_eq!(result, PolicyDecision::Retain);
     }
@@ -1049,7 +1049,7 @@ mod tests {
             "r",
             vec![CelRule::compile("image.tag == 'keep-me'").unwrap()],
         );
-        let manifest = make_manifest("v1");
+        let manifest = make_manifest(&Tag::new("v1").unwrap());
         let result = check_repo_policy(Some(&repo), &manifest, &[], &[]).unwrap();
         assert_eq!(result, PolicyDecision::Delete);
     }

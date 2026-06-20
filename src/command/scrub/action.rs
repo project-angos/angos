@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::{
-    oci::{Digest, Tag},
+    oci::{Digest, Namespace, Tag},
     registry::{
         job_store::{JobState, Queue},
         metadata_store::LinkKind,
@@ -19,7 +19,15 @@ pub enum Action {
     PruneLegacyNamespaceRegistry,
     DeleteOrphanBlob(Digest),
     RemoveBlobIndexLink {
-        namespace: String,
+        namespace: Namespace,
+        blob: Digest,
+        link: LinkKind,
+    },
+    /// Re-add a blob-index grant the index is missing relative to a manifest that
+    /// still references the blob (the additive half of a blob-index reconcile).
+    /// Idempotent: re-inserting a present link is a no-op.
+    GrantBlobIndexLink {
+        namespace: Namespace,
         blob: Digest,
         link: LinkKind,
     },
@@ -27,50 +35,50 @@ pub enum Action {
     /// namespace references the blob), reclaiming the bytes when it was the last
     /// reference anywhere.
     RemoveOrphanBlobGrant {
-        namespace: String,
+        namespace: Namespace,
         blob: Digest,
     },
     RecreateLink {
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
     },
     AddReferrer {
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
         referrer: Digest,
     },
     RemoveReferrer {
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         referrer: Digest,
     },
     SetMediaType {
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
         media_type: String,
         display_name: String,
     },
     DeleteTag {
-        namespace: String,
+        namespace: Namespace,
         tag: Tag,
     },
     DeleteInvalidTag {
-        namespace: String,
+        namespace: Namespace,
         tag: String,
     },
     DeleteOrphanManifest {
-        namespace: String,
+        namespace: Namespace,
         digest: Digest,
     },
     DeleteExpiredUpload {
-        namespace: String,
+        namespace: Namespace,
         uuid: String,
     },
     DeleteOrphanReferrer {
-        namespace: String,
+        namespace: Namespace,
         subject: Digest,
         referrer: Digest,
     },
@@ -83,7 +91,7 @@ pub enum Action {
     /// divergences get the event path's durable retry/backoff/coalescing.
     EnqueueReplicationPush {
         downstream: String,
-        namespace: String,
+        namespace: Namespace,
         tag: Tag,
         digest: Digest,
     },
@@ -92,7 +100,7 @@ pub enum Action {
     /// would destroy an active-active peer's not-yet-replicated newer tag.
     EnqueueReplicationDelete {
         downstream: String,
-        namespace: String,
+        namespace: Namespace,
         tag: Tag,
     },
     /// Delete a queued job (replication or cache) whose payload no longer
@@ -130,6 +138,16 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "remove invalid link from blob index '{namespace}/{blob}': '{link}'"
+                )
+            }
+            Action::GrantBlobIndexLink {
+                namespace,
+                blob,
+                link,
+            } => {
+                write!(
+                    f,
+                    "grant missing blob-index entry '{namespace}/{blob}': '{link}'"
                 )
             }
             Action::RemoveOrphanBlobGrant { namespace, blob } => {

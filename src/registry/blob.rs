@@ -154,12 +154,10 @@ pub async fn cache_blob_mutations(
 ) -> Result<(Vec<Read>, Vec<Mutation>), Error> {
     debug!("Fetching blob: {digest}");
     let session_id = Uuid::new_v4().to_string();
-    blob_store
-        .create_upload(namespace.as_ref(), &session_id)
-        .await?;
+    blob_store.create_upload(&namespace, &session_id).await?;
     blob_store
         .write_upload(
-            namespace.as_ref(),
+            &namespace,
             &session_id,
             stream,
             Some(content_length),
@@ -167,10 +165,10 @@ pub async fn cache_blob_mutations(
         )
         .await?;
     let (_, mut mutations) = blob_store
-        .finalize_upload_mutations(namespace.as_ref(), &session_id, &digest)
+        .finalize_upload_mutations(&namespace, &session_id, &digest)
         .await?;
     let (reads, mut grant_mutations) = metadata_store
-        .build_grant_mutations(namespace.as_ref(), &digest)
+        .build_grant_mutations(&namespace, &digest)
         .await?;
     mutations.append(&mut grant_mutations);
     Ok((reads, mutations))
@@ -309,7 +307,7 @@ impl Registry {
     /// bubbles up, so a scheduling glitch cannot degrade the client response.
     async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
         let payload = CacheFetchBlobPayload {
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
             digest: digest.to_string(),
         };
         let envelope = match JobEnvelope::new(
@@ -390,7 +388,7 @@ impl Registry {
         let result = async {
             if self
                 .metadata_store
-                .revoke_blob_ownership(namespace.as_ref(), digest)
+                .revoke_blob_ownership(namespace, digest)
                 .await?
             {
                 self.blob_store.delete_blob(digest).await?;
@@ -632,8 +630,8 @@ mod tests {
                 .read_blob_index(&digest)
                 .await
                 .unwrap();
-            assert!(blob_index.namespace.contains_key(namespace.as_ref()));
-            let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            assert!(blob_index.namespace.contains_key(namespace));
+            let namespace_links = blob_index.namespace.get(namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             registry.delete_blob(namespace, &digest).await.unwrap();
@@ -814,7 +812,7 @@ mod tests {
                 .read_blob_index(&digest)
                 .await
                 .unwrap();
-            let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            let namespace_links = blob_index.namespace.get(&namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             let repository = registry.get_repository_for_namespace(&namespace).unwrap();

@@ -14,7 +14,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::{
         blob_store,
         metadata_store::{Error as MetadataError, MetadataStore},
@@ -49,7 +49,7 @@ impl OrphanNamespaceChecker {
     /// in-flight uploads are swept separately by [`Self::clear_uploads`].
     async fn clear_namespace(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         // Each revision delete cascades its digest link, pointing tags, referrer
@@ -57,7 +57,7 @@ impl OrphanNamespaceChecker {
         let mut revisions = list_all::revisions(&self.metadata_store, namespace);
         while let Some(digest) = revisions.next().await {
             sink.apply(Action::DeleteOrphanManifest {
-                namespace: namespace.to_string(),
+                namespace: namespace.clone(),
                 digest: digest?,
             })
             .await?;
@@ -66,7 +66,7 @@ impl OrphanNamespaceChecker {
         let mut tags = list_all::tags(&self.metadata_store, namespace);
         while let Some(tag) = tags.next().await {
             sink.apply(Action::DeleteTag {
-                namespace: namespace.to_string(),
+                namespace: namespace.clone(),
                 tag: tag?,
             })
             .await?;
@@ -77,13 +77,13 @@ impl OrphanNamespaceChecker {
     /// Sweep every in-flight upload of the dead `namespace`.
     async fn clear_uploads(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         let mut uploads = list_all::uploads(&self.blob_store, namespace);
         while let Some(uuid) = uploads.next().await {
             sink.apply(Action::DeleteExpiredUpload {
-                namespace: namespace.to_string(),
+                namespace: namespace.clone(),
                 uuid: uuid?,
             })
             .await?;
@@ -147,6 +147,13 @@ impl StoreChecker for OrphanNamespaceChecker {
             if self.resolver.resolve(&namespace).is_some() {
                 continue;
             }
+            let namespace = match Namespace::new(&namespace) {
+                Ok(namespace) => namespace,
+                Err(e) => {
+                    error!("Skipping invalid enumerated namespace '{namespace}': {e}");
+                    continue;
+                }
+            };
             if let Err(e) = self.clear_namespace(&namespace, sink).await {
                 error!("Failed to clear orphan namespace '{namespace}': {e}");
             }
@@ -159,6 +166,13 @@ impl StoreChecker for OrphanNamespaceChecker {
             if self.resolver.resolve(&namespace).is_some() {
                 continue;
             }
+            let namespace = match Namespace::new(&namespace) {
+                Ok(namespace) => namespace,
+                Err(e) => {
+                    error!("Skipping invalid enumerated upload namespace '{namespace}': {e}");
+                    continue;
+                }
+            };
             if let Err(e) = self.clear_uploads(&namespace, sink).await {
                 error!("Failed to clear orphan namespace uploads '{namespace}': {e}");
             }
@@ -248,12 +262,12 @@ mod tests {
             checker.check_all(&mut executor).await.unwrap();
 
             let (revisions, _) = metadata_store
-                .list_revisions("ghost/app", 100, None)
+                .list_revisions(&namespace, 100, None)
                 .await
                 .unwrap();
             assert!(revisions.is_empty(), "revisions must be cleared");
             let (tags, _) = metadata_store
-                .list_tags("ghost/app", 100, None)
+                .list_tags(&namespace, 100, None)
                 .await
                 .unwrap();
             assert!(tags.is_empty(), "tags must be cleared");
@@ -287,7 +301,7 @@ mod tests {
                 "a configured namespace must not be touched"
             );
             let (tags, _) = metadata_store
-                .list_tags("keep/app", 100, None)
+                .list_tags(&namespace, 100, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -327,7 +341,7 @@ mod tests {
                 "the orphan tag must be captured"
             );
             let (revisions, _) = metadata_store
-                .list_revisions("ghost/app", 100, None)
+                .list_revisions(&namespace, 100, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -360,7 +374,7 @@ mod tests {
                 "an empty resolver must not delete the whole registry"
             );
             let (revisions, _) = metadata_store
-                .list_revisions("ghost/app", 100, None)
+                .list_revisions(&namespace, 100, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -449,7 +463,7 @@ mod tests {
             // The end-state of a real push: manifest/config/layer blobs, their
             // links, the revision self-link, and the config/layer ownership grants.
             let (manifest_digest, config_digest, layer_digest) =
-                test_utils::seed_manifest(metadata_store.store(), &metadata_store, "ghost/app")
+                test_utils::seed_manifest(metadata_store.store(), &metadata_store, &namespace)
                     .await;
             metadata_store
                 .update_links(
@@ -464,7 +478,7 @@ mod tests {
             for digest in [config_digest.clone(), layer_digest.clone()] {
                 metadata_store
                     .update_blob_index(
-                        "ghost/app",
+                        &namespace,
                         &digest,
                         BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
                     )
@@ -505,10 +519,11 @@ mod tests {
 
             // A grant-only blob owned by a *configured* namespace: the resolve
             // guard must spare it, the same as a live repo's bytes.
+            let namespace = Namespace::new("keep/app").unwrap();
             let blob = put_blob_direct(metadata_store.store(), b"live grant").await;
             metadata_store
                 .update_blob_index(
-                    "keep/app",
+                    &namespace,
                     &blob,
                     BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
                 )
@@ -525,7 +540,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_blob_index_namespace("keep/app", &blob)
+                    .read_blob_index_namespace(&namespace, &blob)
                     .await
                     .is_ok(),
                 "a configured namespace's grant must be spared"
@@ -549,9 +564,10 @@ mod tests {
             // namespace's reference still pins the bytes.
             let blob = put_blob_direct(metadata_store.store(), b"shared blob").await;
             for namespace in ["keep/app", "ghost/app"] {
+                let namespace = Namespace::new(namespace).unwrap();
                 metadata_store
                     .update_blob_index(
-                        namespace,
+                        &namespace,
                         &blob,
                         BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
                     )
@@ -569,14 +585,14 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_blob_index_namespace("ghost/app", &blob)
+                    .read_blob_index_namespace(&Namespace::new("ghost/app").unwrap(), &blob)
                     .await
                     .is_err(),
                 "the orphan namespace's grant must be revoked"
             );
             assert!(
                 metadata_store
-                    .read_blob_index_namespace("keep/app", &blob)
+                    .read_blob_index_namespace(&Namespace::new("keep/app").unwrap(), &blob)
                     .await
                     .is_ok(),
                 "the configured namespace's grant must remain"
@@ -598,10 +614,11 @@ mod tests {
             // An orphan namespace whose sole footprint is a grant (no manifest),
             // the end-state of a push that lost last-writer-wins. The grant is
             // revoked and the now-unreferenced bytes reclaimed.
+            let namespace = Namespace::new("ghost/app").unwrap();
             let blob = put_blob_direct(metadata_store.store(), b"pure grant").await;
             metadata_store
                 .update_blob_index(
-                    "ghost/app",
+                    &namespace,
                     &blob,
                     BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
                 )
@@ -618,7 +635,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_blob_index_namespace("ghost/app", &blob)
+                    .read_blob_index_namespace(&namespace, &blob)
                     .await
                     .is_err(),
                 "the orphan namespace's grant must be revoked"
@@ -637,10 +654,11 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
+            let namespace = Namespace::new("ghost/app").unwrap();
             let blob = put_blob_direct(metadata_store.store(), b"dry-run grant").await;
             metadata_store
                 .update_blob_index(
-                    "ghost/app",
+                    &namespace,
                     &blob,
                     BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
                 )
@@ -665,7 +683,7 @@ mod tests {
             );
             assert!(
                 metadata_store
-                    .read_blob_index_namespace("ghost/app", &blob)
+                    .read_blob_index_namespace(&namespace, &blob)
                     .await
                     .is_ok(),
                 "a capturing sink must not revoke the grant"
@@ -684,7 +702,10 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let uuid = uuid::Uuid::new_v4().to_string();
-            blob_store.create_upload("ghost/app", &uuid).await.unwrap();
+            blob_store
+                .create_upload(&Namespace::new("ghost/app").unwrap(), &uuid)
+                .await
+                .unwrap();
 
             let checker = OrphanNamespaceChecker::new(
                 blob_store.clone(),

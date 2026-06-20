@@ -73,14 +73,11 @@ pub async fn test_datastore_list_uploads(store: &BlobStore) {
 async fn seed_blob_with(store: &BlobStore, content: &[u8], algorithm: Algorithm) -> Digest {
     let namespace = Namespace::new("test/setup").unwrap();
     let uuid = Uuid::new_v4().to_string();
-    store
-        .create_upload(namespace.as_ref(), &uuid)
-        .await
-        .unwrap();
+    store.create_upload(&namespace, &uuid).await.unwrap();
     let len = content.len() as u64;
     store
         .write_upload(
-            namespace.as_ref(),
+            &namespace,
             &uuid,
             Box::new(Cursor::new(content.to_vec())),
             Some(len),
@@ -90,7 +87,7 @@ async fn seed_blob_with(store: &BlobStore, content: &[u8], algorithm: Algorithm)
         .unwrap();
     let expected = Digest::from_bytes(algorithm, content);
     store
-        .complete_upload(namespace.as_ref(), &uuid, &expected)
+        .complete_upload(&namespace, &uuid, &expected)
         .await
         .unwrap()
 }

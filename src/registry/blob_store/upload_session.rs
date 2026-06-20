@@ -46,7 +46,7 @@ use angos_tx_engine::{
 };
 
 use crate::{
-    oci::{Algorithm, Digest},
+    oci::{Algorithm, Digest, Namespace},
     registry::{
         blob_store::{
             BlobStore, Error, UploadSummary,
@@ -76,7 +76,7 @@ pub struct UploadSessionRecord {
     /// Equals the upload UUID passed to `BlobStore::create_upload`.
     pub session_id: String,
     /// OCI namespace owning this upload.
-    pub namespace: String,
+    pub namespace: Namespace,
     /// Wall-clock time of the last activity, read from the `startedat` file
     /// (refreshed on each `write` call so `scrub`'s `UploadChecker` uses the
     /// latest activity time rather than creation time alone).
@@ -93,7 +93,7 @@ pub struct UploadSessionRecord {
 impl BlobStore {
     pub async fn read_session(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
     ) -> Result<UploadSessionRecord, Error> {
         // The start-date read and the hash-context read (itself a LIST + GET)
@@ -106,7 +106,7 @@ impl BlobStore {
 
         Ok(UploadSessionRecord {
             session_id: uuid.to_string(),
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
             started_at,
             hash_context,
             uploaded_size,
@@ -131,7 +131,11 @@ impl BlobStore {
     }
 
     /// Read the RFC3339 `startedat` file and parse it as a UTC timestamp.
-    async fn read_start_date(&self, namespace: &str, uuid: &str) -> Result<DateTime<Utc>, Error> {
+    async fn read_start_date(
+        &self,
+        namespace: &Namespace,
+        uuid: &str,
+    ) -> Result<DateTime<Utc>, Error> {
         let key = path_builder::upload_start_date_path(namespace, uuid);
         let data = match self.store.get(&key).await {
             Ok(data) => data,
@@ -145,7 +149,7 @@ impl BlobStore {
     /// Write the RFC3339 `startedat` file.
     async fn write_start_date(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
         started_at: DateTime<Utc>,
     ) -> Result<(), Error> {
@@ -160,7 +164,7 @@ impl BlobStore {
     /// is both the most recent hasher state and the bytes consumed so far.
     async fn read_hash_context(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
     ) -> Result<(Vec<u8>, u64), Error> {
         let dir = format!(
@@ -204,7 +208,7 @@ impl BlobStore {
     /// checkpoint, where `offset` is the cumulative number of bytes hashed.
     async fn write_hash_context(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
         offset: u64,
         state: &[u8],
@@ -218,7 +222,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn list_uploads(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
@@ -245,7 +249,7 @@ impl BlobStore {
     }
 
     #[instrument(skip(self))]
-    pub async fn create_upload(&self, namespace: &str, uuid: &str) -> Result<String, Error> {
+    pub async fn create_upload(&self, namespace: &Namespace, uuid: &str) -> Result<String, Error> {
         let upload_path = path_builder::upload_path(namespace, uuid);
         // Begin/clear a fresh upload at the data key (clears any leaked prior
         // multipart and staged remainder).
@@ -254,7 +258,7 @@ impl BlobStore {
         let hash_context = Hasher::new().state().to_bytes()?;
         let record = UploadSessionRecord {
             session_id: uuid.to_string(),
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
             started_at: Utc::now(),
             hash_context,
             uploaded_size: 0,
@@ -266,7 +270,7 @@ impl BlobStore {
     #[instrument(skip(self, stream))]
     pub async fn write_upload(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
         mut stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
@@ -335,7 +339,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn upload_summary(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
     ) -> Result<UploadSummary, Error> {
         let record = self.read_session(namespace, uuid).await?;
@@ -352,7 +356,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn finalize_upload_mutations(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
         digest: &Digest,
     ) -> Result<(Digest, Vec<Mutation>), Error> {
@@ -388,7 +392,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn complete_upload(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
         digest: &Digest,
     ) -> Result<Digest, Error> {
@@ -415,7 +419,7 @@ impl BlobStore {
     /// Abort the upload and delete the per-file session artifacts plus any
     /// staged bytes. Idempotent.
     #[instrument(skip(self))]
-    pub async fn delete_upload(&self, namespace: &str, uuid: &str) -> Result<(), Error> {
+    pub async fn delete_upload(&self, namespace: &Namespace, uuid: &str) -> Result<(), Error> {
         let upload_path = path_builder::upload_path(namespace, uuid);
         // Discard the upload and all backend state it owns (in-progress
         // multipart(s) and any staged remainder on S3; the staging file on FS).
@@ -432,6 +436,6 @@ impl BlobStore {
 /// `hashstates/` tree) are swept best-effort afterwards via `delete_prefix`;
 /// only the metadata file that marks the session as live is removed in the
 /// transaction.
-fn session_record_keys(namespace: &str, uuid: &str) -> Vec<String> {
+fn session_record_keys(namespace: &Namespace, uuid: &str) -> Vec<String> {
     vec![path_builder::upload_start_date_path(namespace, uuid)]
 }
