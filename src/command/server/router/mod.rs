@@ -2,11 +2,10 @@ use std::str::FromStr;
 
 use hyper::{Method, Uri};
 use serde::{Deserialize, de::DeserializeOwned};
-use uuid::Uuid;
 
 use crate::{
     identity::{Action, ManifestPutTarget},
-    oci::{Digest, Namespace, Reference, Tag},
+    oci::{Digest, Namespace, Reference, Tag, UploadSessionId},
     registry::job_store::{JobState, Queue},
 };
 
@@ -244,7 +243,7 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
 
     let (namespace_str, uuid) = path.rsplit_once("/blobs/uploads/")?;
     let namespace = Namespace::new(namespace_str).ok()?;
-    let uuid = Uuid::from_str(uuid).ok()?;
+    let uuid = UploadSessionId::from_str(uuid).ok()?;
 
     match *method {
         Method::GET => Some(Action::GetUpload { namespace, uuid }),

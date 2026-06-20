@@ -7,13 +7,12 @@ use std::{
 use futures_util::future::join_all;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
-use uuid::Uuid;
 
 use super::{parse::manifest_meta_from_body, *};
 use crate::{
     command::server::Error as ServerError,
     event_webhook::event::EventKind,
-    oci::{Algorithm, Namespace, Tag},
+    oci::{Algorithm, Namespace, Tag, UploadSessionId},
     registry::{
         Error, OCI_TAG, Registry,
         metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
@@ -196,10 +195,10 @@ async fn create_test_manifest_with_subject(
 }
 
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
-    let session_id = Uuid::new_v4();
+    let session_id = UploadSessionId::generate();
     registry
         .blob_store
-        .create_upload(namespace, &session_id.to_string())
+        .create_upload(namespace, session_id.as_ref())
         .await
         .unwrap();
 
@@ -209,7 +208,7 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
         .complete_upload(
             None,
             namespace,
-            session_id,
+            &session_id,
             &digest,
             None,
             Some(body.len() as u64),

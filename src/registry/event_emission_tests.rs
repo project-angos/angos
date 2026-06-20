@@ -27,7 +27,7 @@ use crate::{
         dispatcher::EventDispatcher,
         event::EventKind,
     },
-    oci::{Digest, Namespace, Reference, Tag},
+    oci::{Digest, Namespace, Reference, Tag, UploadSessionId},
     registry::{
         Registry, RegistryConfig, blob_store,
         job_store::{JobStore, Queue},
@@ -104,10 +104,10 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
 }
 
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
-    let session_id = Uuid::new_v4();
+    let session_id = UploadSessionId::generate();
     registry
         .blob_store
-        .create_upload(namespace, &session_id.to_string())
+        .create_upload(namespace, session_id.as_ref())
         .await
         .unwrap();
 
@@ -117,7 +117,7 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
         .complete_upload(
             None,
             namespace,
-            session_id,
+            &session_id,
             &digest,
             None,
             Some(body.len() as u64),

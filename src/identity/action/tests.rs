@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use super::*;
-use crate::oci::{Digest, Namespace, Reference, Tag};
+use crate::oci::{Digest, Namespace, Reference, Tag, UploadSessionId};
 
 const SHA256_EMPTY: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -69,14 +69,14 @@ fn test_action_serialization_cel_compatibility() {
             "get-upload",
             Action::GetUpload {
                 namespace: ns(),
-                uuid: Uuid::nil(),
+                uuid: UploadSessionId::generate(),
             },
         ),
         (
             "update-upload",
             Action::PatchUpload {
                 namespace: ns(),
-                uuid: Uuid::nil(),
+                uuid: UploadSessionId::generate(),
             },
         ),
         (
@@ -84,14 +84,14 @@ fn test_action_serialization_cel_compatibility() {
             Action::PutUpload {
                 namespace: ns(),
                 digest: digest(),
-                uuid: Uuid::nil(),
+                uuid: UploadSessionId::generate(),
             },
         ),
         (
             "cancel-upload",
             Action::DeleteUpload {
                 namespace: ns(),
-                uuid: Uuid::nil(),
+                uuid: UploadSessionId::generate(),
             },
         ),
         (
@@ -410,7 +410,7 @@ fn test_is_push() {
     assert!(
         Action::PatchUpload {
             namespace: ns(),
-            uuid: uuid::Uuid::nil()
+            uuid: UploadSessionId::generate()
         }
         .is_push()
     );
@@ -418,14 +418,14 @@ fn test_is_push() {
         Action::PutUpload {
             namespace: ns(),
             digest: digest(),
-            uuid: uuid::Uuid::nil()
+            uuid: UploadSessionId::generate()
         }
         .is_push()
     );
     assert!(
         Action::DeleteUpload {
             namespace: ns(),
-            uuid: uuid::Uuid::nil()
+            uuid: UploadSessionId::generate()
         }
         .is_push()
     );

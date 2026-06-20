@@ -5,7 +5,6 @@ use tokio::io::AsyncReadExt;
 #[cfg(test)]
 use tracing::info;
 use tracing::{debug, instrument, warn};
-use uuid::Uuid;
 
 #[cfg(test)]
 use angos_tx_engine::transaction::Transaction;
@@ -13,7 +12,7 @@ use angos_tx_engine::transaction::{Mutation, Read};
 
 use crate::{
     metrics_provider::metrics_provider,
-    oci::{Digest, Namespace},
+    oci::{Digest, Namespace, UploadSessionId},
     registry::{
         Error, HeaderMap, Registry, Repository, ResponseHeaders,
         blob_ownership::BlobOwnership,
@@ -153,19 +152,21 @@ pub async fn cache_blob_mutations(
     content_length: u64,
 ) -> Result<(Vec<Read>, Vec<Mutation>), Error> {
     debug!("Fetching blob: {digest}");
-    let session_id = Uuid::new_v4().to_string();
-    blob_store.create_upload(&namespace, &session_id).await?;
+    let session_id = UploadSessionId::generate();
+    blob_store
+        .create_upload(&namespace, session_id.as_ref())
+        .await?;
     blob_store
         .write_upload(
             &namespace,
-            &session_id,
+            session_id.as_ref(),
             stream,
             Some(content_length),
             digest.algorithm(),
         )
         .await?;
     let (_, mut mutations) = blob_store
-        .finalize_upload_mutations(&namespace, &session_id, &digest)
+        .finalize_upload_mutations(&namespace, session_id.as_ref(), &digest)
         .await?;
     let (reads, mut grant_mutations) = metadata_store
         .build_grant_mutations(&namespace, &digest)

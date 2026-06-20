@@ -1,6 +1,7 @@
 // All variants are named `Invalid*` by design: each names the exact resource
-// class that failed validation (digest, namespace, reference, manifest JSON).
-// The shared prefix is intentional domain vocabulary, not an accidental smell.
+// class that failed validation (digest, namespace, reference, manifest JSON,
+// upload session id). The shared prefix is intentional domain vocabulary, not an
+// accidental smell.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -12,4 +13,6 @@ pub enum Error {
     InvalidReference(String),
     #[error("invalid manifest JSON: {0}")]
     InvalidManifestJson(#[from] serde_json::Error),
+    #[error("invalid upload session id: {0}")]
+    InvalidUploadSessionId(String),
 }

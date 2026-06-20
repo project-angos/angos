@@ -1,10 +1,9 @@
 use std::slice;
 
 use serde::{Serialize, Serializer, ser::SerializeMap};
-use uuid::Uuid;
 
 use crate::{
-    oci::{Digest, Namespace, Reference, Tag},
+    oci::{Digest, Namespace, Reference, Tag, UploadSessionId},
     registry::job_store::{JobState, Queue},
 };
 
@@ -92,23 +91,23 @@ pub enum Action {
     #[serde(rename = "get-upload")]
     GetUpload {
         namespace: Namespace,
-        uuid: Uuid,
+        uuid: UploadSessionId,
     },
     #[serde(rename = "update-upload")]
     PatchUpload {
         namespace: Namespace,
-        uuid: Uuid,
+        uuid: UploadSessionId,
     },
     #[serde(rename = "complete-upload")]
     PutUpload {
         namespace: Namespace,
         digest: Digest,
-        uuid: Uuid,
+        uuid: UploadSessionId,
     },
     #[serde(rename = "cancel-upload")]
     DeleteUpload {
         namespace: Namespace,
-        uuid: Uuid,
+        uuid: UploadSessionId,
     },
     #[serde(rename = "get-blob")]
     GetBlob {

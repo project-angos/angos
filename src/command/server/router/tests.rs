@@ -299,7 +299,7 @@ fn test_parse_mount_with_malformed_digest_is_rejected() {
 #[test]
 fn test_parse_get_upload() {
     let method = Method::GET;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}")
         .parse()
         .unwrap();
@@ -319,7 +319,7 @@ fn test_parse_get_upload() {
 #[test]
 fn test_parse_patch_upload() {
     let method = Method::PATCH;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}")
         .parse()
         .unwrap();
@@ -339,7 +339,7 @@ fn test_parse_patch_upload() {
 #[test]
 fn test_parse_put_upload() {
     let method = Method::PUT;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}?digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").parse().unwrap();
     let route = parse(&method, &uri);
     if let Some(Action::PutUpload {
@@ -362,7 +362,7 @@ fn test_parse_put_upload() {
 #[test]
 fn test_parse_put_upload_without_digest() {
     let method = Method::PUT;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}")
         .parse()
         .unwrap();
@@ -373,7 +373,7 @@ fn test_parse_put_upload_without_digest() {
 #[test]
 fn test_parse_delete_upload() {
     let method = Method::DELETE;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}")
         .parse()
         .unwrap();

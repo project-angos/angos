@@ -23,9 +23,7 @@ impl Namespace {
         if NAMESPACE_RE.is_match(s) {
             Ok(Self(s.to_owned()))
         } else {
-            Err(Error::InvalidNamespace(format!(
-                "Invalid namespace format: '{s}'"
-            )))
+            Err(Error::InvalidNamespace(s.to_string()))
         }
     }
 }
@@ -45,9 +43,7 @@ impl TryFrom<String> for Namespace {
         if NAMESPACE_RE.is_match(&s) {
             Ok(Self(s))
         } else {
-            Err(Error::InvalidNamespace(format!(
-                "Invalid namespace format: '{s}'"
-            )))
+            Err(Error::InvalidNamespace(s))
         }
     }
 }
