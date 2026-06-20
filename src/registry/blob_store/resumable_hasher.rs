@@ -1,101 +1,69 @@
 use std::collections::BTreeMap;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
-use sha2::{Digest as Sha2Digest, Sha256, Sha512, digest::common::hazmat::SerializableState};
+use sha2::{Digest, Sha256, Sha512, digest::common::hazmat::SerializableState};
 
 use crate::{
     oci::{self, Algorithm},
     registry::blob_store::Error,
 };
 
-/// State-resumable hash logic shared by every supported digest algorithm: the
-/// mid-stream state can be serialized and restored (for chunked-upload
-/// checkpoints), and a finalized hasher yields an [`oci::Digest`]. The bodies
-/// are identical across algorithms, so the impls are macro-generated.
-pub trait ResumableHasher: Sized {
-    const ALGORITHM: Algorithm;
-
-    /// Serialize the hasher's mid-stream state, resumable via [`Self::from_state`].
-    fn serialized_state(&self) -> Vec<u8>;
-
-    /// Restore a hasher from a [`Self::serialized_state`] payload.
-    fn from_state(state: &[u8]) -> Result<Self, Error>;
-
-    /// Finalize into the OCI digest for this algorithm.
-    fn into_digest(self) -> oci::Digest;
+/// One supported algorithm's live hasher. The mid-stream state can be
+/// serialized and restored (for chunked-upload checkpoints), and a finalized
+/// hasher yields an [`oci::Digest`].
+enum AlgorithmHasher {
+    Sha256(Sha256),
+    Sha512(Sha512),
 }
 
-macro_rules! impl_resumable_hasher {
-    ($ty:ty, $algorithm:expr) => {
-        impl ResumableHasher for $ty {
-            const ALGORITHM: Algorithm = $algorithm;
-
-            fn serialized_state(&self) -> Vec<u8> {
-                self.serialize().as_slice().to_vec()
-            }
-
-            fn from_state(state: &[u8]) -> Result<Self, Error> {
-                let state = state.try_into().map_err(|_| {
-                    Error::HashSerialization("Unable to resume hash state".to_string())
-                })?;
-                Ok(<$ty>::deserialize(state)?)
-            }
-
-            fn into_digest(self) -> oci::Digest {
-                oci::Digest::from_finalized(Self::ALGORITHM, self.finalize())
-            }
+impl AlgorithmHasher {
+    fn new(algorithm: Algorithm) -> Self {
+        match algorithm {
+            Algorithm::Sha256 => Self::Sha256(Sha256::new()),
+            Algorithm::Sha512 => Self::Sha512(Sha512::new()),
         }
-    };
-}
+    }
 
-impl_resumable_hasher!(Sha256, Algorithm::Sha256);
-impl_resumable_hasher!(Sha512, Algorithm::Sha512);
+    fn from_state(algorithm: Algorithm, state: &[u8]) -> Result<Self, Error> {
+        let invalid =
+            || Error::HashSerialization("Unable to resume hash state".to_string());
+        Ok(match algorithm {
+            Algorithm::Sha256 => {
+                Self::Sha256(Sha256::deserialize(state.try_into().map_err(|_| invalid())?)?)
+            }
+            Algorithm::Sha512 => {
+                Self::Sha512(Sha512::deserialize(state.try_into().map_err(|_| invalid())?)?)
+            }
+        })
+    }
 
-/// Object-safe view over one algorithm's resumable hasher, so a [`Hasher`] can
-/// hold a heterogeneous, future-extensible set behind `Box<dyn _>`.
-trait AlgorithmHasher: Send {
-    fn algorithm(&self) -> Algorithm;
-    fn update(&mut self, data: &[u8]);
-    fn serialized_state(&self) -> Vec<u8>;
-    fn digest(&self) -> oci::Digest;
-}
-
-/// Adapts any concrete [`ResumableHasher`] to the object-safe [`AlgorithmHasher`].
-struct Adapter<H>(H);
-
-impl<H> AlgorithmHasher for Adapter<H>
-where
-    H: ResumableHasher + Sha2Digest + Clone + Send,
-{
     fn algorithm(&self) -> Algorithm {
-        H::ALGORITHM
+        match self {
+            Self::Sha256(_) => Algorithm::Sha256,
+            Self::Sha512(_) => Algorithm::Sha512,
+        }
     }
 
     fn update(&mut self, data: &[u8]) {
-        Sha2Digest::update(&mut self.0, data);
+        match self {
+            Self::Sha256(h) => h.update(data),
+            Self::Sha512(h) => h.update(data),
+        }
     }
 
     fn serialized_state(&self) -> Vec<u8> {
-        ResumableHasher::serialized_state(&self.0)
+        match self {
+            Self::Sha256(h) => h.serialize().as_slice().to_vec(),
+            Self::Sha512(h) => h.serialize().as_slice().to_vec(),
+        }
     }
 
     fn digest(&self) -> oci::Digest {
-        self.0.clone().into_digest()
+        match self {
+            Self::Sha256(h) => oci::Digest::from_finalized(Algorithm::Sha256, h.clone().finalize()),
+            Self::Sha512(h) => oci::Digest::from_finalized(Algorithm::Sha512, h.clone().finalize()),
+        }
     }
-}
-
-fn fresh_boxed(algorithm: Algorithm) -> Box<dyn AlgorithmHasher> {
-    match algorithm {
-        Algorithm::Sha256 => Box::new(Adapter(Sha256::new())),
-        Algorithm::Sha512 => Box::new(Adapter(Sha512::new())),
-    }
-}
-
-fn boxed_from_state(algorithm: Algorithm, state: &[u8]) -> Result<Box<dyn AlgorithmHasher>, Error> {
-    Ok(match algorithm {
-        Algorithm::Sha256 => Box::new(Adapter(<Sha256 as ResumableHasher>::from_state(state)?)),
-        Algorithm::Sha512 => Box::new(Adapter(<Sha512 as ResumableHasher>::from_state(state)?)),
-    })
 }
 
 /// Hashes a byte stream under every [`Algorithm::supported_algorithms`] in a
@@ -103,7 +71,7 @@ fn boxed_from_state(algorithm: Algorithm, state: &[u8]) -> Result<Box<dyn Algori
 /// the final `PUT`) can be verified without re-reading the assembled blob. All
 /// present states are checkpointed together as one JSON map.
 pub struct Hasher {
-    hashers: Vec<Box<dyn AlgorithmHasher>>,
+    hashers: Vec<AlgorithmHasher>,
 }
 
 impl Hasher {
@@ -111,7 +79,7 @@ impl Hasher {
         Self {
             hashers: Algorithm::supported_algorithms()
                 .iter()
-                .map(|&a| fresh_boxed(a))
+                .map(|&a| AlgorithmHasher::new(a))
                 .collect(),
         }
     }
@@ -120,7 +88,7 @@ impl Hasher {
     /// target algorithm is already known and no checkpoint is persisted.
     pub fn for_algorithm(algorithm: Algorithm) -> Self {
         Self {
-            hashers: vec![fresh_boxed(algorithm)],
+            hashers: vec![AlgorithmHasher::new(algorithm)],
         }
     }
 
@@ -147,7 +115,7 @@ impl Hasher {
         self.hashers
             .iter()
             .find(|h| h.algorithm() == algorithm)
-            .map(|h| h.digest())
+            .map(AlgorithmHasher::digest)
             .ok_or(Error::DigestAlgorithmUnavailable(algorithm))
     }
 }
@@ -213,7 +181,7 @@ impl HashState {
         let hashers = self
             .states
             .into_iter()
-            .map(|(algorithm, state)| boxed_from_state(algorithm, &state))
+            .map(|(algorithm, state)| AlgorithmHasher::from_state(algorithm, &state))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Hasher { hashers })
     }
@@ -228,30 +196,30 @@ mod tests {
 
     #[test]
     fn sha256_state_round_trips() {
-        let mut hasher = Sha256::new();
+        let mut hasher = AlgorithmHasher::new(Algorithm::Sha256);
         hasher.update(b"hello world");
         let state = hasher.serialized_state();
-        let restored = <Sha256 as ResumableHasher>::from_state(&state).unwrap();
+        let restored = AlgorithmHasher::from_state(Algorithm::Sha256, &state).unwrap();
         assert_eq!(state, restored.serialized_state());
     }
 
     #[test]
     fn sha512_state_round_trips() {
-        let mut hasher = Sha512::new();
+        let mut hasher = AlgorithmHasher::new(Algorithm::Sha512);
         hasher.update(b"hello world");
         let state = hasher.serialized_state();
-        let restored = <Sha512 as ResumableHasher>::from_state(&state).unwrap();
+        let restored = AlgorithmHasher::from_state(Algorithm::Sha512, &state).unwrap();
         assert_eq!(state, restored.serialized_state());
     }
 
     #[test]
-    fn into_digest_matches_known_empty() {
+    fn digest_matches_known_empty() {
         assert_eq!(
-            Sha256::new().into_digest(),
+            AlgorithmHasher::new(Algorithm::Sha256).digest(),
             oci::Digest::sha256(EMPTY_SHA256).unwrap()
         );
         assert_eq!(
-            Sha512::new().into_digest(),
+            AlgorithmHasher::new(Algorithm::Sha512).digest(),
             oci::Digest::sha512(EMPTY_SHA512).unwrap()
         );
     }
@@ -293,7 +261,7 @@ mod tests {
     #[test]
     fn legacy_sha256_only_checkpoint_resumes_sha256_and_rejects_sha512() {
         // A pre-JSON checkpoint is a bare sha256 state.
-        let mut sha256 = Sha256::new();
+        let mut sha256 = AlgorithmHasher::new(Algorithm::Sha256);
         sha256.update(b"legacy bytes");
         let legacy = sha256.serialized_state();
 
@@ -303,7 +271,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             restored.digest(Algorithm::Sha256).unwrap(),
-            sha256.into_digest()
+            sha256.digest()
         );
         // sha512 was never hashed for the legacy bytes: it must NOT be fabricated,
         // and the error names the unavailable algorithm (mapped to a 4xx upstream)
