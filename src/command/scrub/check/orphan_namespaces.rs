@@ -178,7 +178,7 @@ mod tests {
     use super::OrphanNamespaceChecker;
     use crate::{
         command::scrub::{action::Action, check::StoreChecker, executor::Executor},
-        oci::{Digest, Namespace},
+        oci::{Digest, Namespace, Tag},
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             Repository,
@@ -220,7 +220,10 @@ mod tests {
                 namespace,
                 &[
                     LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
-                    LinkOperation::create(LinkKind::Tag("latest".to_string()), digest.clone()),
+                    LinkOperation::create(
+                        LinkKind::Tag(Tag::new("latest").unwrap()),
+                        digest.clone(),
+                    ),
                 ],
             )
             .await
@@ -287,7 +290,11 @@ mod tests {
                 .list_tags("keep/app", 100, None)
                 .await
                 .unwrap();
-            assert_eq!(tags, vec!["latest".to_string()], "content must remain");
+            assert_eq!(
+                tags,
+                vec![Tag::new("latest").unwrap()],
+                "content must remain"
+            );
             test_case.cleanup().await;
         }
     }
@@ -377,7 +384,7 @@ mod tests {
                 .update_links(
                     &namespace,
                     &[LinkOperation::create(
-                        LinkKind::Tag("latest".to_string()),
+                        LinkKind::Tag(Tag::new("latest").unwrap()),
                         digest,
                     )],
                 )
@@ -395,7 +402,7 @@ mod tests {
             assert!(
                 sink.iter().any(|a| matches!(
                     a,
-                    Action::DeleteTag { namespace, tag } if namespace == "ghost/app" && tag == "latest"
+                    Action::DeleteTag { namespace, tag } if namespace == "ghost/app" && tag.as_ref() == "latest"
                 )),
                 "a dangling tag must still be swept"
             );

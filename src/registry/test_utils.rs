@@ -10,7 +10,7 @@ use crate::{
     cache,
     configuration::GlobalConfig,
     metrics_provider,
-    oci::{Digest, Namespace},
+    oci::{Digest, Namespace, Tag},
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         Registry, RegistryConfig, Repository, blob_store,
@@ -193,7 +193,7 @@ pub async fn create_test_blob(
 ) -> (Digest, Repository) {
     let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
-    let tag_link = LinkKind::Tag("latest".to_string());
+    let tag_link = LinkKind::Tag(Tag::new("latest").unwrap());
     let layer_link = LinkKind::Layer(digest.clone());
     registry
         .metadata_store
@@ -532,7 +532,10 @@ pub async fn seed_manifest(
         .update_links(
             namespace,
             &[
-                LinkOperation::create(LinkKind::Tag("v1".to_string()), manifest_digest.clone()),
+                LinkOperation::create(
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
+                    manifest_digest.clone(),
+                ),
                 LinkOperation::create(
                     LinkKind::Config(config_digest.clone()),
                     config_digest.clone(),

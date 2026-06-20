@@ -11,7 +11,7 @@
 //! or delete for a given manifest, eliminating divergence between them.
 
 use crate::{
-    oci::{Digest, Manifest, Reference},
+    oci::{Digest, Manifest, Reference, Tag},
     registry::metadata_store::{LinkKind, LinkOperation},
 };
 
@@ -37,7 +37,7 @@ pub fn push(
     reference: &Reference,
     effective_media_type: Option<&str>,
     body_len: u64,
-    created_tags: &[String],
+    created_tags: &[Tag],
 ) -> Vec<LinkOperation> {
     let mut ops = Vec::new();
 
@@ -47,7 +47,7 @@ pub fn push(
         effective_media_type.map(str::to_string),
     ));
 
-    if let Reference::Tag(tag) = reference {
+    if let Some(tag) = reference.as_tag() {
         ops.push(LinkOperation::create_with_media_type(
             LinkKind::Tag(tag.clone()),
             digest.clone(),
@@ -171,7 +171,7 @@ mod tests {
     use std::{collections::HashMap, str::FromStr};
 
     use super::*;
-    use crate::oci::{Descriptor, Manifest};
+    use crate::oci::{Descriptor, Manifest, Tag};
 
     fn d(byte: u8) -> Digest {
         let hex = format!("{byte:02x}").repeat(32);
@@ -244,7 +244,7 @@ mod tests {
         let ops_tag = push(
             &mut m_tag,
             &digest,
-            &Reference::Tag("latest".to_string()),
+            &Reference::Tag(Tag::new("latest").unwrap()),
             None,
             0,
             &[],
@@ -291,7 +291,11 @@ mod tests {
     fn push_created_tags_emit_one_tag_link_each() {
         let digest = d(0x02);
         let mut m = minimal_manifest();
-        let extra = vec!["1.2.3".to_string(), "1.2".to_string(), "latest".to_string()];
+        let extra = vec![
+            Tag::new("1.2.3").unwrap(),
+            Tag::new("1.2").unwrap(),
+            Tag::new("latest").unwrap(),
+        ];
         let ops = push(
             &mut m,
             &digest,
@@ -301,7 +305,7 @@ mod tests {
             &extra,
         );
 
-        let tag_links: Vec<&String> = ops
+        let tag_links: Vec<&Tag> = ops
             .iter()
             .filter_map(|op| match op {
                 LinkOperation::Create {
@@ -422,7 +426,7 @@ mod tests {
         let ops = push(
             &mut m,
             &digest,
-            &Reference::Tag("v1".to_string()),
+            &Reference::Tag(Tag::new("v1").unwrap()),
             Some("application/vnd.oci.image.manifest.v1+json"),
             42,
             &[],
@@ -460,7 +464,7 @@ mod tests {
 
     #[test]
     fn delete_tag_reference_emits_single_tag_delete() {
-        let ops = delete(&Reference::Tag("latest".to_string()), None, &[]);
+        let ops = delete(&Reference::Tag(Tag::new("latest").unwrap()), None, &[]);
         assert_eq!(ops.len(), 1);
         assert!(
             matches!(&ops[0], LinkOperation::Delete { link: LinkKind::Tag(t), referrer: None } if t == "latest")
@@ -481,8 +485,8 @@ mod tests {
     fn delete_digest_with_tags_removes_them_all() {
         let digest = d(0x60);
         let tags = vec![
-            LinkKind::Tag("v1".to_string()),
-            LinkKind::Tag("latest".to_string()),
+            LinkKind::Tag(Tag::new("v1").unwrap()),
+            LinkKind::Tag(Tag::new("latest").unwrap()),
         ];
         let ops = delete(&Reference::Digest(digest.clone()), None, &tags);
 

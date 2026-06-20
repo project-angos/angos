@@ -4,7 +4,7 @@ use futures_util::stream::{self, Stream, TryStreamExt};
 
 use crate::{
     command::scrub::error::Error,
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::{blob_store, metadata_store::MetadataStore},
 };
 
@@ -29,10 +29,22 @@ pub fn revisions<'a>(
 pub fn tags<'a>(
     metadata_store: &'a Arc<MetadataStore>,
     namespace: &'a str,
-) -> ResultStream<'a, String> {
+) -> ResultStream<'a, Tag> {
     Box::pin(paginated(move |marker| async move {
         metadata_store
             .list_tags(namespace, PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
+pub fn unparsed_tags<'a>(
+    metadata_store: &'a Arc<MetadataStore>,
+    namespace: &'a str,
+) -> ResultStream<'a, String> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_tag_names(namespace, PAGE_SIZE, marker)
             .await
             .map_err(Error::from)
     }))

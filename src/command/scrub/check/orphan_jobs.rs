@@ -243,6 +243,7 @@ mod tests {
             executor::{ActionSink, DryRunSink, Executor},
         },
         metrics_provider,
+        oci::Tag,
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             Repository,
@@ -344,7 +345,7 @@ mod tests {
         ReplicationPushPayload {
             downstream: downstream.to_string(),
             namespace: namespace.to_string(),
-            tag: Some("v1".to_string()),
+            tag: Some(Tag::new("v1").unwrap()),
             digest: None,
             kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
             source_ts: None,

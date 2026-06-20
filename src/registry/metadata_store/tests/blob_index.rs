@@ -7,7 +7,7 @@ use angos_tx_engine::{
 
 use super::test_config;
 use crate::{
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::metadata_store::{BlobIndexOperation, Error, LinkKind, LinkOperation},
 };
 
@@ -30,7 +30,7 @@ async fn test_blob_index_updates_multiple_digests() {
         .iter()
         .enumerate()
         .map(|(i, digest)| LinkOperation::Create {
-            link: LinkKind::Tag(format!("tag-bim-{i}")),
+            link: LinkKind::Tag(Tag::try_from(format!("tag-bim-{i}")).unwrap()),
             target: digest.clone(),
             referrer: None,
             media_type: None,
@@ -43,7 +43,7 @@ async fn test_blob_index_updates_multiple_digests() {
     for (i, digest) in digests.iter().enumerate() {
         let blob_index = backend.read_blob_index(digest).await.unwrap();
         let ns_links = blob_index.namespace.get(namespace).unwrap();
-        let expected_link = LinkKind::Tag(format!("tag-bim-{i}"));
+        let expected_link = LinkKind::Tag(Tag::try_from(format!("tag-bim-{i}")).unwrap());
         assert!(
             ns_links.contains(&expected_link),
             "Blob index for digest {digest} should contain {expected_link}"
@@ -197,14 +197,14 @@ async fn test_mixed_creates_and_deletes_across_digests() {
 
     let setup_ops = vec![
         LinkOperation::Create {
-            link: LinkKind::Tag("keep-tag".into()),
+            link: LinkKind::Tag(Tag::new("keep-tag").unwrap()),
             target: digest_keep.clone(),
             referrer: None,
             media_type: None,
             descriptor: None,
         },
         LinkOperation::Create {
-            link: LinkKind::Tag("remove-tag".into()),
+            link: LinkKind::Tag(Tag::new("remove-tag").unwrap()),
             target: digest_remove.clone(),
             referrer: None,
             media_type: None,
@@ -215,11 +215,11 @@ async fn test_mixed_creates_and_deletes_across_digests() {
 
     let mixed_ops = vec![
         LinkOperation::Delete {
-            link: LinkKind::Tag("remove-tag".into()),
+            link: LinkKind::Tag(Tag::new("remove-tag").unwrap()),
             referrer: None,
         },
         LinkOperation::Create {
-            link: LinkKind::Tag("new-tag".into()),
+            link: LinkKind::Tag(Tag::new("new-tag").unwrap()),
             target: digest_add.clone(),
             referrer: None,
             media_type: None,
@@ -230,13 +230,16 @@ async fn test_mixed_creates_and_deletes_across_digests() {
 
     let keep_index = backend.read_blob_index(&digest_keep).await.unwrap();
     let keep_links = keep_index.namespace.get(namespace).unwrap();
-    assert!(keep_links.contains(&LinkKind::Tag("keep-tag".into())));
+    assert!(keep_links.contains(&LinkKind::Tag(Tag::new("keep-tag").unwrap())));
 
     match backend.read_blob_index(&digest_remove).await {
         Ok(idx) => {
             let links = idx.namespace.get(namespace);
             assert!(
-                links.is_none() || !links.unwrap().contains(&LinkKind::Tag("remove-tag".into())),
+                links.is_none()
+                    || !links
+                        .unwrap()
+                        .contains(&LinkKind::Tag(Tag::new("remove-tag").unwrap())),
                 "remove-tag should not be in blob index after delete"
             );
         }
@@ -246,15 +249,15 @@ async fn test_mixed_creates_and_deletes_across_digests() {
 
     let add_index = backend.read_blob_index(&digest_add).await.unwrap();
     let add_links = add_index.namespace.get(namespace).unwrap();
-    assert!(add_links.contains(&LinkKind::Tag("new-tag".into())));
+    assert!(add_links.contains(&LinkKind::Tag(Tag::new("new-tag").unwrap())));
 
     let result = backend
-        .read_link_reference(namespace, &LinkKind::Tag("remove-tag".into()))
+        .read_link_reference(namespace, &LinkKind::Tag(Tag::new("remove-tag").unwrap()))
         .await;
     assert!(matches!(result, Err(Error::ReferenceNotFound)));
 
     let new_meta = backend
-        .read_link_reference(namespace, &LinkKind::Tag("new-tag".into()))
+        .read_link_reference(namespace, &LinkKind::Tag(Tag::new("new-tag").unwrap()))
         .await
         .unwrap();
     assert_eq!(new_meta.target, digest_add);

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use super::*;
-use crate::oci::{Digest, Namespace, Reference};
+use crate::oci::{Digest, Namespace, Reference, Tag};
 
 const SHA256_EMPTY: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -119,7 +119,7 @@ fn test_action_serialization_cel_compatibility() {
             "put-manifest",
             Action::PutManifest {
                 namespace: ns(),
-                target: ManifestPutTarget::Tag("v1.0.0".to_string()),
+                target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap()),
             },
         ),
         (
@@ -329,7 +329,7 @@ fn test_manifest_actions_serialize_reference_for_cel() {
         },
         Action::PutManifest {
             namespace: ns(),
-            target: ManifestPutTarget::Tag("v1.0.0".to_string()),
+            target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap()),
         },
     ];
     for action in actions {
@@ -346,7 +346,7 @@ fn test_manifest_actions_serialize_reference_for_cel() {
 fn test_put_manifest_target_serializes_with_flat_reference() {
     let by_tag = Action::PutManifest {
         namespace: ns(),
-        target: ManifestPutTarget::Tag("latest".to_string()),
+        target: ManifestPutTarget::Tag(Tag::new("latest").unwrap()),
     };
     assert_eq!(
         serde_json::to_value(&by_tag).unwrap(),
@@ -361,7 +361,7 @@ fn test_put_manifest_target_serializes_with_flat_reference() {
         namespace: ns(),
         target: ManifestPutTarget::Digest {
             digest: digest(),
-            tags: vec!["v1".to_string(), "v2".to_string()],
+            tags: vec![Tag::new("v1").unwrap(), Tag::new("v2").unwrap()],
         },
     };
     assert_eq!(
@@ -432,7 +432,7 @@ fn test_is_push() {
     assert!(
         Action::PutManifest {
             namespace: ns(),
-            target: ManifestPutTarget::Tag("v1.0.0".to_string())
+            target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap())
         }
         .is_push()
     );

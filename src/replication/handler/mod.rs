@@ -14,7 +14,7 @@ use angos_tx_engine::transaction::Transaction;
 
 use crate::{
     metrics_provider::metrics_provider,
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{
         blob_store::BlobStore,
         job_store::{Error, JobEnvelope, JobHandler, Queue},
@@ -45,7 +45,7 @@ pub struct ReplicationPushPayload {
     pub namespace: String,
     /// Tag bound to the digest, when the change is tag-scoped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    pub tag: Option<Tag>,
     /// Serialized OCI digest: informational for pushes, authoritative for
     /// digest deletes and tag-less pushes, absent for a tag delete.
     #[serde(default, skip_serializing_if = "Option::is_none")]

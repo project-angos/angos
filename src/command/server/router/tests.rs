@@ -500,7 +500,7 @@ fn test_parse_put_manifest() {
     if let Some(Action::PutManifest { namespace, target }) = route {
         assert_eq!(namespace, "myrepo/app");
         assert!(
-            matches!(target, ManifestPutTarget::Tag(tag) if tag == "v1.0.0"),
+            matches!(target, ManifestPutTarget::Tag(tag) if tag == *"v1.0.0"),
             "a by-tag PUT must produce a Tag target carrying no query tags"
         );
     } else {
@@ -522,10 +522,29 @@ fn test_parse_put_manifest_by_digest_with_tag_params() {
             panic!("a by-digest PUT must produce a Digest target");
         };
         assert_eq!(d.to_string(), digest);
-        assert_eq!(tags, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            tags,
+            vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()],
+            "valid `?tag=` values parse into Tags on the Digest target"
+        );
     } else {
         panic!("Expected PutManifest route");
     }
+}
+
+#[test]
+fn test_parse_put_manifest_by_digest_invalid_tag_param_rejected() {
+    let method = Method::PUT;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/foo/manifests/{digest}?tag=a&tag=bad!tag")
+        .parse()
+        .unwrap();
+    // A single invalid `?tag=` value fails deserialization, so the route is
+    // rejected (the router's generic 400) rather than dropping every tag.
+    assert!(
+        parse(&method, &uri).is_none(),
+        "an invalid `?tag=` value must reject the by-digest PUT route"
+    );
 }
 
 #[test]

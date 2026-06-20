@@ -2,7 +2,7 @@ use std::{str::FromStr, time::Duration};
 
 use super::{test_backend_with_cache, test_config};
 use crate::{
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::{
         metadata_store::{Error, LinkKind, LinkMetadata, LinkOperation},
         path_builder,
@@ -17,7 +17,7 @@ async fn test_read_link_cache_hit_skips_storage() {
     let digest =
         Digest::from_str("sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
             .unwrap();
-    let tag = LinkKind::Tag("latest".into());
+    let tag = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -49,7 +49,7 @@ async fn test_read_link_cache_miss_fetches_from_storage() {
     let digest =
         Digest::from_str("sha256:b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3")
             .unwrap();
-    let tag = LinkKind::Tag("latest".into());
+    let tag = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -83,7 +83,7 @@ async fn test_read_link_cache_expired_refetches() {
     let digest_b =
         Digest::from_str("sha256:d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5")
             .unwrap();
-    let tag = LinkKind::Tag("latest".into());
+    let tag = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -121,7 +121,7 @@ async fn test_update_links_populates_cache_on_overwrite() {
     let digest_b =
         Digest::from_str("sha256:f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1")
             .unwrap();
-    let tag = LinkKind::Tag("latest".into());
+    let tag = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -160,7 +160,7 @@ async fn test_update_links_populates_cache_on_create() {
     let digest =
         Digest::from_str("sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1")
             .unwrap();
-    let tag = LinkKind::Tag("v1".into());
+    let tag = LinkKind::Tag(Tag::new("v1").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -187,7 +187,7 @@ async fn test_update_links_invalidates_cache_on_delete() {
     let digest =
         Digest::from_str("sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2")
             .unwrap();
-    let tag = LinkKind::Tag("to-delete".into());
+    let tag = LinkKind::Tag(Tag::new("to-delete").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -222,7 +222,7 @@ async fn test_read_link_with_access_time_update_populates_cache() {
     let digest =
         Digest::from_str("sha256:a1a2a3a4a5a6a7a8a1a2a3a4a5a6a7a8a1a2a3a4a5a6a7a8a1a2a3a4a5a6a7a8")
             .unwrap();
-    let tag = LinkKind::Tag("latest".into());
+    let tag = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -260,7 +260,7 @@ async fn test_cache_disabled_when_ttl_zero() {
     let digest =
         Digest::from_str("sha256:b1b2b3b4b5b6b7b8b1b2b3b4b5b6b7b8b1b2b3b4b5b6b7b8b1b2b3b4b5b6b7b8")
             .unwrap();
-    let tag = LinkKind::Tag("latest".into());
+    let tag = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -296,7 +296,7 @@ async fn test_cache_keys_are_namespace_scoped() {
     let digest_b =
         Digest::from_str("sha256:d1d2d3d4d5d6d7d8d1d2d3d4d5d6d7d8d1d2d3d4d5d6d7d8d1d2d3d4d5d6d7d8")
             .unwrap();
-    let tag = LinkKind::Tag("latest".into());
+    let tag = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let ops_a = vec![LinkOperation::Create {
         link: tag.clone(),

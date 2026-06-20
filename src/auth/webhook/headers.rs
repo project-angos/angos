@@ -231,7 +231,7 @@ mod tests {
     use super::build_cache_key;
     use crate::{
         identity::{Action, ClientIdentity, OidcClaims},
-        oci::{Namespace, Reference},
+        oci::{Namespace, Reference, Tag},
     };
 
     fn anonymous() -> ClientIdentity {
@@ -264,7 +264,7 @@ mod tests {
             "wh",
             &Action::GetManifest {
                 namespace: Namespace::new("library/nginx").unwrap(),
-                reference: Reference::Tag("latest".to_string()),
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
             },
             &identity,
         )
@@ -353,7 +353,7 @@ mod tests {
             "wh",
             &Action::GetManifest {
                 namespace: Namespace::new("library/nginx").unwrap(),
-                reference: Reference::Tag("latest".to_string()),
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
             },
             &identity,
         )
@@ -363,7 +363,7 @@ mod tests {
             "wh",
             &Action::GetManifest {
                 namespace: Namespace::new("library/nginx").unwrap(),
-                reference: Reference::Tag("v1.0.0".to_string()),
+                reference: Reference::Tag(Tag::new("v1.0.0").unwrap()),
             },
             &identity,
         )

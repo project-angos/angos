@@ -13,7 +13,7 @@ use super::{parse::manifest_meta_from_body, *};
 use crate::{
     command::server::Error as ServerError,
     event_webhook::event::EventKind,
-    oci::{Algorithm, Namespace},
+    oci::{Algorithm, Namespace, Tag},
     registry::{
         Error, OCI_TAG, Registry,
         metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
@@ -231,7 +231,7 @@ async fn test_put_manifest() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag(tag.to_string()),
+                &Reference::Tag(Tag::new(tag).unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -243,7 +243,7 @@ async fn test_put_manifest() {
                 registry.get_repository_for_namespace(namespace).unwrap(),
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 false,
             )
             .await
@@ -290,7 +290,7 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
             Reference::Digest(digest.clone()),
             media_type.clone(),
             Cursor::new(content.clone()),
-            vec!["1.2.3".to_string(), "latest".to_string()],
+            vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()],
         )
         .await
         .expect("by-digest push with tag params must succeed");
@@ -337,7 +337,7 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
                 repository,
                 slice::from_ref(&media_type),
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 false,
             )
             .await
@@ -350,33 +350,10 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
     }
 }
 
-/// A by-digest push must reject an invalid `?tag=` value (one that parses to a
-/// digest or fails the tag regex) with a 400-class `ManifestInvalid` error.
-#[tokio::test]
-async fn accept_put_manifest_rejects_invalid_tag_param() {
-    let case = FSRegistryTestCase::new();
-    let registry = case.registry();
-    let namespace = Namespace::new("test-repo").unwrap();
-    let (content, media_type) = create_test_manifest(registry, &namespace).await;
-    let digest = Digest::from_bytes(Algorithm::Sha512, &content);
-
-    let result = registry
-        .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Digest(digest.clone()),
-            media_type,
-            Cursor::new(content),
-            vec!["not a tag!".to_string()],
-        )
-        .await
-        .map(|_| ());
-    assert!(
-        matches!(result, Err(Error::ManifestInvalid(_))),
-        "invalid tag param must map to ManifestInvalid, got {result:?}"
-    );
-}
+// Invalid `?tag=` values are now rejected at the router (a generic 400) before
+// the handler runs, so the handler always receives pre-validated `Tag`s. The
+// router rejection is covered by
+// `router::tests::test_parse_put_manifest_by_digest_invalid_tag_param_rejected`.
 
 /// A by-tag push must ignore any tag query parameters: only the path tag is
 /// created and no `OCI-Tag` header is emitted.
@@ -392,10 +369,10 @@ async fn accept_put_manifest_by_tag_ignores_tag_params() {
             None,
             None,
             &namespace,
-            Reference::Tag("v1".to_string()),
+            Reference::Tag(Tag::new("v1").unwrap()),
             media_type.clone(),
             Cursor::new(content.clone()),
-            vec!["ignored".to_string()],
+            vec![Tag::new("ignored").unwrap()],
         )
         .await
         .expect("by-tag push must succeed");
@@ -411,7 +388,7 @@ async fn accept_put_manifest_by_tag_ignores_tag_params() {
             repository,
             slice::from_ref(&media_type),
             &namespace,
-            Reference::Tag("ignored".to_string()),
+            Reference::Tag(Tag::new("ignored").unwrap()),
             false,
         )
         .await;
@@ -435,7 +412,7 @@ async fn put_manifest_rejects_missing_config_reference() {
         let Err(err) = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -450,7 +427,7 @@ async fn put_manifest_rejects_missing_config_reference() {
         assert!(
             registry
                 .metadata_store
-                .read_link(namespace, &LinkKind::Tag("latest".to_string()))
+                .read_link(namespace, &LinkKind::Tag(Tag::new("latest").unwrap()))
                 .await
                 .is_err()
         );
@@ -472,7 +449,7 @@ async fn put_manifest_rejects_missing_layer_reference() {
         let Err(err) = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -497,7 +474,7 @@ async fn put_manifest_rejects_missing_child_manifest_reference() {
         let Err(err) = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -531,7 +508,7 @@ async fn put_manifest_rejects_references_owned_by_another_namespace() {
         let Err(err) = registry
             .put_manifest(
                 target_namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -555,7 +532,7 @@ async fn put_manifest_allows_missing_subject_reference() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -600,7 +577,7 @@ async fn accept_put_manifest_honors_reference_validation_flag() {
             None,
             None,
             &namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             media_type.clone(),
             Cursor::new(content.clone()),
             Vec::new(),
@@ -617,7 +594,7 @@ async fn accept_put_manifest_honors_reference_validation_flag() {
             None,
             None,
             &namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -662,7 +639,7 @@ async fn permissive_push_does_not_grant_read_of_unowned_referenced_blob() {
             None,
             None,
             &attacker,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -721,7 +698,7 @@ async fn permissive_push_does_not_grant_read_of_unowned_child_manifest() {
             None,
             None,
             &attacker,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -787,7 +764,7 @@ async fn permissive_push_of_owned_references_yields_a_pullable_manifest() {
             None,
             None,
             &namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -812,7 +789,7 @@ async fn permissive_push_of_owned_references_yields_a_pullable_manifest() {
             repository,
             &[],
             &namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             false,
         )
         .await
@@ -838,7 +815,7 @@ async fn test_get_manifest() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag(tag.to_string()),
+                &Reference::Tag(Tag::new(tag).unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -850,7 +827,7 @@ async fn test_get_manifest() {
                 registry.get_repository_for_namespace(namespace).unwrap(),
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 false,
             )
             .await
@@ -889,7 +866,7 @@ async fn test_head_manifest() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag(tag.to_string()),
+                &Reference::Tag(Tag::new(tag).unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -901,7 +878,7 @@ async fn test_head_manifest() {
                 registry.get_repository_for_namespace(namespace).unwrap(),
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 false,
             )
             .await
@@ -952,7 +929,7 @@ async fn test_delete_manifest() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag(tag.to_string()),
+                &Reference::Tag(Tag::new(tag).unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -960,7 +937,12 @@ async fn test_delete_manifest() {
             .unwrap();
 
         registry
-            .delete_manifest(None, None, namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(
+                None,
+                None,
+                namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+            )
             .await
             .unwrap();
 
@@ -970,7 +952,7 @@ async fn test_delete_manifest() {
                     registry.get_repository_for_namespace(namespace).unwrap(),
                     slice::from_ref(&media_type),
                     namespace,
-                    Reference::Tag(tag.to_string()),
+                    Reference::Tag(Tag::new(tag).unwrap()),
                     false,
                 )
                 .await
@@ -1044,7 +1026,7 @@ async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
         let response = registry
             .put_manifest(
                 first,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &manifest_content,
             )
@@ -1114,7 +1096,7 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &manifest_content,
             )
@@ -1198,7 +1180,7 @@ async fn concurrent_same_digest_pushes_keep_upload_ownership() {
         registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &manifest_content,
             )
@@ -1289,7 +1271,7 @@ async fn test_malformed_json_yields_same_error_shape() {
     let put_err = registry
         .put_manifest(
             namespace,
-            &Reference::Tag("latest".to_string()),
+            &Reference::Tag(Tag::new("latest").unwrap()),
             None,
             malformed,
         )
@@ -1333,7 +1315,7 @@ async fn accept_put_manifest_rejects_body_above_limit() {
             None,
             None,
             namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             "application/vnd.oci.image.manifest.v1+json".to_string(),
             Cursor::new(body),
             Vec::new(),
@@ -1434,7 +1416,7 @@ async fn test_handle_get_manifest() {
         let put_response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag(tag.to_string()),
+                &Reference::Tag(Tag::new(tag).unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -1442,7 +1424,12 @@ async fn test_handle_get_manifest() {
             .unwrap();
 
         let response = registry
-            .resolve_get_manifest(namespace, Reference::Tag(tag.to_string()), &[], false)
+            .resolve_get_manifest(
+                namespace,
+                Reference::Tag(Tag::new(tag).unwrap()),
+                &[],
+                false,
+            )
             .await
             .unwrap();
 
@@ -1484,7 +1471,7 @@ async fn test_handle_put_manifest() {
                 None,
                 None,
                 namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type.clone(),
                 manifest_stream,
                 Vec::new(),
@@ -1505,7 +1492,7 @@ async fn test_handle_put_manifest() {
                 repository,
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 false,
             )
             .await
@@ -1528,7 +1515,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -1538,7 +1525,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
         registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("v1.0".to_string()),
+                &Reference::Tag(Tag::new("v1.0").unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -1563,7 +1550,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
                     repository,
                     slice::from_ref(&media_type),
                     namespace,
-                    Reference::Tag("latest".to_string()),
+                    Reference::Tag(Tag::new("latest").unwrap()),
                     false,
                 )
                 .await
@@ -1576,7 +1563,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
                     repository,
                     slice::from_ref(&media_type),
                     namespace,
-                    Reference::Tag("v1.0".to_string()),
+                    Reference::Tag(Tag::new("v1.0").unwrap()),
                     false,
                 )
                 .await
@@ -1611,7 +1598,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
         let response_a = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("v1.0".to_string()),
+                &Reference::Tag(Tag::new("v1.0").unwrap()),
                 Some(&media_type_a),
                 &content_a,
             )
@@ -1621,7 +1608,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
         registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("v1.1".to_string()),
+                &Reference::Tag(Tag::new("v1.1").unwrap()),
                 Some(&media_type_a),
                 &content_a,
             )
@@ -1631,7 +1618,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
         let response_b = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("v2.0".to_string()),
+                &Reference::Tag(Tag::new("v2.0").unwrap()),
                 Some(&media_type_b),
                 &content_b,
             )
@@ -1656,7 +1643,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
                     repository,
                     slice::from_ref(&media_type_a),
                     namespace,
-                    Reference::Tag("v1.0".to_string()),
+                    Reference::Tag(Tag::new("v1.0").unwrap()),
                     false,
                 )
                 .await
@@ -1669,7 +1656,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
                     repository,
                     slice::from_ref(&media_type_a),
                     namespace,
-                    Reference::Tag("v1.1".to_string()),
+                    Reference::Tag(Tag::new("v1.1").unwrap()),
                     false,
                 )
                 .await
@@ -1681,7 +1668,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
                 repository,
                 slice::from_ref(&media_type_b),
                 namespace,
-                Reference::Tag("v2.0".to_string()),
+                Reference::Tag(Tag::new("v2.0").unwrap()),
                 false,
             )
             .await
@@ -1704,7 +1691,7 @@ async fn test_delete_manifest_with_many_tags() {
         let response_a = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("tag-0".to_string()),
+                &Reference::Tag(Tag::new("tag-0").unwrap()),
                 Some(&media_type_a),
                 &content_a,
             )
@@ -1715,7 +1702,7 @@ async fn test_delete_manifest_with_many_tags() {
             registry
                 .put_manifest(
                     namespace,
-                    &Reference::Tag(format!("tag-{i}")),
+                    &Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
                     Some(&media_type_a),
                     &content_a,
                 )
@@ -1727,7 +1714,7 @@ async fn test_delete_manifest_with_many_tags() {
             registry
                 .put_manifest(
                     namespace,
-                    &Reference::Tag(format!("other-{i}")),
+                    &Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
                     Some(&media_type_b),
                     &content_b,
                 )
@@ -1754,7 +1741,7 @@ async fn test_delete_manifest_with_many_tags() {
                         repository,
                         slice::from_ref(&media_type_a),
                         namespace,
-                        Reference::Tag(format!("tag-{i}")),
+                        Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
                         false,
                     )
                     .await
@@ -1770,7 +1757,7 @@ async fn test_delete_manifest_with_many_tags() {
                         repository,
                         slice::from_ref(&media_type_b),
                         namespace,
-                        Reference::Tag(format!("other-{i}")),
+                        Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
                         false,
                     )
                     .await
@@ -1800,7 +1787,7 @@ async fn test_put_manifest_stores_media_type() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag(tag.to_string()),
+                &Reference::Tag(Tag::new(tag).unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -1819,7 +1806,7 @@ async fn test_put_manifest_stores_media_type() {
             "Digest link should have media_type stored"
         );
 
-        let tag_link = LinkKind::Tag(tag.to_string());
+        let tag_link = LinkKind::Tag(Tag::new(tag).unwrap());
         let tag_meta = registry
             .metadata_store
             .read_link(namespace, &tag_link)
@@ -1849,7 +1836,10 @@ async fn test_head_manifest_fallback_without_media_type() {
                 namespace,
                 &[
                     LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
-                    LinkOperation::create(LinkKind::Tag("latest".to_string()), digest.clone()),
+                    LinkOperation::create(
+                        LinkKind::Tag(Tag::new("latest").unwrap()),
+                        digest.clone(),
+                    ),
                 ],
             )
             .await
@@ -1872,7 +1862,7 @@ async fn test_head_manifest_fallback_without_media_type() {
                 repository,
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Tag("latest".to_string()),
+                Reference::Tag(Tag::new("latest").unwrap()),
                 false,
             )
             .await
@@ -1902,7 +1892,7 @@ async fn test_delete_manifest_no_tags_by_digest() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("temp".to_string()),
+                &Reference::Tag(Tag::new("temp").unwrap()),
                 Some(&media_type),
                 &content,
             )
@@ -1910,7 +1900,12 @@ async fn test_delete_manifest_no_tags_by_digest() {
             .unwrap();
 
         registry
-            .delete_manifest(None, None, namespace, &Reference::Tag("temp".to_string()))
+            .delete_manifest(
+                None,
+                None,
+                namespace,
+                &Reference::Tag(Tag::new("temp").unwrap()),
+            )
             .await
             .unwrap();
 
@@ -1952,7 +1947,7 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
         let response = registry
             .put_manifest(
                 namespace,
-                &Reference::Tag("latest".to_string()),
+                &Reference::Tag(Tag::new("latest").unwrap()),
                 None,
                 &content,
             )
@@ -1992,7 +1987,10 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
                 namespace,
                 &[
                     LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
-                    LinkOperation::create(LinkKind::Tag("latest".to_string()), digest.clone()),
+                    LinkOperation::create(
+                        LinkKind::Tag(Tag::new("latest").unwrap()),
+                        digest.clone(),
+                    ),
                 ],
             )
             .await
@@ -2001,7 +1999,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
         let response = registry
             .resolve_get_manifest(
                 namespace,
-                Reference::Tag("latest".to_string()),
+                Reference::Tag(Tag::new("latest").unwrap()),
                 slice::from_ref(&media_type),
                 false,
             )
@@ -2127,7 +2125,7 @@ async fn store_manifest_writes_blob_and_links() {
     let response = registry
         .put_manifest(
             &namespace,
-            &Reference::Tag("v1".to_string()),
+            &Reference::Tag(Tag::new("v1").unwrap()),
             Some(&media_type),
             &manifest_bytes,
         )
@@ -2140,7 +2138,7 @@ async fn store_manifest_writes_blob_and_links() {
     // The link should be readable via the metadata store.
     let link = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new("v1").unwrap()))
         .await
         .unwrap();
     assert_eq!(link.target, expected_digest);
@@ -2178,7 +2176,7 @@ async fn manifest_blob_lives_in_blob_store_with_split_backends() {
     registry
         .put_manifest(
             &namespace,
-            &Reference::Tag("v1".to_string()),
+            &Reference::Tag(Tag::new("v1").unwrap()),
             Some(&media_type),
             &manifest_bytes,
         )
@@ -2226,7 +2224,7 @@ async fn store_manifest_is_idempotent() {
     registry
         .put_manifest(
             &namespace,
-            &Reference::Tag("v1".to_string()),
+            &Reference::Tag(Tag::new("v1").unwrap()),
             Some(&media_type),
             &manifest_bytes,
         )
@@ -2236,7 +2234,7 @@ async fn store_manifest_is_idempotent() {
     registry
         .put_manifest(
             &namespace,
-            &Reference::Tag("v1".to_string()),
+            &Reference::Tag(Tag::new("v1").unwrap()),
             Some(&media_type),
             &manifest_bytes,
         )
@@ -2247,7 +2245,7 @@ async fn store_manifest_is_idempotent() {
     let digest = Digest::sha256_of_bytes(&manifest_bytes);
     let link = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new("v1").unwrap()))
         .await
         .unwrap();
     assert_eq!(link.target, digest);
@@ -2265,7 +2263,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
     registry
         .put_manifest(
             &namespace,
-            &Reference::Tag("v1".to_string()),
+            &Reference::Tag(Tag::new("v1").unwrap()),
             Some(&media_type),
             &manifest_bytes,
         )
@@ -2274,7 +2272,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
 
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new("v1").unwrap()))
         .await
         .unwrap();
 
@@ -2302,7 +2300,7 @@ async fn seed_tag(registry: &Registry, namespace: &Namespace, tag: &str) -> (Vec
             None,
             None,
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type.clone(),
             Cursor::new(content.clone()),
             Vec::new(),
@@ -2319,7 +2317,7 @@ async fn local_created_at(
 ) -> chrono::DateTime<chrono::Utc> {
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("read seeded tag link")
         .created_at
@@ -2342,7 +2340,7 @@ async fn accept_put_manifest_stamps_created_at_from_source_ts() {
             None,
             Some(source_ts),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -2371,7 +2369,7 @@ async fn accept_put_manifest_without_source_ts_stamps_local_clock() {
             None,
             None,
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -2401,7 +2399,7 @@ async fn accept_put_manifest_rejects_lww_older_source_ts() {
             None,
             Some(older),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -2431,7 +2429,7 @@ async fn accept_put_manifest_accepts_lww_newer_source_ts() {
             None,
             Some(newer),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -2457,7 +2455,7 @@ async fn accept_put_manifest_accepts_lww_equal_source_ts() {
             None,
             Some(created_at),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -2511,7 +2509,7 @@ async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
             None,
             Some(ts),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             larger_mt,
             Cursor::new(larger),
             Vec::new(),
@@ -2524,7 +2522,7 @@ async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
             None,
             Some(ts),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             smaller_mt,
             Cursor::new(smaller),
             Vec::new(),
@@ -2554,7 +2552,7 @@ async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
             None,
             Some(ts),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             smaller_mt,
             Cursor::new(smaller),
             Vec::new(),
@@ -2567,7 +2565,7 @@ async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
             None,
             Some(ts),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             larger_mt,
             Cursor::new(larger),
             Vec::new(),
@@ -2577,7 +2575,7 @@ async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
 
     let target = registry
         .metadata_store
-        .read_link_reference(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link_reference(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("tag link after the tie-break")
         .target;
@@ -2601,7 +2599,7 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
 
     // Assert the seed warmed the cache so the stale-cache scenario stays honest.
     let store = test_case.metadata_store();
-    let link = LinkKind::Tag(tag.to_string());
+    let link = LinkKind::Tag(Tag::new(tag).unwrap());
     let cached = store
         .cache_get(namespace.as_ref(), &link)
         .await
@@ -2629,7 +2627,7 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
             None,
             Some(incoming),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -2651,7 +2649,7 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
     let test_case = FSRegistryTestCase::with_link_cache_ttl(300);
     let store = test_case.metadata_store();
     let namespace = "cascade-repo";
-    let link = LinkKind::Tag("latest".to_string());
+    let link = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let old_digest = Digest::sha256_of_bytes(b"old");
     let new_digest = Digest::sha256_of_bytes(b"new");
@@ -2704,7 +2702,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     let test_case = FSRegistryTestCase::new();
     let store = test_case.metadata_store();
     let namespace = "lww-tx-repo";
-    let link = LinkKind::Tag("latest".to_string());
+    let link = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let newer_body = br#"{"newer":true}"#.to_vec();
     let newer_digest = Digest::sha256_of_bytes(&newer_body);
@@ -2753,7 +2751,7 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
     let test_case = FSRegistryTestCase::new();
     let store = test_case.metadata_store();
     let namespace = "lww-tx-repo";
-    let link = LinkKind::Tag("latest".to_string());
+    let link = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let body = br#"{"winner":true}"#.to_vec();
     let digest = Digest::sha256_of_bytes(&body);
@@ -2796,7 +2794,7 @@ async fn put_manifest_reports_changed_from_the_committed_transaction() {
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("test-repo").unwrap();
-    let tag_ref = Reference::Tag("latest".to_string());
+    let tag_ref = Reference::Tag(Tag::new("latest").unwrap());
 
     let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
 
@@ -2860,7 +2858,7 @@ async fn accept_put_manifest_accepts_lww_when_local_absent() {
             None,
             Some(very_old),
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -2883,7 +2881,7 @@ async fn accept_put_manifest_without_source_ts_skips_lww() {
             None,
             None,
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -2932,7 +2930,7 @@ async fn delete_manifest_rejects_lww_older_source_ts() {
             None,
             Some(older),
             namespace,
-            &Reference::Tag(tag.to_string()),
+            &Reference::Tag(Tag::new(tag).unwrap()),
         )
         .await
         .err();
@@ -2944,7 +2942,7 @@ async fn delete_manifest_rejects_lww_older_source_ts() {
 
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("tag must survive a superseded delete");
 }
@@ -2965,14 +2963,14 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
             None,
             Some(newer),
             namespace,
-            &Reference::Tag(tag.to_string()),
+            &Reference::Tag(Tag::new(tag).unwrap()),
         )
         .await
         .expect("newer source_ts delete must win");
 
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2993,7 +2991,7 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
         .metadata_store
         .write_link_reference(
             namespace.as_ref(),
-            &LinkKind::Tag(tag.to_string()),
+            &LinkKind::Tag(Tag::new(tag).unwrap()),
             &LinkMetadata {
                 target: Digest::sha256_of_bytes(b"manifest-bytes"),
                 created_at: None,
@@ -3013,14 +3011,14 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
             None,
             Some(ancient),
             namespace,
-            &Reference::Tag(tag.to_string()),
+            &Reference::Tag(Tag::new(tag).unwrap()),
         )
         .await
         .expect("a delete must not be superseded by a tag with no created_at");
 
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -3047,7 +3045,7 @@ async fn same_digest_re_push_preserves_created_at() {
             None,
             None,
             namespace,
-            Reference::Tag(tag.to_string()),
+            Reference::Tag(Tag::new(tag).unwrap()),
             media_type,
             Cursor::new(content),
             Vec::new(),
@@ -3071,7 +3069,7 @@ async fn replicated_delete_not_superseded_by_a_legacy_link() {
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("legacy-repo").unwrap();
-    let link = LinkKind::Tag("latest".to_string());
+    let link = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let legacy_digest = Digest::sha256_of_bytes(b"legacy-manifest");
     put_link_raw(
@@ -3088,7 +3086,7 @@ async fn replicated_delete_not_superseded_by_a_legacy_link() {
             None,
             Some(ancient),
             namespace,
-            &Reference::Tag("latest".to_string()),
+            &Reference::Tag(Tag::new("latest").unwrap()),
         )
         .await
         .expect("a legacy tag (no created_at) must never supersede a replicated write");
@@ -3133,7 +3131,7 @@ async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
 
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("pointing tag must survive a superseded digest delete");
     registry
@@ -3161,7 +3159,7 @@ async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
 
     let tag_result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
         matches!(tag_result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -3194,7 +3192,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
             None,
             Some(reparsed),
             namespace,
-            &Reference::Tag(tag.to_string()),
+            &Reference::Tag(Tag::new(tag).unwrap()),
         )
         .await
         .err();
@@ -3204,7 +3202,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
     );
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await
         .expect("a superseded prune delete must preserve the downstream tag");
 
@@ -3220,13 +3218,13 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
             None,
             Some(reparsed),
             namespace,
-            &Reference::Tag(tag.to_string()),
+            &Reference::Tag(Tag::new(tag).unwrap()),
         )
         .await
         .expect("a prune delete must proceed when its source_ts is newer than the tag");
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .read_link(namespace.as_ref(), &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -3274,7 +3272,7 @@ mod noop_suppression_tests {
 
     use crate::{
         event_webhook::event::EventKind,
-        oci::{Digest, Namespace, Reference},
+        oci::{Digest, Namespace, Reference, Tag},
         registry::{
             Registry, RegistryConfig,
             blob_store::BlobStore,
@@ -3380,7 +3378,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type.clone(),
                 Cursor::new(content_a.clone()),
                 Vec::new(),
@@ -3405,7 +3403,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type.clone(),
                 Cursor::new(content_a.clone()),
                 Vec::new(),
@@ -3424,7 +3422,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type_b,
                 Cursor::new(content_b),
                 Vec::new(),
@@ -3539,7 +3537,7 @@ mod noop_suppression_tests {
                 Reference::Digest(digest.clone()),
                 media_type.clone(),
                 Cursor::new(content.clone()),
-                vec![tag.to_string()],
+                vec![Tag::new(tag).unwrap()],
             )
             .await
             .expect("re-push present digest with a new tag");
@@ -3564,7 +3562,7 @@ mod noop_suppression_tests {
                 Reference::Digest(digest),
                 media_type,
                 Cursor::new(content),
-                vec![tag.to_string()],
+                vec![Tag::new(tag).unwrap()],
             )
             .await
             .expect("re-push present digest with the same present tag");
@@ -3588,7 +3586,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type,
                 Cursor::new(content),
                 Vec::new(),
@@ -3598,7 +3596,12 @@ mod noop_suppression_tests {
         let baseline = pending(&job_store).await;
 
         registry
-            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(
+                None,
+                None,
+                &namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+            )
             .await
             .expect("delete existing tag");
         assert_eq!(
@@ -3613,7 +3616,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                &Reference::Tag("does-not-exist".to_string()),
+                &Reference::Tag(Tag::new("does-not-exist").unwrap()),
             )
             .await;
         assert_eq!(
@@ -3640,7 +3643,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type.clone(),
                 Cursor::new(content.clone()),
                 Vec::new(),
@@ -3652,7 +3655,12 @@ mod noop_suppression_tests {
 
         // First delete, deliberately left pending.
         registry
-            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(
+                None,
+                None,
+                &namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+            )
             .await
             .expect("first delete");
         assert_eq!(
@@ -3666,7 +3674,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type,
                 Cursor::new(content),
                 Vec::new(),
@@ -3680,7 +3688,12 @@ mod noop_suppression_tests {
         );
 
         registry
-            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(
+                None,
+                None,
+                &namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+            )
             .await
             .expect("second delete");
         assert_eq!(
@@ -3710,7 +3723,7 @@ mod noop_suppression_tests {
                 None,
                 Some(push_ts),
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type,
                 Cursor::new(content),
                 Vec::new(),
@@ -3725,7 +3738,7 @@ mod noop_suppression_tests {
                 None,
                 Some(delete_ts),
                 &namespace,
-                &Reference::Tag(tag.to_string()),
+                &Reference::Tag(Tag::new(tag).unwrap()),
             )
             .await
             .expect("replicated delete newer than the tag must proceed");
@@ -3755,7 +3768,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag("latest".to_string()),
+                Reference::Tag(Tag::new("latest").unwrap()),
                 media_type,
                 Cursor::new(content),
                 Vec::new(),
@@ -3801,7 +3814,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag("latest".to_string()),
+                Reference::Tag(Tag::new("latest").unwrap()),
                 media_type,
                 Cursor::new(content),
                 Vec::new(),
@@ -3848,7 +3861,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type.clone(),
                 Cursor::new(content.clone()),
                 Vec::new(),
@@ -3862,7 +3875,7 @@ mod noop_suppression_tests {
                 None,
                 None,
                 &namespace,
-                Reference::Tag(tag.to_string()),
+                Reference::Tag(Tag::new(tag).unwrap()),
                 media_type,
                 Cursor::new(content),
                 Vec::new(),
@@ -3904,7 +3917,7 @@ mod dispatch_replication_tests {
     use regex::Regex;
 
     use crate::{
-        oci::{Digest, Namespace},
+        oci::{Digest, Namespace, Tag},
         registry::{
             Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
@@ -3997,12 +4010,13 @@ mod dispatch_replication_tests {
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
 
         let repository = registry.resolver.resolve(&namespace);
+        let tag = Tag::new("v1").unwrap();
         registry
             .dispatch_replication(
                 repository,
                 &namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
+                Some(&tag),
                 Some(&digest),
                 None,
             )
@@ -4030,12 +4044,13 @@ mod dispatch_replication_tests {
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
 
         let repository = registry.resolver.resolve(&namespace);
+        let tag = Tag::new("v1").unwrap();
         registry
             .dispatch_replication(
                 repository,
                 &namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
+                Some(&tag),
                 Some(&digest),
                 None,
             )
@@ -4076,12 +4091,13 @@ mod dispatch_replication_tests {
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
 
         let repository = registry.resolver.resolve(&namespace);
+        let tag = Tag::new("v1").unwrap();
         registry
             .dispatch_replication(
                 repository,
                 &namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
+                Some(&tag),
                 Some(&digest),
                 None,
             )
@@ -4123,12 +4139,13 @@ mod dispatch_replication_tests {
         let author_ts = Utc::now() - Duration::hours(3);
 
         let repository = registry.resolver.resolve(&namespace);
+        let tag = Tag::new("v1").unwrap();
         registry
             .dispatch_replication(
                 repository,
                 &namespace,
                 REPLICATION_DELETE_MANIFEST_KIND,
-                Some("v1"),
+                Some(&tag),
                 None,
                 Some(author_ts),
             )
@@ -4156,12 +4173,13 @@ mod dispatch_replication_tests {
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
 
         let repository = registry.resolver.resolve(&namespace);
+        let tag = Tag::new("v1").unwrap();
         registry
             .dispatch_replication(
                 repository,
                 &namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
+                Some(&tag),
                 Some(&digest),
                 None,
             )
@@ -4193,12 +4211,13 @@ mod dispatch_replication_tests {
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
 
         let repository = registry.resolver.resolve(&namespace);
+        let tag = Tag::new("v1").unwrap();
         registry
             .dispatch_replication(
                 repository,
                 &namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
+                Some(&tag),
                 Some(&digest),
                 None,
             )

@@ -90,6 +90,12 @@ pub fn manifest_tags_dir(namespace: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_manifests/tags")
 }
 
+/// Directory holding a single tag's `current/link`. Scrub uses this to remove a
+/// tag directory whose name is invalid (and so cannot form a `LinkKind::Tag`).
+pub fn manifest_tag_dir(namespace: &str, tag: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_manifests/tags/{tag}")
+}
+
 pub fn manifest_referrers_dir(namespace: &str, subject: &Digest) -> String {
     format!(
         "{REPOS_ROOT}/{namespace}/_manifests/referrers/{}/{}",
@@ -200,6 +206,7 @@ pub fn link_container_path(link: &LinkKind, namespace: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oci::Tag;
 
     // Valid 64-char lowercase-hex sha256 hashes (the only shape `Digest` accepts).
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -268,6 +275,10 @@ mod tests {
             manifest_tags_dir("ns"),
             "v2/repositories/ns/_manifests/tags"
         );
+        assert_eq!(
+            manifest_tag_dir("ns", "v1.0"),
+            "v2/repositories/ns/_manifests/tags/v1.0"
+        );
 
         let subject = Digest::sha256(HASH_A).unwrap();
         assert_eq!(
@@ -290,7 +301,7 @@ mod tests {
             format!("v2/repositories/ns/_blobs/sha256/{HASH_A}")
         );
 
-        let tag = LinkKind::Tag("v1.0".to_string());
+        let tag = LinkKind::Tag(Tag::new("v1.0").unwrap());
         assert_eq!(
             link_path(&tag, "ns"),
             "v2/repositories/ns/_manifests/tags/v1.0/current/link"

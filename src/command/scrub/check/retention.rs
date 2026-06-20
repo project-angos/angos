@@ -12,7 +12,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Digest,
+    oci::{Digest, Tag},
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
         Repository,
@@ -23,7 +23,7 @@ use crate::{
 };
 
 struct TagWithMetadata {
-    name: String,
+    name: Tag,
     metadata: LinkMetadata,
 }
 
@@ -185,7 +185,7 @@ impl RetentionChecker {
     async fn fetch_tag_metadata(
         &self,
         namespace: &str,
-        tag_names: &[String],
+        tag_names: &[Tag],
     ) -> Result<Vec<TagWithMetadata>, Error> {
         const BATCH_SIZE: usize = 100;
 
@@ -200,29 +200,30 @@ impl RetentionChecker {
     async fn fetch_metadata_batch(
         &self,
         namespace: &str,
-        tag_names: &[String],
+        tag_names: &[Tag],
     ) -> Result<Vec<TagWithMetadata>, Error> {
-        join_all(
+        let results: Result<Vec<TagWithMetadata>, Error> = join_all(
             tag_names
                 .iter()
                 .map(|tag| self.fetch_single_tag_metadata(namespace, tag.clone())),
         )
         .await
         .into_iter()
-        .collect()
+        .collect();
+        results
     }
 
     async fn fetch_single_tag_metadata(
         &self,
         namespace: &str,
-        tag_name: String,
+        tag: Tag,
     ) -> Result<TagWithMetadata, Error> {
         let metadata = self
             .metadata_store
-            .read_link(namespace, &LinkKind::Tag(tag_name.clone()))
+            .read_link(namespace, &LinkKind::Tag(tag.clone()))
             .await?;
         Ok(TagWithMetadata {
-            name: tag_name,
+            name: tag,
             metadata,
         })
     }
@@ -236,7 +237,7 @@ impl RetentionChecker {
     fn rank_by<K: Ord>(tags: &[TagWithMetadata], key: impl Fn(&LinkMetadata) -> K) -> Vec<String> {
         let mut indices: Vec<usize> = (0..tags.len()).collect();
         indices.sort_by_cached_key(|&i| Reverse(key(&tags[i].metadata)));
-        indices.iter().map(|&i| tags[i].name.clone()).collect()
+        indices.iter().map(|&i| tags[i].name.to_string()).collect()
     }
 
     fn get_deletable_tags<'a>(
@@ -245,27 +246,27 @@ impl RetentionChecker {
         tags: &'a [TagWithMetadata],
         last_pushed: &[String],
         last_pulled: &[String],
-    ) -> Vec<&'a str> {
+    ) -> Vec<&'a Tag> {
         tags.iter()
             .filter(|tag| {
                 !self
                     .should_retain_tag(namespace, tag, last_pushed, last_pulled)
                     .unwrap_or(true)
             })
-            .map(|tag| tag.name.as_str())
+            .map(|tag| &tag.name)
             .collect()
     }
 
     async fn emit_delete_tags(
         &self,
         namespace: &str,
-        tags_to_delete: &[&str],
+        tags_to_delete: &[&Tag],
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         for tag in tags_to_delete {
             sink.apply(Action::DeleteTag {
                 namespace: namespace.to_string(),
-                tag: (*tag).to_string(),
+                tag: (*tag).clone(),
             })
             .await?;
         }
@@ -282,7 +283,7 @@ impl RetentionChecker {
         debug!("'{namespace}': Checking tag '{}' for retention", tag.name);
 
         let manifest = ManifestImage {
-            tag: Some(tag.name.clone()),
+            tag: Some(tag.name.to_string()),
             pushed_at: EpochSeconds::from_seconds(to_epoch(tag.metadata.created_at)),
             last_pulled_at: EpochSeconds::from_seconds(to_epoch(tag.metadata.accessed_at)),
         };
@@ -463,7 +464,7 @@ mod tests {
         accessed: Option<chrono::DateTime<Utc>>,
     ) -> TagWithMetadata {
         TagWithMetadata {
-            name: name.to_string(),
+            name: Tag::new(name).unwrap(),
             metadata: LinkMetadata {
                 target: dummy_digest(),
                 created_at: created,
@@ -501,7 +502,7 @@ mod tests {
                         index_digest.clone(),
                     ),
                     LinkOperation::create(
-                        LinkKind::Tag("latest".to_string()),
+                        LinkKind::Tag(Tag::new("latest").unwrap()),
                         index_digest.clone(),
                     ),
                     LinkOperation::create(
@@ -524,7 +525,7 @@ mod tests {
             .update_links(
                 namespace,
                 &[
-                    LinkOperation::delete(LinkKind::Tag("latest".to_string())),
+                    LinkOperation::delete(LinkKind::Tag(Tag::new("latest").unwrap())),
                     LinkOperation::delete(LinkKind::Manifest(
                         index_digest.clone(),
                         child_digest.clone(),
@@ -633,7 +634,7 @@ mod tests {
                 .update_links(
                     namespace,
                     &[LinkOperation::create(
-                        LinkKind::Tag("v1.0.0".to_string()),
+                        LinkKind::Tag(Tag::new("v1.0.0").unwrap()),
                         blob_digest.clone(),
                     )],
                 )
@@ -660,7 +661,7 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let tag_link = metadata_store
-                .read_link(namespace, &LinkKind::Tag("v1.0.0".to_string()))
+                .read_link(namespace, &LinkKind::Tag(Tag::new("v1.0.0").unwrap()))
                 .await;
 
             assert!(tag_link.is_ok());
@@ -682,7 +683,7 @@ mod tests {
                 .update_links(
                     namespace,
                     &[LinkOperation::create(
-                        LinkKind::Tag("any-tag".to_string()),
+                        LinkKind::Tag(Tag::new("any-tag").unwrap()),
                         blob_digest.clone(),
                     )],
                 )
@@ -699,7 +700,7 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let tag_link = metadata_store
-                .read_link(namespace, &LinkKind::Tag("any-tag".to_string()))
+                .read_link(namespace, &LinkKind::Tag(Tag::new("any-tag").unwrap()))
                 .await;
 
             assert!(tag_link.is_ok());
@@ -863,7 +864,7 @@ mod tests {
             .update_links(
                 namespace,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v0.0.1".to_string()),
+                    LinkKind::Tag(Tag::new("v0.0.1").unwrap()),
                     blob_digest.clone(),
                 )],
             )
@@ -893,7 +894,7 @@ mod tests {
 
         assert!(
             metadata_store
-                .read_link(namespace, &LinkKind::Tag("v0.0.1".to_string()))
+                .read_link(namespace, &LinkKind::Tag(Tag::new("v0.0.1").unwrap()))
                 .await
                 .is_ok(),
             "Vec sink must not delete the tag"

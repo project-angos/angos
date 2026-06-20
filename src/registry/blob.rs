@@ -449,7 +449,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        oci::Namespace,
+        oci::{Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST,
             blob_ownership::BlobOwnership,
@@ -698,7 +698,7 @@ mod tests {
 
             let cases = [
                 LinkKind::Digest(Digest::sha256_of_bytes(b"digest reference")),
-                LinkKind::Tag("latest".to_string()),
+                LinkKind::Tag(Tag::new("latest").unwrap()),
                 LinkKind::Layer(Digest::sha256_of_bytes(b"layer reference")),
                 LinkKind::Config(Digest::sha256_of_bytes(b"config reference")),
                 LinkKind::Manifest(parent.clone(), Digest::sha256_of_bytes(b"child manifest")),

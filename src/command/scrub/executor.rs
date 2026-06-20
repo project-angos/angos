@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use crate::{
     command::scrub::{action::Action, error::Error},
     metrics_provider::metrics_provider,
-    oci::{Digest, Manifest, Reference},
+    oci::{Digest, Manifest, Reference, Tag},
     registry::{
         blob_store::{self, MultipartCleanup},
         job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore, Queue},
@@ -255,9 +255,18 @@ impl Executor {
         Ok(())
     }
 
-    async fn delete_tag(&self, namespace: String, tag: String) -> Result<(), Error> {
+    async fn delete_tag(&self, namespace: String, tag: Tag) -> Result<(), Error> {
         self.metadata_store
             .update_links(&namespace, &[LinkOperation::delete(LinkKind::Tag(tag))])
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_invalid_tag(&self, namespace: String, tag: String) -> Result<(), Error> {
+        // An invalid tag name cannot form a typed `LinkKind::Tag`, so the
+        // directory is removed by prefix rather than via a link delete.
+        self.metadata_store
+            .delete_tag_directory(&namespace, &tag)
             .await?;
         Ok(())
     }
@@ -326,7 +335,7 @@ impl Executor {
         &self,
         downstream: String,
         namespace: String,
-        tag: String,
+        tag: Tag,
         digest: Digest,
     ) -> Result<(), Error> {
         let payload = ReplicationPushPayload {
@@ -347,7 +356,7 @@ impl Executor {
         &self,
         downstream: String,
         namespace: String,
-        tag: String,
+        tag: Tag,
     ) -> Result<(), Error> {
         // Stamp `source_ts` with the prune decision time so the receiver runs
         // last-writer-wins and preserves a downstream tag dated after this
@@ -428,6 +437,9 @@ impl ActionSink for Executor {
                     .await
             }
             Action::DeleteTag { namespace, tag } => self.delete_tag(namespace, tag).await,
+            Action::DeleteInvalidTag { namespace, tag } => {
+                self.delete_invalid_tag(namespace, tag).await
+            }
             Action::DeleteOrphanManifest { namespace, digest } => {
                 self.delete_orphan_manifest(namespace, digest).await
             }
@@ -626,7 +638,7 @@ mod tests {
                     &[
                         LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
                         LinkOperation::create(
-                            LinkKind::Tag("dangling".to_string()),
+                            LinkKind::Tag(Tag::new("dangling").unwrap()),
                             digest.clone(),
                         ),
                     ],
@@ -647,7 +659,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()))
+                    .read_link(namespace, &LinkKind::Tag(Tag::new("dangling").unwrap()))
                     .await
                     .is_err(),
                 "tag link pointing at missing-blob digest must be removed"
@@ -856,7 +868,7 @@ mod tests {
                 .apply(Action::EnqueueReplicationDelete {
                     downstream: "mirror".to_string(),
                     namespace: "ns/app".to_string(),
-                    tag: "stray".to_string(),
+                    tag: Tag::new("stray").unwrap(),
                 })
                 .await
                 .unwrap();
@@ -901,7 +913,7 @@ mod tests {
                     .apply(Action::EnqueueReplicationDelete {
                         downstream: "mirror".to_string(),
                         namespace: "ns/app".to_string(),
-                        tag: "stray".to_string(),
+                        tag: Tag::new("stray").unwrap(),
                     })
                     .await
                     .unwrap();
@@ -926,7 +938,7 @@ mod tests {
         let payload = ReplicationPushPayload {
             downstream: "removed".to_string(),
             namespace: "ns/app".to_string(),
-            tag: Some("v1".to_string()),
+            tag: Some(Tag::new("v1").unwrap()),
             digest: None,
             kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
             source_ts: None,

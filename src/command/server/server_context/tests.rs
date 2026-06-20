@@ -26,7 +26,7 @@ use crate::{
     },
     identity::{Action, ClientIdentity},
     metrics_provider,
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     policy::AccessPolicyConfig,
     registry::{
         Registry, RegistryConfig, Repository,
@@ -459,7 +459,7 @@ async fn test_authorize_request_with_global_policy() {
 
     let route = Action::GetManifest {
         namespace: Namespace::new("test/repo").unwrap(),
-        reference: Reference::Tag("latest".to_string()),
+        reference: Reference::Tag(Tag::new("latest").unwrap()),
     };
     let identity = ClientIdentity::new(None);
     let request = Request::builder().body(()).unwrap();
@@ -864,7 +864,7 @@ async fn test_shutdown_flushes_pending_access_times() {
     let digest =
         Digest::from_str("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .unwrap();
-    let tag = LinkKind::Tag("v1.0.0".to_string());
+    let tag = LinkKind::Tag(Tag::new("v1.0.0").unwrap());
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
         target: digest.clone(),

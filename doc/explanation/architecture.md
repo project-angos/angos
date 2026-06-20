@@ -166,8 +166,8 @@ repository/
 ### Content Addressing
 
 All content is addressed by digest (SHA-256 or SHA-512):
-- Manifests: `sha256:<hash>`
-- Blobs: `sha256:<hash>`
+- Manifests: `sha256:<hash>` or `sha512:<hash>`
+- Blobs: `sha256:<hash>` or `sha512:<hash>`
 - Tags: Symbolic links to manifest digests
 
 ---

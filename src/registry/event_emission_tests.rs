@@ -27,7 +27,7 @@ use crate::{
         dispatcher::EventDispatcher,
         event::EventKind,
     },
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{
         Registry, RegistryConfig, blob_store,
         job_store::{JobStore, Queue},
@@ -165,7 +165,7 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
             None,
             None,
             &namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
             Vec::new(),
@@ -214,7 +214,7 @@ async fn digest_push_suppresses_tag_create_event() {
             None,
             None,
             &namespace,
-            Reference::Tag("seed".to_string()),
+            Reference::Tag(Tag::new("seed").unwrap()),
             mime_type.clone(),
             Cursor::new(manifest_bytes.clone()),
             Vec::new(),
@@ -278,7 +278,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
             None,
             None,
             &namespace,
-            Reference::Tag("v1".to_string()),
+            Reference::Tag(Tag::new("v1").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
             Vec::new(),
@@ -286,7 +286,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
         .await
         .expect("put manifest");
 
-    let reference = Reference::Tag("v1".to_string());
+    let reference = Reference::Tag(Tag::new("v1").unwrap());
     let response = fixture
         .registry
         .delete_manifest(None, None, &namespace, &reference)
@@ -329,7 +329,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
             None,
             None,
             &namespace,
-            Reference::Tag("to-delete".to_string()),
+            Reference::Tag(Tag::new("to-delete").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
             Vec::new(),
@@ -387,7 +387,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
             None,
             None,
             &namespace,
-            Reference::Tag("stable".to_string()),
+            Reference::Tag(Tag::new("stable").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
             Vec::new(),
@@ -457,7 +457,7 @@ async fn tag_push_events_delivered_to_webhook_endpoint() {
             None,
             None,
             &namespace,
-            Reference::Tag("webhook-test".to_string()),
+            Reference::Tag(Tag::new("webhook-test").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
             Vec::new(),
@@ -498,7 +498,7 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
             None,
             None,
             &namespace,
-            Reference::Tag("seed2".to_string()),
+            Reference::Tag(Tag::new("seed2").unwrap()),
             mime_type.clone(),
             Cursor::new(manifest_bytes.clone()),
             Vec::new(),
@@ -611,7 +611,7 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
             None,
             None,
             &namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
             Vec::new(),
@@ -654,7 +654,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
         .registry
         .put_manifest(
             &namespace,
-            &Reference::Tag("doomed".to_string()),
+            &Reference::Tag(Tag::new("doomed").unwrap()),
             Some(&mime_type),
             &manifest_bytes,
         )
@@ -676,7 +676,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
             None,
             None,
             &namespace,
-            &Reference::Tag("doomed".to_string()),
+            &Reference::Tag(Tag::new("doomed").unwrap()),
         )
         .await
         .expect("delete_manifest");

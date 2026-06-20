@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::{
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::{
         job_store::{JobState, Queue},
         metadata_store::LinkKind,
@@ -55,6 +55,10 @@ pub enum Action {
     },
     DeleteTag {
         namespace: String,
+        tag: Tag,
+    },
+    DeleteInvalidTag {
+        namespace: String,
         tag: String,
     },
     DeleteOrphanManifest {
@@ -80,7 +84,7 @@ pub enum Action {
     EnqueueReplicationPush {
         downstream: String,
         namespace: String,
-        tag: String,
+        tag: Tag,
         digest: Digest,
     },
     /// Enqueue a replication delete job for a downstream-only tag. Emitted only
@@ -89,7 +93,7 @@ pub enum Action {
     EnqueueReplicationDelete {
         downstream: String,
         namespace: String,
-        tag: String,
+        tag: Tag,
     },
     /// Delete a queued job (replication or cache) whose payload no longer
     /// resolves to configured state, so it can never succeed usefully again.
@@ -178,6 +182,9 @@ impl fmt::Display for Action {
             }
             Action::DeleteTag { namespace, tag } => {
                 write!(f, "delete tag '{namespace}:{tag}' (policy)")
+            }
+            Action::DeleteInvalidTag { namespace, tag } => {
+                write!(f, "delete invalid tag directory '{namespace}:{tag}'")
             }
             Action::DeleteOrphanManifest { namespace, digest } => {
                 write!(f, "delete orphan manifest '{namespace}@{digest}' (policy)")

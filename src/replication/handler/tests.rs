@@ -13,7 +13,7 @@ use angos_tx_engine::store::Store;
 
 use crate::{
     cache, metrics_provider,
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, Repository,
         blob_store::BlobStore,
@@ -44,7 +44,7 @@ fn sample_payload() -> ReplicationPushPayload {
     ReplicationPushPayload {
         downstream: DOWNSTREAM.to_string(),
         namespace: NAMESPACE.to_string(),
-        tag: Some("v1".to_string()),
+        tag: Some(Tag::new("v1").unwrap()),
         digest: Some(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
         ),
@@ -414,7 +414,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
     let current_bytes = serde_json::to_vec(&manifest_json("current")).unwrap();
     let current_digest = put_blob(&store, &current_bytes).await;
 
-    let link = LinkKind::Tag("v1".to_string());
+    let link = LinkKind::Tag(Tag::new("v1").unwrap());
     metadata_store
         .update_links(
             NAMESPACE,
@@ -486,7 +486,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
     let payload = ReplicationPushPayload {
         downstream: DOWNSTREAM.to_string(),
         namespace: NAMESPACE.to_string(),
-        tag: Some("v1".to_string()),
+        tag: Some(Tag::new("v1").unwrap()),
         digest: Some(stale_digest.to_string()),
         kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
         source_ts: Some("2026-06-03T00:00:00Z".to_string()),
@@ -591,7 +591,7 @@ async fn execute_push_stamps_resolved_source_timestamp() {
 
     // Read back the tag's created_at to assert the exact stamped value.
     let expected_ts = metadata_store
-        .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()))
+        .read_link(NAMESPACE, &LinkKind::Tag(Tag::new("v1").unwrap()))
         .await
         .unwrap()
         .created_at
@@ -663,7 +663,7 @@ async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, NAMESPACE).await;
     let expected_ts = metadata_store
-        .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()))
+        .read_link(NAMESPACE, &LinkKind::Tag(Tag::new("v1").unwrap()))
         .await
         .unwrap()
         .created_at

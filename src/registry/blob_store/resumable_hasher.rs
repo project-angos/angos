@@ -25,15 +25,14 @@ impl AlgorithmHasher {
     }
 
     fn from_state(algorithm: Algorithm, state: &[u8]) -> Result<Self, Error> {
-        let invalid =
-            || Error::HashSerialization("Unable to resume hash state".to_string());
+        let invalid = || Error::HashSerialization("Unable to resume hash state".to_string());
         Ok(match algorithm {
-            Algorithm::Sha256 => {
-                Self::Sha256(Sha256::deserialize(state.try_into().map_err(|_| invalid())?)?)
-            }
-            Algorithm::Sha512 => {
-                Self::Sha512(Sha512::deserialize(state.try_into().map_err(|_| invalid())?)?)
-            }
+            Algorithm::Sha256 => Self::Sha256(Sha256::deserialize(
+                state.try_into().map_err(|_| invalid())?,
+            )?),
+            Algorithm::Sha512 => Self::Sha512(Sha512::deserialize(
+                state.try_into().map_err(|_| invalid())?,
+            )?),
         })
     }
 
@@ -269,10 +268,7 @@ mod tests {
             .unwrap()
             .into_hasher()
             .unwrap();
-        assert_eq!(
-            restored.digest(Algorithm::Sha256).unwrap(),
-            sha256.digest()
-        );
+        assert_eq!(restored.digest(Algorithm::Sha256).unwrap(), sha256.digest());
         // sha512 was never hashed for the legacy bytes: it must NOT be fabricated,
         // and the error names the unavailable algorithm (mapped to a 4xx upstream)
         // rather than a generic hash-serialization failure.

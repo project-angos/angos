@@ -429,7 +429,7 @@ mod in_process_replication_tests {
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
     use crate::{
-        oci::Namespace,
+        oci::{Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
@@ -548,12 +548,13 @@ mod in_process_replication_tests {
 
         // Enqueue via the production event path.
         let repository = registry.resolver.resolve(&namespace);
+        let tag = Tag::new("v1").unwrap();
         registry
             .dispatch_replication(
                 repository,
                 &namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
+                Some(&tag),
                 Some(&manifest_digest),
                 None,
             )

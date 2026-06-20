@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use crate::{
-    oci::Namespace,
+    oci::{Namespace, Tag},
     registry::{
         metadata_store::{LinkKind, LinkOperation},
         path_builder,
@@ -34,7 +34,7 @@ async fn list_namespaces_is_derived_from_content() {
             .update_links(
                 namespace,
                 &[
-                    LinkOperation::delete(LinkKind::Tag("latest".to_string())),
+                    LinkOperation::delete(LinkKind::Tag(Tag::new("latest").unwrap())),
                     LinkOperation::delete(LinkKind::Layer(digest.clone())),
                 ],
             )

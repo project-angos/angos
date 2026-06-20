@@ -14,7 +14,7 @@ use crate::{
     },
     event_webhook::event::EventActor,
     identity::ClientIdentity,
-    oci::{Namespace, Reference},
+    oci::{Namespace, Reference, Tag},
     registry::GetManifestResponse,
 };
 
@@ -71,7 +71,7 @@ pub async fn handle_put_manifest<S>(
     reference: Reference,
     mime_type: String,
     body_stream: S,
-    tags: Vec<String>,
+    tags: Vec<Tag>,
     identity: &ClientIdentity,
     source_ts: Option<DateTime<Utc>>,
 ) -> Result<EventfulResponse, Error>
@@ -144,7 +144,7 @@ pub async fn dispatch_put_manifest(
     incoming: Incoming,
     namespace: &Namespace,
     reference: Reference,
-    tags: Vec<String>,
+    tags: Vec<Tag>,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
@@ -203,7 +203,7 @@ mod tests {
         },
         configuration::Configuration,
         identity::ClientIdentity,
-        oci::{Namespace, Reference},
+        oci::{Namespace, Reference, Tag},
         replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     };
 
@@ -278,7 +278,7 @@ mod tests {
         let context = context_with_test_repo().await;
         let namespace = Namespace::new("test/repo").unwrap();
         let identity = ClientIdentity::new(None);
-        let tag = || Reference::Tag("latest".to_string());
+        let tag = || Reference::Tag(Tag::new("latest").unwrap());
 
         // Seed the newer local tag with manifest B at a known recent source_ts so
         // created_at is stamped deterministically rather than from the wall clock.

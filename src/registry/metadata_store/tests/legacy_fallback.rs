@@ -7,7 +7,7 @@ use angos_tx_engine::{
 
 use super::{TestS3Config, legacy_blob_index_with, put_legacy_index, test_config};
 use crate::{
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::{
         metadata_store::{BlobIndex, LinkKind, LinkOperation},
         path_builder,
@@ -37,7 +37,7 @@ async fn test_read_blob_index_falls_back_to_legacy_when_no_shards() {
     let digest =
         Digest::from_str("sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a")
             .unwrap();
-    let link = LinkKind::Tag("v1".into());
+    let link = LinkKind::Tag(Tag::new("v1").unwrap());
 
     let legacy = legacy_blob_index_with(vec![(namespace, vec![link.clone()])]);
     put_legacy_index(&backend, &digest, &legacy).await;
@@ -65,8 +65,8 @@ async fn test_read_blob_index_namespace_falls_back_to_legacy() {
     let digest =
         Digest::from_str("sha256:1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b")
             .unwrap();
-    let link_a = LinkKind::Tag("a".into());
-    let link_b = LinkKind::Tag("b".into());
+    let link_a = LinkKind::Tag(Tag::new("a").unwrap());
+    let link_b = LinkKind::Tag(Tag::new("b").unwrap());
 
     let legacy = legacy_blob_index_with(vec![
         (namespace_a, vec![link_a.clone()]),
@@ -103,7 +103,7 @@ async fn test_has_blob_references_sees_legacy() {
     let digest =
         Digest::from_str("sha256:1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c")
             .unwrap();
-    let link = LinkKind::Tag("ref".into());
+    let link = LinkKind::Tag(Tag::new("ref").unwrap());
 
     let legacy = legacy_blob_index_with(vec![(namespace, vec![link.clone()])]);
     put_legacy_index(&backend, &digest, &legacy).await;
@@ -130,10 +130,13 @@ async fn test_update_links_writes_to_legacy_when_present_locked() {
     let digest =
         Digest::from_str("sha256:1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d")
             .unwrap();
-    let tag = LinkKind::Tag("new-tag".into());
+    let tag = LinkKind::Tag(Tag::new("new-tag").unwrap());
 
     // Seed an empty legacy file so the dispatcher routes to it.
-    let seed = legacy_blob_index_with(vec![(namespace, vec![LinkKind::Tag("seed".into())])]);
+    let seed = legacy_blob_index_with(vec![(
+        namespace,
+        vec![LinkKind::Tag(Tag::new("seed").unwrap())],
+    )]);
     put_legacy_index(&backend, &digest, &seed).await;
 
     let ops = vec![LinkOperation::Create {
@@ -180,9 +183,12 @@ async fn test_update_links_writes_to_legacy_when_present_cas() {
     let digest =
         Digest::from_str("sha256:1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e")
             .unwrap();
-    let tag = LinkKind::Tag("cas-new".into());
+    let tag = LinkKind::Tag(Tag::new("cas-new").unwrap());
 
-    let seed = legacy_blob_index_with(vec![(namespace, vec![LinkKind::Tag("seed".into())])]);
+    let seed = legacy_blob_index_with(vec![(
+        namespace,
+        vec![LinkKind::Tag(Tag::new("seed").unwrap())],
+    )]);
     put_legacy_index(&backend, &digest, &seed).await;
 
     let ops = vec![LinkOperation::Create {
@@ -228,7 +234,7 @@ async fn test_update_links_deletes_legacy_when_emptied() {
     let digest =
         Digest::from_str("sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f")
             .unwrap();
-    let tag = LinkKind::Tag("only".into());
+    let tag = LinkKind::Tag(Tag::new("only").unwrap());
 
     // Stage the link normally so its `link.json` actually exists.
     let create_ops = vec![LinkOperation::Create {
@@ -279,7 +285,7 @@ async fn test_no_legacy_writes_still_use_shards() {
     let digest =
         Digest::from_str("sha256:2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a")
             .unwrap();
-    let tag = LinkKind::Tag("shardy".into());
+    let tag = LinkKind::Tag(Tag::new("shardy").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -322,8 +328,8 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     let digest =
         Digest::from_str("sha256:2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b")
             .unwrap();
-    let link_a = LinkKind::Tag("a".into());
-    let link_b = LinkKind::Tag("b".into());
+    let link_a = LinkKind::Tag(Tag::new("a").unwrap());
+    let link_b = LinkKind::Tag(Tag::new("b").unwrap());
 
     let legacy = legacy_blob_index_with(vec![
         (namespace_a, vec![link_a.clone()]),
@@ -332,7 +338,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     put_legacy_index(&backend, &digest, &legacy).await;
 
     // Before migration: an update should still route into the legacy file.
-    let extra = LinkKind::Tag("extra-a".into());
+    let extra = LinkKind::Tag(Tag::new("extra-a").unwrap());
     let pre_ops = vec![LinkOperation::Create {
         link: extra.clone(),
         target: digest.clone(),
@@ -387,7 +393,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     assert!(links_second.contains(&link_b));
 
     // A fresh update now hits a shard (proves the fallback target is gone).
-    let post_link = LinkKind::Tag("post".into());
+    let post_link = LinkKind::Tag(Tag::new("post").unwrap());
     let post_ops = vec![LinkOperation::Create {
         link: post_link.clone(),
         target: digest.clone(),

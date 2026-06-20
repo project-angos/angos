@@ -29,10 +29,13 @@ pub use orphan_namespaces::OrphanNamespaceChecker;
 pub use referrer::ReferrerChecker;
 pub use replication::ReplicationChecker;
 pub use retention::RetentionChecker;
-pub use tag::TagChecker;
+pub use tag::DigestLinkChecker;
 pub use upload::UploadChecker;
 
-use crate::command::scrub::{error::Error, executor::ActionSink};
+use crate::{
+    command::scrub::{error::Error, executor::ActionSink},
+    oci::Tag,
+};
 
 /// A checker that operates on a single namespace at a time.
 ///
@@ -52,4 +55,17 @@ pub trait NamespaceChecker: Send + Sync {
 #[async_trait]
 pub trait StoreChecker: Send + Sync {
     async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error>;
+}
+
+/// A checker that inspects a single already-validated tag. The tag walk is
+/// driven once by `Command::scrub_metadata`, which dispatches every valid tag
+/// to each enabled `TagChecker`.
+#[async_trait]
+pub trait TagChecker: Send + Sync {
+    async fn check_tag(
+        &self,
+        namespace: &str,
+        tag: &Tag,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error>;
 }

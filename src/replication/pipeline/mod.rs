@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
-    oci::{Digest, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference},
+    oci::{Digest, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference, Tag},
     registry::{
         Error as RegistryError, ParsedManifestDigests,
         blob_ownership::BlobOwnership,
@@ -92,7 +92,9 @@ pub async fn push_manifest(
 
     // Pushing by tag binds tag -> digest atomically on the downstream.
     let reference = match tag {
-        Some(tag) => Reference::Tag(tag.to_string()),
+        Some(tag) => Reference::Tag(Tag::new(tag).map_err(|e| {
+            Error::Registry(RegistryError::Internal(format!("invalid tag '{tag}': {e}")))
+        })?),
         None => Reference::Digest(digest.clone()),
     };
     let location = ctx

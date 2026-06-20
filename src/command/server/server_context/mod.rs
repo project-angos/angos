@@ -105,7 +105,7 @@ impl ServerContext {
                     .get_repository_for_namespace(namespace)
                     .ok()
                     .map(|repository| repository.name.as_str()),
-                tag.as_str(),
+                tag,
             ),
             Reference::Digest(_) => false,
         }

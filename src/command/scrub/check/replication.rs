@@ -16,7 +16,7 @@ use crate::{
         error::Error,
         executor::{ActionSink, record_reconcile_outcome},
     },
-    oci::{Digest, Reference},
+    oci::{Digest, Reference, Tag},
     registry::{
         Error as RegistryError,
         metadata_store::{LinkKind, MetadataStore},
@@ -53,10 +53,10 @@ impl ReplicationChecker {
 
     /// Resolves the current local digest for `tag` in `namespace`, bypassing
     /// the link cache so a reconcile never enqueues a stale digest.
-    async fn local_digest(&self, namespace: &str, tag: &str) -> Option<Digest> {
+    async fn local_digest(&self, namespace: &str, tag: &Tag) -> Option<Digest> {
         match self
             .metadata_store
-            .read_link_reference(namespace, &LinkKind::Tag(tag.to_string()))
+            .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
             .await
         {
             Ok(link) => Some(link.target),
@@ -74,7 +74,7 @@ impl ReplicationChecker {
         &self,
         downstream: &ReplicationDownstream,
         namespace: &str,
-        local_tags: &[(String, Option<Digest>)],
+        local_tags: &[(Tag, Option<Digest>)],
         sink: &mut (dyn ActionSink + Send),
     ) {
         reconcile_push_step(downstream, namespace, local_tags, sink).await;
@@ -102,9 +102,9 @@ impl ReplicationChecker {
 
         // Tags whose digest read failed (`None`) still count as local: prune
         // must never delete a tag that exists locally.
-        let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_str()).collect();
+        let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_ref()).collect();
         for tag in downstream_tags {
-            if local_set.contains(tag.as_str()) {
+            if local_set.contains(tag.as_ref()) {
                 continue;
             }
             if let Err(e) = sink
@@ -134,28 +134,28 @@ impl ReplicationChecker {
 async fn reconcile_push_step(
     downstream: &ReplicationDownstream,
     namespace: &str,
-    local_tags: &[(String, Option<Digest>)],
+    local_tags: &[(Tag, Option<Digest>)],
     sink: &mut (dyn ActionSink + Send),
 ) {
     enum Probe {
-        Push { tag: String, digest: Digest },
+        Push { tag: Tag, digest: Digest },
         Converged,
         Skipped,
     }
 
-    let candidates: Vec<(String, Digest)> = local_tags
+    let candidates: Vec<(Tag, Digest)> = local_tags
         .iter()
         .filter_map(|(tag, local)| local.as_ref().map(|digest| (tag.clone(), digest.clone())))
         .collect();
     let probes = stream::iter(candidates)
         .map(|(tag, local)| async move {
+            let reference = Reference::Tag(tag.clone());
             // Only a 404 means absence; any other HEAD failure skips the tag this
             // pass rather than enqueuing a spurious push.
-            let location = downstream.registry_client.get_manifest_path(
-                NO_LOCAL_PREFIX,
-                namespace,
-                &Reference::Tag(tag.clone()),
-            );
+            let location =
+                downstream
+                    .registry_client
+                    .get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
             match downstream
                 .registry_client
                 .head_manifest(&manifest_accept_types(), &location)
@@ -168,7 +168,10 @@ async fn reconcile_push_step(
                     );
                     Probe::Converged
                 }
-                Ok(_) | Err(RegistryError::ManifestUnknown) => Probe::Push { tag, digest: local },
+                Ok(_) | Err(RegistryError::ManifestUnknown) => Probe::Push {
+                    tag,
+                    digest: local,
+                },
                 Err(e) => {
                     debug!(
                         "HEAD for '{namespace}:{tag}' on downstream '{}' failed; skipping this pass: {e}",
@@ -249,7 +252,7 @@ impl NamespaceChecker for ReplicationChecker {
         // Collect and digest-resolve the tag set once to avoid O(downstreams x
         // tags) metadata reads. A failed link read resolves to `None`: skipped
         // for push but still counted as local so prune never deletes a live tag.
-        let mut local_tags: Vec<(String, Option<Digest>)> = Vec::new();
+        let mut local_tags: Vec<(Tag, Option<Digest>)> = Vec::new();
         let mut stream = list_all::tags(&self.metadata_store, namespace);
         while let Some(tag) = stream.next().await {
             let tag = tag?;
@@ -292,7 +295,7 @@ mod tests {
             worker::runner::execute_one,
         },
         metrics_provider,
-        oci::Digest,
+        oci::{Digest, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Repository,
             blob_store::BlobStore,
@@ -358,7 +361,7 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -400,7 +403,7 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest,
                 )],
             )
@@ -477,7 +480,7 @@ mod tests {
                 .update_links(
                     NAMESPACE,
                     &[LinkOperation::create(
-                        LinkKind::Tag(tag.to_string()),
+                        LinkKind::Tag(Tag::new(tag).unwrap()),
                         manifest,
                     )],
                 )
@@ -507,7 +510,7 @@ mod tests {
             .attempted
             .iter()
             .filter_map(|a| match a {
-                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_str()),
+                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -549,7 +552,7 @@ mod tests {
             .attempted
             .iter()
             .filter_map(|a| match a {
-                Action::EnqueueReplicationDelete { tag, .. } => Some(tag.as_str()),
+                Action::EnqueueReplicationDelete { tag, .. } => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -570,7 +573,7 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -611,7 +614,7 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -657,9 +660,9 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[
-                    LinkOperation::create(LinkKind::Tag("v1".to_string()), manifest.clone()),
-                    LinkOperation::create(LinkKind::Tag("v2".to_string()), manifest.clone()),
-                    LinkOperation::create(LinkKind::Tag("v3".to_string()), manifest.clone()),
+                    LinkOperation::create(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone()),
+                    LinkOperation::create(LinkKind::Tag(Tag::new("v2").unwrap()), manifest.clone()),
+                    LinkOperation::create(LinkKind::Tag(Tag::new("v3").unwrap()), manifest.clone()),
                 ],
             )
             .await
@@ -687,7 +690,7 @@ mod tests {
         let mut tags: Vec<&str> = sink
             .iter()
             .filter_map(|action| match action {
-                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_str()),
+                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -710,7 +713,7 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -767,7 +770,7 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -820,7 +823,7 @@ mod tests {
         put_link_raw(
             &store,
             NAMESPACE,
-            &LinkKind::Tag("broken".to_string()),
+            &LinkKind::Tag(Tag::new("broken").unwrap()),
             b"not-a-link",
         )
         .await;
@@ -861,7 +864,7 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -893,7 +896,7 @@ mod tests {
             .update_links(
                 NAMESPACE,
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )

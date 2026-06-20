@@ -15,7 +15,7 @@ use crate::{
     command::server::Error as ServerError,
     configuration::Configuration,
     identity::{ClientCertificate, ManifestPutTarget, OidcClaims},
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{
         RegistryConfig, Repository, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -327,7 +327,7 @@ fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
 
     let action = Action::PutManifest {
         namespace: Namespace::new("myrepo/app").unwrap(),
-        target: ManifestPutTarget::Tag("v1.0.0".to_string()),
+        target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap()),
     };
 
     let result = authorizer.check_immutable_tag("myrepo", &action);
@@ -364,7 +364,7 @@ fn test_check_immutable_tag_returns_conflict_for_by_digest_tag_on_push() {
                 "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             )
             .unwrap(),
-            tags: vec!["v1.0.0".to_string()],
+            tags: vec![Tag::new("v1.0.0").unwrap()],
         },
     };
 
@@ -402,7 +402,7 @@ fn test_check_immutable_tag_allows_by_digest_mutable_tag_on_push() {
                 "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             )
             .unwrap(),
-            tags: vec!["latest".to_string()],
+            tags: vec![Tag::new("latest").unwrap()],
         },
     };
 
@@ -430,7 +430,7 @@ fn test_check_immutable_tag_allows_by_tag_mutable() {
 
     let action = Action::PutManifest {
         namespace: Namespace::new("myrepo/app").unwrap(),
-        target: ManifestPutTarget::Tag("latest".to_string()),
+        target: ManifestPutTarget::Tag(Tag::new("latest").unwrap()),
     };
 
     assert!(
@@ -611,7 +611,7 @@ async fn test_pull_through_repo_blocks_push_operations() {
     let namespace = Namespace::new("docker-io/library/nginx").unwrap();
     let put_manifest_route = Action::PutManifest {
         namespace: namespace.clone(),
-        target: ManifestPutTarget::Tag("latest".to_string()),
+        target: ManifestPutTarget::Tag(Tag::new("latest").unwrap()),
     };
     let result = authorizer
         .authorize_request(&put_manifest_route, &identity, &parts, &registry)
@@ -806,7 +806,7 @@ async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {
 
     let action = Action::GetManifest {
         namespace: Namespace::new("no-such-repo/image").unwrap(),
-        reference: Reference::Tag("latest".to_string()),
+        reference: Reference::Tag(Tag::new("latest").unwrap()),
     };
 
     let result = authorizer
@@ -855,7 +855,7 @@ async fn webhook_unreachable_fails_closed() {
 
     let action = Action::GetManifest {
         namespace: Namespace::new("myrepo/app").unwrap(),
-        reference: Reference::Tag("latest".to_string()),
+        reference: Reference::Tag(Tag::new("latest").unwrap()),
     };
 
     let result = authorizer

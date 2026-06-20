@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     identity::{Action, ManifestPutTarget},
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::job_store::{JobState, Queue},
 };
 
@@ -74,11 +74,12 @@ fn digest_from_params(params: Option<&str>) -> Option<Digest> {
 }
 
 /// Repeated `tag` query parameters for the distribution-spec tag-on-push
-/// feature; values are validated downstream.
+/// feature. Each value deserializes through `Tag`, so an invalid tag fails the
+/// parse and rejects the route.
 #[derive(Deserialize, Default)]
 struct TagQuery {
     #[serde(default)]
-    tag: Vec<String>,
+    tag: Vec<Tag>,
 }
 
 #[derive(Deserialize, Default)]
@@ -297,13 +298,15 @@ fn try_find_manifests(method: &Method, path: &str, params: Option<&str>) -> Opti
             }
             Method::PUT => {
                 // `?tag=` applies only to a by-digest push; a by-tag push ignores it.
+                // Strict parse: a single invalid tag rejects the PUT (generic 400)
+                // rather than silently dropping every requested tag.
                 let target = match reference {
                     Reference::Tag(tag) => ManifestPutTarget::Tag(tag),
                     Reference::Digest(digest) => {
-                        let tags = params
-                            .and_then(parse_query::<TagQuery>)
-                            .map(|q| q.tag)
-                            .unwrap_or_default();
+                        let tags = match params {
+                            Some(p) => parse_query::<TagQuery>(p)?.tag,
+                            None => Vec::new(),
+                        };
                         ManifestPutTarget::Digest { digest, tags }
                     }
                 };

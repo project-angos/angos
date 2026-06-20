@@ -1,6 +1,6 @@
 use crate::{
     event_webhook::event::Event,
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{HeaderMap, OCI_SUBJECT, OCI_TAG, ResponseHeaders},
 };
 
@@ -87,7 +87,7 @@ pub fn put_manifest_headers(
     reference: &Reference,
     digest: &Digest,
     subject: Option<&Digest>,
-    created_tags: &[String],
+    created_tags: &[Tag],
 ) -> HeaderMap {
     let mut headers = ResponseHeaders::new()
         .location(format!("/v2/{namespace}/manifests/{reference}"))
@@ -96,7 +96,12 @@ pub fn put_manifest_headers(
         headers = headers.with(OCI_SUBJECT, subject.to_string());
     }
     if !created_tags.is_empty() {
-        headers = headers.with(OCI_TAG, created_tags.join(", "));
+        let joined = created_tags
+            .iter()
+            .map(Tag::as_ref)
+            .collect::<Vec<&str>>()
+            .join(", ");
+        headers = headers.with(OCI_TAG, joined);
     }
     headers.into_inner()
 }

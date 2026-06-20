@@ -262,7 +262,7 @@ mod tests {
 
     use crate::{
         cache,
-        oci::{Digest, Reference},
+        oci::{Digest, Reference, Tag},
         registry::{
             Error,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -496,7 +496,7 @@ mod tests {
         let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
             .unwrap();
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
         assert!(result.is_ok());
@@ -515,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_to_second_upstream() {
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
 
         let (repo, _first, _second) = fallback_repository(
             "HEAD",
@@ -609,7 +609,7 @@ mod tests {
         let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
             .unwrap();
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
         assert!(result.is_err());
@@ -651,7 +651,7 @@ mod tests {
         let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
             .unwrap();
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
         assert!(result.is_ok());
@@ -687,7 +687,7 @@ mod tests {
         let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
             .unwrap();
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
         assert!(result.is_err());

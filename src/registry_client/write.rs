@@ -16,10 +16,10 @@ use reqwest::{
 use serde::Deserialize;
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::{
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::{DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT},
     registry_client::RegistryClient,
     replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
@@ -539,12 +539,12 @@ impl RegistryClient {
     /// Returns an error when a request fails, access is rejected, or a non-404
     /// page has a non-success status or unparseable body.
     #[instrument(skip(self))]
-    pub async fn list_tags(&self, location: &str) -> Result<Vec<String>, Error> {
+    pub async fn list_tags(&self, location: &str) -> Result<Vec<Tag>, Error> {
         // Guards against non-terminating pagination: `visited` stops an exact
         // page-URL cycle; `MAX_PAGES` backstops endless distinct pages.
         const MAX_PAGES: usize = 10_000;
 
-        let mut tags = Vec::new();
+        let mut tags: Vec<Tag> = Vec::new();
         let mut next = Some(location.to_string());
         let mut visited = HashSet::new();
 
@@ -580,7 +580,13 @@ impl RegistryClient {
                 .map_err(|e| Error::Internal(format!("failed to read tags/list body: {e}")))?;
             let parsed: TagsListBody = serde_json::from_slice(&body)
                 .map_err(|e| Error::Internal(format!("failed to parse tags/list body: {e}")))?;
-            tags.extend(parsed.tags);
+
+            for name in parsed.tags {
+                match Tag::try_from(name) {
+                    Ok(tag) => tags.push(tag),
+                    Err(e) => warn!("ignoring invalid tag in downstream tags/list: {e}"),
+                }
+            }
         }
 
         Ok(tags)

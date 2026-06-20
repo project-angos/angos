@@ -5,7 +5,7 @@ use angos_storage::s3::Backend as StorageS3Backend;
 
 use super::{legacy_blob_index_with, put_legacy_index, test_config};
 use crate::{
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::{
         metadata_store::{BlobIndex, BlobIndexOperation, LinkKind, MetadataStore},
         path_builder,
@@ -32,8 +32,8 @@ async fn test_update_blob_index_legacy_applies_correctly() {
         Digest::from_str("sha256:4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b")
             .unwrap();
     let namespace = "legacy-ns";
-    let seed_link = LinkKind::Tag("seed".into());
-    let new_link = LinkKind::Tag("new".into());
+    let seed_link = LinkKind::Tag(Tag::new("seed").unwrap());
+    let new_link = LinkKind::Tag(Tag::new("new").unwrap());
 
     let legacy = legacy_blob_index_with(vec![(namespace, vec![seed_link.clone()])]);
     put_legacy_index(&backend, &digest, &legacy).await;

@@ -10,7 +10,7 @@ use super::{test_backend_with_debounce, test_config};
 use crate::{
     cache::Cache as CacheEnum,
     cache::memory::Backend as CacheMemoryBackend,
-    oci::Digest,
+    oci::{Digest, Tag},
     registry::{
         metadata_store::{LinkKind, LinkOperation},
         path_builder,
@@ -25,7 +25,7 @@ async fn test_deferred_access_time_returns_data_immediately() {
     let digest =
         Digest::from_str("sha256:da01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6")
             .unwrap();
-    let tag = LinkKind::Tag("deferred-v1".into());
+    let tag = LinkKind::Tag(Tag::new("deferred-v1").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -57,7 +57,7 @@ async fn test_deferred_access_time_writes_eventually() {
     let digest =
         Digest::from_str("sha256:da02b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1")
             .unwrap();
-    let tag = LinkKind::Tag("deferred-v2".into());
+    let tag = LinkKind::Tag(Tag::new("deferred-v2").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -90,7 +90,7 @@ async fn test_deferred_access_time_coalesces_writes() {
     let digest =
         Digest::from_str("sha256:da03c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
             .unwrap();
-    let tag = LinkKind::Tag("deferred-v3".into());
+    let tag = LinkKind::Tag(Tag::new("deferred-v3").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -136,8 +136,8 @@ async fn test_deferred_access_time_different_links_independent() {
     let digest2 =
         Digest::from_str("sha256:da04e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4")
             .unwrap();
-    let tag1 = LinkKind::Tag("tag1".into());
-    let tag2 = LinkKind::Tag("tag2".into());
+    let tag1 = LinkKind::Tag(Tag::new("tag1").unwrap());
+    let tag2 = LinkKind::Tag(Tag::new("tag2").unwrap());
 
     let ops = vec![
         LinkOperation::Create {
@@ -188,7 +188,7 @@ async fn test_deferred_access_time_flush_on_explicit_call() {
     let digest =
         Digest::from_str("sha256:da05f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5")
             .unwrap();
-    let tag = LinkKind::Tag("deferred-v5".into());
+    let tag = LinkKind::Tag(Tag::new("deferred-v5").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -221,7 +221,7 @@ async fn test_deferred_access_time_zero_debounce_writes_synchronously() {
     let digest =
         Digest::from_str("sha256:da06a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6")
             .unwrap();
-    let tag = LinkKind::Tag("deferred-v6".into());
+    let tag = LinkKind::Tag(Tag::new("deferred-v6").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -252,7 +252,7 @@ async fn test_deferred_access_time_does_not_block_read_path() {
     let digest =
         Digest::from_str("sha256:da07b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1")
             .unwrap();
-    let tag = LinkKind::Tag("deferred-v7".into());
+    let tag = LinkKind::Tag(Tag::new("deferred-v7").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -299,7 +299,7 @@ async fn test_flush_processes_entries_concurrently() {
     let mut tags = Vec::new();
     for i in 0..entry_count {
         let digest = Digest::from_str(&format!("sha256:{:0>64}", format!("cc{i:02}"))).unwrap();
-        let tag = LinkKind::Tag(format!("concurrent-{i}"));
+        let tag = LinkKind::Tag(Tag::try_from(format!("concurrent-{i}")).unwrap());
 
         let ops = vec![LinkOperation::Create {
             link: tag.clone(),
@@ -349,8 +349,8 @@ async fn test_flush_errors_do_not_prevent_other_entries() {
     let digest2 =
         Digest::from_str("sha256:ee02b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1")
             .unwrap();
-    let tag1 = LinkKind::Tag("error-iso-1".into());
-    let tag2 = LinkKind::Tag("error-iso-2".into());
+    let tag1 = LinkKind::Tag(Tag::new("error-iso-1").unwrap());
+    let tag2 = LinkKind::Tag(Tag::new("error-iso-2").unwrap());
 
     let ops = vec![
         LinkOperation::Create {
@@ -384,7 +384,10 @@ async fn test_flush_errors_do_not_prevent_other_entries() {
         .access_time_writer
         .as_ref()
         .unwrap()
-        .record("nonexistent-namespace", &LinkKind::Tag("bogus".into()))
+        .record(
+            "nonexistent-namespace",
+            &LinkKind::Tag(Tag::new("bogus").unwrap()),
+        )
         .await;
 
     backend.flush_access_times().await;
@@ -421,7 +424,7 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
     let digest =
         Digest::from_str("sha256:db01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6")
             .unwrap();
-    let tag = LinkKind::Tag("debounce-cached".into());
+    let tag = LinkKind::Tag(Tag::new("debounce-cached").unwrap());
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),

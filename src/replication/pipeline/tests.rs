@@ -17,7 +17,7 @@ use crate::{
     cache, metrics_provider,
     oci::{
         DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, Digest, OCI_INDEX_MEDIA_TYPE,
-        OCI_MANIFEST_MEDIA_TYPE, Reference,
+        OCI_MANIFEST_MEDIA_TYPE, Reference, Tag,
     },
     registry::{
         DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
@@ -1968,7 +1968,7 @@ async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         NAMESPACE,
-        &Reference::Tag("v1".to_string()),
+        &Reference::Tag(Tag::new("v1").unwrap()),
         Some("2026-06-03T00:00:00Z"),
     )
     .await
@@ -1995,7 +1995,7 @@ async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         NAMESPACE,
-        &Reference::Tag("gone".to_string()),
+        &Reference::Tag(Tag::new("gone").unwrap()),
         None,
     )
     .await
@@ -2027,7 +2027,7 @@ async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         NAMESPACE,
-        &Reference::Tag("v1".to_string()),
+        &Reference::Tag(Tag::new("v1").unwrap()),
         None,
     )
     .await
@@ -2054,7 +2054,7 @@ async fn delete_manifest_propagates_non_superseded_409_as_error() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         NAMESPACE,
-        &Reference::Tag("v1".to_string()),
+        &Reference::Tag(Tag::new("v1").unwrap()),
         None,
     )
     .await;

@@ -6,10 +6,10 @@ use tracing::{info, warn};
 use crate::{
     command::scrub::{
         check::{
-            BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, OrphanGrantChecker, OrphanJobChecker,
-            OrphanNamespaceChecker, OrphanQueue, ReferrerChecker, ReplicationChecker,
-            RetentionChecker, StoreChecker, TagChecker, UploadChecker,
+            BlobChecker, DigestLinkChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker,
+            MediaTypeChecker, MultipartChecker, NamespaceChecker, OrphanGrantChecker,
+            OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue, ReferrerChecker,
+            ReplicationChecker, RetentionChecker, StoreChecker, TagChecker, UploadChecker,
         },
         command::Options,
         error::Error,
@@ -68,13 +68,6 @@ pub fn namespace_checkers(
         )));
     }
 
-    if options.tags {
-        checkers.push(Box::new(TagChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )));
-    }
-
     if options.manifests {
         checkers.push(Box::new(ManifestChecker::new(
             blob_store.clone(),
@@ -108,6 +101,22 @@ pub fn namespace_checkers(
     }
 
     Ok(checkers)
+}
+
+/// The per-tag checkers enabled by `--tags`, or `None` when tag scrubbing is off
+/// (which also disables the invalid-tag gate). Driven by the tag walk in
+/// `Command::scrub_metadata`.
+pub fn tag_checkers(
+    options: &Options,
+    blob_store: &Arc<blob_store::BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
+) -> Option<Vec<Box<dyn TagChecker>>> {
+    options.tags.then(|| {
+        vec![Box::new(DigestLinkChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+        )) as Box<dyn TagChecker>]
+    })
 }
 
 pub fn layout_checker(blob_store: &Arc<blob_store::BlobStore>) -> LayoutChecker {

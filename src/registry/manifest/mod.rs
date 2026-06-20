@@ -2,8 +2,6 @@ pub mod link_plan;
 mod parse;
 mod response;
 
-use std::str::FromStr;
-
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
@@ -22,7 +20,7 @@ use tracing::{error, instrument, warn};
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
     metrics_provider::metrics_provider,
-    oci::{Digest, Manifest, Namespace, Reference},
+    oci::{Digest, Manifest, Namespace, Reference, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
@@ -327,7 +325,7 @@ impl Registry {
         reference: &Reference,
         content_type: Option<&String>,
         body: &[u8],
-        created_tags: &[String],
+        created_tags: &[Tag],
         reference_policy: ReferencePolicy,
         created_at: Option<DateTime<Utc>>,
     ) -> Result<PutManifestResponse, Error> {
@@ -596,7 +594,7 @@ impl Registry {
             actor.clone(),
         )];
 
-        if let Reference::Tag(tag) = reference {
+        if let Some(tag) = reference.as_tag() {
             events.push(tag_event(
                 EventKind::TagDelete,
                 namespace,
@@ -611,7 +609,7 @@ impl Registry {
         // For a tag delete the receiver keys off `payload.tag`, so no digest
         // is carried.
         let (tag, dispatch_digest) = match reference {
-            Reference::Tag(tag) => (Some(tag.as_str()), None),
+            Reference::Tag(tag) => (Some(tag), None),
             Reference::Digest(digest) => (None, Some(digest)),
         };
         // Webhook events above fire unconditionally; only the replication
@@ -740,7 +738,7 @@ impl Registry {
         let Some(source_ts) = source_ts else {
             return Ok(());
         };
-        let Reference::Tag(tag) = reference else {
+        let Some(tag) = reference.as_tag() else {
             return Ok(());
         };
 
@@ -837,8 +835,9 @@ impl Registry {
 
     /// Reads the body stream, calls `put_manifest`, and returns the domain response.
     ///
-    /// `tags` carries the values of `?tag=` query parameters; they apply only
-    /// when `reference` is a `Reference::Digest` and are validated downstream.
+    /// `tags` carries the pre-validated values of `?tag=` query parameters; they
+    /// apply only when `reference` is a `Reference::Digest`. A by-tag push
+    /// ignores them and creates no extra tags.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, body_stream, actor))]
     pub async fn accept_put_manifest<S>(
@@ -849,12 +848,17 @@ impl Registry {
         reference: Reference,
         mime_type: String,
         body_stream: S,
-        tags: Vec<String>,
+        tags: Vec<Tag>,
     ) -> Result<PutManifestResponse, Error>
     where
         S: AsyncRead + Unpin + Send,
     {
         let resolved_repository = self.resolver.resolve(namespace);
+
+        let created_tags: Vec<Tag> = match &reference {
+            Reference::Digest(_) => tags,
+            Reference::Tag(_) => Vec::new(),
+        };
 
         let limit = self.max_manifest_size_bytes;
         let mut request_body = Vec::new();
@@ -878,22 +882,6 @@ impl Registry {
             .then(|| Digest::sha256_of_bytes(&request_body));
         self.check_lww_not_superseded(namespace, &reference, source_ts, incoming_digest.as_ref())
             .await?;
-
-        // `?tag=` query parameters apply only to a by-digest push and must each
-        // be a valid tag; a by-tag push ignores them and creates no extra tags.
-        let created_tags: Vec<String> = match &reference {
-            Reference::Digest(_) => {
-                for tag in &tags {
-                    if !matches!(Reference::from_str(tag), Ok(Reference::Tag(_))) {
-                        return Err(Error::ManifestInvalid(format!(
-                            "Invalid tag query parameter: '{tag}'"
-                        )));
-                    }
-                }
-                tags
-            }
-            Reference::Tag(_) => Vec::new(),
-        };
 
         let reference_policy = if self.validate_manifest_references {
             ReferencePolicy::Strict
@@ -926,7 +914,7 @@ impl Registry {
             actor.clone(),
         ));
 
-        if let Reference::Tag(tag) = &reference {
+        if let Some(tag) = reference.as_tag() {
             response.events.push(tag_event(
                 EventKind::TagCreate,
                 namespace,
@@ -979,13 +967,10 @@ impl Registry {
         repository: Option<&Repository>,
         namespace: &Namespace,
         reference: &Reference,
-        created_tags: &[String],
+        created_tags: &[Tag],
         digest: &Digest,
     ) {
-        let path_tag = match reference {
-            Reference::Tag(tag) => Some(tag.as_str()),
-            Reference::Digest(_) => None,
-        };
+        let path_tag = reference.as_tag();
         self.dispatch_replication(
             repository,
             namespace,
@@ -1001,7 +986,7 @@ impl Registry {
                 repository,
                 namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
-                Some(tag.as_str()),
+                Some(tag),
                 Some(digest),
                 None,
             )
@@ -1018,7 +1003,7 @@ impl Registry {
         repository: Option<&Repository>,
         namespace: &Namespace,
         kind: &str,
-        tag: Option<&str>,
+        tag: Option<&Tag>,
         digest: Option<&Digest>,
         source_ts: Option<DateTime<Utc>>,
     ) {
@@ -1044,7 +1029,7 @@ impl Registry {
                 let payload = ReplicationPushPayload {
                     downstream: downstream.name.clone(),
                     namespace: namespace.to_string(),
-                    tag: tag.map(str::to_string),
+                    tag: tag.cloned(),
                     digest: digest.map(ToString::to_string),
                     kind: kind.to_string(),
                     source_ts: Some(source_ts.clone()),

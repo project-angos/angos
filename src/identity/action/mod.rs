@@ -4,7 +4,7 @@ use serde::{Serialize, Serializer, ser::SerializeMap};
 use uuid::Uuid;
 
 use crate::{
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::job_store::{JobState, Queue},
 };
 
@@ -216,8 +216,8 @@ pub enum Action {
 /// with extra tags" state unrepresentable.
 #[derive(Clone, Debug)]
 pub enum ManifestPutTarget {
-    Tag(String),
-    Digest { digest: Digest, tags: Vec<String> },
+    Tag(Tag),
+    Digest { digest: Digest, tags: Vec<Tag> },
 }
 
 impl ManifestPutTarget {
@@ -231,7 +231,7 @@ impl ManifestPutTarget {
 
     /// Every tag this push creates: the path tag for a by-tag push, or the
     /// `?tag=` query parameters for a by-digest push.
-    pub fn created_tags(&self) -> &[String] {
+    pub fn created_tags(&self) -> &[Tag] {
         match self {
             Self::Tag(tag) => slice::from_ref(tag),
             Self::Digest { tags, .. } => tags,

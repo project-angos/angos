@@ -10,7 +10,7 @@ use tracing::{debug, instrument};
 use angos_tx_engine::StorageError;
 
 use crate::{
-    oci::{Algorithm, Descriptor, Digest},
+    oci::{Algorithm, Descriptor, Digest, Tag},
     registry::{
         metadata_store::{Error, LinkKind, MetadataStore},
         pagination,
@@ -66,28 +66,63 @@ impl MetadataStore {
         namespace: &str,
         n: u16,
         last: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
+    ) -> Result<(Vec<Tag>, Option<String>), Error> {
         debug!("Listing {n} tag(s) for namespace '{namespace}' starting with last '{last:?}'");
+
+        // Tags are validated on write; a malformed directory name here is
+        // defensive and is dropped rather than surfaced as a tag. Scrub now
+        // reports and removes such directories, so the drop is silent.
+        let mut tags: Vec<Tag> = self
+            .collect_tag_dir_names(namespace)
+            .await?
+            .into_iter()
+            .filter_map(|name| Tag::try_from(name).ok())
+            .collect();
+        tags.sort();
+
+        Ok(pagination::paginate_sorted(&tags, n, last.as_deref()))
+    }
+
+    /// Lists the RAW tag directory names in `namespace` with NO `Tag`
+    /// validation. Scrub enumerates these so it can detect (and delete)
+    /// directories whose names do not satisfy the `oci::Tag` grammar, which
+    /// [`Self::list_tags`] silently drops.
+    #[instrument(skip(self))]
+    pub async fn list_tag_names(
+        &self,
+        namespace: &str,
+        n: u16,
+        last: Option<String>,
+    ) -> Result<(Vec<String>, Option<String>), Error> {
+        debug!("Listing {n} tag name(s) for namespace '{namespace}' starting with last '{last:?}'");
+
+        let mut names = self.collect_tag_dir_names(namespace).await?;
+        names.sort();
+
+        Ok(pagination::paginate_sorted(&names, n, last.as_deref()))
+    }
+
+    /// Enumerates every raw tag directory name under `namespace`'s tags dir.
+    /// Paginates in memory like `list_namespaces`: backend `start-after`
+    /// ordering and exclusive-`last` semantics aren't portable across backends.
+    async fn collect_tag_dir_names(&self, namespace: &str) -> Result<Vec<String>, Error> {
         let tags_dir = path_builder::manifest_tags_dir(namespace);
 
-        // Paginate in memory like `list_namespaces`: backend `start-after`
-        // ordering and exclusive-`last` semantics aren't portable across backends.
-        let mut tags = Vec::new();
+        let mut names = Vec::new();
         let mut token = None;
         loop {
             let page = self
                 .store()
                 .list_children(&tags_dir, 1000, token, None)
                 .await?;
-            tags.extend(page.sub_prefixes);
+            names.extend(page.sub_prefixes);
             match page.next_token {
                 Some(next) => token = Some(next),
                 None => break,
             }
         }
-        tags.sort();
 
-        Ok(pagination::paginate_sorted(&tags, n, last.as_deref()))
+        Ok(names)
     }
 
     /// Returns the `LinkKind::Tag` entries in `namespace` that currently point at
@@ -258,6 +293,15 @@ impl MetadataStore {
     pub async fn delete_legacy_namespace_registry(&self) -> Result<(), Error> {
         self.store()
             .delete_prefix(LEGACY_NAMESPACE_REGISTRY_PREFIX)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Delete an entire tag directory by prefix. Used by scrub for an invalid
+    /// tag name, which cannot form a typed `LinkKind::Tag` for a link delete.
+    pub async fn delete_tag_directory(&self, namespace: &str, tag_name: &str) -> Result<(), Error> {
+        self.store()
+            .delete_prefix(&path_builder::manifest_tag_dir(namespace, tag_name))
             .await
             .map_err(Error::from)
     }

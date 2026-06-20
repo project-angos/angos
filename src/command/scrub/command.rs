@@ -2,14 +2,15 @@ use std::{num::NonZeroUsize, sync::Arc};
 
 use argh::FromArgs;
 use futures_util::{StreamExt, future::join_all};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     command::{
         bootstrap,
         scrub::{
-            check::{LayoutChecker, NamespaceChecker, StoreChecker, list_all},
+            action::Action,
+            check::{LayoutChecker, NamespaceChecker, StoreChecker, TagChecker, list_all},
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
             setup::{self, LabeledStoreCheckers},
@@ -17,6 +18,7 @@ use crate::{
         worker::runner::run_once,
     },
     configuration::Configuration,
+    oci::Tag,
     registry::{
         blob_store::BlobStore,
         job_store::{JobHandler, JobStore, Queue},
@@ -93,6 +95,10 @@ pub struct Options {
 pub struct Command {
     metadata_store: Arc<MetadataStore>,
     namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
+    /// Per-tag checkers driven by the tag walk in `scrub_metadata`, run before
+    /// the namespace checkers so the invalid-tag gate and per-tag checks precede
+    /// the aggregate tag checks. `None` when `--tags` is absent.
+    tag_checkers: Option<Vec<Box<dyn TagChecker>>>,
     layout_checker: LayoutChecker,
     /// Store-wide checkers (blobs, orphan grants/namespaces/jobs, multipart),
     /// each paired with a stable label for failure attribution, pre-ordered by
@@ -135,6 +141,7 @@ impl Command {
             &metadata_store,
             &repositories,
         )?;
+        let tag_checkers = setup::tag_checkers(options, &blob_backend, &metadata_store);
         let layout_checker = setup::layout_checker(&blob_backend);
         let store_checkers =
             setup::store_checkers(options, &blob_backend, &metadata_store, &repositories)?;
@@ -172,6 +179,7 @@ impl Command {
         Ok(Self {
             metadata_store,
             namespace_checkers,
+            tag_checkers,
             layout_checker,
             store_checkers,
             sink,
@@ -222,15 +230,57 @@ impl Command {
     }
 
     async fn scrub_metadata(&mut self) -> Result<(), Error> {
-        let mut namespaces = list_all::namespaces(&self.metadata_store);
+        // Clone the Arc so the namespace stream borrows a local, leaving `self`
+        // free for the `&mut self` per-namespace methods called in the loop.
+        let metadata_store = self.metadata_store.clone();
+        let mut namespaces = list_all::namespaces(&metadata_store);
         while let Some(namespace) = namespaces.next().await {
             let namespace = namespace?;
+            if let Err(e) = self.scrub_tags(&namespace).await {
+                warn!("Tag scrub failed for namespace '{namespace}': {e}");
+            }
             for i in 0..self.namespace_checkers.len() {
                 if let Err(e) = self.namespace_checkers[i]
                     .check(&namespace, self.sink.as_mut())
                     .await
                 {
                     warn!("Scrub checker failed for namespace '{namespace}': {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Walks a namespace's tags once: an invalid name is deleted and skipped, a
+    /// valid tag is dispatched to each enabled per-tag checker. Runs before the
+    /// aggregate namespace checkers.
+    async fn scrub_tags(&mut self, namespace: &str) -> Result<(), Error> {
+        let Some(tag_checkers) = &self.tag_checkers else {
+            return Ok(());
+        };
+        let mut names = list_all::unparsed_tags(&self.metadata_store, namespace);
+        while let Some(name) = names.next().await {
+            let name = name?;
+            let tag = match Tag::try_from(name.as_str()) {
+                Ok(tag) => tag,
+                Err(reason) => {
+                    warn!("Deleting invalid tag directory '{namespace}:{name}': {reason}");
+                    if let Err(e) = self
+                        .sink
+                        .apply(Action::DeleteInvalidTag {
+                            namespace: namespace.to_string(),
+                            tag: name,
+                        })
+                        .await
+                    {
+                        error!("Failed to delete invalid tag directory in '{namespace}': {e}");
+                    }
+                    continue;
+                }
+            };
+            for checker in tag_checkers {
+                if let Err(e) = checker.check_tag(namespace, &tag, self.sink.as_mut()).await {
+                    error!("Tag check failed for '{namespace}:{tag}': {e}");
                 }
             }
         }
@@ -339,9 +389,82 @@ mod tests {
 
         assert!(command.is_ok());
         let cmd = command.unwrap();
-        // retention, uploads, tags, manifests = 4 namespace checkers
-        assert_eq!(cmd.namespace_checkers.len(), 4);
+        // retention, uploads, manifests = 3 namespace checkers (the tag walk is
+        // a free function driven by `tag_checkers`, not a namespace checker)
+        assert_eq!(cmd.namespace_checkers.len(), 3);
+        // `tags` is enabled, so the per-tag checkers are present.
+        assert!(cmd.tag_checkers.is_some());
         // `blobs` is the only store-wide checker enabled by these options.
         assert_eq!(cmd.store_checkers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scrub_metadata_deletes_invalid_tag_directory() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+
+        // Plant an invalid tag directory on disk before building the command.
+        // A leading '-' is a legal key segment but fails the tag grammar, and
+        // the `_manifests` ancestor makes `test-repo/app` an enumerable
+        // namespace.
+        let tag_dir = format!("{path}/v2/repositories/test-repo/app/_manifests/tags/-bad");
+        std::fs::create_dir_all(format!("{tag_dir}/current")).unwrap();
+        std::fs::write(
+            format!("{tag_dir}/current/link"),
+            b"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+
+        let config_content = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "{path}"
+
+            [metadata_store.fs]
+            root_dir = "{path}"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+
+            [global.retention_policy]
+            rules = []
+            "#
+        );
+
+        let config: Configuration = toml::from_str(&config_content).unwrap();
+
+        let options = Options {
+            dry_run: false,
+            uploads: None,
+            multipart: None,
+            tags: true,
+            manifests: false,
+            blobs: false,
+            retention: false,
+            links: false,
+            media_types: false,
+            referrers: false,
+            replicate: false,
+            replication_orphans: false,
+            cache_orphans: false,
+            orphan_namespaces: false,
+            orphan_grants: None,
+        };
+
+        let mut cmd = Command::new(&options, &config).await.unwrap();
+        cmd.scrub_metadata().await.unwrap();
+
+        assert!(
+            !std::path::Path::new(&tag_dir).exists(),
+            "scrub must delete the invalid tag directory"
+        );
     }
 }
