@@ -10,6 +10,7 @@ use hyper::{
 
 use crate::{
     command::server::{error::Error, request::RequestHeaders, response_body::ResponseBody},
+    oci::MediaType,
     registry::BlobRange,
     replication::X_ANGOS_SOURCE_TIMESTAMP,
 };
@@ -658,7 +659,7 @@ fn test_content_type_valid() {
     let content_type = RequestHeaders::new(&parts.headers).content_type().unwrap();
     assert_eq!(
         content_type,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string())
+        Some(MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap())
     );
 }
 

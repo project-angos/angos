@@ -22,7 +22,7 @@ use angos_tx_engine::{
 };
 
 use crate::{
-    oci::{Descriptor, Digest, Namespace},
+    oci::{Descriptor, Digest, MediaType, Namespace},
     registry::{
         metadata_store::{
             BlobIndexOperation, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore,
@@ -192,7 +192,7 @@ enum PrelockOp<'a> {
         target: &'a Digest,
         old_target: Option<Digest>,
         referrer: &'a Option<Digest>,
-        media_type: &'a Option<String>,
+        media_type: &'a Option<MediaType>,
         descriptor: &'a Option<Box<Descriptor>>,
     },
     /// A delete with the link's currently-stored metadata (`None` = already

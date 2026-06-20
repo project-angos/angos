@@ -15,6 +15,7 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{Error as MetadataError, LinkKind, MetadataStore},
     },
 };
@@ -27,14 +28,14 @@ use crate::{
 /// revoked only when the bytes are older than `min_age`, so an in-flight push
 /// (which grants ownership before it links the manifest) is never reaped.
 pub struct OrphanGrantChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     min_age: Duration,
 }
 
 impl OrphanGrantChecker {
     pub fn new(
-        blob_store: Arc<blob_store::BlobStore>,
+        blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
         min_age: Duration,
     ) -> Self {

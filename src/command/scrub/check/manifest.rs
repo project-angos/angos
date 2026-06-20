@@ -12,19 +12,19 @@ use crate::{
     },
     oci::{Digest, Namespace},
     registry::{
-        blob_store,
+        blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
         parse_manifest_digests,
     },
 };
 
 pub struct ManifestChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl ManifestChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,

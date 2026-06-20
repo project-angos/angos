@@ -1,17 +1,17 @@
 use crate::{
     event_webhook::event::Event,
-    oci::{Digest, Namespace, Reference, Tag},
+    oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{HeaderMap, OCI_SUBJECT, OCI_TAG, ResponseHeaders},
 };
 
 pub struct ManifestMeta {
-    pub media_type: Option<String>,
+    pub media_type: Option<MediaType>,
     pub digest: Digest,
     pub size: u64,
 }
 
 pub struct ManifestBody {
-    pub media_type: Option<String>,
+    pub media_type: Option<MediaType>,
     pub digest: Digest,
     pub content: Vec<u8>,
 }
@@ -49,7 +49,7 @@ pub fn head_manifest_headers(meta: &ManifestMeta) -> HeaderMap {
         .docker_content_digest(&meta.digest)
         .content_length(meta.size);
     match &meta.media_type {
-        Some(media_type) => headers.content_type(media_type).into_inner(),
+        Some(media_type) => headers.content_type(media_type.as_ref()).into_inner(),
         None => headers.into_inner(),
     }
 }
@@ -71,13 +71,13 @@ pub fn get_manifest_body_headers(
 pub fn get_manifest_redirect_headers(
     url: String,
     digest: &Digest,
-    media_type: Option<String>,
+    media_type: Option<MediaType>,
 ) -> HeaderMap {
     let headers = ResponseHeaders::new()
         .location(url)
         .docker_content_digest(digest);
     match media_type {
-        Some(media_type) => headers.content_type(media_type).into_inner(),
+        Some(media_type) => headers.content_type(media_type.as_ref()).into_inner(),
         None => headers.into_inner(),
     }
 }

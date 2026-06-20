@@ -14,18 +14,19 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{self, LinkKind, MetadataStore},
         parse_manifest_digests,
     },
 };
 
 pub struct LinkReferencesChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl LinkReferencesChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -156,10 +157,7 @@ mod tests {
         },
     };
 
-    fn noop_executor(
-        blob_store: Arc<blob_store::BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Executor {
+    fn noop_executor(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Executor {
         Executor::new_for_test(blob_store, metadata_store)
     }
 
@@ -458,7 +456,7 @@ mod tests {
         // that `read_link` fails with an `InvalidData` error, which propagates
         // as `Error::MetadataStore`.
         let fs_case = FSRegistryTestCase::new();
-        let blob_store: Arc<blob_store::BlobStore> = RegistryTestCase::blob_store(&fs_case);
+        let blob_store: Arc<BlobStore> = RegistryTestCase::blob_store(&fs_case);
         let metadata_store = RegistryTestCase::metadata_store(&fs_case);
 
         let namespace = Namespace::new("test-repo/error").unwrap();

@@ -14,6 +14,7 @@ use crate::{
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         Registry, RegistryConfig, Repository, blob_store,
+        blob_store::{BlobStore, BlobStoreConfig},
         job_store::{JobStore, Queue},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
@@ -124,7 +125,7 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
 }
 
 pub fn create_test_registry(
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 ) -> Registry {
     create_test_registry_with(blob_store, metadata_store, true)
@@ -135,7 +136,7 @@ pub fn create_test_registry(
 /// the strict and the permissive (`allow_missing_manifest_references`) modes
 /// can be exercised end-to-end.
 pub fn create_test_registry_with(
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     validate_manifest_references: bool,
 ) -> Registry {
@@ -234,7 +235,7 @@ pub async fn create_test_blob(
 #[async_trait::async_trait(?Send)]
 pub trait RegistryTestCase {
     fn registry(&self) -> &Registry;
-    fn blob_store(&self) -> Arc<blob_store::BlobStore>;
+    fn blob_store(&self) -> Arc<BlobStore>;
     fn metadata_store(&self) -> Arc<MetadataStore>;
     async fn cleanup(&self) {}
 }
@@ -247,7 +248,7 @@ pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
 }
 
 pub struct FSRegistryTestCase {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     registry: Registry,
     temp_dir: TempDir,
@@ -264,7 +265,7 @@ impl FSRegistryTestCase {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
         let path = temp_dir.path().to_string_lossy().to_string();
 
-        let config = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+        let config = BlobStoreConfig::FS(blob_store::FsBackendConfig {
             root_dir: path.clone(),
             sync_to_disk: false,
         });
@@ -296,7 +297,7 @@ impl FSRegistryTestCase {
         let blob_path = temp_dir.path().join("blob").to_string_lossy().into_owned();
         let meta_path = temp_dir.path().join("meta").to_string_lossy().into_owned();
 
-        let config = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+        let config = BlobStoreConfig::FS(blob_store::FsBackendConfig {
             root_dir: blob_path,
             sync_to_disk: false,
         });
@@ -334,7 +335,7 @@ impl RegistryTestCase for FSRegistryTestCase {
         &self.registry
     }
 
-    fn blob_store(&self) -> Arc<blob_store::BlobStore> {
+    fn blob_store(&self) -> Arc<BlobStore> {
         self.blob_store.clone()
     }
 
@@ -345,7 +346,7 @@ impl RegistryTestCase for FSRegistryTestCase {
 
 pub struct S3RegistryTestCase {
     key_prefix: String,
-    s3_blob_store: Arc<blob_store::BlobStore>,
+    s3_blob_store: Arc<BlobStore>,
     s3_metadata_store: Arc<MetadataStore>,
     s3_registry: Registry,
 }
@@ -373,7 +374,7 @@ impl S3RegistryTestCase {
             },
         };
         let blob_store = Arc::new(
-            blob_store::BlobStoreConfig::S3(s3_config)
+            BlobStoreConfig::S3(s3_config)
                 .build_backend()
                 .expect("s3 blob backend"),
         );
@@ -411,7 +412,7 @@ impl RegistryTestCase for S3RegistryTestCase {
         &self.s3_registry
     }
 
-    fn blob_store(&self) -> Arc<blob_store::BlobStore> {
+    fn blob_store(&self) -> Arc<BlobStore> {
         self.s3_blob_store.clone()
     }
 

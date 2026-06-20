@@ -39,6 +39,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{Error as MetadataError, LinkKind, MetadataStore},
         parse_manifest_digests,
     },
@@ -48,12 +49,12 @@ use crate::{
 /// that actually reference each blob. See the module docs for the failure mode
 /// this guards against and the (additive) scope.
 pub struct BlobIndexChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl BlobIndexChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,

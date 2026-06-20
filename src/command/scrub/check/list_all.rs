@@ -5,7 +5,7 @@ use futures_util::stream::{self, Stream, TryStreamExt};
 use crate::{
     command::scrub::error::Error,
     oci::{Digest, Namespace, Tag},
-    registry::{blob_store, metadata_store::MetadataStore},
+    registry::{blob_store::BlobStore, metadata_store::MetadataStore},
 };
 
 const PAGE_SIZE: u16 = 100;
@@ -51,7 +51,7 @@ pub fn unparsed_tags<'a>(
 }
 
 pub fn uploads<'a>(
-    blob_store: &'a Arc<blob_store::BlobStore>,
+    blob_store: &'a Arc<BlobStore>,
     namespace: &'a Namespace,
 ) -> ResultStream<'a, String> {
     Box::pin(paginated(move |marker| async move {
@@ -62,7 +62,7 @@ pub fn uploads<'a>(
     }))
 }
 
-pub fn blobs(blob_store: &Arc<blob_store::BlobStore>) -> ResultStream<'_, Digest> {
+pub fn blobs(blob_store: &Arc<BlobStore>) -> ResultStream<'_, Digest> {
     Box::pin(paginated(move |marker| async move {
         blob_store
             .list_blobs(PAGE_SIZE, marker)

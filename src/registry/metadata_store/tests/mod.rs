@@ -21,7 +21,7 @@ use crate::{
     cache::Cache,
     cache::memory::Backend as CacheMemoryBackend,
     metrics_provider,
-    oci::{Algorithm, Descriptor, Digest, Namespace, Tag},
+    oci::{Algorithm, Descriptor, Digest, MediaType, Namespace, Tag},
     registry::{
         metadata_store::{BlobIndex, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore},
         path_builder,
@@ -118,6 +118,10 @@ pub fn test_backend_with_cache(config: &TestS3Config) -> (MetadataStore, Arc<Cac
         )
         .unwrap();
     (backend, cache)
+}
+
+fn media_type(value: &str) -> MediaType {
+    MediaType::new(value).unwrap()
 }
 
 pub fn test_backend_with_debounce(config: &TestS3Config, debounce_secs: u64) -> MetadataStore {
@@ -370,11 +374,11 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
     let referrers = m.list_referrers(namespace, &base_digest, None).await;
 
     let expected = vec![Descriptor {
-        media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+        media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
         digest: referrer_digest,
         size: 694,
         annotations: HashMap::new(),
-        artifact_type: Some("application/vnd.example.test-artifact".to_string()),
+        artifact_type: Some(media_type("application/vnd.example.test-artifact")),
         platform: None,
     }];
 
@@ -1898,7 +1902,7 @@ async fn create_link_with_media_type(
         &[LinkOperation::create_with_media_type(
             link.clone(),
             digest.clone(),
-            Some(media_type.to_string()),
+            Some(MediaType::new(media_type).unwrap()),
         )],
     )
     .await
@@ -1927,7 +1931,7 @@ async fn test_link_metadata_media_type() {
             .read_link(&namespace, &LinkKind::Digest(digest.clone()))
             .await
             .unwrap();
-        assert_eq!(link.media_type, Some(media_type.to_string()));
+        assert_eq!(link.media_type, Some(MediaType::new(media_type).unwrap()));
         assert_eq!(link.target, digest);
         test_case.cleanup().await;
     }
@@ -1975,11 +1979,11 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
             .unwrap();
 
     let descriptor = Descriptor {
-        media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+        media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
         digest: referrer_digest.clone(),
         size: 1234,
         annotations: HashMap::new(),
-        artifact_type: Some("application/vnd.example.test-artifact".to_string()),
+        artifact_type: Some(media_type("application/vnd.example.test-artifact")),
         platform: None,
     };
 

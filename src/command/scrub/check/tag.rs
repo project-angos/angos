@@ -13,6 +13,7 @@ use crate::{
     oci::{Namespace, Tag},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
     },
 };
@@ -21,12 +22,12 @@ use crate::{
 /// link when the target blob is present, and emits `DeleteOrphanManifest` when
 /// the target blob is missing.
 pub struct DigestLinkChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl DigestLinkChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,

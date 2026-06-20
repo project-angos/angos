@@ -14,17 +14,18 @@ use crate::{
     oci::{Manifest, Namespace},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
     },
 };
 
 pub struct MediaTypeChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl MediaTypeChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -159,7 +160,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        oci::{Namespace, Tag},
+        oci::{MediaType, Namespace, Tag},
         registry::{
             metadata_store::LinkOperation,
             test_utils::{self, backends, put_blob_direct},
@@ -283,12 +284,12 @@ mod tests {
                         LinkOperation::create_with_media_type(
                             LinkKind::Digest(manifest_digest.clone()),
                             manifest_digest.clone(),
-                            Some(media_type.to_string()),
+                            Some(MediaType::new(media_type).unwrap()),
                         ),
                         LinkOperation::create_with_media_type(
                             LinkKind::Tag(Tag::new("latest").unwrap()),
                             manifest_digest.clone(),
-                            Some(media_type.to_string()),
+                            Some(MediaType::new(media_type).unwrap()),
                         ),
                     ],
                 )

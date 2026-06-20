@@ -446,7 +446,7 @@ mod tests {
         oci::{Digest, Namespace},
         policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
-            blob_store,
+            blob_store::BlobStore,
             metadata_store::LinkOperation,
             repository_resolver::RepositoryResolver,
             test_utils::{self, backends, put_blob_direct},
@@ -476,10 +476,7 @@ mod tests {
         }
     }
 
-    fn make_executor(
-        blob_store: Arc<blob_store::BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Executor {
+    fn make_executor(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Executor {
         Executor::new_for_test(blob_store, metadata_store)
     }
 

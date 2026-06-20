@@ -16,7 +16,7 @@ use crate::{
     },
     oci::{Digest, Namespace},
     registry::{
-        blob_store,
+        blob_store::BlobStore,
         metadata_store::{Error as MetadataError, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
@@ -27,14 +27,14 @@ use crate::{
 /// to reclaim layer/config bytes. Does nothing when no repository is configured,
 /// so an emptied config can never wipe the whole registry.
 pub struct OrphanNamespaceChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
 }
 
 impl OrphanNamespaceChecker {
     pub fn new(
-        blob_store: Arc<blob_store::BlobStore>,
+        blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
         resolver: Arc<RepositoryResolver>,
     ) -> Self {

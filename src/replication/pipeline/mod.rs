@@ -14,7 +14,9 @@ use tokio::time::timeout;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
-    oci::{Digest, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference, Tag},
+    oci::{
+        Digest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference, Tag,
+    },
     registry::{
         Error as RegistryError, ParsedManifestDigests,
         blob_ownership::BlobOwnership,
@@ -84,7 +86,7 @@ pub struct PushContext<'a> {
 pub async fn push_manifest(
     ctx: &PushContext<'_>,
     digest: &Digest,
-    media_type: Option<String>,
+    media_type: Option<MediaType>,
     tag: Option<&str>,
     body: Vec<u8>,
 ) -> Result<PushOutcome, Error> {

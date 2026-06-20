@@ -20,7 +20,7 @@ use tracing::{error, instrument, warn};
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
     metrics_provider::metrics_provider,
-    oci::{Digest, Manifest, Namespace, Reference, Tag},
+    oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
@@ -303,7 +303,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         reference: &Reference,
-        content_type: Option<&String>,
+        content_type: Option<&MediaType>,
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
         self.store_manifest(
@@ -323,7 +323,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         reference: &Reference,
-        content_type: Option<&String>,
+        content_type: Option<&MediaType>,
         body: &[u8],
         created_tags: &[Tag],
         reference_policy: ReferencePolicy,
@@ -357,7 +357,7 @@ impl Registry {
             &mut manifest,
             &computed_digest,
             reference,
-            effective_media_type.as_deref(),
+            effective_media_type.as_ref(),
             body.len() as u64,
             created_tags,
         );
@@ -646,7 +646,7 @@ impl Registry {
         let media_type = link.media_type?;
         let presigned_url = self
             .blob_store
-            .presigned_url(&link.target, Some(media_type.as_str()))
+            .presigned_url(&link.target, Some(media_type.as_ref()))
             .await
             .ok()??;
 
@@ -846,7 +846,7 @@ impl Registry {
         source_ts: Option<DateTime<Utc>>,
         namespace: &Namespace,
         reference: Reference,
-        mime_type: String,
+        mime_type: MediaType,
         body_stream: S,
         tags: Vec<Tag>,
     ) -> Result<PutManifestResponse, Error>

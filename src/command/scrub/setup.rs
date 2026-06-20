@@ -18,7 +18,7 @@ use crate::{
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        blob_store, job_store::JobStore, metadata_store::MetadataStore,
+        blob_store::BlobStore, job_store::JobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
 };
@@ -41,7 +41,7 @@ fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Retenti
 pub fn namespace_checkers(
     options: &Options,
     config: &Configuration,
-    blob_store: &Arc<blob_store::BlobStore>,
+    blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     resolver: &Arc<RepositoryResolver>,
 ) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
@@ -116,7 +116,7 @@ pub fn namespace_checkers(
 /// `Command::scrub_metadata`.
 pub fn tag_checkers(
     options: &Options,
-    blob_store: &Arc<blob_store::BlobStore>,
+    blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
 ) -> Option<Vec<Box<dyn TagChecker>>> {
     options.tags.then(|| {
@@ -127,13 +127,13 @@ pub fn tag_checkers(
     })
 }
 
-pub fn layout_checker(blob_store: &Arc<blob_store::BlobStore>) -> LayoutChecker {
+pub fn layout_checker(blob_store: &Arc<BlobStore>) -> LayoutChecker {
     LayoutChecker::new(blob_store.clone())
 }
 
 pub fn blob_checker(
     options: &Options,
-    blob_store: &Arc<blob_store::BlobStore>,
+    blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
 ) -> Option<BlobChecker> {
     options
@@ -143,7 +143,7 @@ pub fn blob_checker(
 
 pub fn multipart_checker(
     options: &Options,
-    blob_store: &Arc<blob_store::BlobStore>,
+    blob_store: &Arc<BlobStore>,
 ) -> Result<Option<MultipartChecker>, Error> {
     let Some(multipart_timeout) = options.multipart else {
         return Ok(None);
@@ -162,7 +162,7 @@ pub fn multipart_checker(
 
 pub fn orphan_grant_checker(
     options: &Options,
-    blob_store: &Arc<blob_store::BlobStore>,
+    blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
 ) -> Result<Option<OrphanGrantChecker>, Error> {
     let Some(min_age) = options.orphan_grants else {
@@ -185,7 +185,7 @@ pub fn orphan_grant_checker(
 /// repositories are configured, since the flag must never wipe the whole registry.
 pub fn orphan_namespace_checker(
     options: &Options,
-    blob_store: &Arc<blob_store::BlobStore>,
+    blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     resolver: &Arc<RepositoryResolver>,
 ) -> Option<OrphanNamespaceChecker> {
@@ -242,7 +242,7 @@ pub fn orphan_job_checkers(
 /// a stable label so a failing checker can be named in the scrub log.
 pub fn store_checkers(
     options: &Options,
-    blob_store: &Arc<blob_store::BlobStore>,
+    blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     resolver: &Arc<RepositoryResolver>,
 ) -> Result<LabeledStoreCheckers, Error> {

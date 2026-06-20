@@ -11,7 +11,7 @@
 //! or delete for a given manifest, eliminating divergence between them.
 
 use crate::{
-    oci::{Digest, Manifest, Reference, Tag},
+    oci::{Digest, Manifest, MediaType, Reference, Tag},
     registry::metadata_store::{LinkKind, LinkOperation},
 };
 
@@ -35,7 +35,7 @@ pub fn push(
     manifest: &mut Manifest,
     digest: &Digest,
     reference: &Reference,
-    effective_media_type: Option<&str>,
+    effective_media_type: Option<&MediaType>,
     body_len: u64,
     created_tags: &[Tag],
 ) -> Vec<LinkOperation> {
@@ -44,14 +44,14 @@ pub fn push(
     ops.push(LinkOperation::create_with_media_type(
         LinkKind::Digest(digest.clone()),
         digest.clone(),
-        effective_media_type.map(str::to_string),
+        effective_media_type.cloned(),
     ));
 
     if let Some(tag) = reference.as_tag() {
         ops.push(LinkOperation::create_with_media_type(
             LinkKind::Tag(tag.clone()),
             digest.clone(),
-            effective_media_type.map(str::to_string),
+            effective_media_type.cloned(),
         ));
     }
 
@@ -59,7 +59,7 @@ pub fn push(
         ops.push(LinkOperation::create_with_media_type(
             LinkKind::Tag(tag.clone()),
             digest.clone(),
-            effective_media_type.map(str::to_string),
+            effective_media_type.cloned(),
         ));
     }
 
@@ -171,16 +171,20 @@ mod tests {
     use std::{collections::HashMap, str::FromStr};
 
     use super::*;
-    use crate::oci::{Descriptor, Manifest, Tag};
+    use crate::oci::{Descriptor, Manifest, MediaType, Tag};
 
     fn d(byte: u8) -> Digest {
         let hex = format!("{byte:02x}").repeat(32);
         Digest::from_str(&format!("sha256:{hex}")).unwrap()
     }
 
+    fn media_type(value: &str) -> MediaType {
+        MediaType::new(value).unwrap()
+    }
+
     fn descriptor(digest: Digest) -> Descriptor {
         Descriptor {
-            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            media_type: media_type("application/vnd.oci.image.layer.v1.tar+gzip"),
             digest,
             size: 0,
             annotations: HashMap::new(),
@@ -203,7 +207,7 @@ mod tests {
 
     fn manifest_with_subject(subject: Digest) -> Manifest {
         Manifest {
-            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            media_type: Some(media_type("application/vnd.oci.image.manifest.v1+json")),
             subject: Some(descriptor(subject)),
             ..Manifest::default()
         }
@@ -416,8 +420,9 @@ mod tests {
         let digest = d(0x30);
         let config = d(0x31);
         let layer = d(0x32);
+        let media_type = media_type("application/vnd.oci.image.manifest.v1+json");
         let mut m = Manifest {
-            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            media_type: Some(media_type.clone()),
             config: Some(descriptor(config)),
             layers: vec![descriptor(layer)],
             ..Manifest::default()
@@ -427,7 +432,7 @@ mod tests {
             &mut m,
             &digest,
             &Reference::Tag(Tag::new("v1").unwrap()),
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some(&media_type),
             42,
             &[],
         );
@@ -439,12 +444,13 @@ mod tests {
     fn push_subject_referrer_uses_descriptor_when_media_type_set() {
         let parent = d(0x40);
         let subject = d(0x41);
+        let media_type = media_type("application/vnd.oci.image.manifest.v1+json");
         let mut m = manifest_with_subject(subject.clone());
         let ops = push(
             &mut m,
             &parent,
             &Reference::Digest(parent.clone()),
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some(&media_type),
             100,
             &[],
         );

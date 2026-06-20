@@ -7,8 +7,8 @@ use tracing::instrument;
 use crate::{
     configuration::RegexPattern,
     oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace,
-        Platform as OciPlatform, Tag, namespace_belongs_to,
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType,
+        Namespace, Platform as OciPlatform, Tag, namespace_belongs_to,
     },
     registry::{
         APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders, job_store,
@@ -90,7 +90,7 @@ struct ParentRef {
 struct ReferrerInfo {
     digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    artifact_type: Option<String>,
+    artifact_type: Option<MediaType>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     annotations: HashMap<String, String>,
 }
@@ -718,7 +718,7 @@ mod tests {
         extract_docker_referrer, extract_in_toto_predicate, parent_refs_for,
     };
     use crate::oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest,
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType,
         Platform as OciPlatform, Tag,
     };
 
@@ -732,9 +732,13 @@ mod tests {
         digest("abc1")
     }
 
+    fn media_type(value: &str) -> MediaType {
+        MediaType::new(value).unwrap()
+    }
+
     fn descriptor_with_annotations(annotations: HashMap<String, String>) -> Descriptor {
         Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: test_digest(),
             size: 0,
             annotations,
@@ -747,7 +751,7 @@ mod tests {
         let layers: Vec<Descriptor> = layer_annotations
             .into_iter()
             .map(|ann| Descriptor {
-                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                media_type: media_type("application/vnd.oci.image.layer.v1.tar+gzip"),
                 digest: test_digest(),
                 size: 0,
                 annotations: ann,
@@ -834,8 +838,9 @@ mod tests {
             subject.to_string(),
         )]));
         descriptor.digest = child.clone();
-        descriptor.artifact_type =
-            Some("application/vnd.dev.cosign.artifact.sig.v1+json".to_string());
+        descriptor.artifact_type = Some(media_type(
+            "application/vnd.dev.cosign.artifact.sig.v1+json",
+        ));
 
         let candidate = extract_docker_referrer(&descriptor).expect("should return Some");
         assert_eq!(candidate.subject, subject);
@@ -873,7 +878,7 @@ mod tests {
             features: None,
         };
         let child = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: child_digest.clone(),
             size: 0,
             annotations: HashMap::new(),
@@ -900,7 +905,7 @@ mod tests {
         let subject = digest("beef");
         let child_digest = digest("cafe");
         let child = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: child_digest.clone(),
             size: 0,
             annotations: HashMap::from([(
@@ -929,7 +934,7 @@ mod tests {
         let index_child_digest = digest("1234");
 
         let referrer_child = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: referrer_digest.clone(),
             size: 0,
             annotations: HashMap::from([(
@@ -940,7 +945,7 @@ mod tests {
             platform: None,
         };
         let index_child = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: index_child_digest.clone(),
             size: 0,
             annotations: HashMap::new(),

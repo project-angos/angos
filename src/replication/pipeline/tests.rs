@@ -16,7 +16,7 @@ use angos_tx_engine::store::Store;
 use crate::{
     cache, metrics_provider,
     oci::{
-        DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, Digest, Namespace,
+        DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, Digest, MediaType, Namespace,
         OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference, Tag,
     },
     registry::{
@@ -34,6 +34,10 @@ use crate::{
 };
 
 const NAMESPACE: &str = "nginx";
+
+fn media_type(value: &str) -> MediaType {
+    MediaType::new(value).unwrap()
+}
 
 fn downstream_client(uri: &str) -> RegistryClient {
     let backend = cache::Config::Memory.to_backend().unwrap();
@@ -192,7 +196,7 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
     push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -370,7 +374,7 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
     let result = push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -619,7 +623,7 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
     push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -699,7 +703,7 @@ async fn index_lands_after_its_child_manifest() {
     push_manifest(
         &ctx,
         &index_digest,
-        Some("application/vnd.oci.image.index.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.index.v1+json")),
         Some("v1"),
         index_bytes,
     )
@@ -774,7 +778,7 @@ async fn index_lands_after_all_children_when_fanned_out() {
     push_manifest(
         &ctx,
         &index_digest,
-        Some("application/vnd.oci.image.index.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.index.v1+json")),
         Some("v1"),
         index_bytes,
     )
@@ -890,7 +894,7 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
     push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -991,7 +995,7 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
     push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -1051,7 +1055,7 @@ async fn push_manifest_stamps_source_timestamp_header() {
     push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -1095,7 +1099,7 @@ async fn push_manifest_skips_put_when_downstream_already_converged() {
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -1242,7 +1246,7 @@ async fn converged_skip_head_sends_standard_accept_headers() {
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -1335,7 +1339,7 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
-        Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
+        Some(media_type(OCI_MANIFEST_MEDIA_TYPE)),
         Some("v1"),
         manifest_bytes,
     )
@@ -1423,7 +1427,7 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
     let outcome = push_manifest(
         &ctx,
         &index_digest,
-        Some(OCI_INDEX_MEDIA_TYPE.to_string()),
+        Some(media_type(OCI_INDEX_MEDIA_TYPE)),
         Some("v1"),
         index_bytes,
     )
@@ -1488,7 +1492,7 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
     let result = push_manifest(
         &ctx,
         &manifest_digest,
-        Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
+        Some(media_type(OCI_MANIFEST_MEDIA_TYPE)),
         Some("v1"),
         manifest_bytes,
     )
@@ -1572,7 +1576,7 @@ async fn failed_patch_cancels_the_upload_session() {
     let result = push_manifest(
         &ctx,
         &manifest_digest,
-        Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
+        Some(media_type(OCI_MANIFEST_MEDIA_TYPE)),
         Some("v1"),
         manifest_bytes,
     )
@@ -1705,7 +1709,7 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
     push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -1748,7 +1752,7 @@ async fn push_manifest_puts_when_downstream_head_returns_404() {
     push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -1781,7 +1785,7 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
             &[LinkOperation::create_with_media_type(
                 LinkKind::Digest(manifest_digest.clone()),
                 manifest_digest.clone(),
-                Some(media_type.to_string()),
+                Some(MediaType::new(media_type).unwrap()),
             )],
         )
         .await
@@ -1846,7 +1850,7 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
             &[LinkOperation::create_with_media_type(
                 LinkKind::Digest(child_digest.clone()),
                 child_digest.clone(),
-                Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
+                Some(media_type(OCI_MANIFEST_MEDIA_TYPE)),
             )],
         )
         .await
@@ -1920,7 +1924,7 @@ async fn push_manifest_treats_lww_superseded_409_as_success() {
     push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )
@@ -1959,7 +1963,7 @@ async fn push_manifest_propagates_immutable_409_as_error() {
     let result = push_manifest(
         &ctx,
         &manifest_digest,
-        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        Some(media_type("application/vnd.oci.image.manifest.v1+json")),
         Some("v1"),
         manifest_bytes,
     )

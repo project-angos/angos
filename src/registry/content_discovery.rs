@@ -1,20 +1,28 @@
+use std::sync::LazyLock;
+
 use serde::Serialize;
 use tracing::instrument;
 
 use hyper::header::LINK;
 
 use crate::{
-    oci::{Descriptor, Digest, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_SCHEMA_VERSION, Tag},
+    oci::{
+        Descriptor, Digest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE,
+        OCI_MANIFEST_SCHEMA_VERSION, Tag,
+    },
     registry::{APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders},
 };
 
 const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
 
+static OCI_INDEX_MEDIA_TYPE_VALUE: LazyLock<MediaType> =
+    LazyLock::new(|| MediaType::new(OCI_INDEX_MEDIA_TYPE).unwrap());
+
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct ReferrerList {
     schema_version: i32,
-    media_type: String,
+    media_type: MediaType,
     manifests: Vec<Descriptor>,
 }
 
@@ -22,7 +30,7 @@ impl Default for ReferrerList {
     fn default() -> Self {
         ReferrerList {
             schema_version: OCI_MANIFEST_SCHEMA_VERSION,
-            media_type: OCI_INDEX_MEDIA_TYPE.to_string(),
+            media_type: OCI_INDEX_MEDIA_TYPE_VALUE.clone(),
             manifests: Vec::new(),
         }
     }
@@ -148,7 +156,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use crate::{
-        oci::{Namespace, Reference, Tag},
+        oci::{MediaType, Namespace, Reference, Tag},
         registry::{
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{backends, create_test_blob, put_blob_direct},
@@ -355,7 +363,8 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
 
             let manifest_content = r#"{"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json"}"#;
-            let media_type = "application/vnd.docker.distribution.manifest.v2+json".to_string();
+            let media_type =
+                MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap();
 
             let (base_manifest_digest, _) =
                 create_test_blob(registry, namespace, manifest_content.as_bytes()).await;

@@ -90,7 +90,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        oci::{Descriptor, Digest, Namespace},
+        oci::{Descriptor, Digest, MediaType, Namespace},
         registry::{
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{backends, put_blob_direct},
@@ -135,7 +135,10 @@ mod tests {
                         LinkKind::Referrer(subject.clone(), manifest_digest.clone()),
                         manifest_digest.clone(),
                         Box::new(Descriptor {
-                            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+                            media_type: MediaType::new(
+                                "application/vnd.oci.image.manifest.v1+json",
+                            )
+                            .unwrap(),
                             digest: manifest_digest.clone(),
                             size: manifest_bytes.len() as u64,
                             annotations: std::collections::HashMap::new(),

@@ -14,7 +14,8 @@ use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
 
 use crate::{
-    command::server::error::Error, registry::BlobRange, replication::X_ANGOS_SOURCE_TIMESTAMP,
+    command::server::error::Error, oci::MediaType, registry::BlobRange,
+    replication::X_ANGOS_SOURCE_TIMESTAMP,
 };
 
 static START_END_RANGE_RE: LazyLock<Regex> =
@@ -102,7 +103,7 @@ impl<'a> RequestHeaders<'a> {
         Ok(Some(content_length))
     }
 
-    pub fn content_type(&self) -> Result<Option<String>, Error> {
+    pub fn content_type(&self) -> Result<Option<MediaType>, Error> {
         let Some(content_type) = self.headers.get(CONTENT_TYPE) else {
             return Ok(None);
         };
@@ -111,7 +112,9 @@ impl<'a> RequestHeaders<'a> {
             .to_str()
             .map_err(|error| Error::BadRequest(format!("Invalid Content-Type header: {error}")))?;
 
-        Ok(Some(content_type.to_string()))
+        MediaType::new(content_type)
+            .map(Some)
+            .map_err(|error| Error::BadRequest(error.to_string()))
     }
 
     /// Reads `X-Angos-Source-Timestamp` as an RFC 3339 instant for

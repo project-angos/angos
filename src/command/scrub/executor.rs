@@ -7,9 +7,9 @@ use tracing::{debug, info, warn};
 use crate::{
     command::scrub::{action::Action, error::Error},
     metrics_provider::metrics_provider,
-    oci::{Digest, Manifest, Namespace, Reference, Tag},
+    oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
     registry::{
-        blob_store::{self, MultipartCleanup},
+        blob_store::{self, BlobStore, MultipartCleanup},
         job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore, Queue},
         manifest::link_plan,
         metadata_store::{
@@ -42,7 +42,7 @@ impl ActionSink for DryRunSink {
 /// Applies scrub actions against live storage backends.
 #[allow(clippy::struct_field_names)]
 pub struct Executor {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     job_store: Arc<JobStore>,
 }
@@ -53,7 +53,7 @@ impl Executor {
     /// through, and the `job_store` replication enqueue actions are landed on.
     #[must_use]
     pub fn new(
-        blob_store: Arc<blob_store::BlobStore>,
+        blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
         job_store: Arc<JobStore>,
     ) -> Self {
@@ -67,10 +67,7 @@ impl Executor {
     /// Test-only constructor that synthesizes a `JobStore`.
     #[cfg(test)]
     #[must_use]
-    pub fn new_for_test(
-        blob_store: Arc<blob_store::BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Self {
+    pub fn new_for_test(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
         Self::new(blob_store, metadata_store, job_store)
     }
@@ -278,7 +275,7 @@ impl Executor {
         namespace: Namespace,
         link: LinkKind,
         target: Digest,
-        media_type: String,
+        media_type: MediaType,
     ) -> Result<(), Error> {
         self.metadata_store
             .update_links(

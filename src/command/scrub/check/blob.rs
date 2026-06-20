@@ -14,6 +14,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{BlobIndex, Error as MetadataError, LinkKind, MetadataStore},
     },
 };
@@ -38,12 +39,12 @@ async fn classify_blob(
 }
 
 pub struct BlobChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl BlobChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,

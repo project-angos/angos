@@ -1663,7 +1663,10 @@ mod tests {
                     .is_ok()
             );
 
-            registry.delete_upload(namespace, &session_id).await.unwrap();
+            registry
+                .delete_upload(namespace, &session_id)
+                .await
+                .unwrap();
 
             assert!(
                 registry

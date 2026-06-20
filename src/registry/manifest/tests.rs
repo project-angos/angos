@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
-    slice,
 };
 
 use futures_util::future::join_all;
@@ -12,7 +11,7 @@ use super::{parse::manifest_meta_from_body, *};
 use crate::{
     command::server::Error as ServerError,
     event_webhook::event::EventKind,
-    oci::{Algorithm, Namespace, Tag, UploadSessionId},
+    oci::{Algorithm, MediaType, Namespace, Tag, UploadSessionId},
     registry::{
         Error, OCI_TAG, Registry,
         metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
@@ -34,7 +33,7 @@ const LAYER_MEDIA_TYPE: &str = "application/vnd.docker.image.rootfs.diff.tar.gzi
 const MISSING_SUBJECT_DIGEST: &str =
     "sha256:9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba";
 
-fn create_raw_test_manifest() -> (Vec<u8>, String) {
+fn create_raw_test_manifest() -> (Vec<u8>, MediaType) {
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
@@ -53,11 +52,11 @@ fn create_raw_test_manifest() -> (Vec<u8>, String) {
     });
 
     let content = serde_json::to_vec(&manifest).unwrap();
-    let media_type = IMAGE_MANIFEST_MEDIA_TYPE.to_string();
+    let media_type = MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap();
     (content, media_type)
 }
 
-fn create_raw_test_manifest_with_subject() -> (Vec<u8>, String) {
+fn create_raw_test_manifest_with_subject() -> (Vec<u8>, MediaType) {
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
@@ -81,7 +80,7 @@ fn create_raw_test_manifest_with_subject() -> (Vec<u8>, String) {
     });
 
     let content = serde_json::to_vec(&manifest).unwrap();
-    let media_type = IMAGE_MANIFEST_MEDIA_TYPE.to_string();
+    let media_type = MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap();
     (content, media_type)
 }
 
@@ -90,7 +89,7 @@ fn manifest_with_references(
     config_size: usize,
     layer_digest: &Digest,
     layer_size: usize,
-) -> (Vec<u8>, String) {
+) -> (Vec<u8>, MediaType) {
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
@@ -109,7 +108,7 @@ fn manifest_with_references(
     });
 
     let content = serde_json::to_vec(&manifest).unwrap();
-    (content, IMAGE_MANIFEST_MEDIA_TYPE.to_string())
+    (content, MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap())
 }
 
 fn manifest_with_subject_and_references(
@@ -117,7 +116,7 @@ fn manifest_with_subject_and_references(
     config_size: usize,
     layer_digest: &Digest,
     layer_size: usize,
-) -> (Vec<u8>, String) {
+) -> (Vec<u8>, MediaType) {
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
@@ -141,11 +140,11 @@ fn manifest_with_subject_and_references(
     });
 
     let content = serde_json::to_vec(&manifest).unwrap();
-    (content, IMAGE_MANIFEST_MEDIA_TYPE.to_string())
+    (content, MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap())
 }
 
-fn index_manifest_with_child(child_digest: &Digest) -> (Vec<u8>, String) {
-    let media_type = "application/vnd.oci.image.index.v1+json".to_string();
+fn index_manifest_with_child(child_digest: &Digest) -> (Vec<u8>, MediaType) {
+    let media_type = MediaType::new("application/vnd.oci.image.index.v1+json").unwrap();
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": media_type,
@@ -163,7 +162,7 @@ fn index_manifest_with_child(child_digest: &Digest) -> (Vec<u8>, String) {
     (content, media_type)
 }
 
-async fn create_test_manifest(registry: &Registry, namespace: &Namespace) -> (Vec<u8>, String) {
+async fn create_test_manifest(registry: &Registry, namespace: &Namespace) -> (Vec<u8>, MediaType) {
     let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
     let layer_content = b"test layer content";
     let config_digest = upload_blob(registry, namespace, config_content).await;
@@ -180,7 +179,7 @@ async fn create_test_manifest(registry: &Registry, namespace: &Namespace) -> (Ve
 async fn create_test_manifest_with_subject(
     registry: &Registry,
     namespace: &Namespace,
-) -> (Vec<u8>, String) {
+) -> (Vec<u8>, MediaType) {
     let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
     let layer_content = b"test layer content";
     let config_digest = upload_blob(registry, namespace, config_content).await;
@@ -240,7 +239,7 @@ async fn test_put_manifest() {
         let stored_manifest = registry
             .get_manifest(
                 registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 namespace,
                 Reference::Tag(Tag::new(tag).unwrap()),
                 false,
@@ -334,7 +333,7 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
         let head = registry
             .head_manifest(
                 repository,
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 &namespace,
                 Reference::Tag(Tag::new(tag).unwrap()),
                 false,
@@ -385,7 +384,7 @@ async fn accept_put_manifest_by_tag_ignores_tag_params() {
     let ignored = registry
         .head_manifest(
             repository,
-            slice::from_ref(&media_type),
+            &[media_type.to_string()],
             &namespace,
             Reference::Tag(Tag::new("ignored").unwrap()),
             false,
@@ -824,7 +823,7 @@ async fn test_get_manifest() {
         let manifest = registry
             .get_manifest(
                 registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 namespace,
                 Reference::Tag(Tag::new(tag).unwrap()),
                 false,
@@ -839,7 +838,7 @@ async fn test_get_manifest() {
         let manifest = registry
             .get_manifest(
                 registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 namespace,
                 Reference::Digest(header_digest(&response.headers)),
                 false,
@@ -875,7 +874,7 @@ async fn test_head_manifest() {
         let manifest = registry
             .head_manifest(
                 registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 namespace,
                 Reference::Tag(Tag::new(tag).unwrap()),
                 false,
@@ -896,7 +895,7 @@ async fn test_head_manifest() {
         let manifest = registry
             .head_manifest(
                 registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 namespace,
                 Reference::Digest(header_digest(&response.headers)),
                 false,
@@ -949,7 +948,7 @@ async fn test_delete_manifest() {
             registry
                 .get_manifest(
                     registry.get_repository_for_namespace(namespace).unwrap(),
-                    slice::from_ref(&media_type),
+                    &[media_type.to_string()],
                     namespace,
                     Reference::Tag(Tag::new(tag).unwrap()),
                     false,
@@ -972,7 +971,7 @@ async fn test_delete_manifest() {
             registry
                 .get_manifest(
                     registry.get_repository_for_namespace(namespace).unwrap(),
-                    slice::from_ref(&media_type),
+                    &[media_type.to_string()],
                     namespace,
                     Reference::Digest(header_digest(&response.headers)),
                     false,
@@ -1006,7 +1005,7 @@ async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
         let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
         let layer_digest = upload_blob(registry, first, layer_content).await;
         let config_digest = upload_blob(registry, first, config_content).await;
-        let media_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+        let media_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
         let manifest = json!({
             "schemaVersion": 2,
             "mediaType": media_type,
@@ -1073,7 +1072,7 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
         let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
         let layer_digest = upload_blob(registry, namespace, layer_content).await;
         let config_digest = upload_blob(registry, namespace, config_content).await;
-        let media_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+        let media_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
         let manifest = json!({
             "schemaVersion": 2,
             "mediaType": media_type,
@@ -1148,7 +1147,7 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
 async fn concurrent_same_digest_pushes_keep_upload_ownership() {
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
-    let media_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+    let media_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
     let layer_content = b"shared zot benchmark layer content";
     let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
 
@@ -1241,7 +1240,7 @@ fn test_parse_manifest_digests() {
         "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
     );
 
-    let wrong_media_type = "application/wrong.media.type".to_string();
+    let wrong_media_type = MediaType::new("application/wrong.media.type").unwrap();
     assert!(parse_manifest_digests(&content, Some(&wrong_media_type)).is_err());
 }
 
@@ -1291,7 +1290,7 @@ async fn test_malformed_json_yields_same_error_shape() {
 #[test]
 fn parse_manifest_digests_media_type_mismatch_returns_manifest_invalid() {
     let (content, _) = create_raw_test_manifest();
-    let wrong_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+    let wrong_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
 
     let err = parse_manifest_digests(&content, Some(&wrong_type))
         .err()
@@ -1315,7 +1314,7 @@ async fn accept_put_manifest_rejects_body_above_limit() {
             None,
             namespace,
             Reference::Tag(Tag::new("latest").unwrap()),
-            "application/vnd.oci.image.manifest.v1+json".to_string(),
+            MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap(),
             Cursor::new(body),
             Vec::new(),
         )
@@ -1489,7 +1488,7 @@ async fn test_handle_put_manifest() {
         let stored_manifest = registry
             .get_manifest(
                 repository,
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 namespace,
                 Reference::Tag(Tag::new(tag).unwrap()),
                 false,
@@ -1547,7 +1546,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
             registry
                 .get_manifest(
                     repository,
-                    slice::from_ref(&media_type),
+                    &[media_type.to_string()],
                     namespace,
                     Reference::Tag(Tag::new("latest").unwrap()),
                     false,
@@ -1560,7 +1559,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
             registry
                 .get_manifest(
                     repository,
-                    slice::from_ref(&media_type),
+                    &[media_type.to_string()],
                     namespace,
                     Reference::Tag(Tag::new("v1.0").unwrap()),
                     false,
@@ -1573,7 +1572,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
             registry
                 .get_manifest(
                     repository,
-                    slice::from_ref(&media_type),
+                    &[media_type.to_string()],
                     namespace,
                     Reference::Digest(header_digest(&response.headers)),
                     false,
@@ -1640,7 +1639,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
             registry
                 .get_manifest(
                     repository,
-                    slice::from_ref(&media_type_a),
+                    &[media_type_a.to_string()],
                     namespace,
                     Reference::Tag(Tag::new("v1.0").unwrap()),
                     false,
@@ -1653,7 +1652,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
             registry
                 .get_manifest(
                     repository,
-                    slice::from_ref(&media_type_a),
+                    &[media_type_a.to_string()],
                     namespace,
                     Reference::Tag(Tag::new("v1.1").unwrap()),
                     false,
@@ -1665,7 +1664,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
         let manifest_b = registry
             .get_manifest(
                 repository,
-                slice::from_ref(&media_type_b),
+                &[media_type_b.to_string()],
                 namespace,
                 Reference::Tag(Tag::new("v2.0").unwrap()),
                 false,
@@ -1738,7 +1737,7 @@ async fn test_delete_manifest_with_many_tags() {
                 registry
                     .get_manifest(
                         repository,
-                        slice::from_ref(&media_type_a),
+                        &[media_type_a.to_string()],
                         namespace,
                         Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
                         false,
@@ -1754,7 +1753,7 @@ async fn test_delete_manifest_with_many_tags() {
                 registry
                     .get_manifest(
                         repository,
-                        slice::from_ref(&media_type_b),
+                        &[media_type_b.to_string()],
                         namespace,
                         Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
                         false,
@@ -1859,7 +1858,7 @@ async fn test_head_manifest_fallback_without_media_type() {
         let head = registry
             .head_manifest(
                 repository,
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 namespace,
                 Reference::Tag(Tag::new("latest").unwrap()),
                 false,
@@ -1924,7 +1923,7 @@ async fn test_delete_manifest_no_tags_by_digest() {
             registry
                 .get_manifest(
                     repository,
-                    slice::from_ref(&media_type),
+                    &[media_type.to_string()],
                     namespace,
                     Reference::Digest(header_digest(&response.headers)),
                     false,
@@ -1964,7 +1963,7 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
 
         assert_eq!(
             digest_link.media_type,
-            Some("application/vnd.docker.distribution.manifest.v2+json".to_string()),
+            Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap()),
             "Digest link should have media_type from manifest body"
         );
         test_case.cleanup().await;
@@ -1999,7 +1998,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
             .resolve_get_manifest(
                 namespace,
                 Reference::Tag(Tag::new("latest").unwrap()),
-                slice::from_ref(&media_type),
+                &[media_type.to_string()],
                 false,
             )
             .await
@@ -2292,7 +2291,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
 
 // --- Receiver-side last-writer-wins (LWW) ------------------------------------
 
-async fn seed_tag(registry: &Registry, namespace: &Namespace, tag: &str) -> (Vec<u8>, String) {
+async fn seed_tag(registry: &Registry, namespace: &Namespace, tag: &str) -> (Vec<u8>, MediaType) {
     let (content, media_type) = create_test_manifest(registry, namespace).await;
     registry
         .accept_put_manifest(
@@ -2467,7 +2466,7 @@ async fn accept_put_manifest_accepts_lww_equal_source_ts() {
 async fn two_manifests_by_digest_order(
     registry: &Registry,
     namespace: &Namespace,
-) -> ((Vec<u8>, String), (Vec<u8>, String)) {
+) -> ((Vec<u8>, MediaType), (Vec<u8>, MediaType)) {
     let first = create_test_manifest(registry, namespace).await;
 
     let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
@@ -3268,7 +3267,7 @@ mod noop_suppression_tests {
 
     use crate::{
         event_webhook::event::EventKind,
-        oci::{Digest, Namespace, Reference, Tag},
+        oci::{Digest, MediaType, Namespace, Reference, Tag},
         registry::{
             Registry, RegistryConfig,
             blob_store::BlobStore,
@@ -3347,7 +3346,7 @@ mod noop_suppression_tests {
     async fn create_second_manifest(
         registry: &Registry,
         namespace: &Namespace,
-    ) -> (Vec<u8>, String) {
+    ) -> (Vec<u8>, MediaType) {
         let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
         let layer_content = b"a different layer content";
         let config_digest = upload_blob(registry, namespace, config_content).await;

@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::{
-    oci::{Digest, Namespace, Tag},
+    oci::{Digest, MediaType, Namespace, Tag},
     registry::{
         job_store::{JobState, Queue},
         metadata_store::LinkKind,
@@ -58,7 +58,7 @@ pub enum Action {
         namespace: Namespace,
         link: LinkKind,
         target: Digest,
-        media_type: String,
+        media_type: MediaType,
         display_name: String,
     },
     DeleteTag {

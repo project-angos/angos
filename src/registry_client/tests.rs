@@ -9,7 +9,7 @@ use wiremock::{
 
 use crate::{
     cache,
-    oci::{Digest, Namespace, Reference, Tag},
+    oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     },
@@ -369,7 +369,7 @@ async fn test_head_manifest_success() {
     let (media_type, digest, size) = result.unwrap();
     assert_eq!(
         media_type,
-        Some("application/vnd.docker.distribution.manifest.v2+json".to_string())
+        Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap())
     );
     assert_eq!(digest, Digest::try_from(test_digest).unwrap());
     assert_eq!(size, 5678);
@@ -420,7 +420,7 @@ async fn test_get_manifest_success() {
     let (media_type, digest, body) = result.unwrap();
     assert_eq!(
         media_type,
-        Some("application/vnd.docker.distribution.manifest.v2+json".to_string())
+        Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap())
     );
     assert_eq!(digest, Digest::try_from(test_digest).unwrap());
     assert_eq!(body, manifest_body);

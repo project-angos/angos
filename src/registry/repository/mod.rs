@@ -8,7 +8,7 @@ pub use crate::registry_client::RegistryClientConfig;
 use crate::{
     cache::Cache,
     configuration::RegexPattern,
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, MediaType, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{Error, blob_store::BoxedReader},
     registry_client::RegistryClient,
@@ -227,7 +227,7 @@ impl Repository {
         accepted_types: &[String],
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<(Option<String>, Digest, u64), Error> {
+    ) -> Result<(Option<MediaType>, Digest, u64), Error> {
         self.try_upstreams(namespace, Error::ManifestUnknown, |upstream| {
             let location = upstream.get_manifest_path(&self.name, namespace.as_ref(), reference);
             Box::pin(async move { upstream.head_manifest(accepted_types, &location).await })
@@ -241,7 +241,7 @@ impl Repository {
         accepted_types: &[String],
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<(Option<String>, Digest, Vec<u8>), Error> {
+    ) -> Result<(Option<MediaType>, Digest, Vec<u8>), Error> {
         self.try_upstreams(namespace, Error::ManifestUnknown, |upstream| {
             let location = upstream.get_manifest_path(&self.name, namespace.as_ref(), reference);
             Box::pin(async move { upstream.get_manifest(accepted_types, &location).await })

@@ -27,9 +27,10 @@ use crate::{
         dispatcher::EventDispatcher,
         event::EventKind,
     },
-    oci::{Digest, Namespace, Reference, Tag, UploadSessionId},
+    oci::{Digest, MediaType, Namespace, Reference, Tag, UploadSessionId},
     registry::{
         Registry, RegistryConfig, blob_store,
+        blob_store::{BlobStore, BlobStoreConfig},
         job_store::{JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -56,7 +57,7 @@ impl FsRegistryFixture {
         let path = temp_dir.path().to_string_lossy().to_string();
 
         let blob_store = Arc::new(
-            blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+            BlobStoreConfig::FS(blob_store::FsBackendConfig {
                 root_dir: path.clone(),
                 sync_to_disk: false,
             })
@@ -128,8 +129,8 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
     digest
 }
 
-/// Minimal valid OCI manifest bytes and its media-type string.
-async fn test_manifest_bytes(registry: &Registry, namespace: &Namespace) -> (Vec<u8>, String) {
+/// Minimal valid OCI manifest bytes and its media type.
+async fn test_manifest_bytes(registry: &Registry, namespace: &Namespace) -> (Vec<u8>, MediaType) {
     let config_content = b"{}";
     let config_digest = upload_blob(registry, namespace, config_content).await;
     let manifest = json!({
@@ -143,7 +144,7 @@ async fn test_manifest_bytes(registry: &Registry, namespace: &Namespace) -> (Vec
         "layers": []
     });
     let bytes = serde_json::to_vec(&manifest).unwrap();
-    let mime = "application/vnd.oci.image.manifest.v1+json".to_string();
+    let mime = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
     (bytes, mime)
 }
 
@@ -576,7 +577,7 @@ impl ReplicationFixture {
                 .access_time_debounce_secs(0)
                 .build(),
         );
-        let blob_store = Arc::new(blob_store::BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let repository =
             repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test"));

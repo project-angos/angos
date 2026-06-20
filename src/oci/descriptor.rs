@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::oci::Digest;
+use crate::oci::{Digest, MediaType};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Platform {
@@ -27,7 +27,7 @@ pub struct Platform {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
-    pub media_type: String,
+    pub media_type: MediaType,
     pub digest: Digest,
     pub size: u64,
     #[serde(default)]
@@ -35,7 +35,7 @@ pub struct Descriptor {
     pub annotations: HashMap<String, String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifact_type: Option<String>,
+    pub artifact_type: Option<MediaType>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
@@ -54,7 +54,7 @@ mod tests {
         )
         .unwrap();
         let descriptor = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap(),
             digest,
             size: 512,
             annotations: HashMap::new(),
@@ -176,7 +176,7 @@ mod tests {
         .unwrap();
 
         let descriptor = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap(),
             digest,
             size: 100,
             annotations: std::collections::HashMap::new(),

@@ -14,7 +14,7 @@ use crate::{
     },
     event_webhook::event::EventActor,
     identity::ClientIdentity,
-    oci::{Namespace, Reference, Tag},
+    oci::{MediaType, Namespace, Reference, Tag},
     registry::GetManifestResponse,
 };
 
@@ -69,7 +69,7 @@ pub async fn handle_put_manifest<S>(
     context: &ServerContext,
     namespace: &Namespace,
     reference: Reference,
-    mime_type: String,
+    mime_type: MediaType,
     body_stream: S,
     tags: Vec<Tag>,
     identity: &ClientIdentity,
@@ -203,7 +203,7 @@ mod tests {
         },
         configuration::Configuration,
         identity::ClientIdentity,
-        oci::{Namespace, Reference, Tag},
+        oci::{MediaType, Namespace, Reference, Tag},
         replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     };
 
@@ -287,7 +287,7 @@ mod tests {
             &context,
             &namespace,
             tag(),
-            MEDIA_TYPE.to_string(),
+            MediaType::new(MEDIA_TYPE).unwrap(),
             std::io::Cursor::new(manifest_b()),
             Vec::new(),
             &identity,
@@ -325,7 +325,7 @@ mod tests {
             &context,
             &namespace,
             tag(),
-            MEDIA_TYPE.to_string(),
+            MediaType::new(MEDIA_TYPE).unwrap(),
             std::io::Cursor::new(manifest_a()),
             Vec::new(),
             &identity,
