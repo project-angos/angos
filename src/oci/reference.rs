@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::oci::{Digest, Error};
 
-static TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w[\w.-]{0,127}$").unwrap());
+// ASCII-only tag grammar per the OCI Distribution Spec: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+// The regex crate makes `\w` Unicode-aware, which would wrongly accept non-ASCII tags.
+static TAG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$").unwrap());
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(try_from = "String")]
@@ -116,7 +119,18 @@ mod tests {
         );
     }
 
-    // Edge case: tag of exactly 128 chars is valid (1 \w + 127 [\w.-])
+    // The tag grammar is ASCII only, so Unicode word characters must be rejected.
+    #[test]
+    fn test_tag_non_ascii_rejected() {
+        for tag in ["café", "日本", "Ａ"] {
+            assert!(
+                Reference::from_str(tag).is_err(),
+                "non-ASCII tag '{tag}' must be rejected"
+            );
+        }
+    }
+
+    // Edge case: tag of exactly 128 chars is valid (1 [a-zA-Z0-9_] + 127 [a-zA-Z0-9._-])
     #[test]
     fn test_tag_128_chars_accepted() {
         let tag = "a".repeat(128);
