@@ -119,8 +119,7 @@ fn test_action_serialization_cel_compatibility() {
             "put-manifest",
             Action::PutManifest {
                 namespace: ns(),
-                reference: reference(),
-                tags: Vec::new(),
+                target: ManifestPutTarget::Tag("v1.0.0".to_string()),
             },
         ),
         (
@@ -296,7 +295,7 @@ fn test_get_reference() {
             reference: r.clone()
         }
         .get_reference()
-        .map(Reference::to_string),
+        .map(|r| r.to_string()),
         Some(r.to_string())
     );
     assert!(Action::ApiVersion.get_reference().is_none());
@@ -307,6 +306,87 @@ fn test_get_reference() {
         }
         .get_reference()
         .is_none()
+    );
+}
+
+// The by-tag and by-digest targets must serialize `reference` exactly as the
+// Every manifest action must expose `reference` to CEL policies.
+#[test]
+fn test_manifest_actions_serialize_reference_for_cel() {
+    let r = reference();
+    let actions = [
+        Action::GetManifest {
+            namespace: ns(),
+            reference: r.clone(),
+        },
+        Action::HeadManifest {
+            namespace: ns(),
+            reference: r.clone(),
+        },
+        Action::DeleteManifest {
+            namespace: ns(),
+            reference: r.clone(),
+        },
+        Action::PutManifest {
+            namespace: ns(),
+            target: ManifestPutTarget::Tag("v1.0.0".to_string()),
+        },
+    ];
+    for action in actions {
+        let value = serde_json::to_value(&action).unwrap();
+        assert!(
+            value.get("reference").is_some(),
+            "action {value} must expose `reference` to CEL"
+        );
+    }
+}
+
+// other manifest actions do so existing CEL policies keep working.
+#[test]
+fn test_put_manifest_target_serializes_with_flat_reference() {
+    let by_tag = Action::PutManifest {
+        namespace: ns(),
+        target: ManifestPutTarget::Tag("latest".to_string()),
+    };
+    assert_eq!(
+        serde_json::to_value(&by_tag).unwrap(),
+        serde_json::json!({
+            "action": "put-manifest",
+            "namespace": "test",
+            "reference": {"Tag": "latest"},
+        })
+    );
+
+    let by_digest = Action::PutManifest {
+        namespace: ns(),
+        target: ManifestPutTarget::Digest {
+            digest: digest(),
+            tags: vec!["v1".to_string(), "v2".to_string()],
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&by_digest).unwrap(),
+        serde_json::json!({
+            "action": "put-manifest",
+            "namespace": "test",
+            "reference": {"Digest": SHA256_EMPTY},
+            "tags": ["v1", "v2"],
+        })
+    );
+
+    let no_tags = Action::PutManifest {
+        namespace: ns(),
+        target: ManifestPutTarget::Digest {
+            digest: digest(),
+            tags: Vec::new(),
+        },
+    };
+    assert!(
+        serde_json::to_value(&no_tags)
+            .unwrap()
+            .get("tags")
+            .is_none(),
+        "empty tags must be omitted from the serialized action"
     );
 }
 
@@ -352,8 +432,7 @@ fn test_is_push() {
     assert!(
         Action::PutManifest {
             namespace: ns(),
-            reference: reference(),
-            tags: Vec::new()
+            target: ManifestPutTarget::Tag("v1.0.0".to_string())
         }
         .is_push()
     );

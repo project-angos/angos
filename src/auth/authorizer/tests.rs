@@ -14,7 +14,7 @@ use crate::{
     cache,
     command::server::Error as ServerError,
     configuration::Configuration,
-    identity::{ClientCertificate, OidcClaims},
+    identity::{ClientCertificate, ManifestPutTarget, OidcClaims},
     oci::{Digest, Namespace, Reference},
     registry::{
         RegistryConfig, Repository, metadata_store::MetadataStore,
@@ -327,8 +327,7 @@ fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
 
     let action = Action::PutManifest {
         namespace: Namespace::new("myrepo/app").unwrap(),
-        reference: Reference::from_str("v1.0.0").unwrap(),
-        tags: Vec::new(),
+        target: ManifestPutTarget::Tag("v1.0.0".to_string()),
     };
 
     let result = authorizer.check_immutable_tag("myrepo", &action);
@@ -339,6 +338,104 @@ fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
     assert!(
         msg.contains("v1.0.0") && msg.contains("immutable"),
         "error message must mention the tag and 'immutable', got: {msg}"
+    );
+}
+
+// A by-digest push carrying an immutable tag in `?tag=` must be rejected, since
+// the registry would create that tag and overwrite the protected one.
+#[test]
+fn test_check_immutable_tag_returns_conflict_for_by_digest_tag_on_push() {
+    let config = load_config(
+        r#"
+            immutable_tags = true
+
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+        "#,
+    );
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let authorizer = Authorizer::new(&config, &cache).unwrap();
+
+    let action = Action::PutManifest {
+        namespace: Namespace::new("myrepo/app").unwrap(),
+        target: ManifestPutTarget::Digest {
+            digest: Digest::from_str(
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .unwrap(),
+            tags: vec!["v1.0.0".to_string()],
+        },
+    };
+
+    let result = authorizer.check_immutable_tag("myrepo", &action);
+
+    let Err(ServerError::Conflict(msg)) = result else {
+        panic!("expected Err(ServerError::Conflict(_)), got: {result:?}");
+    };
+    assert!(
+        msg.contains("v1.0.0") && msg.contains("immutable"),
+        "error message must mention the tag and 'immutable', got: {msg}"
+    );
+}
+
+// A by-digest push whose `?tag=` is excluded (mutable) is allowed.
+#[test]
+fn test_check_immutable_tag_allows_by_digest_mutable_tag_on_push() {
+    let config = load_config(
+        r#"
+            immutable_tags = true
+            immutable_tags_exclusions = ["^latest$"]
+
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+        "#,
+    );
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let authorizer = Authorizer::new(&config, &cache).unwrap();
+
+    let action = Action::PutManifest {
+        namespace: Namespace::new("myrepo/app").unwrap(),
+        target: ManifestPutTarget::Digest {
+            digest: Digest::from_str(
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .unwrap(),
+            tags: vec!["latest".to_string()],
+        },
+    };
+
+    assert!(
+        authorizer.check_immutable_tag("myrepo", &action).is_ok(),
+        "a by-digest push creating only an excluded tag must be allowed"
+    );
+}
+
+// A by-tag push to an excluded (mutable) tag is allowed.
+#[test]
+fn test_check_immutable_tag_allows_by_tag_mutable() {
+    let config = load_config(
+        r#"
+            immutable_tags = true
+            immutable_tags_exclusions = ["^latest$"]
+
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+        "#,
+    );
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let authorizer = Authorizer::new(&config, &cache).unwrap();
+
+    let action = Action::PutManifest {
+        namespace: Namespace::new("myrepo/app").unwrap(),
+        target: ManifestPutTarget::Tag("latest".to_string()),
+    };
+
+    assert!(
+        authorizer.check_immutable_tag("myrepo", &action).is_ok(),
+        "a by-tag push to a mutable tag must be allowed"
     );
 }
 
@@ -512,11 +609,9 @@ async fn test_pull_through_repo_blocks_push_operations() {
         .into_parts();
 
     let namespace = Namespace::new("docker-io/library/nginx").unwrap();
-    let reference = Reference::from_str("latest").unwrap();
     let put_manifest_route = Action::PutManifest {
         namespace: namespace.clone(),
-        reference,
-        tags: Vec::new(),
+        target: ManifestPutTarget::Tag("latest".to_string()),
     };
     let result = authorizer
         .authorize_request(&put_manifest_route, &identity, &parts, &registry)

@@ -14,7 +14,8 @@ use crate::{
         response_body::ResponseBody,
         ui,
     },
-    identity::{Action, ClientIdentity},
+    identity::{Action, ClientIdentity, ManifestPutTarget},
+    oci::Reference,
 };
 
 #[instrument(skip(context, req, action))]
@@ -111,11 +112,11 @@ async fn dispatch_route<'a>(
         } => {
             handlers::manifest::dispatch_head_manifest(context, parts, &namespace, reference).await
         }
-        Action::PutManifest {
-            namespace,
-            reference,
-            tags,
-        } => {
+        Action::PutManifest { namespace, target } => {
+            let (reference, tags) = match target {
+                ManifestPutTarget::Tag(tag) => (Reference::Tag(tag), Vec::new()),
+                ManifestPutTarget::Digest { digest, tags } => (Reference::Digest(digest), tags),
+            };
             handlers::manifest::dispatch_put_manifest(
                 context, parts, incoming, &namespace, reference, tags, identity,
             )

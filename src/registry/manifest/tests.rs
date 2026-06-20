@@ -12,6 +12,7 @@ use uuid::Uuid;
 use super::{parse::manifest_meta_from_body, *};
 use crate::{
     command::server::Error as ServerError,
+    event_webhook::event::EventKind,
     oci::{Algorithm, Namespace},
     registry::{
         Error, OCI_TAG, Registry,
@@ -298,9 +299,36 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
         .headers
         .get(OCI_TAG)
         .expect("OCI-Tag header must be present");
-    assert!(oci_tag.contains("1.2.3"));
-    assert!(oci_tag.contains("latest"));
+    assert_eq!(
+        oci_tag.as_str(),
+        "1.2.3, latest",
+        "OCI-Tag must list created tags comma and space separated in created order"
+    );
     assert_eq!(header_digest(&response.headers), digest);
+
+    let digest_str = digest.to_string();
+    assert!(
+        response
+            .events
+            .iter()
+            .any(|e| e.kind == EventKind::ManifestPush && e.digest.as_deref() == Some(&digest_str)),
+        "a by-digest push must emit a ManifestPush event carrying the digest"
+    );
+    for tag in ["1.2.3", "latest"] {
+        let count = response
+            .events
+            .iter()
+            .filter(|e| {
+                e.kind == EventKind::TagCreate
+                    && e.tag.as_deref() == Some(tag)
+                    && e.digest.as_deref() == Some(&digest_str)
+            })
+            .count();
+        assert_eq!(
+            count, 1,
+            "exactly one TagCreate event carrying the digest must fire for tag '{tag}'"
+        );
+    }
 
     let repository = registry.get_repository_for_namespace(&namespace).unwrap();
     for tag in ["1.2.3", "latest"] {
@@ -3462,6 +3490,88 @@ mod noop_suppression_tests {
             0,
             "re-pushing an already-present revision must enqueue nothing \
              (the gate, not the dedup index, suppresses it)"
+        );
+    }
+
+    /// A by-digest push that adds a new `?tag=` to an already-present digest must
+    /// still dispatch so the new tag link replicates, even though the digest itself
+    /// did not change; re-adding the same tag is a converged no-op.
+    #[tokio::test]
+    async fn digest_push_with_new_tag_dispatches_when_tag_is_added() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "extra";
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let digest = Digest::sha256_of_bytes(&content);
+
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Digest(digest.clone()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+                Vec::new(),
+            )
+            .await
+            .expect("first digest push");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "a first-time digest push must enqueue one job"
+        );
+
+        // Drain so dedup coalescing cannot mask the gate.
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // The digest is already present, so only the new tag link changed; the
+        // gate must still dispatch so that tag replicates. The OR-gate re-dispatches
+        // the unchanged digest push once alongside the changed tag, so two jobs land.
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Digest(digest.clone()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+                vec![tag.to_string()],
+            )
+            .await
+            .expect("re-push present digest with a new tag");
+        assert_eq!(
+            pending(&job_store).await,
+            2,
+            "adding a new tag to a present digest must enqueue the tag push \
+             plus the re-dispatched digest push"
+        );
+
+        // Drain both so dedup coalescing cannot mask the gate on the converged push.
+        drain_one(&job_store).await;
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // Both the digest and the tag are now present, so nothing changed.
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Digest(digest),
+                media_type,
+                Cursor::new(content),
+                vec![tag.to_string()],
+            )
+            .await
+            .expect("re-push present digest with the same present tag");
+        assert_eq!(
+            pending(&job_store).await,
+            0,
+            "re-adding an already-present tag must enqueue nothing"
         );
     }
 

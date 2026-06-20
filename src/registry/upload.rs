@@ -102,11 +102,13 @@ impl Registry {
             }
 
             // The blob already exists, so there is nothing to store: hash the
-            // body into a sink purely to confirm it matches. With a declared
-            // length, drain at most one byte past it so an over-long body is
-            // rejected as soon as the surplus appears rather than after the
-            // whole `bound_blob_stream`-capped body is read.
-            let mut reader = HashingReader::new(&mut *stream, Hasher::new());
+            // body into a sink under the target algorithm alone, purely to
+            // confirm it matches. With a declared length, drain at most one byte
+            // past it so an over-long body is rejected as soon as the surplus
+            // appears rather than after the whole `bound_blob_stream`-capped
+            // body is read.
+            let mut reader =
+                HashingReader::new(&mut *stream, Hasher::for_algorithm(digest.algorithm()));
             match content_length {
                 Some(expected) => {
                     let read = copy(
@@ -1354,6 +1356,112 @@ mod tests {
             let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(expected_digest.clone())));
 
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sha512_patch_then_complete_upload_lifecycle() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let full_content = b"sha512 upload driven through PATCH then PUT";
+            let (first_chunk, second_chunk) = full_content.split_at(20);
+            let session_id = Uuid::new_v4();
+
+            registry
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            registry
+                .patch_upload(
+                    namespace,
+                    session_id,
+                    None,
+                    Some(first_chunk.len() as u64),
+                    Cursor::new(first_chunk.to_vec()),
+                )
+                .await
+                .unwrap();
+            registry
+                .patch_upload(
+                    namespace,
+                    session_id,
+                    Some(first_chunk.len() as u64),
+                    Some(second_chunk.len() as u64),
+                    Cursor::new(second_chunk.to_vec()),
+                )
+                .await
+                .unwrap();
+
+            let expected_digest = Digest::from_bytes(Algorithm::Sha512, full_content);
+            let response = registry
+                .complete_upload(
+                    None,
+                    namespace,
+                    session_id,
+                    &expected_digest,
+                    None,
+                    Some(0),
+                    Cursor::new(Vec::new()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.headers[DOCKER_CONTENT_DIGEST],
+                expected_digest.to_string()
+            );
+            assert_eq!(expected_digest.algorithm(), Algorithm::Sha512);
+            assert_eq!(
+                registry.blob_store.read(&expected_digest).await.unwrap(),
+                full_content
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sha512_complete_upload_wrong_digest_rejected() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let full_content = b"sha512 body that will not match the claimed digest";
+            let session_id = Uuid::new_v4();
+
+            registry
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            registry
+                .patch_upload(
+                    namespace,
+                    session_id,
+                    None,
+                    Some(full_content.len() as u64),
+                    Cursor::new(full_content.to_vec()),
+                )
+                .await
+                .unwrap();
+
+            let wrong_digest = Digest::from_bytes(Algorithm::Sha512, b"different content");
+            let result = registry
+                .complete_upload(
+                    None,
+                    namespace,
+                    session_id,
+                    &wrong_digest,
+                    None,
+                    Some(0),
+                    Cursor::new(Vec::new()),
+                )
+                .await;
+
+            assert!(matches!(result, Err(Error::DigestInvalid)));
             test_case.cleanup().await;
         }
     }

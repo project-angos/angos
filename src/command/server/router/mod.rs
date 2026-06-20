@@ -5,7 +5,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::{
-    identity::Action,
+    identity::{Action, ManifestPutTarget},
     oci::{Digest, Namespace, Reference},
     registry::job_store::{JobState, Queue},
 };
@@ -296,15 +296,18 @@ fn try_find_manifests(method: &Method, path: &str, params: Option<&str>) -> Opti
                 });
             }
             Method::PUT => {
-                let tags = params
-                    .and_then(parse_query::<TagQuery>)
-                    .map(|q| q.tag)
-                    .unwrap_or_default();
-                return Some(Action::PutManifest {
-                    namespace,
-                    reference,
-                    tags,
-                });
+                // `?tag=` applies only to a by-digest push; a by-tag push ignores it.
+                let target = match reference {
+                    Reference::Tag(tag) => ManifestPutTarget::Tag(tag),
+                    Reference::Digest(digest) => {
+                        let tags = params
+                            .and_then(parse_query::<TagQuery>)
+                            .map(|q| q.tag)
+                            .unwrap_or_default();
+                        ManifestPutTarget::Digest { digest, tags }
+                    }
+                };
+                return Some(Action::PutManifest { namespace, target });
             }
             Method::DELETE => {
                 return Some(Action::DeleteManifest {

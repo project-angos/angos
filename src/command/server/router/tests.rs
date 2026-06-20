@@ -60,6 +60,71 @@ fn test_parse_list_catalog_with_pagination() {
 }
 
 #[test]
+fn test_parse_list_catalog_full_pagination() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?n=100&last=foo".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, Some(100));
+        assert_eq!(last, Some("foo".to_string()));
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
+fn test_parse_list_catalog_non_numeric_n() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?n=abc".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, None);
+        assert_eq!(last, None);
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
+fn test_parse_list_catalog_overflowing_n() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?n=65536".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, None);
+        assert_eq!(last, None);
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
+fn test_parse_list_catalog_empty_n() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?n=".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, None);
+        assert_eq!(last, None);
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
+fn test_parse_list_catalog_url_encoded_last() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?last=foo%2Fbar".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, None);
+        assert_eq!(last, Some("foo/bar".to_string()));
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
 fn test_parse_start_upload() {
     let method = Method::POST;
     let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
@@ -432,15 +497,12 @@ fn test_parse_put_manifest() {
     let method = Method::PUT;
     let uri: Uri = "/v2/myrepo/app/manifests/v1.0.0".parse().unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::PutManifest {
-        namespace,
-        reference,
-        tags,
-    }) = route
-    {
+    if let Some(Action::PutManifest { namespace, target }) = route {
         assert_eq!(namespace, "myrepo/app");
-        assert_eq!(reference.to_string(), "v1.0.0");
-        assert!(tags.is_empty(), "a by-tag PUT carries no tag params");
+        assert!(
+            matches!(target, ManifestPutTarget::Tag(tag) if tag == "v1.0.0"),
+            "a by-tag PUT must produce a Tag target carrying no query tags"
+        );
     } else {
         panic!("Expected PutManifest route");
     }
@@ -454,14 +516,12 @@ fn test_parse_put_manifest_by_digest_with_tag_params() {
         .parse()
         .unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::PutManifest {
-        namespace,
-        reference,
-        tags,
-    }) = route
-    {
+    if let Some(Action::PutManifest { namespace, target }) = route {
         assert_eq!(namespace, "foo");
-        assert_eq!(reference.to_string(), digest);
+        let ManifestPutTarget::Digest { digest: d, tags } = target else {
+            panic!("a by-digest PUT must produce a Digest target");
+        };
+        assert_eq!(d.to_string(), digest);
         assert_eq!(tags, vec!["a".to_string(), "b".to_string()]);
     } else {
         panic!("Expected PutManifest route");

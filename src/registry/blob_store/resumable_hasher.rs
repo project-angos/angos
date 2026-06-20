@@ -116,6 +116,14 @@ impl Hasher {
         }
     }
 
+    /// Hash under a single known algorithm, for verify-only paths where the
+    /// target algorithm is already known and no checkpoint is persisted.
+    pub fn for_algorithm(algorithm: Algorithm) -> Self {
+        Self {
+            hashers: vec![fresh_boxed(algorithm)],
+        }
+    }
+
     pub fn update(&mut self, data: &[u8]) {
         for hasher in &mut self.hashers {
             hasher.update(data);

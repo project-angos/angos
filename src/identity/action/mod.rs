@@ -1,4 +1,6 @@
-use serde::Serialize;
+use std::slice;
+
+use serde::{Serialize, Serializer, ser::SerializeMap};
 use uuid::Uuid;
 
 use crate::{
@@ -35,6 +37,7 @@ use crate::{
 /// - `namespace`: The repository namespace (when applicable)
 /// - `digest`: The blob/manifest digest (when applicable)
 /// - `reference`: The manifest tag or digest reference (when applicable)
+/// - `tags`: Tags created by a by-digest manifest push via `?tag=` (when present)
 /// - `uuid`: The upload session UUID (for upload operations)
 /// - `n`: Maximum number of results for pagination
 /// - `last`: Last result marker for pagination
@@ -139,9 +142,8 @@ pub enum Action {
     #[serde(rename = "put-manifest")]
     PutManifest {
         namespace: Namespace,
-        reference: Reference,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tags: Vec<String>,
+        #[serde(flatten)]
+        target: ManifestPutTarget,
     },
     #[serde(rename = "delete-manifest")]
     DeleteManifest {
@@ -208,10 +210,53 @@ pub enum Action {
     },
 }
 
+/// What a manifest PUT writes: a by-tag push targets a single tag, while a
+/// by-digest push targets the digest and may create extra tags via `?tag=`
+/// query parameters. Modeling both as one enum keeps the illegal "tag reference
+/// with extra tags" state unrepresentable.
+#[derive(Clone, Debug)]
+pub enum ManifestPutTarget {
+    Tag(String),
+    Digest { digest: Digest, tags: Vec<String> },
+}
+
+impl ManifestPutTarget {
+    /// The reference this push addresses.
+    pub fn reference(&self) -> Reference {
+        match self {
+            Self::Tag(tag) => Reference::Tag(tag.clone()),
+            Self::Digest { digest, .. } => Reference::Digest(digest.clone()),
+        }
+    }
+
+    /// Every tag this push creates: the path tag for a by-tag push, or the
+    /// `?tag=` query parameters for a by-digest push.
+    pub fn created_tags(&self) -> &[String] {
+        match self {
+            Self::Tag(tag) => slice::from_ref(tag),
+            Self::Digest { tags, .. } => tags,
+        }
+    }
+}
+
+impl Serialize for ManifestPutTarget {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Flatten to the legacy `{reference, tags}` shape so CEL policies keep
+        // seeing `reference` exactly as the other manifest actions emit it.
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("reference", &self.reference())?;
+        if let Self::Digest { tags, .. } = self
+            && !tags.is_empty()
+        {
+            map.serialize_entry("tags", tags)?;
+        }
+        map.end()
+    }
+}
+
 struct ActionData<'a> {
     namespace: Option<&'a Namespace>,
     digest: Option<&'a Digest>,
-    reference: Option<&'a Reference>,
     is_push: bool,
 }
 
@@ -220,7 +265,6 @@ impl ActionData<'_> {
         Self {
             namespace: None,
             digest: None,
-            reference: None,
             is_push: false,
         }
     }
@@ -286,7 +330,10 @@ impl Action {
             Action::ListTags { namespace, .. }
             | Action::GetUpload { namespace, .. }
             | Action::ListRevisions { namespace }
-            | Action::ListUploads { namespace } => ActionData {
+            | Action::ListUploads { namespace }
+            | Action::GetManifest { namespace, .. }
+            | Action::HeadManifest { namespace, .. }
+            | Action::DeleteManifest { namespace, .. } => ActionData {
                 namespace: Some(namespace),
                 ..ActionData::none()
             },
@@ -303,7 +350,6 @@ impl Action {
                 namespace: Some(namespace),
                 digest: digest.as_ref(),
                 is_push: true,
-                ..ActionData::none()
             },
 
             Action::PutUpload {
@@ -315,7 +361,6 @@ impl Action {
                 namespace: Some(namespace),
                 digest: Some(digest),
                 is_push: true,
-                ..ActionData::none()
             },
 
             Action::GetBlob { namespace, digest }
@@ -329,30 +374,8 @@ impl Action {
                 ..ActionData::none()
             },
 
-            Action::GetManifest {
-                namespace,
-                reference,
-            }
-            | Action::HeadManifest {
-                namespace,
-                reference,
-            }
-            | Action::DeleteManifest {
-                namespace,
-                reference,
-            } => ActionData {
+            Action::PutManifest { namespace, .. } => ActionData {
                 namespace: Some(namespace),
-                reference: Some(reference),
-                ..ActionData::none()
-            },
-
-            Action::PutManifest {
-                namespace,
-                reference,
-                tags: _,
-            } => ActionData {
-                namespace: Some(namespace),
-                reference: Some(reference),
                 is_push: true,
                 ..ActionData::none()
             },
@@ -367,8 +390,14 @@ impl Action {
         self.action_data().digest
     }
 
-    pub fn get_reference(&self) -> Option<&Reference> {
-        self.action_data().reference
+    pub fn get_reference(&self) -> Option<Reference> {
+        match self {
+            Action::GetManifest { reference, .. }
+            | Action::HeadManifest { reference, .. }
+            | Action::DeleteManifest { reference, .. } => Some(reference.clone()),
+            Action::PutManifest { target, .. } => Some(target.reference()),
+            _ => None,
+        }
     }
 
     /// Returns `true` if this action writes registry state (uploads or manifest puts).

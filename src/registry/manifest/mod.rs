@@ -401,8 +401,12 @@ impl Registry {
 
         // Changed-state check from the prior target the committed transaction
         // itself validated; a missing entry fails open so a genuine write is
-        // never suppressed.
-        let changed = commit.changed(&LinkKind::from_reference(reference), &computed_digest);
+        // never suppressed. A by-digest push with `?tag=` also counts its created
+        // tag links so newly added tags replicate even when the digest is present.
+        let changed = commit.changed(&LinkKind::from_reference(reference), &computed_digest)
+            || created_tags
+                .iter()
+                .any(|tag| commit.changed(&LinkKind::Tag(tag.clone()), &computed_digest));
 
         let subject = manifest.subject.map(|s| s.digest);
 
