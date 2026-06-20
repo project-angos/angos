@@ -138,6 +138,12 @@ namespace does not already own is not made readable: it resolves as unknown on a
 (`BLOB_UNKNOWN` for a blob, `MANIFEST_UNKNOWN` for a child manifest) until its content is pushed.
 Subject digests used for referrers are not required to exist in either mode.
 
+When pushing by digest, one or more `?tag=` query parameters create the listed tags pointing at the
+pushed manifest, for example `PUT /v2/{namespace}/manifests/{digest}?tag=1.2.3&tag=latest`. Each
+value must be a valid tag; a value that is a digest or fails tag validation is rejected with
+`MANIFEST_INVALID`. The response carries an `OCI-Tag` header listing the accepted tags, comma and
+space separated. Tag query parameters on a by-tag push are ignored.
+
 ```
 DELETE /v2/{namespace}/manifests/{reference}
 ```

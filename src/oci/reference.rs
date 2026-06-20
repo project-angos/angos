@@ -76,7 +76,7 @@ mod tests {
         let Reference::Digest(digest) = Reference::from_str(&input).unwrap() else {
             panic!("Expected digest");
         };
-        assert_eq!(digest.algorithm(), "sha256");
+        assert_eq!(digest.algorithm().to_string(), "sha256");
     }
 
     #[test]
@@ -91,7 +91,6 @@ mod tests {
         assert_eq!(reference.to_string(), input);
     }
 
-    // Edge case: empty string is rejected
     #[test]
     fn test_empty_string_rejected() {
         assert!(
@@ -100,7 +99,6 @@ mod tests {
         );
     }
 
-    // Edge case: tag with invalid characters (exclamation mark) is rejected
     #[test]
     fn test_tag_invalid_char_exclamation_rejected() {
         assert!(
@@ -140,7 +138,6 @@ mod tests {
         );
     }
 
-    // Edge case: digest with non-hex hash is rejected
     #[test]
     fn test_digest_non_hex_rejected() {
         assert!(

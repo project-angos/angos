@@ -71,6 +71,7 @@ pub async fn handle_put_manifest<S>(
     reference: Reference,
     mime_type: String,
     body_stream: S,
+    tags: Vec<String>,
     identity: &ClientIdentity,
     source_ts: Option<DateTime<Utc>>,
 ) -> Result<EventfulResponse, Error>
@@ -87,6 +88,7 @@ where
             reference,
             mime_type,
             body_stream,
+            tags,
         )
         .await?;
 
@@ -135,12 +137,14 @@ pub async fn dispatch_head_manifest(
     handle_head_manifest(context, namespace, reference, &mime_types, is_immutable).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_put_manifest(
     context: &ServerContext,
     parts: &Parts,
     incoming: Incoming,
     namespace: &Namespace,
     reference: Reference,
+    tags: Vec<String>,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
@@ -159,6 +163,7 @@ pub async fn dispatch_put_manifest(
             reference,
             mime_type,
             body_stream,
+            tags,
             identity,
             source_ts,
         )
@@ -284,6 +289,7 @@ mod tests {
             tag(),
             MEDIA_TYPE.to_string(),
             std::io::Cursor::new(manifest_b()),
+            Vec::new(),
             &identity,
             Some(newer_ts),
         )
@@ -321,6 +327,7 @@ mod tests {
             tag(),
             MEDIA_TYPE.to_string(),
             std::io::Cursor::new(manifest_a()),
+            Vec::new(),
             &identity,
             source_ts,
         )

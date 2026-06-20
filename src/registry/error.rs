@@ -119,6 +119,7 @@ impl From<blob_store::Error> for Error {
             blob_store::Error::UploadBodyRead(_) | blob_store::Error::UploadBodySize { .. } => {
                 Error::RangeNotSatisfiable
             }
+            blob_store::Error::DigestAlgorithmUnavailable(_) => Error::DigestInvalid,
             _ => Error::Internal(format!("Data store error during operations: {error}")),
         }
     }
@@ -228,6 +229,13 @@ mod tests {
         }
         .into();
         assert!(matches!(size_err, Error::RangeNotSatisfiable));
+    }
+
+    #[test]
+    fn from_blob_store_routes_digest_algorithm_unavailable() {
+        let err: Error =
+            blob_store::Error::DigestAlgorithmUnavailable(oci::Algorithm::Sha512).into();
+        assert!(matches!(err, Error::DigestInvalid));
     }
 
     #[test]

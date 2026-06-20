@@ -10,6 +10,7 @@ use angos_tx_engine::StorageError;
 pub enum Error {
     DataStore(s3_client::Error),
     HashSerialization(String),
+    DigestAlgorithmUnavailable(oci::Algorithm),
     JSONSerialization(String),
     StorageBackend(String),
     UploadBodyRead(String),
@@ -25,6 +26,10 @@ impl fmt::Display for Error {
         match self {
             Error::DataStore(err) => write!(f, "Data store error: {err}"),
             Error::HashSerialization(e) => write!(f, "Hash state management error: {e}"),
+            Error::DigestAlgorithmUnavailable(algorithm) => write!(
+                f,
+                "digest algorithm '{algorithm}' is unavailable for this upload (resumed from a checkpoint without it)"
+            ),
             Error::JSONSerialization(e) => write!(f, "JSON serialization error: {e}"),
             Error::StorageBackend(e) => write!(f, "Storage backend error: {e}"),
             Error::UploadBodyRead(e) => write!(f, "Upload body read error: {e}"),
@@ -99,21 +104,11 @@ impl From<oci::Error> for Error {
     }
 }
 
-/// Blanket conversion from a storage-layer error into a blob-store error.
-///
-/// # Trap: `StorageError::NotFound` maps to `Error::ReferenceNotFound`
-///
-/// This mapping is intentionally conservative: it assumes the missing resource
-/// is a *reference* (manifest link, tag, etc.) because that is the most common
-/// hot path. It is **wrong** for blob and upload call sites, where the correct
-/// variants are [`Error::BlobNotFound`] and [`Error::UploadNotFound`]
-/// respectively.
-///
-/// Any call site that operates on blob or upload keys **must** intercept
-/// `StorageError::NotFound` explicitly before relying on `?` to reach this
-/// impl, otherwise the caller receives a misleading `ReferenceNotFound` error.
-/// Search for `StorageError::NotFound =>` in the blob-store modules to see how
-/// the correct pattern is applied.
+/// Blanket conversion from a storage-layer error into a blob-store error;
+/// `StorageError::NotFound` maps to `Error::ReferenceNotFound`. That default is
+/// wrong for blob/upload call sites, which must intercept `NotFound` explicitly
+/// (before `?` reaches this impl) and return [`Error::BlobNotFound`] /
+/// [`Error::UploadNotFound`] instead.
 impl From<StorageError> for Error {
     fn from(e: StorageError) -> Self {
         match e {
@@ -147,6 +142,13 @@ mod tests {
         assert_eq!(
             format!("{}", Error::HashSerialization("Invalid state".to_string())),
             "Hash state management error: Invalid state"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Error::DigestAlgorithmUnavailable(oci::Algorithm::Sha512)
+            ),
+            "digest algorithm 'sha512' is unavailable for this upload (resumed from a checkpoint without it)"
         );
         assert_eq!(
             format!("{}", Error::JSONSerialization("Parse error".to_string())),

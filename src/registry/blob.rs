@@ -137,14 +137,13 @@ fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bo
 }
 
 /// Stream `stream` into an upload staging slot and return the engine reads +
-/// mutations that, when committed, atomically promote the staged bytes to
-/// `blob-data/<digest>`, delete the upload-session record, and grant
-/// `namespace` ownership of the blob.
+/// mutations that, on commit, atomically promote the staged bytes to
+/// `blob-data/<digest>`, delete the upload-session record, and grant `namespace`
+/// ownership of the blob.
 ///
-/// **Side-effects already taken** when this returns: the upload-staging
-/// objects are written, and on the S3 backend the multipart upload has been
-/// completed. A crash before the returned mutations are applied leaves these
-/// artifacts for scrub to reclaim.
+/// Side-effects already taken on return: staging objects written (and the S3
+/// multipart completed); a crash before the mutations apply leaves them for
+/// scrub to reclaim.
 pub async fn cache_blob_mutations(
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
@@ -164,10 +163,11 @@ pub async fn cache_blob_mutations(
             &session_id,
             stream,
             Some(content_length),
+            digest.algorithm(),
         )
         .await?;
     let (_, mut mutations) = blob_store
-        .finalize_upload_mutations(namespace.as_ref(), &session_id, Some(&digest))
+        .finalize_upload_mutations(namespace.as_ref(), &session_id, &digest)
         .await?;
     let (reads, mut grant_mutations) = metadata_store
         .build_grant_mutations(namespace.as_ref(), &digest)
@@ -666,7 +666,7 @@ mod tests {
                     &[LinkOperation::create_with_referrer(
                         link.clone(),
                         digest.clone(),
-                        Digest::from_bytes(b"manifest"),
+                        Digest::sha256_of_bytes(b"manifest"),
                     )],
                 )
                 .await
@@ -693,16 +693,16 @@ mod tests {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let parent = Digest::from_bytes(b"index manifest");
-            let subject = Digest::from_bytes(b"subject manifest");
+            let parent = Digest::sha256_of_bytes(b"index manifest");
+            let subject = Digest::sha256_of_bytes(b"subject manifest");
 
             let cases = [
-                LinkKind::Digest(Digest::from_bytes(b"digest reference")),
+                LinkKind::Digest(Digest::sha256_of_bytes(b"digest reference")),
                 LinkKind::Tag("latest".to_string()),
-                LinkKind::Layer(Digest::from_bytes(b"layer reference")),
-                LinkKind::Config(Digest::from_bytes(b"config reference")),
-                LinkKind::Manifest(parent.clone(), Digest::from_bytes(b"child manifest")),
-                LinkKind::Referrer(subject, Digest::from_bytes(b"referrer manifest")),
+                LinkKind::Layer(Digest::sha256_of_bytes(b"layer reference")),
+                LinkKind::Config(Digest::sha256_of_bytes(b"config reference")),
+                LinkKind::Manifest(parent.clone(), Digest::sha256_of_bytes(b"child manifest")),
+                LinkKind::Referrer(subject, Digest::sha256_of_bytes(b"referrer manifest")),
             ];
 
             for link in cases {
@@ -795,7 +795,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = Namespace::new("test-repo").unwrap();
             let content = b"cached pull-through blob content";
-            let digest = Digest::from_bytes(content);
+            let digest = Digest::sha256_of_bytes(content);
             let stream = Box::new(Cursor::new(content.to_vec()));
 
             cache_blob(

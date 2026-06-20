@@ -12,7 +12,7 @@ pub use constants::{
     IN_TOTO_PREDICATE_TYPE, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE,
 };
 pub use descriptor::{Descriptor, Platform};
-pub use digest::Digest;
+pub use digest::{Algorithm, Digest};
 pub use error::Error;
 pub use manifest::{Manifest, OCI_MANIFEST_SCHEMA_VERSION};
 pub use namespace::{Namespace, namespace_belongs_to};

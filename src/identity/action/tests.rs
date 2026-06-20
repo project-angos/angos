@@ -120,6 +120,7 @@ fn test_action_serialization_cel_compatibility() {
             Action::PutManifest {
                 namespace: ns(),
                 reference: reference(),
+                tags: Vec::new(),
             },
         ),
         (
@@ -351,7 +352,8 @@ fn test_is_push() {
     assert!(
         Action::PutManifest {
             namespace: ns(),
-            reference: reference()
+            reference: reference(),
+            tags: Vec::new()
         }
         .is_push()
     );

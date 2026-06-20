@@ -21,7 +21,7 @@ use crate::{
     cache::Cache,
     cache::memory::Backend as CacheMemoryBackend,
     metrics_provider,
-    oci::{Descriptor, Digest, Namespace},
+    oci::{Algorithm, Descriptor, Digest, Namespace},
     registry::{
         metadata_store::{BlobIndex, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore},
         path_builder,
@@ -177,12 +177,10 @@ pub async fn test_datastore_list_namespaces(m: Arc<MetadataStore>) {
         create_link(&m, namespace, &tag_link, &digest).await;
     }
 
-    // Test listing all namespaces
     let (listed_namespaces, token) = m.list_namespaces(10, None).await.unwrap();
     assert_eq!(listed_namespaces, namespaces);
     assert!(token.is_none() || listed_namespaces.len() >= namespaces.len());
 
-    // Test pagination (2 items per pages)
     let (page1, token1) = m.list_namespaces(2, None).await.unwrap();
     assert_eq!(page1, ["repo1", "repo2"]);
     assert!(token1.is_some());
@@ -191,7 +189,6 @@ pub async fn test_datastore_list_namespaces(m: Arc<MetadataStore>) {
     assert_eq!(page2, ["repo3/nested"]);
     assert!(token2.is_none());
 
-    // Test pagination (1 item per pages)
     let (page1, token1) = m.list_namespaces(1, None).await.unwrap();
     assert_eq!(page1, ["repo1"]);
     assert!(token1.is_some());
@@ -220,7 +217,6 @@ pub async fn test_datastore_list_tags(m: Arc<MetadataStore>) {
         create_link(&m, namespace, &tag_link, &digest).await;
     }
 
-    // Test listing all tags
     let (all_tags, token) = m.list_tags(namespace, 10, None).await.unwrap();
     assert_eq!(all_tags.len(), tags.len());
     for tag in tags {
@@ -228,7 +224,6 @@ pub async fn test_datastore_list_tags(m: Arc<MetadataStore>) {
     }
     assert!(token.is_none());
 
-    // Test pagination (2 items per page)
     let (page1, token1) = m.list_tags(namespace, 2, None).await.unwrap();
     assert_eq!(page1.len(), 2);
     assert!(token1.is_some());
@@ -237,7 +232,6 @@ pub async fn test_datastore_list_tags(m: Arc<MetadataStore>) {
     assert_eq!(page2.len(), 1);
     assert!(token2.is_none());
 
-    // Test pagination (1 item per page)
     let (page1, token1) = m.list_tags(namespace, 1, None).await.unwrap();
     assert_eq!(page1.len(), 1);
     assert!(token1.is_some());
@@ -250,7 +244,6 @@ pub async fn test_datastore_list_tags(m: Arc<MetadataStore>) {
     assert_eq!(page3.len(), 1);
     assert!(token3.is_none());
 
-    // Test tag deletion
     let delete_tag = "v1.0";
     let tag_link = LinkKind::Tag(delete_tag.to_string());
     delete_link(&m, namespace, &tag_link).await;
@@ -297,7 +290,6 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
 
     create_link(&m, namespace, &referrers_link, &referrer_digest).await;
 
-    // Test listing referrers
     let referrers = m.list_referrers(namespace, &base_digest, None).await;
 
     let expected = vec![Descriptor {
@@ -311,7 +303,6 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
 
     assert_eq!(Ok(expected), referrers);
 
-    // Test with artifact type filter
     let filtered_referrers = m
         .list_referrers(
             namespace,
@@ -323,7 +314,6 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
 
     assert!(!filtered_referrers.is_empty());
 
-    // Test with non-matching artifact type
     let non_matching_referrers = m
         .list_referrers(
             namespace,
@@ -354,7 +344,6 @@ pub async fn test_datastore_list_revisions(m: Arc<MetadataStore>) {
         create_link(&m, namespace, &digest_link, &digest).await;
     }
 
-    // Test listing all revisions
     let (revisions, token) = m.list_revisions(namespace, 10, None).await.unwrap();
     assert_eq!(revisions.len(), digests.len());
     assert!(token.is_none());
@@ -362,7 +351,6 @@ pub async fn test_datastore_list_revisions(m: Arc<MetadataStore>) {
         assert!(revisions.contains(digest));
     }
 
-    // Test pagination (2 items per page)
     let (page1, token1) = m.list_revisions(namespace, 2, None).await.unwrap();
     assert_eq!(page1.len(), 2);
     assert!(token1.is_some());
@@ -371,25 +359,65 @@ pub async fn test_datastore_list_revisions(m: Arc<MetadataStore>) {
     assert_eq!(page2.len(), 1);
     assert!(token2.is_none());
 
-    // Test basic pagination (1 item per page)
-    let (page1, token1) = m.list_revisions(namespace, 1, None).await.unwrap();
-    assert_eq!(page1.len(), 1);
-    assert!(token1.is_some());
+    // Test basic pagination (1 item per page): draining until the token is None
+    // must surface every revision exactly once.
+    let mut walked = Vec::new();
+    let mut marker = None;
+    loop {
+        let (page, next) = m.list_revisions(namespace, 1, marker).await.unwrap();
+        assert!(page.len() <= 1);
+        walked.extend(page);
+        match next {
+            Some(next_marker) => marker = Some(next_marker),
+            None => break,
+        }
+    }
+    assert_eq!(walked.len(), digests.len());
+    for digest in &digests {
+        assert!(walked.contains(digest));
+    }
+}
 
-    let (page2, token2) = m.list_revisions(namespace, 1, token1).await.unwrap();
-    assert_eq!(page2.len(), 1);
-    assert!(token2.is_some());
+pub async fn test_datastore_list_revisions_across_algorithms(m: Arc<MetadataStore>) {
+    let namespace = &Namespace::new("multi-algo-repo").unwrap();
 
-    let (page3, token3) = m.list_revisions(namespace, 1, token2).await.unwrap();
-    assert_eq!(page3.len(), 1);
-    assert!(token3.is_none());
+    // Two revisions per algorithm. sha256 and sha512 are stored under separate
+    // prefixes; the merged listing must concatenate them in global sort order
+    // (every sha256 before every sha512) and paginate across the boundary.
+    let mut expected = Vec::new();
+    for content in [b"a".as_slice(), b"b".as_slice()] {
+        for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
+            let digest = Digest::from_bytes(algorithm, content);
+            create_link(&m, namespace, &LinkKind::Digest(digest.clone()), &digest).await;
+            expected.push(digest);
+        }
+    }
+    expected.sort();
+
+    // A single large page returns every revision, globally sorted.
+    let (all, token) = m.list_revisions(namespace, 100, None).await.unwrap();
+    assert!(token.is_none());
+    assert_eq!(all, expected);
+
+    // Walking one at a time visits the same set across the algorithm boundary,
+    // exactly once each, ending with a `None` token.
+    let mut walked = Vec::new();
+    let mut marker = None;
+    loop {
+        let (page, next) = m.list_revisions(namespace, 1, marker).await.unwrap();
+        walked.extend(page);
+        match next {
+            Some(next_marker) => marker = Some(next_marker),
+            None => break,
+        }
+    }
+    assert_eq!(walked, expected);
 }
 
 pub async fn test_datastore_link_operations(m: Arc<MetadataStore>) {
     let namespace = &Namespace::new("test-namespace").unwrap();
     let digest = put_blob_direct(m.store(), b"test blob content").await;
 
-    // Test creating and reading tag link
     let tag = "latest";
     let tag_link = LinkKind::Tag(tag.to_string());
 
@@ -398,7 +426,6 @@ pub async fn test_datastore_link_operations(m: Arc<MetadataStore>) {
     let read_digest = m.read_link(namespace, &tag_link).await.unwrap();
     assert_eq!(read_digest.target, digest);
 
-    // Test reading reference info
     let ref_info = m.read_link(namespace, &tag_link).await.unwrap();
     let created_at = ref_info.created_at.unwrap();
     assert!(Utc::now().signed_duration_since(created_at) < Duration::seconds(1));
@@ -432,6 +459,14 @@ async fn test_list_referrers() {
 async fn test_list_revisions() {
     for test_case in backends() {
         test_datastore_list_revisions(test_case.metadata_store()).await;
+        test_case.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn test_list_revisions_across_algorithms() {
+    for test_case in backends() {
+        test_datastore_list_revisions_across_algorithms(test_case.metadata_store()).await;
         test_case.cleanup().await;
     }
 }
@@ -478,7 +513,6 @@ pub async fn test_datastore_list_namespaces_many_namespaces_pagination(m: Arc<Me
         create_link(&m, ns, &tag_link, &digest).await;
     }
 
-    // Paginate with page size 3, collecting all results
     let mut all_namespaces = Vec::new();
     let mut token: Option<String> = None;
     let mut page_count = 0;
@@ -522,7 +556,6 @@ pub async fn test_datastore_list_namespaces_single_item_pages(m: Arc<MetadataSto
         create_link(&m, ns, &tag_link, &digest).await;
     }
 
-    // Paginate with page size 1
     let mut all_namespaces = Vec::new();
     let mut token: Option<String> = None;
 
@@ -543,7 +576,6 @@ pub async fn test_datastore_list_namespaces_single_item_pages(m: Arc<MetadataSto
         token = next_token;
     }
 
-    // After exhausting all items, token should be None
     assert!(
         token.is_none(),
         "Token should be None after all namespaces are consumed"
@@ -585,7 +617,6 @@ pub async fn test_datastore_list_tags_many_tags_pagination(m: Arc<MetadataStore>
         create_link(&m, namespace, &LinkKind::Tag(tag.clone()), &digest).await;
     }
 
-    // Paginate with page size 3, collecting all results
     let mut all_tags = Vec::new();
     let mut token: Option<String> = None;
     let mut page_count = 0;
@@ -629,7 +660,6 @@ pub async fn test_datastore_list_tags_single_item_pages(m: Arc<MetadataStore>) {
         create_link(&m, namespace, &LinkKind::Tag(tag.clone()), &digest).await;
     }
 
-    // Paginate with page size 1
     let mut all_tags = Vec::new();
     let mut token: Option<String> = None;
 
@@ -650,7 +680,6 @@ pub async fn test_datastore_list_tags_single_item_pages(m: Arc<MetadataStore>) {
         token = next_token;
     }
 
-    // After exhausting all items, token should be None
     assert!(
         token.is_none(),
         "Token should be None after all tags are consumed"
@@ -1840,7 +1869,6 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
     assert_eq!(referrers.len(), 1, "Expected 1 referrer descriptor");
     assert_eq!(referrers[0], descriptor);
 
-    // Test artifact_type filtering with matching type
     let filtered = m
         .list_referrers(
             namespace,
@@ -1852,7 +1880,6 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
     assert_eq!(filtered.len(), 1, "Should match artifact type filter");
     assert_eq!(filtered[0], descriptor);
 
-    // Test artifact_type filtering with non-matching type
     let non_matching = m
         .list_referrers(
             namespace,

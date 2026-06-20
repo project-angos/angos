@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use serde_json::json;
-use sha2::{Digest as Sha256Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -14,8 +13,7 @@ use crate::{
     oci::{Digest, Namespace},
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        Registry, RegistryConfig, Repository,
-        blob_store::{self, sha256_ext::Sha256Ext},
+        Registry, RegistryConfig, Repository, blob_store,
         job_store::{JobStore, Queue},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
@@ -173,17 +171,11 @@ pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body:
         .expect("raw link write");
 }
 
-/// Write `content` directly at the canonical blob path via the underlying
-/// `ObjectStore`. Returns the SHA-256 digest.
-///
-/// Test-only setup helper that replaces the deleted `BlobStore::create`
-/// shortcut. Seeds blob bytes without invoking the upload state machine
-/// (no upload-session record, no namespace required), which matches the
-/// legacy `BlobStore::create` semantics most closely.
+/// Test-only helper that writes `content` directly at the canonical blob path
+/// via the underlying `ObjectStore` (no upload state machine, no namespace),
+/// returning its SHA-256 digest.
 pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    let digest = hasher.digest();
+    let digest = Digest::sha256_of_bytes(content);
     store
         .put(
             &path_builder::blob_path(&digest),
@@ -507,9 +499,7 @@ pub async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayloa
 }
 
 /// Seed a config blob, a layer blob, a manifest referencing both, and a `v1`
-/// tag link under `namespace`. Returns the (manifest, config, layer) digests.
-/// `store`/`metadata_store` accept `&Arc<..>` via deref coercion; pass the
-/// repository namespace (callers use "nginx").
+/// tag link under `namespace`, returning the (manifest, config, layer) digests.
 pub async fn seed_manifest(
     store: &Store,
     metadata_store: &MetadataStore,

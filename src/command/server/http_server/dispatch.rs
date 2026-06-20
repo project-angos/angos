@@ -114,9 +114,10 @@ async fn dispatch_route<'a>(
         Action::PutManifest {
             namespace,
             reference,
+            tags,
         } => {
             handlers::manifest::dispatch_put_manifest(
-                context, parts, incoming, &namespace, reference, identity,
+                context, parts, incoming, &namespace, reference, tags, identity,
             )
             .await
         }

@@ -37,6 +37,7 @@ pub use upload::{BlobMount, StartUploadResponse};
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
 pub const OCI_SUBJECT: &str = "OCI-Subject";
+pub const OCI_TAG: &str = "OCI-Tag";
 pub const APPLICATION_JSON: &str = "application/json";
 
 /// Response for endpoints whose body is a JSON (or JSON-flavoured) payload.

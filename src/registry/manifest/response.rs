@@ -1,7 +1,7 @@
 use crate::{
     event_webhook::event::Event,
     oci::{Digest, Namespace, Reference},
-    registry::{HeaderMap, OCI_SUBJECT, ResponseHeaders},
+    registry::{HeaderMap, OCI_SUBJECT, OCI_TAG, ResponseHeaders},
 };
 
 pub struct ManifestMeta {
@@ -87,12 +87,16 @@ pub fn put_manifest_headers(
     reference: &Reference,
     digest: &Digest,
     subject: Option<&Digest>,
+    created_tags: &[String],
 ) -> HeaderMap {
-    let headers = ResponseHeaders::new()
+    let mut headers = ResponseHeaders::new()
         .location(format!("/v2/{namespace}/manifests/{reference}"))
         .docker_content_digest(digest);
-    match subject {
-        Some(subject) => headers.with(OCI_SUBJECT, subject.to_string()).into_inner(),
-        None => headers.into_inner(),
+    if let Some(subject) = subject {
+        headers = headers.with(OCI_SUBJECT, subject.to_string());
     }
+    if !created_tags.is_empty() {
+        headers = headers.with(OCI_TAG, created_tags.join(", "));
+    }
+    headers.into_inner()
 }

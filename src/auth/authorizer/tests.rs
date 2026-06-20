@@ -328,6 +328,7 @@ fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
     let action = Action::PutManifest {
         namespace: Namespace::new("myrepo/app").unwrap(),
         reference: Reference::from_str("v1.0.0").unwrap(),
+        tags: Vec::new(),
     };
 
     let result = authorizer.check_immutable_tag("myrepo", &action);
@@ -515,6 +516,7 @@ async fn test_pull_through_repo_blocks_push_operations() {
     let put_manifest_route = Action::PutManifest {
         namespace: namespace.clone(),
         reference,
+        tags: Vec::new(),
     };
     let result = authorizer
         .authorize_request(&put_manifest_route, &identity, &parts, &registry)

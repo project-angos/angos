@@ -6,22 +6,22 @@
 //!
 //! - `startedat`: RFC3339 timestamp of the last activity, used by `scrub` for
 //!   age-based orphan detection.
-//! - `hashstates/sha256/<offset>`: the serialised SHA-256 hasher state after
-//!   consuming the upload's bytes up to `<offset>`, so the hash computation can
-//!   resume after a crash without re-reading the uploaded bytes. The highest
-//!   checkpoint offset is also the authoritative record of how many bytes have
-//!   been consumed, so the upload's size is recovered from it on resume.
+//! - `hashstates/sha256/<offset>`: serialised hasher state for every supported
+//!   digest algorithm, checkpointed together after consuming the upload's bytes
+//!   up to `<offset>`, so hashing resumes after a crash without re-reading them
+//!   (`sha256` is a fixed legacy path segment, not the only algorithm). The
+//!   highest checkpoint offset also records how many bytes were consumed, so the
+//!   upload's size is recovered from it on resume.
 //! - `data`: the assembled upload bytes (FS append target / S3 multipart key).
 //! - `staged/<offset>`: S3-only multipart sub-part remainder, one file per
 //!   offset, superseded as the upload advances.
 //!
 //! Backend-specific upload mechanics (FS append, S3 multipart) are encapsulated
-//! inside the storage backend's keyed [`ObjectStore`] upload methods; this
-//! module never sees them. There is no persisted opaque session value; the S3 backend
-//! recovers its multipart state from S3 itself on each call, so the upload is
-//! addressed purely by its `data` key. Upload progress (size, hash) is the
-//! blob store's concern and is reconstructed by reading the per-file artifacts
-//! through the engine [`Store`](angos_tx_engine::store::Store).
+//! inside the storage backend's keyed [`ObjectStore`] methods; there is no
+//! persisted session value, so the S3 backend recovers its multipart state from
+//! S3 on each call and the upload is addressed purely by its `data` key. Upload
+//! progress (size, hash) is the blob store's concern, reconstructed by reading
+//! the per-file artifacts through the engine [`Store`](angos_tx_engine::store::Store).
 //!
 //! `complete` is two-phase:
 //! 1. [`Store::complete_upload`](angos_tx_engine::store::Store::complete_upload)
@@ -34,7 +34,6 @@ use std::io::Cursor;
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
     try_join,
@@ -47,20 +46,22 @@ use angos_tx_engine::{
 };
 
 use crate::{
-    oci::Digest,
+    oci::{Algorithm, Digest},
     registry::{
         blob_store::{
             BlobStore, Error, UploadSummary,
             hashing_reader::{HashingReader, hashing_stream},
-            sha256_ext::Sha256Ext,
+            resumable_hasher::{HashState, Hasher},
         },
         pagination, path_builder,
     },
 };
 
-/// Hash algorithm under which the serialised hasher state is checkpointed
-/// (`hashstates/<HASH_ALGORITHM>/<offset>`).
-const HASH_ALGORITHM: &str = "sha256";
+/// Fixed path segment under which the hasher-state checkpoint is stored
+/// (`hashstates/<CHECKPOINT_DIR_SEGMENT>/<offset>`). Kept as `sha256` (its
+/// historical algorithm-name origin) though the checkpoint now holds every
+/// algorithm's state, so a pre-multi-algorithm checkpoint still resumes.
+const CHECKPOINT_DIR_SEGMENT: &str = "sha256";
 
 /// Bytes peeked from a chunked (`None`) body to tell an empty finalize from one
 /// carrying data, before deciding whether to short-circuit or stream.
@@ -80,9 +81,9 @@ pub struct UploadSessionRecord {
     /// (refreshed on each `write` call so `scrub`'s `UploadChecker` uses the
     /// latest activity time rather than creation time alone).
     pub started_at: DateTime<Utc>,
-    /// Raw serialised SHA-256 hasher state read from the highest-offset
-    /// `hashstates/sha256/<offset>` checkpoint. Resumes the hash computation
-    /// after a crash without re-reading the uploaded bytes.
+    /// Serialised hasher-state checkpoint for every supported digest algorithm,
+    /// read from the highest-offset `hashstates/sha256/<offset>` file. Resumes
+    /// the hash computation after a crash without re-reading the uploaded bytes.
     pub hash_context: Vec<u8>,
     /// Number of bytes consumed so far, recovered from the highest hasher-state
     /// checkpoint offset (the cumulative bytes hashed equals the bytes written).
@@ -164,7 +165,7 @@ impl BlobStore {
     ) -> Result<(Vec<u8>, u64), Error> {
         let dir = format!(
             "{}/",
-            path_builder::upload_hash_context_dir(namespace, uuid, HASH_ALGORITHM)
+            path_builder::upload_hash_context_dir(namespace, uuid, CHECKPOINT_DIR_SEGMENT)
         );
         let mut highest: Option<u64> = None;
         let mut token = None;
@@ -190,7 +191,8 @@ impl BlobStore {
         let Some(offset) = highest else {
             return Err(Error::UploadNotFound);
         };
-        let key = path_builder::upload_hash_context_path(namespace, uuid, HASH_ALGORITHM, offset);
+        let key =
+            path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
         match self.store.get(&key).await {
             Ok(data) => Ok((data, offset)),
             Err(StorageError::NotFound) => Err(Error::UploadNotFound),
@@ -207,7 +209,8 @@ impl BlobStore {
         offset: u64,
         state: &[u8],
     ) -> Result<(), Error> {
-        let key = path_builder::upload_hash_context_path(namespace, uuid, HASH_ALGORITHM, offset);
+        let key =
+            path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
         self.store.put(&key, Bytes::copy_from_slice(state)).await?;
         Ok(())
     }
@@ -248,7 +251,7 @@ impl BlobStore {
         // multipart and staged remainder).
         self.store.create_upload(&upload_path).await?;
 
-        let hash_context = Sha256::new().serialized_state();
+        let hash_context = Hasher::new().state().to_bytes()?;
         let record = UploadSessionRecord {
             session_id: uuid.to_string(),
             namespace: namespace.to_string(),
@@ -267,11 +270,14 @@ impl BlobStore {
         uuid: &str,
         mut stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
+        algorithm: Algorithm,
     ) -> Result<(Digest, u64), Error> {
         let mut record = self.read_session(namespace, uuid).await?;
 
         if content_length == Some(0) {
-            let digest = Sha256::from_state(&record.hash_context)?.digest();
+            let digest = HashState::from_bytes(&record.hash_context)?
+                .into_hasher()?
+                .digest(algorithm)?;
             return Ok((digest, record.uploaded_size));
         }
 
@@ -288,7 +294,9 @@ impl BlobStore {
                 .await
                 .map_err(|e| Error::StorageBackend(e.to_string()))?;
             if peek.is_empty() {
-                let digest = Sha256::from_state(&record.hash_context)?.digest();
+                let digest = HashState::from_bytes(&record.hash_context)?
+                    .into_hasher()?
+                    .digest(algorithm)?;
                 return Ok((digest, record.uploaded_size));
             }
             Box::new(Cursor::new(peek.freeze()).chain(stream))
@@ -296,8 +304,8 @@ impl BlobStore {
             stream
         };
 
-        let hasher = Sha256::from_state(&record.hash_context)?;
-        let hashing_reader = HashingReader::with_hasher(stream, hasher);
+        let hasher = HashState::from_bytes(&record.hash_context)?.into_hasher()?;
+        let hashing_reader = HashingReader::new(stream, hasher);
         let (body_stream, finish) = hashing_stream(hashing_reader, content_length);
 
         let upload_path = path_builder::upload_path(namespace, uuid);
@@ -305,23 +313,23 @@ impl BlobStore {
             .store
             .write_upload(&upload_path, body_stream, content_length)
             .await;
-        let final_state = finish
+        let hash_result = finish
             .await
             .map_err(|e| Error::StorageBackend(e.to_string()))?;
         // Hash-task errors (typically UploadBodySize) win over the storage
         // error they triggered.
-        let (final_state, new_size) = match (write_result, final_state) {
-            (Ok(size), Ok(state)) => (state, size),
+        let (hasher, new_size) = match (write_result, hash_result) {
+            (Ok(size), Ok(hasher)) => (hasher, size),
             (_, Err(e)) => return Err(e),
             (Err(e), Ok(_)) => return Err(e.into()),
         };
 
-        record.hash_context = final_state.serialized;
+        record.hash_context = hasher.state().to_bytes()?;
         record.uploaded_size = new_size;
         record.started_at = Utc::now();
         self.write_session(&record).await?;
 
-        Ok((final_state.digest, new_size))
+        Ok((hasher.digest(algorithm)?, new_size))
     }
 
     #[instrument(skip(self))]
@@ -337,22 +345,23 @@ impl BlobStore {
         })
     }
 
-    /// Compute the canonical digest, run the backend completion step, and
-    /// return the engine mutations that atomically promote the staged
-    /// bytes to `blob-data/<digest>` and delete the per-file session artifacts.
+    /// Run the backend completion step and return the engine mutations that
+    /// atomically promote the staged bytes to `blob-data/<digest>` and delete
+    /// the per-file session artifacts. The caller supplies the verified digest
+    /// (its algorithm fixes the canonical blob path).
     #[instrument(skip(self))]
     pub async fn finalize_upload_mutations(
         &self,
         namespace: &str,
         uuid: &str,
-        expected_digest: Option<&Digest>,
+        digest: &Digest,
     ) -> Result<(Digest, Vec<Mutation>), Error> {
-        let record = self.read_session(namespace, uuid).await?;
+        // Confirm the session is live (UploadNotFound otherwise) before promoting.
+        self.read_session(namespace, uuid).await?;
         let upload_key = path_builder::upload_path(namespace, uuid);
 
-        let digest = resolve_digest(&record, expected_digest)?;
         self.store.complete_upload(&upload_key).await?;
-        let blob_key = path_builder::blob_path(&digest);
+        let blob_key = path_builder::blob_path(digest);
 
         let mut mutations = vec![Mutation::Move {
             src: upload_key,
@@ -365,7 +374,7 @@ impl BlobStore {
             });
         }
 
-        Ok((digest, mutations))
+        Ok((digest.clone(), mutations))
     }
 
     /// Finish the upload and atomically relocate the data to the canonical
@@ -381,7 +390,7 @@ impl BlobStore {
         &self,
         namespace: &str,
         uuid: &str,
-        digest: Option<&Digest>,
+        digest: &Digest,
     ) -> Result<Digest, Error> {
         let (final_digest, mutations) = self
             .finalize_upload_mutations(namespace, uuid, digest)
@@ -425,14 +434,4 @@ impl BlobStore {
 /// transaction.
 fn session_record_keys(namespace: &str, uuid: &str) -> Vec<String> {
     vec![path_builder::upload_start_date_path(namespace, uuid)]
-}
-
-fn resolve_digest(
-    record: &UploadSessionRecord,
-    expected: Option<&Digest>,
-) -> Result<Digest, Error> {
-    if let Some(d) = expected {
-        return Ok(d.clone());
-    }
-    Ok(Sha256::from_state(&record.hash_context)?.digest())
 }

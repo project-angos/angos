@@ -2,6 +2,8 @@ pub mod link_plan;
 mod parse;
 mod response;
 
+use std::str::FromStr;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
@@ -241,6 +243,7 @@ impl Registry {
             &reference,
             media_type.as_ref(),
             &content,
+            &[],
             ReferencePolicy::Trusted,
             None,
         )
@@ -310,23 +313,32 @@ impl Registry {
             reference,
             content_type,
             body,
+            &[],
             ReferencePolicy::Strict,
             None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn store_manifest(
         &self,
         namespace: &Namespace,
         reference: &Reference,
         content_type: Option<&String>,
         body: &[u8],
+        created_tags: &[String],
         reference_policy: ReferencePolicy,
         created_at: Option<DateTime<Utc>>,
     ) -> Result<PutManifestResponse, Error> {
         let mut manifest = parse_and_validate_manifest(body, content_type)?;
-        let computed_digest = Digest::from_bytes(body);
+        // A digest reference fixes the algorithm to verify against; a tag push has
+        // no client-chosen algorithm, so the manifest lands under its canonical
+        // sha256 digest.
+        let computed_digest = match reference {
+            Reference::Digest(provided) => Digest::from_bytes(provided.algorithm(), body),
+            Reference::Tag(_) => Digest::sha256_of_bytes(body),
+        };
 
         if let Reference::Digest(provided_digest) = reference
             && provided_digest != &computed_digest
@@ -349,6 +361,7 @@ impl Registry {
             reference,
             effective_media_type.as_deref(),
             body.len() as u64,
+            created_tags,
         );
 
         match reference_policy {
@@ -394,7 +407,13 @@ impl Registry {
         let subject = manifest.subject.map(|s| s.digest);
 
         Ok(PutManifestResponse {
-            headers: put_manifest_headers(namespace, reference, &computed_digest, subject.as_ref()),
+            headers: put_manifest_headers(
+                namespace,
+                reference,
+                &computed_digest,
+                subject.as_ref(),
+                created_tags,
+            ),
             digest: computed_digest,
             events: Vec::new(),
             changed,
@@ -634,12 +653,11 @@ impl Registry {
         })
     }
 
-    /// Resolves a manifest GET request to either a presigned redirect URL or the manifest body.
-    ///
-    /// The redirect fast-path is safe only when the cached target is authoritative:
-    /// the repository is not a pull-through cache, the reference is a digest, or the
-    /// tag has been declared immutable. For mutable tags on a pull-through cache we
-    /// fall through to `get_manifest` to refresh if upstream has moved.
+    /// Resolves a manifest GET request to a presigned redirect URL or the
+    /// manifest body. The redirect fast-path is taken only when the cached target
+    /// is authoritative (not a pull-through cache, a digest reference, or an
+    /// immutable tag); mutable tags on a pull-through cache fall through to
+    /// `get_manifest` to refresh if upstream has moved.
     #[instrument(skip(self, is_tag_immutable))]
     pub async fn resolve_get_manifest(
         &self,
@@ -814,6 +832,10 @@ impl Registry {
     }
 
     /// Reads the body stream, calls `put_manifest`, and returns the domain response.
+    ///
+    /// `tags` carries the values of `?tag=` query parameters; they apply only
+    /// when `reference` is a `Reference::Digest` and are validated downstream.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, body_stream, actor))]
     pub async fn accept_put_manifest<S>(
         &self,
@@ -823,6 +845,7 @@ impl Registry {
         reference: Reference,
         mime_type: String,
         body_stream: S,
+        tags: Vec<String>,
     ) -> Result<PutManifestResponse, Error>
     where
         S: AsyncRead + Unpin + Send,
@@ -848,9 +871,25 @@ impl Registry {
         // write (`source_ts` present) pays this extra hash of the body.
         let incoming_digest = source_ts
             .is_some()
-            .then(|| Digest::from_bytes(&request_body));
+            .then(|| Digest::sha256_of_bytes(&request_body));
         self.check_lww_not_superseded(namespace, &reference, source_ts, incoming_digest.as_ref())
             .await?;
+
+        // `?tag=` query parameters apply only to a by-digest push and must each
+        // be a valid tag; a by-tag push ignores them and creates no extra tags.
+        let created_tags: Vec<String> = match &reference {
+            Reference::Digest(_) => {
+                for tag in &tags {
+                    if !matches!(Reference::from_str(tag), Ok(Reference::Tag(_))) {
+                        return Err(Error::ManifestInvalid(format!(
+                            "Invalid tag query parameter: '{tag}'"
+                        )));
+                    }
+                }
+                tags
+            }
+            Reference::Tag(_) => Vec::new(),
+        };
 
         let reference_policy = if self.validate_manifest_references {
             ReferencePolicy::Strict
@@ -863,6 +902,7 @@ impl Registry {
                 &reference,
                 Some(&mime_type),
                 &request_body,
+                &created_tags,
                 reference_policy,
                 source_ts,
             )
@@ -886,11 +926,25 @@ impl Registry {
             response.events.push(tag_event(
                 EventKind::TagCreate,
                 namespace,
-                repository,
+                repository.clone(),
                 digest_str.clone(),
                 &reference,
                 tag,
-                actor,
+                actor.clone(),
+            ));
+        }
+
+        // Each tag created by a `?tag=` query parameter gets its own TagCreate
+        // event, mirroring the by-tag push above.
+        for tag in &created_tags {
+            response.events.push(tag_event(
+                EventKind::TagCreate,
+                namespace,
+                repository.clone(),
+                digest_str.clone(),
+                &reference,
+                tag,
+                actor.clone(),
             ));
         }
 
@@ -899,22 +953,56 @@ impl Registry {
         // committed transaction) is replicated. Webhook events above fire
         // unconditionally.
         if response.changed {
-            let tag = match &reference {
-                Reference::Tag(tag) => Some(tag.as_str()),
-                Reference::Digest(_) => None,
-            };
-            self.dispatch_replication(
+            self.replicate_manifest_push(
                 resolved_repository,
                 namespace,
-                REPLICATION_PUSH_MANIFEST_KIND,
-                tag,
-                Some(&response.digest),
-                None,
+                &reference,
+                &created_tags,
+                &response.digest,
             )
             .await;
         }
 
         Ok(response)
+    }
+
+    /// Replicates a manifest push to every matching downstream: the path tag
+    /// (when the reference is a tag) plus each tag created via a `?tag=` query
+    /// parameter, so a by-digest push with tag params converges identically on
+    /// every replica.
+    async fn replicate_manifest_push(
+        &self,
+        repository: Option<&Repository>,
+        namespace: &Namespace,
+        reference: &Reference,
+        created_tags: &[String],
+        digest: &Digest,
+    ) {
+        let path_tag = match reference {
+            Reference::Tag(tag) => Some(tag.as_str()),
+            Reference::Digest(_) => None,
+        };
+        self.dispatch_replication(
+            repository,
+            namespace,
+            REPLICATION_PUSH_MANIFEST_KIND,
+            path_tag,
+            Some(digest),
+            None,
+        )
+        .await;
+
+        for tag in created_tags {
+            self.dispatch_replication(
+                repository,
+                namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some(tag.as_str()),
+                Some(digest),
+                None,
+            )
+            .await;
+        }
     }
 
     /// Fire-and-forget enqueue of replication push/delete jobs, one per matching

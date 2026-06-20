@@ -1,14 +1,15 @@
-use sha2::{Digest as ShaDigest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, copy, sink};
 use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
-    oci::{Digest, Namespace},
+    oci::{Algorithm, Digest, Namespace},
     registry::{
         DOCKER_UPLOAD_UUID, Error, HeaderMap, Registry, ResponseHeaders,
-        blob_ownership::BlobOwnership, blob_store,
+        blob_ownership::BlobOwnership,
+        blob_store,
+        blob_store::{hashing_reader::HashingReader, resumable_hasher::Hasher},
     },
 };
 
@@ -83,56 +84,6 @@ fn patch_upload_headers(namespace: &Namespace, session_id: &str, range_max: u64)
         .into_inner()
 }
 
-async fn hash_upload_stream<S>(mut stream: S, content_length: Option<u64>) -> Result<Digest, Error>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    let mut read = 0_u64;
-
-    loop {
-        let bytes_read = stream
-            .read(&mut buffer)
-            .await
-            .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        let bytes_read_u64 = u64::try_from(bytes_read).map_err(blob_store::Error::from)?;
-        read = read
-            .checked_add(bytes_read_u64)
-            .ok_or(blob_store::Error::UploadBodySize {
-                expected: content_length.unwrap_or(read),
-                actual: u64::MAX,
-            })?;
-        if let Some(expected) = content_length
-            && read > expected
-        {
-            return Err(blob_store::Error::UploadBodySize {
-                expected,
-                actual: read,
-            }
-            .into());
-        }
-
-        hasher.update(&buffer[..bytes_read]);
-    }
-
-    if let Some(expected) = content_length
-        && read != expected
-    {
-        return Err(blob_store::Error::UploadBodySize {
-            expected,
-            actual: read,
-        }
-        .into());
-    }
-
-    Ok(Digest::from_sha256(hasher))
-}
-
 impl Registry {
     async fn complete_existing_upload<S>(
         &self,
@@ -150,7 +101,36 @@ impl Registry {
                 return Ok(false);
             }
 
-            let upload_digest = hash_upload_stream(stream, content_length).await?;
+            // The blob already exists, so there is nothing to store: hash the
+            // body into a sink purely to confirm it matches. With a declared
+            // length, drain at most one byte past it so an over-long body is
+            // rejected as soon as the surplus appears rather than after the
+            // whole `bound_blob_stream`-capped body is read.
+            let mut reader = HashingReader::new(&mut *stream, Hasher::new());
+            match content_length {
+                Some(expected) => {
+                    let read = copy(
+                        &mut (&mut reader).take(expected.saturating_add(1)),
+                        &mut sink(),
+                    )
+                    .await
+                    .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
+                    if read != expected {
+                        return Err(blob_store::Error::UploadBodySize {
+                            expected,
+                            actual: read,
+                        }
+                        .into());
+                    }
+                }
+                None => {
+                    copy(&mut reader, &mut sink())
+                        .await
+                        .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
+                }
+            }
+
+            let upload_digest = reader.into_hasher().digest(digest.algorithm())?;
             if &upload_digest != digest {
                 warn!("Expected digest '{digest}', got '{upload_digest}'");
                 return Err(Error::DigestInvalid);
@@ -414,9 +394,17 @@ impl Registry {
             .await?;
 
         let bounded = self.bound_blob_stream(summary.size, content_length, stream);
+        // PATCH only needs the running size; the digest is computed at the final
+        // PUT, so the algorithm here is immaterial.
         let (_, size) = self
             .blob_store
-            .write_upload(namespace, &session_key, Box::new(bounded), content_length)
+            .write_upload(
+                namespace,
+                &session_key,
+                Box::new(bounded),
+                content_length,
+                Algorithm::Sha256,
+            )
             .await?;
 
         self.reject_if_oversized(namespace, &session_key, size)
@@ -484,7 +472,13 @@ impl Registry {
 
         let (upload_digest, new_total) = self
             .blob_store
-            .write_upload(namespace, &session_key, Box::new(stream), content_length)
+            .write_upload(
+                namespace,
+                &session_key,
+                Box::new(stream),
+                content_length,
+                digest.algorithm(),
+            )
             .await?;
 
         self.reject_if_oversized(namespace, &session_key, new_total)
@@ -501,7 +495,7 @@ impl Registry {
                 Ok(_) => {}
                 Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
                     self.blob_store
-                        .complete_upload(namespace, &session_key, Some(digest))
+                        .complete_upload(namespace, &session_key, digest)
                         .await?;
                 }
                 Err(error) => return Err(Error::from(error)),
@@ -572,7 +566,7 @@ mod tests {
         cache,
         event_webhook::event::EventKind,
         identity::ClientIdentity,
-        oci::{Digest, Namespace},
+        oci::{Algorithm, Digest, Namespace},
         registry::{
             BlobMount, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, RegistryConfig,
             StartUploadResponse,
@@ -1278,7 +1272,7 @@ mod tests {
                 .await
                 .expect("a chunked PATCH (no Content-Length) must be accepted");
 
-            let expected_digest = Digest::from_bytes(content);
+            let expected_digest = Digest::sha256_of_bytes(content);
             registry
                 .complete_upload(
                     None,
@@ -1326,7 +1320,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let expected_digest = Digest::from_bytes(content);
+            let expected_digest = Digest::sha256_of_bytes(content);
 
             let empty_stream = Cursor::new(Vec::new());
             let response = registry
@@ -1392,7 +1386,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected_digest = Digest::from_bytes(content);
+        let expected_digest = Digest::sha256_of_bytes(content);
         let response = registry
             .complete_upload(
                 None,
@@ -1691,6 +1685,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_complete_upload_existing_blob_rejects_oversized_body() {
+        // A re-PUT of an already-present blob whose body exceeds its declared
+        // length is rejected on size, as soon as the surplus byte is read.
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = vec![b'x'; 100];
+            let digest = put_blob_direct(registry.metadata_store.store(), &content).await;
+
+            let session_id = Uuid::new_v4();
+            registry
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            // Declare far fewer bytes than the body actually carries.
+            let result = registry
+                .complete_upload(
+                    None,
+                    namespace,
+                    session_id,
+                    &digest,
+                    None,
+                    Some(10),
+                    Cursor::new(content),
+                )
+                .await;
+
+            assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_write_upload_returns_digest_and_size() {
         for test_case in backends() {
             let registry = test_case.registry();
@@ -1713,12 +1742,13 @@ mod tests {
                     &session_id.to_string(),
                     stream,
                     Some(content.len() as u64),
+                    Algorithm::Sha256,
                 )
                 .await
                 .unwrap();
 
             assert_eq!(size, content.len() as u64);
-            assert_eq!(digest, Digest::from_bytes(content));
+            assert_eq!(digest, Digest::sha256_of_bytes(content));
 
             let summary = registry
                 .blob_store
@@ -1761,6 +1791,7 @@ mod tests {
                     &session_id.to_string(),
                     stream,
                     Some(content.len() as u64),
+                    Algorithm::Sha256,
                 )
                 .await
                 .unwrap();
@@ -1832,7 +1863,7 @@ mod tests {
                 None,
                 namespace,
                 session_id,
-                &Digest::from_bytes(content),
+                &Digest::sha256_of_bytes(content),
                 None,
                 Some(0),
                 empty_stream,
@@ -1971,7 +2002,7 @@ mod tests {
 
         // A single chunked PUT carrying the whole body must also be bounded.
         let content = b"single chunked PUT over the cap";
-        let digest = Digest::from_bytes(content);
+        let digest = Digest::sha256_of_bytes(content);
         let result = registry
             .complete_upload(
                 None,

@@ -140,6 +140,8 @@ pub enum Action {
     PutManifest {
         namespace: Namespace,
         reference: Reference,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     #[serde(rename = "delete-manifest")]
     DeleteManifest {
@@ -347,6 +349,7 @@ impl Action {
             Action::PutManifest {
                 namespace,
                 reference,
+                tags: _,
             } => ActionData {
                 namespace: Some(namespace),
                 reference: Some(reference),

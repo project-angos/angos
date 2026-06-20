@@ -112,7 +112,7 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
         .unwrap();
 
     let body = content.to_vec();
-    let digest = Digest::from_bytes(&body);
+    let digest = Digest::sha256_of_bytes(&body);
     registry
         .complete_upload(
             None,
@@ -168,6 +168,7 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
             Reference::Tag("latest".to_string()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -216,6 +217,7 @@ async fn digest_push_suppresses_tag_create_event() {
             Reference::Tag("seed".to_string()),
             mime_type.clone(),
             Cursor::new(manifest_bytes.clone()),
+            Vec::new(),
         )
         .await
         .expect("seed push");
@@ -237,6 +239,7 @@ async fn digest_push_suppresses_tag_create_event() {
             Reference::Digest(digest),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("digest push");
@@ -278,6 +281,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
             Reference::Tag("v1".to_string()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("put manifest");
@@ -328,6 +332,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
             Reference::Tag("to-delete".to_string()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("put manifest");
@@ -385,6 +390,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
             Reference::Tag("stable".to_string()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -454,6 +460,7 @@ async fn tag_push_events_delivered_to_webhook_endpoint() {
             Reference::Tag("webhook-test".to_string()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -494,6 +501,7 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
             Reference::Tag("seed2".to_string()),
             mime_type.clone(),
             Cursor::new(manifest_bytes.clone()),
+            Vec::new(),
         )
         .await
         .expect("seed push");
@@ -514,6 +522,7 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
             Reference::Digest(digest),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("digest push");
@@ -605,6 +614,7 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
             Reference::Tag("latest".to_string()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");

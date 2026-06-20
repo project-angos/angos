@@ -10,7 +10,7 @@ use tracing::{debug, instrument};
 use angos_tx_engine::StorageError;
 
 use crate::{
-    oci::{Descriptor, Digest},
+    oci::{Algorithm, Descriptor, Digest},
     registry::{
         metadata_store::{Error, LinkKind, MetadataStore},
         pagination,
@@ -147,10 +147,11 @@ impl MetadataStore {
                 .iter()
                 .filter_map(|key| {
                     let parts: Vec<&str> = key.split('/').collect();
-                    if parts.len() < 2 || parts[0] != "sha256" {
+                    if parts.len() < 2 {
                         return None;
                     }
-                    Digest::sha256(parts[1]).ok()
+                    let algorithm = parts[0].parse::<Algorithm>().ok()?;
+                    Digest::with_algorithm(algorithm, parts[1]).ok()
                 })
                 .collect();
 
@@ -206,38 +207,46 @@ impl MetadataStore {
         debug!(
             "Fetching {n} revision(s) for namespace '{namespace}' with continuation token: {continuation_token:?}"
         );
-        let revisions_dir = path_builder::manifest_revisions_link_root_dir(namespace, "sha256");
 
-        let page = self
-            .store()
-            .list_children(&revisions_dir, n, continuation_token, None)
-            .await?;
-
-        // Revision dir names are sha256 hashes; skip any that don't validate.
-        let revisions = page
-            .sub_prefixes
-            .into_iter()
-            .filter_map(|key| Digest::sha256(key).ok())
-            .collect();
-
-        Ok((revisions, page.next_token))
+        // Manifest revisions are sharded by algorithm (`revisions/<algo>/<hash>`).
+        pagination::paginate_by_algorithm(
+            n,
+            continuation_token,
+            |algorithm, limit, cursor| async move {
+                let revisions_dir =
+                    path_builder::manifest_revisions_link_root_dir(namespace, algorithm.as_str());
+                let page = self
+                    .store()
+                    .list_children(&revisions_dir, limit, cursor, None)
+                    .await?;
+                let revisions = page
+                    .sub_prefixes
+                    .into_iter()
+                    .filter_map(|key| Digest::with_algorithm(algorithm, key).ok())
+                    .collect();
+                Ok((revisions, page.next_token))
+            },
+        )
+        .await
     }
 
     pub async fn count_manifests(&self, namespace: &str) -> Result<usize, Error> {
-        let revisions_dir = path_builder::manifest_revisions_link_root_dir(namespace, "sha256");
         let mut count = 0;
-        let mut token = None;
+        for &algorithm in Algorithm::supported_algorithms() {
+            let revisions_dir =
+                path_builder::manifest_revisions_link_root_dir(namespace, algorithm.as_str());
+            let mut token = None;
+            loop {
+                let page = self
+                    .store()
+                    .list_children(&revisions_dir, 1000, token, None)
+                    .await?;
 
-        loop {
-            let page = self
-                .store()
-                .list_children(&revisions_dir, 1000, token, None)
-                .await?;
-
-            count += page.sub_prefixes.len();
-            token = page.next_token;
-            if token.is_none() {
-                break;
+                count += page.sub_prefixes.len();
+                token = page.next_token;
+                if token.is_none() {
+                    break;
+                }
             }
         }
 
@@ -254,7 +263,7 @@ impl MetadataStore {
     }
 
     /// Walk the repository tree under `root_path` and yield every path that is a
-    /// namespace — i.e. has a `_manifests` child (an `_uploads`-only path is
+    /// namespace, i.e. has a `_manifests` child (an `_uploads`-only path is
     /// skipped). `_`-prefixed children are never descended into, so
     /// manifest/upload/blob substructure is not mistaken for nested namespaces.
     async fn collect_namespaces(

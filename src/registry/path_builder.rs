@@ -58,15 +58,15 @@ pub fn upload_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/data")
 }
 
-/// Directory holding the SHA-256 hasher-state checkpoints for an upload, one
+/// Directory holding an upload's hasher-state checkpoints under `algorithm`, one
 /// file per offset. Used to enumerate checkpoints and pick the most recent.
 pub fn upload_hash_context_dir(namespace: &str, uuid: &str, algorithm: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}")
 }
 
-/// Serialised SHA-256 hasher state after consuming the upload's bytes up to
-/// `offset`. One file per checkpoint offset, allowing hash resumption after a
-/// crash without re-reading the uploaded bytes.
+/// An upload's serialised hasher-state checkpoint under `algorithm` after
+/// consuming its bytes up to `offset`. One file per offset, allowing hash
+/// resumption after a crash without re-reading the uploaded bytes.
 pub fn upload_hash_context_path(
     namespace: &str,
     uuid: &str,
@@ -204,6 +204,8 @@ mod tests {
     // Valid 64-char lowercase-hex sha256 hashes (the only shape `Digest` accepts).
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    // Valid 128-char lowercase-hex sha512 hash.
+    const HASH_512: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     #[test]
     fn test_blob_paths() {
@@ -219,6 +221,19 @@ mod tests {
         assert_eq!(
             blob_container_dir(&digest),
             format!("v2/blobs/sha256/aa/{HASH_A}")
+        );
+    }
+
+    #[test]
+    fn test_blob_paths_sha512() {
+        let digest = Digest::sha512(HASH_512).unwrap();
+        assert_eq!(
+            blob_path(&digest),
+            format!("v2/blobs/sha512/cc/{HASH_512}/data")
+        );
+        assert_eq!(
+            blob_index_path(&digest),
+            format!("v2/blobs/sha512/cc/{HASH_512}/index.json")
         );
     }
 

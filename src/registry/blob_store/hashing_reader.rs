@@ -6,7 +6,6 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures_util::stream;
-use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, ReadBuf},
     sync::mpsc,
@@ -15,29 +14,23 @@ use tokio::{
 
 use angos_tx_engine::ByteStream;
 
-use crate::{
-    oci,
-    registry::blob_store::{Error, sha256_ext::Sha256Ext},
-};
+use crate::registry::blob_store::{Error, resumable_hasher::Hasher};
 
 const READ_FRAME_SIZE: usize = 1024 * 1024;
 
 pub struct HashingReader<R> {
     inner: R,
-    hasher: Sha256,
+    hasher: Hasher,
 }
 
 impl<R> HashingReader<R> {
-    pub fn with_hasher(inner: R, hasher: Sha256) -> Self {
+    pub fn new(inner: R, hasher: Hasher) -> Self {
         Self { inner, hasher }
     }
 
-    pub fn serialized_state(&self) -> Vec<u8> {
-        self.hasher.serialized_state()
-    }
-
-    pub fn digest(&self) -> oci::Digest {
-        self.hasher.clone().digest()
+    /// Consume the reader, yielding the hasher fed by every byte read.
+    pub fn into_hasher(self) -> Hasher {
+        self.hasher
     }
 }
 
@@ -58,24 +51,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for HashingReader<R> {
     }
 }
 
-/// Final hash state surfaced once the hashing reader has been fully drained.
-pub struct FinalHashState {
-    pub digest: oci::Digest,
-    pub serialized: Vec<u8>,
-}
-
 /// Drive a [`HashingReader`] in a background task, surfacing its bytes as a
-/// [`ByteStream`] for the storage backend to consume and resolving to the
-/// final hasher state via the returned join handle once the body is drained.
+/// [`ByteStream`] for the backend to consume and resolving (via the returned
+/// join handle, once drained) to the [`Hasher`] fed by every byte.
 ///
-/// `Some(len)` reads exactly `len` bytes and errors on a short body; `None`
-/// reads to EOF (a chunked request with no `Content-Length`). Bytes are framed
-/// in 1 MiB chunks shipped over an mpsc channel; the body never sits whole in
-/// memory.
+/// `Some(len)` reads exactly `len` bytes and errors on a short body, `None`
+/// reads to EOF; bytes are framed in 1 MiB chunks over an mpsc channel, so the
+/// body never sits whole in memory.
 pub fn hashing_stream<R>(
     reader: HashingReader<R>,
     content_length: Option<u64>,
-) -> (ByteStream, JoinHandle<Result<FinalHashState, Error>>)
+) -> (ByteStream, JoinHandle<Result<Hasher, Error>>)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -126,10 +112,7 @@ where
             }
         }
         drop(tx);
-        Ok(FinalHashState {
-            digest: reader.digest(),
-            serialized: reader.serialized_state(),
-        })
+        Ok(reader.into_hasher())
     });
 
     let body: ByteStream = Box::pin(stream::unfold(rx, |mut rx| async move {
@@ -142,32 +125,38 @@ where
 mod tests {
     use std::io::Cursor;
 
-    use sha2::{Digest as ShaDigest, Sha256};
     use tokio::io::AsyncReadExt;
 
     use super::*;
+    use crate::oci::Algorithm;
+
+    const HELLO_SHA256: &str =
+        "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    const HELLO_SHA512: &str = "sha512:309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f";
 
     #[tokio::test]
-    async fn test_known_payload_produces_correct_digest() {
-        let payload = b"hello world";
-        let reader = Cursor::new(payload);
-        let mut hashing_reader = HashingReader::with_hasher(reader, Sha256::new());
+    async fn test_known_payload_produces_correct_digests() {
+        let reader = Cursor::new(b"hello world");
+        let mut hashing_reader = HashingReader::new(reader, Hasher::new());
 
         let mut buf = Vec::new();
         hashing_reader.read_to_end(&mut buf).await.unwrap();
 
-        let digest = hashing_reader.digest();
+        let hasher = hashing_reader.into_hasher();
         assert_eq!(
-            digest.to_string(),
-            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+            hasher.digest(Algorithm::Sha256).unwrap().to_string(),
+            HELLO_SHA256
+        );
+        assert_eq!(
+            hasher.digest(Algorithm::Sha512).unwrap().to_string(),
+            HELLO_SHA512
         );
     }
 
     #[tokio::test]
     async fn test_multiple_small_reads_produce_same_digest() {
-        let payload = b"hello world";
-        let reader = Cursor::new(payload);
-        let mut hashing_reader = HashingReader::with_hasher(reader, Sha256::new());
+        let reader = Cursor::new(b"hello world");
+        let mut hashing_reader = HashingReader::new(reader, Hasher::new());
 
         let mut chunk = [0u8; 3];
         loop {
@@ -177,24 +166,31 @@ mod tests {
             }
         }
 
-        let digest = hashing_reader.digest();
+        let hasher = hashing_reader.into_hasher();
         assert_eq!(
-            digest.to_string(),
-            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+            hasher.digest(Algorithm::Sha256).unwrap().to_string(),
+            HELLO_SHA256
+        );
+        assert_eq!(
+            hasher.digest(Algorithm::Sha512).unwrap().to_string(),
+            HELLO_SHA512
         );
     }
 
     #[tokio::test]
     async fn test_empty_input_produces_correct_digest() {
         let reader = Cursor::new(b"");
-        let mut hashing_reader = HashingReader::with_hasher(reader, Sha256::new());
+        let mut hashing_reader = HashingReader::new(reader, Hasher::new());
 
         let mut buf = Vec::new();
         hashing_reader.read_to_end(&mut buf).await.unwrap();
 
-        let digest = hashing_reader.digest();
         assert_eq!(
-            digest.to_string(),
+            hashing_reader
+                .into_hasher()
+                .digest(Algorithm::Sha256)
+                .unwrap()
+                .to_string(),
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
@@ -203,7 +199,7 @@ mod tests {
     async fn test_inner_data_passed_through_unmodified() {
         let payload = b"hello world";
         let reader = Cursor::new(payload);
-        let mut hashing_reader = HashingReader::with_hasher(reader, Sha256::new());
+        let mut hashing_reader = HashingReader::new(reader, Hasher::new());
 
         let mut buf = Vec::new();
         hashing_reader.read_to_end(&mut buf).await.unwrap();
