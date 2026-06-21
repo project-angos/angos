@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `[global.job_queue]` using the in-process `memory` lock strategy is now rejected at startup (breaking): set the metadata store's `lock_strategy` to `s3` or `redis`, or remove `[global.job_queue]` to use the in-process queue.
 - A blob-upload `POST` with a malformed `?digest=`, `?mount=`, or `?from=` now returns `400` instead of silently starting an upload session that ignores the value.
 - The `_catalog` listing is derived directly from stored content (deterministic and strongly consistent); the maintained namespace-registry index is removed and its now-unused `_registry/` objects are pruned by `scrub`.
+- Tags, repository names, upload session IDs, and manifest/descriptor media types are now strictly validated against their OCI grammars, so a request carrying a malformed value is rejected with `400` where an earlier version might have accepted it.
 
 ### Fixed
 
