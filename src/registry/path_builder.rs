@@ -104,6 +104,20 @@ pub fn manifest_revisions_link_root_dir(namespace: &Namespace, algorithm: &str) 
     format!("{REPOS_ROOT}/{namespace}/_manifests/revisions/{algorithm}")
 }
 
+/// Root directory of a namespace's layer links for one algorithm
+/// (`_layers/<algorithm>/<hash>/link`); its children are the layer hashes. Used
+/// to enumerate every layer link.
+pub fn layers_link_root_dir(namespace: &Namespace, algorithm: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_layers/{algorithm}")
+}
+
+/// Root directory of a namespace's config links for one algorithm
+/// (`_config/<algorithm>/<hash>/link`); its children are the config hashes. Used
+/// to enumerate every config link.
+pub fn config_link_root_dir(namespace: &Namespace, algorithm: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_config/{algorithm}")
+}
+
 pub fn manifest_tags_dir(namespace: &Namespace) -> String {
     format!("{REPOS_ROOT}/{namespace}/_manifests/tags")
 }

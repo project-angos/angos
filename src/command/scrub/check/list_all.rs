@@ -26,6 +26,30 @@ pub fn revisions<'a>(
     }))
 }
 
+pub fn layer_links<'a>(
+    metadata_store: &'a Arc<MetadataStore>,
+    namespace: &'a Namespace,
+) -> ResultStream<'a, Digest> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_layer_links(namespace, PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
+pub fn config_links<'a>(
+    metadata_store: &'a Arc<MetadataStore>,
+    namespace: &'a Namespace,
+) -> ResultStream<'a, Digest> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_config_links(namespace, PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
 pub fn tags<'a>(
     metadata_store: &'a Arc<MetadataStore>,
     namespace: &'a Namespace,
