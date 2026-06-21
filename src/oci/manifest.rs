@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::oci::{Descriptor, Digest, Error};
+use crate::oci::{Descriptor, Digest, Error, MediaType};
 
 /// OCI image-spec manifest `schemaVersion` (only version 2 is supported).
 pub const OCI_MANIFEST_SCHEMA_VERSION: i32 = 2;
@@ -11,7 +11,7 @@ pub const OCI_MANIFEST_SCHEMA_VERSION: i32 = 2;
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
     pub schema_version: i32,
-    pub media_type: Option<String>,
+    pub media_type: Option<MediaType>,
     #[serde(default)]
     pub config: Option<Descriptor>,
     #[serde(default)]
@@ -23,7 +23,7 @@ pub struct Manifest {
     #[serde(default)]
     pub annotations: HashMap<String, String>,
     #[serde(default)]
-    pub artifact_type: Option<String>,
+    pub artifact_type: Option<MediaType>,
 }
 
 impl Manifest {
@@ -96,16 +96,21 @@ mod tests {
     const VALID_HASH: &str = "99c9d5e2bdc7ef0223f56c845a695ea0f8f11f5b55ea6f74e1f7df0d4f90026c";
     const MEDIA_TYPE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
     const MEDIA_TYPE_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
+    const ARTIFACT_TYPE_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 
     fn valid_digest() -> Digest {
         Digest::sha256(VALID_HASH).unwrap()
     }
 
+    fn media_type(value: &str) -> MediaType {
+        MediaType::new(value).unwrap()
+    }
+
     fn demo_manifest() -> Manifest {
         Manifest {
-            media_type: Some(MEDIA_TYPE_MANIFEST.to_string()),
+            media_type: Some(media_type(MEDIA_TYPE_MANIFEST)),
             config: Some(Descriptor {
-                media_type: MEDIA_TYPE_CONFIG.to_string(),
+                media_type: media_type(MEDIA_TYPE_CONFIG),
                 digest: valid_digest(),
                 size: 1234,
                 annotations: HashMap::new(),
@@ -113,14 +118,14 @@ mod tests {
                 platform: None,
             }),
             layers: vec![Descriptor {
-                media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+                media_type: media_type("application/vnd.oci.image.layer.v1.tar"),
                 digest: valid_digest(),
                 size: 5678,
                 annotations: HashMap::new(),
                 artifact_type: None,
                 platform: None,
             }],
-            artifact_type: Some("oci.image.index.v1".to_string()),
+            artifact_type: Some(media_type(ARTIFACT_TYPE_INDEX)),
             ..Manifest::default()
         }
     }
@@ -128,7 +133,7 @@ mod tests {
     #[test]
     fn test_has_artifact_type_top_level_field() {
         let manifest = demo_manifest();
-        assert!(manifest.has_artifact_type("oci.image.index.v1"));
+        assert!(manifest.has_artifact_type(ARTIFACT_TYPE_INDEX));
     }
 
     #[test]
@@ -159,7 +164,7 @@ mod tests {
         assert_eq!(d.media_type, MEDIA_TYPE_MANIFEST);
         assert_eq!(d.digest, digest);
         assert_eq!(d.size, 999);
-        assert_eq!(d.artifact_type.as_deref(), Some("oci.image.index.v1"));
+        assert_eq!(d.artifact_type.as_deref(), Some(ARTIFACT_TYPE_INDEX));
     }
 
     // take_descriptor: an image manifest without its own artifactType advertises
@@ -197,7 +202,7 @@ mod tests {
     #[test]
     fn test_artifact_type_matches_filter_matches_artifact_type() {
         let manifest = demo_manifest();
-        let filter = "oci.image.index.v1".to_string();
+        let filter = ARTIFACT_TYPE_INDEX.to_string();
         assert!(manifest.artifact_type_matches(Some(&filter)));
     }
 

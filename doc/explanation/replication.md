@@ -48,6 +48,10 @@ The push pipeline is recursive:
 - For an image index (`application/vnd.oci.image.index.v1+json` or a Docker manifest list), the pipeline recurses into **child manifests first**. The parent index is pushed only after every child is present on the downstream.
 - When a manifest carries a `subject` (an OCI 1.1 referrer), the pipeline pushes the referrer. Against an OCI 1.0 downstream that does not index referrers automatically, it falls back to pushing the referrers-fallback tag manifest, and a later delete of that referrer drops its descriptor from the fallback index (removing the tag once empty).
 
+### Digest algorithms
+
+A push transfers content under the digest algorithm of the local copy (sha256 or sha512), so each downstream must accept that algorithm. A downstream that rejects it (for example a sha256-only registry receiving a sha512 digest) fails the push. The job then retries and dead-letters like any other persistent rejection, so the divergence stays visible to operators rather than being silently dropped. Keep replicating peers on builds with matching algorithm support, or replicate only content addressed with the common algorithm.
+
 ## The Durable Job Queue Substrate
 
 Replication does not maintain its own outbox. It rides the same **durable job queue** that backs pull-through cache-fill work (see [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md)). Each mutation enqueues a small `JobEnvelope` onto a single `replication` queue. The queue gives replication:

@@ -16,7 +16,7 @@ use angos_tx_engine::{
 };
 
 use crate::{
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::{
         metadata_store::{BlobIndex, BlobIndexOperation, Error, LinkKind},
         path_builder,
@@ -36,7 +36,7 @@ pub fn decode_blob_index_shard_namespace(file_name: &str) -> String {
 }
 
 pub fn collect_blob_index_shards(
-    shards: impl IntoIterator<Item = (String, HashSet<LinkKind>)>,
+    shards: impl IntoIterator<Item = (Namespace, HashSet<LinkKind>)>,
 ) -> BlobIndex {
     let mut index = BlobIndex::default();
     for (namespace, links) in shards {
@@ -73,7 +73,7 @@ pub fn non_empty_links_or_not_found(links: HashSet<LinkKind>) -> Result<HashSet<
 
 pub fn namespace_links_from_index(
     index: &BlobIndex,
-    namespace: &str,
+    namespace: &Namespace,
 ) -> Result<HashSet<LinkKind>, Error> {
     index
         .namespace
@@ -92,7 +92,7 @@ pub fn namespace_links_from_index(
 /// the per-namespace shard is used.
 pub async fn append_shard_for_digest(
     store: &Store,
-    namespace: &str,
+    namespace: &Namespace,
     digest: &Digest,
     ops: &[BlobIndexOperation],
     mut builder: TransactionBuilder,
@@ -108,7 +108,7 @@ pub async fn append_shard_for_digest(
                     let raw = Bytes::from(data.clone());
                     let mut legacy: BlobIndex = serde_json::from_slice(&data).unwrap_or_default();
                     {
-                        let entry = legacy.namespace.entry(namespace.to_string()).or_default();
+                        let entry = legacy.namespace.entry(namespace.clone()).or_default();
                         apply_blob_index_operations(entry, ops);
                         if entry.is_empty() {
                             legacy.namespace.remove(namespace);
@@ -187,7 +187,7 @@ pub(crate) fn ops_for_digest<'a>(
 /// Check whether the shard for `namespace` will be empty after applying `ops`.
 pub(crate) async fn shard_will_be_empty(
     store: &Store,
-    namespace: &str,
+    namespace: &Namespace,
     ops: &[BlobIndexOperation],
     shard_path: &str,
     legacy_path: &str,
@@ -222,7 +222,7 @@ pub(crate) async fn shard_will_be_empty(
 /// shard entry in the refs directory.
 pub(crate) async fn any_other_namespace_references_blob(
     store: &Store,
-    our_namespace: &str,
+    our_namespace: &Namespace,
     refs_prefix: &str,
 ) -> Result<bool, Error> {
     let mut continuation = None;
@@ -233,7 +233,7 @@ pub(crate) async fn any_other_namespace_references_blob(
             .map_err(Error::from)?;
         for key in &page.items {
             let ns = decode_blob_index_shard_namespace(key);
-            if ns != our_namespace {
+            if ns != our_namespace.as_ref() {
                 return Ok(true);
             }
         }

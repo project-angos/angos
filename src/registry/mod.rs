@@ -37,6 +37,7 @@ pub use upload::{BlobMount, StartUploadResponse};
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
 pub const OCI_SUBJECT: &str = "OCI-Subject";
+pub const OCI_TAG: &str = "OCI-Tag";
 pub const APPLICATION_JSON: &str = "application/json";
 
 /// Response for endpoints whose body is a JSON (or JSON-flavoured) payload.
@@ -428,7 +429,7 @@ mod in_process_replication_tests {
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
     use crate::{
-        oci::Namespace,
+        oci::{Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
@@ -499,9 +500,10 @@ mod in_process_replication_tests {
         let root = dir.path().to_str().unwrap();
         let client = downstream_client(&mock_server.uri());
         let (registry, blob_store, metadata_store) = build_registry(root, client);
+        let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (manifest_digest, config_digest, layer_digest) =
-            seed_manifest(&blob_store.store, &metadata_store, NAMESPACE).await;
+            seed_manifest(&blob_store.store, &metadata_store, &namespace).await;
 
         // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
         for blob in [&config_digest, &layer_digest] {
@@ -543,16 +545,15 @@ mod in_process_replication_tests {
             .mount(&mock_server)
             .await;
 
-        let namespace = Namespace::new(NAMESPACE).unwrap();
-
         // Enqueue via the production event path.
         let repository = registry.resolver.resolve(&namespace);
+        let tag = Tag::new("v1").unwrap();
         registry
             .dispatch_replication(
                 repository,
                 &namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
+                Some(&tag),
                 Some(&manifest_digest),
                 None,
             )

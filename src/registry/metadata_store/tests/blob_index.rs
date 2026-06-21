@@ -7,7 +7,7 @@ use angos_tx_engine::{
 
 use super::test_config;
 use crate::{
-    oci::Digest,
+    oci::{Digest, Namespace, Tag},
     registry::metadata_store::{BlobIndexOperation, Error, LinkKind, LinkOperation},
 };
 
@@ -15,7 +15,7 @@ use crate::{
 async fn test_blob_index_updates_multiple_digests() {
     let config = test_config();
     let backend = config.to_backend(None, None).unwrap();
-    let namespace = "blob-index-multi-digest-test";
+    let namespace = Namespace::new("blob-index-multi-digest-test").unwrap();
 
     let digests: Vec<Digest> = (0..5)
         .map(|i| {
@@ -30,7 +30,7 @@ async fn test_blob_index_updates_multiple_digests() {
         .iter()
         .enumerate()
         .map(|(i, digest)| LinkOperation::Create {
-            link: LinkKind::Tag(format!("tag-bim-{i}")),
+            link: LinkKind::Tag(Tag::try_from(format!("tag-bim-{i}")).unwrap()),
             target: digest.clone(),
             referrer: None,
             media_type: None,
@@ -38,12 +38,12 @@ async fn test_blob_index_updates_multiple_digests() {
         })
         .collect();
 
-    backend.update_links(namespace, &ops).await.unwrap();
+    backend.update_links(&namespace, &ops).await.unwrap();
 
     for (i, digest) in digests.iter().enumerate() {
         let blob_index = backend.read_blob_index(digest).await.unwrap();
-        let ns_links = blob_index.namespace.get(namespace).unwrap();
-        let expected_link = LinkKind::Tag(format!("tag-bim-{i}"));
+        let ns_links = blob_index.namespace.get(&namespace).unwrap();
+        let expected_link = LinkKind::Tag(Tag::try_from(format!("tag-bim-{i}")).unwrap());
         assert!(
             ns_links.contains(&expected_link),
             "Blob index for digest {digest} should contain {expected_link}"
@@ -55,7 +55,7 @@ async fn test_blob_index_updates_multiple_digests() {
 async fn test_tracked_link_creates_with_referrers() {
     let config = test_config();
     let backend = config.to_backend(None, None).unwrap();
-    let namespace = "tracked-creates-referrer-test";
+    let namespace = Namespace::new("tracked-creates-referrer-test").unwrap();
 
     let referrer_digest =
         Digest::from_str("sha256:aa00000000000000000000000000000000000000000000000000000000000001")
@@ -93,11 +93,14 @@ async fn test_tracked_link_creates_with_referrers() {
         descriptor: None,
     });
 
-    backend.update_links(namespace, &ops).await.unwrap();
+    backend.update_links(&namespace, &ops).await.unwrap();
 
     for layer_digest in &layer_digests {
         let link = LinkKind::Layer(layer_digest.clone());
-        let meta = backend.read_link_reference(namespace, &link).await.unwrap();
+        let meta = backend
+            .read_link_reference(&namespace, &link)
+            .await
+            .unwrap();
         assert_eq!(meta.target, *layer_digest);
         assert!(
             meta.referenced_by.contains(&referrer_digest),
@@ -107,7 +110,7 @@ async fn test_tracked_link_creates_with_referrers() {
 
     let config_link = LinkKind::Config(config_digest.clone());
     let meta = backend
-        .read_link_reference(namespace, &config_link)
+        .read_link_reference(&namespace, &config_link)
         .await
         .unwrap();
     assert_eq!(meta.target, config_digest);
@@ -121,7 +124,7 @@ async fn test_tracked_link_creates_with_referrers() {
 async fn test_tracked_link_deletes_with_referrers() {
     let config = test_config();
     let backend = config.to_backend(None, None).unwrap();
-    let namespace = "tracked-deletes-referrer-test";
+    let namespace = Namespace::new("tracked-deletes-referrer-test").unwrap();
 
     let referrer_digest =
         Digest::from_str("sha256:cc00000000000000000000000000000000000000000000000000000000000001")
@@ -146,11 +149,14 @@ async fn test_tracked_link_deletes_with_referrers() {
             descriptor: None,
         })
         .collect();
-    backend.update_links(namespace, &create_ops).await.unwrap();
+    backend.update_links(&namespace, &create_ops).await.unwrap();
 
     for d in &layer_digests {
         let link = LinkKind::Layer(d.clone());
-        let meta = backend.read_link_reference(namespace, &link).await.unwrap();
+        let meta = backend
+            .read_link_reference(&namespace, &link)
+            .await
+            .unwrap();
         assert_eq!(meta.target, *d);
     }
 
@@ -161,11 +167,11 @@ async fn test_tracked_link_deletes_with_referrers() {
             referrer: Some(referrer_digest.clone()),
         })
         .collect();
-    backend.update_links(namespace, &delete_ops).await.unwrap();
+    backend.update_links(&namespace, &delete_ops).await.unwrap();
 
     for d in &layer_digests {
         let link = LinkKind::Layer(d.clone());
-        let result = backend.read_link_reference(namespace, &link).await;
+        let result = backend.read_link_reference(&namespace, &link).await;
         assert!(
             matches!(result, Err(Error::ReferenceNotFound)),
             "Tracked link {link} should be deleted"
@@ -183,7 +189,7 @@ async fn test_tracked_link_deletes_with_referrers() {
 async fn test_mixed_creates_and_deletes_across_digests() {
     let config = test_config();
     let backend = config.to_backend(None, None).unwrap();
-    let namespace = "mixed-ops-across-digests-test";
+    let namespace = Namespace::new("mixed-ops-across-digests-test").unwrap();
 
     let digest_keep =
         Digest::from_str("sha256:dd00000000000000000000000000000000000000000000000000000000000001")
@@ -197,46 +203,49 @@ async fn test_mixed_creates_and_deletes_across_digests() {
 
     let setup_ops = vec![
         LinkOperation::Create {
-            link: LinkKind::Tag("keep-tag".into()),
+            link: LinkKind::Tag(Tag::new("keep-tag").unwrap()),
             target: digest_keep.clone(),
             referrer: None,
             media_type: None,
             descriptor: None,
         },
         LinkOperation::Create {
-            link: LinkKind::Tag("remove-tag".into()),
+            link: LinkKind::Tag(Tag::new("remove-tag").unwrap()),
             target: digest_remove.clone(),
             referrer: None,
             media_type: None,
             descriptor: None,
         },
     ];
-    backend.update_links(namespace, &setup_ops).await.unwrap();
+    backend.update_links(&namespace, &setup_ops).await.unwrap();
 
     let mixed_ops = vec![
         LinkOperation::Delete {
-            link: LinkKind::Tag("remove-tag".into()),
+            link: LinkKind::Tag(Tag::new("remove-tag").unwrap()),
             referrer: None,
         },
         LinkOperation::Create {
-            link: LinkKind::Tag("new-tag".into()),
+            link: LinkKind::Tag(Tag::new("new-tag").unwrap()),
             target: digest_add.clone(),
             referrer: None,
             media_type: None,
             descriptor: None,
         },
     ];
-    backend.update_links(namespace, &mixed_ops).await.unwrap();
+    backend.update_links(&namespace, &mixed_ops).await.unwrap();
 
     let keep_index = backend.read_blob_index(&digest_keep).await.unwrap();
-    let keep_links = keep_index.namespace.get(namespace).unwrap();
-    assert!(keep_links.contains(&LinkKind::Tag("keep-tag".into())));
+    let keep_links = keep_index.namespace.get(&namespace).unwrap();
+    assert!(keep_links.contains(&LinkKind::Tag(Tag::new("keep-tag").unwrap())));
 
     match backend.read_blob_index(&digest_remove).await {
         Ok(idx) => {
-            let links = idx.namespace.get(namespace);
+            let links = idx.namespace.get(&namespace);
             assert!(
-                links.is_none() || !links.unwrap().contains(&LinkKind::Tag("remove-tag".into())),
+                links.is_none()
+                    || !links
+                        .unwrap()
+                        .contains(&LinkKind::Tag(Tag::new("remove-tag").unwrap())),
                 "remove-tag should not be in blob index after delete"
             );
         }
@@ -245,16 +254,16 @@ async fn test_mixed_creates_and_deletes_across_digests() {
     }
 
     let add_index = backend.read_blob_index(&digest_add).await.unwrap();
-    let add_links = add_index.namespace.get(namespace).unwrap();
-    assert!(add_links.contains(&LinkKind::Tag("new-tag".into())));
+    let add_links = add_index.namespace.get(&namespace).unwrap();
+    assert!(add_links.contains(&LinkKind::Tag(Tag::new("new-tag").unwrap())));
 
     let result = backend
-        .read_link_reference(namespace, &LinkKind::Tag("remove-tag".into()))
+        .read_link_reference(&namespace, &LinkKind::Tag(Tag::new("remove-tag").unwrap()))
         .await;
     assert!(matches!(result, Err(Error::ReferenceNotFound)));
 
     let new_meta = backend
-        .read_link_reference(namespace, &LinkKind::Tag("new-tag".into()))
+        .read_link_reference(&namespace, &LinkKind::Tag(Tag::new("new-tag").unwrap()))
         .await
         .unwrap();
     assert_eq!(new_meta.target, digest_add);
@@ -282,17 +291,18 @@ async fn test_has_blob_references_ignores_empty_cas_shards() {
         Digest::from_str("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
             .unwrap();
     let link = LinkKind::Blob(digest.clone());
+    let namespace = Namespace::new("empty-cas-shard").unwrap();
 
     backend
         .update_blob_index(
-            "empty-cas-shard",
+            &namespace,
             &digest,
             BlobIndexOperation::Insert(link.clone()),
         )
         .await
         .unwrap();
     backend
-        .update_blob_index("empty-cas-shard", &digest, BlobIndexOperation::Remove(link))
+        .update_blob_index(&namespace, &digest, BlobIndexOperation::Remove(link))
         .await
         .unwrap();
 

@@ -78,11 +78,12 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--dry-run`               | `-d`   | Preview what would be removed without making changes                                               |
 | `--uploads <duration>`    | `-u`   | Check upload sessions: remove broken or partial state and uploads older than the given duration (e.g., `1h`, `30m`, `2d`) |
 | `--multipart <duration>`  | `-p`   | Cleanup orphan S3 multipart uploads older than duration (S3 only)                                  |
-| `--tags`                  | `-t`   | Check and fix tag references; remove tags whose target manifest blob is missing                    |
+| `--tags`                  | `-t`   | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
 | `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |
 | `--blobs`                 | `-b`   | Check for blob inconsistencies, corruption, and stale blob-index entries                           |
 | `--retention`             | `-r`   | Enforce retention policies                                                                         |
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
+| `--reconcile-blob-index`  |        | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band (storage corruption, manual tampering). Reads every manifest, so it is expensive |
 | `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 | `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams. By default reconciliation is additive: it enqueues a replication push for each diverging or downstream-missing tag and never deletes. A downstream marked `prune = true` is treated as an authoritative one-way mirror: reconciliation also enqueues a replication delete for each downstream-only tag, so prune is one-way-only by design and unsafe for active-active peers (even with receiver-side last-writer-wins it can remove a peer's newer tag). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |

@@ -9,7 +9,7 @@ use wiremock::{
 
 use crate::{
     cache,
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     },
@@ -54,7 +54,7 @@ fn test_get_manifest_path() {
 
     let repo_name = "local";
     let namespace = &Namespace::new("local/repo").unwrap();
-    let reference = Reference::Tag("latest".to_string());
+    let reference = Reference::Tag(Tag::new("latest").unwrap());
 
     let path = upstream.get_manifest_path(repo_name, namespace, &reference);
     assert_eq!(path, "https://example.com/v2/repo/manifests/latest");
@@ -369,7 +369,7 @@ async fn test_head_manifest_success() {
     let (media_type, digest, size) = result.unwrap();
     assert_eq!(
         media_type,
-        Some("application/vnd.docker.distribution.manifest.v2+json".to_string())
+        Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap())
     );
     assert_eq!(digest, Digest::try_from(test_digest).unwrap());
     assert_eq!(size, 5678);
@@ -420,7 +420,7 @@ async fn test_get_manifest_success() {
     let (media_type, digest, body) = result.unwrap();
     assert_eq!(
         media_type,
-        Some("application/vnd.docker.distribution.manifest.v2+json".to_string())
+        Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap())
     );
     assert_eq!(digest, Digest::try_from(test_digest).unwrap());
     assert_eq!(body, manifest_body);
@@ -1543,7 +1543,8 @@ async fn test_put_manifest_with_oci_subject() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("latest".to_string()));
+    let location =
+        client.get_manifest_path("", "test", &Reference::Tag(Tag::new("latest").unwrap()));
 
     let result = client
         .put_manifest(&location, Some(media_type), manifest.to_vec(), None)
@@ -1570,7 +1571,7 @@ async fn test_put_manifest_without_oci_subject() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let result = client
         .put_manifest(&location, Some(media_type), manifest.to_vec(), None)
@@ -1601,7 +1602,7 @@ async fn test_put_manifest_stamps_replication_headers() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     client
         .put_manifest(
@@ -1627,7 +1628,7 @@ async fn test_put_manifest_superseded_409() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let result = client
         .put_manifest(&location, Some("application/json"), b"{}".to_vec(), None)
@@ -1649,7 +1650,7 @@ async fn test_put_manifest_non_superseded_409_is_error() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let result = client
         .put_manifest(&location, Some("application/json"), b"{}".to_vec(), None)
@@ -1670,7 +1671,7 @@ async fn test_delete_manifest_superseded_409() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let outcome = client.delete_manifest(&location, None).await.unwrap();
     assert_eq!(outcome, DeleteManifestOutcome::Superseded);
@@ -1710,7 +1711,8 @@ async fn test_delete_manifest_surfaces_error_status() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("latest".to_string()));
+    let location =
+        client.get_manifest_path("", "test", &Reference::Tag(Tag::new("latest").unwrap()));
 
     let result = client.delete_manifest(&location, None).await;
     assert!(matches!(result, Err(Error::Internal(_))));
@@ -1730,7 +1732,7 @@ async fn test_delete_manifest_absent_404_is_already_absent() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("gone".to_string()));
+    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("gone").unwrap()));
 
     let outcome = client.delete_manifest(&location, None).await.unwrap();
     assert_eq!(outcome, DeleteManifestOutcome::AlreadyAbsent);
@@ -1750,7 +1752,7 @@ async fn test_delete_manifest_405_is_unsupported() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let outcome = client.delete_manifest(&location, None).await.unwrap();
     assert_eq!(outcome, DeleteManifestOutcome::Unsupported);
@@ -1890,7 +1892,14 @@ async fn test_list_tags_single_page() {
     let location = client.get_tags_list_path("", "test");
 
     let tags = client.list_tags(&location).await.unwrap();
-    assert_eq!(tags, vec!["v1", "v2", "v3"]);
+    assert_eq!(
+        tags,
+        vec![
+            Tag::new("v1").unwrap(),
+            Tag::new("v2").unwrap(),
+            Tag::new("v3").unwrap(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1925,7 +1934,7 @@ async fn test_list_tags_follows_pagination() {
     let tags = client.list_tags(&location).await.unwrap();
     assert_eq!(
         tags,
-        vec!["a", "b"],
+        vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()],
         "tags from both pages must be returned"
     );
     drop(mock_server);
@@ -1972,5 +1981,13 @@ async fn list_tags_breaks_on_cyclic_next_link() {
 
     // expect(2): the base page and one `?last=z` page are fetched before the
     // repeated `?last=z` breaks the loop.
-    assert_eq!(tags, vec!["a", "b", "a", "b"]);
+    assert_eq!(
+        tags,
+        vec![
+            Tag::new("a").unwrap(),
+            Tag::new("b").unwrap(),
+            Tag::new("a").unwrap(),
+            Tag::new("b").unwrap(),
+        ]
+    );
 }

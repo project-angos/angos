@@ -1,12 +1,11 @@
 use std::io::Cursor;
 
 use chrono::{Duration, Utc};
-use sha2::{Digest as Sha2Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::*;
-use crate::{oci::Namespace, registry::blob_store::sha256_ext::Sha256Ext};
+use crate::oci::{Algorithm, Digest, Namespace};
 
 pub async fn test_datastore_list_uploads(store: &BlobStore) {
     let namespace = &Namespace::new("test-repo").unwrap();
@@ -18,7 +17,13 @@ pub async fn test_datastore_list_uploads(store: &BlobStore) {
         let content = format!("Content for upload {id}").into_bytes();
         let len = content.len() as u64;
         store
-            .write_upload(namespace, id, Box::new(Cursor::new(content)), Some(len))
+            .write_upload(
+                namespace,
+                id,
+                Box::new(Cursor::new(content)),
+                Some(len),
+                Algorithm::Sha256,
+            )
             .await
             .unwrap();
     }
@@ -50,8 +55,10 @@ pub async fn test_datastore_list_uploads(store: &BlobStore) {
     assert!(token3.is_none());
 
     let upload_to_complete = upload_ids[0];
+    let completed_digest =
+        Digest::sha256_of_bytes(format!("Content for upload {upload_to_complete}").as_bytes());
     store
-        .complete_upload(namespace, upload_to_complete, None)
+        .complete_upload(namespace, upload_to_complete, &completed_digest)
         .await
         .unwrap();
 
@@ -60,30 +67,50 @@ pub async fn test_datastore_list_uploads(store: &BlobStore) {
     assert!(!uploads_after_complete.contains(&upload_to_complete.to_string()));
 }
 
-/// Seed the backend with `content` at the canonical blob path by driving
-/// the upload workflow (`create_upload` → `write_upload` → `complete_upload`).
-/// Mirrors how production creates blobs.
-async fn seed_blob(store: &BlobStore, content: &[u8]) -> Digest {
+/// Seed the backend with `content` at the canonical blob path for `algorithm`
+/// by driving the upload workflow (`create_upload` → `write_upload` →
+/// `complete_upload`). Mirrors how production creates blobs.
+async fn seed_blob_with(store: &BlobStore, content: &[u8], algorithm: Algorithm) -> Digest {
     let namespace = Namespace::new("test/setup").unwrap();
     let uuid = Uuid::new_v4().to_string();
-    store
-        .create_upload(namespace.as_ref(), &uuid)
-        .await
-        .unwrap();
+    store.create_upload(&namespace, &uuid).await.unwrap();
     let len = content.len() as u64;
     store
         .write_upload(
-            namespace.as_ref(),
+            &namespace,
             &uuid,
             Box::new(Cursor::new(content.to_vec())),
             Some(len),
+            algorithm,
         )
         .await
         .unwrap();
+    let expected = Digest::from_bytes(algorithm, content);
     store
-        .complete_upload(namespace.as_ref(), &uuid, None)
+        .complete_upload(&namespace, &uuid, &expected)
         .await
         .unwrap()
+}
+
+async fn seed_blob(store: &BlobStore, content: &[u8]) -> Digest {
+    seed_blob_with(store, content, Algorithm::Sha256).await
+}
+
+/// Drain `list_blobs` one page at a time until the token is `None`, collecting
+/// every blob surfaced.
+async fn drain_blobs(store: &BlobStore, page_size: u16) -> Vec<Digest> {
+    let mut walked = Vec::new();
+    let mut marker = None;
+    loop {
+        let (page, next) = store.list_blobs(page_size, marker).await.unwrap();
+        assert!(page.len() <= usize::from(page_size));
+        walked.extend(page);
+        match next {
+            Some(next_marker) => marker = Some(next_marker),
+            None => break,
+        }
+    }
+    walked
 }
 
 pub async fn test_datastore_list_blobs(store: &BlobStore) {
@@ -95,35 +122,45 @@ pub async fn test_datastore_list_blobs(store: &BlobStore) {
 
     let mut digests = Vec::new();
     for content in &blob_contents {
-        let digest = seed_blob(store, content).await;
-        digests.push(digest);
+        digests.push(seed_blob(store, content).await);
     }
 
-    let (blobs, _token) = store.list_blobs(10, None).await.unwrap();
-    assert!(blobs.len() >= blob_contents.len());
+    // A single large page returns every blob with no continuation.
+    let (blobs, token) = store.list_blobs(10, None).await.unwrap();
+    assert!(token.is_none());
+    assert!(blobs.len() >= digests.len());
     for digest in &digests {
         assert!(blobs.contains(digest));
     }
 
-    let (page1, token1) = store.list_blobs(2, None).await.unwrap();
-    assert_eq!(page1.len(), 2);
-    assert!(token1.is_some());
+    // Draining one or two at a time surfaces every blob exactly once.
+    for page_size in [1, 2] {
+        let walked = drain_blobs(store, page_size).await;
+        assert_eq!(walked.len(), digests.len());
+        for digest in &digests {
+            assert!(
+                walked.contains(digest),
+                "page_size {page_size} missed {digest}"
+            );
+        }
+    }
+}
 
-    let (page2, token2) = store.list_blobs(2, token1).await.unwrap();
-    assert_eq!(page2.len(), 1);
-    assert!(token2.is_none());
+pub async fn test_datastore_list_blobs_across_algorithms(store: &BlobStore) {
+    // Blobs of both algorithms live under separate prefixes; the listing must
+    // walk across the boundary and surface each exactly once.
+    let mut expected = Vec::new();
+    for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
+        for content in [b"alpha".as_slice(), b"beta".as_slice()] {
+            expected.push(seed_blob_with(store, content, algorithm).await);
+        }
+    }
 
-    let (page1, token1) = store.list_blobs(1, None).await.unwrap();
-    assert_eq!(page1.len(), 1);
-    assert!(token1.is_some());
-
-    let (page2, token2) = store.list_blobs(1, token1).await.unwrap();
-    assert_eq!(page2.len(), 1);
-    assert!(token2.is_some());
-
-    let (page3, token3) = store.list_blobs(1, token2).await.unwrap();
-    assert_eq!(page3.len(), 1);
-    assert!(token3.is_none());
+    let walked = drain_blobs(store, 1).await;
+    assert_eq!(walked.len(), expected.len());
+    for digest in &expected {
+        assert!(walked.contains(digest), "missed {digest}");
+    }
 }
 
 pub async fn test_datastore_blob_operations(store: &BlobStore) {
@@ -177,9 +214,7 @@ pub async fn test_datastore_upload_operations(store: &BlobStore) {
 
     let test_content = b"Test upload content";
 
-    let mut hasher = Sha256::new();
-    hasher.update(test_content);
-    let expected_digest = hasher.digest();
+    let expected_digest = Digest::sha256_of_bytes(test_content);
 
     store
         .write_upload(
@@ -187,6 +222,7 @@ pub async fn test_datastore_upload_operations(store: &BlobStore) {
             &uuid,
             Box::new(Cursor::new(test_content.to_vec())),
             Some(test_content.len() as u64),
+            Algorithm::Sha256,
         )
         .await
         .unwrap();
@@ -195,7 +231,10 @@ pub async fn test_datastore_upload_operations(store: &BlobStore) {
     assert_eq!(summary.size, test_content.len() as u64);
     assert!(Utc::now().signed_duration_since(summary.started_at) < Duration::hours(1));
 
-    let final_digest = store.complete_upload(namespace, &uuid, None).await.unwrap();
+    let final_digest = store
+        .complete_upload(namespace, &uuid, &expected_digest)
+        .await
+        .unwrap();
     assert_eq!(final_digest, expected_digest);
 
     let blob_content = store.read(&final_digest).await.unwrap();
@@ -221,6 +260,14 @@ async fn list_uploads() {
 async fn list_blobs() {
     for tc in backends() {
         test_datastore_list_blobs(tc.blob_store().as_ref()).await;
+        tc.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn list_blobs_across_algorithms() {
+    for tc in backends() {
+        test_datastore_list_blobs_across_algorithms(tc.blob_store().as_ref()).await;
         tc.cleanup().await;
     }
 }

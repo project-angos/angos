@@ -1,17 +1,17 @@
 use tracing::warn;
 
 use crate::{
-    oci::{Digest, Manifest},
+    oci::{Digest, Manifest, MediaType},
     registry::{Error, manifest::response::ManifestMeta, metadata_store::LinkKind},
 };
 
 pub struct ParsedManifestDigests {
     /// The manifest body's declared `mediaType`, surfaced from the single parse
     /// so callers need not re-parse the body just to read it.
-    pub media_type: Option<String>,
+    pub media_type: Option<MediaType>,
     /// The manifest body's declared `artifactType`, surfaced from the same parse
     /// so a referrer descriptor can be built without re-parsing the body.
-    pub artifact_type: Option<String>,
+    pub artifact_type: Option<MediaType>,
     pub subject: Option<Digest>,
     pub config: Option<Digest>,
     pub layers: Vec<Digest>,
@@ -54,7 +54,7 @@ impl ParsedManifestDigests {
 
 fn validate_media_type_match(
     manifest: &Manifest,
-    content_type: Option<&String>,
+    content_type: Option<&MediaType>,
 ) -> Result<(), Error> {
     if content_type.is_some()
         && manifest.media_type.is_some()
@@ -89,7 +89,7 @@ pub fn manifest_meta_from_body(target: &Digest, bytes: &[u8]) -> Result<Manifest
 /// (full-manifest writer) share one error payload.
 pub fn parse_and_validate_manifest(
     body: &[u8],
-    content_type: Option<&String>,
+    content_type: Option<&MediaType>,
 ) -> Result<Manifest, Error> {
     let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
         warn!("Failed to deserialize manifest: {e}");
@@ -101,7 +101,7 @@ pub fn parse_and_validate_manifest(
 
 pub fn parse_manifest_digests(
     body: &[u8],
-    content_type: Option<&String>,
+    content_type: Option<&MediaType>,
 ) -> Result<ParsedManifestDigests, Error> {
     let manifest = parse_and_validate_manifest(body, content_type)?;
 

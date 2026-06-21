@@ -4,8 +4,8 @@ use futures_util::stream::{self, Stream, TryStreamExt};
 
 use crate::{
     command::scrub::error::Error,
-    oci::Digest,
-    registry::{blob_store, metadata_store::MetadataStore},
+    oci::{Digest, Namespace, Tag},
+    registry::{blob_store::BlobStore, metadata_store::MetadataStore},
 };
 
 const PAGE_SIZE: u16 = 100;
@@ -16,7 +16,7 @@ pub type ResultStream<'a, T> = Pin<Box<dyn Stream<Item = Result<T, Error>> + Sen
 
 pub fn revisions<'a>(
     metadata_store: &'a Arc<MetadataStore>,
-    namespace: &'a str,
+    namespace: &'a Namespace,
 ) -> ResultStream<'a, Digest> {
     Box::pin(paginated(move |marker| async move {
         metadata_store
@@ -28,8 +28,8 @@ pub fn revisions<'a>(
 
 pub fn tags<'a>(
     metadata_store: &'a Arc<MetadataStore>,
-    namespace: &'a str,
-) -> ResultStream<'a, String> {
+    namespace: &'a Namespace,
+) -> ResultStream<'a, Tag> {
     Box::pin(paginated(move |marker| async move {
         metadata_store
             .list_tags(namespace, PAGE_SIZE, marker)
@@ -38,9 +38,21 @@ pub fn tags<'a>(
     }))
 }
 
+pub fn unparsed_tags<'a>(
+    metadata_store: &'a Arc<MetadataStore>,
+    namespace: &'a Namespace,
+) -> ResultStream<'a, String> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_tag_names(namespace, PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
 pub fn uploads<'a>(
-    blob_store: &'a Arc<blob_store::BlobStore>,
-    namespace: &'a str,
+    blob_store: &'a Arc<BlobStore>,
+    namespace: &'a Namespace,
 ) -> ResultStream<'a, String> {
     Box::pin(paginated(move |marker| async move {
         blob_store
@@ -50,7 +62,7 @@ pub fn uploads<'a>(
     }))
 }
 
-pub fn blobs(blob_store: &Arc<blob_store::BlobStore>) -> ResultStream<'_, Digest> {
+pub fn blobs(blob_store: &Arc<BlobStore>) -> ResultStream<'_, Digest> {
     Box::pin(paginated(move |marker| async move {
         blob_store
             .list_blobs(PAGE_SIZE, marker)

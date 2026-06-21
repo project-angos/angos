@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    oci::{Descriptor, Digest},
+    oci::{Descriptor, Digest, MediaType},
     registry::metadata_store::Error,
 };
 
@@ -16,7 +16,7 @@ pub struct LinkMetadata {
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub referenced_by: HashSet<Digest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media_type: Option<String>,
+    pub media_type: Option<MediaType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptor: Option<Descriptor>,
 }
@@ -105,7 +105,7 @@ impl LinkMetadata {
         })
     }
 
-    pub fn with_media_type(mut self, media_type: Option<String>) -> Self {
+    pub fn with_media_type(mut self, media_type: Option<MediaType>) -> Self {
         self.media_type = media_type;
         self
     }
@@ -138,9 +138,13 @@ mod tests {
         Digest::sha256(OTHER_HASH).unwrap()
     }
 
+    fn media_type(value: &str) -> MediaType {
+        MediaType::new(value).unwrap()
+    }
+
     fn minimal_descriptor() -> Descriptor {
         Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: digest(),
             size: 42,
             annotations: HashMap::new(),
@@ -166,9 +170,9 @@ mod tests {
         let mut meta = LinkMetadata::from_digest(digest());
         meta.add_referrer(other_digest());
         let meta = meta
-            .with_media_type(Some(
-                "application/vnd.oci.image.manifest.v1+json".to_string(),
-            ))
+            .with_media_type(Some(media_type(
+                "application/vnd.oci.image.manifest.v1+json",
+            )))
             .with_descriptor(Some(minimal_descriptor()));
 
         let bytes = serde_json::to_vec(&meta).unwrap();
@@ -278,15 +282,15 @@ mod tests {
 
     #[test]
     fn with_media_type_assigns_field() {
-        let meta =
-            LinkMetadata::from_digest(digest()).with_media_type(Some("application/vnd.foo".into()));
-        assert_eq!(meta.media_type, Some("application/vnd.foo".to_string()));
+        let meta = LinkMetadata::from_digest(digest())
+            .with_media_type(Some(media_type("application/vnd.foo")));
+        assert_eq!(meta.media_type, Some(media_type("application/vnd.foo")));
     }
 
     #[test]
     fn with_media_type_none_clears_field() {
         let meta = LinkMetadata::from_digest(digest())
-            .with_media_type(Some("application/vnd.foo".into()))
+            .with_media_type(Some(media_type("application/vnd.foo")))
             .with_media_type(None);
         assert!(meta.media_type.is_none());
     }

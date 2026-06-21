@@ -34,7 +34,7 @@ where
         && let Some(desc) = metadata.descriptor
     {
         match artifact_type {
-            Some(at) if desc.artifact_type.as_ref() == Some(at) => return Some(desc),
+            Some(at) if desc.artifact_type.as_deref() == Some(at.as_str()) => return Some(desc),
             None => return Some(desc),
             // Cached descriptor has no artifact_type; fall through to manifest
             // read so the filter can be evaluated against the full manifest data.
@@ -76,7 +76,7 @@ mod tests {
     use std::{collections::HashMap, io};
 
     use super::*;
-    use crate::oci::{Descriptor, Manifest};
+    use crate::oci::{Descriptor, Manifest, MediaType};
 
     // Two distinct 64-char lowercase hex strings for use as digest hashes.
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -86,13 +86,17 @@ mod tests {
         Digest::sha256(hex).unwrap()
     }
 
+    fn media_type(value: &str) -> MediaType {
+        MediaType::new(value).unwrap()
+    }
+
     fn descriptor_with(artifact_type: Option<&str>) -> Descriptor {
         Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: digest(HASH_A),
             size: 100,
             annotations: HashMap::new(),
-            artifact_type: artifact_type.map(str::to_owned),
+            artifact_type: artifact_type.map(media_type),
             platform: None,
         }
     }
@@ -100,8 +104,8 @@ mod tests {
     fn manifest_bytes(artifact_type: Option<&str>) -> Vec<u8> {
         let manifest = Manifest {
             schema_version: 2,
-            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
-            artifact_type: artifact_type.map(str::to_owned),
+            media_type: Some(media_type("application/vnd.oci.image.manifest.v1+json")),
+            artifact_type: artifact_type.map(media_type),
             ..Manifest::default()
         };
         serde_json::to_vec(&manifest).expect("serialization must succeed")

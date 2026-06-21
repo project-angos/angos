@@ -11,7 +11,7 @@
 //! or delete for a given manifest, eliminating divergence between them.
 
 use crate::{
-    oci::{Digest, Manifest, Reference},
+    oci::{Digest, Manifest, MediaType, Reference, Tag},
     registry::metadata_store::{LinkKind, LinkOperation},
 };
 
@@ -27,26 +27,39 @@ use crate::{
 /// `effective_media_type` is the caller-resolved
 /// `content_type.or(manifest.media_type)`. `manifest.annotations` is moved
 /// out when a referrer back-link is emitted.
+///
+/// `created_tags` carries the tags requested via `?tag=` query parameters on a
+/// by-digest push; one extra tag link is emitted per entry. The caller must
+/// have validated each value as a well-formed tag.
 pub fn push(
     manifest: &mut Manifest,
     digest: &Digest,
     reference: &Reference,
-    effective_media_type: Option<&str>,
+    effective_media_type: Option<&MediaType>,
     body_len: u64,
+    created_tags: &[Tag],
 ) -> Vec<LinkOperation> {
     let mut ops = Vec::new();
 
     ops.push(LinkOperation::create_with_media_type(
         LinkKind::Digest(digest.clone()),
         digest.clone(),
-        effective_media_type.map(str::to_string),
+        effective_media_type.cloned(),
     ));
 
-    if let Reference::Tag(tag) = reference {
+    if let Some(tag) = reference.as_tag() {
         ops.push(LinkOperation::create_with_media_type(
             LinkKind::Tag(tag.clone()),
             digest.clone(),
-            effective_media_type.map(str::to_string),
+            effective_media_type.cloned(),
+        ));
+    }
+
+    for tag in created_tags {
+        ops.push(LinkOperation::create_with_media_type(
+            LinkKind::Tag(tag.clone()),
+            digest.clone(),
+            effective_media_type.cloned(),
         ));
     }
 
@@ -158,16 +171,20 @@ mod tests {
     use std::{collections::HashMap, str::FromStr};
 
     use super::*;
-    use crate::oci::{Descriptor, Manifest};
+    use crate::oci::{Descriptor, Manifest, MediaType, Tag};
 
     fn d(byte: u8) -> Digest {
         let hex = format!("{byte:02x}").repeat(32);
         Digest::from_str(&format!("sha256:{hex}")).unwrap()
     }
 
+    fn media_type(value: &str) -> MediaType {
+        MediaType::new(value).unwrap()
+    }
+
     fn descriptor(digest: Digest) -> Descriptor {
         Descriptor {
-            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            media_type: media_type("application/vnd.oci.image.layer.v1.tar+gzip"),
             digest,
             size: 0,
             annotations: HashMap::new(),
@@ -190,7 +207,7 @@ mod tests {
 
     fn manifest_with_subject(subject: Digest) -> Manifest {
         Manifest {
-            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            media_type: Some(media_type("application/vnd.oci.image.manifest.v1+json")),
             subject: Some(descriptor(subject)),
             ..Manifest::default()
         }
@@ -209,7 +226,14 @@ mod tests {
     fn push_digest_self_link_always_present() {
         let digest = d(0xaa);
         let mut m = minimal_manifest();
-        let ops = push(&mut m, &digest, &Reference::Digest(digest.clone()), None, 0);
+        let ops = push(
+            &mut m,
+            &digest,
+            &Reference::Digest(digest.clone()),
+            None,
+            0,
+            &[],
+        );
 
         let has_self = ops.iter().any(|op| {
             matches!(op, LinkOperation::Create { link: LinkKind::Digest(d), .. } if d == &digest)
@@ -224,9 +248,10 @@ mod tests {
         let ops_tag = push(
             &mut m_tag,
             &digest,
-            &Reference::Tag("latest".to_string()),
+            &Reference::Tag(Tag::new("latest").unwrap()),
             None,
             0,
+            &[],
         );
         let tag_count = ops_tag
             .iter()
@@ -249,6 +274,7 @@ mod tests {
             &Reference::Digest(digest.clone()),
             None,
             0,
+            &[],
         );
         let tag_count_dig = ops_dig
             .iter()
@@ -266,12 +292,78 @@ mod tests {
     }
 
     #[test]
+    fn push_created_tags_emit_one_tag_link_each() {
+        let digest = d(0x02);
+        let mut m = minimal_manifest();
+        let extra = vec![
+            Tag::new("1.2.3").unwrap(),
+            Tag::new("1.2").unwrap(),
+            Tag::new("latest").unwrap(),
+        ];
+        let ops = push(
+            &mut m,
+            &digest,
+            &Reference::Digest(digest.clone()),
+            None,
+            0,
+            &extra,
+        );
+
+        let tag_links: Vec<&Tag> = ops
+            .iter()
+            .filter_map(|op| match op {
+                LinkOperation::Create {
+                    link: LinkKind::Tag(t),
+                    ..
+                } => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tag_links.len(), 3, "one tag link per additional tag");
+        assert!(tag_links.iter().all(|t| extra.contains(t)));
+    }
+
+    #[test]
+    fn push_empty_created_tags_emit_no_tag_links() {
+        let digest = d(0x03);
+        let mut m = minimal_manifest();
+        let ops = push(
+            &mut m,
+            &digest,
+            &Reference::Digest(digest.clone()),
+            None,
+            0,
+            &[],
+        );
+        let tag_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    LinkOperation::Create {
+                        link: LinkKind::Tag(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(tag_count, 0, "empty additional tags emit no tag links");
+    }
+
+    #[test]
     fn push_config_and_layer_ops_carry_parent_referrer() {
         let parent = d(0x10);
         let config = d(0x11);
         let layer = d(0x12);
         let mut m = manifest_with_config_and_layer(config.clone(), layer.clone());
-        let ops = push(&mut m, &parent, &Reference::Digest(parent.clone()), None, 0);
+        let ops = push(
+            &mut m,
+            &parent,
+            &Reference::Digest(parent.clone()),
+            None,
+            0,
+            &[],
+        );
 
         let Some(LinkOperation::Create { referrer, .. }) = ops.iter().find(|op| {
             matches!(
@@ -305,7 +397,14 @@ mod tests {
         let parent = d(0x20);
         let child = d(0x21);
         let mut m = manifest_with_child(child.clone());
-        let ops = push(&mut m, &parent, &Reference::Digest(parent.clone()), None, 0);
+        let ops = push(
+            &mut m,
+            &parent,
+            &Reference::Digest(parent.clone()),
+            None,
+            0,
+            &[],
+        );
 
         let Some(LinkOperation::Create { referrer, .. }) = ops.iter().find(|op| {
             matches!(op, LinkOperation::Create { link: LinkKind::Manifest(p, c), .. } if p == &parent && c == &child)
@@ -321,8 +420,9 @@ mod tests {
         let digest = d(0x30);
         let config = d(0x31);
         let layer = d(0x32);
+        let media_type = media_type("application/vnd.oci.image.manifest.v1+json");
         let mut m = Manifest {
-            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            media_type: Some(media_type.clone()),
             config: Some(descriptor(config)),
             layers: vec![descriptor(layer)],
             ..Manifest::default()
@@ -331,9 +431,10 @@ mod tests {
         let ops = push(
             &mut m,
             &digest,
-            &Reference::Tag("v1".to_string()),
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            &Reference::Tag(Tag::new("v1").unwrap()),
+            Some(&media_type),
             42,
+            &[],
         );
         // Expected: digest-link + tag-link + config + layer = 4
         assert_eq!(ops.len(), 4);
@@ -343,13 +444,15 @@ mod tests {
     fn push_subject_referrer_uses_descriptor_when_media_type_set() {
         let parent = d(0x40);
         let subject = d(0x41);
+        let media_type = media_type("application/vnd.oci.image.manifest.v1+json");
         let mut m = manifest_with_subject(subject.clone());
         let ops = push(
             &mut m,
             &parent,
             &Reference::Digest(parent.clone()),
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some(&media_type),
             100,
+            &[],
         );
 
         let Some(LinkOperation::Create { descriptor, .. }) = ops.iter().find(|op| {
@@ -367,7 +470,7 @@ mod tests {
 
     #[test]
     fn delete_tag_reference_emits_single_tag_delete() {
-        let ops = delete(&Reference::Tag("latest".to_string()), None, &[]);
+        let ops = delete(&Reference::Tag(Tag::new("latest").unwrap()), None, &[]);
         assert_eq!(ops.len(), 1);
         assert!(
             matches!(&ops[0], LinkOperation::Delete { link: LinkKind::Tag(t), referrer: None } if t == "latest")
@@ -388,8 +491,8 @@ mod tests {
     fn delete_digest_with_tags_removes_them_all() {
         let digest = d(0x60);
         let tags = vec![
-            LinkKind::Tag("v1".to_string()),
-            LinkKind::Tag("latest".to_string()),
+            LinkKind::Tag(Tag::new("v1").unwrap()),
+            LinkKind::Tag(Tag::new("latest").unwrap()),
         ];
         let ops = delete(&Reference::Digest(digest.clone()), None, &tags);
 

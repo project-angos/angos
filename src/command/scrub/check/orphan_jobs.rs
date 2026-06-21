@@ -243,6 +243,7 @@ mod tests {
             executor::{ActionSink, DryRunSink, Executor},
         },
         metrics_provider,
+        oci::{Namespace, Tag},
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             Repository,
@@ -343,8 +344,8 @@ mod tests {
     fn push_payload(downstream: &str, namespace: &str) -> ReplicationPushPayload {
         ReplicationPushPayload {
             downstream: downstream.to_string(),
-            namespace: namespace.to_string(),
-            tag: Some("v1".to_string()),
+            namespace: Namespace::new(namespace).unwrap(),
+            tag: Some(Tag::new("v1").unwrap()),
             digest: None,
             kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
             source_ts: None,
@@ -353,7 +354,7 @@ mod tests {
 
     fn cache_envelope(namespace: &str) -> JobEnvelope {
         let payload = CacheFetchBlobPayload {
-            namespace: namespace.to_string(),
+            namespace: Namespace::new(namespace).unwrap(),
             digest: DIGEST.to_string(),
         };
         JobEnvelope::new(

@@ -1,23 +1,19 @@
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use hyper::{Method, Uri};
 use serde::{Deserialize, de::DeserializeOwned};
-use uuid::Uuid;
 
 use crate::{
-    identity::Action,
-    oci::{Digest, Namespace, Reference},
+    identity::{Action, ManifestPutTarget},
+    oci::{Digest, Namespace, Reference, Tag, UploadSessionId},
     registry::job_store::{JobState, Queue},
 };
 
-fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
-    serde_urlencoded::from_str(params).unwrap_or_default()
-}
-
-/// Like [`parse_query`] but returns `None` when a value fails to deserialize,
-/// so the caller can reject the route instead of silently dropping the value.
-fn parse_query_strict<T: DeserializeOwned>(params: &str) -> Option<T> {
-    serde_urlencoded::from_str(params).ok()
+/// Deserializes a query string, returning `None` when a value fails to
+/// deserialize so the caller can reject the route or fall back with
+/// `unwrap_or_default`.
+fn parse_query<T: DeserializeOwned>(params: &str) -> Option<T> {
+    serde_html_form::from_str(params).ok()
 }
 
 /// Parses the HTTP method and URI into a registry `Action`.
@@ -51,7 +47,7 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
     if let Some(api_path) = path.strip_prefix("/v2/") {
         return try_parse_upload(method, api_path, params)
             .or_else(|| try_find_blobs(method, api_path))
-            .or_else(|| try_find_manifests(method, api_path))
+            .or_else(|| try_find_manifests(method, api_path, params))
             .or_else(|| try_find_referrers(method, api_path, params))
             .or_else(|| try_find_tags(method, api_path, params));
     }
@@ -72,8 +68,18 @@ struct DigestQuery {
 
 fn digest_from_params(params: Option<&str>) -> Option<Digest> {
     params
-        .map(parse_query::<DigestQuery>)
+        .and_then(parse_query::<DigestQuery>)
         .and_then(|q| q.digest)
+}
+
+/// Repeated `tag` query parameters for the distribution-spec tag-on-push
+/// feature. Each value deserializes through `Tag`, so an invalid tag fails the
+/// parse and rejects the route. The `BTreeSet` drops duplicate values so a
+/// repeated tag is linked, echoed in `OCI-Tag`, and event-emitted only once.
+#[derive(Deserialize, Default)]
+struct TagQuery {
+    #[serde(default)]
+    tag: BTreeSet<Tag>,
 }
 
 #[derive(Deserialize, Default)]
@@ -96,7 +102,7 @@ struct PaginationQuery {
 }
 
 fn parse_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
-    let query: PaginationQuery = params.map(parse_query).unwrap_or_default();
+    let query: PaginationQuery = params.and_then(parse_query).unwrap_or_default();
     (query.n, query.last)
 }
 
@@ -113,7 +119,7 @@ struct JobsQuery {
 /// queue; an absent selector defaults to `cache`.
 fn parse_jobs_query(params: Option<&str>) -> Option<(Option<u16>, Option<String>, Queue)> {
     let query: JobsQuery = match params {
-        Some(params) => parse_query_strict(params)?,
+        Some(params) => parse_query(params)?,
         None => JobsQuery::default(),
     };
     let queue = match query.queue.as_deref() {
@@ -211,7 +217,7 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
         // Strict parse: a malformed query rejects the POST as a 400 instead of
         // silently starting a session.
         let query: MountQuery = match params {
-            Some(p) => parse_query_strict(p)?,
+            Some(p) => parse_query(p)?,
             None => MountQuery::default(),
         };
 
@@ -238,7 +244,7 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
 
     let (namespace_str, uuid) = path.rsplit_once("/blobs/uploads/")?;
     let namespace = Namespace::new(namespace_str).ok()?;
-    let uuid = Uuid::from_str(uuid).ok()?;
+    let uuid = UploadSessionId::from_str(uuid).ok()?;
 
     match *method {
         Method::GET => Some(Action::GetUpload { namespace, uuid }),
@@ -272,7 +278,7 @@ fn try_find_blobs(method: &Method, path: &str) -> Option<Action> {
     None
 }
 
-fn try_find_manifests(method: &Method, path: &str) -> Option<Action> {
+fn try_find_manifests(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
     if let Some((namespace_str, reference)) = path.rsplit_once("/manifests/") {
         let namespace = Namespace::new(namespace_str).ok()?;
         let reference = Reference::from_str(reference).ok()?;
@@ -291,10 +297,23 @@ fn try_find_manifests(method: &Method, path: &str) -> Option<Action> {
                 });
             }
             Method::PUT => {
-                return Some(Action::PutManifest {
-                    namespace,
-                    reference,
-                });
+                // `?tag=` applies only to a by-digest push; a by-tag push ignores it.
+                // Strict parse: a single invalid tag rejects the PUT (generic 400)
+                // rather than silently dropping every requested tag.
+                let target = match reference {
+                    Reference::Tag(tag) => ManifestPutTarget::Tag(tag),
+                    Reference::Digest(digest) => {
+                        let tags = match params {
+                            Some(p) => parse_query::<TagQuery>(p)?.tag,
+                            None => BTreeSet::new(),
+                        };
+                        ManifestPutTarget::Digest {
+                            digest,
+                            tags: tags.into_iter().collect(),
+                        }
+                    }
+                };
+                return Some(Action::PutManifest { namespace, target });
             }
             Method::DELETE => {
                 return Some(Action::DeleteManifest {
@@ -315,7 +334,7 @@ fn try_find_referrers(method: &Method, path: &str, params: Option<&str>) -> Opti
         let digest = Digest::from_str(digest).ok()?;
 
         let artifact_type = params
-            .map(parse_query::<ArtifactTypeQuery>)
+            .and_then(parse_query::<ArtifactTypeQuery>)
             .and_then(|f| f.artifact_type);
 
         if *method == Method::GET {

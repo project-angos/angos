@@ -60,6 +60,71 @@ fn test_parse_list_catalog_with_pagination() {
 }
 
 #[test]
+fn test_parse_list_catalog_full_pagination() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?n=100&last=foo".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, Some(100));
+        assert_eq!(last, Some("foo".to_string()));
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
+fn test_parse_list_catalog_non_numeric_n() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?n=abc".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, None);
+        assert_eq!(last, None);
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
+fn test_parse_list_catalog_overflowing_n() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?n=65536".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, None);
+        assert_eq!(last, None);
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
+fn test_parse_list_catalog_empty_n() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?n=".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, None);
+        assert_eq!(last, None);
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
+fn test_parse_list_catalog_url_encoded_last() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_catalog?last=foo%2Fbar".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListCatalog { n, last }) = route {
+        assert_eq!(n, None);
+        assert_eq!(last, Some("foo/bar".to_string()));
+    } else {
+        panic!("Expected ListCatalog route");
+    }
+}
+
+#[test]
 fn test_parse_start_upload() {
     let method = Method::POST;
     let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
@@ -232,31 +297,9 @@ fn test_parse_mount_with_malformed_digest_is_rejected() {
 }
 
 #[test]
-fn test_parse_query_strict() {
-    assert!(parse_query_strict::<MountQuery>("digest=not-a-digest").is_none());
-
-    let valid = "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-    let query: MountQuery = parse_query_strict(valid).expect("a valid digest must parse strictly");
-    assert!(query.digest.is_some());
-    assert!(query.mount.is_none());
-    assert!(query.from.is_none());
-
-    let query: MountQuery = parse_query_strict("").expect("an empty query must parse strictly");
-    assert!(query.digest.is_none());
-    assert!(query.mount.is_none());
-    assert!(query.from.is_none());
-
-    // serde_urlencoded ignores unknown fields, so a bare `?n=` still yields Some.
-    let query: MountQuery = parse_query_strict("n=5").expect("an unknown field must be ignored");
-    assert!(query.digest.is_none());
-    assert!(query.mount.is_none());
-    assert!(query.from.is_none());
-}
-
-#[test]
 fn test_parse_get_upload() {
     let method = Method::GET;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}")
         .parse()
         .unwrap();
@@ -276,7 +319,7 @@ fn test_parse_get_upload() {
 #[test]
 fn test_parse_patch_upload() {
     let method = Method::PATCH;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}")
         .parse()
         .unwrap();
@@ -296,7 +339,7 @@ fn test_parse_patch_upload() {
 #[test]
 fn test_parse_put_upload() {
     let method = Method::PUT;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}?digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").parse().unwrap();
     let route = parse(&method, &uri);
     if let Some(Action::PutUpload {
@@ -319,7 +362,7 @@ fn test_parse_put_upload() {
 #[test]
 fn test_parse_put_upload_without_digest() {
     let method = Method::PUT;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}")
         .parse()
         .unwrap();
@@ -330,7 +373,7 @@ fn test_parse_put_upload_without_digest() {
 #[test]
 fn test_parse_delete_upload() {
     let method = Method::DELETE;
-    let uuid = Uuid::new_v4();
+    let uuid = UploadSessionId::generate();
     let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}")
         .parse()
         .unwrap();
@@ -454,16 +497,86 @@ fn test_parse_put_manifest() {
     let method = Method::PUT;
     let uri: Uri = "/v2/myrepo/app/manifests/v1.0.0".parse().unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::PutManifest {
-        namespace,
-        reference,
-    }) = route
-    {
+    if let Some(Action::PutManifest { namespace, target }) = route {
         assert_eq!(namespace, "myrepo/app");
-        assert_eq!(reference.to_string(), "v1.0.0");
+        assert!(
+            matches!(target, ManifestPutTarget::Tag(tag) if tag == *"v1.0.0"),
+            "a by-tag PUT must produce a Tag target carrying no query tags"
+        );
     } else {
         panic!("Expected PutManifest route");
     }
+}
+
+#[test]
+fn test_parse_put_manifest_by_digest_with_tag_params() {
+    let method = Method::PUT;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/foo/manifests/{digest}?tag=a&tag=b")
+        .parse()
+        .unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::PutManifest { namespace, target }) = route {
+        assert_eq!(namespace, "foo");
+        let ManifestPutTarget::Digest { digest: d, tags } = target else {
+            panic!("a by-digest PUT must produce a Digest target");
+        };
+        assert_eq!(d.to_string(), digest);
+        assert_eq!(
+            tags,
+            vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()],
+            "valid `?tag=` values parse into Tags on the Digest target"
+        );
+    } else {
+        panic!("Expected PutManifest route");
+    }
+}
+
+#[test]
+fn test_parse_put_manifest_by_digest_dedups_repeated_tag_params() {
+    let method = Method::PUT;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/foo/manifests/{digest}?tag=a&tag=a&tag=b")
+        .parse()
+        .unwrap();
+    let Some(Action::PutManifest {
+        target: ManifestPutTarget::Digest { tags, .. },
+        ..
+    }) = parse(&method, &uri)
+    else {
+        panic!("a by-digest PUT must produce a Digest target");
+    };
+    assert_eq!(
+        tags,
+        vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()],
+        "a repeated `?tag=` value is de-duplicated"
+    );
+}
+
+#[test]
+fn test_parse_put_manifest_by_digest_invalid_tag_param_rejected() {
+    let method = Method::PUT;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/foo/manifests/{digest}?tag=a&tag=bad!tag")
+        .parse()
+        .unwrap();
+    // A single invalid `?tag=` value fails deserialization, so the route is
+    // rejected (the router's generic 400) rather than dropping every tag.
+    assert!(
+        parse(&method, &uri).is_none(),
+        "an invalid `?tag=` value must reject the by-digest PUT route"
+    );
+}
+
+#[test]
+fn test_parse_get_manifest_by_tag_ignores_tag_params() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/foo/manifests/latest?tag=a".parse().unwrap();
+    let route = parse(&method, &uri);
+    assert!(
+        matches!(route, Some(Action::GetManifest { .. })),
+        "GET by tag must not carry tag params"
+    );
 }
 
 #[test]
@@ -606,133 +719,6 @@ fn test_parse_invalid_uuid_in_upload_path() {
 }
 
 #[test]
-fn digest_from_params_parses_valid() {
-    let digest = digest_from_params(Some(
-        "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-    ));
-    assert!(digest.is_some());
-    assert_eq!(
-        digest.unwrap().to_string(),
-        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-    );
-}
-
-#[test]
-fn test_digest_query_from_empty_params() {
-    let params = "";
-    let query: DigestQuery = parse_query(params);
-    assert!(query.digest.is_none());
-}
-
-#[test]
-fn digest_from_params_drops_invalid() {
-    // The Digest deserialize error makes the lenient parse collapse the whole
-    // query to its default.
-    assert!(digest_from_params(Some("digest=invalid-digest")).is_none());
-}
-
-#[test]
-fn test_artifact_type_query_from_params() {
-    let params = "artifactType=application/vnd.oci.image.manifest.v1%2Bjson";
-    let query: ArtifactTypeQuery = parse_query(params);
-    assert!(query.artifact_type.is_some());
-    assert_eq!(
-        query.artifact_type.unwrap(),
-        "application/vnd.oci.image.manifest.v1+json"
-    );
-}
-
-#[test]
-fn test_artifact_type_query_from_empty_params() {
-    let params = "";
-    let query: ArtifactTypeQuery = parse_query(params);
-    assert!(query.artifact_type.is_none());
-}
-
-#[test]
-fn test_pagination_query_from_params() {
-    let params = "n=100&last=previous-item";
-    let query: PaginationQuery = parse_query(params);
-    assert_eq!(query.n, Some(100));
-    assert_eq!(query.last, Some("previous-item".to_string()));
-}
-
-#[test]
-fn test_pagination_query_from_empty_params() {
-    let params = "";
-    let query: PaginationQuery = parse_query(params);
-    assert!(query.n.is_none());
-    assert!(query.last.is_none());
-}
-
-#[test]
-fn test_pagination_query_partial_params() {
-    let params = "n=25";
-    let query: PaginationQuery = parse_query(params);
-    assert_eq!(query.n, Some(25));
-    assert!(query.last.is_none());
-}
-
-#[test]
-fn test_parse_pagination_none_params() {
-    assert_eq!(parse_pagination(None), (None, None));
-}
-
-#[test]
-fn test_parse_pagination_empty_params() {
-    assert_eq!(parse_pagination(Some("")), (None, None));
-}
-
-#[test]
-fn test_parse_pagination_full_params() {
-    assert_eq!(
-        parse_pagination(Some("n=50&last=foo")),
-        (Some(50), Some("foo".to_string()))
-    );
-}
-
-#[test]
-fn test_parse_pagination_partial_params() {
-    assert_eq!(parse_pagination(Some("n=10")), (Some(10), None));
-    assert_eq!(
-        parse_pagination(Some("last=bar")),
-        (None, Some("bar".to_string()))
-    );
-}
-
-#[test]
-fn test_parse_pagination_non_numeric_n() {
-    // Non-numeric value for `n` fails deserialization; unwrap_or_default yields (None, None).
-    assert_eq!(parse_pagination(Some("n=abc")), (None, None));
-}
-
-#[test]
-fn test_parse_pagination_n_zero() {
-    // Zero is a valid u16; it should be preserved.
-    assert_eq!(parse_pagination(Some("n=0")), (Some(0), None));
-}
-
-#[test]
-fn test_parse_pagination_n_exceeds_u16_max() {
-    // 65536 overflows u16; deserialization fails and unwrap_or_default yields (None, None).
-    assert_eq!(parse_pagination(Some("n=65536")), (None, None));
-}
-
-#[test]
-fn test_parse_pagination_n_equals_only() {
-    // `n=` with no value is an empty string, which fails u16 deserialization.
-    assert_eq!(parse_pagination(Some("n=")), (None, None));
-}
-
-#[test]
-fn test_parse_pagination_last_url_encoded_special_chars() {
-    // `last` may contain URL-encoded characters; serde_urlencoded decodes them.
-    let (n, last) = parse_pagination(Some("last=foo%2Fbar%3Abaz"));
-    assert!(n.is_none());
-    assert_eq!(last, Some("foo/bar:baz".to_string()));
-}
-
-#[test]
 fn test_try_parse_upload_start_post_method() {
     let method = Method::POST;
     let path = "myrepo/app/blobs/uploads";
@@ -821,7 +807,7 @@ fn test_try_find_blobs_invalid_digest() {
 fn test_try_find_manifests_valid_tag() {
     let method = Method::GET;
     let path = "myrepo/app/manifests/latest";
-    let route = try_find_manifests(&method, path);
+    let route = try_find_manifests(&method, path, None);
     assert!(route.is_some());
     if let Some(Action::GetManifest {
         namespace,
@@ -869,11 +855,21 @@ fn test_parse_nested_namespace() {
 }
 
 #[test]
-fn test_parse_invalid_sha512_digest() {
+fn test_parse_get_blob_sha512() {
     let method = Method::GET;
-    let uri: Uri = "/v2/myrepo/app/blobs/sha512:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
+    let digest = "sha512:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/myrepo/app/blobs/{digest}").parse().unwrap();
     let route = parse(&method, &uri);
-    assert!(route.is_none());
+    if let Some(Action::GetBlob {
+        namespace,
+        digest: parsed,
+    }) = route
+    {
+        assert_eq!(namespace, "myrepo/app");
+        assert_eq!(parsed.to_string(), digest);
+    } else {
+        panic!("Expected GetBlob route for a sha512 digest");
+    }
 }
 
 #[test]

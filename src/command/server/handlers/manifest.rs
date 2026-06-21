@@ -14,7 +14,7 @@ use crate::{
     },
     event_webhook::event::EventActor,
     identity::ClientIdentity,
-    oci::{Namespace, Reference},
+    oci::{MediaType, Namespace, Reference, Tag},
     registry::GetManifestResponse,
 };
 
@@ -69,8 +69,9 @@ pub async fn handle_put_manifest<S>(
     context: &ServerContext,
     namespace: &Namespace,
     reference: Reference,
-    mime_type: String,
+    mime_type: MediaType,
     body_stream: S,
+    tags: Vec<Tag>,
     identity: &ClientIdentity,
     source_ts: Option<DateTime<Utc>>,
 ) -> Result<EventfulResponse, Error>
@@ -87,6 +88,7 @@ where
             reference,
             mime_type,
             body_stream,
+            tags,
         )
         .await?;
 
@@ -135,12 +137,14 @@ pub async fn dispatch_head_manifest(
     handle_head_manifest(context, namespace, reference, &mime_types, is_immutable).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_put_manifest(
     context: &ServerContext,
     parts: &Parts,
     incoming: Incoming,
     namespace: &Namespace,
     reference: Reference,
+    tags: Vec<Tag>,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
@@ -159,6 +163,7 @@ pub async fn dispatch_put_manifest(
             reference,
             mime_type,
             body_stream,
+            tags,
             identity,
             source_ts,
         )
@@ -198,7 +203,7 @@ mod tests {
         },
         configuration::Configuration,
         identity::ClientIdentity,
-        oci::{Namespace, Reference},
+        oci::{MediaType, Namespace, Reference, Tag},
         replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     };
 
@@ -273,7 +278,7 @@ mod tests {
         let context = context_with_test_repo().await;
         let namespace = Namespace::new("test/repo").unwrap();
         let identity = ClientIdentity::new(None);
-        let tag = || Reference::Tag("latest".to_string());
+        let tag = || Reference::Tag(Tag::new("latest").unwrap());
 
         // Seed the newer local tag with manifest B at a known recent source_ts so
         // created_at is stamped deterministically rather than from the wall clock.
@@ -282,8 +287,9 @@ mod tests {
             &context,
             &namespace,
             tag(),
-            MEDIA_TYPE.to_string(),
+            MediaType::new(MEDIA_TYPE).unwrap(),
             std::io::Cursor::new(manifest_b()),
+            Vec::new(),
             &identity,
             Some(newer_ts),
         )
@@ -319,8 +325,9 @@ mod tests {
             &context,
             &namespace,
             tag(),
-            MEDIA_TYPE.to_string(),
+            MediaType::new(MEDIA_TYPE).unwrap(),
             std::io::Cursor::new(manifest_a()),
+            Vec::new(),
             &identity,
             source_ts,
         )

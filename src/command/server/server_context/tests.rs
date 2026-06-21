@@ -26,7 +26,7 @@ use crate::{
     },
     identity::{Action, ClientIdentity},
     metrics_provider,
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     policy::AccessPolicyConfig,
     registry::{
         Registry, RegistryConfig, Repository,
@@ -171,7 +171,7 @@ pub fn create_test_event() -> Event {
         id: Uuid::new_v4(),
         timestamp: Utc::now(),
         kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
+        namespace: Namespace::new("test/repo").unwrap(),
         digest: Some("sha256:abc123".to_string()),
         reference: Some("sha256:abc123".to_string()),
         tag: None,
@@ -459,7 +459,7 @@ async fn test_authorize_request_with_global_policy() {
 
     let route = Action::GetManifest {
         namespace: Namespace::new("test/repo").unwrap(),
-        reference: Reference::Tag("latest".to_string()),
+        reference: Reference::Tag(Tag::new("latest").unwrap()),
     };
     let identity = ClientIdentity::new(None);
     let request = Request::builder().body(()).unwrap();
@@ -520,7 +520,7 @@ async fn test_dispatch_event_with_no_dispatcher() {
         id: Uuid::new_v4(),
         timestamp: Utc::now(),
         kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
+        namespace: Namespace::new("test/repo").unwrap(),
         digest: Some("sha256:abc123".to_string()),
         reference: Some("sha256:abc123".to_string()),
         tag: None,
@@ -576,7 +576,7 @@ async fn test_dispatch_event_delivers_to_webhook() {
         id: Uuid::new_v4(),
         timestamp: Utc::now(),
         kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
+        namespace: Namespace::new("test/repo").unwrap(),
         digest: Some("sha256:abc123".to_string()),
         reference: Some("sha256:abc123".to_string()),
         tag: None,
@@ -631,7 +631,7 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         id: Uuid::new_v4(),
         timestamp: Utc::now(),
         kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
+        namespace: Namespace::new("test/repo").unwrap(),
         digest: Some("sha256:abc123".to_string()),
         reference: Some("sha256:abc123".to_string()),
         tag: None,
@@ -697,7 +697,7 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         id: Uuid::new_v4(),
         timestamp: Utc::now(),
         kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
+        namespace: Namespace::new("test/repo").unwrap(),
         digest: Some("sha256:abc123".to_string()),
         reference: Some("sha256:abc123".to_string()),
         tag: None,
@@ -762,7 +762,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
         id: Uuid::new_v4(),
         timestamp: Utc::now(),
         kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
+        namespace: Namespace::new("test/repo").unwrap(),
         digest: Some("sha256:abc123".to_string()),
         reference: Some("sha256:abc123".to_string()),
         tag: None,
@@ -785,7 +785,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
 struct ShutdownFlushHarness {
     registry: Registry,
     metadata_store: Arc<MetadataStore>,
-    namespace: String,
+    namespace: Namespace,
 }
 
 fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
@@ -844,7 +844,7 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
     ShutdownFlushHarness {
         registry,
         metadata_store,
-        namespace: format!("{unique_prefix}/myimage"),
+        namespace: Namespace::new(&format!("{unique_prefix}/myimage")).unwrap(),
     }
 }
 
@@ -864,7 +864,7 @@ async fn test_shutdown_flushes_pending_access_times() {
     let digest =
         Digest::from_str("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .unwrap();
-    let tag = LinkKind::Tag("v1.0.0".to_string());
+    let tag = LinkKind::Tag(Tag::new("v1.0.0").unwrap());
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
         target: digest.clone(),
@@ -979,7 +979,7 @@ fn make_event(id: Uuid) -> Event {
         id,
         timestamp: Utc::now(),
         kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
+        namespace: Namespace::new("test/repo").unwrap(),
         digest: Some("sha256:abc123".to_string()),
         reference: Some("sha256:abc123".to_string()),
         tag: None,

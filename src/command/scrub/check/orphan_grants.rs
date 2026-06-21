@@ -15,6 +15,7 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{Error as MetadataError, LinkKind, MetadataStore},
     },
 };
@@ -27,14 +28,14 @@ use crate::{
 /// revoked only when the bytes are older than `min_age`, so an in-flight push
 /// (which grants ownership before it links the manifest) is never reaped.
 pub struct OrphanGrantChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     min_age: Duration,
 }
 
 impl OrphanGrantChecker {
     pub fn new(
-        blob_store: Arc<blob_store::BlobStore>,
+        blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
         min_age: Duration,
     ) -> Self {
@@ -78,14 +79,15 @@ impl OrphanGrantChecker {
         for (namespace, links) in index.namespace {
             // A tracked link (Layer/Config/Manifest) means a manifest references
             // the blob, so the grant is live; only a grant-only namespace leaks.
-            if links.contains(&grant)
-                && !links.iter().any(LinkKind::is_tracked)
-                && let Err(e) = sink
-                    .apply(Action::RemoveOrphanBlobGrant {
-                        namespace: namespace.clone(),
-                        blob: blob.clone(),
-                    })
-                    .await
+            if !links.contains(&grant) || links.iter().any(LinkKind::is_tracked) {
+                continue;
+            }
+            if let Err(e) = sink
+                .apply(Action::RemoveOrphanBlobGrant {
+                    namespace: namespace.clone(),
+                    blob: blob.clone(),
+                })
+                .await
             {
                 error!("Failed to enqueue orphan grant revoke for '{namespace}/{blob}': {e}");
             }
@@ -132,10 +134,11 @@ mod tests {
 
             // A blob whose only index entry is the self-ownership grant: the
             // exact end-state of a push that uploaded the blob then lost LWW.
+            let namespace = Namespace::new(NAMESPACE).unwrap();
             let blob = put_blob_direct(metadata_store.store(), b"stranded grant").await;
             metadata_store
                 .update_blob_index(
-                    NAMESPACE,
+                    &namespace,
                     &blob,
                     BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
                 )
@@ -152,7 +155,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_blob_index_namespace(NAMESPACE, &blob)
+                    .read_blob_index_namespace(&namespace, &blob)
                     .await
                     .is_err(),
                 "the orphaned grant must be revoked"
@@ -171,10 +174,11 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
+            let namespace = Namespace::new(NAMESPACE).unwrap();
             let blob = put_blob_direct(metadata_store.store(), b"referenced blob").await;
             for link in [LinkKind::Blob(blob.clone()), LinkKind::Layer(blob.clone())] {
                 metadata_store
-                    .update_blob_index(NAMESPACE, &blob, BlobIndexOperation::Insert(link))
+                    .update_blob_index(&namespace, &blob, BlobIndexOperation::Insert(link))
                     .await
                     .unwrap();
             }
@@ -204,10 +208,11 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             // Just-written bytes: an in-flight push may still link a manifest.
+            let namespace = Namespace::new(NAMESPACE).unwrap();
             let blob = put_blob_direct(metadata_store.store(), b"fresh grant").await;
             metadata_store
                 .update_blob_index(
-                    NAMESPACE,
+                    &namespace,
                     &blob,
                     BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
                 )
@@ -236,10 +241,11 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
+            let namespace = Namespace::new(NAMESPACE).unwrap();
             let blob = put_blob_direct(metadata_store.store(), b"dry-run grant").await;
             metadata_store
                 .update_blob_index(
-                    NAMESPACE,
+                    &namespace,
                     &blob,
                     BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
                 )

@@ -2,21 +2,27 @@ use std::{
     fmt,
     fmt::{Display, Formatter},
     str::FromStr,
-    sync::LazyLock,
 };
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::oci::{Digest, Error};
-
-static TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w[\w.-]{0,127}$").unwrap());
+use crate::oci::{Digest, Error, Tag};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub enum Reference {
-    Tag(String),
+    Tag(Tag),
     Digest(Digest),
+}
+
+impl Reference {
+    /// The tag when this is a tag reference, `None` for a digest reference.
+    pub fn as_tag(&self) -> Option<&Tag> {
+        match self {
+            Reference::Tag(tag) => Some(tag),
+            Reference::Digest(_) => None,
+        }
+    }
 }
 
 impl FromStr for Reference {
@@ -31,10 +37,8 @@ impl FromStr for Reference {
 
         if s.contains(':') {
             Ok(Reference::Digest(Digest::try_from(s)?))
-        } else if TAG_REGEX.is_match(s) {
-            Ok(Reference::Tag(s.to_string()))
         } else {
-            Err(Error::InvalidReference(format!("Invalid reference: '{s}'")))
+            Tag::from_str(s).map(Reference::Tag)
         }
     }
 }
@@ -50,7 +54,7 @@ impl TryFrom<String> for Reference {
 impl Display for Reference {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Reference::Tag(s) => write!(f, "{s}"),
+            Reference::Tag(tag) => write!(f, "{tag}"),
             Reference::Digest(d) => write!(f, "{d}"),
         }
     }
@@ -67,7 +71,7 @@ mod tests {
         let Reference::Tag(tag) = Reference::from_str("latest").unwrap() else {
             panic!("Expected tag");
         };
-        assert_eq!(tag, "latest");
+        assert_eq!(tag, *"latest");
     }
 
     #[test]
@@ -76,12 +80,24 @@ mod tests {
         let Reference::Digest(digest) = Reference::from_str(&input).unwrap() else {
             panic!("Expected digest");
         };
-        assert_eq!(digest.algorithm(), "sha256");
+        assert_eq!(digest.algorithm().to_string(), "sha256");
+    }
+
+    #[test]
+    fn test_as_tag() {
+        let tag = Reference::from_str("latest").unwrap();
+        assert_eq!(tag.as_tag().unwrap().to_string(), "latest");
+
+        let digest = Reference::from_str(&format!("sha256:{VALID_HASH}")).unwrap();
+        assert!(digest.as_tag().is_none());
     }
 
     #[test]
     fn test_display() {
-        assert_eq!(Reference::Tag("latest".to_string()).to_string(), "latest");
+        assert_eq!(
+            Reference::Tag(Tag::new("latest").unwrap()).to_string(),
+            "latest"
+        );
     }
 
     #[test]
@@ -91,7 +107,6 @@ mod tests {
         assert_eq!(reference.to_string(), input);
     }
 
-    // Edge case: empty string is rejected
     #[test]
     fn test_empty_string_rejected() {
         assert!(
@@ -100,7 +115,6 @@ mod tests {
         );
     }
 
-    // Edge case: tag with invalid characters (exclamation mark) is rejected
     #[test]
     fn test_tag_invalid_char_exclamation_rejected() {
         assert!(
@@ -118,29 +132,6 @@ mod tests {
         );
     }
 
-    // Edge case: tag of exactly 128 chars is valid (1 \w + 127 [\w.-])
-    #[test]
-    fn test_tag_128_chars_accepted() {
-        let tag = "a".repeat(128);
-        assert_eq!(tag.len(), 128);
-        assert!(
-            Reference::from_str(&tag).is_ok(),
-            "128-char tag must be accepted"
-        );
-    }
-
-    // Edge case: tag of 129 chars exceeds the 128-char OCI limit and is rejected
-    #[test]
-    fn test_tag_129_chars_rejected() {
-        let tag = "a".repeat(129);
-        assert_eq!(tag.len(), 129);
-        assert!(
-            Reference::from_str(&tag).is_err(),
-            "129-char tag must be rejected"
-        );
-    }
-
-    // Edge case: digest with non-hex hash is rejected
     #[test]
     fn test_digest_non_hex_rejected() {
         assert!(

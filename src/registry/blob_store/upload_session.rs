@@ -6,22 +6,22 @@
 //!
 //! - `startedat`: RFC3339 timestamp of the last activity, used by `scrub` for
 //!   age-based orphan detection.
-//! - `hashstates/sha256/<offset>`: the serialised SHA-256 hasher state after
-//!   consuming the upload's bytes up to `<offset>`, so the hash computation can
-//!   resume after a crash without re-reading the uploaded bytes. The highest
-//!   checkpoint offset is also the authoritative record of how many bytes have
-//!   been consumed, so the upload's size is recovered from it on resume.
+//! - `hashstates/sha256/<offset>`: serialised hasher state for every supported
+//!   digest algorithm, checkpointed together after consuming the upload's bytes
+//!   up to `<offset>`, so hashing resumes after a crash without re-reading them
+//!   (`sha256` is a fixed legacy path segment, not the only algorithm). The
+//!   highest checkpoint offset also records how many bytes were consumed, so the
+//!   upload's size is recovered from it on resume.
 //! - `data`: the assembled upload bytes (FS append target / S3 multipart key).
 //! - `staged/<offset>`: S3-only multipart sub-part remainder, one file per
 //!   offset, superseded as the upload advances.
 //!
 //! Backend-specific upload mechanics (FS append, S3 multipart) are encapsulated
-//! inside the storage backend's keyed [`ObjectStore`] upload methods; this
-//! module never sees them. There is no persisted opaque session value; the S3 backend
-//! recovers its multipart state from S3 itself on each call, so the upload is
-//! addressed purely by its `data` key. Upload progress (size, hash) is the
-//! blob store's concern and is reconstructed by reading the per-file artifacts
-//! through the engine [`Store`](angos_tx_engine::store::Store).
+//! inside the storage backend's keyed [`ObjectStore`] methods; there is no
+//! persisted session value, so the S3 backend recovers its multipart state from
+//! S3 on each call and the upload is addressed purely by its `data` key. Upload
+//! progress (size, hash) is the blob store's concern, reconstructed by reading
+//! the per-file artifacts through the engine [`Store`](angos_tx_engine::store::Store).
 //!
 //! `complete` is two-phase:
 //! 1. [`Store::complete_upload`](angos_tx_engine::store::Store::complete_upload)
@@ -34,7 +34,6 @@ use std::io::Cursor;
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
     try_join,
@@ -47,24 +46,37 @@ use angos_tx_engine::{
 };
 
 use crate::{
-    oci::Digest,
+    oci::{Algorithm, Digest, Namespace},
     registry::{
         blob_store::{
             BlobStore, Error, UploadSummary,
             hashing_reader::{HashingReader, hashing_stream},
-            sha256_ext::Sha256Ext,
+            resumable_hasher::{HashState, Hasher},
         },
         pagination, path_builder,
     },
 };
 
-/// Hash algorithm under which the serialised hasher state is checkpointed
-/// (`hashstates/<HASH_ALGORITHM>/<offset>`).
-const HASH_ALGORITHM: &str = "sha256";
+/// Fixed path segment under which the hasher-state checkpoint is stored
+/// (`hashstates/<CHECKPOINT_DIR_SEGMENT>/<offset>`). Kept as `sha256` (its
+/// historical algorithm-name origin) though the checkpoint now holds every
+/// algorithm's state, so a pre-multi-algorithm checkpoint still resumes.
+const CHECKPOINT_DIR_SEGMENT: &str = "sha256";
 
 /// Bytes peeked from a chunked (`None`) body to tell an empty finalize from one
 /// carrying data, before deciding whether to short-circuit or stream.
 const PEEK_FRAME_SIZE: usize = 8 * 1024;
+
+/// How an append seeds its hasher.
+enum HashStart {
+    /// Rebuild every supported algorithm from the persisted checkpoint, for a
+    /// chunked upload whose target algorithm was unknown during PATCH.
+    Resume,
+    /// Start a single algorithm fresh, for a monolithic PUT whose algorithm is
+    /// known up front and which has no prior checkpointed bytes, so the other
+    /// algorithms are never computed.
+    Fresh(Algorithm),
+}
 
 /// In-memory reconstruction of an upload's progress, assembled from the
 /// per-file artifacts under the upload container. The `session_id` equals the
@@ -75,14 +87,14 @@ pub struct UploadSessionRecord {
     /// Equals the upload UUID passed to `BlobStore::create_upload`.
     pub session_id: String,
     /// OCI namespace owning this upload.
-    pub namespace: String,
+    pub namespace: Namespace,
     /// Wall-clock time of the last activity, read from the `startedat` file
     /// (refreshed on each `write` call so `scrub`'s `UploadChecker` uses the
     /// latest activity time rather than creation time alone).
     pub started_at: DateTime<Utc>,
-    /// Raw serialised SHA-256 hasher state read from the highest-offset
-    /// `hashstates/sha256/<offset>` checkpoint. Resumes the hash computation
-    /// after a crash without re-reading the uploaded bytes.
+    /// Serialised hasher-state checkpoint for every supported digest algorithm,
+    /// read from the highest-offset `hashstates/sha256/<offset>` file. Resumes
+    /// the hash computation after a crash without re-reading the uploaded bytes.
     pub hash_context: Vec<u8>,
     /// Number of bytes consumed so far, recovered from the highest hasher-state
     /// checkpoint offset (the cumulative bytes hashed equals the bytes written).
@@ -92,7 +104,7 @@ pub struct UploadSessionRecord {
 impl BlobStore {
     pub async fn read_session(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
     ) -> Result<UploadSessionRecord, Error> {
         // The start-date read and the hash-context read (itself a LIST + GET)
@@ -105,7 +117,7 @@ impl BlobStore {
 
         Ok(UploadSessionRecord {
             session_id: uuid.to_string(),
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
             started_at,
             hash_context,
             uploaded_size,
@@ -130,7 +142,11 @@ impl BlobStore {
     }
 
     /// Read the RFC3339 `startedat` file and parse it as a UTC timestamp.
-    async fn read_start_date(&self, namespace: &str, uuid: &str) -> Result<DateTime<Utc>, Error> {
+    async fn read_start_date(
+        &self,
+        namespace: &Namespace,
+        uuid: &str,
+    ) -> Result<DateTime<Utc>, Error> {
         let key = path_builder::upload_start_date_path(namespace, uuid);
         let data = match self.store.get(&key).await {
             Ok(data) => data,
@@ -144,7 +160,7 @@ impl BlobStore {
     /// Write the RFC3339 `startedat` file.
     async fn write_start_date(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
         started_at: DateTime<Utc>,
     ) -> Result<(), Error> {
@@ -159,12 +175,12 @@ impl BlobStore {
     /// is both the most recent hasher state and the bytes consumed so far.
     async fn read_hash_context(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
     ) -> Result<(Vec<u8>, u64), Error> {
         let dir = format!(
             "{}/",
-            path_builder::upload_hash_context_dir(namespace, uuid, HASH_ALGORITHM)
+            path_builder::upload_hash_context_dir(namespace, uuid, CHECKPOINT_DIR_SEGMENT)
         );
         let mut highest: Option<u64> = None;
         let mut token = None;
@@ -190,7 +206,8 @@ impl BlobStore {
         let Some(offset) = highest else {
             return Err(Error::UploadNotFound);
         };
-        let key = path_builder::upload_hash_context_path(namespace, uuid, HASH_ALGORITHM, offset);
+        let key =
+            path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
         match self.store.get(&key).await {
             Ok(data) => Ok((data, offset)),
             Err(StorageError::NotFound) => Err(Error::UploadNotFound),
@@ -202,12 +219,13 @@ impl BlobStore {
     /// checkpoint, where `offset` is the cumulative number of bytes hashed.
     async fn write_hash_context(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
         offset: u64,
         state: &[u8],
     ) -> Result<(), Error> {
-        let key = path_builder::upload_hash_context_path(namespace, uuid, HASH_ALGORITHM, offset);
+        let key =
+            path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
         self.store.put(&key, Bytes::copy_from_slice(state)).await?;
         Ok(())
     }
@@ -215,7 +233,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn list_uploads(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
@@ -242,16 +260,16 @@ impl BlobStore {
     }
 
     #[instrument(skip(self))]
-    pub async fn create_upload(&self, namespace: &str, uuid: &str) -> Result<String, Error> {
+    pub async fn create_upload(&self, namespace: &Namespace, uuid: &str) -> Result<String, Error> {
         let upload_path = path_builder::upload_path(namespace, uuid);
         // Begin/clear a fresh upload at the data key (clears any leaked prior
         // multipart and staged remainder).
         self.store.create_upload(&upload_path).await?;
 
-        let hash_context = Sha256::new().serialized_state();
+        let hash_context = Hasher::new().state().to_bytes()?;
         let record = UploadSessionRecord {
             session_id: uuid.to_string(),
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
             started_at: Utc::now(),
             hash_context,
             uploaded_size: 0,
@@ -260,24 +278,90 @@ impl BlobStore {
         Ok(uuid.to_string())
     }
 
+    /// Append the final chunk of a chunked upload and return its digest under
+    /// `algorithm` (whose value fixes the canonical blob path) plus the total
+    /// size. Resumes the both-algorithm checkpoint, so an upload whose algorithm
+    /// was unknown during PATCH can be finalized under any supported algorithm.
     #[instrument(skip(self, stream))]
     pub async fn write_upload(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
+        uuid: &str,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: Option<u64>,
+        algorithm: Algorithm,
+    ) -> Result<(Digest, u64), Error> {
+        let (hasher, size) = self
+            .append(namespace, uuid, stream, content_length, HashStart::Resume)
+            .await?;
+        Ok((hasher.digest(algorithm)?, size))
+    }
+
+    /// Write a single-shot (monolithic) upload whose `algorithm` is known up
+    /// front and which has no prior chunked writes, hashing only the target so
+    /// the other supported algorithms are never computed. Returns the digest and
+    /// total size.
+    #[instrument(skip(self, stream))]
+    pub async fn write_monolithic_upload(
+        &self,
+        namespace: &Namespace,
+        uuid: &str,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: Option<u64>,
+        algorithm: Algorithm,
+    ) -> Result<(Digest, u64), Error> {
+        let (hasher, size) = self
+            .append(
+                namespace,
+                uuid,
+                stream,
+                content_length,
+                HashStart::Fresh(algorithm),
+            )
+            .await?;
+        Ok((hasher.digest(algorithm)?, size))
+    }
+
+    /// Append a chunk to a chunked upload without finalizing, resuming the
+    /// both-algorithm checkpoint, and return the live hasher plus the new total.
+    /// PATCH discards the hasher; the digest is finalized at the PUT.
+    #[instrument(skip(self, stream))]
+    pub async fn append_upload(
+        &self,
+        namespace: &Namespace,
+        uuid: &str,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: Option<u64>,
+    ) -> Result<(Hasher, u64), Error> {
+        self.append(namespace, uuid, stream, content_length, HashStart::Resume)
+            .await
+    }
+
+    /// Append `stream` to the session, persisting the updated hash state and
+    /// size, and return the live hasher fed by the full body so far plus the new
+    /// total. `start` selects whether the hasher resumes every algorithm from
+    /// the checkpoint or starts a single algorithm fresh.
+    async fn append(
+        &self,
+        namespace: &Namespace,
         uuid: &str,
         mut stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
-    ) -> Result<(Digest, u64), Error> {
+        start: HashStart,
+    ) -> Result<(Hasher, u64), Error> {
         let mut record = self.read_session(namespace, uuid).await?;
+        let hasher = match start {
+            HashStart::Resume => HashState::from_bytes(&record.hash_context)?.into_hasher()?,
+            HashStart::Fresh(algorithm) => Hasher::for_algorithm(algorithm),
+        };
 
         if content_length == Some(0) {
-            let digest = Sha256::from_state(&record.hash_context)?.digest();
-            return Ok((digest, record.uploaded_size));
+            return Ok((hasher, record.uploaded_size));
         }
 
         // A chunked finalize (`None`) with an empty body must short-circuit like
         // the `Some(0)` branch instead of doing a backend round-trip for zero
-        // bytes. Peek one frame: on immediate EOF return the resumed digest; on
+        // bytes. Peek one frame: on immediate EOF return the seeded hasher; on
         // data, chain the peeked bytes back ahead of the remaining stream so the
         // hashing reader sees the full body (mirrors the backend's staged-remainder
         // chaining).
@@ -288,16 +372,14 @@ impl BlobStore {
                 .await
                 .map_err(|e| Error::StorageBackend(e.to_string()))?;
             if peek.is_empty() {
-                let digest = Sha256::from_state(&record.hash_context)?.digest();
-                return Ok((digest, record.uploaded_size));
+                return Ok((hasher, record.uploaded_size));
             }
             Box::new(Cursor::new(peek.freeze()).chain(stream))
         } else {
             stream
         };
 
-        let hasher = Sha256::from_state(&record.hash_context)?;
-        let hashing_reader = HashingReader::with_hasher(stream, hasher);
+        let hashing_reader = HashingReader::new(stream, hasher);
         let (body_stream, finish) = hashing_stream(hashing_reader, content_length);
 
         let upload_path = path_builder::upload_path(namespace, uuid);
@@ -305,29 +387,29 @@ impl BlobStore {
             .store
             .write_upload(&upload_path, body_stream, content_length)
             .await;
-        let final_state = finish
+        let hash_result = finish
             .await
             .map_err(|e| Error::StorageBackend(e.to_string()))?;
         // Hash-task errors (typically UploadBodySize) win over the storage
         // error they triggered.
-        let (final_state, new_size) = match (write_result, final_state) {
-            (Ok(size), Ok(state)) => (state, size),
+        let (hasher, new_size) = match (write_result, hash_result) {
+            (Ok(size), Ok(hasher)) => (hasher, size),
             (_, Err(e)) => return Err(e),
             (Err(e), Ok(_)) => return Err(e.into()),
         };
 
-        record.hash_context = final_state.serialized;
+        record.hash_context = hasher.state().to_bytes()?;
         record.uploaded_size = new_size;
         record.started_at = Utc::now();
         self.write_session(&record).await?;
 
-        Ok((final_state.digest, new_size))
+        Ok((hasher, new_size))
     }
 
     #[instrument(skip(self))]
     pub async fn upload_summary(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
     ) -> Result<UploadSummary, Error> {
         let record = self.read_session(namespace, uuid).await?;
@@ -337,22 +419,23 @@ impl BlobStore {
         })
     }
 
-    /// Compute the canonical digest, run the backend completion step, and
-    /// return the engine mutations that atomically promote the staged
-    /// bytes to `blob-data/<digest>` and delete the per-file session artifacts.
+    /// Run the backend completion step and return the engine mutations that
+    /// atomically promote the staged bytes to `blob-data/<digest>` and delete
+    /// the per-file session artifacts. The caller supplies the verified digest
+    /// (its algorithm fixes the canonical blob path).
     #[instrument(skip(self))]
     pub async fn finalize_upload_mutations(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
-        expected_digest: Option<&Digest>,
+        digest: &Digest,
     ) -> Result<(Digest, Vec<Mutation>), Error> {
-        let record = self.read_session(namespace, uuid).await?;
+        // Confirm the session is live (UploadNotFound otherwise) before promoting.
+        self.read_session(namespace, uuid).await?;
         let upload_key = path_builder::upload_path(namespace, uuid);
 
-        let digest = resolve_digest(&record, expected_digest)?;
         self.store.complete_upload(&upload_key).await?;
-        let blob_key = path_builder::blob_path(&digest);
+        let blob_key = path_builder::blob_path(digest);
 
         let mut mutations = vec![Mutation::Move {
             src: upload_key,
@@ -365,7 +448,7 @@ impl BlobStore {
             });
         }
 
-        Ok((digest, mutations))
+        Ok((digest.clone(), mutations))
     }
 
     /// Finish the upload and atomically relocate the data to the canonical
@@ -379,9 +462,9 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn complete_upload(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         uuid: &str,
-        digest: Option<&Digest>,
+        digest: &Digest,
     ) -> Result<Digest, Error> {
         let (final_digest, mutations) = self
             .finalize_upload_mutations(namespace, uuid, digest)
@@ -406,7 +489,7 @@ impl BlobStore {
     /// Abort the upload and delete the per-file session artifacts plus any
     /// staged bytes. Idempotent.
     #[instrument(skip(self))]
-    pub async fn delete_upload(&self, namespace: &str, uuid: &str) -> Result<(), Error> {
+    pub async fn delete_upload(&self, namespace: &Namespace, uuid: &str) -> Result<(), Error> {
         let upload_path = path_builder::upload_path(namespace, uuid);
         // Discard the upload and all backend state it owns (in-progress
         // multipart(s) and any staged remainder on S3; the staging file on FS).
@@ -423,16 +506,6 @@ impl BlobStore {
 /// `hashstates/` tree) are swept best-effort afterwards via `delete_prefix`;
 /// only the metadata file that marks the session as live is removed in the
 /// transaction.
-fn session_record_keys(namespace: &str, uuid: &str) -> Vec<String> {
+fn session_record_keys(namespace: &Namespace, uuid: &str) -> Vec<String> {
     vec![path_builder::upload_start_date_path(namespace, uuid)]
-}
-
-fn resolve_digest(
-    record: &UploadSessionRecord,
-    expected: Option<&Digest>,
-) -> Result<Digest, Error> {
-    if let Some(d) = expected {
-        return Ok(d.clone());
-    }
-    Ok(Sha256::from_state(&record.hash_context)?.digest())
 }

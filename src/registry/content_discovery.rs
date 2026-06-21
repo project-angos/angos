@@ -1,20 +1,28 @@
+use std::sync::LazyLock;
+
 use serde::Serialize;
 use tracing::instrument;
 
 use hyper::header::LINK;
 
 use crate::{
-    oci::{Descriptor, Digest, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_SCHEMA_VERSION},
+    oci::{
+        Descriptor, Digest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE,
+        OCI_MANIFEST_SCHEMA_VERSION, Tag,
+    },
     registry::{APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders},
 };
 
 const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
 
+static OCI_INDEX_MEDIA_TYPE_VALUE: LazyLock<MediaType> =
+    LazyLock::new(|| MediaType::new(OCI_INDEX_MEDIA_TYPE).unwrap());
+
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct ReferrerList {
     schema_version: i32,
-    media_type: String,
+    media_type: MediaType,
     manifests: Vec<Descriptor>,
 }
 
@@ -22,7 +30,7 @@ impl Default for ReferrerList {
     fn default() -> Self {
         ReferrerList {
             schema_version: OCI_MANIFEST_SCHEMA_VERSION,
-            media_type: OCI_INDEX_MEDIA_TYPE.to_string(),
+            media_type: OCI_INDEX_MEDIA_TYPE_VALUE.clone(),
             manifests: Vec::new(),
         }
     }
@@ -36,7 +44,7 @@ struct CatalogBody {
 #[derive(Serialize)]
 struct TagsBody<'a> {
     name: &'a str,
-    tags: Vec<String>,
+    tags: Vec<Tag>,
 }
 
 fn referrers_headers(artifact_type_filtered: bool) -> HeaderMap {
@@ -79,7 +87,7 @@ impl Registry {
         namespace: &Namespace,
         n: Option<u16>,
         last: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
+    ) -> Result<(Vec<Tag>, Option<String>), Error> {
         let n = n.unwrap_or(100);
 
         let (tags, next_last) = self.metadata_store.list_tags(namespace, n, last).await?;
@@ -148,7 +156,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use crate::{
-        oci::{Namespace, Reference},
+        oci::{MediaType, Namespace, Reference, Tag},
         registry::{
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{backends, create_test_blob, put_blob_direct},
@@ -190,7 +198,10 @@ mod tests {
             let ops: Vec<LinkOperation> = tags
                 .iter()
                 .map(|&tag| {
-                    LinkOperation::create(LinkKind::Tag(tag.to_string()), test_digest.clone())
+                    LinkOperation::create(
+                        LinkKind::Tag(Tag::new(tag).unwrap()),
+                        test_digest.clone(),
+                    )
                 })
                 .collect();
             registry
@@ -204,9 +215,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(tags.len(), 3);
-            assert!(tags.contains(&"latest".to_string()));
-            assert!(tags.contains(&"v1.0".to_string()));
-            assert!(tags.contains(&"v2.0".to_string()));
+            assert!(tags.contains(&Tag::new("latest").unwrap()));
+            assert!(tags.contains(&Tag::new("v1.0").unwrap()));
+            assert!(tags.contains(&Tag::new("v2.0").unwrap()));
             assert!(token.is_none());
 
             let (page1, token1) = registry
@@ -287,7 +298,7 @@ mod tests {
                 .update_links(
                     &ns,
                     &[LinkOperation::create(
-                        LinkKind::Tag("latest".to_string()),
+                        LinkKind::Tag(Tag::new("latest").unwrap()),
                         digest.clone(),
                     )],
                 )
@@ -352,7 +363,8 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
 
             let manifest_content = r#"{"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json"}"#;
-            let media_type = "application/vnd.docker.distribution.manifest.v2+json".to_string();
+            let media_type =
+                MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap();
 
             let (base_manifest_digest, _) =
                 create_test_blob(registry, namespace, manifest_content.as_bytes()).await;

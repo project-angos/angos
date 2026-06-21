@@ -11,21 +11,22 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{self, LinkKind, MetadataStore},
         parse_manifest_digests,
     },
 };
 
 pub struct LinkReferencesChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl LinkReferencesChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -34,7 +35,7 @@ impl LinkReferencesChecker {
 
     async fn repair_referenced_by(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         revision: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
@@ -44,7 +45,7 @@ impl LinkReferencesChecker {
                 warn!("Manifest blob missing for revision {revision}; removing revision link");
                 return sink
                     .apply(Action::DeleteOrphanManifest {
-                        namespace: namespace.to_string(),
+                        namespace: namespace.clone(),
                         digest: revision.clone(),
                     })
                     .await;
@@ -71,7 +72,7 @@ impl LinkReferencesChecker {
     /// left to future enhancements.
     pub async fn ensure_referenced_by(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
         target: &Digest,
         referrer: &Digest,
@@ -85,7 +86,7 @@ impl LinkReferencesChecker {
 
         if !metadata.referenced_by.contains(referrer) {
             sink.apply(Action::AddReferrer {
-                namespace: namespace.to_string(),
+                namespace: namespace.clone(),
                 link: link.clone(),
                 target: target.clone(),
                 referrer: referrer.clone(),
@@ -105,7 +106,7 @@ impl LinkReferencesChecker {
                 Ok(_) => {}
                 Err(metadata_store::Error::ReferenceNotFound) => {
                     sink.apply(Action::RemoveReferrer {
-                        namespace: namespace.to_string(),
+                        namespace: namespace.clone(),
                         link: link.clone(),
                         referrer: stale.clone(),
                     })
@@ -123,7 +124,7 @@ impl LinkReferencesChecker {
 impl NamespaceChecker for LinkReferencesChecker {
     async fn check(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking referenced_by field for namespace '{namespace}'");
@@ -156,10 +157,7 @@ mod tests {
         },
     };
 
-    fn noop_executor(
-        blob_store: Arc<blob_store::BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Executor {
+    fn noop_executor(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Executor {
         Executor::new_for_test(blob_store, metadata_store)
     }
 
@@ -320,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn test_reference_not_found_is_skipped() {
         for test_case in backends() {
-            let namespace = "test-repo/not-found";
+            let namespace = &Namespace::new("test-repo/not-found").unwrap();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
 
@@ -458,10 +456,10 @@ mod tests {
         // that `read_link` fails with an `InvalidData` error, which propagates
         // as `Error::MetadataStore`.
         let fs_case = FSRegistryTestCase::new();
-        let blob_store: Arc<blob_store::BlobStore> = RegistryTestCase::blob_store(&fs_case);
+        let blob_store: Arc<BlobStore> = RegistryTestCase::blob_store(&fs_case);
         let metadata_store = RegistryTestCase::metadata_store(&fs_case);
 
-        let namespace = "test-repo/error";
+        let namespace = Namespace::new("test-repo/error").unwrap();
         let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let target = Digest::sha256(hash).unwrap();
         let referrer =
@@ -478,7 +476,7 @@ mod tests {
         let checker = LinkReferencesChecker::new(blob_store, metadata_store);
         let mut sink: Vec<Action> = Vec::new();
         let result = checker
-            .ensure_referenced_by(namespace, &link, &target, &referrer, &mut sink)
+            .ensure_referenced_by(&namespace, &link, &target, &referrer, &mut sink)
             .await;
 
         assert!(

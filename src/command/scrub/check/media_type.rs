@@ -11,20 +11,21 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Manifest,
+    oci::{Manifest, Namespace},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
     },
 };
 
 pub struct MediaTypeChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl MediaTypeChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -33,7 +34,7 @@ impl MediaTypeChecker {
 
     async fn backfill_link(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
         display_name: &str,
         sink: &mut (dyn ActionSink + Send),
@@ -54,7 +55,7 @@ impl MediaTypeChecker {
                 );
                 return sink
                     .apply(Action::DeleteOrphanManifest {
-                        namespace: namespace.to_string(),
+                        namespace: namespace.clone(),
                         digest: metadata.target,
                     })
                     .await;
@@ -79,7 +80,7 @@ impl MediaTypeChecker {
         };
 
         sink.apply(Action::SetMediaType {
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
             link: link.clone(),
             target: metadata.target,
             media_type,
@@ -90,7 +91,7 @@ impl MediaTypeChecker {
 
     async fn backfill_all<T, S, F>(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         item_kind: &str,
         mut items: S,
         to_link_and_name: F,
@@ -99,11 +100,15 @@ impl MediaTypeChecker {
     where
         T: std::fmt::Display,
         S: Stream<Item = Result<T, Error>> + Unpin,
-        F: Fn(&T) -> (LinkKind, String),
+        F: Fn(&T) -> Option<(LinkKind, String)>,
     {
         while let Some(item) = items.next().await {
             let item = item?;
-            let (link, display_name) = to_link_and_name(&item);
+            // `None` means the item failed validation (e.g. an unparseable tag);
+            // it is skipped so one bad entry never aborts the sweep.
+            let Some((link, display_name)) = to_link_and_name(&item) else {
+                continue;
+            };
             if let Err(e) = self
                 .backfill_link(namespace, &link, &display_name, sink)
                 .await
@@ -121,7 +126,7 @@ impl MediaTypeChecker {
 impl NamespaceChecker for MediaTypeChecker {
     async fn check(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking media_type field for namespace '{namespace}'");
@@ -131,7 +136,7 @@ impl NamespaceChecker for MediaTypeChecker {
             namespace,
             "revision",
             revisions,
-            |d| (LinkKind::Digest(d.clone()), format!("revision {d}")),
+            |d| Some((LinkKind::Digest(d.clone()), format!("revision {d}"))),
             sink,
         )
         .await?;
@@ -141,7 +146,7 @@ impl NamespaceChecker for MediaTypeChecker {
             namespace,
             "tag",
             tags,
-            |t| (LinkKind::Tag(t.clone()), format!("tag '{t}'")),
+            |t| Some((LinkKind::Tag(t.clone()), format!("tag '{t}'"))),
             sink,
         )
         .await?;
@@ -155,7 +160,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        oci::Namespace,
+        oci::{MediaType, Namespace, Tag},
         registry::{
             metadata_store::LinkOperation,
             test_utils::{self, backends, put_blob_direct},
@@ -209,7 +214,7 @@ mod tests {
                             manifest_digest.clone(),
                         ),
                         LinkOperation::create(
-                            LinkKind::Tag("latest".to_string()),
+                            LinkKind::Tag(Tag::new("latest").unwrap()),
                             manifest_digest.clone(),
                         ),
                     ],
@@ -235,7 +240,7 @@ mod tests {
             assert_eq!(digest_link.media_type.as_deref(), Some(media_type));
 
             let tag_link = metadata_store
-                .read_link(namespace, &LinkKind::Tag("latest".to_string()))
+                .read_link(namespace, &LinkKind::Tag(Tag::new("latest").unwrap()))
                 .await
                 .unwrap();
             assert_eq!(tag_link.media_type.as_deref(), Some(media_type));
@@ -279,12 +284,12 @@ mod tests {
                         LinkOperation::create_with_media_type(
                             LinkKind::Digest(manifest_digest.clone()),
                             manifest_digest.clone(),
-                            Some(media_type.to_string()),
+                            Some(MediaType::new(media_type).unwrap()),
                         ),
                         LinkOperation::create_with_media_type(
-                            LinkKind::Tag("latest".to_string()),
+                            LinkKind::Tag(Tag::new("latest").unwrap()),
                             manifest_digest.clone(),
-                            Some(media_type.to_string()),
+                            Some(MediaType::new(media_type).unwrap()),
                         ),
                     ],
                 )
@@ -347,7 +352,7 @@ mod tests {
                             manifest_digest.clone(),
                         ),
                         LinkOperation::create(
-                            LinkKind::Tag("latest".to_string()),
+                            LinkKind::Tag(Tag::new("latest").unwrap()),
                             manifest_digest.clone(),
                         ),
                     ],
@@ -475,7 +480,7 @@ mod tests {
                             manifest_digest.clone(),
                         ),
                         LinkOperation::create(
-                            LinkKind::Tag("dangling-mt".to_string()),
+                            LinkKind::Tag(Tag::new("dangling-mt").unwrap()),
                             manifest_digest.clone(),
                         ),
                     ],
@@ -498,7 +503,7 @@ mod tests {
             );
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling-mt".to_string()))
+                    .read_link(namespace, &LinkKind::Tag(Tag::new("dangling-mt").unwrap()))
                     .await
                     .is_err(),
                 "tag link must be removed when target manifest blob is missing"

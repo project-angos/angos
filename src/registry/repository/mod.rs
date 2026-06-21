@@ -8,7 +8,7 @@ pub use crate::registry_client::RegistryClientConfig;
 use crate::{
     cache::Cache,
     configuration::RegexPattern,
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, MediaType, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{Error, blob_store::BoxedReader},
     registry_client::RegistryClient,
@@ -50,7 +50,7 @@ pub struct Repository {
 impl Repository {
     async fn try_upstreams<'a, F, T>(
         &'a self,
-        namespace: &'a str,
+        namespace: &'a Namespace,
         fallback: Error,
         mut op: F,
     ) -> Result<T, Error>
@@ -197,11 +197,11 @@ impl Repository {
     pub async fn head_blob(
         &self,
         accepted_types: &[String],
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
     ) -> Result<(Digest, u64), Error> {
         self.try_upstreams(namespace, Error::BlobUnknown, |upstream| {
-            let location = upstream.get_blob_path(&self.name, namespace, digest);
+            let location = upstream.get_blob_path(&self.name, namespace.as_ref(), digest);
             Box::pin(async move { upstream.head_blob(accepted_types, &location).await })
         })
         .await
@@ -211,11 +211,11 @@ impl Repository {
     pub async fn get_blob(
         &self,
         accepted_types: &[String],
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
     ) -> Result<(u64, BoxedReader), Error> {
         self.try_upstreams(namespace, Error::BlobUnknown, |upstream| {
-            let location = upstream.get_blob_path(&self.name, namespace, digest);
+            let location = upstream.get_blob_path(&self.name, namespace.as_ref(), digest);
             Box::pin(async move { upstream.get_blob(accepted_types, &location).await })
         })
         .await
@@ -225,11 +225,11 @@ impl Repository {
     pub async fn head_manifest(
         &self,
         accepted_types: &[String],
-        namespace: &str,
+        namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<(Option<String>, Digest, u64), Error> {
+    ) -> Result<(Option<MediaType>, Digest, u64), Error> {
         self.try_upstreams(namespace, Error::ManifestUnknown, |upstream| {
-            let location = upstream.get_manifest_path(&self.name, namespace, reference);
+            let location = upstream.get_manifest_path(&self.name, namespace.as_ref(), reference);
             Box::pin(async move { upstream.head_manifest(accepted_types, &location).await })
         })
         .await
@@ -239,11 +239,11 @@ impl Repository {
     pub async fn get_manifest(
         &self,
         accepted_types: &[String],
-        namespace: &str,
+        namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<(Option<String>, Digest, Vec<u8>), Error> {
+    ) -> Result<(Option<MediaType>, Digest, Vec<u8>), Error> {
         self.try_upstreams(namespace, Error::ManifestUnknown, |upstream| {
-            let location = upstream.get_manifest_path(&self.name, namespace, reference);
+            let location = upstream.get_manifest_path(&self.name, namespace.as_ref(), reference);
             Box::pin(async move { upstream.get_manifest(accepted_types, &location).await })
         })
         .await
@@ -262,7 +262,7 @@ mod tests {
 
     use crate::{
         cache,
-        oci::{Digest, Reference},
+        oci::{Digest, Namespace, Reference, Tag},
         registry::{
             Error,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -496,9 +496,10 @@ mod tests {
         let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
             .unwrap();
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let namespace = Namespace::new("local/repo").unwrap();
 
-        let result = repo.head_manifest(&[], "local/repo", &reference).await;
+        let result = repo.head_manifest(&[], &namespace, &reference).await;
         assert!(result.is_ok());
 
         let (content_type, digest, size) = result.unwrap();
@@ -515,7 +516,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_to_second_upstream() {
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let namespace = Namespace::new("local/repo").unwrap();
 
         let (repo, _first, _second) = fallback_repository(
             "HEAD",
@@ -525,7 +527,7 @@ mod tests {
                 .insert_header("Docker-Content-Digest", FALLBACK_DIGEST),
         )
         .await;
-        let result = repo.head_manifest(&[], "local/repo", &reference).await;
+        let result = repo.head_manifest(&[], &namespace, &reference).await;
         assert!(result.is_ok());
 
         let (_content_type, digest, size) = result.unwrap();
@@ -541,7 +543,7 @@ mod tests {
                 .insert_header("Docker-Content-Digest", TEST_DIGEST),
         )
         .await;
-        let result = repo.get_manifest(&[], "local/repo", &reference).await;
+        let result = repo.get_manifest(&[], &namespace, &reference).await;
         assert!(result.is_ok());
 
         let (_content_type, _digest, body) = result.unwrap();
@@ -556,7 +558,7 @@ mod tests {
                 .insert_header("Docker-Content-Digest", TEST_DIGEST),
         )
         .await;
-        let result = repo.head_blob(&[], "local/repo", &digest).await;
+        let result = repo.head_blob(&[], &namespace, &digest).await;
         assert!(result.is_ok());
 
         let (_returned_digest, size) = result.unwrap();
@@ -569,7 +571,7 @@ mod tests {
             ResponseTemplate::new(200).set_body_bytes(blob_content),
         )
         .await;
-        let result = repo.get_blob(&[], "local/repo", &digest).await;
+        let result = repo.get_blob(&[], &namespace, &digest).await;
         assert!(result.is_ok());
 
         let (size, mut reader) = result.unwrap();
@@ -609,9 +611,10 @@ mod tests {
         let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
             .unwrap();
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let namespace = Namespace::new("local/repo").unwrap();
 
-        let result = repo.head_manifest(&[], "local/repo", &reference).await;
+        let result = repo.head_manifest(&[], &namespace, &reference).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::ManifestUnknown));
     }
@@ -651,9 +654,10 @@ mod tests {
         let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
             .unwrap();
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let namespace = Namespace::new("local/repo").unwrap();
 
-        let result = repo.get_manifest(&[], "local/repo", &reference).await;
+        let result = repo.get_manifest(&[], &namespace, &reference).await;
         assert!(result.is_ok());
 
         let (_content_type, _digest, body) = result.unwrap();
@@ -687,9 +691,10 @@ mod tests {
         let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
             .unwrap();
-        let reference = Reference::Tag("latest".to_string());
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let namespace = Namespace::new("local/repo").unwrap();
 
-        let result = repo.get_manifest(&[], "local/repo", &reference).await;
+        let result = repo.get_manifest(&[], &namespace, &reference).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::ManifestUnknown));
     }
@@ -732,8 +737,9 @@ mod tests {
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
         .unwrap();
+        let namespace = Namespace::new("local/repo").unwrap();
 
-        let result = repo.head_blob(&[], "local/repo", &digest).await;
+        let result = repo.head_blob(&[], &namespace, &digest).await;
         assert!(result.is_ok());
 
         let (returned_digest, size) = result.unwrap();
@@ -772,8 +778,9 @@ mod tests {
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
         .unwrap();
+        let namespace = Namespace::new("local/repo").unwrap();
 
-        let result = repo.head_blob(&[], "local/repo", &digest).await;
+        let result = repo.head_blob(&[], &namespace, &digest).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::BlobUnknown));
     }
@@ -810,8 +817,9 @@ mod tests {
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
         .unwrap();
+        let namespace = Namespace::new("local/repo").unwrap();
 
-        let result = repo.get_blob(&[], "local/repo", &digest).await;
+        let result = repo.get_blob(&[], &namespace, &digest).await;
         assert!(result.is_ok());
 
         let (size, mut reader) = result.unwrap();
@@ -855,8 +863,9 @@ mod tests {
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
         .unwrap();
+        let namespace = Namespace::new("local/repo").unwrap();
 
-        let result = repo.get_blob(&[], "local/repo", &digest).await;
+        let result = repo.get_blob(&[], &namespace, &digest).await;
         assert!(result.is_err());
         match result {
             Err(Error::BlobUnknown) => (),

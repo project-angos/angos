@@ -11,9 +11,10 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{BlobIndex, Error as MetadataError, LinkKind, MetadataStore},
     },
 };
@@ -38,12 +39,12 @@ async fn classify_blob(
 }
 
 pub struct BlobChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl BlobChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -105,7 +106,7 @@ impl BlobChecker {
 
     async fn probe_and_cleanup_link(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         blob: &Digest,
         link: &LinkKind,
         sink: &mut (dyn ActionSink + Send),
@@ -123,7 +124,7 @@ impl BlobChecker {
             .is_err()
             && let Err(err) = sink
                 .apply(Action::RemoveBlobIndexLink {
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     blob: blob.clone(),
                     link: link.clone(),
                 })
@@ -193,14 +194,18 @@ mod tests {
             let digest = put_blob_direct(metadata_store.store(), b"content with empty index").await;
 
             // Insert then immediately remove the only link so the namespace map exists but is empty.
-            let namespace = "test-repo/empty";
+            let namespace = Namespace::new("test-repo/empty").unwrap();
             let link = LinkKind::Layer(digest.clone());
             metadata_store
-                .update_blob_index(namespace, &digest, BlobIndexOperation::Insert(link.clone()))
+                .update_blob_index(
+                    &namespace,
+                    &digest,
+                    BlobIndexOperation::Insert(link.clone()),
+                )
                 .await
                 .unwrap();
             metadata_store
-                .update_blob_index(namespace, &digest, BlobIndexOperation::Remove(link))
+                .update_blob_index(&namespace, &digest, BlobIndexOperation::Remove(link))
                 .await
                 .unwrap();
 
@@ -227,7 +232,7 @@ mod tests {
             match verdict {
                 BlobVerdict::Referenced(index) => {
                     assert!(
-                        index.namespace.contains_key(namespace.as_ref()),
+                        index.namespace.contains_key(namespace),
                         "Referenced verdict must carry the namespace in its BlobIndex"
                     );
                 }
@@ -269,7 +274,7 @@ mod tests {
 
             let initial_refs = blob_index_before
                 .namespace
-                .get(namespace.as_ref())
+                .get(namespace)
                 .map_or(0, HashSet::len);
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
@@ -282,7 +287,7 @@ mod tests {
 
             let final_refs = blob_index_after
                 .namespace
-                .get(namespace.as_ref())
+                .get(namespace)
                 .map_or(0, HashSet::len);
 
             assert!(
@@ -317,7 +322,7 @@ mod tests {
             checker.check_all(&mut executor).await.unwrap();
 
             let blob_index = metadata_store.read_blob_index(&blob_digest).await.unwrap();
-            let links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            let links = blob_index.namespace.get(namespace).unwrap();
             assert!(links.contains(&ownership_link));
             assert!(blob_store.read(&blob_digest).await.is_ok());
             test_case.cleanup().await;
@@ -414,10 +419,7 @@ mod tests {
                 Ok(index) => {
                     assert!(
                         index.namespace.is_empty()
-                            || index
-                                .namespace
-                                .get(namespace.as_ref())
-                                .is_none_or(HashSet::is_empty),
+                            || index.namespace.get(namespace).is_none_or(HashSet::is_empty),
                         "All ownership index entries must be purged when blob bytes are absent"
                     );
                 }
@@ -462,10 +464,7 @@ mod tests {
                 Ok(index) => {
                     assert!(
                         index.namespace.is_empty()
-                            || index
-                                .namespace
-                                .get(namespace.as_ref())
-                                .is_none_or(HashSet::is_empty),
+                            || index.namespace.get(namespace).is_none_or(HashSet::is_empty),
                         "Layer link index entry must be purged when blob bytes are absent"
                     );
                 }
@@ -516,7 +515,7 @@ mod tests {
                 .read_blob_index(&phantom_digest)
                 .await
                 .unwrap();
-            let links = index.namespace.get(namespace.as_ref()).unwrap();
+            let links = index.namespace.get(namespace).unwrap();
             assert!(
                 links.contains(&ownership_link),
                 "blob index must be unchanged under Vec sink"

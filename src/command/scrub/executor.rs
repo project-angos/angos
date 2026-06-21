@@ -7,9 +7,9 @@ use tracing::{debug, info, warn};
 use crate::{
     command::scrub::{action::Action, error::Error},
     metrics_provider::metrics_provider,
-    oci::{Digest, Manifest, Reference},
+    oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
     registry::{
-        blob_store::{self, MultipartCleanup},
+        blob_store::{self, BlobStore, MultipartCleanup},
         job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore, Queue},
         manifest::link_plan,
         metadata_store::{
@@ -42,7 +42,7 @@ impl ActionSink for DryRunSink {
 /// Applies scrub actions against live storage backends.
 #[allow(clippy::struct_field_names)]
 pub struct Executor {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     job_store: Arc<JobStore>,
 }
@@ -53,7 +53,7 @@ impl Executor {
     /// through, and the `job_store` replication enqueue actions are landed on.
     #[must_use]
     pub fn new(
-        blob_store: Arc<blob_store::BlobStore>,
+        blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
         job_store: Arc<JobStore>,
     ) -> Self {
@@ -67,10 +67,7 @@ impl Executor {
     /// Test-only constructor that synthesizes a `JobStore`.
     #[cfg(test)]
     #[must_use]
-    pub fn new_for_test(
-        blob_store: Arc<blob_store::BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Self {
+    pub fn new_for_test(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
         Self::new(blob_store, metadata_store, job_store)
     }
@@ -162,7 +159,7 @@ impl Executor {
 
     async fn remove_blob_index_link(
         &self,
-        namespace: String,
+        namespace: Namespace,
         blob: Digest,
         link: LinkKind,
     ) -> Result<(), Error> {
@@ -172,7 +169,45 @@ impl Executor {
         Ok(())
     }
 
-    async fn remove_orphan_blob_grant(&self, namespace: String, blob: Digest) -> Result<(), Error> {
+    /// Re-add a blob-index grant the index is missing for a still-referenced
+    /// blob, under the `blob-data:{blob}` lock the orphan-blob reclaim also
+    /// holds.
+    ///
+    /// Re-checks the bytes under the lock: the checker's existence gate ran
+    /// before this apply, so a concurrent reclaim may have deleted the bytes in
+    /// between. Granting then would resurrect a reference to a deleted blob, so a
+    /// vanished blob is skipped. The insert itself is idempotent, so a concurrent
+    /// push that re-granted the same link is harmless.
+    async fn grant_blob_index_link(
+        &self,
+        namespace: Namespace,
+        blob: Digest,
+        link: LinkKind,
+    ) -> Result<(), Error> {
+        self.with_blob_data_lock(&blob, || async {
+            match self.blob_store.size(&blob).await {
+                Ok(_) => {}
+                Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                    info!(
+                        "skipping blob-index grant: bytes were reclaimed for '{namespace}/{blob}'"
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(Error::from(e)),
+            }
+            self.metadata_store
+                .update_blob_index(&namespace, &blob, BlobIndexOperation::Insert(link.clone()))
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn remove_orphan_blob_grant(
+        &self,
+        namespace: Namespace,
+        blob: Digest,
+    ) -> Result<(), Error> {
         self.with_blob_data_lock(&blob, || async {
             // Re-check under the lock: a manifest reference may have appeared
             // since the checker classified the grant as orphaned.
@@ -209,7 +244,7 @@ impl Executor {
 
     async fn recreate_link(
         &self,
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
     ) -> Result<(), Error> {
@@ -221,7 +256,7 @@ impl Executor {
 
     async fn add_referrer(
         &self,
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
         referrer: Digest,
@@ -237,10 +272,10 @@ impl Executor {
 
     async fn set_media_type(
         &self,
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
-        media_type: String,
+        media_type: MediaType,
     ) -> Result<(), Error> {
         self.metadata_store
             .update_links(
@@ -255,14 +290,43 @@ impl Executor {
         Ok(())
     }
 
-    async fn delete_tag(&self, namespace: String, tag: String) -> Result<(), Error> {
+    async fn delete_tag(&self, namespace: Namespace, tag: Tag) -> Result<(), Error> {
         self.metadata_store
             .update_links(&namespace, &[LinkOperation::delete(LinkKind::Tag(tag))])
             .await?;
         Ok(())
     }
 
-    async fn delete_orphan_manifest(&self, namespace: String, digest: Digest) -> Result<(), Error> {
+    async fn delete_invalid_tag(&self, namespace: Namespace, tag: String) -> Result<(), Error> {
+        // An invalid tag name cannot form a typed `LinkKind::Tag`, so the
+        // directory is removed by prefix rather than via a link delete.
+        self.metadata_store
+            .delete_tag_directory(&namespace, &tag)
+            .await?;
+        Ok(())
+    }
+
+    /// Reclaim a manifest namespace whose name fails `Namespace` validation: it
+    /// cannot form typed links, so its repository subtree is removed by prefix.
+    async fn delete_invalid_namespace(&self, name: String) -> Result<(), Error> {
+        self.metadata_store
+            .delete_namespace_directory(&name)
+            .await?;
+        Ok(())
+    }
+
+    /// Reclaim an upload-only namespace whose name fails `Namespace` validation
+    /// by removing its upload subtree from the blob store.
+    async fn delete_invalid_upload_namespace(&self, name: String) -> Result<(), Error> {
+        self.blob_store.delete_namespace_directory(&name).await?;
+        Ok(())
+    }
+
+    async fn delete_orphan_manifest(
+        &self,
+        namespace: Namespace,
+        digest: Digest,
+    ) -> Result<(), Error> {
         let manifest = match self.blob_store.read(&digest).await {
             Ok(content) => Manifest::from_slice(&content).ok(),
             Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
@@ -280,14 +344,14 @@ impl Executor {
         Ok(())
     }
 
-    async fn delete_expired_upload(&self, namespace: String, uuid: String) -> Result<(), Error> {
+    async fn delete_expired_upload(&self, namespace: Namespace, uuid: String) -> Result<(), Error> {
         self.blob_store.delete_upload(&namespace, &uuid).await?;
         Ok(())
     }
 
     async fn delete_orphan_referrer(
         &self,
-        namespace: String,
+        namespace: Namespace,
         subject: Digest,
         referrer: Digest,
     ) -> Result<(), Error> {
@@ -302,7 +366,7 @@ impl Executor {
 
     async fn remove_referrer(
         &self,
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         referrer: Digest,
     ) -> Result<(), Error> {
@@ -325,8 +389,8 @@ impl Executor {
     async fn enqueue_replication_push(
         &self,
         downstream: String,
-        namespace: String,
-        tag: String,
+        namespace: Namespace,
+        tag: Tag,
         digest: Digest,
     ) -> Result<(), Error> {
         let payload = ReplicationPushPayload {
@@ -346,8 +410,8 @@ impl Executor {
     async fn enqueue_replication_delete(
         &self,
         downstream: String,
-        namespace: String,
-        tag: String,
+        namespace: Namespace,
+        tag: Tag,
     ) -> Result<(), Error> {
         // Stamp `source_ts` with the prune decision time so the receiver runs
         // last-writer-wins and preserves a downstream tag dated after this
@@ -403,6 +467,11 @@ impl ActionSink for Executor {
                 blob,
                 link,
             } => self.remove_blob_index_link(namespace, blob, link).await,
+            Action::GrantBlobIndexLink {
+                namespace,
+                blob,
+                link,
+            } => self.grant_blob_index_link(namespace, blob, link).await,
             Action::RemoveOrphanBlobGrant { namespace, blob } => {
                 self.remove_orphan_blob_grant(namespace, blob).await
             }
@@ -428,6 +497,13 @@ impl ActionSink for Executor {
                     .await
             }
             Action::DeleteTag { namespace, tag } => self.delete_tag(namespace, tag).await,
+            Action::DeleteInvalidTag { namespace, tag } => {
+                self.delete_invalid_tag(namespace, tag).await
+            }
+            Action::DeleteInvalidNamespace { name } => self.delete_invalid_namespace(name).await,
+            Action::DeleteInvalidUploadNamespace { name } => {
+                self.delete_invalid_upload_namespace(name).await
+            }
             Action::DeleteOrphanManifest { namespace, digest } => {
                 self.delete_orphan_manifest(namespace, digest).await
             }
@@ -572,14 +648,14 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let namespace = "test-repo/app";
+            let namespace = Namespace::new("test-repo/app").unwrap();
 
             // Write manifest blob and create a digest link, then delete the blob.
             let content = b"orphan manifest content for missing-blob test";
             let digest = put_blob_direct(metadata_store.store(), content).await;
             metadata_store
                 .update_links(
-                    namespace,
+                    &namespace,
                     &[LinkOperation::create(
                         LinkKind::Digest(digest.clone()),
                         digest.clone(),
@@ -593,7 +669,7 @@ mod tests {
 
             executor
                 .apply(Action::DeleteOrphanManifest {
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
                 .await
@@ -601,7 +677,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest.clone()))
+                    .read_link(&namespace, &LinkKind::Digest(digest.clone()))
                     .await
                     .is_err(),
                 "digest link must be removed even when the blob is missing"
@@ -616,17 +692,17 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let namespace = "test-repo/app";
+            let namespace = Namespace::new("test-repo/app").unwrap();
 
             let content = b"orphan manifest with tag - missing blob";
             let digest = put_blob_direct(metadata_store.store(), content).await;
             metadata_store
                 .update_links(
-                    namespace,
+                    &namespace,
                     &[
                         LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
                         LinkOperation::create(
-                            LinkKind::Tag("dangling".to_string()),
+                            LinkKind::Tag(Tag::new("dangling").unwrap()),
                             digest.clone(),
                         ),
                     ],
@@ -639,7 +715,7 @@ mod tests {
 
             executor
                 .apply(Action::DeleteOrphanManifest {
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
                 .await
@@ -647,7 +723,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()))
+                    .read_link(&namespace, &LinkKind::Tag(Tag::new("dangling").unwrap()))
                     .await
                     .is_err(),
                 "tag link pointing at missing-blob digest must be removed"
@@ -692,7 +768,7 @@ mod tests {
 
             metadata_store
                 .update_blob_index(
-                    "test-repo/app",
+                    &Namespace::new("test-repo/app").unwrap(),
                     &digest,
                     BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
                 )
@@ -715,12 +791,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executor_grant_blob_index_link_inserts_when_bytes_exist() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            let namespace = Namespace::new("test-repo/app").unwrap();
+            let digest = put_blob_direct(metadata_store.store(), b"granted layer").await;
+
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            executor
+                .apply(Action::GrantBlobIndexLink {
+                    namespace: namespace.clone(),
+                    blob: digest.clone(),
+                    link: LinkKind::Layer(digest.clone()),
+                })
+                .await
+                .unwrap();
+
+            let links = metadata_store
+                .read_blob_index_namespace(&namespace, &digest)
+                .await
+                .unwrap();
+            assert!(
+                links.contains(&LinkKind::Layer(digest.clone())),
+                "the grant must insert the layer link into the blob index"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_grant_blob_index_link_skips_when_bytes_were_reclaimed() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            // A digest the reconcile classified for a grant whose bytes a
+            // concurrent reclaim deleted before this apply: the under-lock
+            // re-check must refuse to resurrect a reference to the absent blob.
+            let namespace = Namespace::new("test-repo/app").unwrap();
+            let digest = Digest::from_str(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            executor
+                .apply(Action::GrantBlobIndexLink {
+                    namespace: namespace.clone(),
+                    blob: digest.clone(),
+                    link: LinkKind::Layer(digest.clone()),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &digest)
+                    .await
+                    .is_err(),
+                "no index entry must be created for a blob with no bytes"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
     async fn executor_delete_orphan_referrer_removes_referrer_link() {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let namespace = "test-repo/referrer-exec";
+            let namespace = Namespace::new("test-repo/referrer-exec").unwrap();
 
             let subject_digest =
                 put_blob_direct(metadata_store.store(), b"subject for referrer exec").await;
@@ -729,7 +872,7 @@ mod tests {
 
             metadata_store
                 .update_links(
-                    namespace,
+                    &namespace,
                     &[
                         LinkOperation::create(
                             LinkKind::Digest(subject_digest.clone()),
@@ -747,7 +890,7 @@ mod tests {
             assert!(
                 metadata_store
                     .read_link(
-                        namespace,
+                        &namespace,
                         &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone())
                     )
                     .await
@@ -759,7 +902,7 @@ mod tests {
 
             executor
                 .apply(Action::DeleteOrphanReferrer {
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     subject: subject_digest.clone(),
                     referrer: referrer_digest.clone(),
                 })
@@ -769,7 +912,7 @@ mod tests {
             assert!(
                 metadata_store
                     .read_link(
-                        namespace,
+                        &namespace,
                         &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone())
                     )
                     .await
@@ -786,7 +929,7 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let namespace = "test-repo/remove-referrer-cascade";
+            let namespace = Namespace::new("test-repo/remove-referrer-cascade").unwrap();
 
             // Create a layer blob and the corresponding layer link with exactly
             // one phantom referrer so referenced_by = {phantom}.
@@ -799,7 +942,7 @@ mod tests {
 
             metadata_store
                 .update_links(
-                    namespace,
+                    &namespace,
                     &[LinkOperation::create_with_referrer(
                         LinkKind::Layer(layer_digest.clone()),
                         layer_digest.clone(),
@@ -811,7 +954,7 @@ mod tests {
 
             // Confirm the layer link exists with the phantom referrer.
             let before = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
+                .read_link(&namespace, &LinkKind::Layer(layer_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -823,7 +966,7 @@ mod tests {
 
             executor
                 .apply(Action::RemoveReferrer {
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     link: LinkKind::Layer(layer_digest.clone()),
                     referrer: phantom_digest.clone(),
                 })
@@ -833,7 +976,7 @@ mod tests {
             // After removing the only referrer the link itself must be gone.
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
+                    .read_link(&namespace, &LinkKind::Layer(layer_digest.clone()))
                     .await
                     .is_err(),
                 "layer link must be removed when referenced_by becomes empty"
@@ -855,8 +998,8 @@ mod tests {
             executor
                 .apply(Action::EnqueueReplicationDelete {
                     downstream: "mirror".to_string(),
-                    namespace: "ns/app".to_string(),
-                    tag: "stray".to_string(),
+                    namespace: Namespace::new("ns/app").unwrap(),
+                    tag: Tag::new("stray").unwrap(),
                 })
                 .await
                 .unwrap();
@@ -900,8 +1043,8 @@ mod tests {
                 executor
                     .apply(Action::EnqueueReplicationDelete {
                         downstream: "mirror".to_string(),
-                        namespace: "ns/app".to_string(),
-                        tag: "stray".to_string(),
+                        namespace: Namespace::new("ns/app").unwrap(),
+                        tag: Tag::new("stray").unwrap(),
                     })
                     .await
                     .unwrap();
@@ -925,8 +1068,8 @@ mod tests {
     fn orphan_push_envelope() -> JobEnvelope {
         let payload = ReplicationPushPayload {
             downstream: "removed".to_string(),
-            namespace: "ns/app".to_string(),
-            tag: Some("v1".to_string()),
+            namespace: Namespace::new("ns/app").unwrap(),
+            tag: Some(Tag::new("v1").unwrap()),
             digest: None,
             kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
             source_ts: None,
@@ -937,7 +1080,7 @@ mod tests {
     /// Builds an orphan-shaped pull-through cache-fill envelope.
     fn orphan_cache_envelope() -> JobEnvelope {
         let payload = CacheFetchBlobPayload {
-            namespace: "ns/app".to_string(),
+            namespace: Namespace::new("ns/app").unwrap(),
             digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
         };
@@ -1080,7 +1223,7 @@ mod tests {
             .await
             .unwrap();
         sink.apply(Action::DeleteExpiredUpload {
-            namespace: "ns".to_string(),
+            namespace: Namespace::new("ns").unwrap(),
             uuid: "uuid".to_string(),
         })
         .await

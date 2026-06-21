@@ -16,16 +16,19 @@ use angos_tx_engine::{
     error::Error as TxError, executor::DEFAULT_RETRY_BUDGET, transaction::Mutation,
 };
 
-use crate::registry::{
-    metadata_store::{Error, LinkKind, LinkMetadata, MetadataStore, tx_error_to_meta},
-    path_builder,
+use crate::{
+    oci::Namespace,
+    registry::{
+        metadata_store::{Error, LinkKind, LinkMetadata, MetadataStore, tx_error_to_meta},
+        path_builder,
+    },
 };
 
 // Access-time write debouncing
 
 #[derive(Clone)]
 pub struct AccessTimeWriter {
-    pub pending: Arc<Mutex<HashMap<String, (String, LinkKind)>>>,
+    pub pending: Arc<Mutex<HashMap<String, (Namespace, LinkKind)>>>,
 }
 
 impl AccessTimeWriter {
@@ -35,16 +38,16 @@ impl AccessTimeWriter {
         }
     }
 
-    pub async fn record(&self, namespace: &str, link: &LinkKind) {
+    pub async fn record(&self, namespace: &Namespace, link: &LinkKind) {
         let key = path_builder::link_path(link, namespace);
         self.pending
             .lock()
             .await
-            .insert(key, (namespace.to_string(), link.clone()));
+            .insert(key, (namespace.clone(), link.clone()));
     }
 
     pub async fn flush(&self, backend: &MetadataStore) {
-        let entries: Vec<(String, LinkKind)> = {
+        let entries: Vec<(Namespace, LinkKind)> = {
             let mut pending = self.pending.lock().await;
             pending.drain().map(|(_, v)| v).collect()
         };
@@ -99,7 +102,7 @@ impl MetadataStore {
     /// budget is silently discarded.
     pub async fn flush_one_access_time(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
     ) -> Result<(), Error> {
         let link_path = path_builder::link_path(link, namespace);

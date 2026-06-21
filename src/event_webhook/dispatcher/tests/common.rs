@@ -12,6 +12,7 @@ use crate::{
         dispatcher::{EventDispatcher, WebhookEndpoint},
         event::{Event, EventKind},
     },
+    oci::Namespace,
     secret::Secret,
 };
 
@@ -29,7 +30,7 @@ pub fn create_test_event() -> Event {
         id: Uuid::new_v4(),
         timestamp: Utc::now(),
         kind: EventKind::ManifestPush,
-        namespace: "library/nginx".to_string(),
+        namespace: Namespace::new("library/nginx").unwrap(),
         digest: Some("sha256:abc123".to_string()),
         reference: Some("sha256:abc123".to_string()),
         tag: Some("latest".to_string()),

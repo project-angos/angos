@@ -1,8 +1,8 @@
 //! The blob-index domain: cross-namespace blob reference tracking.
 //!
 //! Holds the [`BlobIndex`] / [`BlobIndexOperation`] value types, the read/write
-//! methods over the per-namespace shards, and the shard operations ([`shard`] —
-//! both the pure in-memory layer and the store read-modify-write).
+//! methods over the per-namespace shards, and the shard operations ([`shard`]):
+//! both the pure in-memory layer and the store read-modify-write.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +19,7 @@ use angos_tx_engine::{
 };
 
 use crate::{
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::{
         metadata_store::{Error, LinkKind, LinksTx, MetadataStore, tx_error_to_meta},
         path_builder,
@@ -38,7 +38,7 @@ use self::shard::{
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BlobIndex {
-    pub namespace: HashMap<String, HashSet<LinkKind>>,
+    pub namespace: HashMap<Namespace, HashSet<LinkKind>>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +57,7 @@ impl MetadataStore {
     #[instrument(skip(self))]
     pub async fn update_blob_index(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
@@ -92,7 +92,7 @@ impl MetadataStore {
     /// `Conflict`; in-place CAS retry is [`Self::update_blob_index`]'s job.
     pub async fn build_grant_mutations(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
     ) -> Result<(Vec<Read>, Vec<Mutation>), Error> {
         let store = self.store_arc();
@@ -116,7 +116,7 @@ impl MetadataStore {
     /// the same digest).
     pub async fn revoke_blob_ownership(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
     ) -> Result<bool, Error> {
         let tx = LinksTx::RevokeBlobOwnership {
@@ -150,13 +150,17 @@ impl MetadataStore {
                 async move {
                     match self.store().get(&shard_path).await {
                         Ok(data) => {
-                            if let Ok(links) = serde_json::from_slice::<HashSet<LinkKind>>(&data) {
-                                let namespace = decode_blob_index_shard_namespace(&obj);
-                                if !links.is_empty() {
-                                    return Ok(Some((namespace, links)));
+                            // The shard filename was written from a validated
+                            // `Namespace`; an undecodable name is skipped.
+                            match (
+                                serde_json::from_slice::<HashSet<LinkKind>>(&data),
+                                Namespace::new(&decode_blob_index_shard_namespace(&obj)),
+                            ) {
+                                (Ok(links), Ok(namespace)) if !links.is_empty() => {
+                                    Ok(Some((namespace, links)))
                                 }
+                                _ => Ok(None),
                             }
-                            Ok(None)
                         }
                         Err(StorageError::NotFound) => Ok(None),
                         Err(e) => Err(Error::from(e)),
@@ -164,7 +168,7 @@ impl MetadataStore {
                 }
             }))
             .buffer_unordered(SHARD_READ_CONCURRENCY)
-            .collect::<Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>>>()
+            .collect::<Vec<Result<Option<(Namespace, HashSet<LinkKind>)>, Error>>>()
             .await;
 
             let shards = shard_results
@@ -230,7 +234,7 @@ impl MetadataStore {
     #[instrument(skip(self))]
     pub async fn read_blob_index_namespace(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         digest: &Digest,
     ) -> Result<HashSet<LinkKind>, Error> {
         let shard_path = path_builder::blob_index_shard_path(digest, namespace);
@@ -297,11 +301,10 @@ impl MetadataStore {
                     // fingerprint is fresh on every retry attempt.
                     match self.store().get(&shard_path).await {
                         Ok(shard_data) => {
-                            let shard_raw = Bytes::from(shard_data.clone());
                             let mut existing: HashSet<LinkKind> =
                                 serde_json::from_slice(&shard_data).unwrap_or_default();
                             apply_blob_index_operations(&mut existing, &operations);
-                            builder = builder.read(shard_path.clone(), shard_raw);
+                            builder = builder.read(shard_path.clone(), Bytes::from(shard_data));
                             if existing.is_empty() {
                                 builder = builder.mutation(Mutation::Delete {
                                     key: shard_path,

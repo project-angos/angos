@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::{
-    oci::Digest,
+    oci::{Digest, MediaType, Namespace, Tag},
     registry::{
         job_store::{JobState, Queue},
         metadata_store::LinkKind,
@@ -19,7 +19,15 @@ pub enum Action {
     PruneLegacyNamespaceRegistry,
     DeleteOrphanBlob(Digest),
     RemoveBlobIndexLink {
-        namespace: String,
+        namespace: Namespace,
+        blob: Digest,
+        link: LinkKind,
+    },
+    /// Re-add a blob-index grant the index is missing relative to a manifest that
+    /// still references the blob (the additive half of a blob-index reconcile).
+    /// Idempotent: re-inserting a present link is a no-op.
+    GrantBlobIndexLink {
+        namespace: Namespace,
         blob: Digest,
         link: LinkKind,
     },
@@ -27,46 +35,60 @@ pub enum Action {
     /// namespace references the blob), reclaiming the bytes when it was the last
     /// reference anywhere.
     RemoveOrphanBlobGrant {
-        namespace: String,
+        namespace: Namespace,
         blob: Digest,
     },
     RecreateLink {
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
     },
     AddReferrer {
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
         referrer: Digest,
     },
     RemoveReferrer {
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         referrer: Digest,
     },
     SetMediaType {
-        namespace: String,
+        namespace: Namespace,
         link: LinkKind,
         target: Digest,
-        media_type: String,
+        media_type: MediaType,
         display_name: String,
     },
     DeleteTag {
-        namespace: String,
+        namespace: Namespace,
+        tag: Tag,
+    },
+    DeleteInvalidTag {
+        namespace: Namespace,
         tag: String,
     },
+    /// Reclaim a manifest namespace whose raw on-disk name fails `Namespace`
+    /// validation, removing its repository subtree by prefix.
+    DeleteInvalidNamespace {
+        name: String,
+    },
+    /// Reclaim an upload-only namespace whose raw on-disk name fails `Namespace`
+    /// validation, removing its upload subtree by prefix.
+    DeleteInvalidUploadNamespace {
+        name: String,
+    },
     DeleteOrphanManifest {
-        namespace: String,
+        namespace: Namespace,
         digest: Digest,
     },
     DeleteExpiredUpload {
-        namespace: String,
+        namespace: Namespace,
         uuid: String,
     },
     DeleteOrphanReferrer {
-        namespace: String,
+        namespace: Namespace,
         subject: Digest,
         referrer: Digest,
     },
@@ -79,8 +101,8 @@ pub enum Action {
     /// divergences get the event path's durable retry/backoff/coalescing.
     EnqueueReplicationPush {
         downstream: String,
-        namespace: String,
-        tag: String,
+        namespace: Namespace,
+        tag: Tag,
         digest: Digest,
     },
     /// Enqueue a replication delete job for a downstream-only tag. Emitted only
@@ -88,8 +110,8 @@ pub enum Action {
     /// would destroy an active-active peer's not-yet-replicated newer tag.
     EnqueueReplicationDelete {
         downstream: String,
-        namespace: String,
-        tag: String,
+        namespace: Namespace,
+        tag: Tag,
     },
     /// Delete a queued job (replication or cache) whose payload no longer
     /// resolves to configured state, so it can never succeed usefully again.
@@ -126,6 +148,16 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "remove invalid link from blob index '{namespace}/{blob}': '{link}'"
+                )
+            }
+            Action::GrantBlobIndexLink {
+                namespace,
+                blob,
+                link,
+            } => {
+                write!(
+                    f,
+                    "grant missing blob-index entry '{namespace}/{blob}': '{link}'"
                 )
             }
             Action::RemoveOrphanBlobGrant { namespace, blob } => {
@@ -178,6 +210,15 @@ impl fmt::Display for Action {
             }
             Action::DeleteTag { namespace, tag } => {
                 write!(f, "delete tag '{namespace}:{tag}' (policy)")
+            }
+            Action::DeleteInvalidTag { namespace, tag } => {
+                write!(f, "delete invalid tag directory '{namespace}:{tag}'")
+            }
+            Action::DeleteInvalidNamespace { name } => {
+                write!(f, "delete invalid namespace directory '{name}'")
+            }
+            Action::DeleteInvalidUploadNamespace { name } => {
+                write!(f, "delete invalid upload namespace directory '{name}'")
             }
             Action::DeleteOrphanManifest { namespace, digest } => {
                 write!(f, "delete orphan manifest '{namespace}@{digest}' (policy)")

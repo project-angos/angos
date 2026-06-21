@@ -5,7 +5,6 @@ use tokio::io::AsyncReadExt;
 #[cfg(test)]
 use tracing::info;
 use tracing::{debug, instrument, warn};
-use uuid::Uuid;
 
 #[cfg(test)]
 use angos_tx_engine::transaction::Transaction;
@@ -13,7 +12,7 @@ use angos_tx_engine::transaction::{Mutation, Read};
 
 use crate::{
     metrics_provider::metrics_provider,
-    oci::{Digest, Namespace},
+    oci::{Digest, Namespace, UploadSessionId},
     registry::{
         Error, HeaderMap, Registry, Repository, ResponseHeaders,
         blob_ownership::BlobOwnership,
@@ -137,14 +136,13 @@ fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bo
 }
 
 /// Stream `stream` into an upload staging slot and return the engine reads +
-/// mutations that, when committed, atomically promote the staged bytes to
-/// `blob-data/<digest>`, delete the upload-session record, and grant
-/// `namespace` ownership of the blob.
+/// mutations that, on commit, atomically promote the staged bytes to
+/// `blob-data/<digest>`, delete the upload-session record, and grant `namespace`
+/// ownership of the blob.
 ///
-/// **Side-effects already taken** when this returns: the upload-staging
-/// objects are written, and on the S3 backend the multipart upload has been
-/// completed. A crash before the returned mutations are applied leaves these
-/// artifacts for scrub to reclaim.
+/// Side-effects already taken on return: staging objects written (and the S3
+/// multipart completed); a crash before the mutations apply leaves them for
+/// scrub to reclaim.
 pub async fn cache_blob_mutations(
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
@@ -154,23 +152,25 @@ pub async fn cache_blob_mutations(
     content_length: u64,
 ) -> Result<(Vec<Read>, Vec<Mutation>), Error> {
     debug!("Fetching blob: {digest}");
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = UploadSessionId::generate();
     blob_store
-        .create_upload(namespace.as_ref(), &session_id)
+        .create_upload(&namespace, session_id.as_ref())
         .await?;
+    // A single-shot copy of a known blob: hash only the target algorithm.
     blob_store
-        .write_upload(
-            namespace.as_ref(),
-            &session_id,
+        .write_monolithic_upload(
+            &namespace,
+            session_id.as_ref(),
             stream,
             Some(content_length),
+            digest.algorithm(),
         )
         .await?;
     let (_, mut mutations) = blob_store
-        .finalize_upload_mutations(namespace.as_ref(), &session_id, Some(&digest))
+        .finalize_upload_mutations(&namespace, session_id.as_ref(), &digest)
         .await?;
     let (reads, mut grant_mutations) = metadata_store
-        .build_grant_mutations(namespace.as_ref(), &digest)
+        .build_grant_mutations(&namespace, &digest)
         .await?;
     mutations.append(&mut grant_mutations);
     Ok((reads, mutations))
@@ -309,7 +309,7 @@ impl Registry {
     /// bubbles up, so a scheduling glitch cannot degrade the client response.
     async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
         let payload = CacheFetchBlobPayload {
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
             digest: digest.to_string(),
         };
         let envelope = match JobEnvelope::new(
@@ -390,7 +390,7 @@ impl Registry {
         let result = async {
             if self
                 .metadata_store
-                .revoke_blob_ownership(namespace.as_ref(), digest)
+                .revoke_blob_ownership(namespace, digest)
                 .await?
             {
                 self.blob_store.delete_blob(digest).await?;
@@ -449,7 +449,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        oci::Namespace,
+        oci::{Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST,
             blob_ownership::BlobOwnership,
@@ -632,8 +632,8 @@ mod tests {
                 .read_blob_index(&digest)
                 .await
                 .unwrap();
-            assert!(blob_index.namespace.contains_key(namespace.as_ref()));
-            let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            assert!(blob_index.namespace.contains_key(namespace));
+            let namespace_links = blob_index.namespace.get(namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             registry.delete_blob(namespace, &digest).await.unwrap();
@@ -666,7 +666,7 @@ mod tests {
                     &[LinkOperation::create_with_referrer(
                         link.clone(),
                         digest.clone(),
-                        Digest::from_bytes(b"manifest"),
+                        Digest::sha256_of_bytes(b"manifest"),
                     )],
                 )
                 .await
@@ -693,16 +693,16 @@ mod tests {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let parent = Digest::from_bytes(b"index manifest");
-            let subject = Digest::from_bytes(b"subject manifest");
+            let parent = Digest::sha256_of_bytes(b"index manifest");
+            let subject = Digest::sha256_of_bytes(b"subject manifest");
 
             let cases = [
-                LinkKind::Digest(Digest::from_bytes(b"digest reference")),
-                LinkKind::Tag("latest".to_string()),
-                LinkKind::Layer(Digest::from_bytes(b"layer reference")),
-                LinkKind::Config(Digest::from_bytes(b"config reference")),
-                LinkKind::Manifest(parent.clone(), Digest::from_bytes(b"child manifest")),
-                LinkKind::Referrer(subject, Digest::from_bytes(b"referrer manifest")),
+                LinkKind::Digest(Digest::sha256_of_bytes(b"digest reference")),
+                LinkKind::Tag(Tag::new("latest").unwrap()),
+                LinkKind::Layer(Digest::sha256_of_bytes(b"layer reference")),
+                LinkKind::Config(Digest::sha256_of_bytes(b"config reference")),
+                LinkKind::Manifest(parent.clone(), Digest::sha256_of_bytes(b"child manifest")),
+                LinkKind::Referrer(subject, Digest::sha256_of_bytes(b"referrer manifest")),
             ];
 
             for link in cases {
@@ -795,7 +795,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = Namespace::new("test-repo").unwrap();
             let content = b"cached pull-through blob content";
-            let digest = Digest::from_bytes(content);
+            let digest = Digest::sha256_of_bytes(content);
             let stream = Box::new(Cursor::new(content.to_vec()));
 
             cache_blob(
@@ -814,7 +814,7 @@ mod tests {
                 .read_blob_index(&digest)
                 .await
                 .unwrap();
-            let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            let namespace_links = blob_index.namespace.get(&namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             let repository = registry.get_repository_for_namespace(&namespace).unwrap();

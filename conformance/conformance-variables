@@ -49,6 +49,4 @@ export OCI_DATA_CUSTOM_FIELDS=true
 export OCI_DATA_NO_LAYERS=true
 export OCI_DATA_EMPTY_BLOB=true
 export OCI_DATA_SPARSE=true
-
-# angos is sha256-only by design; sha512 is optional per the OCI image-spec.
-export OCI_DATA_SHA512=false
+export OCI_DATA_SHA512=true

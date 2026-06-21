@@ -11,7 +11,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::metadata_store::{self, LinkKind, MetadataStore},
 };
 
@@ -26,7 +26,7 @@ impl ReferrerChecker {
 
     async fn check_referrers_for_revision(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         subject: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
@@ -47,7 +47,7 @@ impl ReferrerChecker {
                 Ok(_) => {}
                 Err(metadata_store::Error::ReferenceNotFound) => {
                     sink.apply(Action::DeleteOrphanReferrer {
-                        namespace: namespace.to_string(),
+                        namespace: namespace.clone(),
                         subject: subject.clone(),
                         referrer,
                     })
@@ -65,7 +65,7 @@ impl ReferrerChecker {
 impl NamespaceChecker for ReferrerChecker {
     async fn check(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking referrer links for namespace '{namespace}'");
@@ -90,7 +90,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        oci::{Descriptor, Digest, Namespace},
+        oci::{Descriptor, Digest, MediaType, Namespace},
         registry::{
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{backends, put_blob_direct},
@@ -135,7 +135,10 @@ mod tests {
                         LinkKind::Referrer(subject.clone(), manifest_digest.clone()),
                         manifest_digest.clone(),
                         Box::new(Descriptor {
-                            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+                            media_type: MediaType::new(
+                                "application/vnd.oci.image.manifest.v1+json",
+                            )
+                            .unwrap(),
                             digest: manifest_digest.clone(),
                             size: manifest_bytes.len() as u64,
                             annotations: std::collections::HashMap::new(),
@@ -294,7 +297,7 @@ mod tests {
                         namespace: ns,
                         subject: s,
                         referrer: r,
-                    } if ns == namespace.as_ref()
+                    } if ns == namespace
                         && s == &subject_digest
                         && r == &referrer_digest
                 ),

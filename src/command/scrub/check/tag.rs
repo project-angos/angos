@@ -1,45 +1,52 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::{
     command::scrub::{
         action::Action,
-        check::{NamespaceChecker, ensure_link, list_all},
+        check::{TagChecker, ensure_link},
         error::Error,
         executor::ActionSink,
     },
+    oci::{Namespace, Tag},
     registry::{
         blob_store,
+        blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
     },
 };
 
-pub struct TagChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+/// Repairs a single tag's digest revision link: it recreates a missing digest
+/// link when the target blob is present, and emits `DeleteOrphanManifest` when
+/// the target blob is missing.
+pub struct DigestLinkChecker {
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
-impl TagChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+impl DigestLinkChecker {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
         }
     }
+}
 
-    async fn repair_tag_digest_link(
+#[async_trait]
+impl TagChecker for DigestLinkChecker {
+    async fn check_tag(
         &self,
-        namespace: &str,
-        tag: &str,
+        namespace: &Namespace,
+        tag: &Tag,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking digest link for tag '{namespace}:{tag}'");
         let tag_metadata = self
             .metadata_store
-            .read_link(namespace, &LinkKind::Tag(tag.to_string()))
+            .read_link(namespace, &LinkKind::Tag(tag.clone()))
             .await?;
 
         match self.blob_store.size(&tag_metadata.target).await {
@@ -60,34 +67,13 @@ impl TagChecker {
                     tag_metadata.target
                 );
                 sink.apply(Action::DeleteOrphanManifest {
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     digest: tag_metadata.target,
                 })
                 .await
             }
             Err(e) => Err(e.into()),
         }
-    }
-}
-
-#[async_trait]
-impl NamespaceChecker for TagChecker {
-    async fn check(
-        &self,
-        namespace: &str,
-        sink: &mut (dyn ActionSink + Send),
-    ) -> Result<(), Error> {
-        debug!("Checking tags inconsistencies from namespace '{namespace}'");
-
-        let mut tags = list_all::tags(&self.metadata_store, namespace);
-        while let Some(tag) = tags.next().await {
-            let tag = tag?;
-            if let Err(e) = self.repair_tag_digest_link(namespace, &tag, sink).await {
-                error!("Failed to check tag from '{namespace}' (tag '{tag}'): {e}");
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -119,7 +105,7 @@ mod tests {
                 .update_links(
                     namespace,
                     &[LinkOperation::create(
-                        LinkKind::Tag(tag_name.to_string()),
+                        LinkKind::Tag(Tag::new(tag_name).unwrap()),
                         blob_digest.clone(),
                     )],
                 )
@@ -128,8 +114,12 @@ mod tests {
 
             let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
-            let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
-            scrubber.check(namespace, &mut executor).await.unwrap();
+            let scrubber = DigestLinkChecker::new(blob_store.clone(), metadata_store.clone());
+            let tag = Tag::new(tag_name).unwrap();
+            scrubber
+                .check_tag(namespace, &tag, &mut executor)
+                .await
+                .unwrap();
 
             let digest_link = metadata_store
                 .read_link(namespace, &LinkKind::Digest(blob_digest.clone()))
@@ -161,7 +151,7 @@ mod tests {
                     &[
                         LinkOperation::delete(LinkKind::Digest(blob_digest.clone())),
                         LinkOperation::create(
-                            LinkKind::Tag("v1.0.0".to_string()),
+                            LinkKind::Tag(Tag::new("v1.0.0").unwrap()),
                             blob_digest.clone(),
                         ),
                     ],
@@ -171,8 +161,12 @@ mod tests {
 
             let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
-            let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
-            scrubber.check(namespace, &mut executor).await.unwrap();
+            let scrubber = DigestLinkChecker::new(blob_store.clone(), metadata_store.clone());
+            let tag = Tag::new("v1.0.0").unwrap();
+            scrubber
+                .check_tag(namespace, &tag, &mut executor)
+                .await
+                .unwrap();
 
             let digest_link = metadata_store
                 .read_link(namespace, &LinkKind::Digest(blob_digest.clone()))
@@ -205,7 +199,7 @@ mod tests {
                 .update_links(
                     namespace,
                     &[LinkOperation::create(
-                        LinkKind::Tag("dangling".to_string()),
+                        LinkKind::Tag(Tag::new("dangling").unwrap()),
                         blob_digest.clone(),
                     )],
                 )
@@ -216,12 +210,16 @@ mod tests {
 
             let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
-            let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
-            scrubber.check(namespace, &mut executor).await.unwrap();
+            let scrubber = DigestLinkChecker::new(blob_store.clone(), metadata_store.clone());
+            let tag = Tag::new("dangling").unwrap();
+            scrubber
+                .check_tag(namespace, &tag, &mut executor)
+                .await
+                .unwrap();
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()))
+                    .read_link(namespace, &LinkKind::Tag(Tag::new("dangling").unwrap()))
                     .await
                     .is_err(),
                 "tag link must be removed when target blob is missing"
@@ -256,7 +254,7 @@ mod tests {
                             blob_digest.clone(),
                         ),
                         LinkOperation::create(
-                            LinkKind::Tag("dangling-dry".to_string()),
+                            LinkKind::Tag(Tag::new("dangling-dry").unwrap()),
                             blob_digest.clone(),
                         ),
                     ],
@@ -266,9 +264,13 @@ mod tests {
 
             blob_store.delete_blob(&blob_digest).await.unwrap();
 
-            let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
+            let scrubber = DigestLinkChecker::new(blob_store.clone(), metadata_store.clone());
+            let tag = Tag::new("dangling-dry").unwrap();
             let mut sink: Vec<Action> = Vec::new();
-            scrubber.check(namespace, &mut sink).await.unwrap();
+            scrubber
+                .check_tag(namespace, &tag, &mut sink)
+                .await
+                .unwrap();
 
             assert!(
                 sink.iter()
@@ -277,7 +279,7 @@ mod tests {
             );
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling-dry".to_string()))
+                    .read_link(namespace, &LinkKind::Tag(Tag::new("dangling-dry").unwrap()))
                     .await
                     .is_ok(),
                 "tag link must not be touched under Vec sink"
@@ -310,7 +312,7 @@ mod tests {
                     &[
                         LinkOperation::delete(LinkKind::Digest(blob_digest.clone())),
                         LinkOperation::create(
-                            LinkKind::Tag("present".to_string()),
+                            LinkKind::Tag(Tag::new("present").unwrap()),
                             blob_digest.clone(),
                         ),
                     ],
@@ -318,9 +320,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
+            let scrubber = DigestLinkChecker::new(blob_store.clone(), metadata_store.clone());
+            let tag = Tag::new("present").unwrap();
             let mut sink: Vec<Action> = Vec::new();
-            scrubber.check(namespace, &mut sink).await.unwrap();
+            scrubber
+                .check_tag(namespace, &tag, &mut sink)
+                .await
+                .unwrap();
 
             assert!(
                 !sink

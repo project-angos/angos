@@ -1,20 +1,16 @@
 //! Blob storage subsystem.
 //!
-//! Exposes a single unified [`BlobStore`] struct that carries an
-//! `Arc<Store>` storage façade. The façade bundles the object store, the
-//! upload-session store (resumable streaming uploads + finalization), the
-//! optional presign backend, and the transaction executor used by the
-//! upload-promotion transaction. FS and S3
-//! are wired through the same code path; the [`BlobStoreConfig`] enum only
-//! picks the underlying storage handles the façade is built from. All public
-//! methods live as inherent methods on `BlobStore`: no caller-facing trait
-//! split.
+//! Exposes a single [`BlobStore`] over an `Arc<Store>` façade that bundles the
+//! object store, upload-session store, optional presign backend, and the
+//! transaction executor for upload promotion. FS and S3 share one code path
+//! (the [`BlobStoreConfig`] enum only picks the storage handles); all public
+//! methods are inherent on `BlobStore`, with no caller-facing trait.
 
 mod config;
 mod error;
 pub mod hashing_reader;
 mod multipart_cleanup;
-pub mod sha256_ext;
+pub mod resumable_hasher;
 pub mod upload_session;
 
 use std::{
@@ -87,40 +83,27 @@ impl BlobStore {
         continuation_token: Option<String>,
     ) -> Result<(Vec<Digest>, Option<String>), Error> {
         debug!("Fetching {n} blob(s) with continuation token: {continuation_token:?}");
-        let algorithm = "sha256";
-        let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
 
-        let mut all_blobs = Vec::new();
-        let mut list_continuation_token = None;
-        loop {
-            let page = self
-                .store
-                .list(&blob_prefix, 1000, list_continuation_token)
-                .await?;
-            for key in page.items {
-                let Some(key_without_data) = key.strip_suffix("/data") else {
-                    continue;
-                };
-                if let Some(slash_pos) = key_without_data.rfind('/') {
-                    let hash = &key_without_data[slash_pos + 1..];
-                    // Skip storage keys that aren't valid sha256 blob paths.
-                    match Digest::sha256(hash) {
-                        Ok(digest) => all_blobs.push(digest),
-                        Err(e) => debug!("skipping blob listing entry '{key_without_data}': {e}"),
-                    }
-                }
-            }
-            list_continuation_token = page.next_token;
-            if list_continuation_token.is_none() {
-                break;
-            }
-        }
-
-        Ok(pagination::paginate_sorted(
-            &all_blobs,
+        // Blobs are sharded by algorithm (`blobs/<algo>/<shard>/<hash>/data`); each
+        // blob is the `/data` key under its container.
+        pagination::paginate_by_algorithm(
             n,
-            continuation_token.as_deref(),
-        ))
+            continuation_token,
+            |algorithm, limit, cursor| async move {
+                let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
+                let page = self.store.list(&blob_prefix, limit, cursor).await?;
+                let blobs = page
+                    .items
+                    .into_iter()
+                    .filter_map(|key| {
+                        let hash = key.strip_suffix("/data")?.rsplit_once('/')?.1;
+                        Digest::with_algorithm(algorithm, hash).ok()
+                    })
+                    .collect();
+                Ok((blobs, page.next_token))
+            },
+        )
+        .await
     }
 
     #[instrument(skip(self))]
@@ -177,10 +160,21 @@ impl BlobStore {
         Ok(())
     }
 
-    /// Write `body` directly at the content-addressed blob path. Used for small
-    /// content the registry holds in memory (manifest bodies); layer blobs go
-    /// through the streaming upload lifecycle instead. Idempotent: the digest
-    /// fixes the path and the bytes, so a re-put is a no-op-equivalent. Callers
+    /// Delete a namespace's repository subtree (its in-flight uploads) by raw
+    /// on-disk name, so scrub can reclaim an upload directory whose name fails
+    /// `Namespace` validation.
+    #[instrument(skip(self))]
+    pub async fn delete_namespace_directory(&self, name: &str) -> Result<(), Error> {
+        let prefix = path_builder::namespace_dir(name).ok_or_else(|| {
+            Error::InvalidFormat(format!("unsafe namespace directory name: '{name}'"))
+        })?;
+        self.store.delete_prefix(&prefix).await?;
+        Ok(())
+    }
+
+    /// Write `body` directly at the content-addressed blob path, for small
+    /// in-memory content (manifest bodies); layer blobs use the streaming upload
+    /// lifecycle instead. Idempotent (the digest fixes path and bytes); callers
     /// serialise against concurrent reclaim with the blob-data lock.
     #[instrument(skip(self, body))]
     pub async fn put_blob(&self, digest: &Digest, body: Bytes) -> Result<(), Error> {

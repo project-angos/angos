@@ -10,21 +10,21 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::Digest,
+    oci::{Digest, Namespace},
     registry::{
-        blob_store,
+        blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
         parse_manifest_digests,
     },
 };
 
 pub struct ManifestChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl ManifestChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -33,7 +33,7 @@ impl ManifestChecker {
 
     async fn repair_manifest_links(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         revision: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
@@ -61,7 +61,7 @@ impl ManifestChecker {
 impl NamespaceChecker for ManifestChecker {
     async fn check(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking manifest inconsistencies from namespace '{namespace}'");

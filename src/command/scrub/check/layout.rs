@@ -11,7 +11,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    registry::blob_store,
+    registry::blob_store::BlobStore,
 };
 
 /// Migrates metadata layout documents that scrub can discover safely.
@@ -20,11 +20,11 @@ use crate::{
 /// only enumerates registry-wide subjects and emits ordinary scrub actions so
 /// dry-run and real runs keep the same control flow as consistency repairs.
 pub struct LayoutChecker {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
 }
 
 impl LayoutChecker {
-    pub fn new(blob_store: Arc<blob_store::BlobStore>) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>) -> Self {
         Self { blob_store }
     }
 }

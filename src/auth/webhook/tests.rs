@@ -29,7 +29,7 @@ use crate::{
     command::server::Error,
     http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     secret::Secret,
     test_fixtures::webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
 };
@@ -241,7 +241,7 @@ fn test_set_registry_action_header() {
 fn test_set_registry_namespace_header() {
     let action = Action::GetManifest {
         namespace: Namespace::new("test-namespace").unwrap(),
-        reference: Reference::Tag("latest".to_string()),
+        reference: Reference::Tag(Tag::new("latest").unwrap()),
     };
     let mut headers = HeaderMap::new();
 
@@ -262,7 +262,7 @@ fn test_set_registry_namespace_header() {
 fn test_set_registry_reference_header() {
     let action = Action::GetManifest {
         namespace: Namespace::new("test-namespace").unwrap(),
-        reference: Reference::Tag("v1.0.0".to_string()),
+        reference: Reference::Tag(Tag::new("v1.0.0").unwrap()),
     };
     let mut headers = HeaderMap::new();
 
@@ -414,7 +414,7 @@ fn test_build_headers() {
 
     let action = Action::GetManifest {
         namespace: Namespace::new("test-namespace").unwrap(),
-        reference: Reference::Tag("latest".to_string()),
+        reference: Reference::Tag(Tag::new("latest").unwrap()),
     };
 
     let mut identity = ClientIdentity::new(None);

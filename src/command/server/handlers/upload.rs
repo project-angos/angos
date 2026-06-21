@@ -1,6 +1,5 @@
 use hyper::{Response, StatusCode, body::Incoming, header::CONTENT_RANGE, http::request::Parts};
 use tokio::io::AsyncRead;
-use uuid::Uuid;
 
 use crate::{
     command::server::{
@@ -12,7 +11,7 @@ use crate::{
     },
     event_webhook::event::{Event, EventActor},
     identity::ClientIdentity,
-    oci::{Digest, Namespace},
+    oci::{Digest, Namespace, UploadSessionId},
     registry::{BlobMount, StartUploadResponse},
 };
 
@@ -87,9 +86,9 @@ fn upload_start_event_response(
 pub async fn handle_get_upload(
     context: &ServerContext,
     namespace: &Namespace,
-    uuid: Uuid,
+    uuid: UploadSessionId,
 ) -> Result<Response<ResponseBody>, Error> {
-    let response = context.registry.get_upload_status(namespace, uuid).await?;
+    let response = context.registry.get_upload_status(namespace, &uuid).await?;
 
     build_response(
         StatusCode::NO_CONTENT,
@@ -101,7 +100,7 @@ pub async fn handle_get_upload(
 pub async fn handle_patch_upload<S>(
     context: &ServerContext,
     namespace: &Namespace,
-    uuid: Uuid,
+    uuid: UploadSessionId,
     start_offset: Option<u64>,
     content_length: Option<u64>,
     body_stream: S,
@@ -111,7 +110,7 @@ where
 {
     let response = context
         .registry
-        .patch_upload(namespace, uuid, start_offset, content_length, body_stream)
+        .patch_upload(namespace, &uuid, start_offset, content_length, body_stream)
         .await?;
 
     build_response(
@@ -125,7 +124,7 @@ where
 pub async fn handle_put_upload<S>(
     context: &ServerContext,
     namespace: &Namespace,
-    uuid: Uuid,
+    uuid: UploadSessionId,
     digest: &Digest,
     start_offset: Option<u64>,
     content_length: Option<u64>,
@@ -141,7 +140,7 @@ where
         .complete_upload(
             actor,
             namespace,
-            uuid,
+            &uuid,
             digest,
             start_offset,
             content_length,
@@ -155,9 +154,9 @@ where
 pub async fn handle_delete_upload(
     context: &ServerContext,
     namespace: &Namespace,
-    uuid: Uuid,
+    uuid: UploadSessionId,
 ) -> Result<Response<ResponseBody>, Error> {
-    context.registry.delete_upload(namespace, uuid).await?;
+    context.registry.delete_upload(namespace, &uuid).await?;
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -169,7 +168,7 @@ pub async fn dispatch_patch_upload(
     parts: &Parts,
     incoming: Incoming,
     namespace: &Namespace,
-    uuid: Uuid,
+    uuid: UploadSessionId,
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
     let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
@@ -194,7 +193,7 @@ pub async fn dispatch_put_upload(
     parts: &Parts,
     incoming: Incoming,
     namespace: &Namespace,
-    uuid: Uuid,
+    uuid: UploadSessionId,
     digest: Digest,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {

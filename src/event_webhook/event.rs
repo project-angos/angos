@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::identity::ClientIdentity;
+use crate::{identity::ClientIdentity, oci::Namespace};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -55,7 +55,7 @@ pub struct Event {
     pub id: Uuid,
     pub timestamp: DateTime<Utc>,
     pub kind: EventKind,
-    pub namespace: String,
+    pub namespace: Namespace,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,7 +68,7 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn new(kind: EventKind, namespace: String, repository: String) -> Self {
+    pub fn new(kind: EventKind, namespace: Namespace, repository: String) -> Self {
         Self {
             id: Uuid::new_v4(),
             timestamp: Utc::now(),

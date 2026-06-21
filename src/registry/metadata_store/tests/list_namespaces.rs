@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use crate::{
-    oci::Namespace,
+    oci::{Namespace, Tag},
     registry::{
         metadata_store::{LinkKind, LinkOperation},
         path_builder,
@@ -34,7 +34,7 @@ async fn list_namespaces_is_derived_from_content() {
             .update_links(
                 namespace,
                 &[
-                    LinkOperation::delete(LinkKind::Tag("latest".to_string())),
+                    LinkOperation::delete(LinkKind::Tag(Tag::new("latest").unwrap())),
                     LinkOperation::delete(LinkKind::Layer(digest.clone())),
                 ],
             )
@@ -58,10 +58,10 @@ async fn list_namespaces_is_derived_from_content() {
 async fn list_namespaces_excludes_upload_only_namespace() {
     for test_case in backends() {
         let metadata_store = test_case.metadata_store();
-        let namespace = "upload-only/repo";
+        let namespace = Namespace::new("upload-only/repo").unwrap();
         let uuid = uuid::Uuid::new_v4().to_string();
 
-        let upload_data_path = path_builder::upload_path(namespace, &uuid);
+        let upload_data_path = path_builder::upload_path(&namespace, &uuid);
         metadata_store
             .store()
             .put(&upload_data_path, Bytes::from_static(b"partial"))
@@ -89,7 +89,7 @@ async fn list_upload_namespaces_keys_off_uploads_not_manifests() {
         let metadata_store = test_case.metadata_store();
 
         let manifest_only = &Namespace::new("upload-marker/manifest-only").unwrap();
-        let upload_only = "upload-marker/upload-only";
+        let upload_only = &Namespace::new("upload-marker/upload-only").unwrap();
         let mixed = &Namespace::new("upload-marker/mixed").unwrap();
 
         // Manifest-only: a `_manifests` child and no upload.
@@ -106,8 +106,7 @@ async fn list_upload_namespaces_keys_off_uploads_not_manifests() {
 
         // Mixed: both a `_manifests` child and an `_uploads` artifact.
         test_utils::create_test_blob(registry, mixed, b"mixed").await;
-        let mixed_upload_path =
-            path_builder::upload_path(mixed.as_ref(), &uuid::Uuid::new_v4().to_string());
+        let mixed_upload_path = path_builder::upload_path(mixed, &uuid::Uuid::new_v4().to_string());
         metadata_store
             .store()
             .put(&mixed_upload_path, Bytes::from_static(b"partial"))

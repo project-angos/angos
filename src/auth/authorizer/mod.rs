@@ -11,7 +11,7 @@ use crate::{
     configuration::{Configuration, RegexPattern},
     http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
-    oci::{Namespace, Reference},
+    oci::{Namespace, Tag},
     policy::{AccessMode, PolicyDecision},
     registry::{AccessPolicy, BlobMount, Registry},
 };
@@ -284,20 +284,21 @@ impl Authorizer {
     }
 
     fn check_immutable_tag(&self, repository_name: &str, action: &Action) -> Result<(), Error> {
-        if let Action::PutManifest {
-            reference: Reference::Tag(tag),
-            ..
-        } = action
-            && !self.is_tag_mutable(Some(repository_name), tag)
-        {
-            return Err(Error::Conflict(format!(
-                "Tag '{tag}' is immutable and cannot be overwritten"
-            )));
+        let Action::PutManifest { target, .. } = action else {
+            return Ok(());
+        };
+
+        for tag in target.created_tags() {
+            if !self.is_tag_mutable(Some(repository_name), tag) {
+                return Err(Error::Conflict(format!(
+                    "Tag '{tag}' is immutable and cannot be overwritten"
+                )));
+            }
         }
         Ok(())
     }
 
-    pub fn is_tag_mutable(&self, repository_name: Option<&str>, tag: &str) -> bool {
+    pub fn is_tag_mutable(&self, repository_name: Option<&str>, tag: &Tag) -> bool {
         let repository = repository_name.and_then(|name| self.repositories.get(name));
         let immutable_tags =
             self.global_immutable_tags || repository.is_some_and(|repo| repo.immutable_tags);
@@ -312,7 +313,9 @@ impl Authorizer {
             _ => &self.global_immutable_tags_exclusions,
         };
 
-        exclusions.iter().any(|pattern| pattern.is_match(tag))
+        exclusions
+            .iter()
+            .any(|pattern| pattern.is_match(tag.as_ref()))
     }
 }
 

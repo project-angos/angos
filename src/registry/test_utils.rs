@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use serde_json::json;
-use sha2::{Digest as Sha256Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -11,11 +10,11 @@ use crate::{
     cache,
     configuration::GlobalConfig,
     metrics_provider,
-    oci::{Digest, Namespace},
+    oci::{Digest, Namespace, Tag},
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        Registry, RegistryConfig, Repository,
-        blob_store::{self, sha256_ext::Sha256Ext},
+        Registry, RegistryConfig, Repository, blob_store,
+        blob_store::{BlobStore, BlobStoreConfig},
         job_store::{JobStore, Queue},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
@@ -126,7 +125,7 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
 }
 
 pub fn create_test_registry(
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 ) -> Registry {
     create_test_registry_with(blob_store, metadata_store, true)
@@ -137,7 +136,7 @@ pub fn create_test_registry(
 /// the strict and the permissive (`allow_missing_manifest_references`) modes
 /// can be exercised end-to-end.
 pub fn create_test_registry_with(
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     validate_manifest_references: bool,
 ) -> Registry {
@@ -163,7 +162,7 @@ pub fn create_test_registry_with(
 /// Write raw bytes at the canonical link path for `link` in `namespace`,
 /// bypassing the transactional `update_links` path so tests can seed
 /// hand-crafted or deliberately corrupt link files.
-pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body: &[u8]) {
+pub async fn put_link_raw(store: &Store, namespace: &Namespace, link: &LinkKind, body: &[u8]) {
     store
         .put(
             &path_builder::link_path(link, namespace),
@@ -173,17 +172,11 @@ pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body:
         .expect("raw link write");
 }
 
-/// Write `content` directly at the canonical blob path via the underlying
-/// `ObjectStore`. Returns the SHA-256 digest.
-///
-/// Test-only setup helper that replaces the deleted `BlobStore::create`
-/// shortcut. Seeds blob bytes without invoking the upload state machine
-/// (no upload-session record, no namespace required), which matches the
-/// legacy `BlobStore::create` semantics most closely.
+/// Test-only helper that writes `content` directly at the canonical blob path
+/// via the underlying `ObjectStore` (no upload state machine, no namespace),
+/// returning its SHA-256 digest.
 pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    let digest = hasher.digest();
+    let digest = Digest::sha256_of_bytes(content);
     store
         .put(
             &path_builder::blob_path(&digest),
@@ -201,7 +194,7 @@ pub async fn create_test_blob(
 ) -> (Digest, Repository) {
     let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
-    let tag_link = LinkKind::Tag("latest".to_string());
+    let tag_link = LinkKind::Tag(Tag::new("latest").unwrap());
     let layer_link = LinkKind::Layer(digest.clone());
     registry
         .metadata_store
@@ -220,8 +213,8 @@ pub async fn create_test_blob(
         .read_blob_index(&digest)
         .await
         .unwrap();
-    assert!(blob_index.namespace.contains_key(namespace.as_ref()));
-    let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+    assert!(blob_index.namespace.contains_key(namespace));
+    let namespace_links = blob_index.namespace.get(namespace).unwrap();
     assert!(namespace_links.contains(&layer_link));
 
     let repository = Repository {
@@ -242,7 +235,7 @@ pub async fn create_test_blob(
 #[async_trait::async_trait(?Send)]
 pub trait RegistryTestCase {
     fn registry(&self) -> &Registry;
-    fn blob_store(&self) -> Arc<blob_store::BlobStore>;
+    fn blob_store(&self) -> Arc<BlobStore>;
     fn metadata_store(&self) -> Arc<MetadataStore>;
     async fn cleanup(&self) {}
 }
@@ -255,7 +248,7 @@ pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
 }
 
 pub struct FSRegistryTestCase {
-    blob_store: Arc<blob_store::BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     registry: Registry,
     temp_dir: TempDir,
@@ -272,7 +265,7 @@ impl FSRegistryTestCase {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
         let path = temp_dir.path().to_string_lossy().to_string();
 
-        let config = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+        let config = BlobStoreConfig::FS(blob_store::FsBackendConfig {
             root_dir: path.clone(),
             sync_to_disk: false,
         });
@@ -304,7 +297,7 @@ impl FSRegistryTestCase {
         let blob_path = temp_dir.path().join("blob").to_string_lossy().into_owned();
         let meta_path = temp_dir.path().join("meta").to_string_lossy().into_owned();
 
-        let config = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+        let config = BlobStoreConfig::FS(blob_store::FsBackendConfig {
             root_dir: blob_path,
             sync_to_disk: false,
         });
@@ -342,7 +335,7 @@ impl RegistryTestCase for FSRegistryTestCase {
         &self.registry
     }
 
-    fn blob_store(&self) -> Arc<blob_store::BlobStore> {
+    fn blob_store(&self) -> Arc<BlobStore> {
         self.blob_store.clone()
     }
 
@@ -353,7 +346,7 @@ impl RegistryTestCase for FSRegistryTestCase {
 
 pub struct S3RegistryTestCase {
     key_prefix: String,
-    s3_blob_store: Arc<blob_store::BlobStore>,
+    s3_blob_store: Arc<BlobStore>,
     s3_metadata_store: Arc<MetadataStore>,
     s3_registry: Registry,
 }
@@ -381,7 +374,7 @@ impl S3RegistryTestCase {
             },
         };
         let blob_store = Arc::new(
-            blob_store::BlobStoreConfig::S3(s3_config)
+            BlobStoreConfig::S3(s3_config)
                 .build_backend()
                 .expect("s3 blob backend"),
         );
@@ -419,7 +412,7 @@ impl RegistryTestCase for S3RegistryTestCase {
         &self.s3_registry
     }
 
-    fn blob_store(&self) -> Arc<blob_store::BlobStore> {
+    fn blob_store(&self) -> Arc<BlobStore> {
         self.s3_blob_store.clone()
     }
 
@@ -507,13 +500,11 @@ pub async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayloa
 }
 
 /// Seed a config blob, a layer blob, a manifest referencing both, and a `v1`
-/// tag link under `namespace`. Returns the (manifest, config, layer) digests.
-/// `store`/`metadata_store` accept `&Arc<..>` via deref coercion; pass the
-/// repository namespace (callers use "nginx").
+/// tag link under `namespace`, returning the (manifest, config, layer) digests.
 pub async fn seed_manifest(
     store: &Store,
     metadata_store: &MetadataStore,
-    namespace: &str,
+    namespace: &Namespace,
 ) -> (Digest, Digest, Digest) {
     let config_bytes = br#"{"config":true}"#.to_vec();
     let layer_bytes = b"layer-bytes".to_vec();
@@ -542,7 +533,10 @@ pub async fn seed_manifest(
         .update_links(
             namespace,
             &[
-                LinkOperation::create(LinkKind::Tag("v1".to_string()), manifest_digest.clone()),
+                LinkOperation::create(
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
+                    manifest_digest.clone(),
+                ),
                 LinkOperation::create(
                     LinkKind::Config(config_digest.clone()),
                     config_digest.clone(),

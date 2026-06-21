@@ -111,12 +111,10 @@ async fn dispatch_route<'a>(
         } => {
             handlers::manifest::dispatch_head_manifest(context, parts, &namespace, reference).await
         }
-        Action::PutManifest {
-            namespace,
-            reference,
-        } => {
+        Action::PutManifest { namespace, target } => {
+            let (reference, tags) = target.into_parts();
             handlers::manifest::dispatch_put_manifest(
-                context, parts, incoming, &namespace, reference, identity,
+                context, parts, incoming, &namespace, reference, tags, identity,
             )
             .await
         }

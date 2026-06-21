@@ -1,7 +1,7 @@
 //! Public link-mutation operation type.
 
 use crate::{
-    oci::{Descriptor, Digest},
+    oci::{Descriptor, Digest, MediaType},
     registry::metadata_store::LinkKind,
 };
 
@@ -16,7 +16,7 @@ pub enum LinkOperation {
         link: LinkKind,
         target: Digest,
         referrer: Option<Digest>,
-        media_type: Option<String>,
+        media_type: Option<MediaType>,
         descriptor: Option<Box<Descriptor>>,
     },
     Delete {
@@ -52,7 +52,7 @@ impl LinkOperation {
     pub fn create_with_media_type(
         link: LinkKind,
         target: Digest,
-        media_type: Option<String>,
+        media_type: Option<MediaType>,
     ) -> Self {
         Self::Create {
             link,

@@ -29,13 +29,14 @@ The `scrub` command performs various maintenance operations. Each check must be 
 
 | Flag                          | Description                                                                                        |
 |-------------------------------|----------------------------------------------------------------------------------------------------|
-| `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing                    |
+| `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
 | `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
 | `-b, --blobs`                 | Check for orphaned or corrupted blobs; prune stale blob-index entries for deleted namespaces       |
 | `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
 | `-u, --uploads <duration>`    | Check upload sessions: remove broken or partial state and uploads older than the given duration    |
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
 | `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
+| `--reconcile-blob-index`      | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band. Reads every manifest, so it is expensive |
 | `-M, --media-types`           | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `-R, --referrers`             | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 | `-n, --orphan-namespaces`     | Delete all content for namespaces not owned by any configured repository (destructive; see below)  |

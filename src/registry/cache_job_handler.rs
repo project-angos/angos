@@ -21,7 +21,7 @@ pub const CACHE_FETCH_BLOB_KIND: &str = "cache.fetch_blob";
 /// JSON payload for a [`CACHE_FETCH_BLOB_KIND`] job on the `cache` queue.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheFetchBlobPayload {
-    pub namespace: String,
+    pub namespace: Namespace,
     /// Serialized OCI digest, e.g. `sha256:abc...`.
     pub digest: String,
 }
@@ -62,9 +62,7 @@ impl JobHandler for CacheJobHandler {
         let payload: CacheFetchBlobPayload = serde_json::from_value(envelope.payload.clone())
             .map_err(|e| Error::Storage(format!("failed to deserialize job payload: {e}")))?;
 
-        let namespace = Namespace::new(&payload.namespace).map_err(|e| {
-            Error::Storage(format!("invalid namespace '{}': {e}", payload.namespace))
-        })?;
+        let namespace = payload.namespace;
         let digest: Digest = payload
             .digest
             .parse()
@@ -79,7 +77,7 @@ impl JobHandler for CacheJobHandler {
         if self.blob_store.size(&digest).await.is_ok() {
             let (reads, mutations) = self
                 .metadata_store
-                .build_grant_mutations(namespace.as_ref(), &digest)
+                .build_grant_mutations(&namespace, &digest)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
             return Ok(Transaction::from_parts(reads, mutations));

@@ -16,7 +16,7 @@ use crate::{
         error::Error,
         executor::{ActionSink, record_reconcile_outcome},
     },
-    oci::{Digest, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{
         Error as RegistryError,
         metadata_store::{LinkKind, MetadataStore},
@@ -47,16 +47,17 @@ impl ReplicationChecker {
     }
 
     /// Whether this downstream participates in the reconcile run for `namespace`.
-    fn downstream_included(downstream: &ReplicationDownstream, namespace: &str) -> bool {
-        downstream.mode.participates_in_reconcile() && downstream.matches_namespace(namespace)
+    fn downstream_included(downstream: &ReplicationDownstream, namespace: &Namespace) -> bool {
+        downstream.mode.participates_in_reconcile()
+            && downstream.matches_namespace(namespace.as_ref())
     }
 
     /// Resolves the current local digest for `tag` in `namespace`, bypassing
     /// the link cache so a reconcile never enqueues a stale digest.
-    async fn local_digest(&self, namespace: &str, tag: &str) -> Option<Digest> {
+    async fn local_digest(&self, namespace: &Namespace, tag: &Tag) -> Option<Digest> {
         match self
             .metadata_store
-            .read_link_reference(namespace, &LinkKind::Tag(tag.to_string()))
+            .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
             .await
         {
             Ok(link) => Some(link.target),
@@ -73,8 +74,8 @@ impl ReplicationChecker {
     async fn reconcile_downstream(
         &self,
         downstream: &ReplicationDownstream,
-        namespace: &str,
-        local_tags: &[(String, Option<Digest>)],
+        namespace: &Namespace,
+        local_tags: &[(Tag, Option<Digest>)],
         sink: &mut (dyn ActionSink + Send),
     ) {
         reconcile_push_step(downstream, namespace, local_tags, sink).await;
@@ -88,7 +89,7 @@ impl ReplicationChecker {
 
         let location = downstream
             .registry_client
-            .get_tags_list_path(NO_LOCAL_PREFIX, namespace);
+            .get_tags_list_path(NO_LOCAL_PREFIX, namespace.as_ref());
         let downstream_tags = match downstream.registry_client.list_tags(&location).await {
             Ok(tags) => tags,
             Err(e) => {
@@ -102,15 +103,15 @@ impl ReplicationChecker {
 
         // Tags whose digest read failed (`None`) still count as local: prune
         // must never delete a tag that exists locally.
-        let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_str()).collect();
+        let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_ref()).collect();
         for tag in downstream_tags {
-            if local_set.contains(tag.as_str()) {
+            if local_set.contains(tag.as_ref()) {
                 continue;
             }
             if let Err(e) = sink
                 .apply(Action::EnqueueReplicationDelete {
                     downstream: downstream.name.clone(),
-                    namespace: namespace.to_string(),
+                    namespace: namespace.clone(),
                     tag: tag.clone(),
                 })
                 .await
@@ -133,29 +134,29 @@ impl ReplicationChecker {
 /// (`None`) is skipped here but still counts as local for the prune step.
 async fn reconcile_push_step(
     downstream: &ReplicationDownstream,
-    namespace: &str,
-    local_tags: &[(String, Option<Digest>)],
+    namespace: &Namespace,
+    local_tags: &[(Tag, Option<Digest>)],
     sink: &mut (dyn ActionSink + Send),
 ) {
     enum Probe {
-        Push { tag: String, digest: Digest },
+        Push { tag: Tag, digest: Digest },
         Converged,
         Skipped,
     }
 
-    let candidates: Vec<(String, Digest)> = local_tags
+    let candidates: Vec<(Tag, Digest)> = local_tags
         .iter()
         .filter_map(|(tag, local)| local.as_ref().map(|digest| (tag.clone(), digest.clone())))
         .collect();
     let probes = stream::iter(candidates)
         .map(|(tag, local)| async move {
+            let reference = Reference::Tag(tag.clone());
             // Only a 404 means absence; any other HEAD failure skips the tag this
             // pass rather than enqueuing a spurious push.
-            let location = downstream.registry_client.get_manifest_path(
-                NO_LOCAL_PREFIX,
-                namespace,
-                &Reference::Tag(tag.clone()),
-            );
+            let location =
+                downstream
+                    .registry_client
+                    .get_manifest_path(NO_LOCAL_PREFIX, namespace.as_ref(), &reference);
             match downstream
                 .registry_client
                 .head_manifest(&manifest_accept_types(), &location)
@@ -168,7 +169,10 @@ async fn reconcile_push_step(
                     );
                     Probe::Converged
                 }
-                Ok(_) | Err(RegistryError::ManifestUnknown) => Probe::Push { tag, digest: local },
+                Ok(_) | Err(RegistryError::ManifestUnknown) => Probe::Push {
+                    tag,
+                    digest: local,
+                },
                 Err(e) => {
                     debug!(
                         "HEAD for '{namespace}:{tag}' on downstream '{}' failed; skipping this pass: {e}",
@@ -196,7 +200,7 @@ async fn reconcile_push_step(
                 if let Err(e) = sink
                     .apply(Action::EnqueueReplicationPush {
                         downstream: downstream.name.clone(),
-                        namespace: namespace.to_string(),
+                        namespace: namespace.clone(),
                         tag: tag.clone(),
                         digest,
                     })
@@ -229,7 +233,7 @@ async fn reconcile_push_step(
 impl NamespaceChecker for ReplicationChecker {
     async fn check(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         let Some(repository) = self.resolver.resolve(namespace) else {
@@ -249,7 +253,7 @@ impl NamespaceChecker for ReplicationChecker {
         // Collect and digest-resolve the tag set once to avoid O(downstreams x
         // tags) metadata reads. A failed link read resolves to `None`: skipped
         // for push but still counted as local so prune never deletes a live tag.
-        let mut local_tags: Vec<(String, Option<Digest>)> = Vec::new();
+        let mut local_tags: Vec<(Tag, Option<Digest>)> = Vec::new();
         let mut stream = list_all::tags(&self.metadata_store, namespace);
         while let Some(tag) = stream.next().await {
             let tag = tag?;
@@ -292,7 +296,7 @@ mod tests {
             worker::runner::execute_one,
         },
         metrics_provider,
-        oci::Digest,
+        oci::{Digest, Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Repository,
             blob_store::BlobStore,
@@ -311,6 +315,12 @@ mod tests {
     const NAMESPACE: &str = "nginx";
     const REPO: &str = "nginx";
     const DOWNSTREAM: &str = "eu-region";
+
+    /// The validated [`Namespace`] form of [`NAMESPACE`], for the store/checker
+    /// APIs that now take `&Namespace`.
+    fn namespace() -> Namespace {
+        Namespace::new(NAMESPACE).unwrap()
+    }
 
     /// FS-backed metadata store so the tests run without S3; also returns the
     /// store façade for seeding blobs.
@@ -356,9 +366,9 @@ mod tests {
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -379,7 +389,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert_eq!(sink.len(), 1);
         assert!(matches!(
@@ -398,9 +408,9 @@ mod tests {
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest,
                 )],
             )
@@ -427,7 +437,7 @@ mod tests {
             .get();
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert!(
             sink.is_empty(),
@@ -475,9 +485,9 @@ mod tests {
             let manifest = put_blob_direct(&store, body.as_bytes()).await;
             metadata_store
                 .update_links(
-                    NAMESPACE,
+                    &namespace(),
                     &[LinkOperation::create(
-                        LinkKind::Tag(tag.to_string()),
+                        LinkKind::Tag(Tag::new(tag).unwrap()),
                         manifest,
                     )],
                 )
@@ -501,13 +511,13 @@ mod tests {
             attempted: Vec::new(),
             fail_first: 1,
         };
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         let attempted: Vec<&str> = sink
             .attempted
             .iter()
             .filter_map(|a| match a {
-                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_str()),
+                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -543,13 +553,13 @@ mod tests {
             attempted: Vec::new(),
             fail_first: 1,
         };
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         let deleted: Vec<&str> = sink
             .attempted
             .iter()
             .filter_map(|a| match a {
-                Action::EnqueueReplicationDelete { tag, .. } => Some(tag.as_str()),
+                Action::EnqueueReplicationDelete { tag, .. } => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -568,9 +578,9 @@ mod tests {
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -595,7 +605,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert!(sink.is_empty(), "converged tag must not enqueue a push");
     }
@@ -609,9 +619,9 @@ mod tests {
         let manifest = put_blob_direct(&store, b"new-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -639,7 +649,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert_eq!(sink.len(), 1, "diverging tag must enqueue a push");
     }
@@ -655,11 +665,11 @@ mod tests {
         let manifest = put_blob_direct(&store, b"new-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[
-                    LinkOperation::create(LinkKind::Tag("v1".to_string()), manifest.clone()),
-                    LinkOperation::create(LinkKind::Tag("v2".to_string()), manifest.clone()),
-                    LinkOperation::create(LinkKind::Tag("v3".to_string()), manifest.clone()),
+                    LinkOperation::create(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone()),
+                    LinkOperation::create(LinkKind::Tag(Tag::new("v2").unwrap()), manifest.clone()),
+                    LinkOperation::create(LinkKind::Tag(Tag::new("v3").unwrap()), manifest.clone()),
                 ],
             )
             .await
@@ -682,12 +692,12 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         let mut tags: Vec<&str> = sink
             .iter()
             .filter_map(|action| match action {
-                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_str()),
+                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -708,9 +718,9 @@ mod tests {
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -742,7 +752,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert_eq!(
             sink.len(),
@@ -765,9 +775,9 @@ mod tests {
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -802,7 +812,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert!(
             sink.is_empty(),
@@ -819,8 +829,8 @@ mod tests {
 
         put_link_raw(
             &store,
-            NAMESPACE,
-            &LinkKind::Tag("broken".to_string()),
+            &namespace(),
+            &LinkKind::Tag(Tag::new("broken").unwrap()),
             b"not-a-link",
         )
         .await;
@@ -841,7 +851,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert!(
             sink.is_empty(),
@@ -859,9 +869,9 @@ mod tests {
         let manifest = put_blob_direct(&store, b"event-only-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -877,7 +887,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert!(sink.is_empty(), "event-only downstream must be skipped");
     }
@@ -891,9 +901,9 @@ mod tests {
         let manifest = put_blob_direct(&store, b"reconcile-only-bytes").await;
         metadata_store
             .update_links(
-                NAMESPACE,
+                &namespace(),
                 &[LinkOperation::create(
-                    LinkKind::Tag("v1".to_string()),
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
                     manifest.clone(),
                 )],
             )
@@ -914,7 +924,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut sink).await.unwrap();
+        checker.check(&namespace(), &mut sink).await.unwrap();
 
         assert_eq!(
             sink.len(),
@@ -1000,7 +1010,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, config_digest, layer_digest) =
-            seed_manifest(&store, &metadata_store, NAMESPACE).await;
+            seed_manifest(&store, &metadata_store, &namespace()).await;
 
         mount_out_of_sync_downstream(
             &mock_server,
@@ -1021,7 +1031,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
         let mut captured: Vec<Action> = Vec::new();
-        checker.check(NAMESPACE, &mut captured).await.unwrap();
+        checker.check(&namespace(), &mut captured).await.unwrap();
         assert_eq!(captured.len(), 1, "out-of-sync tag must emit one action");
         assert!(matches!(
             &captured[0],
@@ -1037,7 +1047,10 @@ mod tests {
             metadata_store.clone(),
             job_store.clone(),
         ));
-        checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
+        checker
+            .check(&namespace(), executor.as_mut())
+            .await
+            .unwrap();
         assert_eq!(
             job_store
                 .count_pending(Queue::Replication, 0)
@@ -1047,7 +1060,10 @@ mod tests {
             "the divergent tag must enqueue exactly one replication job"
         );
 
-        checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
+        checker
+            .check(&namespace(), executor.as_mut())
+            .await
+            .unwrap();
         assert_eq!(
             job_store
                 .count_pending(Queue::Replication, 0)
@@ -1097,7 +1113,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, _config_digest, _layer_digest) =
-            seed_manifest(&store, &metadata_store, NAMESPACE).await;
+            seed_manifest(&store, &metadata_store, &namespace()).await;
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1135,7 +1151,10 @@ mod tests {
             metadata_store.clone(),
             job_store.clone(),
         ));
-        checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
+        checker
+            .check(&namespace(), executor.as_mut())
+            .await
+            .unwrap();
         assert_eq!(
             job_store
                 .count_pending(Queue::Replication, 0)

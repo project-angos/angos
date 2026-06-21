@@ -24,7 +24,7 @@ pub use crate::registry_client::write::{DeleteManifestOutcome, PutManifestResult
 use crate::{
     cache::Cache,
     http_client::HttpClientBuilder,
-    oci::Digest,
+    oci::{Digest, MediaType},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader,
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -433,7 +433,7 @@ impl RegistryClient {
         &self,
         accepted_types: &[String],
         location: &str,
-    ) -> Result<(Option<String>, Digest, u64), Error> {
+    ) -> Result<(Option<MediaType>, Digest, u64), Error> {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
@@ -461,7 +461,7 @@ impl RegistryClient {
         &self,
         accepted_types: &[String],
         location: &str,
-    ) -> Result<(Option<String>, Digest, Vec<u8>), Error> {
+    ) -> Result<(Option<MediaType>, Digest, Vec<u8>), Error> {
         let response = self.query(&Method::GET, accepted_types, location).await?;
 
         if !response.status().is_success() {

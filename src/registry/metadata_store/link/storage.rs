@@ -8,16 +8,19 @@ use angos_tx_engine::{
     StorageError, error::Error as TxError, executor::DEFAULT_RETRY_BUDGET, transaction::Mutation,
 };
 
-use crate::registry::{
-    metadata_store::{Error, LinkKind, LinkMetadata, MetadataStore, tx_error_to_meta},
-    path_builder,
+use crate::{
+    oci::Namespace,
+    registry::{
+        metadata_store::{Error, LinkKind, LinkMetadata, MetadataStore, tx_error_to_meta},
+        path_builder,
+    },
 };
 
 impl MetadataStore {
     /// Read the stored [`LinkMetadata`] for `link` within `namespace`.
     pub async fn read_link_reference(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
@@ -31,7 +34,11 @@ impl MetadataStore {
     /// Cache-aware link read with no access-time side effect: serve from the
     /// link cache, else read through and populate it.
     #[instrument(skip(self))]
-    pub async fn read_link(&self, namespace: &str, link: &LinkKind) -> Result<LinkMetadata, Error> {
+    pub async fn read_link(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+    ) -> Result<LinkMetadata, Error> {
         if let Some(cached) = self.cache_get(namespace, link).await {
             return Ok(cached);
         }
@@ -47,7 +54,7 @@ impl MetadataStore {
     #[instrument(skip(self))]
     pub async fn read_link_recording_access(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
         let Some(writer) = &self.access_time_writer else {
@@ -62,11 +69,11 @@ impl MetadataStore {
 
     /// Mark the access time for `link` in `namespace` using a read-modify-write
     /// transaction, returning the updated [`LinkMetadata`]. Concurrent updaters
-    /// resolve via content-hash conflict detection — last writer wins, which is
+    /// resolve via content-hash conflict detection (last writer wins), which is
     /// fine for advisory access-time stamps.
     async fn update_link_access_time(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
@@ -111,7 +118,7 @@ impl MetadataStore {
     #[cfg(test)]
     pub async fn write_link_reference(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         link: &LinkKind,
         metadata: &LinkMetadata,
     ) -> Result<(), Error> {

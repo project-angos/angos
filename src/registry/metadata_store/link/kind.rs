@@ -2,12 +2,12 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::oci::{Digest, Reference};
+use crate::oci::{Digest, Reference, Tag};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum LinkKind {
     Blob(Digest),
-    Tag(String),
+    Tag(Tag),
     Digest(Digest),
     Layer(Digest),
     Config(Digest),
@@ -48,7 +48,7 @@ impl Display for LinkKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oci::Reference;
+    use crate::oci::{Reference, Tag};
 
     // Valid 64-char lowercase-hex sha256 hashes (the only shape `Digest` accepts).
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -60,8 +60,8 @@ mod tests {
 
     #[test]
     fn test_from_reference() {
-        let tag = Reference::Tag("tag".to_string());
-        let tag_link = LinkKind::Tag("tag".to_string());
+        let tag = Reference::Tag(Tag::new("tag").unwrap());
+        let tag_link = LinkKind::Tag(Tag::new("tag").unwrap());
         assert_eq!(LinkKind::from_reference(&tag), tag_link);
 
         let digest = Reference::Digest(sha(HASH_A));
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn is_tracked_returns_false_for_tag() {
-        assert!(!LinkKind::Tag("latest".to_string()).is_tracked());
+        assert!(!LinkKind::Tag(Tag::new("latest").unwrap()).is_tracked());
     }
 
     #[test]
@@ -108,7 +108,7 @@ mod tests {
     fn display_renders_expected_string_for_each_variant() {
         let cases = [
             (
-                LinkKind::Tag("v1.0.0".to_string()),
+                LinkKind::Tag(Tag::new("v1.0.0").unwrap()),
                 "tag:v1.0.0".to_string(),
             ),
             (LinkKind::Blob(sha(HASH_A)), format!("blob:sha256:{HASH_A}")),

@@ -27,9 +27,10 @@ use crate::{
         dispatcher::EventDispatcher,
         event::EventKind,
     },
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, MediaType, Namespace, Reference, Tag, UploadSessionId},
     registry::{
         Registry, RegistryConfig, blob_store,
+        blob_store::{BlobStore, BlobStoreConfig},
         job_store::{JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -56,7 +57,7 @@ impl FsRegistryFixture {
         let path = temp_dir.path().to_string_lossy().to_string();
 
         let blob_store = Arc::new(
-            blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+            BlobStoreConfig::FS(blob_store::FsBackendConfig {
                 root_dir: path.clone(),
                 sync_to_disk: false,
             })
@@ -104,20 +105,20 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
 }
 
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
-    let session_id = Uuid::new_v4();
+    let session_id = UploadSessionId::generate();
     registry
         .blob_store
-        .create_upload(namespace, &session_id.to_string())
+        .create_upload(namespace, session_id.as_ref())
         .await
         .unwrap();
 
     let body = content.to_vec();
-    let digest = Digest::from_bytes(&body);
+    let digest = Digest::sha256_of_bytes(&body);
     registry
         .complete_upload(
             None,
             namespace,
-            session_id,
+            &session_id,
             &digest,
             None,
             Some(body.len() as u64),
@@ -128,8 +129,8 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
     digest
 }
 
-/// Minimal valid OCI manifest bytes and its media-type string.
-async fn test_manifest_bytes(registry: &Registry, namespace: &Namespace) -> (Vec<u8>, String) {
+/// Minimal valid OCI manifest bytes and its media type.
+async fn test_manifest_bytes(registry: &Registry, namespace: &Namespace) -> (Vec<u8>, MediaType) {
     let config_content = b"{}";
     let config_digest = upload_blob(registry, namespace, config_content).await;
     let manifest = json!({
@@ -143,7 +144,7 @@ async fn test_manifest_bytes(registry: &Registry, namespace: &Namespace) -> (Vec
         "layers": []
     });
     let bytes = serde_json::to_vec(&manifest).unwrap();
-    let mime = "application/vnd.oci.image.manifest.v1+json".to_string();
+    let mime = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
     (bytes, mime)
 }
 
@@ -165,9 +166,10 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
             None,
             None,
             &namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -213,9 +215,10 @@ async fn digest_push_suppresses_tag_create_event() {
             None,
             None,
             &namespace,
-            Reference::Tag("seed".to_string()),
+            Reference::Tag(Tag::new("seed").unwrap()),
             mime_type.clone(),
             Cursor::new(manifest_bytes.clone()),
+            Vec::new(),
         )
         .await
         .expect("seed push");
@@ -237,6 +240,7 @@ async fn digest_push_suppresses_tag_create_event() {
             Reference::Digest(digest),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("digest push");
@@ -275,14 +279,15 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
             None,
             None,
             &namespace,
-            Reference::Tag("v1".to_string()),
+            Reference::Tag(Tag::new("v1").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("put manifest");
 
-    let reference = Reference::Tag("v1".to_string());
+    let reference = Reference::Tag(Tag::new("v1").unwrap());
     let response = fixture
         .registry
         .delete_manifest(None, None, &namespace, &reference)
@@ -325,9 +330,10 @@ async fn digest_delete_suppresses_tag_delete_event() {
             None,
             None,
             &namespace,
-            Reference::Tag("to-delete".to_string()),
+            Reference::Tag(Tag::new("to-delete").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("put manifest");
@@ -382,9 +388,10 @@ async fn tag_push_event_payload_has_all_required_fields() {
             None,
             None,
             &namespace,
-            Reference::Tag("stable".to_string()),
+            Reference::Tag(Tag::new("stable").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -413,8 +420,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
         "Event repository must not be empty"
     );
     assert_eq!(
-        tag_create.namespace,
-        namespace.to_string(),
+        tag_create.namespace, namespace,
         "Event namespace must match the pushed namespace"
     );
     assert_eq!(tag_create.tag.as_deref(), Some("stable"));
@@ -451,9 +457,10 @@ async fn tag_push_events_delivered_to_webhook_endpoint() {
             None,
             None,
             &namespace,
-            Reference::Tag("webhook-test".to_string()),
+            Reference::Tag(Tag::new("webhook-test").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -491,9 +498,10 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
             None,
             None,
             &namespace,
-            Reference::Tag("seed2".to_string()),
+            Reference::Tag(Tag::new("seed2").unwrap()),
             mime_type.clone(),
             Cursor::new(manifest_bytes.clone()),
+            Vec::new(),
         )
         .await
         .expect("seed push");
@@ -514,6 +522,7 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
             Reference::Digest(digest),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("digest push");
@@ -568,7 +577,7 @@ impl ReplicationFixture {
                 .access_time_debounce_secs(0)
                 .build(),
         );
-        let blob_store = Arc::new(blob_store::BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let repository =
             repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test"));
@@ -602,9 +611,10 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
             None,
             None,
             &namespace,
-            Reference::Tag("latest".to_string()),
+            Reference::Tag(Tag::new("latest").unwrap()),
             mime_type,
             Cursor::new(manifest_bytes),
+            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -644,7 +654,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
         .registry
         .put_manifest(
             &namespace,
-            &Reference::Tag("doomed".to_string()),
+            &Reference::Tag(Tag::new("doomed").unwrap()),
             Some(&mime_type),
             &manifest_bytes,
         )
@@ -666,7 +676,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
             None,
             None,
             &namespace,
-            &Reference::Tag("doomed".to_string()),
+            &Reference::Tag(Tag::new("doomed").unwrap()),
         )
         .await
         .expect("delete_manifest");

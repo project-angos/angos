@@ -6,14 +6,17 @@
 
 use tracing::warn;
 
-use crate::registry::metadata_store::{LinkKind, LinkMetadata, MetadataStore};
+use crate::{
+    oci::Namespace,
+    registry::metadata_store::{LinkKind, LinkMetadata, MetadataStore},
+};
 
 impl MetadataStore {
-    fn cache_key(namespace: &str, link: &LinkKind) -> String {
+    fn cache_key(namespace: &Namespace, link: &LinkKind) -> String {
         format!("link:{namespace}:{link}")
     }
 
-    pub async fn cache_get(&self, namespace: &str, link: &LinkKind) -> Option<LinkMetadata> {
+    pub async fn cache_get(&self, namespace: &Namespace, link: &LinkKind) -> Option<LinkMetadata> {
         if self.link_cache_ttl == 0 {
             return None;
         }
@@ -25,7 +28,7 @@ impl MetadataStore {
             .flatten()
     }
 
-    pub async fn cache_put(&self, namespace: &str, link: &LinkKind, metadata: &LinkMetadata) {
+    pub async fn cache_put(&self, namespace: &Namespace, link: &LinkKind, metadata: &LinkMetadata) {
         if self.link_cache_ttl == 0 {
             return;
         }
@@ -37,7 +40,7 @@ impl MetadataStore {
         }
     }
 
-    pub async fn cache_invalidate(&self, namespace: &str, link: &LinkKind) {
+    pub async fn cache_invalidate(&self, namespace: &Namespace, link: &LinkKind) {
         if let Some(cache) = &self.cache {
             let _ = cache.delete_value(&Self::cache_key(namespace, link)).await;
         }

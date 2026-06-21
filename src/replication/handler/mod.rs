@@ -14,7 +14,7 @@ use angos_tx_engine::transaction::Transaction;
 
 use crate::{
     metrics_provider::metrics_provider,
-    oci::{Digest, Namespace, Reference},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{
         blob_store::BlobStore,
         job_store::{Error, JobEnvelope, JobHandler, Queue},
@@ -42,10 +42,10 @@ pub const REPLICATION_DELETE_MANIFEST_KIND: &str = "replication.delete_manifest"
 pub struct ReplicationPushPayload {
     /// Local identifier of the target downstream (selects the `RegistryClient`).
     pub downstream: String,
-    pub namespace: String,
+    pub namespace: Namespace,
     /// Tag bound to the digest, when the change is tag-scoped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    pub tag: Option<Tag>,
     /// Serialized OCI digest: informational for pushes, authoritative for
     /// digest deletes and tag-less pushes, absent for a tag delete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,7 +249,7 @@ impl ReplicationJobHandler {
         if let Some(tag) = &payload.tag {
             match self
                 .metadata_store
-                .read_link_reference(namespace.as_ref(), &LinkKind::Tag(tag.clone()))
+                .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
                 .await
             {
                 Ok(link) => Ok(Some((link.target, link.created_at))),
@@ -270,7 +270,7 @@ impl ReplicationJobHandler {
             // A content-addressed digest carries no local version timestamp.
             match self
                 .metadata_store
-                .read_link_reference(namespace.as_ref(), &LinkKind::Digest(digest.clone()))
+                .read_link_reference(namespace, &LinkKind::Digest(digest.clone()))
                 .await
             {
                 Ok(_) => Ok(Some((digest, None))),
@@ -290,10 +290,8 @@ impl ReplicationJobHandler {
         envelope: &JobEnvelope,
         payload: &ReplicationPushPayload,
     ) -> Result<(), Error> {
-        let namespace = Namespace::new(&payload.namespace).map_err(|e| {
-            Error::Storage(format!("invalid namespace '{}': {e}", payload.namespace))
-        })?;
-        let downstream = self.resolve_downstream(&namespace, &payload.downstream)?;
+        let namespace = &payload.namespace;
+        let downstream = self.resolve_downstream(namespace, &payload.downstream)?;
         let registry_client = &downstream.registry_client;
         let max_concurrent_pushes = downstream.max_concurrent_pushes;
 
@@ -315,7 +313,7 @@ impl ReplicationJobHandler {
             let outcome = pipeline::delete_manifest(
                 registry_client,
                 &self.metadata_store,
-                namespace.as_ref(),
+                namespace,
                 &reference,
                 payload.source_ts.as_deref(),
             )
@@ -326,7 +324,7 @@ impl ReplicationJobHandler {
             // Re-resolving the digest at execute time gives latest-wins for a
             // coalesced job.
             let Some((digest, created_at)) =
-                self.resolve_current_digest(&namespace, payload).await?
+                self.resolve_current_digest(namespace, payload).await?
             else {
                 debug!(
                     namespace = %namespace,
@@ -351,7 +349,7 @@ impl ReplicationJobHandler {
                 downstream: registry_client,
                 blob_store: &self.blob_store,
                 metadata_store: &self.metadata_store,
-                namespace: namespace.as_ref(),
+                namespace,
                 max_concurrent_pushes,
                 source_ts: source_ts.as_deref(),
             };

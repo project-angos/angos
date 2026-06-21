@@ -1,7 +1,63 @@
-/// Collects all items from a paginated source into a single `Vec`.
+use std::future::Future;
+
+use crate::oci::Algorithm;
+
+/// Paginate across the per-algorithm shards of a sharded store
+/// (`<root>/<algorithm>/...`), resuming via an opaque `"<algorithm>:<cursor>"`
+/// token; algorithms never interleave in sort order, so each call lists at most
+/// one bounded page per prefix rather than re-enumerating every entry.
 ///
-/// `fetch` receives the current continuation token and returns the next page plus an optional
-/// next token. When the token is `None`, iteration stops.
+/// `fetch(algorithm, limit, cursor)` returns up to `limit` items from that
+/// prefix plus the backend's next cursor (`None` once exhausted); an unknown
+/// algorithm in the token restarts from the first prefix.
+pub async fn paginate_by_algorithm<T, E, Fetch, FetchFut>(
+    n: u16,
+    continuation_token: Option<String>,
+    mut fetch: Fetch,
+) -> Result<(Vec<T>, Option<String>), E>
+where
+    Fetch: FnMut(Algorithm, u16, Option<String>) -> FetchFut,
+    FetchFut: Future<Output = Result<(Vec<T>, Option<String>), E>>,
+{
+    let algorithms = Algorithm::supported_algorithms();
+    let (mut index, mut cursor) = continuation_token
+        .as_deref()
+        .and_then(|token| {
+            let (name, cursor) = match token.split_once(':') {
+                Some((name, cursor)) => (name, (!cursor.is_empty()).then(|| cursor.to_string())),
+                None => (token, None),
+            };
+            Some((algorithms.iter().position(|a| a.as_str() == name)?, cursor))
+        })
+        .unwrap_or((0, None));
+
+    let target = usize::from(n);
+    let mut items = Vec::with_capacity(target);
+    let mut next_token = None;
+    while index < algorithms.len() {
+        let algorithm = algorithms[index];
+        let limit = u16::try_from(target - items.len()).unwrap_or(u16::MAX);
+        let (page, page_cursor) = fetch(algorithm, limit, cursor.take()).await?;
+        items.extend(page);
+        match page_cursor {
+            Some(token) => cursor = Some(token),
+            None => index += 1,
+        }
+        if items.len() >= target {
+            next_token = match &cursor {
+                Some(token) => Some(format!("{algorithm}:{token}")),
+                None => algorithms.get(index).map(ToString::to_string),
+            };
+            break;
+        }
+    }
+
+    Ok((items, next_token))
+}
+
+/// Collects all items from a paginated source into a single `Vec`. `fetch`
+/// receives the current continuation token and returns the next page plus the
+/// next token (`None` stops iteration).
 pub async fn collect_all_pages<T, E, Fetch, FetchFut>(mut fetch: Fetch) -> Result<Vec<T>, E>
 where
     Fetch: FnMut(Option<String>) -> FetchFut,
@@ -70,6 +126,70 @@ pub fn paginate_sorted<T: Clone + ToString + Ord>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Per-algorithm fixture: sha256 holds [a, b, c], sha512 holds [d, e]. `fetch`
+    // lists up to `limit` entries from the named prefix after `cursor`.
+    async fn fixture_fetch(
+        algorithm: Algorithm,
+        limit: u16,
+        cursor: Option<String>,
+    ) -> Result<(Vec<String>, Option<String>), std::convert::Infallible> {
+        let items: &[&str] = match algorithm {
+            Algorithm::Sha256 => &["a", "b", "c"],
+            Algorithm::Sha512 => &["d", "e"],
+        };
+        let start = match cursor.as_deref() {
+            Some(c) => items
+                .iter()
+                .position(|i| *i == c)
+                .map_or(items.len(), |p| p + 1),
+            None => 0,
+        };
+        let end = (start + usize::from(limit)).min(items.len());
+        let page: Vec<String> = items[start..end].iter().map(|s| (*s).to_string()).collect();
+        let next = (end < items.len()).then(|| page.last().cloned()).flatten();
+        Ok((page, next))
+    }
+
+    #[tokio::test]
+    async fn paginate_by_algorithm_streams_across_prefixes() {
+        let mut all = Vec::new();
+        let mut marker = None;
+        loop {
+            let (page, next) = paginate_by_algorithm(1, marker, fixture_fetch)
+                .await
+                .unwrap();
+            assert!(page.len() <= 1);
+            all.extend(page);
+            match next {
+                Some(next_marker) => marker = Some(next_marker),
+                None => break,
+            }
+        }
+        assert_eq!(all, ["a", "b", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn paginate_by_algorithm_fills_pages_across_the_boundary() {
+        // A page larger than the first prefix spills into the next one.
+        let (page, token) = paginate_by_algorithm(4, None, fixture_fetch).await.unwrap();
+        assert_eq!(page, ["a", "b", "c", "d"]);
+        assert_eq!(token, Some("sha512:d".to_string()));
+
+        let (page, token) = paginate_by_algorithm(4, token, fixture_fetch)
+            .await
+            .unwrap();
+        assert_eq!(page, ["e"]);
+        assert!(token.is_none());
+    }
+
+    #[tokio::test]
+    async fn paginate_by_algorithm_unknown_token_restarts() {
+        let (page, _) = paginate_by_algorithm(2, Some("blake3:x".to_string()), fixture_fetch)
+            .await
+            .unwrap();
+        assert_eq!(page, ["a", "b"]);
+    }
 
     #[test]
     fn test_paginate_empty() {

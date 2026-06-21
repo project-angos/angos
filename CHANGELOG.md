@@ -12,11 +12,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - New `scrub --replication-orphans` and `scrub --cache-orphans` flags delete pending and dead-lettered replication and cache jobs whose downstream or pull-through repository is no longer configured.
 - New `scrub --orphan-namespaces` (`-n`) flag removes revisions, tags, and in-flight uploads for namespaces not owned by any configured repository and reclaims their layer/config blob bytes (combine with `--blobs` to also reclaim manifest blob bytes); it is destructive (dry-run first) and refuses to run when no repositories are configured.
 - Cross-repository blob mount (`POST /v2/{namespace}/blobs/uploads/?mount={digest}[&from={repository}]`) grants an already-present blob to the target namespace with no upload.
+- Blob and manifest pushes, pulls, and deletes now accept sha512 digests in addition to sha256.
+- A by-digest manifest push supports the `?tag=` query parameter to create one or more tags pointing at the pushed manifest, returning the accepted tags in an `OCI-Tag` response header.
 - The `_jobs` admin API accepts `?queue=cache|replication` (default `cache`), so failed replication jobs can be listed, retried, and deleted like cache jobs.
 - New `angos_replication_*` metrics (`angos_replication_push_total`, `angos_replication_last_success_timestamp_seconds`, `angos_replication_reconcile_total`) expose per-downstream push health and reconcile outcomes, and the existing `angos_job_queue_pending` gauge gains a `queue="replication"` series for the new replication queue backlog.
 - New server-published `angos_job_queue_failed{queue}` gauge reports dead-lettered jobs per queue, so replication failures stay observable even when `angos worker` drains the queue.
 - New `[global] allow_missing_manifest_references` knob (default `true`) accepts manifest pushes with absent or unowned references, leaving them unreadable; set `false` to reject with `MANIFEST_BLOB_UNKNOWN`.
 - New `[global] max_blob_size` knob (default `100GiB`) caps the total size of a single blob upload, rejecting a larger upload with `BLOB_UPLOAD_INVALID`.
+- Scrub `--tags` removes tag directories whose names violate the OCI tag grammar.
+- New `scrub --reconcile-blob-index` flag rebuilds blob-index grants missing relative to the manifests that reference each blob, repairing an index corrupted out-of-band; it reads every manifest, so it is expensive.
 
 ### Changed
 
@@ -28,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `[global.job_queue]` using the in-process `memory` lock strategy is now rejected at startup (breaking): set the metadata store's `lock_strategy` to `s3` or `redis`, or remove `[global.job_queue]` to use the in-process queue.
 - A blob-upload `POST` with a malformed `?digest=`, `?mount=`, or `?from=` now returns `400` instead of silently starting an upload session that ignores the value.
 - The `_catalog` listing is derived directly from stored content (deterministic and strongly consistent); the maintained namespace-registry index is removed and its now-unused `_registry/` objects are pruned by `scrub`.
+- Tags, repository names, upload session IDs, and manifest/descriptor media types are now strictly validated against their OCI grammars, so a request carrying a malformed value is rejected with `400` where an earlier version might have accepted it.
 
 ### Fixed
 

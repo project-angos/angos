@@ -7,8 +7,8 @@ use tracing::instrument;
 use crate::{
     configuration::RegexPattern,
     oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace,
-        Platform as OciPlatform, namespace_belongs_to,
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType,
+        Namespace, Platform as OciPlatform, Tag, namespace_belongs_to,
     },
     registry::{
         APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders, job_store,
@@ -80,7 +80,7 @@ impl From<OciPlatform> for ExtPlatform {
 #[derive(Serialize, Debug, Clone)]
 struct ParentRef {
     digest: String,
-    tags: Vec<String>,
+    tags: Vec<Tag>,
     #[serde(skip_serializing_if = "Option::is_none")]
     platform: Option<ExtPlatform>,
 }
@@ -90,7 +90,7 @@ struct ParentRef {
 struct ReferrerInfo {
     digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    artifact_type: Option<String>,
+    artifact_type: Option<MediaType>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     annotations: HashMap<String, String>,
 }
@@ -108,7 +108,7 @@ impl From<Descriptor> for ReferrerInfo {
 #[derive(Serialize, Debug)]
 struct ManifestEntry {
     digest: String,
-    tags: Vec<String>,
+    tags: Vec<Tag>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     parents: Vec<ParentRef>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -265,10 +265,8 @@ fn analyze_manifest(manifest: &Manifest) -> ManifestAnalysis {
 ///
 /// This is the pure aggregation step that follows the async I/O that resolves
 /// each tag to its target digest.
-fn build_digest_to_tags_map_from_pairs(
-    tag_links: Vec<(String, Digest)>,
-) -> HashMap<Digest, Vec<String>> {
-    let mut map: HashMap<Digest, Vec<String>> = HashMap::new();
+fn build_digest_to_tags_map_from_pairs(tag_links: Vec<(Tag, Digest)>) -> HashMap<Digest, Vec<Tag>> {
+    let mut map: HashMap<Digest, Vec<Tag>> = HashMap::new();
     for (tag, digest) in tag_links {
         map.entry(digest).or_default().push(tag);
     }
@@ -280,7 +278,7 @@ fn build_digest_to_tags_map_from_pairs(
 fn parent_refs_for(
     digest: &Digest,
     child_to_parents: &HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>>,
-    digest_to_tags: &HashMap<Digest, Vec<String>>,
+    digest_to_tags: &HashMap<Digest, Vec<Tag>>,
 ) -> Vec<ParentRef> {
     child_to_parents
         .get(digest)
@@ -609,7 +607,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         all_revisions: Vec<Digest>,
-        digest_to_tags: &HashMap<Digest, Vec<String>>,
+        digest_to_tags: &HashMap<Digest, Vec<Tag>>,
         child_to_parents: HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>>,
         mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>>,
     ) -> Vec<ManifestEntry> {
@@ -663,7 +661,7 @@ impl Registry {
     async fn build_digest_to_tags_map(
         &self,
         namespace: &Namespace,
-    ) -> Result<HashMap<Digest, Vec<String>>, Error> {
+    ) -> Result<HashMap<Digest, Vec<Tag>>, Error> {
         let all_tags = collect_all_pages(|last| async move {
             self.metadata_store
                 .list_tags(namespace, 1000, last)
@@ -672,7 +670,7 @@ impl Registry {
         })
         .await?;
 
-        let mut tag_links: Vec<(String, Digest)> = Vec::with_capacity(all_tags.len());
+        let mut tag_links: Vec<(Tag, Digest)> = Vec::with_capacity(all_tags.len());
         for tag in all_tags {
             let link = LinkKind::Tag(tag.clone());
             if let Ok(link_metadata) = self.metadata_store.read_link(namespace, &link).await {
@@ -720,8 +718,8 @@ mod tests {
         extract_docker_referrer, extract_in_toto_predicate, parent_refs_for,
     };
     use crate::oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest,
-        Platform as OciPlatform,
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType,
+        Platform as OciPlatform, Tag,
     };
 
     fn digest(hex_suffix: &str) -> Digest {
@@ -734,9 +732,13 @@ mod tests {
         digest("abc1")
     }
 
+    fn media_type(value: &str) -> MediaType {
+        MediaType::new(value).unwrap()
+    }
+
     fn descriptor_with_annotations(annotations: HashMap<String, String>) -> Descriptor {
         Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: test_digest(),
             size: 0,
             annotations,
@@ -749,7 +751,7 @@ mod tests {
         let layers: Vec<Descriptor> = layer_annotations
             .into_iter()
             .map(|ann| Descriptor {
-                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                media_type: media_type("application/vnd.oci.image.layer.v1.tar+gzip"),
                 digest: test_digest(),
                 size: 0,
                 annotations: ann,
@@ -836,8 +838,9 @@ mod tests {
             subject.to_string(),
         )]));
         descriptor.digest = child.clone();
-        descriptor.artifact_type =
-            Some("application/vnd.dev.cosign.artifact.sig.v1+json".to_string());
+        descriptor.artifact_type = Some(media_type(
+            "application/vnd.dev.cosign.artifact.sig.v1+json",
+        ));
 
         let candidate = extract_docker_referrer(&descriptor).expect("should return Some");
         assert_eq!(candidate.subject, subject);
@@ -875,7 +878,7 @@ mod tests {
             features: None,
         };
         let child = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: child_digest.clone(),
             size: 0,
             annotations: HashMap::new(),
@@ -902,7 +905,7 @@ mod tests {
         let subject = digest("beef");
         let child_digest = digest("cafe");
         let child = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: child_digest.clone(),
             size: 0,
             annotations: HashMap::from([(
@@ -931,7 +934,7 @@ mod tests {
         let index_child_digest = digest("1234");
 
         let referrer_child = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: referrer_digest.clone(),
             size: 0,
             annotations: HashMap::from([(
@@ -942,7 +945,7 @@ mod tests {
             platform: None,
         };
         let index_child = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
             digest: index_child_digest.clone(),
             size: 0,
             annotations: HashMap::new(),
@@ -976,23 +979,27 @@ mod tests {
     #[test]
     fn build_digest_to_tags_map_single_tag_maps_to_its_digest() {
         let d = digest("1111");
-        let result = build_digest_to_tags_map_from_pairs(vec![("latest".to_string(), d.clone())]);
+        let result =
+            build_digest_to_tags_map_from_pairs(vec![(Tag::new("latest").unwrap(), d.clone())]);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[&d], vec!["latest".to_string()]);
+        assert_eq!(result[&d], vec![Tag::new("latest").unwrap()]);
     }
 
     #[test]
     fn build_digest_to_tags_map_multiple_tags_for_same_digest_are_grouped() {
         let d = digest("2222");
         let pairs = vec![
-            ("v1.0".to_string(), d.clone()),
-            ("latest".to_string(), d.clone()),
+            (Tag::new("v1.0").unwrap(), d.clone()),
+            (Tag::new("latest").unwrap(), d.clone()),
         ];
         let result = build_digest_to_tags_map_from_pairs(pairs);
         assert_eq!(result.len(), 1);
         let mut tags = result[&d].clone();
         tags.sort_unstable();
-        assert_eq!(tags, vec!["latest".to_string(), "v1.0".to_string()]);
+        assert_eq!(
+            tags,
+            vec![Tag::new("latest").unwrap(), Tag::new("v1.0").unwrap()]
+        );
     }
 
     #[test]
@@ -1000,13 +1007,13 @@ mod tests {
         let d1 = digest("aaaa");
         let d2 = digest("bbbb");
         let pairs = vec![
-            ("alpha".to_string(), d1.clone()),
-            ("beta".to_string(), d2.clone()),
+            (Tag::new("alpha").unwrap(), d1.clone()),
+            (Tag::new("beta").unwrap(), d2.clone()),
         ];
         let result = build_digest_to_tags_map_from_pairs(pairs);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[&d1], vec!["alpha".to_string()]);
-        assert_eq!(result[&d2], vec!["beta".to_string()]);
+        assert_eq!(result[&d1], vec![Tag::new("alpha").unwrap()]);
+        assert_eq!(result[&d2], vec![Tag::new("beta").unwrap()]);
     }
 
     // --- parent_refs_for ---
@@ -1014,7 +1021,7 @@ mod tests {
     #[test]
     fn parent_refs_for_returns_empty_when_digest_not_in_parent_map() {
         let child_to_parents: HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>> = HashMap::new();
-        let digest_to_tags: HashMap<Digest, Vec<String>> = HashMap::new();
+        let digest_to_tags: HashMap<Digest, Vec<Tag>> = HashMap::new();
         let result = parent_refs_for(&digest("cccc"), &child_to_parents, &digest_to_tags);
         assert!(result.is_empty());
     }
@@ -1024,7 +1031,7 @@ mod tests {
         let child = digest("cccc");
         let parent = digest("dddd");
         let child_to_parents = HashMap::from([(child.clone(), vec![(parent.clone(), None)])]);
-        let digest_to_tags: HashMap<Digest, Vec<String>> = HashMap::new();
+        let digest_to_tags: HashMap<Digest, Vec<Tag>> = HashMap::new();
 
         let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
         assert_eq!(result.len(), 1);
@@ -1038,11 +1045,11 @@ mod tests {
         let child = digest("eeee");
         let parent = digest("ffff");
         let child_to_parents = HashMap::from([(child.clone(), vec![(parent.clone(), None)])]);
-        let digest_to_tags = HashMap::from([(parent.clone(), vec!["v2".to_string()])]);
+        let digest_to_tags = HashMap::from([(parent.clone(), vec![Tag::new("v2").unwrap()])]);
 
         let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].tags, vec!["v2".to_string()]);
+        assert_eq!(result[0].tags, vec![Tag::new("v2").unwrap()]);
     }
 
     #[test]
@@ -1062,7 +1069,7 @@ mod tests {
                 (parent_b.clone(), Some(platform.clone())),
             ],
         )]);
-        let digest_to_tags: HashMap<Digest, Vec<String>> = HashMap::new();
+        let digest_to_tags: HashMap<Digest, Vec<Tag>> = HashMap::new();
 
         let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
         assert_eq!(result.len(), 2);
