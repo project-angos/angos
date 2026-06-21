@@ -79,7 +79,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--uploads <duration>`    | `-u`   | Check upload sessions: remove broken or partial state and uploads older than the given duration (e.g., `1h`, `30m`, `2d`) |
 | `--multipart <duration>`  | `-p`   | Cleanup orphan S3 multipart uploads older than duration (S3 only)                                  |
 | `--tags`                  | `-t`   | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
-| `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |
+| `--manifests`             | `-m`   | Recreate missing/mismatched manifest links; report (never delete) references to missing config/layer blobs or index children |
 | `--blobs`                 | `-b`   | Remove orphaned blobs and prune stale blob-index entries                                           |
 | `--retention`             | `-r`   | Enforce retention policies                                                                         |
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |

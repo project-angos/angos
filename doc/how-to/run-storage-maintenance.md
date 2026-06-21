@@ -30,7 +30,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | Flag                          | Description                                                                                        |
 |-------------------------------|----------------------------------------------------------------------------------------------------|
 | `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
-| `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
+| `-m, --manifests`             | Recreate missing/mismatched manifest links; **report** (never delete) references to missing config/layer blobs or index children — pull-through/partial pulls legitimately lack them |
 | `-b, --blobs`                 | Remove orphaned (unreferenced) blobs; prune stale blob-index entries for deleted namespaces        |
 | `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
 | `-u, --uploads <duration>`    | Check upload sessions: remove broken or partial state and uploads older than the given duration    |
