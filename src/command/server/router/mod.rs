@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use hyper::{Method, Uri};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -74,11 +74,12 @@ fn digest_from_params(params: Option<&str>) -> Option<Digest> {
 
 /// Repeated `tag` query parameters for the distribution-spec tag-on-push
 /// feature. Each value deserializes through `Tag`, so an invalid tag fails the
-/// parse and rejects the route.
+/// parse and rejects the route. The `BTreeSet` drops duplicate values so a
+/// repeated tag is linked, echoed in `OCI-Tag`, and event-emitted only once.
 #[derive(Deserialize, Default)]
 struct TagQuery {
     #[serde(default)]
-    tag: Vec<Tag>,
+    tag: BTreeSet<Tag>,
 }
 
 #[derive(Deserialize, Default)]
@@ -304,9 +305,12 @@ fn try_find_manifests(method: &Method, path: &str, params: Option<&str>) -> Opti
                     Reference::Digest(digest) => {
                         let tags = match params {
                             Some(p) => parse_query::<TagQuery>(p)?.tag,
-                            None => Vec::new(),
+                            None => BTreeSet::new(),
                         };
-                        ManifestPutTarget::Digest { digest, tags }
+                        ManifestPutTarget::Digest {
+                            digest,
+                            tags: tags.into_iter().collect(),
+                        }
                     }
                 };
                 return Some(Action::PutManifest { namespace, target });

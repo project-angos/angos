@@ -533,6 +533,27 @@ fn test_parse_put_manifest_by_digest_with_tag_params() {
 }
 
 #[test]
+fn test_parse_put_manifest_by_digest_dedups_repeated_tag_params() {
+    let method = Method::PUT;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/foo/manifests/{digest}?tag=a&tag=a&tag=b")
+        .parse()
+        .unwrap();
+    let Some(Action::PutManifest {
+        target: ManifestPutTarget::Digest { tags, .. },
+        ..
+    }) = parse(&method, &uri)
+    else {
+        panic!("a by-digest PUT must produce a Digest target");
+    };
+    assert_eq!(
+        tags,
+        vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()],
+        "a repeated `?tag=` value is de-duplicated"
+    );
+}
+
+#[test]
 fn test_parse_put_manifest_by_digest_invalid_tag_param_rejected() {
     let method = Method::PUT;
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
