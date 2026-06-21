@@ -236,6 +236,15 @@ impl ManifestPutTarget {
             Self::Digest { tags, .. } => tags,
         }
     }
+
+    /// Decompose into the addressed reference and the extra `?tag=` tags (empty
+    /// for a by-tag push, whose only tag is the reference itself).
+    pub fn into_parts(self) -> (Reference, Vec<Tag>) {
+        match self {
+            Self::Tag(tag) => (Reference::Tag(tag), Vec::new()),
+            Self::Digest { digest, tags } => (Reference::Digest(digest), tags),
+        }
+    }
 }
 
 impl Serialize for ManifestPutTarget {

@@ -20,7 +20,7 @@
 //! Scope: this is the *additive* half of a reconcile. It restores entries the
 //! index is missing; it does not remove stale entries whose backing link no
 //! longer exists (a leak, not data loss). Bare self-ownership `Blob` grants are
-//! also out of scope — they are transient and not derivable from manifest
+//! also out of scope: they are transient and not derivable from manifest
 //! content; a manifest-referenced blob is pinned by its tracked link regardless.
 
 use std::sync::Arc;

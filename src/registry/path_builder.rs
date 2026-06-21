@@ -15,6 +15,21 @@ pub fn repository_dir() -> &'static str {
     REPOS_ROOT
 }
 
+/// Storage prefix for a namespace's repository subtree addressed by its raw
+/// on-disk name, so scrub can reclaim a directory whose name fails `Namespace`
+/// validation (out-of-band corruption). Returns `None` when a path segment is
+/// empty, `.`, or `..`, which could escape the repositories root.
+pub fn namespace_dir(name: &str) -> Option<String> {
+    if name.is_empty()
+        || name
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return None;
+    }
+    Some(format!("{REPOS_ROOT}/{name}"))
+}
+
 fn blob_dir(digest: &Digest) -> String {
     format!(
         "{BLOBS_ROOT}/{}/{}/{}",
@@ -267,6 +282,21 @@ mod tests {
             upload_start_date_path(&ns, "uuid"),
             "v2/repositories/ns/_uploads/uuid/startedat"
         );
+    }
+
+    #[test]
+    fn test_namespace_dir() {
+        assert_eq!(namespace_dir("ns").unwrap(), "v2/repositories/ns");
+        assert_eq!(namespace_dir("org/app").unwrap(), "v2/repositories/org/app");
+        // Uppercase fails `Namespace` validation but is safe as a directory name.
+        assert_eq!(namespace_dir("BadNS").unwrap(), "v2/repositories/BadNS");
+        // Empty, traversal, and empty-segment names are rejected.
+        for unsafe_name in ["", "..", ".", "a/../b", "a//b", "/a", "a/", "a/."] {
+            assert!(
+                namespace_dir(unsafe_name).is_none(),
+                "'{unsafe_name}' must be rejected"
+            );
+        }
     }
 
     #[test]

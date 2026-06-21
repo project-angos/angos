@@ -160,6 +160,18 @@ impl BlobStore {
         Ok(())
     }
 
+    /// Delete a namespace's repository subtree (its in-flight uploads) by raw
+    /// on-disk name, so scrub can reclaim an upload directory whose name fails
+    /// `Namespace` validation.
+    #[instrument(skip(self))]
+    pub async fn delete_namespace_directory(&self, name: &str) -> Result<(), Error> {
+        let prefix = path_builder::namespace_dir(name).ok_or_else(|| {
+            Error::InvalidFormat(format!("unsafe namespace directory name: '{name}'"))
+        })?;
+        self.store.delete_prefix(&prefix).await?;
+        Ok(())
+    }
+
     /// Write `body` directly at the content-addressed blob path, for small
     /// in-memory content (manifest bodies); layer blobs use the streaming upload
     /// lifecycle instead. Idempotent (the digest fixes path and bytes); callers

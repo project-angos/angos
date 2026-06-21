@@ -69,6 +69,16 @@ pub enum Action {
         namespace: Namespace,
         tag: String,
     },
+    /// Reclaim a manifest namespace whose raw on-disk name fails `Namespace`
+    /// validation, removing its repository subtree by prefix.
+    DeleteInvalidNamespace {
+        name: String,
+    },
+    /// Reclaim an upload-only namespace whose raw on-disk name fails `Namespace`
+    /// validation, removing its upload subtree by prefix.
+    DeleteInvalidUploadNamespace {
+        name: String,
+    },
     DeleteOrphanManifest {
         namespace: Namespace,
         digest: Digest,
@@ -203,6 +213,12 @@ impl fmt::Display for Action {
             }
             Action::DeleteInvalidTag { namespace, tag } => {
                 write!(f, "delete invalid tag directory '{namespace}:{tag}'")
+            }
+            Action::DeleteInvalidNamespace { name } => {
+                write!(f, "delete invalid namespace directory '{name}'")
+            }
+            Action::DeleteInvalidUploadNamespace { name } => {
+                write!(f, "delete invalid upload namespace directory '{name}'")
             }
             Action::DeleteOrphanManifest { namespace, digest } => {
                 write!(f, "delete orphan manifest '{namespace}@{digest}' (policy)")

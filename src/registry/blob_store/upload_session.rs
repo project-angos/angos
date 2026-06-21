@@ -67,6 +67,17 @@ const CHECKPOINT_DIR_SEGMENT: &str = "sha256";
 /// carrying data, before deciding whether to short-circuit or stream.
 const PEEK_FRAME_SIZE: usize = 8 * 1024;
 
+/// How an append seeds its hasher.
+enum HashStart {
+    /// Rebuild every supported algorithm from the persisted checkpoint, for a
+    /// chunked upload whose target algorithm was unknown during PATCH.
+    Resume,
+    /// Start a single algorithm fresh, for a monolithic PUT whose algorithm is
+    /// known up front and which has no prior checkpointed bytes, so the other
+    /// algorithms are never computed.
+    Fresh(Algorithm),
+}
+
 /// In-memory reconstruction of an upload's progress, assembled from the
 /// per-file artifacts under the upload container. The `session_id` equals the
 /// upload `uuid` so the existing `(namespace, uuid)` addressing maps 1:1
@@ -267,27 +278,90 @@ impl BlobStore {
         Ok(uuid.to_string())
     }
 
+    /// Append the final chunk of a chunked upload and return its digest under
+    /// `algorithm` (whose value fixes the canonical blob path) plus the total
+    /// size. Resumes the both-algorithm checkpoint, so an upload whose algorithm
+    /// was unknown during PATCH can be finalized under any supported algorithm.
     #[instrument(skip(self, stream))]
     pub async fn write_upload(
         &self,
         namespace: &Namespace,
         uuid: &str,
-        mut stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
         algorithm: Algorithm,
     ) -> Result<(Digest, u64), Error> {
+        let (hasher, size) = self
+            .append(namespace, uuid, stream, content_length, HashStart::Resume)
+            .await?;
+        Ok((hasher.digest(algorithm)?, size))
+    }
+
+    /// Write a single-shot (monolithic) upload whose `algorithm` is known up
+    /// front and which has no prior chunked writes, hashing only the target so
+    /// the other supported algorithms are never computed. Returns the digest and
+    /// total size.
+    #[instrument(skip(self, stream))]
+    pub async fn write_monolithic_upload(
+        &self,
+        namespace: &Namespace,
+        uuid: &str,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: Option<u64>,
+        algorithm: Algorithm,
+    ) -> Result<(Digest, u64), Error> {
+        let (hasher, size) = self
+            .append(
+                namespace,
+                uuid,
+                stream,
+                content_length,
+                HashStart::Fresh(algorithm),
+            )
+            .await?;
+        Ok((hasher.digest(algorithm)?, size))
+    }
+
+    /// Append a chunk to a chunked upload without finalizing, resuming the
+    /// both-algorithm checkpoint, and return the live hasher plus the new total.
+    /// PATCH discards the hasher; the digest is finalized at the PUT.
+    #[instrument(skip(self, stream))]
+    pub async fn append_upload(
+        &self,
+        namespace: &Namespace,
+        uuid: &str,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: Option<u64>,
+    ) -> Result<(Hasher, u64), Error> {
+        self.append(namespace, uuid, stream, content_length, HashStart::Resume)
+            .await
+    }
+
+    /// Append `stream` to the session, persisting the updated hash state and
+    /// size, and return the live hasher fed by the full body so far plus the new
+    /// total. `start` selects whether the hasher resumes every algorithm from
+    /// the checkpoint or starts a single algorithm fresh.
+    async fn append(
+        &self,
+        namespace: &Namespace,
+        uuid: &str,
+        mut stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: Option<u64>,
+        start: HashStart,
+    ) -> Result<(Hasher, u64), Error> {
         let mut record = self.read_session(namespace, uuid).await?;
+        let hasher = match start {
+            HashStart::Resume => HashState::from_bytes(&record.hash_context)?.into_hasher()?,
+            HashStart::Fresh(algorithm) => Hasher::for_algorithm(algorithm),
+        };
 
         if content_length == Some(0) {
-            let digest = HashState::from_bytes(&record.hash_context)?
-                .into_hasher()?
-                .digest(algorithm)?;
-            return Ok((digest, record.uploaded_size));
+            return Ok((hasher, record.uploaded_size));
         }
 
         // A chunked finalize (`None`) with an empty body must short-circuit like
         // the `Some(0)` branch instead of doing a backend round-trip for zero
-        // bytes. Peek one frame: on immediate EOF return the resumed digest; on
+        // bytes. Peek one frame: on immediate EOF return the seeded hasher; on
         // data, chain the peeked bytes back ahead of the remaining stream so the
         // hashing reader sees the full body (mirrors the backend's staged-remainder
         // chaining).
@@ -298,17 +372,13 @@ impl BlobStore {
                 .await
                 .map_err(|e| Error::StorageBackend(e.to_string()))?;
             if peek.is_empty() {
-                let digest = HashState::from_bytes(&record.hash_context)?
-                    .into_hasher()?
-                    .digest(algorithm)?;
-                return Ok((digest, record.uploaded_size));
+                return Ok((hasher, record.uploaded_size));
             }
             Box::new(Cursor::new(peek.freeze()).chain(stream))
         } else {
             stream
         };
 
-        let hasher = HashState::from_bytes(&record.hash_context)?.into_hasher()?;
         let hashing_reader = HashingReader::new(stream, hasher);
         let (body_stream, finish) = hashing_stream(hashing_reader, content_length);
 
@@ -333,7 +403,7 @@ impl BlobStore {
         record.started_at = Utc::now();
         self.write_session(&record).await?;
 
-        Ok((hasher.digest(algorithm)?, new_size))
+        Ok((hasher, new_size))
     }
 
     #[instrument(skip(self))]

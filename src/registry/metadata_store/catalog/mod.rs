@@ -323,6 +323,19 @@ impl MetadataStore {
             .map_err(Error::from)
     }
 
+    /// Delete a namespace's entire repository subtree by raw on-disk name. Used
+    /// by scrub to reclaim a directory whose name fails `Namespace` validation
+    /// and so cannot form typed links for a per-link delete.
+    pub async fn delete_namespace_directory(&self, name: &str) -> Result<(), Error> {
+        let prefix = path_builder::namespace_dir(name).ok_or_else(|| {
+            Error::InvalidData(format!("unsafe namespace directory name: '{name}'"))
+        })?;
+        self.store()
+            .delete_prefix(&prefix)
+            .await
+            .map_err(Error::from)
+    }
+
     /// Walk the repository tree under `root_path` and yield every path that is a
     /// namespace, i.e. has a `_manifests` child (an `_uploads`-only path is
     /// skipped). `_`-prefixed children are never descended into, so

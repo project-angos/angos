@@ -69,7 +69,7 @@ impl MetadataStore {
 
     /// Mark the access time for `link` in `namespace` using a read-modify-write
     /// transaction, returning the updated [`LinkMetadata`]. Concurrent updaters
-    /// resolve via content-hash conflict detection — last writer wins, which is
+    /// resolve via content-hash conflict detection (last writer wins), which is
     /// fine for advisory access-time stamps.
     async fn update_link_access_time(
         &self,

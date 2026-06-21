@@ -147,12 +147,19 @@ impl StoreChecker for OrphanNamespaceChecker {
             if self.resolver.resolve(&namespace).is_some() {
                 continue;
             }
-            let namespace = match Namespace::new(&namespace) {
-                Ok(namespace) => namespace,
-                Err(e) => {
-                    error!("Skipping invalid enumerated namespace '{namespace}': {e}");
-                    continue;
+            // A name that fails `Namespace` validation cannot form typed links,
+            // yet its on-disk directory is exactly the out-of-band corruption
+            // this checker exists to reclaim, so remove it by raw prefix.
+            let Ok(namespace) = Namespace::new(&namespace) else {
+                if let Err(e) = sink
+                    .apply(Action::DeleteInvalidNamespace {
+                        name: namespace.clone(),
+                    })
+                    .await
+                {
+                    error!("Failed to reclaim invalid orphan namespace '{namespace}': {e}");
                 }
+                continue;
             };
             if let Err(e) = self.clear_namespace(&namespace, sink).await {
                 error!("Failed to clear orphan namespace '{namespace}': {e}");
@@ -166,12 +173,16 @@ impl StoreChecker for OrphanNamespaceChecker {
             if self.resolver.resolve(&namespace).is_some() {
                 continue;
             }
-            let namespace = match Namespace::new(&namespace) {
-                Ok(namespace) => namespace,
-                Err(e) => {
-                    error!("Skipping invalid enumerated upload namespace '{namespace}': {e}");
-                    continue;
+            let Ok(namespace) = Namespace::new(&namespace) else {
+                if let Err(e) = sink
+                    .apply(Action::DeleteInvalidUploadNamespace {
+                        name: namespace.clone(),
+                    })
+                    .await
+                {
+                    error!("Failed to reclaim invalid orphan upload namespace '{namespace}': {e}");
                 }
+                continue;
             };
             if let Err(e) = self.clear_uploads(&namespace, sink).await {
                 error!("Failed to clear orphan namespace uploads '{namespace}': {e}");
@@ -188,6 +199,8 @@ impl StoreChecker for OrphanNamespaceChecker {
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
+
+    use bytes::Bytes;
 
     use super::OrphanNamespaceChecker;
     use crate::{
@@ -721,6 +734,83 @@ mod tests {
                     Action::DeleteExpiredUpload { namespace, .. } if namespace == "ghost/app"
                 )),
                 "the in-flight upload of the orphan namespace must be swept"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaims_invalidly_named_orphan_namespace() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            // Seed a raw namespace whose name fails `Namespace` validation
+            // (uppercase). A `_manifests` descendant makes the catalog walk
+            // enumerate it; this is the out-of-band corruption scrub must reclaim.
+            let key = "v2/repositories/BadNS/_manifests/revisions/sha256/dead/link";
+            metadata_store
+                .store()
+                .put(key, Bytes::from_static(b"sha256:dead"))
+                .await
+                .unwrap();
+            let (catalog, _) = metadata_store.list_namespaces(100, None).await.unwrap();
+            assert!(
+                catalog.iter().any(|n| n == "BadNS"),
+                "the invalid namespace must enumerate before the sweep; got: {catalog:?}"
+            );
+
+            let checker = OrphanNamespaceChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                resolver(&["keep"]),
+            );
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            checker.check_all(&mut executor).await.unwrap();
+
+            assert!(
+                metadata_store.store().get(key).await.is_err(),
+                "the invalidly-named namespace directory must be reclaimed"
+            );
+            let (catalog, _) = metadata_store.list_namespaces(100, None).await.unwrap();
+            assert!(
+                !catalog.iter().any(|n| n == "BadNS"),
+                "the reclaimed namespace must drop out of the catalog; got: {catalog:?}"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_captures_invalid_namespace_reclaim_without_mutating() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            let key = "v2/repositories/BadNS/_manifests/revisions/sha256/dead/link";
+            metadata_store
+                .store()
+                .put(key, Bytes::from_static(b"sha256:dead"))
+                .await
+                .unwrap();
+
+            let checker = OrphanNamespaceChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                resolver(&["keep"]),
+            );
+            let mut sink: Vec<Action> = Vec::new();
+            checker.check_all(&mut sink).await.unwrap();
+
+            assert!(
+                sink.iter().any(
+                    |a| matches!(a, Action::DeleteInvalidNamespace { name } if name == "BadNS")
+                ),
+                "the invalid orphan namespace reclaim must be captured"
+            );
+            assert!(
+                metadata_store.store().get(key).await.is_ok(),
+                "a capturing sink must not mutate storage"
             );
             test_case.cleanup().await;
         }

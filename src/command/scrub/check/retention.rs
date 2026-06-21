@@ -202,15 +202,14 @@ impl RetentionChecker {
         namespace: &Namespace,
         tag_names: &[Tag],
     ) -> Result<Vec<TagWithMetadata>, Error> {
-        let results: Result<Vec<TagWithMetadata>, Error> = join_all(
+        join_all(
             tag_names
                 .iter()
                 .map(|tag| self.fetch_single_tag_metadata(namespace, tag.clone())),
         )
         .await
         .into_iter()
-        .collect();
-        results
+        .collect()
     }
 
     async fn fetch_single_tag_metadata(

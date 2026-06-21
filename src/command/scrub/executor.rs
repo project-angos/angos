@@ -306,6 +306,22 @@ impl Executor {
         Ok(())
     }
 
+    /// Reclaim a manifest namespace whose name fails `Namespace` validation: it
+    /// cannot form typed links, so its repository subtree is removed by prefix.
+    async fn delete_invalid_namespace(&self, name: String) -> Result<(), Error> {
+        self.metadata_store
+            .delete_namespace_directory(&name)
+            .await?;
+        Ok(())
+    }
+
+    /// Reclaim an upload-only namespace whose name fails `Namespace` validation
+    /// by removing its upload subtree from the blob store.
+    async fn delete_invalid_upload_namespace(&self, name: String) -> Result<(), Error> {
+        self.blob_store.delete_namespace_directory(&name).await?;
+        Ok(())
+    }
+
     async fn delete_orphan_manifest(
         &self,
         namespace: Namespace,
@@ -483,6 +499,10 @@ impl ActionSink for Executor {
             Action::DeleteTag { namespace, tag } => self.delete_tag(namespace, tag).await,
             Action::DeleteInvalidTag { namespace, tag } => {
                 self.delete_invalid_tag(namespace, tag).await
+            }
+            Action::DeleteInvalidNamespace { name } => self.delete_invalid_namespace(name).await,
+            Action::DeleteInvalidUploadNamespace { name } => {
+                self.delete_invalid_upload_namespace(name).await
             }
             Action::DeleteOrphanManifest { namespace, digest } => {
                 self.delete_orphan_manifest(namespace, digest).await

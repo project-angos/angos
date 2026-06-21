@@ -156,8 +156,9 @@ pub async fn cache_blob_mutations(
     blob_store
         .create_upload(&namespace, session_id.as_ref())
         .await?;
+    // A single-shot copy of a known blob: hash only the target algorithm.
     blob_store
-        .write_upload(
+        .write_monolithic_upload(
             &namespace,
             session_id.as_ref(),
             stream,

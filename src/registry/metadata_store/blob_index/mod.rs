@@ -1,8 +1,8 @@
 //! The blob-index domain: cross-namespace blob reference tracking.
 //!
 //! Holds the [`BlobIndex`] / [`BlobIndexOperation`] value types, the read/write
-//! methods over the per-namespace shards, and the shard operations ([`shard`] —
-//! both the pure in-memory layer and the store read-modify-write).
+//! methods over the per-namespace shards, and the shard operations ([`shard`]):
+//! both the pure in-memory layer and the store read-modify-write.
 
 use std::collections::{HashMap, HashSet};
 

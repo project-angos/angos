@@ -3,7 +3,7 @@ use tracing::{instrument, warn};
 
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
-    oci::{Algorithm, Digest, Namespace, UploadSessionId},
+    oci::{Digest, Namespace, UploadSessionId},
     registry::{
         DOCKER_UPLOAD_UUID, Error, HeaderMap, Registry, ResponseHeaders,
         blob_ownership::BlobOwnership,
@@ -395,17 +395,10 @@ impl Registry {
             .await?;
 
         let bounded = self.bound_blob_stream(summary.size, content_length, stream);
-        // PATCH only needs the running size; the digest is computed at the final
-        // PUT, so the algorithm here is immaterial.
+        // PATCH only needs the running size; the digest is finalized at the PUT.
         let (_, size) = self
             .blob_store
-            .write_upload(
-                namespace,
-                &session_key,
-                Box::new(bounded),
-                content_length,
-                Algorithm::Sha256,
-            )
+            .append_upload(namespace, &session_key, Box::new(bounded), content_length)
             .await?;
 
         self.reject_if_oversized(namespace, &session_key, size)
@@ -471,16 +464,30 @@ impl Registry {
                 .await);
         }
 
-        let (upload_digest, new_total) = self
-            .blob_store
-            .write_upload(
-                namespace,
-                &session_key,
-                Box::new(stream),
-                content_length,
-                digest.algorithm(),
-            )
-            .await?;
+        // A monolithic PUT (no prior chunked writes) knows its algorithm up
+        // front, so hash only the target; a chunked finalize must resume the
+        // both-algorithm checkpoint left by its PATCHes.
+        let (upload_digest, new_total) = if has_prior_writes {
+            self.blob_store
+                .write_upload(
+                    namespace,
+                    &session_key,
+                    Box::new(stream),
+                    content_length,
+                    digest.algorithm(),
+                )
+                .await?
+        } else {
+            self.blob_store
+                .write_monolithic_upload(
+                    namespace,
+                    &session_key,
+                    Box::new(stream),
+                    content_length,
+                    digest.algorithm(),
+                )
+                .await?
+        };
 
         self.reject_if_oversized(namespace, &session_key, new_total)
             .await?;
@@ -1356,6 +1363,50 @@ mod tests {
             assert!(namespace_links.contains(&LinkKind::Blob(expected_digest.clone())));
 
             test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_monolithic_complete_upload_without_prior_patch() {
+        // The whole body arrives in the final PUT with no prior PATCH, so
+        // completion takes the monolithic path that hashes only the target
+        // algorithm; verify it produces the correct digest for both.
+        for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
+            for test_case in backends() {
+                let registry = test_case.registry();
+                let namespace = &Namespace::new("test-repo").unwrap();
+                let content = b"monolithic upload body";
+                let session_id = UploadSessionId::generate();
+
+                registry
+                    .blob_store
+                    .create_upload(namespace, session_id.as_ref())
+                    .await
+                    .unwrap();
+
+                let expected_digest = Digest::from_bytes(algorithm, content);
+                let response = registry
+                    .complete_upload(
+                        None,
+                        namespace,
+                        &session_id,
+                        &expected_digest,
+                        None,
+                        Some(content.len() as u64),
+                        Cursor::new(content.to_vec()),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    response.headers[DOCKER_CONTENT_DIGEST],
+                    expected_digest.to_string()
+                );
+                let stored = registry.blob_store.read(&expected_digest).await.unwrap();
+                assert_eq!(stored, content);
+
+                test_case.cleanup().await;
+            }
         }
     }
 
