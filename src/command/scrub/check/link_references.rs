@@ -2,18 +2,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{
     command::scrub::{
         action::Action,
-        check::{NamespaceChecker, list_all},
+        check::{NamespaceChecker, list_all, orphan_on_missing_manifest},
         error::Error,
         executor::ActionSink,
     },
     oci::{Digest, Namespace},
     registry::{
-        blob_store,
         blob_store::BlobStore,
         metadata_store::{self, LinkKind, MetadataStore},
         parse_manifest_digests,
@@ -39,18 +38,15 @@ impl LinkReferencesChecker {
         revision: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        let content = match self.blob_store.read(revision).await {
-            Ok(content) => content,
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                warn!("Manifest blob missing for revision {revision}; removing revision link");
-                return sink
-                    .apply(Action::DeleteOrphanManifest {
-                        namespace: namespace.clone(),
-                        digest: revision.clone(),
-                    })
-                    .await;
-            }
-            Err(e) => return Err(e.into()),
+        let Some(content) = orphan_on_missing_manifest(
+            self.blob_store.read(revision).await,
+            namespace,
+            revision,
+            sink,
+        )
+        .await?
+        else {
+            return Ok(());
         };
 
         let manifest = parse_manifest_digests(&content, None)?;

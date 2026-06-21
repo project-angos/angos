@@ -1,18 +1,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
     command::scrub::{
-        action::Action,
-        check::{TagChecker, ensure_link},
+        check::{TagChecker, ensure_link, orphan_on_missing_manifest},
         error::Error,
         executor::ActionSink,
     },
     oci::{Namespace, Tag},
     registry::{
-        blob_store,
         blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
     },
@@ -44,36 +42,24 @@ impl TagChecker for DigestLinkChecker {
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking digest link for tag '{namespace}:{tag}'");
-        let tag_metadata = self
+        let target = self
             .metadata_store
             .read_link(namespace, &LinkKind::Tag(tag.clone()))
-            .await?;
+            .await?
+            .target;
 
-        match self.blob_store.size(&tag_metadata.target).await {
-            Ok(_) => {
-                let digest_link = LinkKind::Digest(tag_metadata.target.clone());
-                ensure_link(
-                    &self.metadata_store,
-                    namespace,
-                    &digest_link,
-                    &tag_metadata.target,
-                    sink,
-                )
-                .await
-            }
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                warn!(
-                    "Tag '{namespace}:{tag}' targets missing blob '{}'; removing",
-                    tag_metadata.target
-                );
-                sink.apply(Action::DeleteOrphanManifest {
-                    namespace: namespace.clone(),
-                    digest: tag_metadata.target,
-                })
-                .await
-            }
-            Err(e) => Err(e.into()),
+        // Existence is enough here, so probe with `size`; a missing manifest
+        // blob makes the tag's revision an orphan.
+        let probe = self.blob_store.size(&target).await;
+        if orphan_on_missing_manifest(probe, namespace, &target, sink)
+            .await?
+            .is_none()
+        {
+            return Ok(());
         }
+
+        let digest_link = LinkKind::Digest(target.clone());
+        ensure_link(&self.metadata_store, namespace, &digest_link, &target, sink).await
     }
 }
 

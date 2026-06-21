@@ -21,7 +21,7 @@ pub use blob::BlobChecker;
 pub use blob_index::BlobIndexChecker;
 pub use layout::LayoutChecker;
 pub use link_references::LinkReferencesChecker;
-pub use link_repair::ensure_link;
+pub use link_repair::{ensure_link, orphan_on_missing_manifest};
 pub use manifest::ManifestChecker;
 pub use media_type::MediaTypeChecker;
 pub use multipart::MultipartChecker;
