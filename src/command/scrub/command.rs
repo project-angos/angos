@@ -1,24 +1,24 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
 use argh::FromArgs;
-use futures_util::{StreamExt, future::join_all};
-use tracing::{error, info, warn};
+use futures_util::future::join_all;
+use tokio::sync::{Mutex, Semaphore};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
     command::{
         bootstrap,
         scrub::{
-            action::Action,
-            check::{LayoutChecker, NamespaceChecker, StoreChecker, TagChecker, list_all},
+            context::{Ctx, DEFAULT_FANOUT, ScrubFlags},
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
-            setup::{self, LabeledStoreCheckers},
+            node::{self, NodeParts},
+            scheduler, setup,
         },
         worker::runner::run_once,
     },
     configuration::Configuration,
-    oci::{Namespace, Tag},
     registry::{
         blob_store::BlobStore,
         job_store::{JobHandler, JobStore, Queue},
@@ -101,39 +101,65 @@ pub struct Options {
     /// that lost last-writer-wins), reclaiming the bytes when it was the last
     /// reference
     pub orphan_grants: Option<humantime::Duration>,
+    #[argh(switch)]
+    /// structural job reconcile: drop dangling `_jobs/index` lock-key entries
+    /// whose pending envelope has vanished. With --prune-unknown it also removes
+    /// unknown-named queue directories. Independent of the config-drift orphan
+    /// sweeps (--replication-orphans / --cache-orphans)
+    pub jobs: bool,
+    #[argh(switch)]
+    /// opt-in: also delete structurally-invalid objects scrub would otherwise
+    /// only report — invalid-named namespaces and unknown job-queue directories.
+    /// Off by default so no existing flag ever deletes more than before. Run
+    /// with -d first
+    pub prune_unknown: bool,
 }
 
 pub struct Command {
-    metadata_store: Arc<MetadataStore>,
-    namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
-    /// Per-tag checkers driven by the tag walk in `scrub_metadata`, run before
-    /// the namespace checkers so the invalid-tag gate and per-tag checks precede
-    /// the aggregate tag checks. `None` when `--tags` is absent.
-    tag_checkers: Option<Vec<Box<dyn TagChecker>>>,
-    /// Storage-layout migration pass (legacy blob-index -> sharded, legacy
-    /// namespace-registry prune). `None` unless `--migrate` is set, since it
-    /// scans every blob and is a one-time migration, not a routine consistency
-    /// repair.
-    layout_checker: Option<LayoutChecker>,
-    /// Store-wide checkers (blobs, orphan grants/namespaces/jobs, multipart),
-    /// each paired with a stable label for failure attribution, pre-ordered by
-    /// [`setup::store_checkers`] and applied in one pass.
-    store_checkers: LabeledStoreCheckers,
-    sink: Box<dyn ActionSink + Send>,
-    /// Drains reconcile-enqueued replication jobs in-process, since no running
-    /// worker is assumed; a transiently failing push is rescheduled with backoff
-    /// onto the durable queue for a worker or a later run. `None` when dry-run or
-    /// `--replicate` is absent.
-    replication_drain: Option<ReplicationDrain>,
+    /// Shared context (stores, sink, flags, semaphore) threaded into every node.
+    ctx: Arc<Ctx>,
+    /// The pre-built checkers and drain. Constructed in `new`, consumed by
+    /// `build_nodes` in `run` (hence `Option` + `take`).
+    parts: Option<NodeParts>,
 }
 
 /// Consumer queue and handler for draining reconcile-enqueued replication jobs
 /// in-process. `concurrency` bounds the parallel claim loops so a cold-mirror
 /// reconcile does not push one tag at a time.
-struct ReplicationDrain {
+pub(crate) struct ReplicationDrain {
     consumer: Arc<JobStore>,
     handler: Box<dyn JobHandler>,
     concurrency: NonZeroUsize,
+}
+
+impl ReplicationDrain {
+    /// Drains reconcile-enqueued replication jobs with up to
+    /// `max_concurrent_replication_jobs` concurrent claim loops. A loop ends when
+    /// no claimable job remains, so jobs already backed off to a future time are
+    /// intentionally not awaited. Consuming `self` because it is the `replicate`
+    /// node's `FnOnce` body.
+    pub(crate) async fn drain(self) {
+        info!(
+            "Draining enqueued replication jobs to convergence ({} concurrent)",
+            self.concurrency
+        );
+        let loops = (0..self.concurrency.get()).map(|_| async {
+            let mut drained: u64 = 0;
+            loop {
+                match run_once(&self.consumer, self.handler.as_ref(), Queue::Replication).await {
+                    Ok(true) => drained += 1,
+                    Ok(false) => break,
+                    Err(e) => {
+                        warn!("Failed to claim a replication job during drain: {e}");
+                        break;
+                    }
+                }
+            }
+            drained
+        });
+        let drained: u64 = join_all(loops).await.into_iter().sum();
+        info!("Replication drain complete: processed {drained} job(s)");
+    }
 }
 
 impl Command {
@@ -149,6 +175,9 @@ impl Command {
         )
         .await?;
 
+        // Reuse the existing checker builders verbatim; the only orchestration
+        // change is that the store-wide checkers are now distinct nodes (their
+        // order is encoded as DAG deps) instead of one labeled vec.
         let namespace_checkers = setup::namespace_checkers(
             options,
             config,
@@ -160,8 +189,15 @@ impl Command {
         let layout_checker = options
             .migrate
             .then(|| setup::layout_checker(&blob_backend));
-        let store_checkers =
-            setup::store_checkers(options, &blob_backend, &metadata_store, &repositories)?;
+        let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
+        let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
+        let orphan_grant_checker =
+            setup::orphan_grant_checker(options, &blob_backend, &metadata_store)?;
+        let orphan_namespace_checker =
+            setup::orphan_namespace_checker(options, &blob_backend, &metadata_store, &repositories);
+        let orphan_job_checkers =
+            setup::orphan_job_checkers(options, &metadata_store, &repositories);
+        let job_checker = setup::job_checker(options, &metadata_store);
 
         // One `Arc<JobStore>` serves as both producer (Executor enqueue) and
         // consumer (end-of-run drain). Building the queue is cheap, so every
@@ -193,14 +229,33 @@ impl Command {
             Box::new(executor)
         };
 
-        Ok(Self {
+        let opts = ScrubFlags::from_options(options)?;
+
+        let ctx = Arc::new(Ctx {
+            blob_store: blob_backend,
             metadata_store,
+            resolver: repositories,
+            sink: Arc::new(Mutex::new(sink)),
+            opts,
+            sem: Arc::new(Semaphore::new(DEFAULT_FANOUT)),
+        });
+
+        let parts = NodeParts {
+            layout_checker,
             namespace_checkers,
             tag_checkers,
-            layout_checker,
-            store_checkers,
-            sink,
+            blob_checker,
+            multipart_checker,
+            orphan_grant_checker,
+            orphan_namespace_checker,
+            orphan_job_checkers,
+            job_checker,
             replication_drain,
+        };
+
+        Ok(Self {
+            ctx,
+            parts: Some(parts),
         })
     }
 
@@ -226,148 +281,32 @@ impl Command {
         }
     }
 
+    /// Build the enabled-node set from the flags and run it as a DAG. The DAG
+    /// edges encode main's observable order (see `node.rs`): metadata and
+    /// orphan-namespaces before the blob GC, grants after blob, the replication
+    /// drain after the orphan-job sweep. After every node completes, the access
+    /// times accumulated by the Executor are flushed, exactly as the old
+    /// sequential `run` did.
     pub async fn run(&mut self) -> Result<(), Error> {
-        self.migrate_storage_layout().await?;
-        self.scrub_metadata().await?;
-        // Store-wide checkers run in the order `setup::store_checkers` built
-        // them: orphan-namespace clearing frees manifest bytes for the blob
-        // reclaim, and the orphan-job sweep precedes the replication drain so
-        // the drain does not churn orphaned jobs through retries first.
-        self.scrub_store().await;
-        self.drain_replication_jobs().await;
-        self.metadata_store.flush_access_times().await;
+        let parts = self
+            .parts
+            .take()
+            .expect("Command::run called more than once");
+        let nodes = node::build_nodes(&self.ctx, parts);
+        scheduler::run_dag(nodes, self.ctx.sem.clone()).await;
+        self.ctx.metadata_store.flush_access_times().await;
         Ok(())
-    }
-
-    async fn migrate_storage_layout(&mut self) -> Result<(), Error> {
-        let Some(layout_checker) = &self.layout_checker else {
-            return Ok(());
-        };
-        if let Err(e) = layout_checker.check_all(self.sink.as_mut()).await {
-            warn!("Storage layout migration checker failed: {e}");
-        }
-        Ok(())
-    }
-
-    async fn scrub_metadata(&mut self) -> Result<(), Error> {
-        // Clone the Arc so the namespace stream borrows a local, leaving `self`
-        // free for the `&mut self` per-namespace methods called in the loop.
-        let metadata_store = self.metadata_store.clone();
-        let mut namespaces = list_all::namespaces(&metadata_store);
-        while let Some(namespace) = namespaces.next().await {
-            let namespace = namespace?;
-            let namespace = match Namespace::new(&namespace) {
-                Ok(namespace) => namespace,
-                Err(e) => {
-                    warn!("Skipping invalid enumerated namespace '{namespace}': {e}");
-                    continue;
-                }
-            };
-            if let Err(e) = self.scrub_tags(&namespace).await {
-                warn!("Tag scrub failed for namespace '{namespace}': {e}");
-            }
-            for i in 0..self.namespace_checkers.len() {
-                if let Err(e) = self.namespace_checkers[i]
-                    .check(&namespace, self.sink.as_mut())
-                    .await
-                {
-                    warn!("Scrub checker failed for namespace '{namespace}': {e}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Walks a namespace's tags once: an invalid name is deleted and skipped, a
-    /// valid tag is dispatched to each enabled per-tag checker. Runs before the
-    /// aggregate namespace checkers.
-    async fn scrub_tags(&mut self, namespace: &Namespace) -> Result<(), Error> {
-        let Some(tag_checkers) = &self.tag_checkers else {
-            return Ok(());
-        };
-        let mut names = list_all::unparsed_tags(&self.metadata_store, namespace);
-        while let Some(name) = names.next().await {
-            let name = name?;
-            let tag = match Tag::try_from(name.as_str()) {
-                Ok(tag) => tag,
-                Err(reason) => {
-                    warn!("Deleting invalid tag directory '{namespace}:{name}': {reason}");
-                    if let Err(e) = self
-                        .sink
-                        .apply(Action::DeleteInvalidTag {
-                            namespace: namespace.clone(),
-                            tag: name,
-                        })
-                        .await
-                    {
-                        error!("Failed to delete invalid tag directory in '{namespace}': {e}");
-                    }
-                    continue;
-                }
-            };
-            for checker in tag_checkers {
-                if let Err(e) = checker.check_tag(namespace, &tag, self.sink.as_mut()).await {
-                    error!("Tag check failed for '{namespace}:{tag}': {e}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Apply every enabled store-wide checker in order, logging and continuing
-    /// past a failed checker (scrub is best-effort).
-    async fn scrub_store(&mut self) {
-        for i in 0..self.store_checkers.len() {
-            let (name, checker) = &self.store_checkers[i];
-            if let Err(e) = checker.check_all(self.sink.as_mut()).await {
-                warn!("Store scrub checker '{name}' failed: {e}");
-            }
-        }
-    }
-
-    /// Drains reconcile-enqueued replication jobs with up to
-    /// `max_concurrent_replication_jobs` concurrent claim loops. A loop ends when
-    /// no claimable job remains, so jobs already backed off to a future time are
-    /// intentionally not awaited.
-    async fn drain_replication_jobs(&mut self) {
-        let Some(drain) = &self.replication_drain else {
-            return;
-        };
-
-        info!(
-            "Draining enqueued replication jobs to convergence ({} concurrent)",
-            drain.concurrency
-        );
-        let loops = (0..drain.concurrency.get()).map(|_| async {
-            let mut drained: u64 = 0;
-            loop {
-                match run_once(&drain.consumer, drain.handler.as_ref(), Queue::Replication).await {
-                    Ok(true) => drained += 1,
-                    Ok(false) => break,
-                    Err(e) => {
-                        warn!("Failed to claim a replication job during drain: {e}");
-                        break;
-                    }
-                }
-            }
-            drained
-        });
-        let drained: u64 = join_all(loops).await.into_iter().sum();
-        info!("Replication drain complete: processed {drained} job(s)");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
-    #[tokio::test]
-    async fn test_command_new_with_valid_config() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().to_string_lossy().to_string();
-
+    /// A minimal valid fs-backed configuration with an empty retention policy.
+    fn test_config(path: &str) -> Configuration {
         let config_content = format!(
             r#"
             [blob_store.fs]
@@ -389,19 +328,19 @@ mod tests {
             rules = []
             "#
         );
+        toml::from_str(&config_content).unwrap()
+    }
 
-        let config: Configuration = toml::from_str(&config_content).unwrap();
-
-        let options = Options {
+    /// All-false `Options` so each test toggles only the flags it cares about.
+    fn base_options() -> Options {
+        Options {
             dry_run: true,
-            uploads: Some(humantime::Duration::from(std::time::Duration::from_hours(
-                1,
-            ))),
+            uploads: None,
             multipart: None,
-            tags: true,
-            manifests: true,
-            blobs: true,
-            retention: true,
+            tags: false,
+            manifests: false,
+            blobs: false,
+            retention: false,
             links: false,
             reconcile_blob_index: false,
             migrate: false,
@@ -412,25 +351,115 @@ mod tests {
             cache_orphans: false,
             orphan_namespaces: false,
             orphan_grants: None,
-        };
+            jobs: false,
+            prune_unknown: false,
+        }
+    }
 
-        let command = Command::new(&options, &config).await;
-
-        assert!(command.is_ok());
-        let cmd = command.unwrap();
-        // retention, uploads, manifests = 3 namespace checkers (the tag walk is
-        // a free function driven by `tag_checkers`, not a namespace checker)
-        assert_eq!(cmd.namespace_checkers.len(), 3);
-        // `tags` is enabled, so the per-tag checkers are present.
-        assert!(cmd.tag_checkers.is_some());
-        // `blobs` is the only store-wide checker enabled by these options.
-        assert_eq!(cmd.store_checkers.len(), 1);
-        // `--migrate` is absent, so the layout migration pass is not built.
-        assert!(cmd.layout_checker.is_none());
+    /// Build the command and project its node set to an id -> deps map so tests
+    /// can assert the flag -> DAG mapping without depending on node internals.
+    async fn node_map(
+        options: &Options,
+        config: &Configuration,
+    ) -> HashMap<&'static str, Vec<&'static str>> {
+        let mut cmd = Command::new(options, config).await.unwrap();
+        let parts = cmd.parts.take().unwrap();
+        node::build_nodes(&cmd.ctx, parts)
+            .into_iter()
+            .map(|n| (n.id, n.deps.to_vec()))
+            .collect()
     }
 
     #[tokio::test]
-    async fn scrub_metadata_deletes_invalid_tag_directory() {
+    async fn command_new_builds_the_expected_node_set_and_edges() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let config = test_config(&path);
+
+        // The flags from the former structural test: tags + manifests + blobs +
+        // retention + uploads (dry-run). The metadata-scoped steps collapse into
+        // one `metadata` node; `blobs` is the only store node, and it depends on
+        // the metadata barrier (orphan-namespaces is absent, so that edge drops).
+        let options = Options {
+            uploads: Some(humantime::Duration::from(std::time::Duration::from_hours(
+                1,
+            ))),
+            tags: true,
+            manifests: true,
+            blobs: true,
+            retention: true,
+            ..base_options()
+        };
+
+        let nodes = node_map(&options, &config).await;
+
+        let mut ids: Vec<&str> = nodes.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["blob", "metadata"]);
+        // The blob node always declares the metadata + orphan-namespaces + migrate
+        // barrier; the scheduler drops the edges to the absent orphan-namespaces
+        // and migrate nodes.
+        assert_eq!(
+            nodes.get("blob").unwrap(),
+            &vec!["metadata", "orphan-namespaces", "migrate"]
+        );
+        // `--migrate` is absent, so no migration node is built.
+        assert!(!nodes.contains_key("migrate"));
+    }
+
+    #[tokio::test]
+    async fn no_flags_builds_no_nodes() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let config = test_config(&path);
+
+        let nodes = node_map(&base_options(), &config).await;
+        assert!(nodes.is_empty(), "no flags => no nodes: {nodes:?}");
+    }
+
+    #[tokio::test]
+    async fn store_node_edges_match_main_ordering() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let config = test_config(&path);
+
+        // Enable every store-side flag (no repositories configured means the
+        // orphan-namespace gate refuses, matching its safety guard, so it is
+        // intentionally absent here). Assert the dependency edges that encode
+        // main's observable order survive even when a dep node is absent.
+        let options = Options {
+            blobs: true,
+            multipart: Some(humantime::Duration::from(std::time::Duration::from_hours(
+                1,
+            ))),
+            orphan_grants: Some(humantime::Duration::from(std::time::Duration::from_hours(
+                1,
+            ))),
+            manifests: true,
+            ..base_options()
+        };
+
+        let nodes = node_map(&options, &config).await;
+
+        // metadata -> blob barrier (migrate edge present but its node absent here).
+        assert_eq!(
+            nodes.get("blob").unwrap(),
+            &vec!["metadata", "orphan-namespaces", "migrate"]
+        );
+        // blob -> orphan-grants.
+        assert_eq!(nodes.get("orphan-grants").unwrap(), &vec!["blob"]);
+        // multipart is independent.
+        assert_eq!(nodes.get("multipart").unwrap(), &Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn metadata_node_deletes_invalid_tag_directory() {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
@@ -448,56 +477,230 @@ mod tests {
         )
         .unwrap();
 
-        let config_content = format!(
-            r#"
-            [blob_store.fs]
-            root_dir = "{path}"
+        let config = test_config(&path);
 
-            [metadata_store.fs]
-            root_dir = "{path}"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-
-            [global.retention_policy]
-            rules = []
-            "#
-        );
-
-        let config: Configuration = toml::from_str(&config_content).unwrap();
-
+        // Only `--tags`, mutate (not dry-run). The single enabled node is
+        // `metadata`; running the DAG exercises the real metadata node body,
+        // including the invalid-tag gate. Behavioral assertion unchanged.
         let options = Options {
             dry_run: false,
-            uploads: None,
-            multipart: None,
             tags: true,
-            manifests: false,
-            blobs: false,
-            retention: false,
-            links: false,
-            reconcile_blob_index: false,
-            migrate: false,
-            media_types: false,
-            referrers: false,
-            replicate: false,
-            replication_orphans: false,
-            cache_orphans: false,
-            orphan_namespaces: false,
-            orphan_grants: None,
+            ..base_options()
         };
 
         let mut cmd = Command::new(&options, &config).await.unwrap();
-        cmd.scrub_metadata().await.unwrap();
+        cmd.run().await.unwrap();
 
         assert!(
             !std::path::Path::new(&tag_dir).exists(),
             "scrub must delete the invalid tag directory"
+        );
+    }
+
+    /// `--jobs` builds an independent `jobs` node; it does not gate or depend on
+    /// the metadata/blob barrier or the config-drift orphan-jobs sweep.
+    #[tokio::test]
+    async fn jobs_flag_builds_independent_jobs_node() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let config = test_config(&path);
+
+        let options = Options {
+            jobs: true,
+            ..base_options()
+        };
+
+        let nodes = node_map(&options, &config).await;
+
+        let mut ids: Vec<&str> = nodes.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["jobs"]);
+        assert_eq!(nodes.get("jobs").unwrap(), &Vec::<&str>::new());
+    }
+
+    /// Plants an invalid-named namespace (uppercase fails the `Namespace`
+    /// grammar) carrying a `_manifests` marker so `list_all_namespaces`
+    /// enumerates it, and returns its metadata subtree path.
+    fn plant_invalid_namespace(path: &str) -> String {
+        let ns_dir = format!("{path}/v2/repositories/BADNS");
+        std::fs::create_dir_all(format!("{ns_dir}/_manifests/revisions")).unwrap();
+        std::fs::write(format!("{ns_dir}/_manifests/revisions/marker"), b"x").unwrap();
+        ns_dir
+    }
+
+    /// Without `--prune-unknown` an invalid-named namespace is report-only: the
+    /// metadata walk warns and skips it, leaving the directory in place
+    /// (main's behavior).
+    #[tokio::test]
+    async fn metadata_node_keeps_invalid_namespace_without_prune_unknown() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let ns_dir = plant_invalid_namespace(&path);
+        let config = test_config(&path);
+
+        // `--manifests` builds the metadata node and mutates (not dry-run), but
+        // `--prune-unknown` is OFF, so no namespace deletion may occur.
+        let options = Options {
+            dry_run: false,
+            manifests: true,
+            prune_unknown: false,
+            ..base_options()
+        };
+
+        let mut cmd = Command::new(&options, &config).await.unwrap();
+        cmd.run().await.unwrap();
+
+        assert!(
+            std::path::Path::new(&ns_dir).exists(),
+            "without --prune-unknown an invalid-named namespace must survive"
+        );
+    }
+
+    /// With `--prune-unknown` (and not dry-run) the metadata walk reclaims the
+    /// invalid-named namespace's subtree.
+    #[tokio::test]
+    async fn metadata_node_deletes_invalid_namespace_under_prune_unknown() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let ns_dir = plant_invalid_namespace(&path);
+        let config = test_config(&path);
+
+        let options = Options {
+            dry_run: false,
+            manifests: true,
+            prune_unknown: true,
+            ..base_options()
+        };
+
+        let mut cmd = Command::new(&options, &config).await.unwrap();
+        cmd.run().await.unwrap();
+
+        assert!(
+            !std::path::Path::new(&ns_dir).exists(),
+            "--prune-unknown must delete the invalid-named namespace's subtree"
+        );
+    }
+
+    /// `-l` now visits **link-only** namespaces (those carrying `_layers`/`_config`
+    /// but no `_manifests`), the accepted behavioral counterpart to `-u` reaching
+    /// upload-only namespaces. On main, the metadata walk keyed off `_manifests`
+    /// (`list_namespaces`), so a manifest-less namespace was never enumerated and
+    /// `-l` skipped it. With `list_all_namespaces`, the walk now reaches it, so
+    /// `LinkReferencesChecker` prunes the orphan layer link's phantom referrer and
+    /// cascade-deletes the now referrer-less link. This is strictly-more-correct
+    /// cleanup of links whose owning manifests are already gone.
+    #[tokio::test]
+    async fn links_flag_reaps_orphan_link_in_link_only_namespace() {
+        use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+        use futures_util::StreamExt;
+        use tempfile::TempDir;
+
+        use crate::{
+            oci::{Digest, Namespace},
+            registry::{
+                metadata_store::{LinkKind, LinkOperation},
+                test_utils,
+            },
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+
+        // Plant a link-only namespace over the same FS root the command will read:
+        // a `_layers` link whose sole referrer is a phantom (no `Digest` link) and
+        // no `_manifests` content, so `list_namespaces` (the catalog) excludes it
+        // and main's `-l` would have skipped it.
+        let link_only = Namespace::new("link-only/orphan").unwrap();
+        let phantom =
+            Digest::sha256("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                .unwrap();
+        {
+            let object: Arc<dyn ObjectStore> =
+                Arc::new(StorageFsBackend::builder(path.as_str()).build());
+            let executor = test_utils::build_test_fs_executor(path.as_str(), false);
+            let metadata_store = test_utils::metadata_store_over(object, executor);
+
+            let layer = test_utils::put_blob_direct(metadata_store.store(), b"orphan layer").await;
+            metadata_store
+                .update_links(
+                    &link_only,
+                    &[LinkOperation::create_with_referrer(
+                        LinkKind::Layer(layer.clone()),
+                        layer.clone(),
+                        phantom.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            // The link-only namespace is absent from the catalog (keyed off
+            // `_manifests`), confirming main's `-l` would never have visited it.
+            let (catalog, _) = metadata_store.list_namespaces(1000, None).await.unwrap();
+            assert!(
+                !catalog.contains(&link_only.to_string()),
+                "the planted namespace must be link-only (absent from the catalog)"
+            );
+        }
+
+        let config = test_config(&path);
+
+        // Only `--links`, mutate (not dry-run). The single enabled node is
+        // `metadata`; running the DAG exercises the real metadata node body over
+        // `list_all_namespaces`, which now reaches the link-only namespace.
+        let options = Options {
+            dry_run: false,
+            links: true,
+            ..base_options()
+        };
+
+        let mut cmd = Command::new(&options, &config).await.unwrap();
+        cmd.run().await.unwrap();
+
+        // Re-open the store and assert the orphan layer link was reclaimed: its
+        // only referrer was a phantom, so pruning it left no referrers and the
+        // executor cascade-deleted the link.
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder(path.as_str()).build());
+        let executor = test_utils::build_test_fs_executor(path.as_str(), false);
+        let metadata_store = test_utils::metadata_store_over(object, executor);
+        let mut layers =
+            crate::command::scrub::check::list_all::layer_links(&metadata_store, &link_only);
+        assert!(
+            layers.next().await.is_none(),
+            "-l must reclaim the orphan layer link in a link-only namespace"
+        );
+    }
+
+    /// Under `--prune-unknown` but dry-run, the invalid-named namespace must
+    /// survive: `-d` previews, never mutates.
+    #[tokio::test]
+    async fn metadata_node_dry_run_keeps_invalid_namespace_under_prune_unknown() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let ns_dir = plant_invalid_namespace(&path);
+        let config = test_config(&path);
+
+        let options = Options {
+            dry_run: true,
+            manifests: true,
+            prune_unknown: true,
+            ..base_options()
+        };
+
+        let mut cmd = Command::new(&options, &config).await.unwrap();
+        cmd.run().await.unwrap();
+
+        assert!(
+            std::path::Path::new(&ns_dir).exists(),
+            "dry-run must not delete the invalid-named namespace even under --prune-unknown"
         );
     }
 }

@@ -6,10 +6,10 @@ use tracing::{info, warn};
 use crate::{
     command::scrub::{
         check::{
-            BlobChecker, BlobIndexChecker, DigestLinkChecker, LayoutChecker, LinkReferencesChecker,
-            ManifestChecker, MediaTypeChecker, MultipartChecker, NamespaceChecker,
-            OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue,
-            ReferrerChecker, ReplicationChecker, RetentionChecker, StoreChecker, TagChecker,
+            BlobChecker, BlobIndexChecker, DigestLinkChecker, JobChecker, LayoutChecker,
+            LinkReferencesChecker, ManifestChecker, MediaTypeChecker, MultipartChecker,
+            NamespaceChecker, OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker,
+            OrphanQueue, ReferrerChecker, ReplicationChecker, RetentionChecker, TagChecker,
             UploadChecker,
         },
         command::Options,
@@ -22,10 +22,6 @@ use crate::{
         repository_resolver::RepositoryResolver,
     },
 };
-
-/// Store-wide checkers paired with a stable label used to name a failing checker
-/// in the scrub log.
-pub type LabeledStoreCheckers = Vec<(&'static str, Box<dyn StoreChecker>)>;
 
 fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
     if config.rules.is_empty() {
@@ -112,8 +108,8 @@ pub fn namespace_checkers(
 }
 
 /// The per-tag checkers enabled by `--tags`, or `None` when tag scrubbing is off
-/// (which also disables the invalid-tag gate). Driven by the tag walk in
-/// `Command::scrub_metadata`.
+/// (which also disables the invalid-tag gate). Driven by the tag walk in the
+/// scrub `metadata` node.
 pub fn tag_checkers(
     options: &Options,
     blob_store: &Arc<BlobStore>,
@@ -209,6 +205,23 @@ pub fn orphan_namespace_checker(
     ))
 }
 
+/// Builds the structural `--jobs` checker, or `None` when the flag is off. The
+/// `JobStore` handle reconciles dangling lock-key indexes through its own
+/// conditional engine transactions (not the action sink), so the consumer id is
+/// irrelevant and left empty; `dry_run` / `prune_unknown` are copied so the
+/// checker can honour `-d` and gate the net-new unknown-queue removal.
+pub fn job_checker(options: &Options, metadata_store: &Arc<MetadataStore>) -> Option<JobChecker> {
+    if !options.jobs {
+        return None;
+    }
+    let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), ""));
+    Some(JobChecker::new(
+        job_store,
+        options.dry_run,
+        options.prune_unknown,
+    ))
+}
+
 /// Builds one orphan-job checker per queue selected by `--replication-orphans`
 /// and `--cache-orphans`. The `JobStore` handle is read-only here (the executor
 /// deletes through its own), so the consumer id is irrelevant and left empty.
@@ -232,37 +245,6 @@ pub fn orphan_job_checkers(
         .into_iter()
         .map(|queue| OrphanJobChecker::new(job_store.clone(), resolver.clone(), queue))
         .collect()
-}
-
-/// Build the enabled store-wide checkers in the order [`super::command`] must
-/// apply them: orphan-namespace clearing first (its link deletions free manifest
-/// bytes the blob checker then reclaims), then blob / orphan-grant / multipart
-/// reclamation, and finally the orphan-job sweep, which must precede the
-/// replication drain. Each is included only when its flag is set, and paired with
-/// a stable label so a failing checker can be named in the scrub log.
-pub fn store_checkers(
-    options: &Options,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    resolver: &Arc<RepositoryResolver>,
-) -> Result<LabeledStoreCheckers, Error> {
-    let mut checkers: LabeledStoreCheckers = Vec::new();
-    if let Some(checker) = orphan_namespace_checker(options, blob_store, metadata_store, resolver) {
-        checkers.push(("orphan-namespaces", Box::new(checker)));
-    }
-    if let Some(checker) = blob_checker(options, blob_store, metadata_store) {
-        checkers.push(("blobs", Box::new(checker)));
-    }
-    if let Some(checker) = orphan_grant_checker(options, blob_store, metadata_store)? {
-        checkers.push(("orphan-grants", Box::new(checker)));
-    }
-    if let Some(checker) = multipart_checker(options, blob_store)? {
-        checkers.push(("multipart", Box::new(checker)));
-    }
-    for checker in orphan_job_checkers(options, metadata_store, resolver) {
-        checkers.push(("orphan-jobs", Box::new(checker)));
-    }
-    Ok(checkers)
 }
 
 #[cfg(test)]

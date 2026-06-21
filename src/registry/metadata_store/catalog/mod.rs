@@ -70,6 +70,34 @@ impl MetadataStore {
         Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
     }
 
+    /// Lists every namespace marked by *any* registry subtree
+    /// (`_manifests`, `_layers`, `_config`, `_blobs`, or `_uploads`), the union
+    /// of the content-derived catalog and the upload-only and link-only paths.
+    ///
+    /// Scrub's per-namespace validity walk drives off this so it visits a
+    /// namespace regardless of which of its subtrees survive; unlike
+    /// [`Self::list_namespaces`] (keyed off `_manifests` only) it does not omit
+    /// a namespace holding nothing but stranded uploads or dangling
+    /// layer/config links. Paginated identically to [`Self::list_namespaces`].
+    #[instrument(skip(self))]
+    pub async fn list_all_namespaces(
+        &self,
+        n: u16,
+        last: Option<String>,
+    ) -> Result<(Vec<String>, Option<String>), Error> {
+        debug!("Fetching {n} all-namespace(s) with continuation token: {last:?}");
+
+        let namespaces = self
+            .collect_namespaces_with_any_marker(
+                path_builder::repository_dir(),
+                "",
+                &["_manifests", "_layers", "_config", "_blobs", "_uploads"],
+            )
+            .await?;
+
+        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+    }
+
     #[instrument(skip(self))]
     pub async fn list_tags(
         &self,
@@ -447,6 +475,24 @@ impl MetadataStore {
         root_prefix: &str,
         marker: &str,
     ) -> Result<Vec<String>, Error> {
+        self.collect_namespaces_with_any_marker(root_path, root_prefix, &[marker])
+            .await
+    }
+
+    /// Generalises [`Self::collect_namespaces_with_marker`] to a *set* of
+    /// markers: a path is a namespace when it holds **any** of `markers` as a
+    /// child (the union, not the intersection). Scrub's `list_all_namespaces`
+    /// passes every registry subtree so it reaches a namespace surviving in any
+    /// one of them. With a single-element slice it is identical to the
+    /// single-marker walk. Reuses the same `_`-prefixed-children-are-never-
+    /// descended tree walk so manifest/upload/blob substructure is not mistaken
+    /// for nested namespaces.
+    async fn collect_namespaces_with_any_marker(
+        &self,
+        root_path: &str,
+        root_prefix: &str,
+        markers: &[&str],
+    ) -> Result<Vec<String>, Error> {
         let mut stack: Vec<(String, String)> =
             vec![(root_path.to_string(), root_prefix.to_string())];
         let mut namespaces = Vec::new();
@@ -459,7 +505,7 @@ impl MetadataStore {
                 let page = self.store().list_children(&path, 1000, token, None).await?;
 
                 for entry in &page.sub_prefixes {
-                    if entry == marker {
+                    if markers.contains(&entry.as_str()) {
                         is_namespace = true;
                         continue;
                     }

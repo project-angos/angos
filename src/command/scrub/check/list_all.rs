@@ -104,6 +104,38 @@ pub fn namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, Strin
     }))
 }
 
+/// Streams every namespace marked by *any* registry subtree, not just
+/// `_manifests`. The scrub metadata walk drives off this so it also visits
+/// upload-only and link-only namespaces; unlike [`namespaces`], a namespace
+/// holding nothing but stranded uploads or stranded `_layers`/`_config` links
+/// is no longer skipped. This carries two strictly-more-correct, accepted
+/// behavior changes vs main, both confined to namespaces main never visited:
+///
+/// - `-u` now reaps stranded uploads in **upload-only** namespaces (those with
+///   an `_uploads` child but no `_manifests`).
+/// - `-l` now reaps orphan layer/config links in **link-only** namespaces
+///   (those carrying `_layers`/`_config` but no `_manifests`).
+///   [`LinkReferencesChecker`] reads `_layers`/`_config` directly (via
+///   `prune_unreachable_link_referrers`), so visiting these namespaces lets it
+///   prune phantom `referenced_by` entries — and cascade-delete the now
+///   referrer-less links — for links whose owning manifests are already gone.
+///   On main, `list_namespaces` (keyed off `_manifests`) never enumerated a
+///   manifest-less namespace, so main's `-l` skipped them entirely.
+///
+/// Every other step (`-m`/`-M`/`-r`/`--replicate`) enumerates revisions/tags
+/// under `_manifests`, so it correctly no-ops on the newly visited namespaces.
+/// No step deletes more than main outside these two cases.
+///
+/// [`LinkReferencesChecker`]: crate::command::scrub::check::link_references::LinkReferencesChecker
+pub fn all_namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, String> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_all_namespaces(PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
 pub fn upload_namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, String> {
     Box::pin(paginated(move |marker| async move {
         metadata_store
