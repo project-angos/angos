@@ -37,6 +37,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
 | `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--reconcile-blob-index`      | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band. Reads every manifest, so it is expensive |
+| `--migrate`                   | Migrate the on-disk storage layout (legacy blob-index files → sharded; prune the pre-1.3 namespace-registry index). Scans every blob; run once after upgrade, not on routine scrubs |
 | `-M, --media-types`           | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `-R, --referrers`             | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 | `-n, --orphan-namespaces`     | Delete all content for namespaces not owned by any configured repository (destructive; see below)  |
@@ -340,18 +341,18 @@ This is idempotent and safe to run multiple times.
 
 Legacy single-file blob indexes (`index.json`) keep working at runtime against both the S3 and filesystem backends. Reads consult the sharded layout first and fall back to the legacy file when no sharded entry exists, and writes are applied in place to a legacy file when one is present so the layout never splits mid-blob. Operators are **not** forced to run scrub just to keep serving traffic.
 
-`scrub` is the only way to convert the on-disk blob-index layout from legacy to sharded:
+`scrub --migrate` is the only way to convert the on-disk blob-index layout from legacy to sharded:
 
-- `scrub --blobs` iterates every blob, rewrites each legacy `index.json` into per-namespace shards under `refs/{namespace}.json`, and deletes the legacy file once the shards are written.
+- `scrub --migrate` iterates every blob, rewrites each legacy `index.json` into per-namespace shards under `refs/{namespace}.json`, deletes the legacy file once the shards are written, and prunes the pre-1.3 `_registry/` namespace-registry index.
 
-Running scrub benefits operators who want the per-namespace shard layout's lock granularity and concurrency characteristics for old blobs; the runtime fallback is correct but does not gain those properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
+Because it scans every blob, `--migrate` is **not** part of routine maintenance: run it once after an upgrade that introduces the sharded layout, then drop it from scheduled jobs. Running it benefits operators who want the per-namespace shard layout's lock granularity and concurrency characteristics for old blobs; the runtime fallback is correct but does not gain those properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
 
 ```bash
 # Migrate legacy blob indexes
-./angos -c config.toml scrub --blobs
+./angos -c config.toml scrub --migrate
 ```
 
-This migration is **idempotent**: re-running scrub is safe and will simply skip data that is already in the sharded layout.
+This migration is **idempotent**: re-running it is safe and will simply skip data that is already in the sharded layout.
 
 ### Fix Links Format
 

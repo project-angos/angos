@@ -65,6 +65,12 @@ pub struct Options {
     /// reference each blob (repairs an index corrupted out-of-band, e.g. storage
     /// corruption or manual tampering); reads every manifest, so it is expensive
     pub reconcile_blob_index: bool,
+    #[argh(switch)]
+    /// migrate the on-disk storage layout: rewrite legacy single-file blob
+    /// indexes into the sharded layout and prune the pre-1.3 namespace-registry
+    /// index. Scans every blob, so run it only when migrating, not on routine
+    /// scrubs
+    pub migrate: bool,
     #[argh(switch, short = 'M')]
     /// backfill missing `media_type` on manifest links
     pub media_types: bool,
@@ -104,7 +110,11 @@ pub struct Command {
     /// the namespace checkers so the invalid-tag gate and per-tag checks precede
     /// the aggregate tag checks. `None` when `--tags` is absent.
     tag_checkers: Option<Vec<Box<dyn TagChecker>>>,
-    layout_checker: LayoutChecker,
+    /// Storage-layout migration pass (legacy blob-index -> sharded, legacy
+    /// namespace-registry prune). `None` unless `--migrate` is set, since it
+    /// scans every blob and is a one-time migration, not a routine consistency
+    /// repair.
+    layout_checker: Option<LayoutChecker>,
     /// Store-wide checkers (blobs, orphan grants/namespaces/jobs, multipart),
     /// each paired with a stable label for failure attribution, pre-ordered by
     /// [`setup::store_checkers`] and applied in one pass.
@@ -147,7 +157,9 @@ impl Command {
             &repositories,
         )?;
         let tag_checkers = setup::tag_checkers(options, &blob_backend, &metadata_store);
-        let layout_checker = setup::layout_checker(&blob_backend);
+        let layout_checker = options
+            .migrate
+            .then(|| setup::layout_checker(&blob_backend));
         let store_checkers =
             setup::store_checkers(options, &blob_backend, &metadata_store, &repositories)?;
 
@@ -228,7 +240,10 @@ impl Command {
     }
 
     async fn migrate_storage_layout(&mut self) -> Result<(), Error> {
-        if let Err(e) = self.layout_checker.check_all(self.sink.as_mut()).await {
+        let Some(layout_checker) = &self.layout_checker else {
+            return Ok(());
+        };
+        if let Err(e) = layout_checker.check_all(self.sink.as_mut()).await {
             warn!("Storage layout migration checker failed: {e}");
         }
         Ok(())
@@ -389,6 +404,7 @@ mod tests {
             retention: true,
             links: false,
             reconcile_blob_index: false,
+            migrate: false,
             media_types: false,
             referrers: false,
             replicate: false,
@@ -409,6 +425,8 @@ mod tests {
         assert!(cmd.tag_checkers.is_some());
         // `blobs` is the only store-wide checker enabled by these options.
         assert_eq!(cmd.store_checkers.len(), 1);
+        // `--migrate` is absent, so the layout migration pass is not built.
+        assert!(cmd.layout_checker.is_none());
     }
 
     #[tokio::test]
@@ -464,6 +482,7 @@ mod tests {
             retention: false,
             links: false,
             reconcile_blob_index: false,
+            migrate: false,
             media_types: false,
             referrers: false,
             replicate: false,
