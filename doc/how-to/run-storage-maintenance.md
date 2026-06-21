@@ -18,7 +18,7 @@ Verify storage integrity and enforce retention policies using the `scrub` comman
 Angos performs garbage collection **automatically** during normal operation: unreferenced blobs are cleaned up as part of request handling, without downtime.
 
 The `scrub` command runs as a **separate periodic process** that operates alongside the live server (no shutdown required):
-- Checking and repairing data corruption
+- Checking and repairing metadata corruption (links, blob index, referrers)
 - Verifying storage consistency
 - Enforcing retention policies
 - Cleaning up stale uploads
@@ -31,7 +31,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 |-------------------------------|----------------------------------------------------------------------------------------------------|
 | `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
 | `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
-| `-b, --blobs`                 | Check for orphaned or corrupted blobs; prune stale blob-index entries for deleted namespaces       |
+| `-b, --blobs`                 | Remove orphaned (unreferenced) blobs; prune stale blob-index entries for deleted namespaces        |
 | `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
 | `-u, --uploads <duration>`    | Check upload sessions: remove broken or partial state and uploads older than the given duration    |
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |

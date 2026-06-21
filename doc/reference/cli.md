@@ -80,7 +80,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--multipart <duration>`  | `-p`   | Cleanup orphan S3 multipart uploads older than duration (S3 only)                                  |
 | `--tags`                  | `-t`   | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
 | `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |
-| `--blobs`                 | `-b`   | Check for blob inconsistencies, corruption, and stale blob-index entries                           |
+| `--blobs`                 | `-b`   | Remove orphaned blobs and prune stale blob-index entries                                           |
 | `--retention`             | `-r`   | Enforce retention policies                                                                         |
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--reconcile-blob-index`  |        | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band (storage corruption, manual tampering). Reads every manifest, so it is expensive |
