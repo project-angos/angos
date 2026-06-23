@@ -841,6 +841,196 @@ async fn run_delete_pending_removes_record_and_index(h: Harness) {
     );
 }
 
+// =========================================================================
+// Structural enumerators (feed the future JobChecker)
+// =========================================================================
+
+async fn run_list_queue_dirs_includes_unknown_queue(h: Harness) {
+    // A real enqueue creates `_jobs/pending/cache/`.
+    h.store
+        .enqueue(dummy_envelope("cache.ns:sha256:known"))
+        .await
+        .expect("enqueue");
+
+    // Plant an unknown queue directory by writing a body under a bogus queue
+    // name; the engine would never produce this, so it is the structural-scrub
+    // target (a typo or a decommissioned queue's leftover tree).
+    h.raw
+        .put(
+            &path_builder::job_pending_path("bogus-queue", "0000000000000000-x"),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .expect("seed unknown queue");
+
+    let dirs = h
+        .store
+        .list_queue_dirs(JobState::Pending)
+        .await
+        .expect("list pending queue dirs");
+    assert!(
+        dirs.contains(&"cache".to_string()),
+        "the known queue dir must be listed; got {dirs:?}"
+    );
+    assert!(
+        dirs.contains(&"bogus-queue".to_string()),
+        "an unknown queue dir must be listed so scrub can flag it; got {dirs:?}"
+    );
+    assert!(
+        !dirs.contains(&"replication".to_string()),
+        "a queue with no directory must not be listed; got {dirs:?}"
+    );
+}
+
+async fn run_list_queue_dirs_empty_partition_is_empty(h: Harness) {
+    let pending = h
+        .store
+        .list_queue_dirs(JobState::Pending)
+        .await
+        .expect("list pending queue dirs");
+    assert!(
+        pending.is_empty(),
+        "an untouched pending partition must list no queue dirs; got {pending:?}"
+    );
+
+    let failed = h
+        .store
+        .list_queue_dirs(JobState::Failed)
+        .await
+        .expect("list failed queue dirs");
+    assert!(
+        failed.is_empty(),
+        "an untouched failed partition must list no queue dirs; got {failed:?}"
+    );
+}
+
+async fn run_list_lock_key_index_keys_enumerates_entries(h: Harness) {
+    // Each enqueue writes one dedup-index file under `_jobs/index/cache/`.
+    let lock_keys = [
+        "cache.ns:sha256:a",
+        "cache.ns:sha256:b",
+        "cache.ns:sha256:c",
+    ];
+    for lock_key in lock_keys {
+        h.store
+            .enqueue(dummy_envelope(lock_key))
+            .await
+            .expect("enqueue");
+    }
+
+    let mut keys = h
+        .store
+        .list_lock_key_index_keys(Queue::Cache)
+        .await
+        .expect("list index keys");
+    assert_eq!(
+        keys.len(),
+        lock_keys.len(),
+        "one index entry per enqueued lock_key; got {keys:?}"
+    );
+
+    // The enumerated stems are the encoded lock keys (`.json` stripped); each
+    // must address a readable index file under the queue's index directory.
+    keys.sort();
+    let index_dir = path_builder::job_lock_key_index_dir("cache");
+    for key in &keys {
+        h.raw
+            .get(&format!("{index_dir}/{key}.json"))
+            .await
+            .expect("enumerated index file must be readable");
+    }
+
+    // A different queue with no index entries is empty.
+    let replication = h
+        .store
+        .list_lock_key_index_keys(Queue::Replication)
+        .await
+        .expect("list index keys for empty queue");
+    assert!(
+        replication.is_empty(),
+        "a queue with no dedup indexes must enumerate nothing; got {replication:?}"
+    );
+}
+
+async fn run_list_lock_key_index_keys_detects_dangling_entry(h: Harness) {
+    let lock_key = "cache.ns:sha256:dangling";
+    // Seed only the index file, no pending envelope: the dangling-lock-key
+    // reconcile target.
+    h.raw
+        .put(
+            &path_builder::job_lock_key_index_path("cache", lock_key),
+            Bytes::from(serialize_lock_key_index("0000000000000000-gone").expect("serialize")),
+        )
+        .await
+        .expect("seed dangling index");
+
+    let keys = h
+        .store
+        .list_lock_key_index_keys(Queue::Cache)
+        .await
+        .expect("list index keys");
+    assert_eq!(
+        keys.len(),
+        1,
+        "the dangling index must be enumerated; got {keys:?}"
+    );
+
+    // No pending body backs it.
+    let (pending, _) = h
+        .store
+        .list_pending_page(Queue::Cache, 10, None)
+        .await
+        .expect("list pending");
+    assert!(
+        pending.is_empty(),
+        "the dangling index has no pending envelope; got {pending:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_queue_dirs_includes_unknown_queue() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_queue_dirs_includes_unknown_queue(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_queue_dirs_includes_unknown_queue_memory() {
+    run_list_queue_dirs_includes_unknown_queue(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn list_queue_dirs_empty_partition_is_empty() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_queue_dirs_empty_partition_is_empty(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_queue_dirs_empty_partition_is_empty_memory() {
+    run_list_queue_dirs_empty_partition_is_empty(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn list_lock_key_index_keys_enumerates_entries() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_lock_key_index_keys_enumerates_entries(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_lock_key_index_keys_enumerates_entries_memory() {
+    run_list_lock_key_index_keys_enumerates_entries(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn list_lock_key_index_keys_detects_dangling_entry() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_lock_key_index_keys_detects_dangling_entry(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_lock_key_index_keys_detects_dangling_entry_memory() {
+    run_list_lock_key_index_keys_detects_dangling_entry(harness_memory()).await;
+}
+
 #[tokio::test]
 async fn list_pending_page_is_keyset_ordered() {
     let dir = TempDir::new().expect("temp dir");

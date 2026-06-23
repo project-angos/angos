@@ -2,20 +2,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{
     command::scrub::{
         action::Action,
-        check::{NamespaceChecker, list_all},
+        check::{NamespaceChecker, list_all, orphan_on_missing_manifest},
         error::Error,
         executor::ActionSink,
     },
     oci::{Digest, Namespace},
     registry::{
-        blob_store,
         blob_store::BlobStore,
-        metadata_store::{self, LinkKind, MetadataStore},
+        metadata_store::{self, LinkKind, LinkMetadata, MetadataStore},
         parse_manifest_digests,
     },
 };
@@ -39,18 +38,15 @@ impl LinkReferencesChecker {
         revision: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        let content = match self.blob_store.read(revision).await {
-            Ok(content) => content,
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                warn!("Manifest blob missing for revision {revision}; removing revision link");
-                return sink
-                    .apply(Action::DeleteOrphanManifest {
-                        namespace: namespace.clone(),
-                        digest: revision.clone(),
-                    })
-                    .await;
-            }
-            Err(e) => return Err(e.into()),
+        let Some(content) = orphan_on_missing_manifest(
+            self.blob_store.read(revision).await,
+            namespace,
+            revision,
+            sink,
+        )
+        .await?
+        else {
+            return Ok(());
         };
 
         let manifest = parse_manifest_digests(&content, None)?;
@@ -67,9 +63,9 @@ impl LinkReferencesChecker {
     /// any entries in `link`'s `referenced_by` set that no longer have a
     /// corresponding `LinkKind::Digest` revision link in the namespace.
     ///
-    /// A link with an entirely-phantom `referenced_by` that is unreachable from
-    /// the current revision graph is not visited by this method; that case is
-    /// left to future enhancements.
+    /// This visits only links reachable from a current revision's manifest body;
+    /// links unreachable from the revision graph are swept by
+    /// [`Self::prune_unreachable_link_referrers`].
     pub async fn ensure_referenced_by(
         &self,
         namespace: &Namespace,
@@ -94,8 +90,26 @@ impl LinkReferencesChecker {
             .await?;
         }
 
+        // `referrer` is the current revision being processed; its `Digest` link
+        // exists by definition, so it is skipped rather than re-read.
+        self.prune_phantom_referrers(namespace, link, &metadata, Some(referrer), sink)
+            .await
+    }
+
+    /// Remove every `referenced_by` entry on `link` whose `LinkKind::Digest`
+    /// revision link no longer exists (a phantom referrer), except `skip`. When
+    /// the last referrer is removed the executor cascades to deleting `link`
+    /// itself, reclaiming an orphaned layer/config link.
+    async fn prune_phantom_referrers(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+        metadata: &LinkMetadata,
+        skip: Option<&Digest>,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
         for stale in &metadata.referenced_by {
-            if stale == referrer {
+            if Some(stale) == skip {
                 continue;
             }
             match self
@@ -115,8 +129,50 @@ impl LinkReferencesChecker {
                 Err(e) => return Err(e.into()),
             }
         }
-
         Ok(())
+    }
+
+    /// Prune phantom `referenced_by` entries on layer and config links the
+    /// revision walk never reaches — links no current manifest references, whose
+    /// stale back-references would otherwise pin them (and their blob grants)
+    /// forever. Closes the gap left by [`Self::ensure_referenced_by`], which only
+    /// visits links reachable from a current revision's manifest body.
+    async fn prune_unreachable_link_referrers(
+        &self,
+        namespace: &Namespace,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
+        let mut layers = list_all::layer_links(&self.metadata_store, namespace);
+        while let Some(digest) = layers.next().await {
+            let link = LinkKind::Layer(digest?);
+            if let Err(e) = self.prune_link(namespace, &link, sink).await {
+                error!("Failed to prune referrers for '{namespace}' link '{link}': {e}");
+            }
+        }
+        let mut configs = list_all::config_links(&self.metadata_store, namespace);
+        while let Some(digest) = configs.next().await {
+            let link = LinkKind::Config(digest?);
+            if let Err(e) = self.prune_link(namespace, &link, sink).await {
+                error!("Failed to prune referrers for '{namespace}' link '{link}': {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Read one link and prune its phantom referrers. A vanished link is a no-op.
+    async fn prune_link(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
+        let metadata = match self.metadata_store.read_link(namespace, link).await {
+            Ok(m) => m,
+            Err(metadata_store::Error::ReferenceNotFound) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        self.prune_phantom_referrers(namespace, link, &metadata, None, sink)
+            .await
     }
 }
 
@@ -138,6 +194,10 @@ impl NamespaceChecker for LinkReferencesChecker {
                 );
             }
         }
+
+        // Sweep layer/config links the revision walk above never reached.
+        self.prune_unreachable_link_referrers(namespace, sink)
+            .await?;
 
         Ok(())
     }
@@ -668,6 +728,99 @@ mod tests {
             assert!(
                 unchanged.referenced_by.contains(&phantom),
                 "on-disk referenced_by must be unchanged under Vec sink"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prunes_phantom_referrer_on_layer_unreachable_from_revisions() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/unreachable").unwrap();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            // A layer link whose sole referrer is a phantom (no `Digest` link)
+            // and which no current revision references — there are no revisions,
+            // so the revision walk never reaches it.
+            let layer = put_blob_direct(metadata_store.store(), b"orphan layer").await;
+            let phantom =
+                Digest::sha256("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                    .unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create_with_referrer(
+                        LinkKind::Layer(layer.clone()),
+                        layer.clone(),
+                        phantom.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let before = metadata_store
+                .read_link(namespace, &LinkKind::Layer(layer.clone()))
+                .await
+                .unwrap();
+            assert!(before.referenced_by.contains(&phantom));
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
+            checker.check(namespace, &mut executor).await.unwrap();
+
+            // The phantom is pruned; with no referrers left, the link is reclaimed.
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Layer(layer.clone()))
+                    .await
+                    .is_err(),
+                "an unreachable layer link with only phantom referrers must be reclaimed"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_captures_remove_referrer_for_unreachable_layer() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/unreachable-dry").unwrap();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let layer = put_blob_direct(metadata_store.store(), b"orphan layer dry").await;
+            let phantom =
+                Digest::sha256("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                    .unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create_with_referrer(
+                        LinkKind::Layer(layer.clone()),
+                        layer.clone(),
+                        phantom.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut sink: Vec<Action> = Vec::new();
+            checker.check(namespace, &mut sink).await.unwrap();
+
+            assert!(
+                sink.iter().any(|a| matches!(
+                    a,
+                    Action::RemoveReferrer { referrer, .. } if *referrer == phantom
+                )),
+                "Vec sink must capture RemoveReferrer for the unreachable layer's phantom"
+            );
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Layer(layer.clone()))
+                    .await
+                    .is_ok(),
+                "a Vec sink must not mutate the link"
             );
             test_case.cleanup().await;
         }

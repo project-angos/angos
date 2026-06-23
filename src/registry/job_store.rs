@@ -587,6 +587,60 @@ impl JobStore {
             .await
     }
 
+    /// List the queue sub-directory names under `_jobs/<state>/` (one per
+    /// queue). Structural scrub diffs these against the known [`Queue`] set to
+    /// flag an unknown queue directory (a typo or a decommissioned queue's
+    /// leftover tree) without reading any job bodies. The bodies of a known
+    /// queue are reached through [`Self::list_pending_page`] /
+    /// [`Self::list_failed_page`]; this only enumerates the partition roots.
+    ///
+    /// Returns the bare child names (e.g. `"cache"`, `"replication"`), looping
+    /// the backend's pagination to exhaustion. An absent partition root yields
+    /// an empty list.
+    pub async fn list_queue_dirs(&self, state: JobState) -> Result<Vec<String>, Error> {
+        let root = match state {
+            JobState::Pending => path_builder::job_pending_root_dir(),
+            JobState::Failed => path_builder::job_failed_root_dir(),
+        };
+        let mut names = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self.store.list_children(&root, 1000, token, None).await?;
+            names.extend(page.sub_prefixes);
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        Ok(names)
+    }
+
+    /// Enumerate the dedup-index file storage keys under `_jobs/index/<queue>/`,
+    /// one per `lock_key` (the bare `<encoded-lock-key>` stem, `.json`
+    /// stripped). Structural scrub walks these so the dangling-lock-key
+    /// reconcile can detect an index whose pending envelope has vanished
+    /// (the orphan self-heal in [`Self::find_pending_with_lock_key`] then
+    /// retires it). Loops the backend pagination to exhaustion; an absent
+    /// index directory yields an empty list.
+    pub async fn list_lock_key_index_keys(&self, queue: Queue) -> Result<Vec<String>, Error> {
+        let dir = path_builder::job_lock_key_index_dir(queue.as_str());
+        let mut keys = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self.store.list_children(&dir, 1000, token, None).await?;
+            keys.extend(
+                page.objects
+                    .into_iter()
+                    .filter_map(|name| name.strip_suffix(".json").map(str::to_string)),
+            );
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        Ok(keys)
+    }
+
     /// Shared keyset pager over a job directory. Children are flat `<key>.json`
     /// files, so `list_children` returns them as bare `objects` in lexicographic
     /// (== time) order; `start_after` skips up to and including its argument, so
@@ -728,6 +782,88 @@ impl JobStore {
             }
             Err(e) => Err(Error::from(e)),
         }
+    }
+
+    /// Reconcile one dedup-index file addressed by its *already-encoded* stem
+    /// (the value [`Self::list_lock_key_index_keys`] yields), retiring it when
+    /// its pending envelope has vanished. Returns `true` when the index was an
+    /// orphan (whether or not the conditional delete won the race), `false` when
+    /// the pending file still exists or the index has already gone.
+    ///
+    /// Unlike [`Self::find_pending_with_lock_key`], which takes a RAW `lock_key`
+    /// and re-encodes it, this consumes the encoded stem directly, so it never
+    /// double-encodes a `lock_key` containing `:` / `/` (which the stem already
+    /// carries as `%3A` / `%2F`). It reads the index for its stored
+    /// `storage_key` rather than decoding the stem, so the reconcile is exact
+    /// regardless of the encoding's invertibility.
+    ///
+    /// The orphan delete is the same fingerprint-guarded, conditional engine
+    /// transaction the enqueue self-heal runs, so a concurrent enqueue that
+    /// refreshes the index between the GET and the apply turns the delete into a
+    /// no-op conflict rather than clobbering the fresh index.
+    pub async fn reconcile_orphan_lock_key_index(
+        &self,
+        queue: Queue,
+        encoded_stem: &str,
+    ) -> Result<bool, Error> {
+        let index_path = format!(
+            "{}/{encoded_stem}.json",
+            path_builder::job_lock_key_index_dir(queue.as_str())
+        );
+        let data = match self.store.get(&index_path).await {
+            Ok(d) => d,
+            // The index vanished since the listing: nothing to reconcile.
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(e) => return Err(Error::from(e)),
+        };
+        let index = parse_lock_key_index(&data)?;
+
+        let pending_key = path_builder::job_pending_path(queue.as_str(), &index.storage_key);
+        match self.store.head(&pending_key).await {
+            // Pending file still present: the index is live, leave it.
+            Ok(_) => Ok(false),
+            Err(StorageError::NotFound) => {
+                let (read, delete) = Self::conditional_index_delete(
+                    index_path,
+                    &data,
+                    &index.storage_key,
+                    &index.storage_key,
+                );
+                let mut tx = Transaction::builder().build();
+                tx.reads.extend(read);
+                tx.mutations.extend(delete);
+                match self.store.execute(tx).await {
+                    Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(true),
+                    Err(e) => {
+                        warn!(
+                            encoded_stem,
+                            error = %e,
+                            "Failed to remove orphan lock-key index via engine",
+                        );
+                        Ok(true)
+                    }
+                }
+            }
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    /// Remove the `_jobs/<state>/<queue>` subtree for a queue directory whose
+    /// name is not a recognized [`Queue`] (a typo or a decommissioned queue's
+    /// leftover tree). Structural scrub calls this only under `--prune-unknown`;
+    /// the directory carries no jobs any live producer/consumer will ever
+    /// address, so removing it by prefix reclaims the bytes without a per-body
+    /// fence. An absent prefix is a no-op.
+    pub async fn delete_unknown_queue_dir(
+        &self,
+        state: JobState,
+        queue_name: &str,
+    ) -> Result<(), Error> {
+        let dir = match state {
+            JobState::Pending => path_builder::job_pending_dir(queue_name),
+            JobState::Failed => path_builder::job_failed_dir(queue_name),
+        };
+        self.store.delete_prefix(&dir).await.map_err(Error::from)
     }
 
     /// Return the raw bytes of the per-`lock_key` dedup index alongside the
