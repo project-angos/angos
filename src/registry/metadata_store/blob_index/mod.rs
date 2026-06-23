@@ -15,7 +15,7 @@ use angos_tx_engine::{
     StorageError,
     error::Error as TxError,
     executor::{DEFAULT_RETRY_BUDGET, execute_with_retry},
-    transaction::{Mutation, Read, Transaction},
+    transaction::{Mutation, Transaction},
 };
 
 use crate::{
@@ -83,30 +83,6 @@ impl MetadataStore {
         .await
         .map(|_| ())
         .map_err(tx_error_to_meta)
-    }
-
-    /// Build the engine reads + mutations that insert `LinkKind::Blob(digest)`
-    /// into the per-namespace shard for `digest`, without executing them.
-    ///
-    /// The caller embeds these in a larger transaction and propagates any
-    /// `Conflict`; in-place CAS retry is [`Self::update_blob_index`]'s job.
-    pub async fn build_grant_mutations(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<(Vec<Read>, Vec<Mutation>), Error> {
-        let store = self.store_arc();
-        let ops = [BlobIndexOperation::Insert(LinkKind::Blob(digest.clone()))];
-        let builder = append_shard_for_digest(
-            store.as_ref(),
-            namespace,
-            digest,
-            &ops,
-            Transaction::builder(),
-        )
-        .await?;
-        let tx = builder.build();
-        Ok((tx.reads, tx.mutations))
     }
 
     /// Revoke `namespace`'s ownership of `digest` in an atomic transaction and

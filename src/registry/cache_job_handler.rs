@@ -8,7 +8,7 @@ use angos_tx_engine::transaction::Transaction;
 use crate::{
     oci::{Digest, Namespace},
     registry::{
-        blob::cache_blob_mutations,
+        blob::{cache_blob, grant_blob_reference},
         blob_store::BlobStore,
         job_store::{Error, JobEnvelope, JobHandler},
         metadata_store::MetadataStore,
@@ -73,14 +73,18 @@ impl JobHandler for CacheJobHandler {
         // presence*, not on a `can_read` ownership link: a manifest pull records
         // the layer's ownership link before its bytes are fetched, so a
         // link-only short-circuit here would skip the fetch and the blob would
-        // never be cached (see doc/reviews/20260603-in-process-cache-fill-broken.md).
+        // never be cached.
+        //
+        // The grant commits on the metadata store and the bytes on the blob
+        // store; neither is folded into the job-completion transaction, because
+        // those stores can be separate backends and a single executor cannot
+        // commit across both. The work is idempotent, so it is safe to redo on a
+        // retry even though it no longer commits atomically with job completion.
         if self.blob_store.size(&digest).await.is_ok() {
-            let (reads, mutations) = self
-                .metadata_store
-                .build_grant_mutations(&namespace, &digest)
+            grant_blob_reference(&self.metadata_store, &namespace, &digest)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
-            return Ok(Transaction::from_parts(reads, mutations));
+            return Ok(Transaction::builder().build());
         }
 
         let Some(repository) = self.resolver.resolve(&namespace) else {
@@ -100,17 +104,17 @@ impl JobHandler for CacheJobHandler {
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let (reads, mutations) = cache_blob_mutations(
-            self.blob_store.clone(),
-            self.metadata_store.clone(),
-            namespace,
-            digest,
+        cache_blob(
+            &self.blob_store,
+            &self.metadata_store,
+            &namespace,
+            &digest,
             stream,
             content_length,
         )
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
 
-        Ok(Transaction::from_parts(reads, mutations))
+        Ok(Transaction::builder().build())
     }
 }
