@@ -14,6 +14,7 @@ use crate::{
         },
         command::Options,
         error::Error,
+        report::Findings,
     },
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
@@ -34,12 +35,20 @@ fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Retenti
     )))
 }
 
+/// Build the per-namespace checkers for the enabled flags.
+///
+/// `findings` is the shared report-only accumulator from the run's `Ctx`; it is
+/// attached to the `ManifestChecker` (under `-m`) so its dangling-reference
+/// warnings also surface in the end-of-run summary. Threading it here lights the
+/// findings up for `scrub`, `policy`, and `replication` alike, since all three
+/// build their checkers through this one function.
 pub fn namespace_checkers(
     options: &Options,
     config: &Configuration,
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     resolver: &Arc<RepositoryResolver>,
+    findings: &Findings,
 ) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
     let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
 
@@ -69,6 +78,7 @@ pub fn namespace_checkers(
         checkers.push(Box::new(ManifestChecker::new(
             blob_store.clone(),
             metadata_store.clone(),
+            findings.clone(),
         )));
     }
 
@@ -86,6 +96,13 @@ pub fn namespace_checkers(
         )));
     }
 
+    // Media-type backfill is the deprecated standalone `-M` (media_types) only;
+    // it deliberately does NOT ride `-l`. `media_type` is now recorded in link
+    // metadata at manifest-push time, so newly pushed content never needs
+    // backfill and `-l` stays a cheap link-format/referrer repair (no full
+    // manifest content scan). `-M` exists solely to backfill legacy links
+    // written before media_type was recorded at push time.
+    // Position kept right after `LinkReferencesChecker`.
     if options.media_types {
         checkers.push(Box::new(MediaTypeChecker::new(
             blob_store.clone(),

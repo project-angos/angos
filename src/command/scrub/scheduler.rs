@@ -3,24 +3,23 @@
 //! Execution is modelled as a dependency DAG rather than a fixed loop: each
 //! [`Node`] declares the ids of the nodes it depends on, and the scheduler
 //! ([`run_dag`]) starts a node only once every one of its *present* deps has
-//! completed. Independent nodes therefore overlap, bounded only by a single
-//! shared [`Semaphore`] that each node body uses to cap its own fan-out.
+//! completed. Independent nodes therefore overlap; each node body bounds its own
+//! fan-out internally (the `metadata` node via `for_each_concurrent`).
 //!
 //! Wired into the live scrub flow by [`super::command::Command::run`], which
 //! builds the enabled-node set ([`super::node::build_nodes`]) and runs it here.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, pin::Pin};
 
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::task::JoinSet;
 use tracing::warn;
 
 /// Stable, human-readable identifier for a scheduler node.
 pub(crate) type NodeId = &'static str;
 
-/// A node body: given the shared concurrency budget, produces the future that
-/// performs the node's work. Boxed so heterogeneous closures share one type.
-pub(crate) type RunFn =
-    Box<dyn FnOnce(Arc<Semaphore>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+/// A node body: produces the future that performs the node's work. Boxed so
+/// heterogeneous closures share one type.
+pub(crate) type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 /// One unit of work plus the ids it must wait for before starting.
 pub(crate) struct Node {
@@ -29,7 +28,7 @@ pub(crate) struct Node {
     /// Ids whose completion gates this node. Edges to ids absent from the node
     /// set are dropped, so the node runs without waiting on them.
     pub deps: &'static [NodeId],
-    /// Builds the node's work future from the shared semaphore.
+    /// Builds the node's work future.
     pub run: RunFn,
 }
 
@@ -39,14 +38,13 @@ pub(crate) struct Node {
 /// Semantics:
 /// - A node starts only after **all** of its present deps have completed.
 /// - Ready nodes run concurrently; the scheduler does not cap how many run at
-///   once — `sem` is passed to each body so they share one global fan-out
-///   budget.
+///   once. Each node body bounds its own fan-out internally.
 /// - A dep is satisfied by **completion, not success**: a panicking node is
 ///   logged and its dependents are still released (ordering, not success, is
 ///   the contract); a [`JoinError`](tokio::task::JoinError) never aborts the
 ///   run or strands dependents.
 /// - Edges to a `NodeId` not present in `nodes` are dropped.
-pub(crate) async fn run_dag(nodes: Vec<Node>, sem: Arc<Semaphore>) {
+pub(crate) async fn run_dag(nodes: Vec<Node>) {
     let present: std::collections::HashSet<NodeId> = nodes.iter().map(|n| n.id).collect();
 
     // in-degree over present deps only, plus the reverse (dependents) edges.
@@ -71,13 +69,12 @@ pub(crate) async fn run_dag(nodes: Vec<Node>, sem: Arc<Semaphore>) {
     let mut tasks: JoinSet<NodeId> = JoinSet::new();
     let spawn = |tasks: &mut JoinSet<NodeId>, pending: &mut HashMap<NodeId, RunFn>, id: NodeId| {
         if let Some(run) = pending.remove(id) {
-            let sem = sem.clone();
             // Run the body on an inner task so a panic surfaces as a
             // `JoinError` *here* (logged) while the outer JoinSet task always
-            // returns the id — a dep is satisfied by completion, not success,
+            // returns the id: a dep is satisfied by completion, not success,
             // so dependents must be released even when the body panics.
             tasks.spawn(async move {
-                let inner = tokio::spawn(run(sem));
+                let inner = tokio::spawn(run());
                 if let Err(err) = inner.await {
                     warn!("scrub scheduler: node {id} failed: {err}");
                 }
@@ -128,13 +125,9 @@ mod tests {
         },
     };
 
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::Notify;
 
     use super::{Node, NodeId, run_dag};
-
-    fn sem() -> Arc<Semaphore> {
-        Arc::new(Semaphore::new(8))
-    }
 
     /// Records the order in which nodes begin and end.
     type Log = Arc<Mutex<Vec<String>>>;
@@ -148,7 +141,7 @@ mod tests {
         Node {
             id,
             deps,
-            run: Box::new(move |_sem| {
+            run: Box::new(move || {
                 Box::pin(async move {
                     record(&log, id);
                 })
@@ -165,7 +158,7 @@ mod tests {
             marker("b", &["a"], log.clone()),
         ];
 
-        run_dag(nodes, sem()).await;
+        run_dag(nodes).await;
 
         assert_eq!(*log.lock().unwrap(), vec!["a", "b", "c"]);
     }
@@ -186,7 +179,7 @@ mod tests {
             Node {
                 id,
                 deps: &["a"],
-                run: Box::new(move |_sem| {
+                run: Box::new(move || {
                     Box::pin(async move {
                         record(&log, format!("start {id}"));
                         if started.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
@@ -207,7 +200,7 @@ mod tests {
             marker("d", &["b", "c"], log.clone()),
         ];
 
-        run_dag(nodes, sem()).await;
+        run_dag(nodes).await;
 
         let log = log.lock().unwrap();
         let pos = |s: &str| log.iter().position(|e| e == s).unwrap();
@@ -232,7 +225,7 @@ mod tests {
             Node {
                 id,
                 deps: &[],
-                run: Box::new(move |_sem| {
+                run: Box::new(move || {
                     Box::pin(async move {
                         record(&log, format!("start {id}"));
                         if started.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
@@ -246,7 +239,7 @@ mod tests {
             }
         };
 
-        run_dag(vec![independent("x"), independent("y")], sem()).await;
+        run_dag(vec![independent("x"), independent("y")]).await;
 
         let log = log.lock().unwrap();
         let pos = |s: &str| log.iter().position(|e| e == s).unwrap();
@@ -261,12 +254,12 @@ mod tests {
             Node {
                 id: "boom",
                 deps: &[],
-                run: Box::new(|_sem| Box::pin(async { panic!("boom") })),
+                run: Box::new(|| Box::pin(async { panic!("boom") })),
             },
             marker("after", &["boom"], log.clone()),
         ];
 
-        run_dag(nodes, sem()).await;
+        run_dag(nodes).await;
 
         assert_eq!(*log.lock().unwrap(), vec!["after"]);
     }
@@ -277,7 +270,7 @@ mod tests {
         // "lonely" depends on "ghost", which is not in the node set.
         let nodes = vec![marker("lonely", &["ghost"], log.clone())];
 
-        run_dag(nodes, sem()).await;
+        run_dag(nodes).await;
 
         assert_eq!(*log.lock().unwrap(), vec!["lonely"]);
     }
@@ -290,7 +283,7 @@ mod tests {
             Node {
                 id,
                 deps,
-                run: Box::new(move |_sem| {
+                run: Box::new(move || {
                     Box::pin(async move {
                         *counts.lock().unwrap().entry(id).or_insert(0) += 1;
                     })
@@ -306,7 +299,7 @@ mod tests {
             counting("e", &[]),
         ];
 
-        run_dag(nodes, sem()).await;
+        run_dag(nodes).await;
 
         let counts = counts.lock().unwrap();
         assert_eq!(counts.len(), 5);

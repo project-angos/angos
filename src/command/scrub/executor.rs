@@ -2,6 +2,7 @@ use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -36,6 +37,28 @@ impl ActionSink for DryRunSink {
     async fn apply(&mut self, action: Action) -> Result<(), Error> {
         info!("DRY RUN: would {action}");
         Ok(())
+    }
+}
+
+/// A per-task handle over the run's shared sink. Locking the shared `Mutex`
+/// around each individual `apply` (rather than around a checker's whole walk)
+/// lets the fanned-out namespace tasks overlap their enumeration and probe I/O
+/// while their mutations still serialize one at a time. Cheap to clone (an `Arc`
+/// bump); each fanned-out task holds its own.
+#[derive(Clone)]
+pub struct SharedSink(Arc<Mutex<Box<dyn ActionSink + Send>>>);
+
+impl SharedSink {
+    #[must_use]
+    pub fn new(inner: Arc<Mutex<Box<dyn ActionSink + Send>>>) -> Self {
+        Self(inner)
+    }
+}
+
+#[async_trait]
+impl ActionSink for SharedSink {
+    async fn apply(&mut self, action: Action) -> Result<(), Error> {
+        self.0.lock().await.apply(action).await
     }
 }
 

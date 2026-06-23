@@ -3,7 +3,7 @@
 //!
 //! The node bodies REUSE the existing checker structs verbatim: each body drives
 //! the relevant `NamespaceChecker` / `StoreChecker` / `TagChecker` over the right
-//! enumeration. Only the orchestration moved here — the per-checker logic is
+//! enumeration. Only the orchestration moved here; the per-checker logic is
 //! untouched. The DAG edges encode main's observable execution order:
 //!
 //! ```text
@@ -15,7 +15,7 @@
 //!   multipart          deps: []
 //!   orphan-jobs        deps: []
 //!   jobs               deps: []
-//!   replicate          deps: [orphan-jobs, metadata]
+//!   replicate          deps: [orphan-jobs, metadata, blob, orphan-grants]
 //! ```
 //!
 //! - `metadata -> blob` and `orphan-namespaces -> blob`: metadata link
@@ -28,13 +28,17 @@
 //!   when `--migrate` is absent (the common case), so routine scrubs run the GC
 //!   exactly as before.
 //! - `blob -> orphan-grants`: grants are applied after blob reclaim, as on main.
-//! - `orphan-jobs -> replicate`: the in-process replication drain runs after the
-//!   orphan-job sweep, as on main.
+//! - `{orphan-jobs, metadata, blob, orphan-grants} -> replicate`: the in-process
+//!   replication drain runs after the orphan-job sweep, the metadata enqueue
+//!   walk, and any blob reclaim, as main sequenced it. The drain reads
+//!   live-referenced blob bytes, so it must not overlap the blob GC; the
+//!   scheduler drops the blob/orphan-grants edges when those nodes are absent
+//!   (the dedicated `angos replication` path runs no blob GC).
 //! - `multipart` is dep-free: it shares no state with the other store sweeps
 //!   (pure S3 abort), so its action set is independent of ordering.
 //!
 //! Edges to a disabled (absent) node are dropped by the scheduler, so a
-//! dependent then runs against persisted state — exactly as the sequential loop
+//! dependent then runs against persisted state, exactly as the sequential loop
 //! did when a flag was off.
 
 use std::sync::Arc;
@@ -43,11 +47,19 @@ use futures_util::StreamExt;
 use tracing::{error, warn};
 
 use crate::{
-    command::scrub::{
-        action::Action,
-        check::{BlobChecker, NamespaceChecker, StoreChecker, TagChecker, list_all},
-        context::Ctx,
-        scheduler::Node,
+    command::{
+        maintenance::ReplicationDrain,
+        scrub::{
+            action::Action,
+            check::{
+                BlobChecker, JobChecker, LayoutChecker, MultipartChecker, NamespaceChecker,
+                OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker, StoreChecker,
+                TagChecker, list_all,
+            },
+            context::Ctx,
+            executor::{ActionSink, SharedSink},
+            scheduler::Node,
+        },
     },
     oci::{Namespace, Tag},
 };
@@ -55,9 +67,11 @@ use crate::{
 /// The `metadata` node body. One uniform walk over `list_all_namespaces`, fanned
 /// out up to `fanout` namespaces. Per namespace, run the enabled steps in main's
 /// order: tags walk first, then each namespace checker in `setup::namespace_checkers`
-/// push order. Each checker call locks the sink so the applies stay serialized
-/// (the action set is identical to the serial loop on main).
-async fn metadata_node(
+/// push order. Each checker drives a per-task `SharedSink` that locks the shared
+/// sink around each apply, so mutations serialize one at a time while the
+/// per-namespace reads fan out (the action set is identical to the serial loop on
+/// main).
+pub async fn metadata_node(
     ctx: Arc<Ctx>,
     namespace_checkers: Arc<Vec<Box<dyn NamespaceChecker>>>,
     tag_checkers: Arc<Option<Vec<Box<dyn TagChecker>>>>,
@@ -69,14 +83,6 @@ async fn metadata_node(
             let namespace_checkers = namespace_checkers.clone();
             let tag_checkers = tag_checkers.clone();
             async move {
-                // `ctx.sem` is the shared cross-node fan-out budget. Within this
-                // node it is functionally redundant with the `for_each_concurrent`
-                // bound above (both are `DEFAULT_FANOUT`, so this permit never
-                // actually gates), but it is the single budget the deferred blob
-                // fan-out will draw from the same pool, keeping total in-flight
-                // work bounded once blob-level parallelism lands. Held for the
-                // task's lifetime.
-                let _permit = ctx.sem.clone().acquire_owned().await;
                 let namespace = match namespace {
                     Ok(name) => match Namespace::new(&name) {
                         Ok(namespace) => namespace,
@@ -99,8 +105,8 @@ async fn metadata_node(
                 scrub_tags(&ctx, &namespace, &tag_checkers).await;
 
                 for checker in namespace_checkers.iter() {
-                    let mut guard = ctx.sink.lock().await;
-                    if let Err(e) = checker.check(&namespace, guard.as_mut()).await {
+                    let mut sink = SharedSink::new(ctx.sink.clone());
+                    if let Err(e) = checker.check(&namespace, &mut sink).await {
                         warn!("Scrub checker failed for namespace '{namespace}': {e}");
                     }
                 }
@@ -113,20 +119,32 @@ async fn metadata_node(
 ///
 /// Without `--prune-unknown` this is report-only: it logs a warning and emits
 /// no `Action`, exactly as main did (main `warn!`d and continued). With
-/// `--prune-unknown` it reclaims both possible footprints — the manifest
+/// `--prune-unknown` it reclaims both possible footprints (the manifest
 /// repository subtree ([`Action::DeleteInvalidNamespace`]) and the upload
-/// subtree ([`Action::DeleteInvalidUploadNamespace`]) — because
+/// subtree ([`Action::DeleteInvalidUploadNamespace`])) because
 /// `list_all_namespaces` enumerates a namespace marked by *either* subtree.
 /// Each delete is a best-effort prefix removal, so emitting both when only one
 /// exists is harmless (an absent prefix is a no-op in the executor).
 async fn prune_invalid_namespace(ctx: &Arc<Ctx>, name: &str, reason: &str) {
     if !ctx.opts.prune_unknown {
-        warn!(
-            "Skipping invalid enumerated namespace '{name}': {reason} (run with --prune-unknown to delete it)"
-        );
+        // Only `scrub` exposes `--prune-unknown`, so only steer operators at it
+        // when the running subcommand actually accepts it.
+        if ctx.prune_unknown_supported {
+            warn!(
+                "Skipping invalid enumerated namespace '{name}': {reason} (run with --prune-unknown to delete it)"
+            );
+        } else {
+            warn!("Skipping invalid enumerated namespace '{name}': {reason}");
+        }
+        // Report-only: surface the skip in the end-of-run summary (no `Action`
+        // is emitted, so this never deletes more than main).
+        ctx.findings
+            .record_skipped_invalid_namespace(name, reason)
+            .await;
         return;
     }
     warn!("Deleting invalid namespace directory '{name}': {reason}");
+    let mut sink = SharedSink::new(ctx.sink.clone());
     for action in [
         Action::DeleteInvalidNamespace {
             name: name.to_string(),
@@ -135,8 +153,7 @@ async fn prune_invalid_namespace(ctx: &Arc<Ctx>, name: &str, reason: &str) {
             name: name.to_string(),
         },
     ] {
-        let mut guard = ctx.sink.lock().await;
-        if let Err(e) = guard.apply(action).await {
+        if let Err(e) = sink.apply(action).await {
             error!("Failed to delete invalid namespace directory '{name}': {e}");
         }
     }
@@ -167,8 +184,8 @@ async fn scrub_tags(
             Ok(tag) => tag,
             Err(reason) => {
                 warn!("Deleting invalid tag directory '{namespace}:{name}': {reason}");
-                let mut guard = ctx.sink.lock().await;
-                if let Err(e) = guard
+                let mut sink = SharedSink::new(ctx.sink.clone());
+                if let Err(e) = sink
                     .apply(Action::DeleteInvalidTag {
                         namespace: namespace.clone(),
                         tag: name,
@@ -181,8 +198,8 @@ async fn scrub_tags(
             }
         };
         for checker in tag_checkers {
-            let mut guard = ctx.sink.lock().await;
-            if let Err(e) = checker.check_tag(namespace, &tag, guard.as_mut()).await {
+            let mut sink = SharedSink::new(ctx.sink.clone());
+            if let Err(e) = checker.check_tag(namespace, &tag, &mut sink).await {
                 error!("Tag check failed for '{namespace}:{tag}': {e}");
             }
         }
@@ -192,8 +209,8 @@ async fn scrub_tags(
 /// A node body that drives a single store-wide checker's `check_all`. Logs and
 /// continues past a failed checker (scrub is best-effort).
 async fn store_node(ctx: &Ctx, label: &'static str, checker: Box<dyn StoreChecker>) {
-    let mut guard = ctx.sink.lock().await;
-    if let Err(e) = checker.check_all(guard.as_mut()).await {
+    let mut sink = SharedSink::new(ctx.sink.clone());
+    if let Err(e) = checker.check_all(&mut sink).await {
         warn!("Store scrub checker '{label}' failed: {e}");
     }
 }
@@ -202,8 +219,8 @@ async fn store_node(ctx: &Ctx, label: &'static str, checker: Box<dyn StoreChecke
 /// drives `check_all`; blob-level fan-out is deferred (keeping `-b` behavior
 /// byte-identical to main).
 async fn blob_node(ctx: &Ctx, checker: BlobChecker) {
-    let mut guard = ctx.sink.lock().await;
-    if let Err(e) = checker.check_all(guard.as_mut()).await {
+    let mut sink = SharedSink::new(ctx.sink.clone());
+    if let Err(e) = checker.check_all(&mut sink).await {
         warn!("Store scrub checker 'blobs' failed: {e}");
     }
 }
@@ -216,7 +233,7 @@ async fn blob_node(ctx: &Ctx, checker: BlobChecker) {
 /// One flat declarative node table; the length is the node count, not branching
 /// complexity, so the line-count lint is allowed rather than fragmenting it.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
+pub fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
     let NodeParts {
         layout_checker,
         namespace_checkers,
@@ -238,7 +255,7 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         nodes.push(Node {
             id: "migrate",
             deps: &[],
-            run: Box::new(move |_sem| {
+            run: Box::new(move || {
                 Box::pin(async move {
                     store_node(&ctx, "migrate", Box::new(layout_checker)).await;
                 })
@@ -256,9 +273,7 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         nodes.push(Node {
             id: "metadata",
             deps: &[],
-            run: Box::new(move |_sem| {
-                Box::pin(metadata_node(ctx, namespace_checkers, tag_checkers))
-            }),
+            run: Box::new(move || Box::pin(metadata_node(ctx, namespace_checkers, tag_checkers))),
         });
     }
 
@@ -269,7 +284,7 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         nodes.push(Node {
             id: "orphan-namespaces",
             deps: &[],
-            run: Box::new(move |_sem| {
+            run: Box::new(move || {
                 Box::pin(async move {
                     store_node(&ctx, "orphan-namespaces", Box::new(checker)).await;
                 })
@@ -288,7 +303,7 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         nodes.push(Node {
             id: "blob",
             deps: &["metadata", "orphan-namespaces", "migrate"],
-            run: Box::new(move |_sem| {
+            run: Box::new(move || {
                 Box::pin(async move {
                     blob_node(&ctx, checker).await;
                 })
@@ -302,7 +317,7 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         nodes.push(Node {
             id: "orphan-grants",
             deps: &["blob"],
-            run: Box::new(move |_sem| {
+            run: Box::new(move || {
                 Box::pin(async move {
                     store_node(&ctx, "orphan-grants", Box::new(checker)).await;
                 })
@@ -316,7 +331,7 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         nodes.push(Node {
             id: "multipart",
             deps: &[],
-            run: Box::new(move |_sem| {
+            run: Box::new(move || {
                 Box::pin(async move {
                     store_node(&ctx, "multipart", Box::new(checker)).await;
                 })
@@ -330,7 +345,7 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         nodes.push(Node {
             id: "orphan-jobs",
             deps: &[],
-            run: Box::new(move |_sem| {
+            run: Box::new(move || {
                 Box::pin(async move {
                     for checker in orphan_job_checkers {
                         store_node(&ctx, "orphan-jobs", Box::new(checker)).await;
@@ -348,7 +363,7 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         nodes.push(Node {
             id: "jobs",
             deps: &[],
-            run: Box::new(move |_sem| {
+            run: Box::new(move || {
                 Box::pin(async move {
                     store_node(&ctx, "jobs", Box::new(checker)).await;
                 })
@@ -356,20 +371,20 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
         });
     }
 
-    // replicate: the in-process drain, after orphan-jobs and metadata. The
-    // ReplicationChecker's enqueue step already ran inside the metadata node.
-    //
-    // The drain may overlap the blob GC, orphan-grants, and multipart sweeps
-    // (none is a dep), unlike main where the drain ran strictly after the whole
-    // store sweep. This is action-set-neutral: the drain only pushes
-    // live-referenced tags/blobs, and the blob GC re-checks every reference under
-    // the per-digest blob data lock before classifying anything as orphan, so the
-    // overlap can never make GC delete content the drain still needs.
+    // replicate: the in-process drain, after the orphan-jobs sweep and the
+    // metadata enqueue walk (the ReplicationChecker's enqueue step ran inside the
+    // metadata node). It also depends on `blob` and `orphan-grants` so the drain
+    // runs strictly after any blob reclaim, exactly as main sequenced it: the
+    // drain reads live-referenced blob bytes to push them downstream, so it must
+    // not overlap the GC that could reclaim bytes. The scheduler drops the
+    // blob/orphan-grants edges when those nodes are absent (the dedicated
+    // `angos replication` path runs no blob GC), so the drain then runs right
+    // after the enqueue walk.
     if let Some(drain) = replication_drain {
         nodes.push(Node {
             id: "replicate",
-            deps: &["orphan-jobs", "metadata"],
-            run: Box::new(move |_sem| Box::pin(drain.drain())),
+            deps: &["orphan-jobs", "metadata", "blob", "orphan-grants"],
+            run: Box::new(move || Box::pin(drain.drain())),
         });
     }
 
@@ -378,15 +393,15 @@ pub(crate) fn build_nodes(ctx: &Arc<Ctx>, parts: NodeParts) -> Vec<Node> {
 
 /// The pre-built checkers and drain handed to [`build_nodes`]. Constructed in
 /// `Command::new` via the unchanged `setup::*` builders.
-pub(crate) struct NodeParts {
-    pub layout_checker: Option<crate::command::scrub::check::LayoutChecker>,
+pub struct NodeParts {
+    pub layout_checker: Option<LayoutChecker>,
     pub namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
     pub tag_checkers: Option<Vec<Box<dyn TagChecker>>>,
     pub blob_checker: Option<BlobChecker>,
-    pub multipart_checker: Option<crate::command::scrub::check::MultipartChecker>,
-    pub orphan_grant_checker: Option<crate::command::scrub::check::OrphanGrantChecker>,
-    pub orphan_namespace_checker: Option<crate::command::scrub::check::OrphanNamespaceChecker>,
-    pub orphan_job_checkers: Vec<crate::command::scrub::check::OrphanJobChecker>,
-    pub job_checker: Option<crate::command::scrub::check::JobChecker>,
-    pub replication_drain: Option<super::command::ReplicationDrain>,
+    pub multipart_checker: Option<MultipartChecker>,
+    pub orphan_grant_checker: Option<OrphanGrantChecker>,
+    pub orphan_namespace_checker: Option<OrphanNamespaceChecker>,
+    pub orphan_job_checkers: Vec<OrphanJobChecker>,
+    pub job_checker: Option<JobChecker>,
+    pub replication_drain: Option<ReplicationDrain>,
 }

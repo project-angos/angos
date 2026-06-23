@@ -9,6 +9,7 @@ use crate::{
         check::{NamespaceChecker, ensure_link, list_all},
         error::Error,
         executor::ActionSink,
+        report::Findings,
     },
     oci::{Digest, Namespace},
     registry::{
@@ -51,13 +52,23 @@ pub struct DanglingReference {
 pub struct ManifestChecker {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
+    /// Shared report-only accumulator: each dangling reference is recorded here so
+    /// it surfaces in the end-of-run summary. Recording is purely additive; it
+    /// never changes which `Action`s are emitted. Tests pass `Findings::default()`
+    /// (a no-op accumulator never read back).
+    findings: Findings,
 }
 
 impl ManifestChecker {
-    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(
+        blob_store: Arc<BlobStore>,
+        metadata_store: Arc<MetadataStore>,
+        findings: Findings,
+    ) -> Self {
         Self {
             blob_store,
             metadata_store,
+            findings,
         }
     }
 
@@ -84,13 +95,18 @@ impl ManifestChecker {
         }
 
         // Report-only: surface references whose backing content is missing.
-        // Never deleted — a pull-through mirror or a partial pull legitimately
-        // lacks config/layer blobs or index children.
+        // Never deleted: a pull-through mirror or a partial pull legitimately
+        // lacks config/layer blobs or index children. The `warn!` is the
+        // per-item line; the `findings` record feeds the end-of-run summary count
+        // (additive, emits no `Action`).
         for dangling in self.find_dangling_references(&manifest).await? {
             warn!(
                 "Manifest '{namespace}@{revision}' references missing {} '{}'",
                 dangling.kind, dangling.digest
             );
+            self.findings
+                .record_dangling(namespace, revision, &dangling)
+                .await;
         }
 
         Ok(())
@@ -98,7 +114,7 @@ impl ManifestChecker {
 
     /// Probe every blob and child manifest a revision references and collect the
     /// ones whose bytes are absent. Existence-only (`size`); a real backend error
-    /// propagates. Report-only — see [`DanglingReference`].
+    /// propagates. Report-only; see [`DanglingReference`].
     async fn find_dangling_references(
         &self,
         manifest: &ParsedManifestDigests,
@@ -229,7 +245,11 @@ mod tests {
 
             let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
-            let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            let scrubber = ManifestChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                Findings::default(),
+            );
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let config_link = metadata_store
@@ -311,7 +331,11 @@ mod tests {
 
             let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
-            let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            let scrubber = ManifestChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                Findings::default(),
+            );
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let link_meta = metadata_store
@@ -391,7 +415,11 @@ mod tests {
                 .unwrap();
 
             let mut sink: Vec<Action> = Vec::new();
-            let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            let scrubber = ManifestChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                Findings::default(),
+            );
             scrubber.check(namespace, &mut sink).await.unwrap();
 
             let has_recreate = sink.iter().any(|a| {
@@ -462,7 +490,11 @@ mod tests {
             let body = image_manifest(&config, &[&present_layer, &missing_layer]);
             let manifest = parse_manifest_digests(body.as_bytes(), None).unwrap();
 
-            let checker = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            let checker = ManifestChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                Findings::default(),
+            );
             let dangling = checker.find_dangling_references(&manifest).await.unwrap();
 
             assert_eq!(
@@ -504,7 +536,11 @@ mod tests {
             );
             let manifest = parse_manifest_digests(body.as_bytes(), None).unwrap();
 
-            let checker = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            let checker = ManifestChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                Findings::default(),
+            );
             let dangling = checker.find_dangling_references(&manifest).await.unwrap();
 
             assert_eq!(
@@ -533,7 +569,11 @@ mod tests {
             let body = image_manifest(&config, &[&layer]);
             let manifest = parse_manifest_digests(body.as_bytes(), None).unwrap();
 
-            let checker = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            let checker = ManifestChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                Findings::default(),
+            );
             assert!(
                 checker
                     .find_dangling_references(&manifest)
@@ -588,7 +628,11 @@ mod tests {
             // Dangling layer: still referenced and linked, but its bytes are gone.
             blob_store.delete_blob(&layer_digest).await.unwrap();
 
-            let checker = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            let checker = ManifestChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                Findings::default(),
+            );
             let mut sink: Vec<Action> = Vec::new();
             checker.check(namespace, &mut sink).await.unwrap();
 
