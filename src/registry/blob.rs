@@ -1,14 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE};
 use tokio::io::AsyncReadExt;
-#[cfg(test)]
-use tracing::info;
-use tracing::{debug, instrument, warn};
-
-#[cfg(test)]
-use angos_tx_engine::transaction::Transaction;
-use angos_tx_engine::transaction::{Mutation, Read};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     metrics_provider::metrics_provider,
@@ -19,7 +13,7 @@ use crate::{
         blob_store::{BlobStore, BoxedReader},
         cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
         job_store::{JobEnvelope, Queue},
-        metadata_store::{LinkKind, MetadataStore},
+        metadata_store::{BlobIndexOperation, LinkKind, MetadataStore},
     },
 };
 
@@ -135,75 +129,87 @@ fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bo
         .any(|link| !matches!(link, LinkKind::Blob(link_digest) if link_digest == digest))
 }
 
-/// Stream `stream` into an upload staging slot and return the engine reads +
-/// mutations that, on commit, atomically promote the staged bytes to
-/// `blob-data/<digest>`, delete the upload-session record, and grant `namespace`
-/// ownership of the blob.
+/// Cache a pull-through blob: stage and finalize its bytes through the blob
+/// store, then grant `namespace` a reference through the metadata store.
 ///
-/// Side-effects already taken on return: staging objects written (and the S3
-/// multipart completed); a crash before the mutations apply leaves them for
-/// scrub to reclaim.
-pub async fn cache_blob_mutations(
-    blob_store: Arc<BlobStore>,
-    metadata_store: Arc<MetadataStore>,
-    namespace: Namespace,
-    digest: Digest,
+/// Each write commits on its own store's executor, so the blob bytes and the
+/// blob-index grant can live on separate backends without one being routed
+/// through the other's executor. Byte presence is the dedup gate and the grant
+/// is idempotent, so a retry after a partial fill re-grants without re-fetching;
+/// a crash before the grant leaves the blob-data for scrub to reclaim.
+pub async fn cache_blob(
+    blob_store: &BlobStore,
+    metadata_store: &MetadataStore,
+    namespace: &Namespace,
+    digest: &Digest,
     stream: BoxedReader,
     content_length: u64,
-) -> Result<(Vec<Read>, Vec<Mutation>), Error> {
+) -> Result<(), Error> {
     debug!("Fetching blob: {digest}");
     let session_id = UploadSessionId::generate();
     blob_store
-        .create_upload(&namespace, session_id.as_ref())
+        .create_upload(namespace, session_id.as_ref())
         .await?;
     // A single-shot copy of a known blob: hash only the target algorithm.
     blob_store
         .write_monolithic_upload(
-            &namespace,
+            namespace,
             session_id.as_ref(),
             stream,
             Some(content_length),
             digest.algorithm(),
         )
         .await?;
-    let (_, mut mutations) = blob_store
-        .finalize_upload_mutations(&namespace, session_id.as_ref(), &digest)
-        .await?;
-    let (reads, mut grant_mutations) = metadata_store
-        .build_grant_mutations(&namespace, &digest)
-        .await?;
-    mutations.append(&mut grant_mutations);
-    Ok((reads, mutations))
+    // Promote the staged bytes and grant the reference under the blob-data lock
+    // so a concurrent delete cannot reclaim the blob in the window between the
+    // two store-local commits. This is the same coarse lock `delete_blob` holds
+    // while reclaiming, and mirrors the manifest path's bytes-then-link order.
+    let lock = metadata_store.acquire_blob_data_lock(digest).await?;
+    let result = async {
+        blob_store
+            .complete_upload(namespace, session_id.as_ref(), digest)
+            .await?;
+        grant_blob_index_reference(metadata_store, namespace, digest).await
+    }
+    .await;
+    lock.release().await;
+    result?;
+
+    info!("Caching of {digest} completed");
+    Ok(())
 }
 
-/// Fetch `stream` into the local blob store and record namespace ownership
-/// as a single committed transaction. The handler path uses
-/// [`cache_blob_mutations`] directly and merges the result into a larger
-/// transaction; this wrapper exists for the rare non-handler caller (tests).
-#[cfg(test)]
-pub async fn cache_blob(
-    blob_store: Arc<BlobStore>,
-    metadata_store: Arc<MetadataStore>,
-    namespace: Namespace,
-    digest: Digest,
-    stream: BoxedReader,
-    content_length: u64,
+/// Grant `namespace` a reference to an already-present blob, holding the
+/// blob-data lock so the grant is serialized against a concurrent reclaim (the
+/// `bytes already present` branch of the cache-fill handler).
+pub async fn grant_blob_reference(
+    metadata_store: &MetadataStore,
+    namespace: &Namespace,
+    digest: &Digest,
 ) -> Result<(), Error> {
-    let (reads, mutations) = cache_blob_mutations(
-        blob_store,
-        metadata_store.clone(),
-        namespace,
-        digest.clone(),
-        stream,
-        content_length,
-    )
-    .await?;
+    let lock = metadata_store.acquire_blob_data_lock(digest).await?;
+    let result = grant_blob_index_reference(metadata_store, namespace, digest).await;
+    lock.release().await;
+    result
+}
+
+/// Insert `namespace`'s blob ownership reference into the metadata store's blob
+/// index. The caller holds the blob-data lock. Committed on the metadata store's
+/// executor with the engine's conflict retry, so it is never routed through the
+/// blob store's executor; the insert is idempotent, so a cache-fill retry
+/// re-grants harmlessly.
+async fn grant_blob_index_reference(
+    metadata_store: &MetadataStore,
+    namespace: &Namespace,
+    digest: &Digest,
+) -> Result<(), Error> {
     metadata_store
-        .executor()
-        .execute(Transaction::from_parts(reads, mutations))
-        .await
-        .map_err(|e| Error::Internal(format!("cache_blob transaction failed: {e}")))?;
-    info!("Caching of {digest} completed");
+        .update_blob_index(
+            namespace,
+            digest,
+            BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
+        )
+        .await?;
     Ok(())
 }
 
@@ -442,9 +448,11 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, time::Duration};
+    use std::{io::Cursor, sync::Arc, time::Duration};
 
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
     use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
+    use tempfile::TempDir;
     use tokio::{io::AsyncReadExt, time::sleep};
 
     use super::*;
@@ -453,8 +461,11 @@ mod tests {
         registry::{
             DOCKER_CONTENT_DIGEST,
             blob_ownership::BlobOwnership,
-            metadata_store::LinkOperation,
-            test_utils::{backends, create_test_blob, put_blob_direct},
+            metadata_store::{BlobIndexOperation, LinkOperation},
+            test_utils::{
+                backends, build_store, create_test_blob, locked_executor_over, metadata_store_over,
+                put_blob_direct,
+            },
         },
     };
 
@@ -799,10 +810,10 @@ mod tests {
             let stream = Box::new(Cursor::new(content.to_vec()));
 
             cache_blob(
-                registry.blob_store.clone(),
-                registry.metadata_store.clone(),
-                namespace.clone(),
-                digest.clone(),
+                &registry.blob_store,
+                &registry.metadata_store,
+                &namespace,
+                &digest,
                 stream,
                 content.len() as u64,
             )
@@ -834,6 +845,68 @@ mod tests {
             }
             test_case.cleanup().await;
         }
+    }
+
+    /// Regression guard for the split-backend pull-through cache-fill failure:
+    /// with the blob store and metadata store on separate backends, `cache_blob`
+    /// must store the bytes in the blob store and grant the reference in the
+    /// metadata store, committing each on its own executor. The previous design
+    /// folded both into one transaction and conflicted on every layer because
+    /// the blob-index read was verified against the wrong backend.
+    #[tokio::test]
+    async fn cache_blob_grants_reference_with_split_blob_and_metadata_backends() {
+        crate::metrics_provider::init_for_tests();
+        let blob_dir = TempDir::new().unwrap();
+        let meta_dir = TempDir::new().unwrap();
+
+        let blob_obj: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder(blob_dir.path().to_str().unwrap()).build());
+        let blob_store = Arc::new(BlobStore::new(build_store(
+            blob_obj.clone(),
+            locked_executor_over(blob_obj.clone()),
+        )));
+
+        let meta_obj: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder(meta_dir.path().to_str().unwrap()).build());
+        let metadata_store = metadata_store_over(meta_obj.clone(), locked_executor_over(meta_obj));
+
+        let namespace = Namespace::new("kubernetes.io/kube-apiserver").unwrap();
+        let content = b"layer bytes";
+        let digest = Digest::sha256_of_bytes(content);
+
+        // A prior manifest pull recorded the layer's ownership link in the
+        // metadata store, which is what made the old design conflict.
+        metadata_store
+            .update_blob_index(
+                &namespace,
+                &digest,
+                BlobIndexOperation::Insert(LinkKind::Layer(digest.clone())),
+            )
+            .await
+            .unwrap();
+
+        cache_blob(
+            &blob_store,
+            &metadata_store,
+            &namespace,
+            &digest,
+            Box::new(Cursor::new(content.to_vec())),
+            content.len() as u64,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            blob_store.read(&digest).await.unwrap(),
+            content,
+            "the blob bytes must land in the blob store"
+        );
+        let blob_index = metadata_store.read_blob_index(&digest).await.unwrap();
+        let links = blob_index.namespace.get(&namespace).unwrap();
+        assert!(
+            links.contains(&LinkKind::Blob(digest.clone())),
+            "the namespace must hold a blob ownership reference after caching"
+        );
     }
 
     #[tokio::test]
