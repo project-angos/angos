@@ -7,12 +7,13 @@ use tracing::{debug, error, warn};
 use crate::{
     command::scrub::{
         action::Action,
-        check::{NamespaceChecker, list_all, orphan_on_missing_manifest},
+        check::{NamespaceChecker, list_all},
         error::Error,
         executor::ActionSink,
     },
     oci::{Manifest, Namespace},
     registry::{
+        blob_store,
         blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
     },
@@ -45,15 +46,21 @@ impl MediaTypeChecker {
             return Ok(());
         }
 
-        let Some(content) = orphan_on_missing_manifest(
-            self.blob_store.read(&metadata.target).await,
-            namespace,
-            &metadata.target,
-            sink,
-        )
-        .await?
-        else {
-            return Ok(());
+        let content = match self.blob_store.read(&metadata.target).await {
+            Ok(content) => content,
+            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                warn!(
+                    "Manifest blob missing for {display_name} ({}); removing revision link",
+                    metadata.target
+                );
+                return sink
+                    .apply(Action::DeleteOrphanManifest {
+                        namespace: namespace.clone(),
+                        digest: metadata.target,
+                    })
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
         };
 
         let media_type = match serde_json::from_slice::<Manifest>(&content) {

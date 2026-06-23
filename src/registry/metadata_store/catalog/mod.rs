@@ -26,16 +26,6 @@ use referrer_resolver::resolve_referrer_descriptor;
 /// derived from content, so these objects are dead and are pruned by scrub.
 const LEGACY_NAMESPACE_REGISTRY_PREFIX: &str = "_registry";
 
-/// Parse a `<algorithm>/<hash>[/...]` referrers-dir entry key into the referrer
-/// manifest digest, ignoring trailing path segments (e.g. `/link`). Shared by
-/// the descriptor-resolving [`MetadataStore::list_referrers`] and the raw
-/// [`MetadataStore::list_referrer_digests`].
-fn parse_referrer_digest(key: &str) -> Option<Digest> {
-    let mut parts = key.split('/');
-    let algorithm = parts.next()?.parse::<Algorithm>().ok()?;
-    Digest::with_algorithm(algorithm, parts.next()?).ok()
-}
-
 impl MetadataStore {
     #[instrument(skip(self))]
     pub async fn list_namespaces(
@@ -65,34 +55,6 @@ impl MetadataStore {
 
         let namespaces = self
             .collect_namespaces_with_marker(path_builder::repository_dir(), "", "_uploads")
-            .await?;
-
-        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
-    }
-
-    /// Lists every namespace marked by *any* registry subtree
-    /// (`_manifests`, `_layers`, `_config`, `_blobs`, or `_uploads`), the union
-    /// of the content-derived catalog and the upload-only and link-only paths.
-    ///
-    /// Scrub's per-namespace validity walk drives off this so it visits a
-    /// namespace regardless of which of its subtrees survive; unlike
-    /// [`Self::list_namespaces`] (keyed off `_manifests` only) it does not omit
-    /// a namespace holding nothing but stranded uploads or dangling
-    /// layer/config links. Paginated identically to [`Self::list_namespaces`].
-    #[instrument(skip(self))]
-    pub async fn list_all_namespaces(
-        &self,
-        n: u16,
-        last: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
-        debug!("Fetching {n} all-namespace(s) with continuation token: {last:?}");
-
-        let namespaces = self
-            .collect_namespaces_with_any_marker(
-                path_builder::repository_dir(),
-                "",
-                &["_manifests", "_layers", "_config", "_blobs", "_uploads"],
-            )
             .await?;
 
         Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
@@ -218,7 +180,14 @@ impl MetadataStore {
             let digest_entries: Vec<Digest> = page
                 .items
                 .iter()
-                .filter_map(|key| parse_referrer_digest(key))
+                .filter_map(|key| {
+                    let parts: Vec<&str> = key.split('/').collect();
+                    if parts.len() < 2 {
+                        return None;
+                    }
+                    let algorithm = parts[0].parse::<Algorithm>().ok()?;
+                    Digest::with_algorithm(algorithm, parts[1]).ok()
+                })
                 .collect();
 
             let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
@@ -256,34 +225,6 @@ impl MetadataStore {
 
         referrers.sort_by(|a, b| a.digest.cmp(&b.digest));
         Ok(referrers)
-    }
-
-    /// Enumerate the raw referrer manifest digests recorded under `subject`,
-    /// independent of whether each has a cached descriptor or a readable manifest
-    /// blob. Unlike [`Self::list_referrers`] it resolves no descriptors, so a
-    /// caller (scrub) can see — and reclaim — orphan referrer links that
-    /// [`Self::list_referrers`] silently drops.
-    pub async fn list_referrer_digests(
-        &self,
-        namespace: &Namespace,
-        subject: &Digest,
-    ) -> Result<Vec<Digest>, Error> {
-        let referrers_dir = path_builder::manifest_referrers_dir(namespace, subject);
-        let mut digests = Vec::new();
-        let mut token = None;
-        loop {
-            let page = self.store().list(&referrers_dir, 100, token).await?;
-            digests.extend(
-                page.items
-                    .iter()
-                    .filter_map(|key| parse_referrer_digest(key)),
-            );
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
-        }
-        Ok(digests)
     }
 
     pub async fn has_referrers(
@@ -325,64 +266,6 @@ impl MetadataStore {
                 Ok((revisions, page.next_token))
             },
         )
-        .await
-    }
-
-    /// Enumerate a namespace's layer links (`_layers/<algo>/<hash>`), paginated
-    /// and sharded by algorithm like [`Self::list_revisions`]. Scrub uses this to
-    /// reach layer links no current manifest references.
-    pub async fn list_layer_links(
-        &self,
-        namespace: &Namespace,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        self.list_sharded_links(n, continuation_token, |algorithm| {
-            path_builder::layers_link_root_dir(namespace, algorithm.as_str())
-        })
-        .await
-    }
-
-    /// Enumerate a namespace's config links (`_config/<algo>/<hash>`), paginated
-    /// and sharded by algorithm like [`Self::list_revisions`].
-    pub async fn list_config_links(
-        &self,
-        namespace: &Namespace,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        self.list_sharded_links(n, continuation_token, |algorithm| {
-            path_builder::config_link_root_dir(namespace, algorithm.as_str())
-        })
-        .await
-    }
-
-    /// Shared driver for the algorithm-sharded link enumerators: lists the
-    /// `<hash>` children of each `root_dir(algorithm)` and maps them to digests.
-    async fn list_sharded_links<F>(
-        &self,
-        n: u16,
-        continuation_token: Option<String>,
-        root_dir: F,
-    ) -> Result<(Vec<Digest>, Option<String>), Error>
-    where
-        F: Fn(Algorithm) -> String,
-    {
-        pagination::paginate_by_algorithm(n, continuation_token, |algorithm, limit, cursor| {
-            let dir = root_dir(algorithm);
-            async move {
-                let page = self
-                    .store()
-                    .list_children(&dir, limit, cursor, None)
-                    .await?;
-                let digests = page
-                    .sub_prefixes
-                    .into_iter()
-                    .filter_map(|key| Digest::with_algorithm(algorithm, key).ok())
-                    .collect();
-                Ok((digests, page.next_token))
-            }
-        })
         .await
     }
 
@@ -475,24 +358,6 @@ impl MetadataStore {
         root_prefix: &str,
         marker: &str,
     ) -> Result<Vec<String>, Error> {
-        self.collect_namespaces_with_any_marker(root_path, root_prefix, &[marker])
-            .await
-    }
-
-    /// Generalises [`Self::collect_namespaces_with_marker`] to a *set* of
-    /// markers: a path is a namespace when it holds **any** of `markers` as a
-    /// child (the union, not the intersection). Scrub's `list_all_namespaces`
-    /// passes every registry subtree so it reaches a namespace surviving in any
-    /// one of them. With a single-element slice it is identical to the
-    /// single-marker walk. Reuses the same `_`-prefixed-children-are-never-
-    /// descended tree walk so manifest/upload/blob substructure is not mistaken
-    /// for nested namespaces.
-    async fn collect_namespaces_with_any_marker(
-        &self,
-        root_path: &str,
-        root_prefix: &str,
-        markers: &[&str],
-    ) -> Result<Vec<String>, Error> {
         let mut stack: Vec<(String, String)> =
             vec![(root_path.to_string(), root_prefix.to_string())];
         let mut namespaces = Vec::new();
@@ -505,7 +370,7 @@ impl MetadataStore {
                 let page = self.store().list_children(&path, 1000, token, None).await?;
 
                 for entry in &page.sub_prefixes {
-                    if markers.contains(&entry.as_str()) {
+                    if entry == marker {
                         is_namespace = true;
                         continue;
                     }

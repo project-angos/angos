@@ -17,11 +17,6 @@ pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4)
 /// Default replication-worker concurrency; the `unwrap` is const-evaluated.
 pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
-/// Default per-node fan-out budget for the `scrub` / `policy` / `replication`
-/// DAG: how many namespaces may be enumerated in-flight at once. The `unwrap` is
-/// const-evaluated.
-pub const DEFAULT_MAX_CONCURRENT_SCRUB_TASKS: NonZeroUsize = NonZeroUsize::new(16).unwrap();
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
@@ -38,15 +33,6 @@ pub struct GlobalConfig {
         deserialize_with = "deserialize_max_concurrent_replication_jobs"
     )]
     pub max_concurrent_replication_jobs: NonZeroUsize,
-    /// Per-node fan-out budget for the `scrub` / `policy` / `replication` DAG:
-    /// how many namespaces may be enumerated in-flight at once. The shared sink
-    /// still serializes the actual mutations, so this never changes the set of
-    /// emitted actions.
-    #[serde(
-        default = "default_max_concurrent_scrub_tasks",
-        deserialize_with = "deserialize_max_concurrent_scrub_tasks"
-    )]
-    pub max_concurrent_scrub_tasks: NonZeroUsize,
     #[serde(default = "default_max_manifest_size")]
     pub max_manifest_size: ByteSize,
     #[serde(default = "default_max_blob_size")]
@@ -128,17 +114,6 @@ where
     deserialize_positive_nonzero(deserializer, "max_concurrent_replication_jobs")
 }
 
-fn default_max_concurrent_scrub_tasks() -> NonZeroUsize {
-    DEFAULT_MAX_CONCURRENT_SCRUB_TASKS
-}
-
-fn deserialize_max_concurrent_scrub_tasks<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_positive_nonzero(deserializer, "max_concurrent_scrub_tasks")
-}
-
 fn default_max_manifest_size() -> ByteSize {
     ByteSize::mib(5)
 }
@@ -161,7 +136,6 @@ impl Default for GlobalConfig {
             max_concurrent_requests: default_max_concurrent_requests(),
             max_concurrent_cache_jobs: default_max_concurrent_cache_jobs(),
             max_concurrent_replication_jobs: default_max_concurrent_replication_jobs(),
-            max_concurrent_scrub_tasks: default_max_concurrent_scrub_tasks(),
             max_manifest_size: default_max_manifest_size(),
             max_blob_size: default_max_blob_size(),
             update_pull_time: default_update_pull_time(),
@@ -217,7 +191,6 @@ mod tests {
         assert_eq!(config.max_concurrent_requests, 64);
         assert_eq!(config.max_concurrent_cache_jobs.get(), 4);
         assert_eq!(config.max_concurrent_replication_jobs.get(), 4);
-        assert_eq!(config.max_concurrent_scrub_tasks.get(), 16);
         assert_eq!(config.max_manifest_size, ByteSize::mib(5));
         assert_eq!(config.max_blob_size, ByteSize::gib(100));
         assert!(!config.update_pull_time);
@@ -237,7 +210,6 @@ mod tests {
             max_concurrent_requests = 10
             max_concurrent_cache_jobs = 8
             max_concurrent_replication_jobs = 6
-            max_concurrent_scrub_tasks = 32
             max_manifest_size = "7MiB"
             max_blob_size = "10GiB"
             update_pull_time = true
@@ -257,10 +229,6 @@ mod tests {
         assert_eq!(
             config.max_concurrent_replication_jobs,
             NonZeroUsize::new(6).unwrap()
-        );
-        assert_eq!(
-            config.max_concurrent_scrub_tasks,
-            NonZeroUsize::new(32).unwrap()
         );
         assert_eq!(config.max_manifest_size, ByteSize::mib(7));
         assert_eq!(config.max_blob_size, ByteSize::gib(10));
@@ -282,12 +250,6 @@ mod tests {
     #[test]
     fn max_concurrent_replication_jobs_zero_is_rejected() {
         let result = toml::from_str::<GlobalConfig>("max_concurrent_replication_jobs = 0\n");
-        assert!(result.is_err(), "zero must be rejected at deserialization");
-    }
-
-    #[test]
-    fn max_concurrent_scrub_tasks_zero_is_rejected() {
-        let result = toml::from_str::<GlobalConfig>("max_concurrent_scrub_tasks = 0\n");
         assert!(result.is_err(), "zero must be rejected at deserialization");
     }
 

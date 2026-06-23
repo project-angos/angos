@@ -1,6 +1,5 @@
 mod blob;
 mod blob_index;
-mod jobs;
 mod layout;
 mod link_references;
 mod link_repair;
@@ -20,11 +19,10 @@ mod upload;
 use async_trait::async_trait;
 pub use blob::BlobChecker;
 pub use blob_index::BlobIndexChecker;
-pub use jobs::JobChecker;
 pub use layout::LayoutChecker;
 pub use link_references::LinkReferencesChecker;
-pub use link_repair::{ensure_link, orphan_on_missing_manifest};
-pub use manifest::{DanglingReference, ManifestChecker, ReferenceKind};
+pub use link_repair::ensure_link;
+pub use manifest::ManifestChecker;
 pub use media_type::MediaTypeChecker;
 pub use multipart::MultipartChecker;
 pub use orphan_grants::OrphanGrantChecker;
@@ -65,7 +63,7 @@ pub trait StoreChecker: Send + Sync {
 }
 
 /// A checker that inspects a single already-validated tag. The tag walk is
-/// driven once by the scrub `metadata` node, which dispatches every valid tag
+/// driven once by `Command::scrub_metadata`, which dispatches every valid tag
 /// to each enabled `TagChecker`.
 #[async_trait]
 pub trait TagChecker: Send + Sync {

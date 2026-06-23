@@ -14,9 +14,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    command::{
-        argon, policy as policy_command, replication as replication_command, scrub, server, worker,
-    },
+    command::{argon, scrub, server, worker},
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
     metrics_provider::initialize_metrics,
 };
@@ -109,8 +107,6 @@ struct GlobalArguments {
 #[argh(subcommand)]
 enum SubCommand {
     Argon(argon::Options),
-    Policy(policy_command::Options),
-    Replication(replication_command::Options),
     Scrub(scrub::Options),
     Serve(server::Options),
     Worker(worker::Options),
@@ -166,22 +162,6 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
                 1
             }
         },
-        SubCommand::Policy(policy_options) => match run_policy(policy_options, config).await {
-            Ok(()) => 0,
-            Err(err) => {
-                error!("Policy error: {err}");
-                1
-            }
-        },
-        SubCommand::Replication(replication_options) => {
-            match run_replication(replication_options, config).await {
-                Ok(()) => 0,
-                Err(err) => {
-                    error!("Replication error: {err}");
-                    1
-                }
-            }
-        }
         SubCommand::Scrub(scrub_options) => match run_scrub(scrub_options, config).await {
             Ok(()) => 0,
             Err(err) => {
@@ -221,22 +201,6 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
 async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
     let mut scrub = scrub::Command::new(&options, &config).await?;
     scrub.run().await
-}
-
-async fn run_policy(
-    options: policy_command::Options,
-    config: Configuration,
-) -> Result<(), policy_command::Error> {
-    let mut policy = policy_command::Command::new(&options, &config).await?;
-    policy.run().await
-}
-
-async fn run_replication(
-    options: replication_command::Options,
-    config: Configuration,
-) -> Result<(), replication_command::Error> {
-    let mut replication = replication_command::Command::new(&options, &config).await?;
-    replication.run().await
 }
 
 async fn run_worker(

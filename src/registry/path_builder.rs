@@ -104,20 +104,6 @@ pub fn manifest_revisions_link_root_dir(namespace: &Namespace, algorithm: &str) 
     format!("{REPOS_ROOT}/{namespace}/_manifests/revisions/{algorithm}")
 }
 
-/// Root directory of a namespace's layer links for one algorithm
-/// (`_layers/<algorithm>/<hash>/link`); its children are the layer hashes. Used
-/// to enumerate every layer link.
-pub fn layers_link_root_dir(namespace: &Namespace, algorithm: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_layers/{algorithm}")
-}
-
-/// Root directory of a namespace's config links for one algorithm
-/// (`_config/<algorithm>/<hash>/link`); its children are the config hashes. Used
-/// to enumerate every config link.
-pub fn config_link_root_dir(namespace: &Namespace, algorithm: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_config/{algorithm}")
-}
-
 pub fn manifest_tags_dir(namespace: &Namespace) -> String {
     format!("{REPOS_ROOT}/{namespace}/_manifests/tags")
 }
@@ -136,13 +122,6 @@ pub fn manifest_referrers_dir(namespace: &Namespace, subject: &Digest) -> String
     )
 }
 
-/// Root directory holding one child directory per pending queue
-/// (`_jobs/pending/<queue>`). Scrub enumerates these to detect a queue
-/// directory whose name is not a recognized [`crate::registry::job_store::Queue`].
-pub fn job_pending_root_dir() -> String {
-    format!("{JOBS_ROOT}/pending")
-}
-
 pub fn job_pending_dir(queue: &str) -> String {
     format!("{JOBS_ROOT}/pending/{queue}")
 }
@@ -151,27 +130,12 @@ pub fn job_pending_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/pending/{queue}/{id}.json")
 }
 
-/// Root directory holding one child directory per dead-letter queue
-/// (`_jobs/failed/<queue>`). Companion of [`job_pending_root_dir`] for the
-/// failed partition.
-pub fn job_failed_root_dir() -> String {
-    format!("{JOBS_ROOT}/failed")
-}
-
 pub fn job_failed_dir(queue: &str) -> String {
     format!("{JOBS_ROOT}/failed/{queue}")
 }
 
 pub fn job_failed_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/failed/{queue}/{id}.json")
-}
-
-/// Directory holding the per-`lock_key` dedup index files for one `queue`
-/// (`_jobs/index/<queue>/<encoded-lock-key>.json`). Scrub enumerates its
-/// entries to reconcile dangling lock-key index files whose pending envelope
-/// has vanished.
-pub fn job_lock_key_index_dir(queue: &str) -> String {
-    format!("{JOBS_ROOT}/index/{queue}")
 }
 
 /// Path to the `lock_key` → `storage_key` dedup index file. Each pending
@@ -437,18 +401,15 @@ mod tests {
 
     #[test]
     fn test_job_paths() {
-        assert_eq!(job_pending_root_dir(), "_jobs/pending");
         assert_eq!(job_pending_dir("cache"), "_jobs/pending/cache");
         assert_eq!(
             job_pending_path("cache", "01HABCDE"),
             "_jobs/pending/cache/01HABCDE.json"
         );
-        assert_eq!(job_failed_root_dir(), "_jobs/failed");
         assert_eq!(
             job_failed_path("cache", "01HABCDE"),
             "_jobs/failed/cache/01HABCDE.json"
         );
-        assert_eq!(job_lock_key_index_dir("cache"), "_jobs/index/cache");
         assert_eq!(
             job_lock_key_index_path("cache", "cache.ns:sha256:abc"),
             "_jobs/index/cache/cache.ns%3Asha256%3Aabc.json"

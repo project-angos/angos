@@ -30,16 +30,15 @@ impl ReferrerChecker {
         subject: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        // Enumerate the raw referrer links rather than going through
-        // `list_referrers`, which resolves descriptors and so silently drops
-        // entries with neither a cached descriptor nor a readable blob — exactly
-        // the orphans this checker must reclaim.
         let referrers = self
             .metadata_store
-            .list_referrer_digests(namespace, subject)
+            .list_referrers(namespace, subject, None)
             .await?;
 
-        for referrer in referrers {
+        for descriptor in referrers {
+            let referrer = descriptor.digest.clone();
+            // list_referrers filters out entries with no cached descriptor and no readable blob,
+            // so a Referrer link with neither cached descriptor nor blob is not detected here.
             match self
                 .metadata_store
                 .read_link(namespace, &LinkKind::Digest(referrer.clone()))
@@ -315,79 +314,6 @@ mod tests {
                     .await
                     .is_ok(),
                 "Referrer link must persist when using a Vec (dry-run) sink"
-            );
-            test_case.cleanup().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn referrer_checker_reclaims_referrer_with_no_descriptor_or_blob() {
-        for test_case in backends() {
-            let namespace = &Namespace::new("test-repo/referrer-no-desc").unwrap();
-            let metadata_store = test_case.metadata_store();
-            let blob_store = test_case.blob_store();
-
-            // Subject is a current revision so the checker walks it.
-            let subject = put_blob_direct(metadata_store.store(), b"subject manifest").await;
-            metadata_store
-                .update_links(
-                    namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Digest(subject.clone()),
-                        subject.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
-
-            // A referrer link with NO cached descriptor; its manifest blob is
-            // never written and it has no `Digest` revision link — the exact
-            // orphan `list_referrers` hides (no descriptor, no readable blob).
-            let referrer =
-                Digest::sha256("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
-                    .unwrap();
-            metadata_store
-                .update_links(
-                    namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Referrer(subject.clone(), referrer.clone()),
-                        referrer.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
-
-            // The gap: `list_referrers` drops it, but the raw enumeration sees it.
-            assert!(
-                metadata_store
-                    .list_referrers(namespace, &subject, None)
-                    .await
-                    .unwrap()
-                    .is_empty(),
-                "list_referrers must hide a referrer with no descriptor and no blob"
-            );
-            assert!(
-                metadata_store
-                    .list_referrer_digests(namespace, &subject)
-                    .await
-                    .unwrap()
-                    .contains(&referrer),
-                "list_referrer_digests must still surface it"
-            );
-
-            let checker = ReferrerChecker::new(metadata_store.clone());
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
-            checker.check(namespace, &mut executor).await.unwrap();
-
-            assert!(
-                metadata_store
-                    .read_link(
-                        namespace,
-                        &LinkKind::Referrer(subject.clone(), referrer.clone())
-                    )
-                    .await
-                    .is_err(),
-                "an orphan referrer link must be reclaimed even with no descriptor or blob"
             );
             test_case.cleanup().await;
         }

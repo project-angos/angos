@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue; `angos replication` reconciles on demand (`scrub --replicate` is a deprecated alias).
+- Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue; `scrub --replicate` reconciles on demand.
 - New `scrub --replication-orphans` and `scrub --cache-orphans` flags delete pending and dead-lettered replication and cache jobs whose downstream or pull-through repository is no longer configured.
 - New `scrub --orphan-namespaces` (`-n`) flag removes revisions, tags, and in-flight uploads for namespaces not owned by any configured repository and reclaims their layer/config blob bytes (combine with `--blobs` to also reclaim manifest blob bytes); it is destructive (dry-run first) and refuses to run when no repositories are configured.
 - Cross-repository blob mount (`POST /v2/{namespace}/blobs/uploads/?mount={digest}[&from={repository}]`) grants an already-present blob to the target namespace with no upload.
@@ -21,10 +21,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - New `[global] max_blob_size` knob (default `100GiB`) caps the total size of a single blob upload, rejecting a larger upload with `BLOB_UPLOAD_INVALID`.
 - Scrub `--tags` removes tag directories whose names violate the OCI tag grammar.
 - New `scrub --reconcile-blob-index` flag rebuilds blob-index grants missing relative to the manifests that reference each blob, repairing an index corrupted out-of-band; it reads every manifest, so it is expensive.
-- New `angos policy` subcommand enforces retention, extracted from scrub.
-- New `angos replication` subcommand reconciles replication, extracted from scrub.
-- `scrub`, `policy`, and `replication` now end every run with an always-on summary of action counts and report-only findings.
-- New `[global] max_concurrent_scrub_tasks` knob bounds per-node scrub/policy/replication fan-out (default 16).
 
 ### Changed
 
@@ -37,12 +33,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A blob-upload `POST` with a malformed `?digest=`, `?mount=`, or `?from=` now returns `400` instead of silently starting an upload session that ignores the value.
 - The `_catalog` listing is derived directly from stored content (deterministic and strongly consistent); the maintained namespace-registry index is removed and its now-unused `_registry/` objects are pruned by `scrub`.
 - Tags, repository names, upload session IDs, and manifest/descriptor media types are now strictly validated against their OCI grammars, so a request carrying a malformed value is rejected with `400` where an earlier version might have accepted it.
-
-### Deprecated
-
-- `scrub --retention` is a deprecated alias for `angos policy --retention`; it still runs unchanged.
-- `scrub --replicate` is a deprecated alias for `angos replication`; it still runs unchanged.
-- `scrub --media-types` (`-M`) is deprecated: manifests now record their `media_type` at push time, so `-M` only backfills legacy links and will be removed in a future release; it still runs unchanged.
 
 ### Fixed
 
