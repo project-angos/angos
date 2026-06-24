@@ -95,13 +95,14 @@ mod tests {
 
     use super::*;
     use crate::{
+        oci::Namespace,
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::Repository,
     };
 
     fn repo(name: &str) -> Repository {
         Repository {
-            name: name.to_string(),
+            name: Namespace::new(name).unwrap(),
             upstreams: Vec::new(),
             replication: Vec::new(),
             retention_policy: RetentionPolicy::new(

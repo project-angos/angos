@@ -24,7 +24,7 @@ use crate::{
         metadata_store::{LinkKind, MetadataStore},
         parse_manifest_digests,
     },
-    registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient, UploadSession},
+    registry_client::{DeleteManifestOutcome, RegistryClient, UploadSession},
     replication::{Error, manifest_accept_types},
 };
 
@@ -64,6 +64,17 @@ pub struct PushContext<'a> {
     pub blob_store: &'a Arc<BlobStore>,
     pub metadata_store: &'a Arc<MetadataStore>,
     pub namespace: &'a Namespace,
+    /// The remote namespace this push targets on the downstream, derived by the
+    /// handler from the local namespace.
+    pub downstream_namespace: &'a Namespace,
+    /// Local namespace prefix the downstream strips before mapping, mirrored from
+    /// [`ReplicationDownstream::local_namespace`]; `None` for a verbatim mirror.
+    /// Used to map a cross-repo mount sibling to its downstream location.
+    pub downstream_local_namespace: Option<&'a Namespace>,
+    /// Target namespace prefix the downstream prepends after stripping, mirrored
+    /// from [`ReplicationDownstream::target_namespace`]; `None` for a verbatim
+    /// mirror.
+    pub downstream_target_namespace: Option<&'a Namespace>,
     pub max_concurrent_pushes: usize,
     pub source_ts: Option<&'a str>,
 }
@@ -99,9 +110,9 @@ pub async fn push_manifest(
         })?),
         None => Reference::Digest(digest.clone()),
     };
-    let location =
-        ctx.downstream
-            .get_manifest_path(NO_LOCAL_PREFIX, ctx.namespace.as_ref(), &reference);
+    let location = ctx
+        .downstream
+        .get_manifest_path(ctx.downstream_namespace.as_ref(), &reference);
 
     // The converged skip runs before child recursion and the blob sweep: a
     // digest-matching HEAD means the downstream validated this manifest's
@@ -190,6 +201,7 @@ pub async fn push_manifest(
             ctx.downstream,
             ctx.metadata_store,
             ctx.namespace,
+            ctx.downstream_namespace.as_ref(),
             digest,
             &parsed,
             &body,
@@ -249,30 +261,32 @@ async fn push_blobs(ctx: &PushContext<'_>, parsed: &ParsedManifestDigests) -> Re
     Ok(())
 }
 
-/// Picks a cross-repo blob-mount `from` hint: the lexicographically smallest
-/// local namespace, other than the target, that already references the blob.
-///
-/// A wrong guess just falls back to the full upload, and any blob-index read
-/// error yields `None`: a missing optimization must never fail a push.
+/// Picks a cross-repo blob-mount `from` hint: the smallest sibling namespace
+/// referencing the blob, mapped through the same strip/prepend so `from` is the
+/// sibling's location on the downstream. A sibling outside this repository (strip
+/// fails) or any read error yields `None`, so the mount is skipped and the push
+/// falls back to a full upload.
 async fn mount_candidate(
     metadata_store: &Arc<MetadataStore>,
     namespace: &Namespace,
     digest: &Digest,
+    local: Option<&Namespace>,
+    target: Option<&Namespace>,
 ) -> Option<String> {
-    BlobOwnership::new(metadata_store)
+    let sibling = BlobOwnership::new(metadata_store)
         .smallest_referencing_namespace(digest, namespace)
         .await
         .ok()
-        .flatten()
-        .map(|ns| ns.to_string())
+        .flatten()?;
+    sibling.remote(local, target).ok().map(|m| m.to_string())
 }
 
 /// Transfers a single blob to the downstream if it is not already present,
 /// attempting a cross-repo mount before a full upload.
 async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Error> {
-    let head_location =
-        ctx.downstream
-            .get_blob_path(NO_LOCAL_PREFIX, ctx.namespace.as_ref(), digest);
+    let head_location = ctx
+        .downstream
+        .get_blob_path(ctx.downstream_namespace.as_ref(), digest);
     // Existence-only probe: any 2xx means present (the optional
     // Docker-Content-Digest header is not required, so a converged blob never
     // dead-letters on a minimal downstream); a 404 means absent; a transient
@@ -290,11 +304,19 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
 
     let start_location = ctx
         .downstream
-        .get_uploads_start_path(NO_LOCAL_PREFIX, ctx.namespace.as_ref());
+        .get_uploads_start_path(ctx.downstream_namespace.as_ref());
 
     // The mount is a pure optimization: a miss opens a session and a policy
     // rejection falls through to a plain upload, so it can never fail the push.
-    if let Some(from) = mount_candidate(ctx.metadata_store, ctx.namespace, digest).await {
+    if let Some(from) = mount_candidate(
+        ctx.metadata_store,
+        ctx.namespace,
+        digest,
+        ctx.downstream_local_namespace,
+        ctx.downstream_target_namespace,
+    )
+    .await
+    {
         match ctx
             .downstream
             .mount_blob(&start_location, digest, Some(&from))
@@ -382,6 +404,7 @@ async fn push_referrers_fallback(
     downstream: &RegistryClient,
     metadata_store: &Arc<MetadataStore>,
     namespace: &Namespace,
+    downstream_namespace: &str,
     digest: &Digest,
     parsed: &ParsedManifestDigests,
     body: &[u8],
@@ -403,7 +426,7 @@ async fn push_referrers_fallback(
             "invalid referrers fallback tag '{fallback_tag}': {e}"
         )))
     })?;
-    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace.as_ref(), &reference);
+    let location = downstream.get_manifest_path(downstream_namespace, &reference);
 
     // Serialize the GET/merge/PUT: two referrers of the same subject are
     // distinct jobs the queue runs concurrently, and unserialized merges read
@@ -568,17 +591,20 @@ pub async fn delete_manifest(
     downstream: &RegistryClient,
     metadata_store: &Arc<MetadataStore>,
     namespace: &Namespace,
+    downstream_namespace: &str,
     reference: &Reference,
     source_ts: Option<&str>,
 ) -> Result<PushOutcome, Error> {
     // Capture the subject before the manifest is gone (a tag delete leaves it,
     // so it has no fallback index to maintain).
     let fallback_subject = match reference {
-        Reference::Digest(digest) => deleted_referrer_subject(downstream, namespace, digest).await,
+        Reference::Digest(digest) => {
+            deleted_referrer_subject(downstream, downstream_namespace, digest).await
+        }
         Reference::Tag(_) => None,
     };
 
-    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace.as_ref(), reference);
+    let location = downstream.get_manifest_path(downstream_namespace, reference);
     let outcome = downstream
         .delete_manifest(&location, source_ts)
         .await
@@ -620,8 +646,15 @@ pub async fn delete_manifest(
     // gone, so a failure warns rather than churning the whole delete.
     if matches!(push_outcome, PushOutcome::Pushed | PushOutcome::Converged)
         && let (Reference::Digest(digest), Some(subject)) = (reference, &fallback_subject)
-        && let Err(e) =
-            remove_referrers_fallback(downstream, metadata_store, namespace, subject, digest).await
+        && let Err(e) = remove_referrers_fallback(
+            downstream,
+            metadata_store,
+            namespace,
+            downstream_namespace,
+            subject,
+            digest,
+        )
+        .await
     {
         warn!(
             namespace = %namespace,
@@ -639,14 +672,11 @@ pub async fn delete_manifest(
 /// subject) yields `None`, leaving the fallback index untouched.
 async fn deleted_referrer_subject(
     downstream: &RegistryClient,
-    namespace: &Namespace,
+    downstream_namespace: &str,
     digest: &Digest,
 ) -> Option<Digest> {
-    let location = downstream.get_manifest_path(
-        NO_LOCAL_PREFIX,
-        namespace.as_ref(),
-        &Reference::Digest(digest.clone()),
-    );
+    let location =
+        downstream.get_manifest_path(downstream_namespace, &Reference::Digest(digest.clone()));
     let (_, _, body) = downstream
         .get_manifest(&manifest_accept_types(), &location)
         .await
@@ -662,6 +692,7 @@ async fn remove_referrers_fallback(
     downstream: &RegistryClient,
     metadata_store: &Arc<MetadataStore>,
     namespace: &Namespace,
+    downstream_namespace: &str,
     subject: &Digest,
     referrer: &Digest,
 ) -> Result<(), Error> {
@@ -671,7 +702,7 @@ async fn remove_referrers_fallback(
             "invalid referrers fallback tag '{fallback_tag}': {e}"
         )))
     })?;
-    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace.as_ref(), &reference);
+    let location = downstream.get_manifest_path(downstream_namespace, &reference);
 
     let lock_keys = [referrers_fallback_lock_key(namespace, subject)];
     let session = metadata_store

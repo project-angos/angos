@@ -112,7 +112,7 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     repositories.insert(
         "test-repo".to_string(),
         Repository {
-            name: "test-repo".to_string(),
+            name: Namespace::new("test-repo").unwrap(),
             upstreams: Vec::new(),
             replication: Vec::new(),
             retention_policy: RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock)),
@@ -218,7 +218,7 @@ pub async fn create_test_blob(
     assert!(namespace_links.contains(&layer_link));
 
     let repository = Repository {
-        name: "test-repo".to_string(),
+        name: Namespace::new("test-repo").unwrap(),
         upstreams: Vec::new(),
         replication: Vec::new(),
         retention_policy: RetentionPolicy::new(
@@ -452,7 +452,7 @@ pub fn repository_with_replication(
     replication: Vec<ReplicationDownstream>,
 ) -> Repository {
     Repository {
-        name: name.to_string(),
+        name: Namespace::new(name).unwrap(),
         upstreams: Vec::new(),
         replication,
         retention_policy: RetentionPolicy::new(

@@ -363,6 +363,109 @@ async fn execute_pushes_manifest_with_head_before_put() {
     drop(mock_server);
 }
 
+/// A prefixed downstream must push at the mapped path: local `nginx/app` strips
+/// `nginx` and prepends `mirror`, so manifest and blobs land at `mirror/app`. The
+/// `.expect(...)` mocks there assert it, failing on any regression to `nginx/app`.
+#[tokio::test]
+async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
+    metrics_provider::init_for_tests();
+    let mock_server = MockServer::start().await;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
+    let executor = build_test_fs_executor(root, false);
+    let store = build_store(object, executor);
+    let metadata_store = Arc::new(
+        MetadataStore::builder(store.clone())
+            .link_cache_ttl(0)
+            .access_time_debounce_secs(0)
+            .build(),
+    );
+    let blob_store = Arc::new(BlobStore::new(store.clone()));
+
+    // Local content lives in the `nginx/app` sub-namespace; the mapping strips
+    // `nginx` and prepends `mirror`, so the remote path is `mirror/app`.
+    let local_namespace = Namespace::new("nginx/app").unwrap();
+    let mapped = "mirror/app";
+    let (manifest_digest, config_digest, layer_digest) =
+        seed_manifest(&store, &metadata_store, &local_namespace).await;
+
+    // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
+    for blob in [&config_digest, &layer_digest] {
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{mapped}/blobs/{blob}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+    }
+    // Each missing blob: POST start, PATCH chunk, PUT complete.
+    Mock::given(method("POST"))
+        .and(path(format!("/v2/{mapped}/blobs/uploads/")))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("Location", format!("/v2/{mapped}/blobs/uploads/s1")),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(format!("/v2/{mapped}/blobs/uploads/s1")))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("Location", format!("/v2/{mapped}/blobs/uploads/s1")),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{mapped}/blobs/uploads/s1")))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+    // The manifest itself is PUT by tag at the mapped namespace.
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{mapped}/manifests/v1")))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // REPO stays `nginx` so the resolver routes `nginx/app` to this repo; the
+    // downstream carries the strip+prepend mapping.
+    let downstream = ReplicationDownstream::builder(
+        DOWNSTREAM.to_string(),
+        downstream_client(&mock_server.uri()),
+        4,
+    )
+    .namespace_mapping(
+        Some(Namespace::new("nginx").unwrap()),
+        Some(Namespace::new("mirror").unwrap()),
+    )
+    .build();
+    let mut repositories = HashMap::new();
+    repositories.insert(
+        REPO.to_string(),
+        repository_with_replication(REPO, vec![downstream]),
+    );
+    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+    let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
+
+    let mut payload = sample_payload();
+    payload.namespace = local_namespace;
+    let envelope = build_envelope(&payload).unwrap();
+    let tx = handler.execute(&envelope).await.unwrap();
+    assert!(tx.mutations.is_empty(), "push returns an empty transaction");
+    // wiremock `.expect(...)` assertions are verified on MockServer drop.
+    drop(mock_server);
+}
+
 /// The execute-time tag resolve must read the backend link, not the
 /// per-process cache: a worker's cache can lag a sibling process's write
 /// by up to its TTL, and a stale resolve would replicate the old digest

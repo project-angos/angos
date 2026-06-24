@@ -8,7 +8,7 @@ pub use crate::registry_client::RegistryClientConfig;
 use crate::{
     cache::Cache,
     configuration::RegexPattern,
-    oci::{Digest, MediaType, Namespace, Reference},
+    oci::{Digest, Error as OciError, MediaType, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{Error, blob_store::BoxedReader},
     registry_client::RegistryClient,
@@ -38,35 +38,73 @@ fn split_registry_url(url: &str) -> (String, String) {
     (trimmed.to_string(), String::new())
 }
 
+/// Validate a URL-path namespace prefix so a misconfigured upstream/downstream
+/// url fails at startup, not at request time. An empty prefix (bare host) yields
+/// `None`; otherwise the validated prefix is returned.
+fn validate_url_prefix(repo_name: &Namespace, prefix: &str) -> Result<Option<Namespace>, Error> {
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    Namespace::new(prefix).map(Some).map_err(|e| {
+        Error::Initialization(format!(
+            "repository '{repo_name}' has a url path '{prefix}' that is not a valid namespace prefix: {e}"
+        ))
+    })
+}
+
+/// One resolved pull-through upstream: the URL-formatting client plus the
+/// namespace mapping (`local_namespace` to strip, optional `target_namespace` to
+/// prepend) applied via [`Namespace::remote`].
+pub struct Upstream {
+    pub client: RegistryClient,
+    pub local_namespace: Option<Namespace>,
+    pub target_namespace: Option<Namespace>,
+}
+
+impl Upstream {
+    /// Maps `namespace` to its upstream form via [`Namespace::remote`]. For a
+    /// routed namespace the strip always succeeds, so an `Err` is effectively
+    /// unreachable but callers still propagate it.
+    pub fn remote(&self, namespace: &Namespace) -> Result<Namespace, OciError> {
+        namespace.remote(
+            self.local_namespace.as_ref(),
+            self.target_namespace.as_ref(),
+        )
+    }
+}
+
 /// Build the pull-through upstream clients. A path on an upstream URL is the
-/// namespace prefix the images live under upstream; angos talks to the registry
-/// root and maps the path into the namespace. The repository name is stripped by
-/// the `local_name` argument the pull path passes, so the mirror only prepends.
+/// upstream namespace prefix; the mapping always strips the repository `name` and
+/// prepends that optional prefix.
 async fn build_upstreams(
     upstream_configs: &[RegistryClientConfig],
+    name: &Namespace,
     cache: &Arc<Cache>,
     max_manifest_size_bytes: usize,
-) -> Result<Vec<RegistryClient>, Error> {
+) -> Result<Vec<Upstream>, Error> {
     if upstream_configs.is_empty() {
         return Ok(Vec::new());
     }
     let upstream_configs = upstream_configs.to_vec();
     let cache = Arc::clone(cache);
+    let repo_name = name.clone();
     task::spawn_blocking(move || {
         let mut upstreams = Vec::new();
         for config in &upstream_configs {
-            let (base_url, prefix) = split_registry_url(&config.url);
+            let (base_url, prefix_str) = split_registry_url(&config.url);
+            let target_namespace = validate_url_prefix(&repo_name, &prefix_str)?;
             let mut client_config = config.clone();
             client_config.url = base_url;
-            let mut client = RegistryClient::from_config(
+            let client = RegistryClient::from_config(
                 &client_config,
                 Arc::clone(&cache),
                 max_manifest_size_bytes,
             )?;
-            if !prefix.is_empty() {
-                client = client.with_namespace_mirror(String::new(), prefix);
-            }
-            upstreams.push(client);
+            upstreams.push(Upstream {
+                client,
+                local_namespace: Some(repo_name.clone()),
+                target_namespace,
+            });
         }
         Ok::<_, Error>(upstreams)
     })
@@ -80,7 +118,7 @@ async fn build_upstreams(
 /// prefix (`repo/x` -> `prefix/x`); a bare-host URL mirrors the namespace
 /// verbatim.
 async fn build_downstreams(
-    name: &str,
+    name: &Namespace,
     downstream_configs: &[ReplicationDownstreamConfig],
     cache: &Arc<Cache>,
     max_manifest_size_bytes: usize,
@@ -107,21 +145,22 @@ async fn build_downstreams(
     }
     let downstream_configs = downstream_configs.to_vec();
     let cache = Arc::clone(cache);
-    let repo_name = name.to_string();
+    let repo_name = name.clone();
     task::spawn_blocking(move || {
         let mut downstreams = Vec::new();
         for config in &downstream_configs {
-            let (base_url, prefix) = split_registry_url(&config.client.url);
+            let (base_url, prefix_str) = split_registry_url(&config.client.url);
+            let target_namespace = validate_url_prefix(&repo_name, &prefix_str)?;
             let mut client_config = config.client.clone();
             client_config.url = base_url;
-            let mut registry_client = RegistryClient::from_config(
+            let registry_client = RegistryClient::from_config(
                 &client_config,
                 Arc::clone(&cache),
                 max_manifest_size_bytes,
             )?;
-            if !prefix.is_empty() {
-                registry_client = registry_client.with_namespace_mirror(repo_name.clone(), prefix);
-            }
+            // A URL path replaces this repository's prefix; a bare host mirrors
+            // the namespace verbatim (no strip).
+            let local_namespace = target_namespace.as_ref().map(|_| repo_name.clone());
             downstreams.push(
                 ReplicationDownstream::builder(
                     config.name.clone(),
@@ -130,6 +169,7 @@ async fn build_downstreams(
                         .max_concurrent_pushes
                         .map_or(DEFAULT_MAX_CONCURRENT_PUSHES, NonZeroUsize::get),
                 )
+                .namespace_mapping(local_namespace, target_namespace)
                 .mode(config.mode)
                 .namespace_filter(
                     config
@@ -169,8 +209,8 @@ pub struct Config {
 }
 
 pub struct Repository {
-    pub name: String,
-    pub upstreams: Vec<RegistryClient>,
+    pub name: Namespace,
+    pub upstreams: Vec<Upstream>,
     pub replication: Vec<ReplicationDownstream>,
     pub retention_policy: RetentionPolicy,
     pub immutable_tags: bool,
@@ -186,7 +226,7 @@ impl Repository {
     ) -> Result<T, Error>
     where
         F: FnMut(
-            &'a RegistryClient,
+            &'a Upstream,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T, Error>> + Send + 'a>,
         >,
@@ -197,7 +237,7 @@ impl Repository {
                 Err(e) => {
                     warn!(
                         "Upstream operation failed for namespace '{namespace}' against {}: {e}",
-                        upstream.url
+                        upstream.client.url
                     );
                 }
             }
@@ -211,14 +251,20 @@ impl Repository {
         cache: &Arc<Cache>,
         max_manifest_size_bytes: usize,
     ) -> Result<Self, Error> {
-        let upstreams = build_upstreams(&config.upstream, cache, max_manifest_size_bytes).await?;
+        let name = Namespace::new(name).map_err(|e| {
+            Error::Initialization(format!(
+                "repository name '{name}' is not a valid namespace: {e}"
+            ))
+        })?;
+        let upstreams =
+            build_upstreams(&config.upstream, &name, cache, max_manifest_size_bytes).await?;
         let replication =
-            build_downstreams(name, &config.downstream, cache, max_manifest_size_bytes).await?;
+            build_downstreams(&name, &config.downstream, cache, max_manifest_size_bytes).await?;
         let retention_policy =
             RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock));
 
         Ok(Self {
-            name: name.to_string(),
+            name,
             upstreams,
             replication,
             retention_policy,
@@ -253,8 +299,12 @@ impl Repository {
         digest: &Digest,
     ) -> Result<(Digest, u64), Error> {
         self.try_upstreams(namespace, Error::BlobUnknown, |upstream| {
-            let location = upstream.get_blob_path(&self.name, namespace.as_ref(), digest);
-            Box::pin(async move { upstream.head_blob(accepted_types, &location).await })
+            Box::pin(async move {
+                let location = upstream
+                    .client
+                    .get_blob_path(upstream.remote(namespace)?.as_ref(), digest);
+                upstream.client.head_blob(accepted_types, &location).await
+            })
         })
         .await
     }
@@ -267,8 +317,12 @@ impl Repository {
         digest: &Digest,
     ) -> Result<(u64, BoxedReader), Error> {
         self.try_upstreams(namespace, Error::BlobUnknown, |upstream| {
-            let location = upstream.get_blob_path(&self.name, namespace.as_ref(), digest);
-            Box::pin(async move { upstream.get_blob(accepted_types, &location).await })
+            Box::pin(async move {
+                let location = upstream
+                    .client
+                    .get_blob_path(upstream.remote(namespace)?.as_ref(), digest);
+                upstream.client.get_blob(accepted_types, &location).await
+            })
         })
         .await
     }
@@ -281,8 +335,15 @@ impl Repository {
         reference: &Reference,
     ) -> Result<(Option<MediaType>, Digest, u64), Error> {
         self.try_upstreams(namespace, Error::ManifestUnknown, |upstream| {
-            let location = upstream.get_manifest_path(&self.name, namespace.as_ref(), reference);
-            Box::pin(async move { upstream.head_manifest(accepted_types, &location).await })
+            Box::pin(async move {
+                let location = upstream
+                    .client
+                    .get_manifest_path(upstream.remote(namespace)?.as_ref(), reference);
+                upstream
+                    .client
+                    .head_manifest(accepted_types, &location)
+                    .await
+            })
         })
         .await
     }
@@ -295,8 +356,15 @@ impl Repository {
         reference: &Reference,
     ) -> Result<(Option<MediaType>, Digest, Vec<u8>), Error> {
         self.try_upstreams(namespace, Error::ManifestUnknown, |upstream| {
-            let location = upstream.get_manifest_path(&self.name, namespace.as_ref(), reference);
-            Box::pin(async move { upstream.get_manifest(accepted_types, &location).await })
+            Box::pin(async move {
+                let location = upstream
+                    .client
+                    .get_manifest_path(upstream.remote(namespace)?.as_ref(), reference);
+                upstream
+                    .client
+                    .get_manifest(accepted_types, &location)
+                    .await
+            })
         })
         .await
     }
@@ -380,6 +448,21 @@ mod tests {
             super::split_registry_url("https://angos-eu.example.com/"),
             ("https://angos-eu.example.com".to_string(), String::new())
         );
+    }
+
+    #[test]
+    fn validate_url_prefix_accepts_empty_and_valid_rejects_invalid() {
+        let repo = Namespace::new("repo").unwrap();
+        assert_eq!(super::validate_url_prefix(&repo, "").unwrap(), None);
+        assert_eq!(
+            super::validate_url_prefix(&repo, "mirror-1").unwrap(),
+            Some(Namespace::new("mirror-1").unwrap())
+        );
+        assert_eq!(
+            super::validate_url_prefix(&repo, "team/sub").unwrap(),
+            Some(Namespace::new("team/sub").unwrap())
+        );
+        assert!(super::validate_url_prefix(&repo, "Bad_Prefix").is_err());
     }
 
     async fn repository_with_upstreams(first_url: String, second_url: String) -> Repository {

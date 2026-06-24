@@ -2,7 +2,6 @@
 mod tests;
 
 mod auth;
-mod upstream_url;
 mod write;
 
 use std::{future::Future, io, path::Path, sync::Arc, time::Duration};
@@ -17,14 +16,13 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
-pub use upstream_url::{NO_LOCAL_PREFIX, get_upstream_namespace};
 
 pub use crate::registry_client::write::{DeleteManifestOutcome, PutManifestResult, UploadSession};
 
 use crate::{
     cache::Cache,
     http_client::HttpClientBuilder,
-    oci::{Digest, MediaType},
+    oci::{Digest, MediaType, Reference},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader,
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -107,16 +105,6 @@ impl RegistryClientConfig {
     }
 }
 
-/// A downstream namespace mirror for replication fan-out: strip the `source`
-/// repository prefix and prepend the `target` prefix, so a local `source/x` is
-/// stored as `target/x` on the downstream (the inverse of the pull-through
-/// [`get_upstream_namespace`] strip).
-#[derive(Debug)]
-struct NamespaceMirror {
-    source: String,
-    target: String,
-}
-
 #[derive(Debug)]
 pub struct RegistryClient {
     pub url: String,
@@ -125,10 +113,6 @@ pub struct RegistryClient {
     cache: Arc<Cache>,
     token_refresh: Mutex<()>,
     max_manifest_size_bytes: usize,
-    /// Optional namespace mirror applied when building request paths. `None` for
-    /// upstream clients and verbatim downstreams; set for a replication
-    /// downstream that lands content under its own prefix.
-    mirror: Option<NamespaceMirror>,
 }
 
 impl RegistryClient {
@@ -206,15 +190,27 @@ impl RegistryClient {
             .build())
     }
 
-    /// Mirror replicated content under a different namespace prefix on this
-    /// downstream: a local `source/x` is pushed as `target/x` (paths built by
-    /// [`get_manifest_path`](Self::get_manifest_path) and friends). This is the
-    /// push-side inverse of the pull-through prefix strip, letting one registry
-    /// fan a repository out into sibling repositories.
-    #[must_use]
-    pub fn with_namespace_mirror(mut self, source: String, target: String) -> Self {
-        self.mirror = Some(NamespaceMirror { source, target });
-        self
+    /// Build an OCI request URL from a final namespace. These are pure formatters;
+    /// the caller resolves the remote namespace, the client only joins the path.
+    pub fn get_manifest_path(&self, namespace: &str, reference: &Reference) -> String {
+        format!("{}/v2/{namespace}/manifests/{reference}", self.url)
+    }
+
+    pub fn get_blob_path(&self, namespace: &str, digest: &Digest) -> String {
+        format!("{}/v2/{namespace}/blobs/{digest}", self.url)
+    }
+
+    /// URL to start a resumable blob upload session (OCI `POST /v2/<ns>/blobs/uploads/`).
+    ///
+    /// Session-continuation URLs are server-assigned via `Location`, never built here.
+    pub fn get_uploads_start_path(&self, namespace: &str) -> String {
+        format!("{}/v2/{namespace}/blobs/uploads/", self.url)
+    }
+
+    /// URL to list a repository's tags (OCI `GET /v2/<ns>/tags/list`), without
+    /// pagination parameters.
+    pub fn get_tags_list_path(&self, namespace: &str) -> String {
+        format!("{}/v2/{namespace}/tags/list", self.url)
     }
 
     async fn query(
@@ -564,7 +560,6 @@ impl RegistryClientBuilder {
             max_manifest_size_bytes: self
                 .max_manifest_size_bytes
                 .unwrap_or(DEFAULT_MAX_MANIFEST_SIZE_BYTES),
-            mirror: None,
         }
     }
 }

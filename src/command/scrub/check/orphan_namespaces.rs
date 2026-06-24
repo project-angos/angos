@@ -223,7 +223,7 @@ mod tests {
             repositories.insert(
                 (*prefix).to_string(),
                 Repository {
-                    name: (*prefix).to_string(),
+                    name: Namespace::new(prefix).unwrap(),
                     upstreams: Vec::new(),
                     replication: Vec::new(),
                     retention_policy: RetentionPolicy::new(

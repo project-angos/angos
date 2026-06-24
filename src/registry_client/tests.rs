@@ -9,32 +9,17 @@ use wiremock::{
 
 use crate::{
     cache,
-    oci::{Digest, MediaType, Namespace, Reference, Tag},
+    oci::{Digest, MediaType, Reference, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     },
     registry_client::{
         DeleteManifestOutcome, RegistryClient, RegistryClientConfig,
         auth::{token_cache_key, token_index_cache_key},
-        get_upstream_namespace,
     },
     replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     secret::Secret,
 };
-
-#[test]
-fn test_get_upstream_namespace() {
-    let local_name = "local";
-    let upstream_name = "local/repo";
-
-    let result = get_upstream_namespace(local_name, upstream_name);
-    assert_eq!(result, "repo");
-
-    let repo_name = "local/nested";
-    let namespace = &Namespace::new("completely/different/path").unwrap();
-    let result = get_upstream_namespace(repo_name, namespace);
-    assert_eq!(result, "completely/different/path");
-}
 
 #[test]
 fn test_get_manifest_path() {
@@ -52,11 +37,9 @@ fn test_get_manifest_path() {
     let upstream =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
-    let repo_name = "local";
-    let namespace = &Namespace::new("local/repo").unwrap();
     let reference = Reference::Tag(Tag::new("latest").unwrap());
 
-    let path = upstream.get_manifest_path(repo_name, namespace, &reference);
+    let path = upstream.get_manifest_path("repo", &reference);
     assert_eq!(path, "https://example.com/v2/repo/manifests/latest");
 }
 
@@ -76,13 +59,11 @@ fn test_get_blob_path() {
     let upstream =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
-    let repo_name = "local";
-    let namespace = &Namespace::new("local/repo").unwrap();
     let digest =
         Digest::try_from("sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
             .unwrap();
 
-    let path = upstream.get_blob_path(repo_name, namespace, &digest);
+    let path = upstream.get_blob_path("repo", &digest);
     assert_eq!(
         path,
         "https://example.com/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -1151,7 +1132,7 @@ async fn test_blob_upload_sequence() {
         .await;
 
     let client = client_for(&mock_server);
-    let start_url = client.get_uploads_start_path("", "test");
+    let start_url = client.get_uploads_start_path("test");
     assert_eq!(
         start_url,
         format!("{}/v2/test/blobs/uploads/", mock_server.uri())
@@ -1271,7 +1252,7 @@ async fn test_blob_upload_reuses_session_open_bearer_token_on_patch() {
         .await;
 
     let client = client_for(&mock_server);
-    let start_url = client.get_uploads_start_path("", "test");
+    let start_url = client.get_uploads_start_path("test");
     let session = client.start_upload(&start_url).await.unwrap();
     assert_eq!(session.auth.as_deref(), Some("Bearer push-token"));
     let next_url = client
@@ -1339,7 +1320,7 @@ async fn test_blob_upload_reuses_basic_credentials_on_patch() {
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
-    let start_url = client.get_uploads_start_path("", "test");
+    let start_url = client.get_uploads_start_path("test");
     let session = client.start_upload(&start_url).await.unwrap();
     assert_eq!(session.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
     let next_url = client
@@ -1375,7 +1356,7 @@ async fn test_mount_blob_returns_none_on_201() {
         .await;
 
     let client = client_for(&mock_server);
-    let start_url = client.get_uploads_start_path("", "target");
+    let start_url = client.get_uploads_start_path("target");
     let outcome = client
         .mount_blob(
             &start_url,
@@ -1410,7 +1391,7 @@ async fn test_mount_blob_omits_from_when_none() {
         .await;
 
     let client = client_for(&mock_server);
-    let start_url = client.get_uploads_start_path("", "target");
+    let start_url = client.get_uploads_start_path("target");
     let outcome = client
         .mount_blob(&start_url, &Digest::try_from(digest).unwrap(), None)
         .await
@@ -1439,7 +1420,7 @@ async fn test_mount_blob_falls_back_to_session_on_202() {
         .await;
 
     let client = client_for(&mock_server);
-    let start_url = client.get_uploads_start_path("", "target");
+    let start_url = client.get_uploads_start_path("target");
     let outcome = client
         .mount_blob(
             &start_url,
@@ -1473,7 +1454,7 @@ async fn test_mount_blob_rejects_mismatched_201_digest() {
         .await;
 
     let client = client_for(&mock_server);
-    let start_url = client.get_uploads_start_path("", "target");
+    let start_url = client.get_uploads_start_path("target");
     let outcome = client
         .mount_blob(
             &start_url,
@@ -1504,7 +1485,7 @@ async fn test_mount_blob_accepts_matching_201_digest() {
         .await;
 
     let client = client_for(&mock_server);
-    let start_url = client.get_uploads_start_path("", "target");
+    let start_url = client.get_uploads_start_path("target");
     let outcome = client
         .mount_blob(
             &start_url,
@@ -1543,8 +1524,7 @@ async fn test_put_manifest_with_oci_subject() {
         .await;
 
     let client = client_for(&mock_server);
-    let location =
-        client.get_manifest_path("", "test", &Reference::Tag(Tag::new("latest").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("latest").unwrap()));
 
     let result = client
         .put_manifest(&location, Some(media_type), manifest.to_vec(), None)
@@ -1571,7 +1551,7 @@ async fn test_put_manifest_without_oci_subject() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let result = client
         .put_manifest(&location, Some(media_type), manifest.to_vec(), None)
@@ -1602,7 +1582,7 @@ async fn test_put_manifest_stamps_replication_headers() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     client
         .put_manifest(
@@ -1628,7 +1608,7 @@ async fn test_put_manifest_superseded_409() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let result = client
         .put_manifest(&location, Some("application/json"), b"{}".to_vec(), None)
@@ -1650,7 +1630,7 @@ async fn test_put_manifest_non_superseded_409_is_error() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let result = client
         .put_manifest(&location, Some("application/json"), b"{}".to_vec(), None)
@@ -1671,7 +1651,7 @@ async fn test_delete_manifest_superseded_409() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let outcome = client.delete_manifest(&location, None).await.unwrap();
     assert_eq!(outcome, DeleteManifestOutcome::Superseded);
@@ -1691,7 +1671,6 @@ async fn test_delete_manifest() {
 
     let client = client_for(&mock_server);
     let location = client.get_manifest_path(
-        "",
         "test",
         &Reference::Digest(Digest::try_from(digest).unwrap()),
     );
@@ -1711,8 +1690,7 @@ async fn test_delete_manifest_surfaces_error_status() {
         .await;
 
     let client = client_for(&mock_server);
-    let location =
-        client.get_manifest_path("", "test", &Reference::Tag(Tag::new("latest").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("latest").unwrap()));
 
     let result = client.delete_manifest(&location, None).await;
     assert!(matches!(result, Err(Error::Internal(_))));
@@ -1732,7 +1710,7 @@ async fn test_delete_manifest_absent_404_is_already_absent() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("gone").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("gone").unwrap()));
 
     let outcome = client.delete_manifest(&location, None).await.unwrap();
     assert_eq!(outcome, DeleteManifestOutcome::AlreadyAbsent);
@@ -1752,7 +1730,7 @@ async fn test_delete_manifest_405_is_unsupported() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_manifest_path("", "test", &Reference::Tag(Tag::new("v1").unwrap()));
+    let location = client.get_manifest_path("test", &Reference::Tag(Tag::new("v1").unwrap()));
 
     let outcome = client.delete_manifest(&location, None).await.unwrap();
     assert_eq!(outcome, DeleteManifestOutcome::Unsupported);
@@ -1852,27 +1830,8 @@ fn test_get_tags_list_path() {
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
-    let path = client.get_tags_list_path("local", "local/repo");
+    let path = client.get_tags_list_path("repo");
     assert_eq!(path, "https://example.com/v2/repo/tags/list");
-}
-
-#[test]
-fn test_get_uploads_start_path_strips_local_prefix() {
-    let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
-
-    let path = client.get_uploads_start_path("local", "local/repo");
-    assert_eq!(path, "https://example.com/v2/repo/blobs/uploads/");
 }
 
 #[tokio::test]
@@ -1889,7 +1848,7 @@ async fn test_list_tags_single_page() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_tags_list_path("", "test");
+    let location = client.get_tags_list_path("test");
 
     let tags = client.list_tags(&location).await.unwrap();
     assert_eq!(
@@ -1951,7 +1910,7 @@ async fn test_list_tags_absent_repo_returns_empty() {
         .await;
 
     let client = client_for(&mock_server);
-    let location = client.get_tags_list_path("", "missing");
+    let location = client.get_tags_list_path("missing");
 
     let tags = client.list_tags(&location).await.unwrap();
     assert!(tags.is_empty(), "a 404 repo must yield an empty tag list");
@@ -1975,7 +1934,7 @@ async fn list_tags_breaks_on_cyclic_next_link() {
 
     let client = client_for(&mock_server);
     let tags = client
-        .list_tags(&client.get_tags_list_path("", "test"))
+        .list_tags(&client.get_tags_list_path("test"))
         .await
         .expect("cyclic pagination must terminate, not error");
 

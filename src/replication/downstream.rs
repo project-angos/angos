@@ -3,7 +3,10 @@ use std::sync::Arc;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::registry_client::RegistryClient;
+use crate::{
+    oci::{Error, Namespace},
+    registry_client::RegistryClient,
+};
 
 /// Whether a downstream participates in the event-driven push path, the scrub
 /// reconciliation path, or both.
@@ -47,6 +50,12 @@ pub struct ReplicationDownstream {
     /// When `true`, scrub reconciliation deletes tags present on this downstream
     /// but absent locally. Only safe for a one-way mirror, not an active-active peer.
     pub prune: bool,
+    /// Local repository namespace to strip before mapping to the downstream.
+    /// `None` for a bare-host downstream (verbatim mirror).
+    pub local_namespace: Option<Namespace>,
+    /// Target namespace to prepend after stripping. `None` for a bare-host
+    /// downstream (verbatim mirror). Applied via [`Namespace::remote`].
+    pub target_namespace: Option<Namespace>,
 }
 
 impl ReplicationDownstream {
@@ -67,6 +76,8 @@ impl ReplicationDownstream {
             namespace_filter: None,
             max_concurrent_pushes,
             prune: false,
+            local_namespace: None,
+            target_namespace: None,
         }
     }
 
@@ -87,6 +98,16 @@ impl ReplicationDownstream {
     pub fn enqueues_for(&self, namespace: &str) -> bool {
         self.mode.enqueues_on_event() && self.matches_namespace(namespace)
     }
+
+    /// Maps `namespace` to its downstream form via [`Namespace::remote`]. For a
+    /// routed namespace the strip always succeeds, so an `Err` is effectively
+    /// unreachable but callers still handle it.
+    pub fn remote(&self, namespace: &Namespace) -> Result<Namespace, Error> {
+        namespace.remote(
+            self.local_namespace.as_ref(),
+            self.target_namespace.as_ref(),
+        )
+    }
 }
 
 /// Builder for [`ReplicationDownstream`]. `name`, `registry_client` and
@@ -99,6 +120,8 @@ pub struct ReplicationDownstreamBuilder {
     namespace_filter: Option<Vec<Regex>>,
     max_concurrent_pushes: usize,
     prune: bool,
+    local_namespace: Option<Namespace>,
+    target_namespace: Option<Namespace>,
 }
 
 impl ReplicationDownstreamBuilder {
@@ -124,6 +147,19 @@ impl ReplicationDownstreamBuilder {
         self
     }
 
+    /// Namespace mapping to the downstream: the local namespace to strip and the
+    /// target namespace to prepend (defaults to verbatim).
+    #[must_use]
+    pub fn namespace_mapping(
+        mut self,
+        local_namespace: Option<Namespace>,
+        target_namespace: Option<Namespace>,
+    ) -> Self {
+        self.local_namespace = local_namespace;
+        self.target_namespace = target_namespace;
+        self
+    }
+
     /// Builds the [`ReplicationDownstream`].
     #[must_use]
     pub fn build(self) -> ReplicationDownstream {
@@ -134,6 +170,8 @@ impl ReplicationDownstreamBuilder {
             namespace_filter: self.namespace_filter.unwrap_or_default(),
             max_concurrent_pushes: self.max_concurrent_pushes,
             prune: self.prune,
+            local_namespace: self.local_namespace,
+            target_namespace: self.target_namespace,
         }
     }
 }
