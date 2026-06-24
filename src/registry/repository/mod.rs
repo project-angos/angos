@@ -19,6 +19,136 @@ use crate::{
 /// `max_concurrent_pushes`.
 const DEFAULT_MAX_CONCURRENT_PUSHES: usize = 4;
 
+/// Split a registry URL (upstream or downstream) into the registry base (talked
+/// to at its OCI `/v2/` root) and the path-derived namespace prefix.
+/// `http://host:8000/team` yields (`http://host:8000`, `team`); a bare-host URL
+/// yields an empty prefix. A path before `/v2/` is meaningless to an OCI
+/// registry, so it is mapped into the namespace rather than the HTTP path.
+fn split_registry_url(url: &str) -> (String, String) {
+    let trimmed = url.trim_end_matches('/');
+    if let Some(scheme_end) = trimmed.find("://") {
+        let authority_start = scheme_end + 3;
+        if let Some(path_offset) = trimmed[authority_start..].find('/') {
+            let split_at = authority_start + path_offset;
+            let base = trimmed[..split_at].to_string();
+            let prefix = trimmed[split_at..].trim_matches('/').to_string();
+            return (base, prefix);
+        }
+    }
+    (trimmed.to_string(), String::new())
+}
+
+/// Build the pull-through upstream clients. A path on an upstream URL is the
+/// namespace prefix the images live under upstream; angos talks to the registry
+/// root and maps the path into the namespace. The repository name is stripped by
+/// the `local_name` argument the pull path passes, so the mirror only prepends.
+async fn build_upstreams(
+    upstream_configs: &[RegistryClientConfig],
+    cache: &Arc<Cache>,
+    max_manifest_size_bytes: usize,
+) -> Result<Vec<RegistryClient>, Error> {
+    if upstream_configs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let upstream_configs = upstream_configs.to_vec();
+    let cache = Arc::clone(cache);
+    task::spawn_blocking(move || {
+        let mut upstreams = Vec::new();
+        for config in &upstream_configs {
+            let (base_url, prefix) = split_registry_url(&config.url);
+            let mut client_config = config.clone();
+            client_config.url = base_url;
+            let mut client = RegistryClient::from_config(
+                &client_config,
+                Arc::clone(&cache),
+                max_manifest_size_bytes,
+            )?;
+            if !prefix.is_empty() {
+                client = client.with_namespace_mirror(String::new(), prefix);
+            }
+            upstreams.push(client);
+        }
+        Ok::<_, Error>(upstreams)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))?
+}
+
+/// Build the replication downstream clients after validating that every
+/// downstream `name` is non-empty and unique (the name is the job routing key
+/// and metrics label). A path on a downstream URL replaces this repository's
+/// prefix (`repo/x` -> `prefix/x`); a bare-host URL mirrors the namespace
+/// verbatim.
+async fn build_downstreams(
+    name: &str,
+    downstream_configs: &[ReplicationDownstreamConfig],
+    cache: &Arc<Cache>,
+    max_manifest_size_bytes: usize,
+) -> Result<Vec<ReplicationDownstream>, Error> {
+    let mut seen_names = HashSet::new();
+    for downstream in downstream_configs {
+        if downstream.name.is_empty() {
+            return Err(Error::Initialization(format!(
+                "replication downstream in repository '{name}' has an empty name; \
+                 a non-empty name is required (it is the job routing key and metrics label)"
+            )));
+        }
+        if !seen_names.insert(downstream.name.as_str()) {
+            return Err(Error::Initialization(format!(
+                "repository '{name}' has duplicate replication downstream name '{}'; \
+                 downstream names must be unique (they are the job routing key and metrics label)",
+                downstream.name
+            )));
+        }
+    }
+
+    if downstream_configs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let downstream_configs = downstream_configs.to_vec();
+    let cache = Arc::clone(cache);
+    let repo_name = name.to_string();
+    task::spawn_blocking(move || {
+        let mut downstreams = Vec::new();
+        for config in &downstream_configs {
+            let (base_url, prefix) = split_registry_url(&config.client.url);
+            let mut client_config = config.client.clone();
+            client_config.url = base_url;
+            let mut registry_client = RegistryClient::from_config(
+                &client_config,
+                Arc::clone(&cache),
+                max_manifest_size_bytes,
+            )?;
+            if !prefix.is_empty() {
+                registry_client = registry_client.with_namespace_mirror(repo_name.clone(), prefix);
+            }
+            downstreams.push(
+                ReplicationDownstream::builder(
+                    config.name.clone(),
+                    Arc::new(registry_client),
+                    config
+                        .max_concurrent_pushes
+                        .map_or(DEFAULT_MAX_CONCURRENT_PUSHES, NonZeroUsize::get),
+                )
+                .mode(config.mode)
+                .namespace_filter(
+                    config
+                        .namespace_filter
+                        .iter()
+                        .cloned()
+                        .map(RegexPattern::into_regex)
+                        .collect(),
+                )
+                .prune(config.prune)
+                .build(),
+            );
+        }
+        Ok::<_, Error>(downstreams)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("Failed to initialize downstream clients: {e}")))?
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -81,87 +211,9 @@ impl Repository {
         cache: &Arc<Cache>,
         max_manifest_size_bytes: usize,
     ) -> Result<Self, Error> {
-        let upstreams = if config.upstream.is_empty() {
-            Vec::new()
-        } else {
-            let upstream_configs = config.upstream.clone();
-            let cache = Arc::clone(cache);
-            task::spawn_blocking(move || {
-                let mut upstreams = Vec::new();
-                for config in &upstream_configs {
-                    upstreams.push(RegistryClient::from_config(
-                        config,
-                        Arc::clone(&cache),
-                        max_manifest_size_bytes,
-                    )?);
-                }
-                Ok::<_, Error>(upstreams)
-            })
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))??
-        };
-
-        // `name` is the job lock_key segment and the per-downstream metrics label,
-        // so an empty or duplicate name would silently coalesce two distinct targets.
-        let mut seen_names = HashSet::new();
-        for downstream in &config.downstream {
-            if downstream.name.is_empty() {
-                return Err(Error::Initialization(format!(
-                    "replication downstream in repository '{name}' has an empty name; \
-                     a non-empty name is required (it is the job routing key and metrics label)"
-                )));
-            }
-            if !seen_names.insert(downstream.name.as_str()) {
-                return Err(Error::Initialization(format!(
-                    "repository '{name}' has duplicate replication downstream name '{}'; \
-                     downstream names must be unique (they are the job routing key and metrics label)",
-                    downstream.name
-                )));
-            }
-        }
-
-        let replication = if config.downstream.is_empty() {
-            Vec::new()
-        } else {
-            let downstream_configs = config.downstream.clone();
-            let cache = Arc::clone(cache);
-            task::spawn_blocking(move || {
-                let mut downstreams = Vec::new();
-                for config in &downstream_configs {
-                    let registry_client = RegistryClient::from_config(
-                        &config.client,
-                        Arc::clone(&cache),
-                        max_manifest_size_bytes,
-                    )?;
-                    downstreams.push(
-                        ReplicationDownstream::builder(
-                            config.name.clone(),
-                            Arc::new(registry_client),
-                            config
-                                .max_concurrent_pushes
-                                .map_or(DEFAULT_MAX_CONCURRENT_PUSHES, NonZeroUsize::get),
-                        )
-                        .mode(config.mode)
-                        .namespace_filter(
-                            config
-                                .namespace_filter
-                                .iter()
-                                .cloned()
-                                .map(RegexPattern::into_regex)
-                                .collect(),
-                        )
-                        .prune(config.prune)
-                        .build(),
-                    );
-                }
-                Ok::<_, Error>(downstreams)
-            })
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("Failed to initialize downstream clients: {e}"))
-            })??
-        };
-
+        let upstreams = build_upstreams(&config.upstream, cache, max_manifest_size_bytes).await?;
+        let replication =
+            build_downstreams(name, &config.downstream, cache, max_manifest_size_bytes).await?;
         let retention_policy =
             RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock));
 
@@ -301,6 +353,33 @@ mod tests {
             max_concurrent_pushes: None,
             prune: false,
         }
+    }
+
+    #[test]
+    fn split_registry_url_extracts_namespace_prefix_from_the_path() {
+        assert_eq!(
+            super::split_registry_url("http://192.168.178.143:8000/push-through-1"),
+            (
+                "http://192.168.178.143:8000".to_string(),
+                "push-through-1".to_string()
+            )
+        );
+        assert_eq!(
+            super::split_registry_url("https://host:8000/team/sub/"),
+            ("https://host:8000".to_string(), "team/sub".to_string())
+        );
+    }
+
+    #[test]
+    fn split_registry_url_yields_no_prefix_for_a_bare_host() {
+        assert_eq!(
+            super::split_registry_url("http://angos-b:8000"),
+            ("http://angos-b:8000".to_string(), String::new())
+        );
+        assert_eq!(
+            super::split_registry_url("https://angos-eu.example.com/"),
+            ("https://angos-eu.example.com".to_string(), String::new())
+        );
     }
 
     async fn repository_with_upstreams(first_url: String, second_url: String) -> Repository {

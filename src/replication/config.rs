@@ -15,6 +15,11 @@ pub struct ReplicationDownstreamConfig {
     pub name: String,
     /// HTTP/TLS/auth fields shared with an upstream registry, flattened so they
     /// parse from the same TOML table; carries the mTLS-pairing validation.
+    ///
+    /// A path on the `url` (`http://host:8000/team`) becomes the namespace
+    /// prefix the content lands under on the downstream, replacing the source
+    /// repository prefix (`<repo>/x` -> `team/x`); a bare-host `url` mirrors the
+    /// namespace verbatim.
     #[serde(flatten)]
     pub client: RegistryClientConfig,
     #[serde(default)]

@@ -35,7 +35,7 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (pos
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | string | required | Local identifier for this downstream (used in logs and the `downstream` metric label) |
-| `url` | string | required | Downstream registry base URL |
+| `url` | string | required | Downstream registry URL. A bare host mirrors the namespace verbatim; a path (`http://host:8000/team`) becomes the namespace prefix the content lands under, replacing the source repository prefix (`<repo>/x` → `team/x`). Angos serves the OCI API at `/v2/` root, so the path is mapped into the namespace, not the HTTP path. See [Fan out into sibling repositories](#fan-out-into-sibling-repositories). |
 | `mode` | string | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"` |
 | `namespace_filter` | [string] | `[]` (all) | Regex patterns; a namespace replicates to this downstream only if it matches one |
 | `max_concurrent_pushes` | usize | `4` | Concurrent blob pushes per manifest for this downstream (positive integer, >= 1) |
@@ -60,6 +60,25 @@ Pending jobs for a removed or renamed downstream fail loudly and dead-letter aft
 :::note Reclaiming stranded blobs on a receiver
 When a replicated manifest push uploads a blob but its manifest then loses last-writer-wins or dead-letters, the receiver keeps the blob's per-namespace ownership grant with no manifest referencing it, pinning the bytes. `angos scrub --orphan-grants <age>` (e.g. `24h`) revokes such grants once the blob is older than the given age and reclaims the bytes; the age gate avoids racing an in-flight push.
 :::
+
+## Fan out into sibling repositories
+
+A bare-host `url` mirrors the namespace verbatim, which suits a separate registry. To mirror a repository into a different repository on the **same** instance (or under a different prefix on another instance), put that prefix on the `url` path: it replaces the source repository prefix, so `team/app` lands as `team-a/app`. Angos serves the OCI API at the root, so the path is mapped into the namespace rather than the HTTP path.
+
+```toml
+[[repository."team".downstream]]
+name = "team-a"
+url = "https://angos.example.com/team-a"   # path -> namespace prefix
+
+[[repository."team".downstream]]
+name = "team-b"
+url = "https://angos.example.com/team-b"
+
+[repository."team-a"]          # the receiving repositories
+[repository."team-b"]
+```
+
+A push to `team/<image>` then fans out to `team-a/<image>` and `team-b/<image>`. With a bare-host `url`, replicating to the same instance would re-target the source repository itself (a self-loop, suppressed as a no-op) rather than landing in a sibling.
 
 ## Global Knobs
 
