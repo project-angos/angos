@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue; `scrub --replicate` reconciles on demand.
+- A path on a pull-through upstream's or replication downstream's `url` is the namespace prefix the content maps to (`<repo>/x` ↔ `<path>/x`), so a repository can mirror a prefixed remote namespace or fan out into sibling repositories; a bare host maps verbatim.
 - New `scrub --replication-orphans` and `scrub --cache-orphans` flags delete pending and dead-lettered replication and cache jobs whose downstream or pull-through repository is no longer configured.
 - New `scrub --orphan-namespaces` (`-n`) flag removes revisions, tags, and in-flight uploads for namespaces not owned by any configured repository and reclaims their layer/config blob bytes (combine with `--blobs` to also reclaim manifest blob bytes); it is destructive (dry-run first) and refuses to run when no repositories are configured.
 - Cross-repository blob mount (`POST /v2/{namespace}/blobs/uploads/?mount={digest}[&from={repository}]`) grants an already-present blob to the target namespace with no upload.
@@ -33,11 +34,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A blob-upload `POST` with a malformed `?digest=`, `?mount=`, or `?from=` now returns `400` instead of silently starting an upload session that ignores the value.
 - The `_catalog` listing is derived directly from stored content (deterministic and strongly consistent); the maintained namespace-registry index is removed and its now-unused `_registry/` objects are pruned by `scrub`.
 - Tags, repository names, upload session IDs, and manifest/descriptor media types are now strictly validated against their OCI grammars, so a request carrying a malformed value is rejected with `400` where an earlier version might have accepted it.
+- Repository names exceeding the OCI 255-character limit are now rejected where an earlier version accepted them.
 
 ### Fixed
 
 - Blob uploads using chunked transfer-encoding without `Content-Length`, as sent by `docker push`, are now accepted and streamed to EOF.
 - Manifests are now stored in the blob store, so a registry with its blob and metadata stores on separate backends no longer returns 404 on manifest read or delete.
+- Pulling a pull-through upstream at the repository root now maps the namespace verbatim instead of building a malformed `/v2//` request URL that upstreams reject.
 
 ## 1.2.0 - 2026-06-03
 

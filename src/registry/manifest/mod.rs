@@ -578,7 +578,7 @@ impl Registry {
         }
 
         let repository = resolved_repository
-            .map(|r| r.name.clone())
+            .map(|r| r.name.to_string())
             .unwrap_or_default();
         let digest_str = match reference {
             Reference::Digest(d) => Some(d.to_string()),
@@ -901,7 +901,7 @@ impl Registry {
             .await?;
 
         let repository = resolved_repository
-            .map(|r| r.name.clone())
+            .map(|r| r.name.to_string())
             .unwrap_or_default();
         let digest_str = response.headers.get(DOCKER_CONTENT_DIGEST).cloned();
 

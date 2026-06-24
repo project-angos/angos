@@ -226,12 +226,15 @@ impl Authorizer {
             repository.name
         );
 
-        let auth_repo = self.repositories.get(&repository.name).ok_or_else(|| {
-            Error::Execution(format!(
-                "Repository '{}' not found in authorizer",
-                repository.name
-            ))
-        })?;
+        let auth_repo = self
+            .repositories
+            .get(repository.name.as_ref())
+            .ok_or_else(|| {
+                Error::Execution(format!(
+                    "Repository '{}' not found in authorizer",
+                    repository.name
+                ))
+            })?;
 
         if let Some(ref access_policy) = auth_repo.access_policy {
             match access_policy.evaluate(action, identity) {
@@ -257,7 +260,7 @@ impl Authorizer {
             }
         }
 
-        self.check_immutable_tag(repository.name.as_str(), action)?;
+        self.check_immutable_tag(repository.name.as_ref(), action)?;
 
         let webhook = auth_repo
             .authorization_webhook

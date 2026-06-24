@@ -190,6 +190,9 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -272,6 +275,9 @@ async fn referrers_fallback_put_is_timestamp_less() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
     };
@@ -368,6 +374,9 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -451,6 +460,9 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -550,6 +562,9 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -617,6 +632,9 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -697,6 +715,9 @@ async fn index_lands_after_its_child_manifest() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -772,6 +793,9 @@ async fn index_lands_after_all_children_when_fanned_out() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -888,6 +912,9 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -989,6 +1016,9 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1049,6 +1079,9 @@ async fn push_manifest_stamps_source_timestamp_header() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
     };
@@ -1093,6 +1126,9 @@ async fn push_manifest_skips_put_when_downstream_already_converged() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1182,6 +1218,9 @@ async fn repeated_layer_digest_uploads_the_blob_once() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1240,6 +1279,9 @@ async fn converged_skip_head_sends_standard_accept_headers() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1333,6 +1375,9 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1421,6 +1466,9 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1486,6 +1534,9 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1570,6 +1621,9 @@ async fn failed_patch_cancels_the_upload_session() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1657,6 +1711,9 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1703,6 +1760,9 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1746,6 +1806,9 @@ async fn push_manifest_puts_when_downstream_head_returns_404() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1809,6 +1872,9 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1884,6 +1950,9 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1918,6 +1987,9 @@ async fn push_manifest_treats_lww_superseded_409_as_success() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
     };
@@ -1957,6 +2029,9 @@ async fn push_manifest_propagates_immutable_409_as_error() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -1997,6 +2072,7 @@ async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         &Namespace::new(NAMESPACE).unwrap(),
+        NAMESPACE,
         &Reference::Tag(Tag::new("v1").unwrap()),
         Some("2026-06-03T00:00:00Z"),
     )
@@ -2024,6 +2100,7 @@ async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         &Namespace::new(NAMESPACE).unwrap(),
+        NAMESPACE,
         &Reference::Tag(Tag::new("gone").unwrap()),
         None,
     )
@@ -2056,6 +2133,7 @@ async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         &Namespace::new(NAMESPACE).unwrap(),
+        NAMESPACE,
         &Reference::Tag(Tag::new("v1").unwrap()),
         None,
     )
@@ -2083,6 +2161,7 @@ async fn delete_manifest_propagates_non_superseded_409_as_error() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         &Namespace::new(NAMESPACE).unwrap(),
+        NAMESPACE,
         &Reference::Tag(Tag::new("v1").unwrap()),
         None,
     )
@@ -2123,6 +2202,9 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
         blob_store: &blob_store,
         metadata_store: &metadata_store,
         namespace: &namespace,
+        downstream_namespace: &namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
         max_concurrent_pushes: 4,
         source_ts: None,
     };
@@ -2203,6 +2285,7 @@ async fn deleting_last_referrer_removes_the_fallback_tag() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         &Namespace::new(NAMESPACE).unwrap(),
+        NAMESPACE,
         &Reference::Digest(referrer.clone()),
         None,
     )
@@ -2271,6 +2354,7 @@ async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
         &downstream_client(&mock_server.uri()),
         &metadata_store,
         &Namespace::new(NAMESPACE).unwrap(),
+        NAMESPACE,
         &Reference::Digest(referrer.clone()),
         None,
     )

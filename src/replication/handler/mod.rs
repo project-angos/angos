@@ -293,6 +293,12 @@ impl ReplicationJobHandler {
         let namespace = &payload.namespace;
         let downstream = self.resolve_downstream(namespace, &payload.downstream)?;
         let registry_client = &downstream.registry_client;
+        // `Err` is unreachable for a routed namespace; the map stays defensive.
+        let downstream_namespace = downstream.remote(namespace).map_err(|e| {
+            Error::Storage(format!(
+                "invalid downstream namespace for '{namespace}': {e}"
+            ))
+        })?;
         let max_concurrent_pushes = downstream.max_concurrent_pushes;
 
         if envelope.kind == REPLICATION_DELETE_MANIFEST_KIND {
@@ -314,6 +320,7 @@ impl ReplicationJobHandler {
                 registry_client,
                 &self.metadata_store,
                 namespace,
+                downstream_namespace.as_ref(),
                 &reference,
                 payload.source_ts.as_deref(),
             )
@@ -350,6 +357,9 @@ impl ReplicationJobHandler {
                 blob_store: &self.blob_store,
                 metadata_store: &self.metadata_store,
                 namespace,
+                downstream_namespace: &downstream_namespace,
+                downstream_local_namespace: downstream.local_namespace.as_ref(),
+                downstream_target_namespace: downstream.target_namespace.as_ref(),
                 max_concurrent_pushes,
                 source_ts: source_ts.as_deref(),
             };

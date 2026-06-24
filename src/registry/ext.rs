@@ -535,7 +535,11 @@ impl Registry {
             };
         };
 
-        let upstream_urls: Vec<String> = repo.upstreams.iter().map(|u| u.url.clone()).collect();
+        let upstream_urls: Vec<String> = repo
+            .upstreams
+            .iter()
+            .map(|u| u.client.url.clone())
+            .collect();
         let immutable_tags_exclusions = if repo.immutable_tags_exclusions.is_empty() {
             global_exclusions()
         } else {

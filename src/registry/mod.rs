@@ -270,7 +270,7 @@ impl Registry {
     /// `repository` field should reflect the configured repository scope.
     pub fn repository_name_for(&self, namespace: &Namespace) -> String {
         self.get_repository_for_namespace(namespace)
-            .map(|r| r.name.clone())
+            .map(|r| r.name.to_string())
             .unwrap_or_default()
     }
 

@@ -441,7 +441,7 @@ Array of upstream registries for pull-through cache.
 
 | Option               | Type   | Default  | Description                       |
 |----------------------|--------|----------|-----------------------------------|
-| `url`                | string | required | Upstream registry URL             |
+| `url`                | string | required | Upstream registry URL. A bare host pulls from the registry root after stripping the repository name (`<repo>/x` → upstream `x`); a path (`https://host/team`) becomes the upstream namespace prefix instead (`<repo>/x` → upstream `team/x`). Pulling the repository root `<repo>` itself maps to `<repo>` for a bare host and to `<path>` for a path URL. Angos talks to the OCI `/v2/` root, so the path is mapped into the namespace, not the HTTP path. |
 | `max_redirect`       | u8     | `5`      | Maximum redirects to follow       |
 | `server_ca_bundle`   | string | -        | CA bundle for server verification |
 | `client_certificate` | string | -        | Client certificate for mTLS       |
@@ -456,7 +456,7 @@ Array of downstream registries to which this repository's mutations are replicat
 | Option                  | Type     | Default            | Description                                                              |
 |-------------------------|----------|--------------------|--------------------------------------------------------------------------|
 | `name`                  | string   | required           | Local identifier for this downstream (logs, `downstream` metric label)   |
-| `url`                   | string   | required           | Downstream registry base URL                                             |
+| `url`                   | string   | required           | Downstream registry URL. A bare host (`http://host:8000`) mirrors the namespace verbatim; a path (`http://host:8000/team`) becomes the namespace prefix the content lands under, replacing the source repository prefix (`<repo>/x` → `team/x`). The repository root `<repo>` itself maps to `<repo>` for a bare host and to `<path>` for a path URL. Angos serves the OCI API at the root, so the path is mapped into the namespace, not the HTTP path. |
 | `mode`                  | string   | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"`              |
 | `namespace_filter`      | [string] | `[]` (all)         | Regex patterns; a namespace replicates here only if it matches one       |
 | `max_concurrent_pushes` | usize    | `4`                | Concurrent blob pushes per manifest for this downstream (positive integer, >= 1) |

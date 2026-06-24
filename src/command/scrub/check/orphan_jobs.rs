@@ -252,6 +252,7 @@ mod tests {
             job_store::{FailOutcome, JobEnvelope, JobState, JobStore, Queue},
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::MetadataStore,
+            repository::Upstream,
             repository_resolver::RepositoryResolver,
             test_utils::{build_store, build_test_fs_executor},
         },
@@ -304,8 +305,17 @@ mod tests {
         upstreams: Vec<RegistryClient>,
         replication: Vec<ReplicationDownstream>,
     ) -> Repository {
+        // Tests build clients directly; wrap each in a verbatim-mapping Upstream.
+        let upstreams = upstreams
+            .into_iter()
+            .map(|client| Upstream {
+                client,
+                local_namespace: None,
+                target_namespace: None,
+            })
+            .collect();
         Repository {
-            name: name.to_string(),
+            name: Namespace::new(name).unwrap(),
             upstreams,
             replication,
             retention_policy: RetentionPolicy::new(

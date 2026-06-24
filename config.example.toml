@@ -169,7 +169,9 @@ default = "allow"
 # array-of-tables entry per downstream (shape mirrors [[repository.X.upstream]]).
 #[[repository."nginx".downstream]]
 #name = "eu-region"                    # local identifier for this downstream
-#url = "https://angos-eu.example.com"
+#url = "https://angos-eu.example.com"  # registry root: mirrors the namespace verbatim.
+                                       # A path (https://host/eu-mirror) becomes the namespace
+                                       # prefix instead: nginx/x lands as eu-mirror/x.
 #username = "replicator"
 #password = "..."
 #mode = "event+reconcile"              # "event+reconcile" | "event-only" | "reconcile-only"

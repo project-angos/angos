@@ -22,7 +22,6 @@ use crate::{
         metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
-    registry_client::NO_LOCAL_PREFIX,
     replication::{ReplicationDownstream, manifest_accept_types},
 };
 
@@ -87,9 +86,20 @@ impl ReplicationChecker {
             return;
         }
 
+        // `Err` is unreachable for a routed namespace; warn-and-skip is defensive.
+        let remote = match downstream.remote(namespace) {
+            Ok(remote) => remote,
+            Err(e) => {
+                warn!(
+                    "Invalid downstream namespace on '{}' for '{namespace}'; skipping cleanup: {e}",
+                    downstream.name
+                );
+                return;
+            }
+        };
         let location = downstream
             .registry_client
-            .get_tags_list_path(NO_LOCAL_PREFIX, namespace.as_ref());
+            .get_tags_list_path(remote.as_ref());
         let downstream_tags = match downstream.registry_client.list_tags(&location).await {
             Ok(tags) => tags,
             Err(e) => {
@@ -144,6 +154,19 @@ async fn reconcile_push_step(
         Skipped,
     }
 
+    // `Err` is unreachable for a routed namespace; warn-and-skip is defensive.
+    let remote = match downstream.remote(namespace) {
+        Ok(remote) => remote,
+        Err(e) => {
+            warn!(
+                "Invalid downstream namespace on '{}' for '{namespace}'; skipping push: {e}",
+                downstream.name
+            );
+            return;
+        }
+    };
+    let remote = &remote;
+
     let candidates: Vec<(Tag, Digest)> = local_tags
         .iter()
         .filter_map(|(tag, local)| local.as_ref().map(|digest| (tag.clone(), digest.clone())))
@@ -153,10 +176,9 @@ async fn reconcile_push_step(
             let reference = Reference::Tag(tag.clone());
             // Only a 404 means absence; any other HEAD failure skips the tag this
             // pass rather than enqueuing a spurious push.
-            let location =
-                downstream
-                    .registry_client
-                    .get_manifest_path(NO_LOCAL_PREFIX, namespace.as_ref(), &reference);
+            let location = downstream
+                .registry_client
+                .get_manifest_path(remote.as_ref(), &reference);
             match downstream
                 .registry_client
                 .head_manifest(&manifest_accept_types(), &location)
@@ -351,6 +373,29 @@ mod tests {
         )
     }
 
+    /// A path-prefixed downstream: strips `nginx` and prepends `mirror`, so content
+    /// `nginx/app` maps to remote `mirror/app`. `REPO == "nginx"` keeps the resolver
+    /// routing here.
+    fn prefixed_repository(
+        client: Arc<RegistryClient>,
+        mode: ReplicationMode,
+        prune: bool,
+    ) -> Repository {
+        repository_with_replication(
+            REPO,
+            vec![
+                ReplicationDownstream::builder(DOWNSTREAM.to_string(), client, 4)
+                    .namespace_mapping(
+                        Some(Namespace::new("nginx").unwrap()),
+                        Some(Namespace::new("mirror").unwrap()),
+                    )
+                    .mode(mode)
+                    .prune(prune)
+                    .build(),
+            ],
+        )
+    }
+
     fn resolver_for(repo: Repository) -> Arc<RepositoryResolver> {
         let mut repositories = HashMap::new();
         repositories.insert(REPO.to_string(), repo);
@@ -397,6 +442,153 @@ mod tests {
             Action::EnqueueReplicationPush { downstream, tag, digest, .. }
                 if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
         ));
+    }
+
+    #[tokio::test]
+    async fn enqueues_push_for_prefixed_downstream_at_mapped_path() {
+        // A prefixed downstream must probe the mapped path `mirror/app`, not the
+        // local `nginx/app`. The `.expect(1)` on the mapped HEAD asserts this,
+        // verified on `MockServer` drop.
+        metrics_provider::init_for_tests();
+        let (metadata_store, store, _dir) = fs_metadata_store();
+        let mock_server = MockServer::start().await;
+
+        let content = Namespace::new("nginx/app").unwrap();
+        let manifest = put_blob_direct(&store, b"manifest-bytes").await;
+        metadata_store
+            .update_links(
+                &content,
+                &[LinkOperation::create(
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
+                    manifest.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        Mock::given(method("HEAD"))
+            .and(path("/v2/mirror/app/manifests/v1"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let resolver = resolver_for(prefixed_repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::EventReconcile,
+            false,
+        ));
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
+
+        let mut sink: Vec<Action> = Vec::new();
+        checker.check(&content, &mut sink).await.unwrap();
+
+        assert_eq!(sink.len(), 1);
+        assert!(matches!(
+            &sink[0],
+            Action::EnqueueReplicationPush { downstream, namespace, tag, digest }
+                if downstream == DOWNSTREAM
+                    && namespace == "nginx/app"
+                    && tag == "v1"
+                    && *digest == manifest
+        ));
+
+        // Drop explicitly so the mapped-path `.expect(1)` is verified here.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn prunes_prefixed_downstream_at_mapped_path() {
+        // Prune on a prefixed downstream must list and delete at the mapped path
+        // `mirror/app`, not the local `nginx/app`. The `.expect(1)` on the mapped
+        // list and delete asserts that.
+        metrics_provider::init_for_tests();
+        let (metadata_store, store, _dir) = fs_metadata_store();
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let mock_server = MockServer::start().await;
+
+        let content = Namespace::new("nginx/app").unwrap();
+        // Local tag `v1` converges; `stray` is downstream-only and must be pruned.
+        let manifest = put_blob_direct(&store, b"converged-bytes").await;
+        metadata_store
+            .update_links(
+                &content,
+                &[LinkOperation::create(
+                    LinkKind::Tag(Tag::new("v1").unwrap()),
+                    manifest.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        Mock::given(method("HEAD"))
+            .and(path("/v2/mirror/app/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest.to_string().as_str())
+                    .insert_header("Content-Length", "15"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/mirror/app/tags/list"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["v1", "stray"] })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/mirror/app/manifests/stray"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let resolver = resolver_for(prefixed_repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::EventReconcile,
+            true,
+        ));
+        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
+
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
+
+        let mut executor: Box<dyn ActionSink + Send> = Box::new(Executor::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            job_store.clone(),
+        ));
+        checker.check(&content, executor.as_mut()).await.unwrap();
+        assert_eq!(
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
+            1,
+            "the downstream-only tag must enqueue exactly one delete job"
+        );
+
+        let handler = ReplicationJobHandler::new(
+            resolver.clone(),
+            blob_store.clone(),
+            metadata_store.clone(),
+        );
+
+        let mut drained: u64 = 0;
+        loop {
+            let outcome = job_store.claim_one(Queue::Replication).await.unwrap();
+            let Some(claimed) = outcome.claimed else {
+                break;
+            };
+            execute_one(&job_store, &handler, claimed).await;
+            drained += 1;
+        }
+        assert_eq!(drained, 1, "exactly one delete job is drained");
+
+        // Drop explicitly so the mapped-path list and DELETE `.expect(1)` are
+        // verified here.
+        drop(mock_server);
     }
 
     #[tokio::test]
