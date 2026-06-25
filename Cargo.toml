@@ -21,39 +21,39 @@ argh = "0.1.19"
 argon2 = "0.5.3"
 async-trait = "0.1.89"
 base64 = "0.22.1"
-bytes = "1.11.1"
-bytesize = { version = "2.3.1", features = ["serde"] }
+bytes = "1.12.0"
+bytesize = { version = "2.4.0", features = ["serde"] }
 cel-interpreter = "0.10"
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 futures-util = { version = "0.3.32", default-features = false }
 hex = "0.4.3"
 hmac = "0.13.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
 humantime = "2.3"
-hyper = { version = "1.9" , features = ["full"]}
+hyper = { version = "1.10" , features = ["full"]}
 hyper-util = { version = "0.1.20", features = ["tokio", "server-graceful"] }
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 md-5 = "0.11"
 mime_guess = "2.0.5"
 notify = "8.2"
 opentelemetry = "0.32.0"
-opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio", "metrics"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.32.0" , features = ["grpc-tonic"]}
 parking_lot = "0.12.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 prometheus = "0.14"
-quick-xml = "0.38"
-redis = { version = "1.2.1", features = ["tokio-comp"] }
-regex = "1.12.3"
-reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "stream", "json"] }
-rpassword = "7.5.2"
+quick-xml = "0.40"
+redis = { version = "1.2.4", features = ["tokio-comp"] }
+regex = "1.12.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "json"] }
+rpassword = "7.5.4"
 rust-embed = "8.11"
-rustls = { version = "0.23.40", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
+rustls = { version = "0.23.41", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 rustls-pki-types = "1.14.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_html_form = "0.4.0"
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 sha2 = "0.11.0"
 smallvec = "1.15"
 tempfile = "3.27"
@@ -66,12 +66,12 @@ tracing = "0.1.44"
 tracing-opentelemetry = { git = "https://github.com/tokio-rs/tracing-opentelemetry", rev = "44521fa43c79989cdfb5b7244d5f1afadef6dd7e" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = { version = "2.5.8", features = ["serde"] }
-uuid = { version = "1.23.1", features = ["v4", "serde"] }
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
 x509-parser = "0.18.1"
-zeroize = { version = "1.8.2", features = ["derive"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 
 [dev-dependencies]
 wiremock = "0.6.5"
 rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
 p256 = { version = "0.13.2", features = ["ecdsa", "pem", "jwk"] }
-opentelemetry_sdk = { version = "0.32.0", features = ["testing"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
