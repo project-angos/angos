@@ -9,16 +9,16 @@ pedantic = { level = "warn", priority = -1 }
 [dependencies]
 angos-backoff = { path = "../backoff" }
 base64 = "0.22.1"
-bytes = "1.11.1"
-bytesize = { version = "2.3.1", features = ["serde"] }
-chrono = { version = "0.4.44", features = ["serde"] }
+bytes = "1.12.0"
+bytesize = { version = "2.4.0", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 futures-util = { version = "0.3.32", default-features = false }
 hex = "0.4.3"
 hmac = "0.13.0"
 md-5 = "0.11"
 parking_lot = "0.12.5"
-quick-xml = "0.38"
-reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "stream"] }
+quick-xml = "0.40"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"
 smallvec = "1.15"
