@@ -1,3 +1,4 @@
+use angos_tx_engine::lock::Error as LockError;
 use tokio::io::{AsyncRead, AsyncReadExt, copy, sink};
 use tracing::{instrument, warn};
 
@@ -14,11 +15,10 @@ use crate::{
 
 /// Caps the namespaces CEL-evaluated for a from-less mount, bounding an
 /// attacker-influenceable fan-out. Candidates beyond the cap fall back to a
-/// normal upload session, so no access is over-granted.
+/// normal upload session.
 const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
 
-/// Default cap on a blob's cumulative uploaded size, mirroring
-/// [`manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES`](crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES).
+/// Default cap on a blob's cumulative uploaded size.
 pub const DEFAULT_MAX_BLOB_SIZE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
 pub enum StartUploadResponse {
@@ -27,9 +27,8 @@ pub enum StartUploadResponse {
 }
 
 /// An OCI cross-repository blob mount request
-/// (`POST /v2/<ns>/blobs/uploads/?mount=<digest>[&from=<repo>]`).
-/// An unsatisfiable mount falls back to a normal upload session rather than
-/// failing, per the distribution spec.
+/// (`POST /v2/<ns>/blobs/uploads/?mount=<digest>[&from=<repo>]`). An
+/// unsatisfiable mount falls back to a normal upload session, per the spec.
 #[derive(Debug)]
 pub struct BlobMount {
     pub digest: Digest,
@@ -49,8 +48,7 @@ pub struct CompleteUploadResponse {
     pub events: Vec<Event>,
 }
 
-/// Headers for a completed-blob response (used by `StartUpload` when the digest
-/// already exists, and by `CompleteUpload` when the upload finishes).
+/// Headers for a completed-blob response.
 fn blob_location_headers(namespace: &Namespace, digest: &Digest) -> HeaderMap {
     ResponseHeaders::new()
         .location(format!("/v2/{namespace}/blobs/{digest}"))
@@ -95,17 +93,15 @@ impl Registry {
         S: AsyncRead + Unpin,
     {
         let session = self.acquire_blob_data_lock(digest).await?;
+        let cancellation = session.cancellation();
         let result = async {
             if self.blob_store.size(digest).await.is_err() {
                 return Ok(false);
             }
 
-            // The blob already exists, so there is nothing to store: hash the
-            // body into a sink under the target algorithm alone, purely to
-            // confirm it matches. With a declared length, drain at most one byte
-            // past it so an over-long body is rejected as soon as the surplus
-            // appears rather than after the whole `bound_blob_stream`-capped
-            // body is read.
+            // The blob exists, so hash the body into a sink only to confirm it
+            // matches. With a declared length, drain at most one byte past it so
+            // an over-long body is rejected as soon as the surplus appears.
             let mut reader =
                 HashingReader::new(&mut *stream, Hasher::for_algorithm(digest.algorithm()));
             match content_length {
@@ -137,6 +133,12 @@ impl Registry {
                 return Err(Error::DigestInvalid);
             }
 
+            // Lock-loss fence: a lost session means a concurrent reclaim may
+            // have committed unseen, so abort before granting a reference that
+            // could dangle over deleted bytes.
+            if cancellation.is_cancelled() {
+                return Err(Error::from(LockError::Invalidated));
+            }
             BlobOwnership::new(self.metadata_store.as_ref())
                 .grant(namespace, digest)
                 .await?;
@@ -170,11 +172,10 @@ impl Registry {
         }
     }
 
-    /// Grants `namespace` a reference to `mount.digest`, re-checked against the
-    /// authorized `source`, returning `Ok(None)` when the source no longer
-    /// holds the blob or its bytes are gone. Check and grant run under the
-    /// `blob-data:{digest}` lock so a concurrent `delete_blob` cannot leave a
-    /// dangling reference.
+    /// Grant `namespace` a reference to `mount.digest`, re-checked against the
+    /// authorized `source`; `Ok(None)` when the source no longer holds the blob.
+    /// Check and grant run under the `blob-data:{digest}` lock so a concurrent
+    /// `delete_blob` cannot leave a dangling reference.
     async fn try_cross_repo_mount(
         &self,
         namespace: &Namespace,
@@ -182,6 +183,7 @@ impl Registry {
         source: &Namespace,
     ) -> Result<Option<HeaderMap>, Error> {
         let session = self.acquire_blob_data_lock(&mount.digest).await?;
+        let cancellation = session.cancellation();
         let result = async {
             if self.blob_store.size(&mount.digest).await.is_err()
                 || !BlobOwnership::new(self.metadata_store.as_ref())
@@ -191,6 +193,12 @@ impl Registry {
                 return Ok(None);
             }
 
+            // Lock-loss fence: a lost session means a concurrent reclaim may
+            // have committed unseen, so abort before granting a reference that
+            // could dangle over deleted bytes.
+            if cancellation.is_cancelled() {
+                return Err(Error::from(LockError::Invalidated));
+            }
             BlobOwnership::new(self.metadata_store.as_ref())
                 .grant(namespace, &mount.digest)
                 .await?;
@@ -269,11 +277,10 @@ impl Registry {
         self.open_upload_session(namespace).await
     }
 
-    /// Starts a cross-repository blob mount from the authorized `source`,
-    /// falling back to an ordinary upload session when the mount cannot be
-    /// satisfied. A satisfied mount returns a `blob.push` event (the session
-    /// fallback returns none: its eventual upload completion emits one), so a
-    /// mounted blob is as visible to webhook consumers as an uploaded one.
+    /// Start a cross-repository blob mount from the authorized `source`, falling
+    /// back to an ordinary upload session when it cannot be satisfied. A satisfied
+    /// mount returns a `blob.push` event; the session fallback returns none (its
+    /// eventual upload emits one).
     #[instrument(skip(actor))]
     pub async fn mount_blob(
         &self,
@@ -316,11 +323,9 @@ impl Registry {
     }
 
     /// Bound a chunked (`None` content-length) body to `remaining + 1` bytes so
-    /// it can never grow the session past `max_blob_size_bytes` without the
-    /// extra byte tripping the overflow check after the write. `remaining` is
-    /// the headroom left before the cap; a `Some(_)` content-length is passed
-    /// through unbounded because [`Self::reject_oversized_known_length`] already
-    /// vetted it.
+    /// it cannot grow the session past `max_blob_size_bytes` without the extra
+    /// byte tripping the post-write check. A `Some(_)` content-length is passed
+    /// through, already vetted by [`Self::reject_oversized_known_length`].
     fn bound_blob_stream<S>(
         &self,
         committed: u64,
@@ -331,8 +336,8 @@ impl Registry {
         S: AsyncRead + Unpin,
     {
         if content_length.is_some() {
-            // A vetted known length never trips the guard; cap at exactly the
-            // limit so a deceptive Content-Length cannot smuggle extra bytes.
+            // Cap at the limit so a deceptive Content-Length cannot smuggle extra
+            // bytes.
             return stream.take(self.max_blob_size_bytes.saturating_add(1));
         }
         let remaining = self.max_blob_size_bytes.saturating_sub(committed);
@@ -439,9 +444,8 @@ impl Registry {
         };
         let has_prior_writes = committed > 0;
 
-        // A final-chunk PUT carrying a Content-Range must resume from the
-        // committed offset; a gap or rewind is an out-of-order chunk (416), not
-        // a digest mismatch.
+        // A final-chunk PUT with a Content-Range must resume from the committed
+        // offset; a gap or rewind is an out-of-order chunk (416).
         if let Some(offset) = start_offset
             && offset != committed
         {
@@ -451,8 +455,8 @@ impl Registry {
         self.reject_oversized_known_length(namespace, &session_key, committed, content_length)
             .await?;
 
-        // Bound the final chunk so a chunked (`None` content-length) PUT that
-        // carries the whole body cannot grow the session past the cap.
+        // Bound the final chunk so a chunked PUT carrying the whole body cannot
+        // grow the session past the cap.
         let mut stream = self.bound_blob_stream(committed, content_length, stream);
         if !has_prior_writes
             && self
@@ -464,9 +468,8 @@ impl Registry {
                 .await);
         }
 
-        // A monolithic PUT (no prior chunked writes) knows its algorithm up
-        // front, so hash only the target; a chunked finalize must resume the
-        // both-algorithm checkpoint left by its PATCHes.
+        // A monolithic PUT hashes only the target algorithm; a chunked finalize
+        // resumes the both-algorithm checkpoint left by its PATCHes.
         let (upload_digest, new_total) = if has_prior_writes {
             self.blob_store
                 .write_upload(
@@ -497,29 +500,55 @@ impl Registry {
             return Err(Error::DigestInvalid);
         }
 
+        self.finalize_upload_reference(namespace, &session_key, digest)
+            .await?;
+
+        Ok(self
+            .finish_completed_upload(actor, namespace, &session_key, digest)
+            .await)
+    }
+
+    /// Promote the session's staged bytes to their canonical blob path and write
+    /// the self-grant, holding `blob-data:{digest}` across both so no reaper
+    /// observes canonical bytes without their reference.
+    ///
+    /// The bytes and the grant shard live in independent object stores over
+    /// independent executors, so a single transaction cannot span them; the lock
+    /// gives complete mutual exclusion against a concurrent reaper or delete
+    /// instead. A crash between the two leaves a true orphan the sweep reaps and
+    /// the client re-pushes.
+    async fn finalize_upload_reference(
+        &self,
+        namespace: &Namespace,
+        session_key: &str,
+        digest: &Digest,
+    ) -> Result<(), Error> {
         let session = self.acquire_blob_data_lock(digest).await?;
+        let cancellation = session.cancellation();
         let result = async {
             match self.blob_store.size(digest).await {
                 Ok(_) => {}
                 Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
                     self.blob_store
-                        .complete_upload(namespace, &session_key, digest)
+                        .complete_upload(namespace, session_key, digest)
                         .await?;
                 }
                 Err(error) => return Err(Error::from(error)),
             }
 
+            // Lock-loss fence: a lost session means a concurrent reclaim may
+            // have committed unseen, so abort before granting a reference that
+            // could dangle over deleted bytes.
+            if cancellation.is_cancelled() {
+                return Err(Error::from(LockError::Invalidated));
+            }
             BlobOwnership::new(self.metadata_store.as_ref())
                 .grant(namespace, digest)
                 .await
         }
         .await;
         session.release().await;
-        result?;
-
-        Ok(self
-            .finish_completed_upload(actor, namespace, &session_key, digest)
-            .await)
+        result
     }
 
     #[instrument]
@@ -565,9 +594,10 @@ mod tests {
 
     use angos_storage::{
         BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
-        MultipartUploadPage, ObjectMeta, ObjectStore, Page,
+        MultipartUploadPage, ObjectMeta, ObjectStore, Page, fs::Backend as StorageFsBackend,
     };
     use angos_tx_engine::store::Store;
+    use tempfile::TempDir;
 
     use crate::{
         auth::Authorizer,
@@ -579,13 +609,14 @@ mod tests {
             BlobMount, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, RegistryConfig,
             StartUploadResponse,
             blob_ownership::BlobOwnership,
-            blob_store::BlobStore,
+            blob_store::{BlobStore, BlobStoreConfig, FsBackendConfig},
             metadata_store::LinkKind,
             path_builder,
             repository_resolver::RepositoryResolver,
             test_utils::{
                 FSRegistryTestCase, RegistryTestCase, backends, create_test_registry,
-                create_test_repositories, put_blob_direct,
+                create_test_repositories, locked_executor_over, metadata_store_over,
+                put_blob_direct,
             },
         },
         test_fixtures::configuration::load_config,
@@ -602,6 +633,11 @@ mod tests {
         /// Fail `write_upload`: must never run on the monolithic existing-blob
         /// path.
         WriteUpload,
+        /// Fail the blob-index grant-shard `put` (`.../refs/<ns>.json`),
+        /// simulating a crash of the self-grant write after the blob bytes have
+        /// been promoted to canonical. Every other `put` (blob bytes, intent
+        /// log, session artifacts) proceeds untouched.
+        GrantShardPut,
     }
 
     /// Delegating storage wrapper that injects a single failure at the storage
@@ -632,6 +668,11 @@ mod tests {
         }
 
         async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
+            // Only blob-index shard files live under a `/refs/` segment, so this
+            // matches the self-grant write without touching bytes or intent log.
+            if matches!(self.fail, FailOp::GrantShardPut) && key.contains("/refs/") {
+                return Err(fail("grant-shard put failed"));
+            }
             self.inner.put(key, data).await
         }
 
@@ -725,6 +766,38 @@ mod tests {
         });
         let facade = Arc::new(Store::builder(failing, inner.store.executor().clone()).build());
         Arc::new(BlobStore::new(facade))
+    }
+
+    /// A registry whose blob bytes land on a healthy FS backend but whose
+    /// blob-index grant-shard writes always fail (`FailOp::GrantShardPut`),
+    /// simulating a crash of the self-grant transaction after the bytes have
+    /// been promoted to canonical. Blob and metadata stores share one FS root
+    /// (as in `FSRegistryTestCase`) so a canonical blob and its would-be grant
+    /// shard address the same tree. Returns the registry and its `TempDir`
+    /// (kept alive for the test's duration).
+    fn grant_failing_registry() -> (Registry, TempDir) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().to_string_lossy().to_string();
+
+        let blob_config = BlobStoreConfig::FS(FsBackendConfig {
+            root_dir: path.clone(),
+            sync_to_disk: false,
+        });
+        let blob_store = Arc::new(blob_config.build_backend().expect("fs blob backend"));
+
+        // The grant is a metadata-store transaction whose shard `put` runs
+        // through the executor's own object store, so wrap that store (and the
+        // façade's) to fail the shard write while leaving the intent log and
+        // every read intact.
+        let failing_meta: Arc<dyn ObjectStore> = Arc::new(FailingStorage {
+            inner: Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build()),
+            fail: FailOp::GrantShardPut,
+        });
+        let meta_executor = locked_executor_over(failing_meta.clone());
+        let metadata_store = metadata_store_over(failing_meta, meta_executor);
+
+        let registry = create_test_registry(blob_store, metadata_store);
+        (registry, temp_dir)
     }
 
     #[tokio::test]
@@ -1168,7 +1241,7 @@ mod tests {
                 .into_parts();
             let mut reader = ClientIdentity::new(None);
             reader.id = Some("reader".to_string());
-            let stranger = ClientIdentity::new(None);
+            let unrecognized = ClientIdentity::new(None);
 
             for from in [Some(source.clone()), None] {
                 let mount = BlobMount {
@@ -1185,7 +1258,7 @@ mod tests {
                 );
                 assert!(
                     authorizer
-                        .authorize_mount_source(&mount, &stranger, &parts, registry)
+                        .authorize_mount_source(&mount, &unrecognized, &parts, registry)
                         .await
                         .unwrap()
                         .is_none(),
@@ -1364,6 +1437,171 @@ mod tests {
 
             test_case.cleanup().await;
         }
+    }
+
+    #[tokio::test]
+    async fn complete_upload_leaves_no_canonical_blob_without_a_grant() {
+        // Finalization invariant: after `complete_upload` returns, any blob
+        // whose bytes are canonical must carry a self-grant. The promotion and
+        // the grant are both written under `blob-data:{digest}`, so a reaper
+        // (which reaps `has_blob_references == false` under that same lock) can
+        // never observe the bytes without their reference.
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"finalization invariant body";
+            let session_id = UploadSessionId::generate();
+
+            registry
+                .blob_store
+                .create_upload(namespace, session_id.as_ref())
+                .await
+                .unwrap();
+            registry
+                .patch_upload(
+                    namespace,
+                    &session_id,
+                    None,
+                    Some(content.len() as u64),
+                    Cursor::new(content),
+                )
+                .await
+                .unwrap();
+
+            let digest = Digest::sha256_of_bytes(content);
+            registry
+                .complete_upload(
+                    None,
+                    namespace,
+                    &session_id,
+                    &digest,
+                    None,
+                    Some(0),
+                    Cursor::new(Vec::new()),
+                )
+                .await
+                .unwrap();
+
+            // Bytes are canonical.
+            assert!(registry.blob_store.size(&digest).await.is_ok());
+            // And so is the reference the reaper would consult.
+            assert!(
+                registry
+                    .metadata_store
+                    .has_blob_references(&digest)
+                    .await
+                    .unwrap(),
+                "a canonical blob must carry a reference after complete_upload"
+            );
+
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_upload_grant_failure_leaves_a_reapable_orphan_not_a_partial_grant() {
+        // Crash injection: the grant-shard write fails after the bytes have been
+        // promoted to canonical (the acceptable residue, since the bytes and
+        // the grant live in separate object stores and cannot share one
+        // crash-atomic transaction). The upload must surface an error, and the
+        // residue must be a TRUE orphan (canonical bytes, `has_blob_references ==
+        // false`), never a half-written grant. Such an orphan is what the sweep
+        // reclaims and what the client re-pushes; it is never mistaken for a
+        // live, referenced blob.
+        let (registry, _temp) = grant_failing_registry();
+        let namespace = &Namespace::new("test-repo").unwrap();
+        let content = b"grant-failure orphan body";
+        let session_id = UploadSessionId::generate();
+
+        registry
+            .blob_store
+            .create_upload(namespace, session_id.as_ref())
+            .await
+            .unwrap();
+        registry
+            .patch_upload(
+                namespace,
+                &session_id,
+                None,
+                Some(content.len() as u64),
+                Cursor::new(content),
+            )
+            .await
+            .unwrap();
+
+        let digest = Digest::sha256_of_bytes(content);
+        let result = registry
+            .complete_upload(
+                None,
+                namespace,
+                &session_id,
+                &digest,
+                None,
+                Some(0),
+                Cursor::new(Vec::new()),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a failed self-grant must fail the upload, not report success"
+        );
+        // The bytes were promoted to canonical (the grant fails only afterwards),
+        // so the residue is exactly a true orphan: canonical bytes with no
+        // reference. The promote-then-grant sequence is not crash-atomic across
+        // the two stores, but the failure never leaves a partial reference.
+        assert!(
+            registry.blob_store.size(&digest).await.is_ok(),
+            "the promoted bytes are canonical (the crash is after promotion)"
+        );
+        assert!(
+            !registry
+                .metadata_store
+                .has_blob_references(&digest)
+                .await
+                .unwrap(),
+            "a failed grant must never leave a partial reference"
+        );
+
+        // The orphan is re-pushable: a fresh upload now grants cleanly once the
+        // grant-shard write is healthy again.
+        let healthy = FSRegistryTestCase::new();
+        let healthy = healthy.registry();
+        let session_id = UploadSessionId::generate();
+        healthy
+            .blob_store
+            .create_upload(namespace, session_id.as_ref())
+            .await
+            .unwrap();
+        healthy
+            .patch_upload(
+                namespace,
+                &session_id,
+                None,
+                Some(content.len() as u64),
+                Cursor::new(content),
+            )
+            .await
+            .unwrap();
+        healthy
+            .complete_upload(
+                None,
+                namespace,
+                &session_id,
+                &digest,
+                None,
+                Some(0),
+                Cursor::new(Vec::new()),
+            )
+            .await
+            .expect("a re-push after a grant failure must succeed");
+        assert!(
+            healthy
+                .metadata_store
+                .has_blob_references(&digest)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

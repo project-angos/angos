@@ -5,13 +5,28 @@ use crate::registry::job_store::{
     ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore, Queue,
 };
 
+/// Whether one job run drove its job to successful completion. `Failed` covers a
+/// handler error, a commit fail-over (retry or dead-letter), and a lock lost
+/// mid-execution: in each case the job did not converge on this attempt. Callers
+/// that only need to know a job ran may ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobRunOutcome {
+    Succeeded,
+    Failed,
+}
+
 /// Execute one claimed job: observe the lock session's cancellation
 /// token alongside the handler future, then complete, fail (with retry
 /// or dead-letter), or abort on lock loss. The heartbeat is internal to
 /// the session held in `claimed.session`; it stops automatically when the
 /// session is consumed by `complete`/`fail` or dropped on the lock-lost
-/// branch.
-pub async fn execute_one(consumer: &JobStore, handler: &dyn JobHandler, claimed: ClaimedJob) {
+/// branch. Returns whether the job completed successfully so a one-shot
+/// drain can tell convergence from a failed push.
+pub async fn execute_one(
+    consumer: &JobStore,
+    handler: &dyn JobHandler,
+    claimed: ClaimedJob,
+) -> JobRunOutcome {
     let lock_key = claimed.envelope.lock_key.clone();
     let lock_lost = claimed.session.cancellation();
 
@@ -21,16 +36,27 @@ pub async fn execute_one(consumer: &JobStore, handler: &dyn JobHandler, claimed:
     };
 
     match handler_result {
-        None => warn!(lock_key, "Lock lost during execution; aborting"),
+        None => {
+            warn!(lock_key, "Lock lost during execution; aborting");
+            JobRunOutcome::Failed
+        }
         Some(Ok(tx)) => match consumer.complete(claimed, tx).await {
-            Ok(CompleteOutcome::Completed) => info!(lock_key, "Job completed successfully"),
+            Ok(CompleteOutcome::Completed) => {
+                info!(lock_key, "Job completed successfully");
+                JobRunOutcome::Succeeded
+            }
             Ok(CompleteOutcome::FailedOver(FailOutcome::Retried { next_at })) => {
                 warn!(lock_key, %next_at, "Commit failed; job scheduled for retry");
+                JobRunOutcome::Failed
             }
             Ok(CompleteOutcome::FailedOver(FailOutcome::MovedToDeadLetter)) => {
                 warn!(lock_key, "Commit failed; job moved to dead-letter");
+                JobRunOutcome::Failed
             }
-            Err(e) => error!(lock_key, error = %e, "Failed to complete or fail job"),
+            Err(e) => {
+                error!(lock_key, error = %e, "Failed to complete or fail job");
+                JobRunOutcome::Failed
+            }
         },
         Some(Err(err)) => {
             warn!(lock_key, error = %err, "Job handler returned error");
@@ -44,23 +70,22 @@ pub async fn execute_one(consumer: &JobStore, handler: &dyn JobHandler, claimed:
                 }
                 Err(e) => error!(lock_key, error = %e, "Failed to record job failure"),
             }
+            JobRunOutcome::Failed
         }
     }
 }
 
-/// Drive one full claim → execute → complete/fail cycle. Returns `true` when
-/// a job was processed and `false` when no claimable job remains.
+/// Drive one full claim → execute → complete/fail cycle. Returns `None` when no
+/// claimable job remains and `Some(outcome)` when a job ran, so a one-shot drain
+/// can tell a converged push from a failed one.
 pub async fn run_once(
     consumer: &JobStore,
     handler: &dyn JobHandler,
     queue: Queue,
-) -> Result<bool, Error> {
+) -> Result<Option<JobRunOutcome>, Error> {
     match consumer.claim_one(queue).await?.claimed {
-        None => Ok(false),
-        Some(claimed) => {
-            execute_one(consumer, handler, claimed).await;
-            Ok(true)
-        }
+        None => Ok(None),
+        Some(claimed) => Ok(Some(execute_one(consumer, handler, claimed).await)),
     }
 }
 
@@ -89,7 +114,7 @@ mod tests {
     };
 
     use crate::{
-        command::worker::runner::{execute_one, run_once},
+        command::worker::runner::{JobRunOutcome, execute_one, run_once},
         metrics_provider,
         registry::job_store::{ClaimedJob, Error, JobEnvelope, JobHandler, JobStore, Queue},
     };
@@ -100,6 +125,15 @@ mod tests {
     impl JobHandler for OkHandler {
         async fn execute(&self, _envelope: &JobEnvelope) -> Result<Transaction, Error> {
             Ok(Transaction::builder().build())
+        }
+    }
+
+    struct ErrHandler;
+
+    #[async_trait]
+    impl JobHandler for ErrHandler {
+        async fn execute(&self, _envelope: &JobEnvelope) -> Result<Transaction, Error> {
+            Err(Error::Initialization("handler failed".into()))
         }
     }
 
@@ -120,14 +154,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_once_returns_false_on_empty_queue() {
+    async fn run_once_returns_none_on_empty_queue() {
         metrics_provider::init_for_tests();
         let dir = TempDir::new().expect("temp dir");
         let store = make_store(&dir);
         let found = run_once(&store, &OkHandler, Queue::Cache)
             .await
             .expect("run_once");
-        assert!(!found, "empty queue must return false");
+        assert!(found.is_none(), "empty queue must return None");
     }
 
     #[tokio::test]
@@ -144,17 +178,45 @@ mod tests {
             .await
             .expect("enqueue");
 
-        assert!(
+        assert_eq!(
             run_once(&store, &OkHandler, Queue::Cache)
                 .await
                 .expect("run_once"),
-            "queue with one job must return true"
+            Some(JobRunOutcome::Succeeded),
+            "queue with one job must report the job succeeded"
         );
-        assert!(
-            !run_once(&store, &OkHandler, Queue::Cache)
+        assert_eq!(
+            run_once(&store, &OkHandler, Queue::Cache)
                 .await
                 .expect("run_once second call"),
+            None,
             "queue must be empty after job completes"
+        );
+    }
+
+    /// A handler that errors makes `run_once` report `Failed`, not `Succeeded`:
+    /// the failure signal must survive `consumer.fail`'s retry scheduling so a
+    /// one-shot drain can count the job as not converged.
+    #[tokio::test]
+    async fn run_once_reports_handler_failure() {
+        metrics_provider::init_for_tests();
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+
+        store
+            .enqueue(
+                JobEnvelope::new(Queue::Cache, "test.fail", "cache.ns:sha256:ddeeff", &())
+                    .expect("envelope"),
+            )
+            .await
+            .expect("enqueue");
+
+        assert_eq!(
+            run_once(&store, &ErrHandler, Queue::Cache)
+                .await
+                .expect("run_once"),
+            Some(JobRunOutcome::Failed),
+            "a failing handler must report the job failed, not processed"
         );
     }
 

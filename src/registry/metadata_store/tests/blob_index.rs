@@ -93,7 +93,7 @@ async fn test_tracked_link_creates_with_referrers() {
         descriptor: None,
     });
 
-    backend.update_links(&namespace, &ops).await.unwrap();
+    backend.seed_links(&namespace, &ops).await.unwrap();
 
     for layer_digest in &layer_digests {
         let link = LinkKind::Layer(layer_digest.clone());
@@ -149,7 +149,7 @@ async fn test_tracked_link_deletes_with_referrers() {
             descriptor: None,
         })
         .collect();
-    backend.update_links(&namespace, &create_ops).await.unwrap();
+    backend.seed_links(&namespace, &create_ops).await.unwrap();
 
     for d in &layer_digests {
         let link = LinkKind::Layer(d.clone());
@@ -165,6 +165,7 @@ async fn test_tracked_link_deletes_with_referrers() {
         .map(|d| LinkOperation::Delete {
             link: LinkKind::Layer(d.clone()),
             referrer: Some(referrer_digest.clone()),
+            expected_target: None,
         })
         .collect();
     backend.update_links(&namespace, &delete_ops).await.unwrap();
@@ -223,6 +224,7 @@ async fn test_mixed_creates_and_deletes_across_digests() {
         LinkOperation::Delete {
             link: LinkKind::Tag(Tag::new("remove-tag").unwrap()),
             referrer: None,
+            expected_target: None,
         },
         LinkOperation::Create {
             link: LinkKind::Tag(Tag::new("new-tag").unwrap()),
@@ -267,6 +269,83 @@ async fn test_mixed_creates_and_deletes_across_digests() {
         .await
         .unwrap();
     assert_eq!(new_meta.target, digest_add);
+}
+
+#[tokio::test]
+async fn test_delete_if_targets_keeps_concurrently_repointed_link() {
+    let config = test_config();
+    let backend = config.to_backend(None, None).unwrap();
+    let namespace = Namespace::new("delete-if-targets-guard-test").unwrap();
+
+    let digest_live =
+        Digest::from_str("sha256:ee00000000000000000000000000000000000000000000000000000000000001")
+            .unwrap();
+    let digest_other =
+        Digest::from_str("sha256:ee00000000000000000000000000000000000000000000000000000000000002")
+            .unwrap();
+    let tag = Tag::new("repointed-tag").unwrap();
+    let link = LinkKind::Tag(tag.clone());
+
+    let create_op = LinkOperation::Create {
+        link: link.clone(),
+        target: digest_live.clone(),
+        referrer: None,
+        media_type: None,
+        descriptor: None,
+    };
+    backend.update_links(&namespace, &[create_op]).await.unwrap();
+
+    // The cascade was planned against digest_other, but the live link now
+    // targets digest_live, so the guard must keep the re-pointed link.
+    let guarded_delete = LinkOperation::delete_if_targets(link.clone(), digest_other.clone());
+    backend
+        .update_links(&namespace, &[guarded_delete])
+        .await
+        .unwrap();
+
+    let meta = backend
+        .read_link_reference(&namespace, &link)
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.target, digest_live,
+        "link re-pointed away from the planned target must be preserved"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_if_targets_removes_matching_link() {
+    let config = test_config();
+    let backend = config.to_backend(None, None).unwrap();
+    let namespace = Namespace::new("delete-if-targets-match-test").unwrap();
+
+    let digest_live =
+        Digest::from_str("sha256:ef00000000000000000000000000000000000000000000000000000000000001")
+            .unwrap();
+    let tag = Tag::new("matching-tag").unwrap();
+    let link = LinkKind::Tag(tag.clone());
+
+    let create_op = LinkOperation::Create {
+        link: link.clone(),
+        target: digest_live.clone(),
+        referrer: None,
+        media_type: None,
+        descriptor: None,
+    };
+    backend.update_links(&namespace, &[create_op]).await.unwrap();
+
+    // The expected target matches the live link, so the delete proceeds.
+    let guarded_delete = LinkOperation::delete_if_targets(link.clone(), digest_live.clone());
+    backend
+        .update_links(&namespace, &[guarded_delete])
+        .await
+        .unwrap();
+
+    let result = backend.read_link_reference(&namespace, &link).await;
+    assert!(
+        matches!(result, Err(Error::ReferenceNotFound)),
+        "link whose target matches the guard must be deleted"
+    );
 }
 
 #[tokio::test]

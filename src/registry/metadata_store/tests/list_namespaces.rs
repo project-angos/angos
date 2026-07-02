@@ -5,14 +5,13 @@ use crate::{
     registry::{
         metadata_store::{LinkKind, LinkOperation},
         path_builder,
-        test_utils::{self, backends},
+        test_utils::{self, backends, put_blob_direct},
     },
 };
 
-/// The catalog is derived directly from stored content: a namespace appears in
-/// `list_namespaces` exactly when it holds at least one revision or tag (a
-/// `_manifests` child), and disappears once all of them are deleted, with no
-/// scrub or rebuild step in between.
+/// The catalog is content-derived: a namespace appears in `list_namespaces` when
+/// it holds a `_manifests` child and disappears once all are deleted, with no
+/// scrub or rebuild in between.
 #[tokio::test]
 async fn list_namespaces_is_derived_from_content() {
     for test_case in backends() {
@@ -28,8 +27,7 @@ async fn list_namespaces_is_derived_from_content() {
             "a namespace with content must appear in the catalog; got: {listed:?}"
         );
 
-        // Remove every revision and tag, the only `_manifests` content this
-        // namespace holds, with no scrub or rebuild call afterwards.
+        // Remove the only `_manifests` content, with no scrub or rebuild after.
         metadata_store
             .update_links(
                 namespace,
@@ -79,75 +77,6 @@ async fn list_namespaces_excludes_upload_only_namespace() {
     }
 }
 
-/// `list_upload_namespaces` keys off the `_uploads` child, the mirror of
-/// `list_namespaces` (which keys off `_manifests`), so an upload-only namespace
-/// surfaces here but not in the catalog, and a manifest-only one the converse.
-#[tokio::test]
-async fn list_upload_namespaces_keys_off_uploads_not_manifests() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let metadata_store = test_case.metadata_store();
-
-        let manifest_only = &Namespace::new("upload-marker/manifest-only").unwrap();
-        let upload_only = &Namespace::new("upload-marker/upload-only").unwrap();
-        let mixed = &Namespace::new("upload-marker/mixed").unwrap();
-
-        // Manifest-only: a `_manifests` child and no upload.
-        test_utils::create_test_blob(registry, manifest_only, b"manifest-only").await;
-
-        // Upload-only: an `_uploads` artifact and no manifest content.
-        let upload_only_path =
-            path_builder::upload_path(upload_only, &uuid::Uuid::new_v4().to_string());
-        metadata_store
-            .store()
-            .put(&upload_only_path, Bytes::from_static(b"partial"))
-            .await
-            .unwrap();
-
-        // Mixed: both a `_manifests` child and an `_uploads` artifact.
-        test_utils::create_test_blob(registry, mixed, b"mixed").await;
-        let mixed_upload_path = path_builder::upload_path(mixed, &uuid::Uuid::new_v4().to_string());
-        metadata_store
-            .store()
-            .put(&mixed_upload_path, Bytes::from_static(b"partial"))
-            .await
-            .unwrap();
-
-        let (upload_listed, _) = metadata_store
-            .list_upload_namespaces(1000, None)
-            .await
-            .unwrap();
-        assert!(
-            upload_listed.contains(&upload_only.to_string()),
-            "an upload-only namespace must appear in list_upload_namespaces; got: {upload_listed:?}"
-        );
-        assert!(
-            upload_listed.contains(&mixed.to_string()),
-            "a namespace with an upload must appear in list_upload_namespaces; got: {upload_listed:?}"
-        );
-        assert!(
-            !upload_listed.contains(&manifest_only.to_string()),
-            "a manifest-only namespace must not appear in list_upload_namespaces; got: {upload_listed:?}"
-        );
-
-        let (manifest_listed, _) = metadata_store.list_namespaces(1000, None).await.unwrap();
-        assert!(
-            manifest_listed.contains(&manifest_only.to_string()),
-            "a manifest-only namespace must appear in the catalog; got: {manifest_listed:?}"
-        );
-        assert!(
-            manifest_listed.contains(&mixed.to_string()),
-            "a namespace with content must appear in the catalog; got: {manifest_listed:?}"
-        );
-        assert!(
-            !manifest_listed.contains(&upload_only.to_string()),
-            "an upload-only namespace must not appear in the catalog; got: {manifest_listed:?}"
-        );
-
-        test_case.cleanup().await;
-    }
-}
-
 /// `scrub` prunes the dead pre-1.3 namespace-registry index objects under
 /// `_registry/`, and the prune is idempotent.
 #[tokio::test]
@@ -179,6 +108,84 @@ async fn delete_legacy_namespace_registry_prunes_dead_index() {
             .delete_legacy_namespace_registry()
             .await
             .expect("prune is idempotent");
+
+        test_case.cleanup().await;
+    }
+}
+
+/// `collect_all_namespaces` unions every registry subtree (manifest-only,
+/// upload-only, layer/config-only all appear) in sorted order, while
+/// `list_namespaces` still excludes the upload-only and layer/config-only ones.
+#[tokio::test]
+async fn collect_all_namespaces_unions_every_subtree() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let metadata_store = test_case.metadata_store();
+
+        let manifest_only = &Namespace::new("list-all/manifest-only").unwrap();
+        let upload_only = &Namespace::new("list-all/upload-only").unwrap();
+        let link_only = &Namespace::new("list-all/link-only").unwrap();
+
+        // Manifest-only: a tag + layer via the normal content path (`_manifests`).
+        test_utils::create_test_blob(registry, manifest_only, b"manifest-only").await;
+
+        // Upload-only: an `_uploads` artifact and nothing else.
+        let upload_path = path_builder::upload_path(upload_only, &uuid::Uuid::new_v4().to_string());
+        metadata_store
+            .store()
+            .put(&upload_path, Bytes::from_static(b"partial"))
+            .await
+            .unwrap();
+
+        // Layer/config-only: a layer and a config link, but no tag or revision,
+        // so the namespace holds `_layers` and `_config` but no `_manifests`.
+        let layer_digest = put_blob_direct(metadata_store.store(), b"layer-only-bytes").await;
+        let config_digest = put_blob_direct(metadata_store.store(), b"config-only-bytes").await;
+        metadata_store
+            .update_links(
+                link_only,
+                &[
+                    LinkOperation::create(
+                        LinkKind::Layer(layer_digest.clone()),
+                        layer_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Config(config_digest.clone()),
+                        config_digest.clone(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The walk-once collector sees every subtree's namespace, sorted.
+        let collected = metadata_store.collect_all_namespaces().await.unwrap();
+        for ns in [manifest_only, upload_only, link_only] {
+            assert!(
+                collected.contains(&ns.to_string()),
+                "collect_all_namespaces must union every subtree; '{ns}' missing"
+            );
+        }
+        assert!(
+            collected.windows(2).all(|pair| pair[0] <= pair[1]),
+            "collect_all_namespaces must return sorted names; got {collected:?}"
+        );
+
+        // The catalog (unchanged) keys off `_manifests`: only the manifest-only
+        // namespace qualifies; the upload-only and link-only ones are excluded.
+        let (catalog, _) = metadata_store.list_namespaces(1000, None).await.unwrap();
+        assert!(
+            catalog.contains(&manifest_only.to_string()),
+            "list_namespaces must still include the manifest-only ns; got {catalog:?}"
+        );
+        assert!(
+            !catalog.contains(&upload_only.to_string()),
+            "list_namespaces must still EXCLUDE the upload-only ns; got {catalog:?}"
+        );
+        assert!(
+            !catalog.contains(&link_only.to_string()),
+            "list_namespaces must still EXCLUDE the layer/config-only ns; got {catalog:?}"
+        );
 
         test_case.cleanup().await;
     }

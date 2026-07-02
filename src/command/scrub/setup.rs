@@ -1,16 +1,14 @@
 use std::sync::Arc;
 
 use chrono::Duration;
-use tracing::{info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use crate::{
     command::scrub::{
         check::{
-            BlobChecker, BlobIndexChecker, DigestLinkChecker, LayoutChecker, LinkReferencesChecker,
-            ManifestChecker, MediaTypeChecker, MultipartChecker, NamespaceChecker,
-            OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue,
-            ReferrerChecker, ReplicationChecker, RetentionChecker, StoreChecker, TagChecker,
-            UploadChecker,
+            JobChecker, MultipartChecker, NamespaceChecker, OrphanJobChecker, OrphanQueue,
+            ReplicationChecker, RetentionChecker, UploadChecker,
         },
         command::Options,
         error::Error,
@@ -23,10 +21,6 @@ use crate::{
     },
 };
 
-/// Store-wide checkers paired with a stable label used to name a failing checker
-/// in the scrub log.
-pub type LabeledStoreCheckers = Vec<(&'static str, Box<dyn StoreChecker>)>;
-
 fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
     if config.rules.is_empty() {
         return None;
@@ -38,6 +32,9 @@ fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Retenti
     )))
 }
 
+/// Build the per-namespace checkers for the enabled flags shared across `scrub`,
+/// `policy`, and `replication`. The scrub-only rebuild is built in scrub's
+/// `Command::new`, not here.
 pub fn namespace_checkers(
     options: &Options,
     config: &Configuration,
@@ -69,38 +66,6 @@ pub fn namespace_checkers(
         )));
     }
 
-    if options.manifests {
-        checkers.push(Box::new(ManifestChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )));
-    }
-
-    if options.links {
-        checkers.push(Box::new(LinkReferencesChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )));
-    }
-
-    if options.reconcile_blob_index {
-        checkers.push(Box::new(BlobIndexChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )));
-    }
-
-    if options.media_types {
-        checkers.push(Box::new(MediaTypeChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )));
-    }
-
-    if options.referrers {
-        checkers.push(Box::new(ReferrerChecker::new(metadata_store.clone())));
-    }
-
     if options.replicate {
         checkers.push(Box::new(ReplicationChecker::new(
             metadata_store.clone(),
@@ -109,36 +74,6 @@ pub fn namespace_checkers(
     }
 
     Ok(checkers)
-}
-
-/// The per-tag checkers enabled by `--tags`, or `None` when tag scrubbing is off
-/// (which also disables the invalid-tag gate). Driven by the tag walk in
-/// `Command::scrub_metadata`.
-pub fn tag_checkers(
-    options: &Options,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-) -> Option<Vec<Box<dyn TagChecker>>> {
-    options.tags.then(|| {
-        vec![Box::new(DigestLinkChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )) as Box<dyn TagChecker>]
-    })
-}
-
-pub fn layout_checker(blob_store: &Arc<BlobStore>) -> LayoutChecker {
-    LayoutChecker::new(blob_store.clone())
-}
-
-pub fn blob_checker(
-    options: &Options,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-) -> Option<BlobChecker> {
-    options
-        .blobs
-        .then(|| BlobChecker::new(blob_store.clone(), metadata_store.clone()))
 }
 
 pub fn multipart_checker(
@@ -160,58 +95,34 @@ pub fn multipart_checker(
     )))
 }
 
-pub fn orphan_grant_checker(
+/// Builds the structural `--jobs` checker, or `None` when the flag is off. It
+/// reconciles through the `JobStore`'s own conditional transactions (not the
+/// action sink), so its gate is `!commit` rather than the sink selection.
+/// `--prune-unknown` gates the unknown-queue removal on top of that; `grace`
+/// is the operator's maintenance grace (an unknown queue directory may belong
+/// to a newer replica, so it must stay quiescent that long before removal).
+pub fn job_checker(
     options: &Options,
-    blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
-) -> Result<Option<OrphanGrantChecker>, Error> {
-    let Some(min_age) = options.orphan_grants else {
-        return Ok(None);
-    };
-    let min_age = Duration::from_std(min_age.into())
-        .map_err(|e| Error::Initialization(format!("Orphan-grant age is invalid: {e}")))?;
-    info!(
-        "Orphan blob-grant minimum age set to {} second(s)",
-        min_age.num_seconds()
-    );
-    Ok(Some(OrphanGrantChecker::new(
-        blob_store.clone(),
-        metadata_store.clone(),
-        min_age,
-    )))
-}
-
-/// Builds the `--orphan-namespaces` checker, or `None` (with a warning) when no
-/// repositories are configured, since the flag must never wipe the whole registry.
-pub fn orphan_namespace_checker(
-    options: &Options,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    resolver: &Arc<RepositoryResolver>,
-) -> Option<OrphanNamespaceChecker> {
-    if !options.orphan_namespaces {
+    grace: Duration,
+    cancel: CancellationToken,
+) -> Option<JobChecker> {
+    if !options.jobs {
         return None;
     }
-    if resolver.len() == 0 {
-        warn!(
-            "scrub --orphan-namespaces: no repositories configured; refusing to delete every namespace"
-        );
-        return None;
-    }
-    info!(
-        "Orphan-namespace clearing enabled for {} configured repositories",
-        resolver.len()
-    );
-    Some(OrphanNamespaceChecker::new(
-        blob_store.clone(),
-        metadata_store.clone(),
-        resolver.clone(),
+    let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), ""));
+    Some(JobChecker::new(
+        job_store,
+        !options.commit,
+        options.prune_unknown,
+        grace,
+        cancel,
     ))
 }
 
 /// Builds one orphan-job checker per queue selected by `--replication-orphans`
-/// and `--cache-orphans`. The `JobStore` handle is read-only here (the executor
-/// deletes through its own), so the consumer id is irrelevant and left empty.
+/// and `--cache-orphans`. The `JobStore` handle is read-only here, so the
+/// consumer id is left empty.
 pub fn orphan_job_checkers(
     options: &Options,
     metadata_store: &Arc<MetadataStore>,
@@ -234,44 +145,127 @@ pub fn orphan_job_checkers(
         .collect()
 }
 
-/// Build the enabled store-wide checkers in the order [`super::command`] must
-/// apply them: orphan-namespace clearing first (its link deletions free manifest
-/// bytes the blob checker then reclaims), then blob / orphan-grant / multipart
-/// reclamation, and finally the orphan-job sweep, which must precede the
-/// replication drain. Each is included only when its flag is set, and paired with
-/// a stable label so a failing checker can be named in the scrub log.
-pub fn store_checkers(
-    options: &Options,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    resolver: &Arc<RepositoryResolver>,
-) -> Result<LabeledStoreCheckers, Error> {
-    let mut checkers: LabeledStoreCheckers = Vec::new();
-    if let Some(checker) = orphan_namespace_checker(options, blob_store, metadata_store, resolver) {
-        checkers.push(("orphan-namespaces", Box::new(checker)));
-    }
-    if let Some(checker) = blob_checker(options, blob_store, metadata_store) {
-        checkers.push(("blobs", Box::new(checker)));
-    }
-    if let Some(checker) = orphan_grant_checker(options, blob_store, metadata_store)? {
-        checkers.push(("orphan-grants", Box::new(checker)));
-    }
-    if let Some(checker) = multipart_checker(options, blob_store)? {
-        checkers.push(("multipart", Box::new(checker)));
-    }
-    for checker in orphan_job_checkers(options, metadata_store, resolver) {
-        checkers.push(("orphan-jobs", Box::new(checker)));
-    }
-    Ok(checkers)
-}
-
 #[cfg(test)]
 mod tests {
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_tx_engine::store::Store;
+    use serde_json::json;
+    use tempfile::TempDir;
+
     use super::*;
-    use crate::policy::CelRule;
+    use crate::{
+        command::scrub::{check::StoreChecker, executor::DryRunSink},
+        metrics_provider,
+        policy::CelRule,
+        registry::{
+            job_store::{JobEnvelope, Queue},
+            test_utils::{build_store, build_test_fs_executor},
+        },
+    };
 
     fn rule(s: &str) -> CelRule {
         CelRule::compile(s).unwrap()
+    }
+
+    /// FS-backed metadata store plus its raw `Store`, so a test can plant and
+    /// inspect the dangling lock-key index directly.
+    fn fs_store() -> (Arc<MetadataStore>, Arc<Store>, TempDir) {
+        metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build(),
+        );
+        (metadata_store, store, dir)
+    }
+
+    /// Enqueue a cache job then delete its pending envelope out-of-band, leaving a
+    /// dangling lock-key index the `--jobs` reconcile would retire.
+    async fn plant_dangling_lock_key_index(metadata_store: &Arc<MetadataStore>, store: &Store) {
+        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "jobs-test"));
+        let envelope = JobEnvelope::new(
+            Queue::Cache,
+            "cache.fetch_blob",
+            "cache.ns/app",
+            &json!({ "namespace": "ns/app", "digest": "sha256:abc" }),
+        )
+        .unwrap();
+        job_store.enqueue(envelope).await.unwrap();
+        let keys = job_store.list_pending(Queue::Cache, 10).await.unwrap();
+        store
+            .delete(&format!("_jobs/pending/cache/{}.json", keys[0]))
+            .await
+            .unwrap();
+    }
+
+    async fn remaining_lock_key_indexes(metadata_store: &Arc<MetadataStore>) -> usize {
+        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "probe"));
+        job_store
+            .list_lock_key_index_keys(Queue::Cache)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// `scrub --jobs` without `--commit` is report-only: the reconcile mutates
+    /// through the `JobStore`, so its gate rides `--commit` and the dangling index
+    /// survives.
+    #[tokio::test]
+    async fn job_checker_report_only_leaves_dangling_index() {
+        let (metadata_store, store, _dir) = fs_store();
+        plant_dangling_lock_key_index(&metadata_store, &store).await;
+
+        let options = Options {
+            jobs: true,
+            ..Default::default()
+        };
+        let checker = job_checker(
+            &options,
+            &metadata_store,
+            Duration::hours(24),
+            CancellationToken::new(),
+        )
+        .expect("--jobs builds a checker");
+        checker.check_all(&mut (DryRunSink)).await.unwrap();
+
+        assert_eq!(
+            remaining_lock_key_indexes(&metadata_store).await,
+            1,
+            "report-only --jobs (no --commit) must leave the dangling lock-key index in place"
+        );
+    }
+
+    /// `scrub --jobs --commit` retires the dangling lock-key index.
+    #[tokio::test]
+    async fn job_checker_commit_retires_dangling_index() {
+        let (metadata_store, store, _dir) = fs_store();
+        plant_dangling_lock_key_index(&metadata_store, &store).await;
+
+        let options = Options {
+            jobs: true,
+            commit: true,
+            ..Default::default()
+        };
+        let checker = job_checker(
+            &options,
+            &metadata_store,
+            Duration::hours(24),
+            CancellationToken::new(),
+        )
+        .expect("--jobs builds a checker");
+        checker.check_all(&mut (DryRunSink)).await.unwrap();
+
+        assert_eq!(
+            remaining_lock_key_indexes(&metadata_store).await,
+            0,
+            "--jobs --commit must retire the dangling lock-key index"
+        );
     }
 
     #[test]

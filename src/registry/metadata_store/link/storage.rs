@@ -47,10 +47,9 @@ impl MetadataStore {
         Ok(data)
     }
 
-    /// Like [`Self::read_link`] but records the link's access time: deferred via
-    /// the debounce writer when configured, else stamped inline with a
-    /// read-modify-write. The manifest pull path uses this when pull-time
-    /// tracking is enabled.
+    /// Like [`Self::read_link`] but records the access time: deferred via the
+    /// debounce writer when configured, else stamped inline. Used by the manifest
+    /// pull path when pull-time tracking is enabled.
     #[instrument(skip(self))]
     pub async fn read_link_recording_access(
         &self,
@@ -67,10 +66,9 @@ impl MetadataStore {
         Ok(link_data)
     }
 
-    /// Mark the access time for `link` in `namespace` using a read-modify-write
-    /// transaction, returning the updated [`LinkMetadata`]. Concurrent updaters
-    /// resolve via content-hash conflict detection (last writer wins), which is
-    /// fine for advisory access-time stamps.
+    /// Stamp the access time for `link` via a read-modify-write, returning the
+    /// updated [`LinkMetadata`]. Concurrent updaters resolve last-writer-wins,
+    /// fine for advisory stamps.
     async fn update_link_access_time(
         &self,
         namespace: &Namespace,

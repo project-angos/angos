@@ -204,6 +204,7 @@ async fn test_update_links_invalidates_cache_on_delete() {
     let ops = vec![LinkOperation::Delete {
         link: tag.clone(),
         referrer: None,
+        expected_target: None,
     }];
     backend.update_links(&namespace, &ops).await.unwrap();
 

@@ -15,7 +15,7 @@ Set up automated cleanup of old container images using CEL-based retention polic
 
 ## How Retention Works
 
-Retention policies define which images to **keep**. Images not matching any rule are eligible for deletion when running `scrub --retention`.
+Retention policies define which images to **keep**. Images not matching any rule are eligible for deletion when running `angos policy --retention`.
 
 ```mermaid
 sequenceDiagram
@@ -198,22 +198,41 @@ Result: Production images kept for 365 days, others for 7 days.
 
 ## Enforcing Retention Policies
 
-Retention policies are enforced by the `scrub` command with the `--retention` flag:
+Retention policies are enforced by the `angos policy` command with the `--retention` flag (`scrub --retention` is a deprecated alias):
 
 ```bash
 # Preview what would be deleted
-./angos -c config.toml scrub --retention --dry-run
+./angos -c config.toml policy --retention --dry-run
 
 # Enforce retention policies
-./angos -c config.toml scrub --retention
+./angos -c config.toml policy --retention
 ```
 
 ### Scheduled Enforcement
 
-**Cron:**
-```bash
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub --retention
+**Systemd timer:**
+```ini
+# /etc/systemd/system/angos-retention.service
+[Unit]
+Description=angos retention enforcement
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/angos -c /etc/registry/config.toml policy --retention
 ```
+```ini
+# /etc/systemd/system/angos-retention.timer
+[Unit]
+Description=Enforce retention daily at 03:00
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+Enable with `systemctl enable --now angos-retention.timer`.
 
 **Kubernetes CronJob:**
 ```yaml
@@ -228,9 +247,9 @@ spec:
       template:
         spec:
           containers:
-            - name: scrub
+            - name: policy
               image: ghcr.io/project-angos/angos:latest
-              args: ["-c", "/config/config.toml", "scrub", "--retention"]
+              args: ["-c", "/config/config.toml", "policy", "--retention"]
               volumeMounts:
                 - name: config
                   mountPath: /config
@@ -249,7 +268,7 @@ spec:
 ### Check What Would Be Deleted
 
 ```bash
-RUST_LOG=info ./angos scrub --retention --dry-run
+RUST_LOG=info ./angos policy --retention --dry-run
 ```
 
 ### List Current Manifests
@@ -279,7 +298,7 @@ WARN retention rule 2 returned non-boolean value: Int(42); treating as 'retain' 
 WARN retention rule 3 evaluation failed: no such key: nonexistent_var; treating as 'retain' (fail-open)
 ```
 
-Fix the offending rule and re-run `scrub --retention --dry-run` to verify the corrected behaviour before running without `--dry-run`.
+Fix the offending rule and re-run `policy --retention --dry-run` to verify the corrected behaviour before running without `--dry-run`.
 
 ---
 
@@ -288,7 +307,7 @@ Fix the offending rule and re-run `scrub --retention --dry-run` to verify the co
 **Images not being deleted:**
 - Check if they match any retention rule
 - Check if they're protected (index child or has referrers)
-- Verify `scrub` command is running
+- Verify the `angos policy --retention` job is running
 
 **Pull time not tracked:**
 - Enable `update_pull_time = true` in global config
@@ -301,4 +320,4 @@ Fix the offending rule and re-run `scrub --retention --dry-run` to verify the co
 ## Reference
 
 - [CEL Expressions Reference](../reference/cel-expressions.md) - Retention variables and functions
-- [CLI Reference](../reference/cli.md) - scrub command details
+- [CLI Reference](../reference/cli.md) - policy and scrub command details

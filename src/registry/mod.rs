@@ -15,10 +15,11 @@ mod event_emission_tests;
 mod ext;
 mod headers;
 pub mod job_store;
+pub mod key_classifier;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;
-mod path_builder;
+pub mod path_builder;
 pub mod repository;
 pub mod repository_resolver;
 pub mod s3_connection;
@@ -40,11 +41,8 @@ pub const OCI_SUBJECT: &str = "OCI-Subject";
 pub const OCI_TAG: &str = "OCI-Tag";
 pub const APPLICATION_JSON: &str = "application/json";
 
-/// Response for endpoints whose body is a JSON (or JSON-flavoured) payload.
-///
-/// The registry is the sole authority on both the headers (Content-Type,
-/// Link, OCI-Filters-Applied, ...) and the serialized body bytes. Handlers
-/// attach the headers verbatim and pass the body through.
+/// Response for endpoints whose body is a JSON payload. The registry owns both
+/// the headers and the serialized body; handlers pass them through verbatim.
 pub struct JsonResponse {
     pub headers: HashMap<&'static str, String>,
     pub body: Vec<u8>,
@@ -79,26 +77,19 @@ pub struct RegistryConfig {
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
     pub max_blob_size_bytes: u64,
-    /// When `true`, a client manifest push is rejected with
-    /// `MANIFEST_BLOB_UNKNOWN` if any referenced blob or child manifest is not
-    /// present and owned by the target namespace. When `false`, the push is
-    /// accepted but the unowned references are left dangling rather than granted,
-    /// so they resolve as unknown on a later pull and a namespace never gains
-    /// read access to content it did not push. `subject` references are exempt
-    /// either way. Pull-through cache-fill writes are always trusted, independent
-    /// of this flag.
+    /// When `true`, a manifest push is rejected with `MANIFEST_BLOB_UNKNOWN` if a
+    /// referenced blob or child manifest is not owned by the target namespace.
+    /// When `false`, unowned references are left dangling rather than granted.
+    /// `subject` references are exempt; cache-fill writes are always trusted.
     pub validate_manifest_references: bool,
-    /// When set, the registry routes all cache-fill and replication jobs through
-    /// this pre-built queue (typically the durable backend wired in `server setup`).
-    /// When absent, an engine-backed in-process queue is constructed
-    /// automatically. The choice is made once at startup; no runtime switching.
+    /// When set, all cache-fill and replication jobs route through this pre-built
+    /// queue; when absent, an in-process queue is built. Chosen once at startup.
     pub job_queue: Option<Arc<JobStore>>,
-    /// Number of in-process cache-fill jobs that may run in parallel. Only
-    /// consulted when `job_queue` is `None`; durable deployments use the
-    /// equivalent worker-side setting instead.
+    /// Parallel in-process cache-fill jobs; consulted only when `job_queue` is
+    /// `None`.
     pub max_concurrent_cache_jobs: NonZeroUsize,
-    /// Parallel in-process replication-push jobs. Only consulted when
-    /// `job_queue` is `None`; durable deployments use `angos worker` instead.
+    /// Parallel in-process replication-push jobs; consulted only when `job_queue`
+    /// is `None`.
     pub max_concurrent_replication_jobs: NonZeroUsize,
 }
 
@@ -112,9 +103,9 @@ impl Default for RegistryConfig {
             global_immutable_tags_exclusions: Vec::new(),
             max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             max_blob_size_bytes: upload::DEFAULT_MAX_BLOB_SIZE_BYTES,
-            // Strict by default at the struct level so test/internal registries
-            // built from `RegistryConfig::default()` keep validating; the server
-            // opts into the permissive production default via `[global]`.
+            // Strict by default so registries built from
+            // `RegistryConfig::default()` validate; the server opts into the
+            // permissive default via `[global]`.
             validate_manifest_references: true,
             job_queue: None,
             max_concurrent_cache_jobs: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
@@ -189,9 +180,8 @@ pub struct Registry {
     enable_manifest_redirect: bool,
     update_pull_time: bool,
     job_queue: Arc<JobStore>,
-    /// Cancels the in-process claim loops when this `Registry` is dropped.
-    /// `None` when a durable `[global.job_queue]` is configured (no in-process
-    /// loops to cancel).
+    /// Cancels the in-process claim loops on drop; `None` when a durable
+    /// `[global.job_queue]` is configured.
     in_process_shutdown: Option<CancellationToken>,
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
@@ -265,25 +255,18 @@ impl Registry {
         self.resolver.resolve(namespace).ok_or(Error::NameUnknown)
     }
 
-    /// Resolves the configured repository name for a namespace, or empty string
-    /// if none matches. Used when constructing events where the event's
-    /// `repository` field should reflect the configured repository scope.
+    /// The configured repository name for a namespace, or empty string if none
+    /// matches. Used to stamp an event's `repository` field.
     pub fn repository_name_for(&self, namespace: &Namespace) -> String {
         self.get_repository_for_namespace(namespace)
             .map(|r| r.name.to_string())
             .unwrap_or_default()
     }
 
-    /// Acquire the coarse `blob-data:{digest}` lock that serialises blob-data
-    /// creation (upload completion) against reclamation (unreferenced delete)
-    /// and against concurrent manifest pushes, which declare the same coarse
-    /// lock on their link transactions. Without it, a delete can reclaim a
-    /// content-addressed blob's bytes in the window between another repository
-    /// granting a reference and validating its manifest, surfacing as
-    /// `ManifestBlobUnknown`.
-    ///
-    /// Delegates to [`MetadataStore::acquire_blob_data_lock`], the canonical
-    /// home for the key string and the lock domain (the metadata executor).
+    /// Acquire the coarse `blob-data:{digest}` lock serialising blob-data
+    /// creation against reclamation and concurrent manifest pushes. Delegates to
+    /// [`MetadataStore::acquire_blob_data_lock`], which owns the key and lock
+    /// domain.
     pub async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockSession, Error> {
         self.metadata_store
             .acquire_blob_data_lock(digest)
@@ -293,10 +276,8 @@ impl Registry {
 }
 
 /// Construct the in-process job queue used when `[global.job_queue]` is absent.
-///
-/// Sharing the registry's store backend is required: cache-fill commits and
-/// replication reads only resolve against the store holding the bytes, and
-/// jobs persisted under its `_jobs/` prefix survive restarts.
+/// Shares the registry's store backend so cache-fill commits and replication
+/// reads resolve against the store holding the bytes, and jobs survive restarts.
 fn build_in_process_queue(
     resolver: &Arc<RepositoryResolver>,
     blob_store: &Arc<BlobStore>,
@@ -304,13 +285,9 @@ fn build_in_process_queue(
     cache_concurrency: NonZeroUsize,
     replication_concurrency: NonZeroUsize,
 ) -> (Arc<JobStore>, CancellationToken) {
-    // Share the registry's object store and transaction executor (the same
-    // handle the blob/metadata stores use). The cache-fill handler stages bytes
-    // into the blob store and returns a transaction that moves them into
-    // blob-data and grants metadata references; that transaction must commit
-    // against the backend where the bytes were staged. A private object store
-    // here would make those mutations fail with `NotFound`
-    // (see doc/reviews/20260603-in-process-cache-fill-broken.md).
+    // Share the registry's object store and executor: the cache-fill handler
+    // returns a transaction that must commit against the backend where its bytes
+    // were staged, so a private store here would fail those mutations.
     let store = Arc::clone(&blob_store.store);
     let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "in-process"));
 
@@ -320,18 +297,13 @@ fn build_in_process_queue(
         metadata_store.clone(),
     ));
 
-    // Drain replication only when a downstream is configured: with none, the
-    // queue stays empty forever, so its loops would just storm the object store
-    // with `LIST`s. (Replication jobs left from a removed downstream are reaped
-    // by `scrub --replication-orphans`, not drained here.) Build the fallible
-    // handler before spawning any loop so an error cannot leak a cache loop.
+    // Drain replication only when a downstream is configured; otherwise the loops
+    // would storm the object store with `LIST`s over an always-empty queue.
     let any_downstream = resolver
         .keys()
         .filter_map(|name| resolver.get(name))
         .any(|repository| !repository.replication.is_empty());
     let replication_handler: Option<Arc<dyn JobHandler>> = if any_downstream {
-        // Mesh cycles terminate: only state-changing writes dispatch, and
-        // receiver-side no-op suppression stops any remaining replays.
         Some(Arc::new(ReplicationJobHandler::new(
             resolver.clone(),
             blob_store.clone(),
@@ -341,7 +313,6 @@ fn build_in_process_queue(
         None
     };
 
-    // One shared token cancels every loop when the owning `Registry` is dropped.
     let shutdown = CancellationToken::new();
 
     for _ in 0..cache_concurrency.get() {
@@ -367,21 +338,16 @@ fn build_in_process_queue(
     (job_store, shutdown)
 }
 
-/// Idle poll interval for the in-process claim loops. Production polls once a
-/// second (matching the durable `angos worker`) so an empty queue does not
-/// storm the object store with `LIST`s; tests poll fast so the suite stays
-/// snappy.
+/// Idle poll interval for the in-process claim loops. Production matches the
+/// durable `angos worker`; tests poll fast.
 #[cfg(not(test))]
 const IN_PROCESS_IDLE_POLL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const IN_PROCESS_IDLE_POLL: Duration = Duration::from_millis(10);
 
-/// Single claim-loop task for the in-process pool. Mirrors the per-worker
-/// loop in `command::worker::command::Command::run`, idling at
-/// [`IN_PROCESS_IDLE_POLL`]. `handler` must be the handler bound to `queue`.
-///
-/// Cancellation races only the claim, so an already-claimed job runs to
-/// completion rather than being interrupted mid-execute.
+/// One claim-loop task for the in-process pool, idling at
+/// [`IN_PROCESS_IDLE_POLL`]. `handler` must be bound to `queue`. Cancellation
+/// races only the claim, so an already-claimed job runs to completion.
 async fn in_process_claim_loop(
     consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
@@ -397,7 +363,9 @@ async fn in_process_claim_loop(
                 Ok(claim_outcome) => match claim_outcome.claimed {
                     None => sleep(claim_outcome.idle_sleep(IN_PROCESS_IDLE_POLL)).await,
                     Some(claimed) => {
-                        execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
+                        // The in-process pool keeps retrying; a per-job failure
+                        // is logged inside `execute_one`, not surfaced here.
+                        let _ = execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
                     }
                 },
             },
@@ -407,8 +375,8 @@ async fn in_process_claim_loop(
 
 impl Drop for Registry {
     fn drop(&mut self) {
-        // Claim loops hold their own `Arc<JobStore>` clones, so only cancelling
-        // the token stops them; leased durable jobs are re-claimed after restart.
+        // Claim loops hold their own `Arc<JobStore>` clones, so only the token
+        // cancel stops them.
         if let Some(shutdown) = &self.in_process_shutdown {
             shutdown.cancel();
         }

@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ impl LinkKind {
 }
 
 impl Display for LinkKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             LinkKind::Blob(d) => write!(f, "blob:{d}"),
             LinkKind::Tag(s) => write!(f, "tag:{s}"),

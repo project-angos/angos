@@ -2,12 +2,13 @@ use std::{str::FromStr, sync::Arc};
 
 use angos_s3_client as s3_client;
 use angos_storage::s3::Backend as StorageS3Backend;
+use angos_tx_engine::StorageError;
 
 use super::{legacy_blob_index_with, put_legacy_index, test_config};
 use crate::{
     oci::{Digest, Namespace, Tag},
     registry::{
-        metadata_store::{BlobIndex, BlobIndexOperation, LinkKind, MetadataStore},
+        metadata_store::{BlobIndexOperation, LinkKind, MetadataStore},
         path_builder,
         test_utils::{locked_executor_over, metadata_store_over},
     },
@@ -18,10 +19,11 @@ fn make_backend(storage: Arc<StorageS3Backend>) -> Arc<MetadataStore> {
     metadata_store_over(storage.clone(), locked_executor_over(storage))
 }
 
-/// Verify that a blob-index update applies the operation correctly to a legacy
-/// `index.json` file when one is present.
+/// Verify that a blob-index update on a digest still carrying a legacy
+/// `index.json` drains the legacy file into the per-namespace shard rather than
+/// routing the write back into it.
 #[tokio::test]
-async fn test_update_blob_index_legacy_applies_correctly() {
+async fn test_update_blob_index_drains_legacy() {
     let config = test_config();
 
     let http = s3_client::Backend::new(&config.connection.to_client_config()).unwrap();
@@ -47,25 +49,30 @@ async fn test_update_blob_index_legacy_applies_correctly() {
         .await
         .unwrap();
 
-    // Verify the legacy file picked up the new link.
-    let raw = backend
-        .store()
-        .get(&path_builder::blob_index_path(&digest))
+    // The shard holds both the folded legacy seed and the new link.
+    let links = backend
+        .read_blob_index_namespace(&namespace, &digest)
         .await
         .unwrap();
-    let stored: BlobIndex = serde_json::from_slice(&raw).unwrap();
-    let links = stored
-        .namespace
-        .get(&namespace)
-        .expect("namespace must still be present in legacy file");
     assert!(
         links.contains(&seed_link),
-        "seed link must remain after legacy update"
+        "seed link must fold into the shard"
     );
     assert!(
         links.contains(&new_link),
-        "new link must be present in legacy file after update"
+        "new link must be written to the shard"
     );
+
+    // The legacy file is drained, not updated in place.
+    match backend
+        .store()
+        .get(&path_builder::blob_index_path(&digest))
+        .await
+    {
+        Err(StorageError::NotFound) => {}
+        Ok(_) => panic!("legacy file must be drained after the update"),
+        Err(e) => panic!("unexpected error checking legacy path: {e}"),
+    }
 
     backend
         .store()

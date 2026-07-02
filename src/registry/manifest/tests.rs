@@ -1,23 +1,46 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::future::join_all;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
+
+use angos_storage::{
+    BoxedReader, ByteStream, ChildrenPage, Error as StorageError, MemoryObjectStore,
+    MultipartUploadPage, ObjectMeta, ObjectStore, Page,
+};
+use angos_tx_engine::{
+    executor::{TransactionExecutor, locked::LockedExecutor},
+    lock::{
+        primitive::Lock,
+        storage::{LockStorage, memory::MemoryLockStorage},
+    },
+};
 
 use super::{parse::manifest_meta_from_body, *};
 use crate::{
-    command::server::Error as ServerError,
+    command::{scrub::executor::remove_stale_grant_locked, server::Error as ServerError},
     event_webhook::event::EventKind,
     oci::{Algorithm, MediaType, Namespace, Tag, UploadSessionId},
     registry::{
         Error, OCI_TAG, Registry,
-        metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
+        blob_store::BlobStore,
+        metadata_store::{
+            self, BlobIndexOperation, LinkKind, LinkMetadata, LinkOperation, blob_data_lock_key,
+        },
+        path_builder,
         path_builder::blob_path,
         test_utils::{
-            FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct, put_link_raw,
+            FSRegistryTestCase, RegistryTestCase, backends, build_store, create_test_registry,
+            metadata_store_over, put_blob_direct, put_link_raw,
         },
     },
     replication::REPLICATION_SUPERSEDED_CODE,
@@ -989,10 +1012,6 @@ async fn test_delete_manifest() {
 /// still points at it (conformance `MANIFEST_BLOB_UNKNOWN`).
 #[tokio::test]
 async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
-    use std::time::Duration;
-
-    use tokio::time::sleep;
-
     use crate::registry::blob_ownership::BlobOwnership;
 
     for test_case in backends() {
@@ -1141,6 +1160,513 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
         assert!(registry.blob_store.read(&config_digest).await.is_err());
         test_case.cleanup().await;
     }
+}
+
+/// Seed the stale-grant crash artifact the sweep's stale-grant pass targets:
+/// layer bytes present, the namespace's shard grants `Layer(digest)`, the link
+/// file absent. HEAD-based dedupe answers 200 from exactly this state.
+async fn seed_stale_layer_grant(
+    registry: &Registry,
+    namespace: &Namespace,
+    layer_content: &[u8],
+) -> Digest {
+    let layer_digest = put_blob_direct(registry.metadata_store.store(), layer_content).await;
+    registry
+        .metadata_store
+        .update_blob_index(
+            namespace,
+            &layer_digest,
+            BlobIndexOperation::Insert(LinkKind::Layer(layer_digest.clone())),
+        )
+        .await
+        .unwrap();
+    layer_digest
+}
+
+/// Reaper-first order of the stale-grant race: after the reap removed the
+/// grant and reclaimed the bytes, a push referencing the layer validates under
+/// `blob-data:{layer}`, fails `MANIFEST_BLOB_UNKNOWN` (the client re-uploads),
+/// and re-creates nothing.
+#[tokio::test]
+async fn push_after_stale_grant_reap_fails_blob_unknown_and_recreates_nothing() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/reaper-first").unwrap();
+        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+        let layer_content = b"stale-granted layer bytes";
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let layer_digest = seed_stale_layer_grant(registry, namespace, layer_content).await;
+
+        remove_stale_grant_locked(
+            &registry.metadata_store,
+            &registry.blob_store,
+            namespace,
+            &layer_digest,
+            &LinkKind::Layer(layer_digest.clone()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            registry.blob_store.read(&layer_digest).await.is_err(),
+            "the reap must have reclaimed the stale-granted bytes"
+        );
+
+        let (content, media_type) = manifest_with_references(
+            &config_digest,
+            config_content.len(),
+            &layer_digest,
+            layer_content.len(),
+        );
+        let result = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::ManifestBlobUnknown)),
+            "a push referencing the reaped layer must fail MANIFEST_BLOB_UNKNOWN"
+        );
+
+        assert!(
+            !registry
+                .metadata_store
+                .has_blob_references(&layer_digest)
+                .await
+                .unwrap(),
+            "the failed push must not re-create the reaped grant"
+        );
+        assert!(
+            registry
+                .metadata_store
+                .read_link(namespace, &LinkKind::Tag(Tag::new("latest").unwrap()))
+                .await
+                .is_err(),
+            "the failed push must not leave a tag link"
+        );
+        test_case.cleanup().await;
+    }
+}
+
+/// Push-first order of the stale-grant race: the push re-creates the layer
+/// link under `blob-data:{layer}` (discovered by the planner's refusal), so
+/// the reap's under-lock link re-check keeps the grant and the bytes.
+#[tokio::test]
+async fn stale_grant_reap_after_push_keeps_grant_and_bytes() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/push-first").unwrap();
+        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+        let layer_content = b"re-linked layer bytes";
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let layer_digest = seed_stale_layer_grant(registry, namespace, layer_content).await;
+
+        // HEAD-dedupe path: the stale grant answers ownership, the bytes exist,
+        // so the client skips the upload and pushes the manifest directly.
+        let (content, media_type) = manifest_with_references(
+            &config_digest,
+            config_content.len(),
+            &layer_digest,
+            layer_content.len(),
+        );
+        registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+            .unwrap();
+
+        // The sweep applies its pre-push "link absent" classification: the
+        // under-lock re-read sees the link the push committed and keeps all.
+        remove_stale_grant_locked(
+            &registry.metadata_store,
+            &registry.blob_store,
+            namespace,
+            &layer_digest,
+            &LinkKind::Layer(layer_digest.clone()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            registry.blob_store.read(&layer_digest).await.unwrap(),
+            layer_content,
+            "the pushed layer's bytes must survive the raced reap"
+        );
+        let link = registry
+            .metadata_store
+            .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
+            .await
+            .unwrap();
+        assert_eq!(link.target, layer_digest);
+        assert!(
+            registry
+                .metadata_store
+                .has_blob_references(&layer_digest)
+                .await
+                .unwrap(),
+            "the grant must survive the raced reap"
+        );
+        test_case.cleanup().await;
+    }
+}
+
+/// A push inserting a tracked grant serializes on `blob-data:{layer}`: while
+/// the lock is held the push cannot commit, and after release it completes
+/// with the link and grant in place.
+#[tokio::test]
+async fn push_grant_insert_waits_for_the_layer_blob_data_lock() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/insert-lock").unwrap();
+        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+        let layer_content = b"lock-serialized layer bytes";
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let layer_digest = upload_blob(registry, namespace, layer_content).await;
+        let (content, media_type) = manifest_with_references(
+            &config_digest,
+            config_content.len(),
+            &layer_digest,
+            layer_content.len(),
+        );
+
+        let session = registry
+            .acquire_blob_data_lock(&layer_digest)
+            .await
+            .unwrap();
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let push = registry.put_manifest(namespace, &reference, Some(&media_type), &content);
+        tokio::pin!(push);
+        tokio::select! {
+            result = &mut push => {
+                panic!(
+                    "push committed its grant insert while blob-data was held (ok={})",
+                    result.is_ok()
+                );
+            }
+            () = sleep(Duration::from_millis(25)) => {}
+        }
+        session.release().await;
+        push.await.unwrap();
+
+        let link = registry
+            .metadata_store
+            .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
+            .await
+            .unwrap();
+        assert_eq!(link.target, layer_digest);
+        let links = registry
+            .metadata_store
+            .read_blob_index_namespace(namespace, &layer_digest)
+            .await
+            .unwrap();
+        assert!(links.contains(&LinkKind::Layer(layer_digest.clone())));
+        test_case.cleanup().await;
+    }
+}
+
+/// The bounded lock-discovery loop converges under link churn: attempt 1
+/// discovers the absent config and layer-A links, and a layer-B link deleted
+/// while the push waits for those locks is re-discovered and committed under
+/// the enlarged lock set on the next attempt.
+#[tokio::test]
+async fn push_lock_discovery_converges_when_a_link_vanishes_between_attempts() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/churn").unwrap();
+        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let layer_a = upload_blob(registry, namespace, b"churn layer a").await;
+        let layer_b = upload_blob(registry, namespace, b"churn layer b").await;
+        // Layer B starts with a live link, so the first attempt discovers only
+        // the config and layer-A inserts.
+        registry
+            .metadata_store
+            .update_links(
+                namespace,
+                &[LinkOperation::create(
+                    LinkKind::Layer(layer_b.clone()),
+                    layer_b.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let media_type = MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap();
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": CONFIG_MEDIA_TYPE,
+                "digest": config_digest,
+                "size": config_content.len()
+            },
+            "layers": [
+                {
+                    "mediaType": LAYER_MEDIA_TYPE,
+                    "digest": layer_a,
+                    "size": b"churn layer a".len()
+                },
+                {
+                    "mediaType": LAYER_MEDIA_TYPE,
+                    "digest": layer_b,
+                    "size": b"churn layer b".len()
+                }
+            ]
+        });
+        let content = serde_json::to_vec(&manifest).unwrap();
+
+        // Holding blob-data:{A} parks the push between its discovery attempt
+        // and its committing attempt.
+        let session = registry.acquire_blob_data_lock(&layer_a).await.unwrap();
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let push = registry.put_manifest(namespace, &reference, Some(&media_type), &content);
+        tokio::pin!(push);
+        tokio::select! {
+            result = &mut push => {
+                panic!("push committed while blob-data was held (ok={})", result.is_ok());
+            }
+            () = sleep(Duration::from_millis(50)) => {}
+        }
+        // Delete layer B's link while the push waits, so the insert set
+        // discovered on the first attempt is stale when the next one re-reads.
+        registry
+            .metadata_store
+            .store()
+            .delete(&path_builder::link_path(
+                &LinkKind::Layer(layer_b.clone()),
+                namespace,
+            ))
+            .await
+            .unwrap();
+        session.release().await;
+        push.await.unwrap();
+
+        for layer in [&layer_a, &layer_b] {
+            let link = registry
+                .metadata_store
+                .read_link(namespace, &LinkKind::Layer((*layer).clone()))
+                .await
+                .unwrap();
+            assert_eq!(&link.target, layer);
+            let links = registry
+                .metadata_store
+                .read_blob_index_namespace(namespace, layer)
+                .await
+                .unwrap();
+            assert!(
+                links.contains(&LinkKind::Layer((*layer).clone())),
+                "the re-discovered layer grant must be committed"
+            );
+        }
+        test_case.cleanup().await;
+    }
+}
+
+/// `delete_manifest(M1)` racing `push(M2)` over a shared layer: the delete's
+/// pre-planned operations name M1 as the only referrer, but the transaction
+/// validates against the live link, so M2's referrer merge survives and the
+/// shared layer keeps its grant and bytes.
+#[tokio::test]
+async fn delete_manifest_racing_push_preserves_shared_layer_referrer_merge() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/shared-layer").unwrap();
+        let layer_content = b"shared layer bytes";
+        let config1 = br#"{"architecture":"amd64","os":"linux"}"#;
+        let config2 = br#"{"architecture":"arm64","os":"linux"}"#;
+        let layer_digest = upload_blob(registry, namespace, layer_content).await;
+        let config1_digest = upload_blob(registry, namespace, config1).await;
+        let config2_digest = upload_blob(registry, namespace, config2).await;
+
+        let (m1_content, media_type) = manifest_with_references(
+            &config1_digest,
+            config1.len(),
+            &layer_digest,
+            layer_content.len(),
+        );
+        let response = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag(Tag::new("m1").unwrap()),
+                Some(&media_type),
+                &m1_content,
+            )
+            .await
+            .unwrap();
+        let m1_digest = header_digest(&response.headers);
+
+        // Park the delete after it planned its link operations (still naming
+        // M1 as the layer's only referrer) by holding blob-data:{M1}.
+        let session = registry.acquire_blob_data_lock(&m1_digest).await.unwrap();
+        let reference = Reference::Digest(m1_digest.clone());
+        let delete = registry.delete_manifest(None, None, namespace, &reference);
+        tokio::pin!(delete);
+        tokio::select! {
+            result = &mut delete => {
+                panic!("delete finished while blob-data was held (ok={})", result.is_ok());
+            }
+            () = sleep(Duration::from_millis(25)) => {}
+        }
+
+        // The racing push lands M2's referrer merge on the shared layer link.
+        let (m2_content, _) = manifest_with_references(
+            &config2_digest,
+            config2.len(),
+            &layer_digest,
+            layer_content.len(),
+        );
+        let response = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag(Tag::new("m2").unwrap()),
+                Some(&media_type),
+                &m2_content,
+            )
+            .await
+            .unwrap();
+        let m2_digest = header_digest(&response.headers);
+
+        session.release().await;
+        delete.await.unwrap();
+
+        // M2's merge survives: the shared layer link, its grant, and its bytes.
+        let link = registry
+            .metadata_store
+            .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
+            .await
+            .unwrap();
+        assert!(
+            link.referenced_by.contains(&m2_digest),
+            "M2's referrer merge must survive the raced delete"
+        );
+        assert!(
+            !link.referenced_by.contains(&m1_digest),
+            "M1's referrer must be pruned by its delete"
+        );
+        assert!(
+            registry
+                .metadata_store
+                .has_blob_references(&layer_digest)
+                .await
+                .unwrap(),
+            "the shared layer grant must survive"
+        );
+        assert_eq!(
+            registry.blob_store.read(&layer_digest).await.unwrap(),
+            layer_content
+        );
+        // M1 itself is gone: revision link removed and its bytes reclaimed.
+        assert!(
+            registry
+                .metadata_store
+                .read_link(namespace, &LinkKind::Digest(m1_digest.clone()))
+                .await
+                .is_err()
+        );
+        assert!(registry.blob_store.read(&m1_digest).await.is_err());
+        test_case.cleanup().await;
+    }
+}
+
+/// Lock-loss fence: when the blob-data session is stolen mid-delete, the
+/// reclaim aborts before the byte delete (a concurrent grant may have
+/// committed unseen). The link removal itself may commit; that residue is
+/// keep-direction and the sweep reaps true orphans.
+#[tokio::test(start_paused = true)]
+async fn delete_manifest_reclaim_aborts_when_blob_data_lock_is_lost() {
+    // A hand-built registry whose metadata lock storage the test can reach, so
+    // it can steal the blob-data lock object mid-operation.
+    let lock_storage = Arc::new(MemoryLockStorage::new());
+    let lock = Arc::new(Lock::builder(lock_storage.clone()).build().unwrap());
+    let object: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+    let executor: Arc<dyn TransactionExecutor> =
+        Arc::new(LockedExecutor::builder(object.clone(), lock.clone()).build());
+    let blob_store = Arc::new(BlobStore::new(build_store(
+        object.clone(),
+        executor.clone(),
+    )));
+    let metadata_store = metadata_store_over(object, executor);
+    let registry = create_test_registry(blob_store.clone(), metadata_store);
+
+    let namespace = &Namespace::new("test-repo/fence").unwrap();
+    let media_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
+    let content = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": media_type,
+    }))
+    .unwrap();
+    let response = registry
+        .put_manifest(
+            namespace,
+            &Reference::Tag(Tag::new("latest").unwrap()),
+            Some(&media_type),
+            &content,
+        )
+        .await
+        .unwrap();
+    let digest = header_digest(&response.headers);
+
+    // Park the delete's link transaction on one of its engine keys so its
+    // blob-data session stays held across a heartbeat tick.
+    let parked = lock
+        .acquire(&[path_builder::link_path(
+            &LinkKind::Digest(digest.clone()),
+            namespace,
+        )])
+        .await
+        .unwrap();
+
+    let reference = Reference::Digest(digest.clone());
+    let delete = registry.delete_manifest(None, None, namespace, &reference);
+    tokio::pin!(delete);
+
+    // Drive the delete until it holds blob-data:{digest} and is parked.
+    let lock_key = blob_data_lock_key(&digest);
+    while lock_storage.get_with_etag(&lock_key).await.is_err() {
+        tokio::select! {
+            result = &mut delete => {
+                panic!("delete finished while parked (ok={})", result.is_ok());
+            }
+            () = sleep(Duration::from_millis(10)) => {}
+        }
+    }
+
+    // Steal the lock: rewriting the object rotates its version, so the
+    // holder's next heartbeat refresh mismatches and fires its cancellation.
+    let (body, etag, _) = lock_storage.get_with_etag(&lock_key).await.unwrap();
+    lock_storage
+        .put_if_match(&lock_key, &etag.unwrap(), body)
+        .await
+        .unwrap();
+
+    // One heartbeat tick later (ttl/3, virtual time) the loss is observed.
+    tokio::select! {
+        result = &mut delete => {
+            panic!("delete finished before the heartbeat tick (ok={})", result.is_ok());
+        }
+        () = sleep(Duration::from_secs(11)) => {}
+    }
+    parked.release().await;
+
+    let Err(err) = delete.await else {
+        panic!("a reclaim whose blob-data lock was stolen must abort")
+    };
+    assert!(
+        err.to_string().contains("lock invalidated"),
+        "the abort must come from the lock-loss fence, got: {err}"
+    );
+    assert!(
+        blob_store.read(&digest).await.is_ok(),
+        "the manifest bytes must survive a reclaim whose lock was stolen"
+    );
 }
 
 #[tokio::test]
@@ -2657,6 +3183,7 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
             &namespace,
             &[LinkOperation::create(link.clone(), old_digest.clone())],
             None,
+            &HashSet::new(),
         )
         .await
         .expect("seed the tag and warm the cache");
@@ -2710,6 +3237,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
             &namespace,
             &[LinkOperation::create(link.clone(), newer_digest.clone())],
             Some(newer_ts),
+            &HashSet::new(),
         )
         .await
         .expect("seed the newer replicated write");
@@ -2721,6 +3249,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
             &namespace,
             &[LinkOperation::create(link.clone(), older_digest.clone())],
             Some(newer_ts - chrono::Duration::hours(1)),
+            &HashSet::new(),
         )
         .await
         .err();
@@ -2759,6 +3288,7 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
             &namespace,
             &[LinkOperation::create(link.clone(), digest.clone())],
             Some(newer_ts),
+            &HashSet::new(),
         )
         .await
         .expect("seed the newer tag");
@@ -3246,6 +3776,147 @@ async fn replication_superseded_maps_to_distinct_oci_code() {
     assert_ne!(
         superseded_json["errors"][0]["code"],
         conflict_json["errors"][0]["code"]
+    );
+}
+
+/// An `ObjectStore` wrapper recording how many `put`s land on each key, so a
+/// test can assert the manifest body is uploaded once across the commit loop's
+/// discovery re-attempts.
+struct PutCountingStore {
+    inner: Arc<dyn ObjectStore>,
+    puts: Mutex<HashMap<String, u64>>,
+}
+
+impl PutCountingStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            puts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn puts_for(&self, key: &str) -> u64 {
+        self.puts.lock().unwrap().get(key).copied().unwrap_or(0)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PutCountingStore {
+    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.get(key).await
+    }
+    async fn get_stream(
+        &self,
+        key: &str,
+        offset: Option<u64>,
+    ) -> Result<(BoxedReader, u64), StorageError> {
+        self.inner.get_stream(key, offset).await
+    }
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
+        *self.puts.lock().unwrap().entry(key.to_string()).or_insert(0) += 1;
+        self.inner.put(key, data).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.inner.delete(key).await
+    }
+    async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
+        self.inner.delete_prefix(prefix).await
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+        self.inner.head(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+    ) -> Result<Page<String>, StorageError> {
+        self.inner.list(prefix, n, token).await
+    }
+    async fn list_children(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+        start_after: Option<String>,
+    ) -> Result<ChildrenPage, StorageError> {
+        self.inner
+            .list_children(prefix, n, token, start_after)
+            .await
+    }
+    async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
+        self.inner.copy(source, destination).await
+    }
+    async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
+        self.inner.create_upload(key).await
+    }
+    async fn write_upload(
+        &self,
+        key: &str,
+        body: ByteStream,
+        len: Option<u64>,
+    ) -> Result<u64, StorageError> {
+        self.inner.write_upload(key, body, len).await
+    }
+    async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
+        self.inner.complete_upload(key).await
+    }
+    async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
+        self.inner.abort_upload(key).await
+    }
+    async fn list_multipart_uploads(
+        &self,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+    ) -> Result<MultipartUploadPage, StorageError> {
+        self.inner
+            .list_multipart_uploads(key_marker, upload_id_marker)
+            .await
+    }
+}
+
+/// A normal image-manifest push uploads the manifest body once even though the
+/// commit loop re-attempts after its config/layer tracked-grant inserts are
+/// refused on the first pass (only the manifest digest is locked then). The
+/// presence check skips the re-upload; before it, the second attempt re-wrote
+/// the identical body.
+#[tokio::test]
+async fn manifest_body_is_uploaded_once_across_discovery_reattempts() {
+    let counting = Arc::new(PutCountingStore::new(Arc::new(MemoryObjectStore::new())));
+    let object: Arc<dyn ObjectStore> = counting.clone();
+    let lock = Arc::new(
+        Lock::builder(Arc::new(MemoryLockStorage::new()))
+            .build()
+            .unwrap(),
+    );
+    let executor: Arc<dyn TransactionExecutor> =
+        Arc::new(LockedExecutor::builder(object.clone(), lock).build());
+    let blob_store = Arc::new(BlobStore::new(build_store(object.clone(), executor.clone())));
+    let metadata_store = metadata_store_over(object, executor);
+    let registry = create_test_registry(blob_store, metadata_store);
+
+    let namespace = &Namespace::new("test-repo").unwrap();
+    // Owned config + layer so the strict push validates and its tracked grant
+    // inserts drive the needs_locks re-attempt.
+    let (content, media_type) = create_test_manifest(&registry, namespace).await;
+    let digest = Digest::sha256_of_bytes(&content);
+    let manifest_key = blob_path(&digest);
+    assert_eq!(counting.puts_for(&manifest_key), 0, "body not yet written");
+
+    registry
+        .put_manifest(
+            namespace,
+            &Reference::Tag(Tag::new("latest").unwrap()),
+            Some(&media_type),
+            &content,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        counting.puts_for(&manifest_key),
+        1,
+        "the manifest body must be uploaded once, not re-uploaded on the discovery re-attempt"
     );
 }
 

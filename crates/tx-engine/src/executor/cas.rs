@@ -18,6 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::future::join_all;
 use sha2::{Digest as _, Sha256};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -113,15 +114,14 @@ impl CasExecutor {
     /// Verify the read set, capturing each present read key's live etag and
     /// each key a read confirmed absent.
     ///
-    /// Re-reads every read key, checks the content fingerprint recorded at
-    /// build time (returning [`Error::Conflict`] on mismatch or if a
-    /// present-expecting key has vanished). The etags let the caller turn a
+    /// Re-reads every read key concurrently, checking the content fingerprint
+    /// recorded at build time (returning [`Error::Conflict`] on mismatch or if
+    /// a present-expecting key has vanished). The etags let the caller turn a
     /// same-key write into a compare-and-swap; the absent set lets it turn a
     /// same-key write into a `PutIfAbsent` so the absence precondition holds
     /// through Apply, not just Prepare.
     async fn prepare_reads(&self, tx: &Transaction) -> Result<PreparedReads, Error> {
-        let mut prepared = PreparedReads::default();
-        for read in &tx.reads {
+        let verified = join_all(tx.reads.iter().map(|read| async move {
             match self.store.get_with_etag(&read.key).await {
                 Ok((body, etag)) => {
                     let actual: [u8; 32] = Sha256::digest(&body).into();
@@ -132,18 +132,31 @@ impl CasExecutor {
                         );
                         return Err(Error::Conflict);
                     }
-                    if let Some(etag) = etag {
-                        prepared.etags.insert(read.key.clone(), etag);
-                    }
+                    Ok(VerifiedRead::Present(etag))
                 }
                 Err(StorageError::NotFound) => {
                     // An absent key matches only a read that recorded absence.
-                    if !read.expects_absent() {
-                        return Err(Error::Conflict);
+                    if read.expects_absent() {
+                        Ok(VerifiedRead::Absent)
+                    } else {
+                        Err(Error::Conflict)
                     }
+                }
+                Err(e) => Err(Error::Storage(e)),
+            }
+        }))
+        .await;
+
+        let mut prepared = PreparedReads::default();
+        for (read, verified) in tx.reads.iter().zip(verified) {
+            match verified? {
+                VerifiedRead::Present(Some(etag)) => {
+                    prepared.etags.insert(read.key.clone(), etag);
+                }
+                VerifiedRead::Present(None) => {}
+                VerifiedRead::Absent => {
                     prepared.absent.insert(read.key.clone());
                 }
-                Err(e) => return Err(Error::Storage(e)),
             }
         }
         Ok(prepared)
@@ -224,6 +237,12 @@ impl CasExecutor {
 struct PreparedReads {
     etags: HashMap<String, Etag>,
     absent: HashSet<String>,
+}
+
+/// Outcome of one Prepare-phase read verification.
+enum VerifiedRead {
+    Present(Option<Etag>),
+    Absent,
 }
 
 /// Promote same-key read-modify-write mutations to conditional writes and order

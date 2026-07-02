@@ -22,6 +22,9 @@ use crate::{
     },
 };
 
+/// Tag-listing page size for the retention scan.
+const TAG_LIST_PAGE: u16 = 1000;
+
 struct TagWithMetadata {
     name: Tag,
     metadata: LinkMetadata,
@@ -95,19 +98,14 @@ fn check_repo_policy(
 
 #[derive(Debug, PartialEq, Eq)]
 enum Fate {
-    /// Manifest is protected by another reference, has tags, or its link
-    /// metadata is missing: leave it alone.
+    /// Protected, tagged, or missing metadata: leave it alone.
     Skip,
-    /// Retention policy says to keep this manifest.
     Retain,
-    /// Retention policy says to delete this manifest.
     Delete,
 }
 
-/// Pure decision over pre-loaded inputs: should this orphan manifest be skipped,
-/// retained, or deleted? The caller is responsible for fetching `is_protected`,
-/// `has_tags`, and `metadata` and for resolving the relevant `Repository` /
-/// global policy from the checker's state.
+/// Pure decision over pre-loaded inputs. The caller fetches `is_protected`,
+/// `has_tags`, and `metadata` and resolves the relevant policies.
 fn decide_orphan_fate(
     is_protected: bool,
     has_tags: bool,
@@ -165,7 +163,9 @@ impl NamespaceChecker for RetentionChecker {
         debug!("Checking retention policies on '{namespace}'");
 
         let tag_names = collect_all_pages(|marker| async move {
-            self.metadata_store.list_tags(namespace, 1000, marker).await
+            self.metadata_store
+                .list_tags(namespace, TAG_LIST_PAGE, marker)
+                .await
         })
         .await
         .map_err(Error::from)?;
@@ -533,8 +533,6 @@ mod tests {
             .unwrap();
     }
 
-    // --- rank_by ---
-
     #[test]
     fn rank_by_sorts_descending_by_key() {
         let t1 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
@@ -569,8 +567,6 @@ mod tests {
         assert!(ranked.contains(&"alpha".to_string()));
         assert!(ranked.contains(&"beta".to_string()));
     }
-
-    // --- build_sorted_rankings ---
 
     #[test]
     fn build_sorted_rankings_pushed_order() {
@@ -905,7 +901,7 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            // First revision: write blob, then delete it so the executor encounters a missing blob.
+            // First revision: delete its blob so the executor hits a missing blob.
             let digest_missing = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
             metadata_store
                 .update_links(
@@ -919,7 +915,7 @@ mod tests {
                 .unwrap();
             blob_store.delete_blob(&digest_missing).await.unwrap();
 
-            // Second revision: healthy manifest blob with a digest link.
+            // Second revision: healthy manifest blob.
             let digest_healthy = put_blob_direct(metadata_store.store(), TEST_INDEX).await;
             metadata_store
                 .update_links(
@@ -949,7 +945,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            // The healthy revision must be cleaned up: the broken one did not block the loop.
+            // The healthy revision must still be processed after the broken one.
             assert!(
                 metadata_store
                     .read_link(&namespace, &LinkKind::Digest(digest_healthy))

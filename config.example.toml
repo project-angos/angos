@@ -17,7 +17,10 @@ client_auth = "required"
 [global]
 max_concurrent_requests = 4
 max_concurrent_cache_jobs = 4
-max_concurrent_replication_jobs = 4   # replication-job concurrency for angos worker, the in-process drain, and the scrub --replicate drain (must be > 0)
+max_concurrent_replication_jobs = 4   # replication-job concurrency for angos worker, the in-process drain, and the `angos replication` drain (must be > 0)
+max_concurrent_scrub_tasks = 16       # per-node fan-out for the scrub / policy / replication DAG: how many namespaces are enumerated in-flight at once (must be > 0, capped at 1024)
+maintenance_lock_max_hold_secs = 86400 # maximum wall-clock one maintenance run (scrub / policy / replication) may hold the shared maintenance lock before it self-cancels; size above your worst-case scrub duration (must be > 0)
+maintenance_grace_secs = 172800       # maintenance grace: how long an object must have been quiescent before a scrub GC category may reap it (0 disables the grace)
 update_pull_time = false
 
 # Maximum total size of a single blob upload (default 100GiB, must be > 0). A
@@ -126,10 +129,10 @@ password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w" # te
 # issuer = "https://auth.example.com"
 # discovery_url = "https://auth.example.com/.well-known/openid-configuration"
 
-# Event webhooks -- notify external systems on registry operations
+# Event webhooks: notify external systems on registry operations
 # Define webhooks with [event_webhook.<name>], then reference them in global or repository config.
 
-# Audit log -- must succeed before client gets a response
+# Audit log: must succeed before client gets a response
 #[event_webhook.audit]
 #url = "https://audit.example.com/events"
 #policy = "required"
@@ -138,14 +141,14 @@ password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w" # te
 #timeout_ms = 3000
 #max_retries = 2
 
-# Slack notifications -- best effort
+# Slack notifications: best effort
 #[event_webhook.slack]
 #url = "https://hooks.slack.com/services/T.../B.../xxx"
 #policy = "optional"
 #events = ["manifest.push", "tag.create"]
 #timeout_ms = 3000
 
-# Analytics -- fire and forget
+# Analytics: fire and forget
 #[event_webhook.analytics]
 #url = "https://analytics.internal/ingest"
 #policy = "async"
@@ -165,7 +168,7 @@ default = "allow"
 
 # Optional: Replicate this repository to one or more downstream registries.
 # Each downstream mirrors local mutations (manifest push, manifest/tag
-# delete) and/or is reconciled by `angos scrub --replicate`. Declare one
+# delete) and/or is reconciled by `angos replication`. Declare one
 # array-of-tables entry per downstream (shape mirrors [[repository.X.upstream]]).
 #[[repository."nginx".downstream]]
 #name = "eu-region"                    # local identifier for this downstream
@@ -177,7 +180,7 @@ default = "allow"
 #mode = "event+reconcile"              # "event+reconcile" | "event-only" | "reconcile-only"
 #namespace_filter = ["^nginx/.*"]      # optional list of regex patterns; empty = match all
 #max_concurrent_pushes = 4             # optional; per-manifest blob fan-out for this downstream (positive integer, default 4)
-#prune = false                         # if true, scrub --replicate DELETES downstream tags absent locally
+#prune = false                         # if true, `angos replication` DELETES downstream tags absent locally
                                        # (authoritative one-way mirror only; leave false for active-active peers)
 # Optional mTLS to the downstream (both required together):
 #server_ca_bundle = "tls.d/downstream-ca-bundle.pem"

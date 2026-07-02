@@ -47,18 +47,18 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (pos
 
 ### Modes
 
-| Mode | Live pushes on mutation | Included in `scrub --replicate` |
+| Mode | Live pushes on mutation | Included in `angos replication` |
 |------|-------------------------|---------------------------------|
 | `event+reconcile` | Yes | Yes |
 | `event-only` | Yes | No |
 | `reconcile-only` | No | Yes |
 
 :::note Removing or renaming a downstream
-Pending jobs for a removed or renamed downstream fail loudly and dead-letter after their retry budget. Clear them with `angos scrub --replication-orphans` (use `--dry-run` to preview), or inspect them via the jobs admin UI or the [`_jobs` API](../reference/api-endpoints.md#list-failed-jobs) (`?queue=replication`).
+Pending jobs for a removed or renamed downstream fail loudly and dead-letter after their retry budget. Clear them with `angos scrub --replication-orphans --commit` (omit `--commit` to preview), or inspect them via the jobs admin UI or the [`_jobs` API](../reference/api-endpoints.md#list-failed-jobs) (`?queue=replication`).
 :::
 
 :::note Reclaiming stranded blobs on a receiver
-When a replicated manifest push uploads a blob but its manifest then loses last-writer-wins or dead-letters, the receiver keeps the blob's per-namespace ownership grant with no manifest referencing it, pinning the bytes. `angos scrub --orphan-grants <age>` (e.g. `24h`) revokes such grants once the blob is older than the given age and reclaims the bytes; the age gate avoids racing an in-flight push.
+When a replicated manifest push uploads a blob but its manifest then loses last-writer-wins or dead-letters, the receiver keeps the blob's per-namespace ownership grant with no manifest referencing it, pinning the bytes. `angos scrub --commit` revokes such a bare self-grant once it is older than the maintenance grace (`maintenance_grace_secs`, default 48h) and reclaims the bytes when it was the last reference; an explicit `DELETE /v2/<name>/blobs/<digest>` reclaims immediately. If the whole receiving namespace is no longer a configured repository, the config-ownership sweep (`angos scrub --commit`) deletes it, grants included.
 :::
 
 ## Fan out into sibling repositories
@@ -89,7 +89,7 @@ One `[global]` field tunes replication across all repositories:
 max_concurrent_replication_jobs = 4                # worker concurrency for replication jobs (must be > 0)
 ```
 
-- `max_concurrent_replication_jobs` bounds how many replication jobs are handled in parallel by each `angos worker`, the server's in-process drain, and the `scrub --replicate` end-of-run drain. Default `4`; must be greater than zero.
+- `max_concurrent_replication_jobs` bounds how many replication jobs are handled in parallel by each `angos worker`, the server's in-process drain, and the `angos replication` end-of-run drain. Default `4`; must be greater than zero.
 
 :::warning Restrict who may push to replicated repositories
 A replication write is an ordinary manifest push carrying the `X-Angos-Source-Timestamp` header, and the receiver persists that timestamp as the tag's creation time. It's the value that decides last-writer-wins races and age-based retention. Future-dating is clamped, but **any identity allowed to push can backdate a tag**. On every instance that receives replication, gate the write actions (`put-manifest`, `delete-manifest`, uploads) to the replicator identity through the CEL `access_policy`, see [Restrict replication writes](set-up-access-control.md#restrict-replication-writes).
@@ -156,14 +156,14 @@ docker pull localhost:8001/nginx/app:v1   # served from B
 
 ## Reconcile on Demand
 
-When the event path misses a change (an instance was down, or two instances drifted after a partition), reconcile explicitly:
+When the event path misses a change (an instance was down, or two instances drifted after a partition), reconcile explicitly with `angos replication` (`scrub --replicate` is a deprecated alias):
 
 ```bash
 # Preview the pushes that would be enqueued; enqueues nothing
-angos -c config.toml scrub --replicate --dry-run
+angos -c config.toml replication --dry-run
 
-# Enqueue the diverging tags (a standalone scrub drains them end-of-run)
-angos -c config.toml scrub --replicate
+# Enqueue the diverging tags (the run drains them end-of-run)
+angos -c config.toml replication
 ```
 
 By default reconciliation is **additive**: it pushes diverging or downstream-missing tags and never deletes. With `--dry-run` it previews the work without enqueuing anything: it lists an `EnqueueReplicationPush` for each diverging or downstream-missing tag and, for any downstream marked `prune = true`, an `EnqueueReplicationDelete` for each downstream-only tag.
@@ -172,12 +172,35 @@ A downstream marked `prune = true` is treated as an **authoritative one-way mirr
 
 **Leave `prune = false` for active-active peers.** The delete does carry a `source_ts`, so the receiver applies last-writer-wins rather than deleting unconditionally. But that only protects a downstream tag dated in the future relative to the reconcile decision. A peer's legitimately-newer tag whose `created_at` predates the reconcile run is still removed.
 
-Re-running is a no-op once converged (coalesced by the queue). Schedule it like any other maintenance task:
+Re-running is a no-op once converged (coalesced by the queue). Schedule it like any other maintenance task with a systemd timer. Create `/etc/systemd/system/angos-replication.service`:
 
-```bash
-# Cron: reconcile every replicated repository nightly at 4 AM
-0 4 * * * /usr/bin/angos -c /etc/registry/config.toml scrub --replicate
+```ini
+[Unit]
+Description=angos replication reconcile
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/angos -c /etc/registry/config.toml replication
+Environment=RUST_LOG=info
 ```
+
+Create `/etc/systemd/system/angos-replication.timer`:
+
+```ini
+[Unit]
+Description=Reconcile replicated repositories nightly at 04:00
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable it with `systemctl enable --now angos-replication.timer`.
+
+A run whose drain leaves any push unconverged (a downstream pushed during the run failed) exits **degraded** (code `2`), so a scheduler treats it as a failed run and alerts; the failed job is left for a later retry. See the [`replication` exit codes](../reference/cli.md#replication).
 
 ## Observability
 

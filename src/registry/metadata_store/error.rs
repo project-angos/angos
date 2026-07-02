@@ -2,7 +2,7 @@ use std::fmt;
 
 use angos_tx_engine::lock;
 
-use crate::oci;
+use crate::oci::{self, Digest};
 use angos_s3_client as s3_client;
 use angos_tx_engine::StorageError;
 
@@ -16,6 +16,10 @@ pub enum Error {
     /// A replicated link write lost last-writer-wins against the state the
     /// committing transaction was validated against.
     ReplicationSuperseded(String),
+    /// A tracked grant insert was refused because the caller does not hold the
+    /// named digests' `blob-data` locks. Only `store_manifest` with the digest
+    /// in its granted set may insert tracked grants; nothing was committed.
+    TrackedInsertWithoutLock(Vec<Digest>),
 }
 
 impl fmt::Display for Error {
@@ -27,6 +31,14 @@ impl fmt::Display for Error {
             Error::StorageBackend(msg) => write!(f, "Storage backend error: {msg}"),
             Error::ReferenceNotFound => write!(f, "Reference not found"),
             Error::ReplicationSuperseded(msg) => write!(f, "Replication superseded: {msg}"),
+            Error::TrackedInsertWithoutLock(digests) => {
+                let digests: Vec<String> = digests.iter().map(ToString::to_string).collect();
+                write!(
+                    f,
+                    "Tracked grant insert requires the blob-data lock for: {}",
+                    digests.join(", ")
+                )
+            }
         }
     }
 }

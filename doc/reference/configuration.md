@@ -52,7 +52,10 @@ When omitted, the server runs without TLS (insecure).
 |-----------------------------|----------|----------|---------------------------------------------|
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`). With `[global.job_queue]` enabled, also bounds the number of jobs each `angos worker` processes in parallel. |
-| `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes are handled in parallel by each `angos worker`, the server's in-process drain, and the `scrub --replicate` end-of-run drain. |
+| `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes are handled in parallel by each `angos worker`, the server's in-process drain, and the `angos replication` end-of-run drain. |
+| `max_concurrent_scrub_tasks` | non-zero usize | `16` | Per-node fan-out for `scrub` / `policy` / `replication`: how many namespaces a single node enumerates in parallel (minimum `1`, capped at `1024`). The shared sink still serializes the actual mutations, so this never changes the set of emitted actions. |
+| `maintenance_lock_max_hold_secs` | non-zero u64 | `86400` | Maximum wall-clock seconds one maintenance run (`scrub`, or a mutating `policy` / `replication`) may hold the shared maintenance lock before it self-cancels (scrub aborts with exit 3). Size above the worst-case scrub duration. |
+| `maintenance_grace_secs` | u64 | `172800` | Maintenance grace: the minimum age (by backend `last_modified`) before any scrub GC category may reap an object; an object without a `last_modified` is never reaped. `0` disables the grace; a value beyond the representable duration ceiling (about 9.2e15 seconds) is rejected at load. De-configured namespace deletion is config-driven and not age-gated, and the `-u` / `-p` upload cleaners take their age from their flag durations. |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `max_blob_size`             | string   | `"100GiB"` | Maximum total size of a single blob upload; a larger upload is rejected with `BLOB_UPLOAD_INVALID` (HTTP 413) |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
@@ -300,7 +303,7 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 
 > **Note:** `lock_strategy = "s3"` selects the CAS-based coordinator and requires the provider to support `put_if_none_match` and `put_if_match`; startup fails fast if either is missing. `lock_strategy = "memory"` and `"redis"` select the lock coordinator, but Angos still uses conditional writes for blob-index shard updates when available.
 
-**Memory** (default) uses in-process locks, suitable for single-instance deployments only:
+**Memory** (default) uses in-process locks, suitable for single-instance deployments only; a mutating `scrub`, `policy`, or `replication` run is refused under `memory` since it gives no cross-process exclusion (see the [CLI reference](cli.md#scrub)):
 
 ```toml
 [metadata_store.s3]
@@ -469,9 +472,9 @@ Array of downstream registries to which this repository's mutations are replicat
 | `client_private_key`    | string   | -                  | Client key for mTLS (requires `client_certificate`)                     |
 
 `mode` values:
-- `event+reconcile` (default): push on every local mutation **and** include in `angos scrub --replicate`.
-- `event-only`: push on local mutations; excluded from scrub reconciliation.
-- `reconcile-only`: excluded from live pushes; mirrored only via `angos scrub --replicate`.
+- `event+reconcile` (default): push on every local mutation **and** include in `angos replication`.
+- `event-only`: push on local mutations; excluded from reconciliation.
+- `reconcile-only`: excluded from live pushes; mirrored only via `angos replication`.
 
 If either `client_certificate` or `client_private_key` is set, both must be set.
 

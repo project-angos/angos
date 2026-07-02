@@ -793,7 +793,7 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
     let conn = S3ConnectionConfig {
         access_key_id: Secret::new("root".to_string()),
         secret_key: Secret::new("roottoor".to_string()),
-        endpoint: "http://127.0.0.1:9000".to_string(),
+        endpoint: crate::registry::test_utils::test_s3_endpoint(),
         bucket: "registry".to_string(),
         region: "region".to_string(),
         key_prefix: unique_prefix.to_string(),
@@ -850,10 +850,8 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
 
 #[tokio::test]
 async fn test_shutdown_flushes_pending_access_times() {
-    // shutdown_with_timeout() must flush the S3 metadata backend's buffered
-    // access-time writes before returning. With access_time_debounce_secs > 0
-    // those writes sit in a background loop and would be lost on a naïve
-    // shutdown.
+    // With access_time_debounce_secs > 0 the buffered access-time writes sit in a
+    // background loop; shutdown_with_timeout() must flush them before returning.
     let unique_prefix = format!("test-shutdown-flush-{}", Uuid::new_v4());
     let ShutdownFlushHarness {
         registry,

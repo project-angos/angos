@@ -1,4 +1,5 @@
 use std::{
+    slice::from_ref,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
@@ -14,7 +15,7 @@ mod error;
 mod link;
 
 #[cfg(test)]
-mod tests;
+pub mod tests;
 
 pub use blob_index::{BlobIndex, BlobIndexOperation};
 pub use error::Error;
@@ -22,9 +23,12 @@ pub use link::{LinkKind, LinkMetadata, LinkOperation, LinksCommit, LinksTx, tx_e
 
 use access_time::{AccessTimeWriter, FlushHandle};
 
-/// Canonical key for the coarse `blob-data:{digest}` lock — the single source of
-/// truth shared by [`MetadataStore::acquire_blob_data_lock`] and the
-/// `coarse_lock(...)` calls in `link::ops`, so the two never drift.
+/// Canonical key for the coarse `blob-data:{digest}` lock. The invariant it
+/// backs: every transaction that inserts a tracked grant for `digest` commits
+/// while its issuer holds this lock, and every blob-byte delete decides and
+/// deletes under it. Grant removals need no byte lock; a removal only
+/// accelerates emptiness and shard writes are conditioned at the transaction
+/// layer.
 pub fn blob_data_lock_key(digest: &Digest) -> String {
     format!("blob-data:{digest}")
 }
@@ -33,8 +37,8 @@ pub fn blob_data_lock_key(digest: &Digest) -> String {
 
 #[derive(Clone)]
 pub struct MetadataStore {
-    /// Storage façade owning the object store and transaction executor; all
-    /// reads, reads-for-update, and coordinated writes flow through it.
+    /// Storage façade owning the object store and executor; all reads and
+    /// coordinated writes flow through it.
     store: Arc<Store>,
     cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
@@ -110,20 +114,19 @@ impl Builder {
 }
 
 impl MetadataStore {
-    /// Return a builder over the storage façade `store` (object store for reads
-    /// plus the transaction executor). `cache`, `link_cache_ttl` and
-    /// `access_time_debounce_secs` are optional fluent setters.
+    /// Return a builder over the storage façade `store`. `cache`,
+    /// `link_cache_ttl`, and `access_time_debounce_secs` are optional setters.
     pub fn builder(store: Arc<Store>) -> Builder {
         Builder::new(store)
     }
 
-    /// Returns the storage façade used for all reads and coordinated writes.
+    /// The storage façade used for all reads and coordinated writes.
     pub fn store(&self) -> &Store {
         self.store.as_ref()
     }
 
-    /// Returns an owned handle to the storage façade, for closures and helpers
-    /// that need to capture it across `await` points.
+    /// An owned handle to the storage façade, for closures that capture it across
+    /// `await` points.
     pub fn store_arc(&self) -> Arc<Store> {
         self.store.clone()
     }
@@ -132,14 +135,19 @@ impl MetadataStore {
         self.store.executor().as_ref()
     }
 
-    /// Acquire the coarse [`blob_data_lock_key`] lock for `digest`.
-    ///
-    /// Lives on the METADATA executor — the one domain every blob-data
-    /// participant (manifest push, upload, scrub) agrees on — even though the
-    /// bytes may be mutated on the separate BLOB engine, so the pairing can't
-    /// drift.
+    /// Acquire the coarse [`blob_data_lock_key`] lock for `digest`. Lives on the
+    /// metadata executor, the one domain every blob-data participant agrees on,
+    /// even though the bytes may be mutated on the separate blob engine.
     pub async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockSession, Error> {
-        let keys = [blob_data_lock_key(digest)];
+        self.acquire_blob_data_locks(from_ref(digest)).await
+    }
+
+    /// Acquire the [`blob_data_lock_key`] lock for every digest in one sorted,
+    /// deduplicated, all-or-nothing acquisition: on contention every
+    /// already-acquired key is released before retrying, so no caller ever
+    /// waits while holding a blob-data key.
+    pub async fn acquire_blob_data_locks(&self, digests: &[Digest]) -> Result<LockSession, Error> {
+        let keys: Vec<String> = digests.iter().map(blob_data_lock_key).collect();
         self.executor()
             .acquire(&keys)
             .await

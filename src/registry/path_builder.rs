@@ -7,6 +7,12 @@ const BLOBS_ROOT: &str = "v2/blobs";
 const REPOS_ROOT: &str = "v2/repositories";
 const JOBS_ROOT: &str = "_jobs";
 
+/// The subtree markers that terminate the variable-length namespace in a
+/// `v2/repositories/<ns>/...` key: the namespace precedes the first of these,
+/// and holding any of them as a child marks a path as a namespace.
+pub const NAMESPACE_MARKERS: [&str; 5] =
+    ["_manifests", "_layers", "_config", "_blobs", "_uploads"];
+
 pub fn blobs_root_dir() -> &'static str {
     BLOBS_ROOT
 }
@@ -15,10 +21,13 @@ pub fn repository_dir() -> &'static str {
     REPOS_ROOT
 }
 
-/// Storage prefix for a namespace's repository subtree addressed by its raw
-/// on-disk name, so scrub can reclaim a directory whose name fails `Namespace`
-/// validation (out-of-band corruption). Returns `None` when a path segment is
-/// empty, `.`, or `..`, which could escape the repositories root.
+pub fn jobs_root_dir() -> &'static str {
+    JOBS_ROOT
+}
+
+/// Storage prefix for a namespace's repository subtree by its raw on-disk name,
+/// so scrub can reclaim a directory whose name fails `Namespace` validation.
+/// Returns `None` for an empty, `.`, or `..` segment that could escape the root.
 pub fn namespace_dir(name: &str) -> Option<String> {
     if name.is_empty()
         || name
@@ -52,8 +61,7 @@ pub fn blob_index_refs_dir(digest: &Digest) -> String {
 }
 
 pub fn blob_index_shard_path(digest: &Digest, namespace: &Namespace) -> String {
-    // Encode namespace as a safe filename: percent-encode '/' and '%' to avoid
-    // ambiguity (namespaces can contain underscores, so '/' -> '_' is lossy).
+    // Percent-encode '/' and '%' so the filename is unambiguous.
     let safe_ns = namespace.replace('%', "%25").replace('/', "%2F");
     format!("{}/refs/{safe_ns}.json", blob_dir(digest))
 }
@@ -77,14 +85,13 @@ pub fn upload_path(namespace: &Namespace, uuid: &str) -> String {
 }
 
 /// Directory holding an upload's hasher-state checkpoints under `algorithm`, one
-/// file per offset. Used to enumerate checkpoints and pick the most recent.
+/// file per offset.
 pub fn upload_hash_context_dir(namespace: &Namespace, uuid: &str, algorithm: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}")
 }
 
 /// An upload's serialised hasher-state checkpoint under `algorithm` after
-/// consuming its bytes up to `offset`. One file per offset, allowing hash
-/// resumption after a crash without re-reading the uploaded bytes.
+/// consuming bytes up to `offset`, allowing hash resumption after a crash.
 pub fn upload_hash_context_path(
     namespace: &Namespace,
     uuid: &str,
@@ -102,6 +109,18 @@ pub fn upload_start_date_path(namespace: &Namespace, uuid: &str) -> String {
 
 pub fn manifest_revisions_link_root_dir(namespace: &Namespace, algorithm: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_manifests/revisions/{algorithm}")
+}
+
+/// Root directory of a namespace's layer links for one algorithm
+/// (`_layers/<algorithm>/<hash>/link`); its children are the layer hashes.
+pub fn layers_link_root_dir(namespace: &Namespace, algorithm: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_layers/{algorithm}")
+}
+
+/// Root directory of a namespace's config links for one algorithm
+/// (`_config/<algorithm>/<hash>/link`); its children are the config hashes.
+pub fn config_link_root_dir(namespace: &Namespace, algorithm: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_config/{algorithm}")
 }
 
 pub fn manifest_tags_dir(namespace: &Namespace) -> String {
@@ -122,12 +141,24 @@ pub fn manifest_referrers_dir(namespace: &Namespace, subject: &Digest) -> String
     )
 }
 
+/// Root directory holding one child directory per pending queue
+/// (`_jobs/pending/<queue>`).
+pub fn job_pending_root_dir() -> String {
+    format!("{JOBS_ROOT}/pending")
+}
+
 pub fn job_pending_dir(queue: &str) -> String {
     format!("{JOBS_ROOT}/pending/{queue}")
 }
 
 pub fn job_pending_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/pending/{queue}/{id}.json")
+}
+
+/// Root directory holding one child directory per dead-letter queue
+/// (`_jobs/failed/<queue>`).
+pub fn job_failed_root_dir() -> String {
+    format!("{JOBS_ROOT}/failed")
 }
 
 pub fn job_failed_dir(queue: &str) -> String {
@@ -138,9 +169,20 @@ pub fn job_failed_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/failed/{queue}/{id}.json")
 }
 
-/// Path to the `lock_key` → `storage_key` dedup index file. Each pending
-/// envelope has at most one such file alongside it; `find_pending_with_lock_key`
-/// reads it for an O(1) lookup instead of scanning all pending bodies.
+/// Root directory holding one child directory per dedup-index queue
+/// (`_jobs/index/<queue>`).
+pub fn job_index_root_dir() -> String {
+    format!("{JOBS_ROOT}/index")
+}
+
+/// Directory holding the per-`lock_key` dedup index files for one `queue`
+/// (`_jobs/index/<queue>/<encoded-lock-key>.json`).
+pub fn job_lock_key_index_dir(queue: &str) -> String {
+    format!("{JOBS_ROOT}/index/{queue}")
+}
+
+/// Path to the `lock_key` to `storage_key` dedup index file, read by
+/// `find_pending_with_lock_key` for an O(1) lookup.
 pub fn job_lock_key_index_path(queue: &str, lock_key: &str) -> String {
     format!(
         "{JOBS_ROOT}/index/{queue}/{}.json",
@@ -148,9 +190,8 @@ pub fn job_lock_key_index_path(queue: &str, lock_key: &str) -> String {
     )
 }
 
-/// Percent-encode characters that are unsafe as a filesystem filename or as
-/// part of an S3 key path component, so a `lock_key` lands on the same path
-/// regardless of backend.
+/// Percent-encode characters unsafe as a filename or S3 key component so a
+/// `lock_key` lands on the same path regardless of backend.
 fn encode_job_lock_key(lock_key: &str) -> String {
     lock_key
         .chars()
@@ -401,15 +442,18 @@ mod tests {
 
     #[test]
     fn test_job_paths() {
+        assert_eq!(job_pending_root_dir(), "_jobs/pending");
         assert_eq!(job_pending_dir("cache"), "_jobs/pending/cache");
         assert_eq!(
             job_pending_path("cache", "01HABCDE"),
             "_jobs/pending/cache/01HABCDE.json"
         );
+        assert_eq!(job_failed_root_dir(), "_jobs/failed");
         assert_eq!(
             job_failed_path("cache", "01HABCDE"),
             "_jobs/failed/cache/01HABCDE.json"
         );
+        assert_eq!(job_lock_key_index_dir("cache"), "_jobs/index/cache");
         assert_eq!(
             job_lock_key_index_path("cache", "cache.ns:sha256:abc"),
             "_jobs/index/cache/cache.ns%3Asha256%3Aabc.json"

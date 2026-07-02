@@ -114,7 +114,10 @@ pub fn push(
 ///
 /// `tags_pointing_at_digest` should contain the `LinkKind::Tag(...)` entries
 /// already pointing at the digest. Passing an empty slice is safe and correct
-/// when the caller has confirmed no tags point at the digest.
+/// when the caller has confirmed no tags point at the digest. Each tag delete
+/// is conditioned on the digest as its expected target, so a tag concurrently
+/// re-pointed at another manifest survives the cascade (the concurrent writer
+/// wins).
 pub fn delete(
     reference: &Reference,
     manifest: Option<&Manifest>,
@@ -128,7 +131,10 @@ pub fn delete(
             ops.push(LinkOperation::delete(LinkKind::Digest(digest.clone())));
 
             for tag_link in tags_pointing_at_digest {
-                ops.push(LinkOperation::delete(tag_link.clone()));
+                ops.push(LinkOperation::delete_if_targets(
+                    tag_link.clone(),
+                    digest.clone(),
+                ));
             }
 
             if let Some(m) = manifest {
@@ -473,7 +479,7 @@ mod tests {
         let ops = delete(&Reference::Tag(Tag::new("latest").unwrap()), None, &[]);
         assert_eq!(ops.len(), 1);
         assert!(
-            matches!(&ops[0], LinkOperation::Delete { link: LinkKind::Tag(t), referrer: None } if t == "latest")
+            matches!(&ops[0], LinkOperation::Delete { link: LinkKind::Tag(t), referrer: None, .. } if t == "latest")
         );
     }
 
@@ -509,6 +515,16 @@ mod tests {
             })
             .collect();
         assert_eq!(tag_deletes.len(), 2);
+        assert!(
+            tag_deletes.iter().all(|op| matches!(
+                op,
+                LinkOperation::Delete {
+                    expected_target: Some(expected),
+                    ..
+                } if expected == &digest
+            )),
+            "every cascade tag delete must be conditioned on the digest it was planned against"
+        );
     }
 
     #[test]
@@ -525,7 +541,8 @@ mod tests {
                 op,
                 LinkOperation::Delete {
                     link: LinkKind::Config(_),
-                    referrer: Some(_)
+                    referrer: Some(_),
+                    ..
                 }
             )
         }) else {
@@ -538,7 +555,8 @@ mod tests {
                 op,
                 LinkOperation::Delete {
                     link: LinkKind::Layer(_),
-                    referrer: Some(_)
+                    referrer: Some(_),
+                    ..
                 }
             )
         }) else {
@@ -573,7 +591,7 @@ mod tests {
         let ops = delete(&Reference::Digest(parent.clone()), Some(&m), &[]);
 
         let Some(LinkOperation::Delete { referrer, .. }) = ops.iter().find(|op| {
-            matches!(op, LinkOperation::Delete { link: LinkKind::Manifest(p, c), referrer: Some(_) } if p == &parent && c == &child)
+            matches!(op, LinkOperation::Delete { link: LinkKind::Manifest(p, c), referrer: Some(_), .. } if p == &parent && c == &child)
         }) else {
             panic!("child manifest Delete op with referrer must be present");
         };

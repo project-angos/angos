@@ -290,37 +290,54 @@ At startup, Angos probes the S3 provider to verify conditional write support. If
 
 ## Scheduled Storage Maintenance
 
-For scheduled maintenance (scrub), use your system's cron scheduler or a dedicated cron container:
+For scheduled maintenance (scrub), use a host systemd timer that drives the container. `scrub` is report-only by default and deletes nothing without `--commit`, so validate a schedule with a report-only run first, then commit on the recurring job. Retention enforcement is a separate `angos policy` operation:
 
 ```bash
-# Run manual maintenance with Docker Compose
-docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs --retention
+# Report-only classification (deletes nothing) with Docker Compose
+docker compose run --rm registry /angos -c /config/config.toml scrub
+
+# Rebuild-and-sweep, committing deletions (age-gated on the maintenance grace)
+docker compose run --rm registry /angos -c /config/config.toml scrub --commit
+
+# Enforce retention policies
+docker compose run --rm registry /angos -c /config/config.toml policy --retention
 ```
 
-**Cron scheduling approaches:**
+Drive the container from a host **systemd timer**. Create `/etc/systemd/system/angos-scrub.service`:
 
-1. **System cron (recommended):**
-   ```bash
-   # Add to crontab -e: run scrub daily at 3 AM
-   0 3 * * * cd /path/to/registry && docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs --retention
-   ```
+```ini
+[Unit]
+Description=angos storage maintenance (scrub)
+Requires=docker.service
+After=docker.service
 
-2. **Docker container cron (ofelia):**
-   Add to docker-compose.yml:
-   ```yaml
-   services:
-     ofelia:
-       image: mcuadros/ofelia:latest
-       volumes:
-         - /var/run/docker.sock:/var/run/docker.sock
-       command: daemon --docker
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/registry
+ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml scrub --commit
+```
 
-     # Add to registry service:
-     # labels:
-     #   ofelia.enabled: "true"
-     #   ofelia.job-exec.registry-scrub.schedule: "@daily"
-     #   ofelia.job-exec.registry-scrub.command: "/angos -c /config/config.toml scrub --tags --manifests --blobs --retention"
-   ```
+Create `/etc/systemd/system/angos-scrub.timer`:
+
+```ini
+[Unit]
+Description=Run angos scrub daily at 03:00
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Add a sibling `angos-policy.service` (`ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml policy --retention`) and `angos-policy.timer` (`OnCalendar=*-*-* 03:30:00`), then enable both:
+
+```bash
+systemctl enable --now angos-scrub.timer angos-policy.timer
+systemctl list-timers 'angos-*'   # confirm the schedule
+journalctl -u angos-scrub          # review a run
+```
 
 ---
 

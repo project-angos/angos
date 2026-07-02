@@ -191,6 +191,14 @@ operation_attempt_timeout_secs = 300
 - Cloudflare R2
 - Any S3-compatible storage
 
+### Provider Requirements
+
+Beyond the base object API, Angos relies on three provider behaviors:
+
+- **Conditional writes** (`If-None-Match` / `If-Match`): required by `lock_strategy = "s3"` and used for blob-index shard updates; probed at startup (see [Locking Behavior](#locking-behavior)).
+- **Strongly consistent GET and LIST after write**: the catalog, garbage collection, and the maintenance lock all assume a completed write is immediately visible to reads and listings.
+- **Object `last_modified` timestamps**: scrub's maintenance grace measures a reap candidate's age from the object's `last_modified`; an object the provider reports without one is never reaped, so garbage collection cannot reclaim anything on a provider that omits it.
+
 ---
 
 ## Multi-Replica Deployments
@@ -537,15 +545,11 @@ This makes the catalog **deterministic and strongly consistent**: a namespace ap
 
 The per-blob `index.json` file written by Angos prior to v1.1.0 can be encountered after upgrade. It continues to work at runtime without any migration step.
 
-Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present for a digest the runtime updates it in place (the legacy file stays the source of truth for that blob until scrub moves it), and only when no legacy file is present does a write create or update a sharded entry under `refs/{namespace}.json`. This is decided per blob, so different blobs in the same deployment can sit in different states.
+Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present the runtime updates it in place (it stays the source of truth for that blob until scrub moves it); otherwise a write creates or updates a sharded entry under `refs/{namespace}.json`. Different blobs in the same deployment can sit in different states.
 
-`angos scrub` is the only thing that actively rewrites legacy data into the sharded layout:
+`angos scrub` is the only thing that rewrites legacy data into the sharded layout. Every committed scrub (`--commit`) converges automatically: it rewrites each legacy `v2/blobs/{algorithm}/{hash_prefix}/{hash}/index.json` into per-namespace shards and deletes the legacy file once the shards are written. Convergence is additive (it only rewrites grants, never deletes blob bytes), but like every scrub write it lands only under `--commit`; the report-only default counts the legacy files without rewriting. It is idempotent: re-running is a no-op for data already sharded.
 
-- `angos scrub --blobs` rewrites each legacy `v2/blobs/{algorithm}/{hash_prefix}/{hash}/index.json` into per-namespace shards under `refs/{namespace}.json` and deletes the legacy file once the shards are written.
-
-The migration is idempotent: re-running scrub is safe and is a no-op for data that is already in the sharded layout.
-
-Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written; the catalog is now derived directly from stored content. These objects become unused after upgrade and can be left in place or deleted manually; no migration step is required.
+Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written; the catalog is derived directly from stored content. These objects can be left in place or deleted manually; no migration step is required.
 
 #### Blob Index Convergence
 
@@ -557,18 +561,9 @@ The write path adds entries on push and removes them on successful delete.
 Mid-flight failures or out-of-band edits can leave stale entries pointing to
 namespaces that no longer exist.
 
-Periodic `angos scrub -b` reconciles every blob-index entry against
-`MetadataStore::read_link`. Entries that fail the probe are removed, and a
-shard whose entries all disappear is itself deleted. The empty `refs/`
-directory is pruned too. This convergence only runs when `-b` is part of the
-invocation; omitting it means stale shards accumulate indefinitely.
+`angos scrub` reconciles the blob index on every run, with no dedicated flag. Its per-revision **rebuild** re-derives each namespace's ownership grants from the current manifests, and its raw **sweep** purges what the rebuild does not account for: a stale grant entry whose backing link file is gone (tracked layer/config/manifest entries and non-tracked tag/digest/referrer entries alike), a bare self-grant (whose namespace holds no link to the digest), and the orphan blob bytes that become unreferenced once the last grant is removed. Grant and byte reaps happen only under `--commit`, once the candidate is older than the maintenance grace (`maintenance_grace_secs`), each re-checked under a per-blob lock via a strongly-consistent point read; the report-only default classifies without deleting. A shard whose entries all disappear is deleted and the empty `refs/` directory pruned. Convergence and grant re-derivation are additive and, like every scrub write, land only under `--commit`, so stale shards stop accumulating once committed runs are scheduled.
 
-Blob ownership markers (`LinkKind::Blob`) are intentionally retained until the
-client issues an explicit `DELETE /v2/<name>/blobs/<digest>`. They are not
-removed when a namespace's manifests are deleted. When scrub detects that a
-referenced blob's backing bytes are absent, however, the entire blob-index entry
-(including any ownership markers) is purged, so runtime `can_read` no longer
-reports the blob as accessible.
+An explicit `DELETE /v2/<name>/blobs/<digest>` drops a namespace's ownership marker immediately. A bare self-grant left behind (a blob a namespace owns with no link referencing it, e.g. an upload whose manifest never landed) is revoked by `scrub --commit` once it is older than the maintenance grace; the grace keeps a normal push safe while its manifest is still on the way. When scrub finds a referenced blob's backing bytes absent, the entire blob-index entry (ownership markers included) is purged, so the runtime no longer reports the blob as accessible.
 
 ### Caching
 

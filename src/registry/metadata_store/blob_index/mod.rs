@@ -1,8 +1,7 @@
 //! The blob-index domain: cross-namespace blob reference tracking.
 //!
 //! Holds the [`BlobIndex`] / [`BlobIndexOperation`] value types, the read/write
-//! methods over the per-namespace shards, and the shard operations ([`shard`]):
-//! both the pure in-memory layer and the store read-modify-write.
+//! methods over the per-namespace shards, and the shard operations ([`shard`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,7 +25,7 @@ use crate::{
     },
 };
 
-pub(crate) mod shard;
+pub mod shard;
 
 use self::shard::{
     SHARD_READ_CONCURRENCY, append_shard_for_digest, apply_blob_index_operations,
@@ -50,10 +49,8 @@ pub enum BlobIndexOperation {
 // Engine-backed write methods
 
 impl MetadataStore {
-    /// Update the blob-index shard for `digest` in `namespace`.
-    ///
-    /// Reads the current shard, applies `operation`, and submits a `Transaction`,
-    /// retrying on `Conflict`/`Precondition` up to [`DEFAULT_RETRY_BUDGET`] times.
+    /// Update the blob-index shard for `digest` in `namespace`: read, apply
+    /// `operation`, submit, retrying up to [`DEFAULT_RETRY_BUDGET`] times.
     #[instrument(skip(self))]
     pub async fn update_blob_index(
         &self,
@@ -85,11 +82,9 @@ impl MetadataStore {
         .map_err(tx_error_to_meta)
     }
 
-    /// Revoke `namespace`'s ownership of `digest` in an atomic transaction and
-    /// return whether the blob became unreferenced, so the caller reclaims its
-    /// blob-data from the blob store under the `blob-data:{digest}` lock it must
-    /// hold across this call (serialising against concurrent pushes/deletes of
-    /// the same digest).
+    /// Revoke `namespace`'s ownership of `digest` atomically, returning whether
+    /// the blob became unreferenced so the caller reclaims its blob-data under
+    /// the `blob-data:{digest}` lock it must hold across this call.
     pub async fn revoke_blob_ownership(
         &self,
         namespace: &Namespace,
@@ -126,8 +121,8 @@ impl MetadataStore {
                 async move {
                     match self.store().get(&shard_path).await {
                         Ok(data) => {
-                            // The shard filename was written from a validated
-                            // `Namespace`; an undecodable name is skipped.
+                            // Shard filenames come from validated `Namespace`s;
+                            // an undecodable name is skipped.
                             match (
                                 serde_json::from_slice::<HashSet<LinkKind>>(&data),
                                 Namespace::new(&decode_blob_index_shard_namespace(&obj)),
@@ -162,6 +157,8 @@ impl MetadataStore {
         }
 
         if !found_shards || index.namespace.is_empty() {
+            // 1.3.x legacy fallback: dropping it would 404 a manifest whose only
+            // reference is a single-file index.json with no refs/ shard.
             return match self.read_legacy_blob_index(digest).await? {
                 Some(legacy) if !legacy.namespace.is_empty() => Ok(legacy),
                 _ => Err(Error::ReferenceNotFound),
@@ -201,6 +198,9 @@ impl MetadataStore {
             }
         }
 
+        // 1.3.x legacy fallback: dropping it would return false for a blob
+        // referenced only by a legacy index.json, so the sweep would reap live
+        // bytes under --commit.
         Ok(self
             .read_legacy_blob_index(digest)
             .await?
@@ -219,6 +219,8 @@ impl MetadataStore {
                 let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
                 non_empty_links_or_not_found(links)
             }
+            // 1.3.x legacy fallback: dropping it would 404 legacy-only-referenced
+            // manifests.
             Err(StorageError::NotFound) => match self.read_legacy_blob_index(digest).await? {
                 Some(legacy) => namespace_links_from_index(&legacy, namespace),
                 None => Err(Error::ReferenceNotFound),
@@ -227,10 +229,9 @@ impl MetadataStore {
         }
     }
 
-    /// Read the legacy single-file blob index for `digest`, or `None` when no
-    /// legacy object exists. A malformed body deserializes to an empty
-    /// [`BlobIndex`] (`unwrap_or_default`); callers apply their own non-empty /
-    /// not-found projection over the result.
+    /// Read the 1.3.x single-file blob index for `digest`, or `None` when absent.
+    /// A malformed body deserializes to an empty [`BlobIndex`]; callers apply
+    /// their own non-empty / not-found projection.
     async fn read_legacy_blob_index(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
         match self
             .store()
@@ -247,9 +248,8 @@ impl MetadataStore {
     pub async fn migrate_blob_index(&self, digest: &Digest) -> Result<(), Error> {
         let legacy_path = path_builder::blob_index_path(digest);
 
-        // Read the legacy file once outside the retry loop; if absent, nothing
-        // to migrate. On conflict the engine re-reads under the lock, so a
-        // concurrent migrator wins and we bail cleanly.
+        // Read the legacy file once outside the retry loop; absent means nothing
+        // to migrate.
         let data = match self.store().get(&legacy_path).await {
             Ok(d) => d,
             Err(StorageError::NotFound) => return Ok(()),
@@ -273,8 +273,8 @@ impl MetadataStore {
                         .map(|l| BlobIndexOperation::Insert(l.clone()))
                         .collect();
 
-                    // Re-read each shard inside the closure so the
-                    // fingerprint is fresh on every retry attempt.
+                    // Re-read each shard inside the closure so the fingerprint is
+                    // fresh on every retry.
                     match self.store().get(&shard_path).await {
                         Ok(shard_data) => {
                             let mut existing: HashSet<LinkKind> =

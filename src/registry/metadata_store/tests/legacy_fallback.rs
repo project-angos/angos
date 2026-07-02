@@ -123,7 +123,7 @@ async fn test_has_blob_references_sees_legacy() {
 }
 
 #[tokio::test]
-async fn test_update_links_writes_to_legacy_when_present_locked() {
+async fn test_update_links_drains_legacy_when_present_locked() {
     let config = test_config();
     let backend = config.to_backend(None, None).unwrap();
     let namespace = Namespace::new("legacy-fallback-4").unwrap();
@@ -131,13 +131,11 @@ async fn test_update_links_writes_to_legacy_when_present_locked() {
         Digest::from_str("sha256:1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d")
             .unwrap();
     let tag = LinkKind::Tag(Tag::new("new-tag").unwrap());
+    let seed = LinkKind::Tag(Tag::new("seed").unwrap());
 
-    // Seed an empty legacy file so the dispatcher routes to it.
-    let seed = legacy_blob_index_with(vec![(
-        namespace.as_ref(),
-        vec![LinkKind::Tag(Tag::new("seed").unwrap())],
-    )]);
-    put_legacy_index(&backend, &digest, &seed).await;
+    // Seed a legacy file so the write encounters it.
+    let legacy = legacy_blob_index_with(vec![(namespace.as_ref(), vec![seed.clone()])]);
+    put_legacy_index(&backend, &digest, &legacy).await;
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -148,24 +146,21 @@ async fn test_update_links_writes_to_legacy_when_present_locked() {
     }];
     backend.update_links(&namespace, &ops).await.unwrap();
 
-    let raw = backend
+    // The write drains the legacy file into the shard rather than routing into it.
+    let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
+    let data = backend.store().get(&shard_path).await.unwrap();
+    let links: HashSet<LinkKind> = serde_json::from_slice(&data).unwrap();
+    assert!(links.contains(&tag));
+    assert!(links.contains(&seed), "legacy links fold into the shard");
+
+    match backend
         .store()
         .get(&path_builder::blob_index_path(&digest))
         .await
-        .unwrap();
-    let stored: BlobIndex = serde_json::from_slice(&raw).unwrap();
-    let ns_links = stored
-        .namespace
-        .get(&namespace)
-        .expect("namespace stays in legacy file");
-    assert!(ns_links.contains(&tag));
-
-    // No sharded shard should have been written.
-    let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
-    match backend.store().get(&shard_path).await {
+    {
         Err(StorageError::NotFound) => {}
-        Ok(_) => panic!("shard must not exist when legacy file took the write"),
-        Err(e) => panic!("unexpected error checking shard: {e}"),
+        Ok(_) => panic!("legacy file must be drained once a write touches the digest"),
+        Err(e) => panic!("unexpected error checking legacy path: {e}"),
     }
 
     backend
@@ -176,7 +171,7 @@ async fn test_update_links_writes_to_legacy_when_present_locked() {
 }
 
 #[tokio::test]
-async fn test_update_links_writes_to_legacy_when_present_cas() {
+async fn test_update_links_drains_legacy_when_present_cas() {
     let config = test_config();
     let backend = cas_test_backend(&config);
     let namespace = Namespace::new("legacy-fallback-5").unwrap();
@@ -184,12 +179,10 @@ async fn test_update_links_writes_to_legacy_when_present_cas() {
         Digest::from_str("sha256:1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e")
             .unwrap();
     let tag = LinkKind::Tag(Tag::new("cas-new").unwrap());
+    let seed = LinkKind::Tag(Tag::new("seed").unwrap());
 
-    let seed = legacy_blob_index_with(vec![(
-        namespace.as_ref(),
-        vec![LinkKind::Tag(Tag::new("seed").unwrap())],
-    )]);
-    put_legacy_index(&backend, &digest, &seed).await;
+    let legacy = legacy_blob_index_with(vec![(namespace.as_ref(), vec![seed.clone()])]);
+    put_legacy_index(&backend, &digest, &legacy).await;
 
     let ops = vec![LinkOperation::Create {
         link: tag.clone(),
@@ -200,23 +193,20 @@ async fn test_update_links_writes_to_legacy_when_present_cas() {
     }];
     backend.update_links(&namespace, &ops).await.unwrap();
 
-    let raw = backend
+    let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
+    let data = backend.store().get(&shard_path).await.unwrap();
+    let links: HashSet<LinkKind> = serde_json::from_slice(&data).unwrap();
+    assert!(links.contains(&tag));
+    assert!(links.contains(&seed), "legacy links fold into the shard");
+
+    match backend
         .store()
         .get(&path_builder::blob_index_path(&digest))
         .await
-        .unwrap();
-    let stored: BlobIndex = serde_json::from_slice(&raw).unwrap();
-    let ns_links = stored
-        .namespace
-        .get(&namespace)
-        .expect("namespace stays in legacy file");
-    assert!(ns_links.contains(&tag));
-
-    let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
-    match backend.store().get(&shard_path).await {
+    {
         Err(StorageError::NotFound) => {}
-        Ok(_) => panic!("shard must not exist when legacy file took the write"),
-        Err(e) => panic!("unexpected error checking shard: {e}"),
+        Ok(_) => panic!("legacy file must be drained once a write touches the digest"),
+        Err(e) => panic!("unexpected error checking legacy path: {e}"),
     }
 
     backend
@@ -255,6 +245,7 @@ async fn test_update_links_deletes_legacy_when_emptied() {
     let delete_ops = vec![LinkOperation::Delete {
         link: tag.clone(),
         referrer: None,
+        expected_target: None,
     }];
     backend.update_links(&namespace, &delete_ops).await.unwrap();
 
@@ -337,30 +328,6 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     ]);
     put_legacy_index(&backend, &digest, &legacy).await;
 
-    // Before migration: an update should still route into the legacy file.
-    let extra = LinkKind::Tag(Tag::new("extra-a").unwrap());
-    let pre_ops = vec![LinkOperation::Create {
-        link: extra.clone(),
-        target: digest.clone(),
-        referrer: None,
-        media_type: None,
-        descriptor: None,
-    }];
-    backend.update_links(&namespace_a, &pre_ops).await.unwrap();
-    let pre_raw = backend
-        .store()
-        .get(&path_builder::blob_index_path(&digest))
-        .await
-        .unwrap();
-    let pre_stored: BlobIndex = serde_json::from_slice(&pre_raw).unwrap();
-    assert!(
-        pre_stored
-            .namespace
-            .get(namespace_a.as_ref())
-            .is_some_and(|s| s.contains(&extra)),
-        "pre-migration update must land in the legacy file"
-    );
-
     backend.migrate_blob_index(&digest).await.unwrap();
 
     // Legacy file is gone.
@@ -382,7 +349,6 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
         .unwrap();
     let links_first: HashSet<LinkKind> = serde_json::from_slice(&shard_first).unwrap();
     assert!(links_first.contains(&link_a));
-    assert!(links_first.contains(&extra));
 
     let shard_second = backend
         .store()

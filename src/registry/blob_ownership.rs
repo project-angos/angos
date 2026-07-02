@@ -56,9 +56,8 @@ impl<'a> BlobOwnership<'a> {
         }
     }
 
-    /// Every local namespace referencing `digest`, per the blob index; empty
-    /// when none do (a missing index entry is not an error). Malformed index
-    /// keys are skipped rather than failing the enumeration.
+    /// Every local namespace referencing `digest`, per the blob index; empty when
+    /// none do (a missing entry is not an error).
     pub async fn referencing_namespaces(&self, digest: &Digest) -> Result<Vec<Namespace>, Error> {
         let index = match self.metadata_store.read_blob_index(digest).await {
             Ok(index) => index,
@@ -70,8 +69,7 @@ impl<'a> BlobOwnership<'a> {
     }
 
     /// The lexicographically-smallest namespace referencing `digest`, excluding
-    /// `exclude`; `None` when no other namespace references it. Takes the
-    /// minimum without materialising the full referencing-namespace set.
+    /// `exclude`; `None` when no other references it.
     pub async fn smallest_referencing_namespace(
         &self,
         digest: &Digest,

@@ -47,7 +47,7 @@ use crate::lock::{
 
 // constants
 
-const MAX_LOCK_TTL_SECS: u64 = 3600;
+pub const MAX_LOCK_TTL_SECS: u64 = 3600;
 
 // Lock
 
@@ -62,6 +62,7 @@ pub struct Lock {
     max_hold_secs: u64,
     max_retries: u32,
     retry_backoff: Backoff,
+    recovery_margin_secs: u64,
 }
 
 impl Debug for Lock {
@@ -83,6 +84,7 @@ pub struct LockBuilder {
     max_hold_secs: Option<u64>,
     max_retries: Option<u32>,
     retry_delay_ms: Option<u64>,
+    recovery_margin_secs: Option<u64>,
 }
 
 impl LockBuilder {
@@ -117,6 +119,17 @@ impl LockBuilder {
         self
     }
 
+    /// Steal a contended lock only after the holder has been stale for at least
+    /// this many seconds, instead of as soon as its TTL lapses. A long-hold lock
+    /// pairs a small `ttl_secs` (fast heartbeat) with a wide margin so a live
+    /// holder is never stolen mid-run while a crashed one is still recovered.
+    /// Defaults to 0 (steal as soon as the TTL expires).
+    #[must_use]
+    pub fn recovery_margin_secs(mut self, secs: u64) -> Self {
+        self.recovery_margin_secs = Some(secs);
+        self
+    }
+
     /// Consume the builder and produce a [`Lock`].
     ///
     /// # Errors
@@ -128,6 +141,7 @@ impl LockBuilder {
         let max_hold_secs = self.max_hold_secs.unwrap_or(300);
         let max_retries = self.max_retries.unwrap_or(100);
         let retry_delay_ms = self.retry_delay_ms.unwrap_or(50);
+        let recovery_margin_secs = self.recovery_margin_secs.unwrap_or(0);
 
         if ttl_secs < 9 {
             return Err(Error::InvalidData("ttl_secs must be at least 9".into()));
@@ -140,6 +154,11 @@ impl LockBuilder {
         if max_hold_secs < ttl_secs {
             return Err(Error::InvalidData(
                 "max_hold_secs must be >= ttl_secs".into(),
+            ));
+        }
+        if recovery_margin_secs > 0 && recovery_margin_secs < ttl_secs {
+            return Err(Error::InvalidData(
+                "recovery_margin_secs must be 0 (steal on TTL expiry) or >= ttl_secs".into(),
             ));
         }
         if retry_delay_ms < 1 {
@@ -160,6 +179,7 @@ impl LockBuilder {
             max_hold_secs,
             max_retries,
             retry_backoff,
+            recovery_margin_secs,
         })
     }
 }
@@ -177,6 +197,7 @@ impl Lock {
             max_hold_secs: None,
             max_retries: None,
             retry_delay_ms: None,
+            recovery_margin_secs: None,
         }
     }
 
@@ -192,6 +213,7 @@ impl Lock {
             refreshed_at: Utc::now(),
             ttl_secs: self.ttl_secs,
             writer_nonce: Uuid::new_v4(),
+            recovery_margin_secs: self.recovery_margin_secs,
         };
         serde_json::to_vec(&body)
             .map_err(|e| Error::InvalidData(format!("lock body serialization failed: {e}")))
@@ -220,7 +242,15 @@ impl Lock {
         let body: LockBody = serde_json::from_slice(&data)
             .map_err(|e| Error::InvalidData(format!("corrupt lock body: {e}")))?;
 
-        if !body.is_expired(last_modified) {
+        // A long-hold lock only reclaims a holder stale beyond a wide margin, so
+        // a live holder whose fast heartbeat briefly lagged is never stolen; the
+        // default margin of 0 keeps the commit-path lock's steal-on-expiry rule.
+        let recoverable = if self.recovery_margin_secs > 0 {
+            body.is_stale_beyond(last_modified, self.recovery_margin_secs)
+        } else {
+            body.is_expired(last_modified)
+        };
+        if !recoverable {
             return Ok(None);
         }
 
@@ -251,9 +281,10 @@ impl Lock {
 
     /// Acquire all `keys`, retrying on contention up to `max_retries` times.
     ///
-    /// Keys are sorted and de-duplicated before acquisition (deadlock-free).
-    /// On each failed attempt any already-acquired paths are released before
-    /// sleeping.
+    /// Keys are sorted and de-duplicated, then attempted concurrently and
+    /// all-or-nothing: on each failed attempt every already-acquired key is
+    /// released before sleeping, so the lock never waits while holding keys
+    /// (deadlock-free).
     ///
     /// # Errors
     ///
@@ -273,7 +304,7 @@ impl Lock {
         let start = Instant::now();
 
         loop {
-            match self.try_acquire_all_sequential(&sorted).await {
+            match self.try_acquire_all(&sorted).await {
                 AcquireAllOutcome::Acquired(etags) => {
                     let metrics = lock_metrics();
                     metrics.observe_acquisition_duration(label, elapsed_ms(start));
@@ -306,7 +337,7 @@ impl Lock {
     }
 
     /// Non-blocking acquire: single attempt only. Returns `Ok(None)` when any
-    /// key is contended.
+    /// key is contended, releasing whatever subset was acquired.
     ///
     /// # Errors
     ///
@@ -323,7 +354,7 @@ impl Lock {
         let label = self.storage.label();
         let start = Instant::now();
 
-        match self.try_acquire_all_sequential(&sorted).await {
+        match self.try_acquire_all(&sorted).await {
             AcquireAllOutcome::Acquired(etags) => {
                 let metrics = lock_metrics();
                 metrics.observe_acquisition_duration(label, elapsed_ms(start));
@@ -345,41 +376,54 @@ impl Lock {
 
     // internal helpers
 
-    async fn try_acquire_all_sequential(&self, sorted_keys: &[String]) -> AcquireAllOutcome {
+    /// Attempt every key concurrently, all-or-nothing: on contention the
+    /// already-acquired subset is handed back for the caller to release before
+    /// it sleeps or gives up, and on a hard error it is released here. Never
+    /// waiting while holding keys keeps overlapping multi-key acquisitions
+    /// deadlock-free without any ordering protocol between holders.
+    async fn try_acquire_all(&self, sorted_keys: &[String]) -> AcquireAllOutcome {
+        let outcomes = join_all(sorted_keys.iter().map(|key| async move {
+            match self.try_acquire_one(key).await {
+                Ok(Some(etag)) => Ok(Some(etag)),
+                // Contended: try stale-lock recovery.
+                Ok(None) => self.try_recover_stale(key).await,
+                Err(e) => Err(e),
+            }
+        }))
+        .await;
+
         let mut acquired_paths: Vec<String> = Vec::new();
         let mut etags: HashMap<String, Option<String>> = HashMap::new();
+        let mut contended = false;
+        let mut hard_error: Option<Error> = None;
 
-        for key in sorted_keys {
-            match self.try_acquire_one(key).await {
+        for (key, outcome) in sorted_keys.iter().zip(outcomes) {
+            match outcome {
                 Ok(Some(etag)) => {
                     etags.insert(key.clone(), etag);
                     acquired_paths.push(key.clone());
                 }
-                Ok(None) => {
-                    // Contended. Try stale-lock recovery.
-                    match self.try_recover_stale(key).await {
-                        Ok(Some(new_etag)) => {
-                            etags.insert(key.clone(), new_etag);
-                            acquired_paths.push(key.clone());
-                        }
-                        Ok(None) => {
-                            // Still held or lost the recovery race.
-                            return AcquireAllOutcome::Retry {
-                                acquired: acquired_paths,
-                            };
-                        }
-                        Err(e) => {
-                            return AcquireAllOutcome::HardError(e);
-                        }
-                    }
-                }
+                // Still held or lost the recovery race.
+                Ok(None) => contended = true,
                 Err(e) => {
-                    self.release_paths(&acquired_paths).await;
-                    return AcquireAllOutcome::HardError(e);
+                    // The first error in key order is reported; the rest only
+                    // differ by key and the acquisition fails either way.
+                    if hard_error.is_none() {
+                        hard_error = Some(e);
+                    }
                 }
             }
         }
 
+        if let Some(e) = hard_error {
+            self.release_paths(&acquired_paths).await;
+            return AcquireAllOutcome::HardError(e);
+        }
+        if contended {
+            return AcquireAllOutcome::Retry {
+                acquired: acquired_paths,
+            };
+        }
         AcquireAllOutcome::Acquired(etags)
     }
 
@@ -424,10 +468,13 @@ impl Lock {
         etag_cache: Arc<RwLock<HashMap<String, Option<String>>>>,
     ) -> JoinHandle<()> {
         let storage = self.storage.clone();
-        let ttl_secs = self.ttl_secs;
+        let spec = BodySpec {
+            ttl_secs: self.ttl_secs,
+            recovery_margin_secs: self.recovery_margin_secs,
+        };
         let max_hold_secs = self.max_hold_secs;
         let label = storage.label();
-        let tick_interval = Duration::from_secs(ttl_secs / 3);
+        let tick_interval = Duration::from_secs(spec.ttl_secs / 3);
 
         spawn(async move {
             let started_at = TokioInstant::now();
@@ -454,7 +501,7 @@ impl Lock {
                 match run_heartbeat_tick(
                     &paths,
                     storage.as_ref(),
-                    ttl_secs,
+                    spec,
                     tick_interval,
                     &etag_cache,
                     &mut consecutive_failures,
@@ -476,6 +523,15 @@ impl Lock {
 
 // Heartbeat
 
+/// Fields the heartbeat stamps into every refreshed [`LockBody`], so each
+/// refresh re-declares the holder's TTL and recovery margin on the freshest
+/// body (which is what peers and janitors read).
+#[derive(Clone, Copy)]
+struct BodySpec {
+    ttl_secs: u64,
+    recovery_margin_secs: u64,
+}
+
 enum HeartbeatOutcome {
     Continue,
     Invalidate(&'static str),
@@ -488,7 +544,7 @@ enum HeartbeatOutcome {
 async fn run_heartbeat_tick(
     paths: &[String],
     storage: &dyn LockStorage,
-    ttl_secs: u64,
+    spec: BodySpec,
     tick_deadline: Duration,
     etag_cache: &Arc<RwLock<HashMap<String, Option<String>>>>,
     consecutive_failures: &mut u32,
@@ -514,7 +570,7 @@ async fn run_heartbeat_tick(
         |(path, cached_etag)| async move {
             match timeout(
                 tick_deadline,
-                heartbeat_tick_path(storage, path, ttl_secs, cached_etag),
+                heartbeat_tick_path(storage, path, spec, cached_etag),
             )
             .await
             {
@@ -561,8 +617,12 @@ async fn run_heartbeat_tick(
 
     if had_failure {
         *consecutive_failures = consecutive_failures.saturating_add(1);
-        let ticks_per_ttl = ttl_secs / (ttl_secs / 3).max(1);
-        if u64::from(*consecutive_failures) >= ticks_per_ttl {
+        // Ride out transient storage errors until about the point a peer could steal the lock, so a wide recovery margin is honored on the holder side and a margin of 0 keeps the steal-on-expiry behavior.
+        let tick_interval_secs = (spec.ttl_secs / 3).max(1);
+        let ticks_per_ttl = spec.ttl_secs / tick_interval_secs;
+        let margin_ticks = spec.recovery_margin_secs.div_ceil(tick_interval_secs);
+        let failure_budget = ticks_per_ttl.max(margin_ticks);
+        if u64::from(*consecutive_failures) >= failure_budget {
             warn!(
                 consecutive_failures,
                 "Lock: too many consecutive heartbeat failures, invalidating"
@@ -585,14 +645,15 @@ enum PathTickOutcome {
 async fn heartbeat_tick_path(
     storage: &dyn LockStorage,
     path: &str,
-    ttl_secs: u64,
+    spec: BodySpec,
     cached_etag: Option<String>,
 ) -> PathTickOutcome {
     let make_body = || -> Result<Vec<u8>, String> {
         let body = LockBody {
             refreshed_at: Utc::now(),
-            ttl_secs,
+            ttl_secs: spec.ttl_secs,
             writer_nonce: Uuid::new_v4(),
+            recovery_margin_secs: spec.recovery_margin_secs,
         };
         serde_json::to_vec(&body).map_err(|e| e.to_string())
     };
@@ -766,16 +827,27 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
-    use tokio::sync::Barrier;
+    use tokio::{sync::Barrier, time::timeout};
     use uuid::Uuid;
 
-    use super::{HeartbeatOutcome, Lock, PathTickOutcome, heartbeat_tick_path, run_heartbeat_tick};
+    use super::{
+        BodySpec, HeartbeatOutcome, Lock, PathTickOutcome, heartbeat_tick_path, run_heartbeat_tick,
+    };
     use crate::lock::{
         Error,
         storage::{
             DeleteIfMatchOutcome, LockBody, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome,
+            memory::MemoryLockStorage,
         },
     };
+
+    /// The heartbeat spec every pre-existing tick test uses: ttl 9, no margin.
+    fn spec9() -> BodySpec {
+        BodySpec {
+            ttl_secs: 9,
+            recovery_margin_secs: 0,
+        }
+    }
 
     /// What a single `put_if_match` call on the fake should return.
     #[derive(Clone, Copy)]
@@ -824,6 +896,8 @@ mod tests {
         put_match_calls: AtomicUsize,
         delete_if_match_calls: AtomicUsize,
         delete_calls: AtomicUsize,
+        /// Last `put_if_match` body, for refresh-stamp assertions.
+        last_put_match_body: Mutex<Option<Vec<u8>>>,
         /// Last `delete_if_match` etag, for assertions.
         last_delete_etag: Mutex<Option<String>>,
         /// When set, `delete_if_match` reports a mismatch.
@@ -868,6 +942,7 @@ mod tests {
                 refreshed_at,
                 ttl_secs: 30,
                 writer_nonce: Uuid::new_v4(),
+                recovery_margin_secs: 0,
             };
             serde_json::to_vec(&body).unwrap()
         }
@@ -894,9 +969,10 @@ mod tests {
             &self,
             _key: &str,
             _expected_etag: &str,
-            _body: Vec<u8>,
+            body: Vec<u8>,
         ) -> Result<PutIfMatchOutcome, Error> {
             self.put_match_calls.fetch_add(1, Ordering::Relaxed);
+            *self.last_put_match_body.lock().unwrap() = Some(body);
             match self
                 .put_match
                 .lock()
@@ -968,6 +1044,33 @@ mod tests {
         Arc::new(RwLock::new(map))
     }
 
+    // builder
+
+    #[test]
+    fn builder_rejects_margin_between_zero_and_ttl() {
+        let result = Lock::builder(FakeLockStorage::arc())
+            .ttl_secs(9)
+            .max_hold_secs(9)
+            .recovery_margin_secs(5)
+            .build();
+        assert!(
+            matches!(result, Err(Error::InvalidData(_))),
+            "a nonzero margin below the ttl would steal more aggressively than TTL expiry"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_zero_and_ttl_wide_margins() {
+        for margin in [0, 9, 3600] {
+            Lock::builder(FakeLockStorage::arc())
+                .ttl_secs(9)
+                .max_hold_secs(9)
+                .recovery_margin_secs(margin)
+                .build()
+                .expect("margin 0 or >= ttl is valid");
+        }
+    }
+
     // heartbeat_tick_path
 
     #[tokio::test]
@@ -975,8 +1078,13 @@ mod tests {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Mismatch);
 
-        let outcome =
-            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+        let outcome = heartbeat_tick_path(
+            storage.as_ref(),
+            "k",
+            spec9(),
+            Some("\"cached\"".to_string()),
+        )
+        .await;
 
         assert!(
             matches!(outcome, PathTickOutcome::Invalidate("ownership_lost")),
@@ -989,8 +1097,13 @@ mod tests {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Updated);
 
-        let outcome =
-            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+        let outcome = heartbeat_tick_path(
+            storage.as_ref(),
+            "k",
+            spec9(),
+            Some("\"cached\"".to_string()),
+        )
+        .await;
 
         match outcome {
             PathTickOutcome::Updated(Some(new_etag)) => {
@@ -1012,7 +1125,7 @@ mod tests {
         storage.set_get(GetScript::NotFound);
 
         // No cached ETag → slow path re-reads via get_with_etag, which is NotFound.
-        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None).await;
+        let outcome = heartbeat_tick_path(storage.as_ref(), "k", spec9(), None).await;
 
         assert!(
             matches!(outcome, PathTickOutcome::Invalidate("file_disappeared")),
@@ -1025,7 +1138,7 @@ mod tests {
         let storage = FakeLockStorage::arc();
         storage.set_get(GetScript::FreshNoEtag);
 
-        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None).await;
+        let outcome = heartbeat_tick_path(storage.as_ref(), "k", spec9(), None).await;
 
         assert!(
             matches!(outcome, PathTickOutcome::Invalidate("etag_unavailable")),
@@ -1034,12 +1147,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tick_path_refresh_stamps_recovery_margin() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_match(PutMatchScript::Updated);
+
+        let spec = BodySpec {
+            ttl_secs: 9,
+            recovery_margin_secs: 3600,
+        };
+        let outcome =
+            heartbeat_tick_path(storage.as_ref(), "k", spec, Some("\"cached\"".to_string())).await;
+        assert!(matches!(outcome, PathTickOutcome::Updated(_)));
+
+        let bytes = storage
+            .last_put_match_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("refresh body captured");
+        let body: LockBody = serde_json::from_slice(&bytes).expect("valid body");
+        assert_eq!(
+            body.recovery_margin_secs, 3600,
+            "every refresh must re-declare the margin so janitors see it on the freshest body"
+        );
+        assert_eq!(body.ttl_secs, 9);
+    }
+
+    #[tokio::test]
     async fn tick_path_fast_path_storage_error_is_failure() {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Failure);
 
-        let outcome =
-            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+        let outcome = heartbeat_tick_path(
+            storage.as_ref(),
+            "k",
+            spec9(),
+            Some("\"cached\"".to_string()),
+        )
+        .await;
 
         assert!(
             matches!(outcome, PathTickOutcome::Failure),
@@ -1067,7 +1212,7 @@ mod tests {
         let outcome = run_heartbeat_tick(
             &["k".to_string()],
             storage.as_ref(),
-            9,
+            spec9(),
             Duration::from_secs(3),
             &etag_cache,
             &mut consecutive,
@@ -1105,7 +1250,7 @@ mod tests {
         let o1 = run_heartbeat_tick(
             &paths,
             storage.as_ref(),
-            9,
+            spec9(),
             tick,
             &etag_cache,
             &mut consecutive,
@@ -1116,7 +1261,7 @@ mod tests {
         let o2 = run_heartbeat_tick(
             &paths,
             storage.as_ref(),
-            9,
+            spec9(),
             tick,
             &etag_cache,
             &mut consecutive,
@@ -1127,7 +1272,7 @@ mod tests {
         let o3 = run_heartbeat_tick(
             &paths,
             storage.as_ref(),
-            9,
+            spec9(),
             tick,
             &etag_cache,
             &mut consecutive,
@@ -1151,7 +1296,7 @@ mod tests {
         let outcome = run_heartbeat_tick(
             &["k".to_string()],
             storage.as_ref(),
-            9,
+            spec9(),
             Duration::from_secs(3),
             &etag_cache,
             &mut consecutive,
@@ -1177,7 +1322,7 @@ mod tests {
         let outcome = run_heartbeat_tick(
             &["k".to_string()],
             storage.as_ref(),
-            9,
+            spec9(),
             Duration::from_secs(3),
             &etag_cache,
             &mut consecutive,
@@ -1332,6 +1477,46 @@ mod tests {
         );
     }
 
+    /// One contended key must fail the whole multi-key acquisition and release
+    /// the siblings that were acquired, leaving the holder's object untouched.
+    #[tokio::test]
+    async fn multi_key_try_acquire_is_all_or_nothing_under_contention() {
+        let storage = Arc::new(MemoryLockStorage::new());
+        let held = LockBody {
+            refreshed_at: Utc::now(),
+            ttl_secs: 3600,
+            writer_nonce: Uuid::new_v4(),
+            recovery_margin_secs: 0,
+        };
+        storage
+            .put_if_absent("k-b", serde_json::to_vec(&held).unwrap())
+            .await
+            .expect("plant held lock");
+
+        let lock = Lock::builder(storage.clone())
+            .ttl_secs(9)
+            .max_hold_secs(9)
+            .build()
+            .expect("lock builder");
+        let keys = vec!["k-a".to_string(), "k-b".to_string(), "k-c".to_string()];
+        let session = lock.try_acquire(&keys).await.expect("no hard error");
+        assert!(
+            session.is_none(),
+            "one contended key must fail the whole acquisition"
+        );
+
+        for key in ["k-a", "k-c"] {
+            assert!(
+                matches!(storage.get_with_etag(key).await, Err(Error::NotFound)),
+                "acquired sibling {key} must be released on contention"
+            );
+        }
+        storage
+            .get_with_etag("k-b")
+            .await
+            .expect("the holder's lock object survives");
+    }
+
     // release
 
     #[tokio::test]
@@ -1388,12 +1573,13 @@ mod tests {
     /// [`LockStorage`] double that records the maximum number of `put_if_match`
     /// calls that were ever simultaneously in-flight.
     ///
-    /// Each call increments an in-flight counter, then awaits a [`Barrier`]
-    /// sized to the number of paths. The barrier only releases once every path's
-    /// call has arrived, so a sequential refresh (one call at a time) would
-    /// deadlock-stall and time out, whereas a concurrent refresh sails through.
+    /// Each conditional write (`put_if_absent` for acquisition, `put_if_match`
+    /// for refresh) increments an in-flight counter, then awaits a [`Barrier`]
+    /// sized to the number of keys. The barrier only releases once every key's
+    /// call has arrived, so a sequential caller (one call at a time) would
+    /// deadlock-stall and time out, whereas a concurrent caller sails through.
     /// The observed peak therefore equals the barrier width when (and only when)
-    /// the refreshes truly overlap. Determinism comes from the barrier rather
+    /// the calls truly overlap. Determinism comes from the barrier rather
     /// than any wall-clock sleep.
     struct ConcurrencyRecordingStorage {
         next_etag: AtomicU64,
@@ -1423,6 +1609,16 @@ mod tests {
             let v = self.next_etag.fetch_add(1, Ordering::Relaxed);
             format!("\"etag-{v}\"")
         }
+
+        /// Record the in-flight peak, then block until every concurrent call
+        /// has arrived. A sequential caller never reaches the barrier width,
+        /// so overlap is required.
+        async fn enter_barrier(&self) {
+            let now = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::AcqRel);
+            self.barrier.wait().await;
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     #[async_trait]
@@ -1432,6 +1628,7 @@ mod tests {
             _key: &str,
             _body: Vec<u8>,
         ) -> Result<PutIfAbsentOutcome, Error> {
+            self.enter_barrier().await;
             Ok(PutIfAbsentOutcome::Created(Some(self.mint_etag())))
         }
 
@@ -1441,12 +1638,7 @@ mod tests {
             _expected_etag: &str,
             _body: Vec<u8>,
         ) -> Result<PutIfMatchOutcome, Error> {
-            let now = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
-            self.max_in_flight.fetch_max(now, Ordering::AcqRel);
-            // Block until every concurrent refresh has arrived. A sequential
-            // caller never reaches the barrier width, so overlap is required.
-            self.barrier.wait().await;
-            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.enter_barrier().await;
             Ok(PutIfMatchOutcome::Updated(Some(self.mint_etag())))
         }
 
@@ -1489,7 +1681,7 @@ mod tests {
         let outcome = run_heartbeat_tick(
             &paths,
             storage.as_ref(),
-            9,
+            spec9(),
             // A short per-path deadline: a sequential refresh that stalls on the
             // barrier would time out long before all paths ran, so the only way
             // every path succeeds is genuine overlap.
@@ -1509,6 +1701,33 @@ mod tests {
             storage.max_in_flight.load(Ordering::Acquire),
             paths.len(),
             "all path refreshes must run concurrently within one tick budget"
+        );
+    }
+
+    /// A multi-key acquisition must attempt every key concurrently: each
+    /// `put_if_absent` blocks on a barrier sized to the key count, so a
+    /// sequential acquire would stall on the first key and trip the timeout.
+    #[tokio::test]
+    async fn multi_key_try_acquire_attempts_keys_concurrently() {
+        let keys: Vec<String> = (0..4).map(|i| format!("k{i}")).collect();
+        let storage = ConcurrencyRecordingStorage::arc(keys.len());
+        let lock = Lock::builder(storage.clone())
+            .ttl_secs(9)
+            .max_hold_secs(9)
+            .build()
+            .expect("lock builder");
+
+        let session = timeout(Duration::from_secs(5), lock.try_acquire(&keys))
+            .await
+            .expect("all key attempts must be in flight at once to pass the barrier")
+            .expect("no hard error")
+            .expect("all keys acquired");
+        session.release().await;
+
+        assert_eq!(
+            storage.max_in_flight.load(Ordering::Acquire),
+            keys.len(),
+            "every key's put_if_absent must run concurrently"
         );
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use angos_tx_engine::lock::Error as LockError;
 use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
@@ -130,13 +131,9 @@ fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bo
 }
 
 /// Cache a pull-through blob: stage and finalize its bytes through the blob
-/// store, then grant `namespace` a reference through the metadata store.
-///
-/// Each write commits on its own store's executor, so the blob bytes and the
-/// blob-index grant can live on separate backends without one being routed
-/// through the other's executor. Byte presence is the dedup gate and the grant
-/// is idempotent, so a retry after a partial fill re-grants without re-fetching;
-/// a crash before the grant leaves the blob-data for scrub to reclaim.
+/// store, then grant `namespace` a reference through the metadata store. Each
+/// write commits on its own store's executor, so the two can live on separate
+/// backends. The grant is idempotent, so a retry re-grants without re-fetching.
 pub async fn cache_blob(
     blob_store: &BlobStore,
     metadata_store: &MetadataStore,
@@ -150,7 +147,7 @@ pub async fn cache_blob(
     blob_store
         .create_upload(namespace, session_id.as_ref())
         .await?;
-    // A single-shot copy of a known blob: hash only the target algorithm.
+    // A known blob: hash only the target algorithm.
     blob_store
         .write_monolithic_upload(
             namespace,
@@ -161,14 +158,19 @@ pub async fn cache_blob(
         )
         .await?;
     // Promote the staged bytes and grant the reference under the blob-data lock
-    // so a concurrent delete cannot reclaim the blob in the window between the
-    // two store-local commits. This is the same coarse lock `delete_blob` holds
-    // while reclaiming, and mirrors the manifest path's bytes-then-link order.
+    // so a concurrent delete cannot reclaim the blob between the two commits.
     let lock = metadata_store.acquire_blob_data_lock(digest).await?;
+    let cancellation = lock.cancellation();
     let result = async {
         blob_store
             .complete_upload(namespace, session_id.as_ref(), digest)
             .await?;
+        // Lock-loss fence: a lost session means a concurrent reclaim may have
+        // committed unseen, so abort before granting a reference that could
+        // dangle over deleted bytes.
+        if cancellation.is_cancelled() {
+            return Err(Error::from(LockError::Invalidated));
+        }
         grant_blob_index_reference(metadata_store, namespace, digest).await
     }
     .await;
@@ -179,25 +181,38 @@ pub async fn cache_blob(
     Ok(())
 }
 
-/// Grant `namespace` a reference to an already-present blob, holding the
-/// blob-data lock so the grant is serialized against a concurrent reclaim (the
-/// `bytes already present` branch of the cache-fill handler).
+/// Grant `namespace` a reference to an already-present blob under the blob-data
+/// lock, serializing against a concurrent reclaim.
 pub async fn grant_blob_reference(
+    blob_store: &BlobStore,
     metadata_store: &MetadataStore,
     namespace: &Namespace,
     digest: &Digest,
 ) -> Result<(), Error> {
     let lock = metadata_store.acquire_blob_data_lock(digest).await?;
-    let result = grant_blob_index_reference(metadata_store, namespace, digest).await;
+    let cancellation = lock.cancellation();
+    let result = async {
+        // Re-check byte presence under the lock: the caller's presence check ran
+        // outside it, so a `delete_blob` may have reclaimed the bytes in the
+        // window before this grant. Refuse rather than dangle over deleted bytes.
+        blob_store.size(digest).await?;
+
+        // Lock-loss fence (guards lock loss only): a lost session means a
+        // concurrent reclaim may have committed after the size check above, so
+        // abort before granting.
+        if cancellation.is_cancelled() {
+            return Err(Error::from(LockError::Invalidated));
+        }
+        grant_blob_index_reference(metadata_store, namespace, digest).await
+    }
+    .await;
     lock.release().await;
     result
 }
 
-/// Insert `namespace`'s blob ownership reference into the metadata store's blob
-/// index. The caller holds the blob-data lock. Committed on the metadata store's
-/// executor with the engine's conflict retry, so it is never routed through the
-/// blob store's executor; the insert is idempotent, so a cache-fill retry
-/// re-grants harmlessly.
+/// Insert `namespace`'s blob ownership reference into the blob index (caller
+/// holds the blob-data lock). Committed on the metadata executor; idempotent, so
+/// a cache-fill retry re-grants harmlessly.
 async fn grant_blob_index_reference(
     metadata_store: &MetadataStore,
     namespace: &Namespace,
@@ -311,8 +326,8 @@ impl Registry {
     }
 
     /// Fire-and-forget enqueue of a pull-through cache-fill job. A failure is
-    /// logged and counted on `angos_job_queue_enqueue_failures_total` but never
-    /// bubbles up, so a scheduling glitch cannot degrade the client response.
+    /// logged and counted but never bubbles up, so it cannot degrade the client
+    /// response.
     async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
         let payload = CacheFetchBlobPayload {
             namespace: namespace.clone(),
@@ -386,19 +401,23 @@ impl Registry {
             return Err(Error::BlobReferenced);
         }
 
-        // Hold the coarse `blob-data:{digest}` lock across the revoke + reclaim.
-        // The revoke transaction is crash-atomic on its own, but the lock is what
-        // serialises it against the upload `grant` path (which records ownership
-        // in the shard without a transactional coarse lock), so a concurrent
-        // reference grant cannot be missed during the unreferenced check, and the
-        // blob-store reclaim cannot race a concurrent push of the same digest.
+        // Hold the coarse `blob-data:{digest}` lock across the revoke + reclaim so
+        // it serialises against the upload `grant` path: a concurrent grant is not
+        // missed during the unreferenced check, and the reclaim cannot race a push.
         let session = self.acquire_blob_data_lock(digest).await?;
+        let cancellation = session.cancellation();
         let result = async {
             if self
                 .metadata_store
                 .revoke_blob_ownership(namespace, digest)
                 .await?
             {
+                // Lock-loss fence: a lost session means a concurrent grant may
+                // have committed unseen; keep the bytes (the sweep reaps true
+                // orphans).
+                if cancellation.is_cancelled() {
+                    return Err(Error::from(LockError::Invalidated));
+                }
                 self.blob_store.delete_blob(digest).await?;
             }
             Ok::<_, Error>(())
@@ -408,10 +427,9 @@ impl Registry {
         result
     }
 
-    /// Resolves a blob GET request to either a presigned redirect URL or a stream.
-    ///
-    /// The redirect fast-path is only taken when `enable_blob_redirect` is set, the
-    /// range is absent, and the blob is locally available (for pull-through repos).
+    /// Resolve a blob GET to a presigned redirect or a stream. The redirect
+    /// fast-path is taken only when `enable_blob_redirect` is set, the range is
+    /// absent, and the blob is locally available.
     #[instrument(skip(self))]
     pub async fn resolve_get_blob(
         &self,
@@ -450,7 +468,14 @@ impl Registry {
 mod tests {
     use std::{io::Cursor, sync::Arc, time::Duration};
 
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_storage::{MemoryObjectStore, ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_tx_engine::{
+        executor::{TransactionExecutor, locked::LockedExecutor},
+        lock::{
+            primitive::Lock,
+            storage::{LockStorage, memory::MemoryLockStorage},
+        },
+    };
     use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
     use tempfile::TempDir;
     use tokio::{io::AsyncReadExt, time::sleep};
@@ -461,19 +486,18 @@ mod tests {
         registry::{
             DOCKER_CONTENT_DIGEST,
             blob_ownership::BlobOwnership,
-            metadata_store::{BlobIndexOperation, LinkOperation},
+            metadata_store::{BlobIndexOperation, LinkOperation, blob_data_lock_key},
+            path_builder,
             test_utils::{
-                backends, build_store, create_test_blob, locked_executor_over, metadata_store_over,
-                put_blob_direct,
+                backends, build_store, create_test_blob, create_test_registry,
+                locked_executor_over, metadata_store_over, put_blob_direct,
             },
         },
     };
 
-    /// `delete_blob` must hold the `blob-data:{digest}` coarse lock across its
-    /// revoke-and-reclaim transaction, so a concurrent reference grant cannot be
-    /// missed while the unreferenced check and the blob-data delete are decided.
-    /// Regression guard for the conformance `MANIFEST_BLOB_UNKNOWN` failure
-    /// caused by dropping that lock during the transactional-engine migration.
+    /// `delete_blob` must hold the `blob-data:{digest}` lock across its
+    /// revoke-and-reclaim so a concurrent reference grant is not missed while the
+    /// unreferenced check and the blob-data delete are decided.
     #[tokio::test]
     async fn delete_blob_waits_for_blob_data_lock_before_reclaiming_data() {
         for test_case in backends() {
@@ -512,6 +536,82 @@ mod tests {
 
             test_case.cleanup().await;
         }
+    }
+
+    /// Lock-loss fence: when the blob-data session is stolen mid-delete, the
+    /// reclaim aborts before the byte delete (a concurrent grant may have
+    /// committed unseen). The revoke itself may commit; that residue is
+    /// keep-direction and the sweep reaps true orphans.
+    #[tokio::test(start_paused = true)]
+    async fn delete_blob_reclaim_aborts_when_blob_data_lock_is_lost() {
+        // A hand-built registry whose metadata lock storage the test can reach,
+        // so it can steal the blob-data lock object mid-operation.
+        let lock_storage = Arc::new(MemoryLockStorage::new());
+        let lock = Arc::new(Lock::builder(lock_storage.clone()).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+        let executor: Arc<dyn TransactionExecutor> =
+            Arc::new(LockedExecutor::builder(object.clone(), lock.clone()).build());
+        let blob_store = Arc::new(BlobStore::new(build_store(
+            object.clone(),
+            executor.clone(),
+        )));
+        let metadata_store = metadata_store_over(object, executor);
+        let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
+
+        let namespace = &Namespace::new("test-repo/fence").unwrap();
+        let content = b"fenced blob bytes";
+        let digest = put_blob_direct(metadata_store.store(), content).await;
+        BlobOwnership::new(metadata_store.as_ref())
+            .grant(namespace, &digest)
+            .await
+            .unwrap();
+
+        // Park the revoke transaction on its grant-shard key so the blob-data
+        // session stays held across a heartbeat tick.
+        let parked = lock
+            .acquire(&[path_builder::blob_index_shard_path(&digest, namespace)])
+            .await
+            .unwrap();
+
+        let delete = registry.delete_blob(namespace, &digest);
+        tokio::pin!(delete);
+
+        // Drive the delete until it holds blob-data:{digest} and is parked.
+        let lock_key = blob_data_lock_key(&digest);
+        while lock_storage.get_with_etag(&lock_key).await.is_err() {
+            tokio::select! {
+                result = &mut delete => panic!("delete finished while parked: {result:?}"),
+                () = sleep(Duration::from_millis(10)) => {}
+            }
+        }
+
+        // Steal the lock: rewriting the object rotates its version, so the
+        // holder's next heartbeat refresh mismatches and fires its cancellation.
+        let (body, etag, _) = lock_storage.get_with_etag(&lock_key).await.unwrap();
+        lock_storage
+            .put_if_match(&lock_key, &etag.unwrap(), body)
+            .await
+            .unwrap();
+
+        // One heartbeat tick later (ttl/3, virtual time) the loss is observed.
+        tokio::select! {
+            result = &mut delete => panic!("delete finished before the heartbeat tick: {result:?}"),
+            () = sleep(Duration::from_secs(11)) => {}
+        }
+        parked.release().await;
+
+        let err = delete
+            .await
+            .expect_err("a reclaim whose blob-data lock was stolen must abort");
+        assert!(
+            err.to_string().contains("lock invalidated"),
+            "the abort must come from the lock-loss fence, got: {err}"
+        );
+        assert_eq!(
+            blob_store.read(&digest).await.unwrap(),
+            content,
+            "the blob bytes must survive a reclaim whose lock was stolen"
+        );
     }
 
     #[tokio::test]
@@ -672,7 +772,7 @@ mod tests {
 
             registry
                 .metadata_store
-                .update_links(
+                .seed_links(
                     namespace,
                     &[LinkOperation::create_with_referrer(
                         link.clone(),
@@ -732,7 +832,7 @@ mod tests {
                 };
                 registry
                     .metadata_store
-                    .update_links(namespace, &[op])
+                    .seed_links(namespace, &[op])
                     .await
                     .unwrap();
 
@@ -907,6 +1007,39 @@ mod tests {
             links.contains(&LinkKind::Blob(digest.clone())),
             "the namespace must hold a blob ownership reference after caching"
         );
+    }
+
+    /// `grant_blob_reference` re-checks byte presence under the blob-data lock:
+    /// if the bytes are gone (a concurrent delete completed after the caller's
+    /// outside check), it returns the not-found path and grants no reference,
+    /// so nothing dangles over deleted bytes.
+    #[tokio::test]
+    async fn grant_blob_reference_refuses_when_bytes_absent() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            // A digest whose bytes were never written to the blob store.
+            let digest = Digest::sha256_of_bytes(b"absent blob bytes");
+
+            let result = grant_blob_reference(
+                &registry.blob_store,
+                &registry.metadata_store,
+                namespace,
+                &digest,
+            )
+            .await;
+            assert!(matches!(result, Err(Error::BlobUnknown)));
+
+            // No ownership reference was created over the missing bytes.
+            assert!(
+                registry
+                    .metadata_store
+                    .read_blob_index(&digest)
+                    .await
+                    .is_err()
+            );
+            test_case.cleanup().await;
+        }
     }
 
     #[tokio::test]

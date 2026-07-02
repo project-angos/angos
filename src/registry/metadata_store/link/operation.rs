@@ -9,7 +9,8 @@ use crate::{
 /// `Create` carries the target digest and optional referrer / media-type /
 /// descriptor metadata; `Delete` carries an optional referrer qualification so
 /// tracked links (layers, configs) decrement their reference count rather than
-/// being removed outright.
+/// being removed outright, plus an optional expected target so a cascade delete
+/// planned against one target skips a link concurrently re-pointed at another.
 #[derive(Debug, Clone)]
 pub enum LinkOperation {
     Create {
@@ -22,6 +23,7 @@ pub enum LinkOperation {
     Delete {
         link: LinkKind,
         referrer: Option<Digest>,
+        expected_target: Option<Digest>,
     },
 }
 
@@ -83,6 +85,7 @@ impl LinkOperation {
         Self::Delete {
             link,
             referrer: None,
+            expected_target: None,
         }
     }
 
@@ -91,6 +94,19 @@ impl LinkOperation {
         Self::Delete {
             link,
             referrer: Some(referrer),
+            expected_target: None,
+        }
+    }
+
+    /// Deletes a link only while it still targets `expected_target`: a link
+    /// concurrently re-pointed at another digest is kept (the concurrent
+    /// writer wins). Cascade deletes planned from "tags pointing at digest"
+    /// ride this so a racing push is never untagged.
+    pub fn delete_if_targets(link: LinkKind, expected_target: Digest) -> Self {
+        Self::Delete {
+            link,
+            referrer: None,
+            expected_target: Some(expected_target),
         }
     }
 }

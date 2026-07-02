@@ -209,6 +209,16 @@ impl Store {
         self.object.copy(source, destination).await
     }
 
+    /// Move `source` to `destination`. FS renames atomically; S3 inherits the
+    /// copy + delete default.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the backend [`StorageError`].
+    pub async fn move_object(&self, source: &str, destination: &str) -> Result<(), StorageError> {
+        self.object.move_object(source, destination).await
+    }
+
     // Transactions
 
     /// Execute a pre-built [`Transaction`] once (no retry).

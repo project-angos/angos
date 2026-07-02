@@ -17,8 +17,7 @@ use crate::{metrics_provider, registry::path_builder};
 
 struct Harness {
     store: Arc<JobStore>,
-    // Raw handle lets tests stage deliberate fixture state (count-cap
-    // stress, orphan indexes) that the engine would never produce naturally.
+    // Raw handle lets tests stage fixture state the engine would never produce.
     raw: Arc<dyn ObjectStore>,
 }
 
@@ -573,13 +572,338 @@ async fn concurrent_enqueue_dedup_memory() {
 }
 
 // =========================================================================
+// Corrupt dedup-index recovery
+// =========================================================================
+
+/// Plant unparseable bytes at the dedup-index path of `lock_key`.
+async fn plant_corrupt_index(h: &Harness, lock_key: &str) -> String {
+    let index_path = path_builder::job_lock_key_index_path("cache", lock_key);
+    h.raw
+        .put(&index_path, Bytes::from_static(b"{not json"))
+        .await
+        .expect("seed corrupt index");
+    index_path
+}
+
+/// The reconcile pass counts and retires a corrupt index instead of erroring.
+async fn run_corrupt_index_is_counted_and_retired_by_reconcile(h: Harness) {
+    let index_path = plant_corrupt_index(&h, "cache.ns:sha256:corrupt").await;
+
+    let stems = h
+        .store
+        .list_lock_key_index_keys(Queue::Cache)
+        .await
+        .expect("list stems");
+    assert_eq!(stems.len(), 1, "the corrupt index must be enumerated");
+
+    assert!(
+        h.store
+            .is_orphan_lock_key_index(Queue::Cache, &stems[0])
+            .await
+            .expect("dry-run probe must classify, not error"),
+        "the dry-run probe must count a corrupt index as retirable",
+    );
+    assert!(
+        h.raw.head(&index_path).await.is_ok(),
+        "the read-only probe must not retire the index",
+    );
+
+    assert!(
+        h.store
+            .reconcile_orphan_lock_key_index(Queue::Cache, &stems[0])
+            .await
+            .expect("reconcile must retire, not error"),
+        "the reconcile must report the corrupt index as retired",
+    );
+    assert!(
+        h.raw.head(&index_path).await.is_err(),
+        "the corrupt index must be gone after the reconcile",
+    );
+}
+
+/// An enqueue whose `lock_key` is blackholed by a corrupt index recovers: the
+/// index is retired, the job lands, and the rebuilt index points at it.
+async fn run_enqueue_recovers_from_corrupt_index(h: Harness) {
+    let lock_key = "cache.ns:sha256:corrupt-enqueue";
+    plant_corrupt_index(&h, lock_key).await;
+
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue must recover from a corrupt index");
+
+    let pending = h.store.list_pending(Queue::Cache, 10).await.expect("list");
+    assert_eq!(pending.len(), 1, "the job must not be silently dropped");
+    let (index_storage_key, _) = h
+        .store
+        .get_lock_key_index_raw(Queue::Cache, lock_key)
+        .await
+        .expect("index must parse after the recovery")
+        .expect("index must be rebuilt");
+    assert_eq!(
+        index_storage_key, pending[0],
+        "the rebuilt index must point at the enqueued body",
+    );
+    assert!(
+        h.store
+            .find_pending_with_lock_key(Queue::Cache, lock_key)
+            .await
+            .expect("probe"),
+        "the recovered entry must dedup subsequent enqueues",
+    );
+}
+
+/// A present body whose index is corrupt is flagged and corrected by the
+/// re-index direction of the reconcile.
+async fn run_reindex_corrects_corrupt_index(h: Harness) {
+    let lock_key = "cache.ns:sha256:corrupt-reindex";
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue");
+    let pending = h.store.list_pending(Queue::Cache, 10).await.expect("list");
+    let storage_key = pending[0].clone();
+    plant_corrupt_index(&h, lock_key).await;
+
+    assert!(
+        h.store
+            .needs_reindex_pending(Queue::Cache, &storage_key)
+            .await
+            .expect("probe must classify, not error"),
+        "a present body with a corrupt index must need a re-index",
+    );
+    assert!(
+        h.store
+            .reindex_orphan_pending_body(Queue::Cache, &storage_key)
+            .await
+            .expect("re-index must correct, not error"),
+        "the re-index must report the corrupt entry as corrected",
+    );
+    let (index_storage_key, _) = h
+        .store
+        .get_lock_key_index_raw(Queue::Cache, lock_key)
+        .await
+        .expect("index must parse after the correction")
+        .expect("index present");
+    assert_eq!(
+        index_storage_key, storage_key,
+        "the corrected entry must point at the present body",
+    );
+}
+
+/// `fail` on a retryable job must not clobber the fresh index a producer
+/// created for a same-`lock_key` enqueue during execution.
+async fn run_fail_retry_leaves_concurrent_producers_index(h: Harness) {
+    let lock_key = "cache.ns:sha256:retry-vs-producer";
+    let mut env = dummy_envelope(lock_key);
+    env.max_attempts = 3;
+    h.store.enqueue(env).await.expect("enqueue 1");
+
+    // Claim without completing: the claim retires the dedup index.
+    let claimed = h
+        .store
+        .claim_one(Queue::Cache)
+        .await
+        .expect("claim")
+        .claimed
+        .expect("Some");
+
+    // A producer enqueues the same lock_key mid-execution: fresh pending +
+    // fresh index owned by that enqueue.
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue 2");
+    let (producer_key, _) = h
+        .store
+        .get_lock_key_index_raw(Queue::Cache, lock_key)
+        .await
+        .expect("read index")
+        .expect("the mid-execution enqueue re-creates the index");
+
+    assert!(matches!(
+        h.store.fail(claimed, "boom").await.expect("fail"),
+        FailOutcome::Retried { .. }
+    ));
+
+    let pending = h.store.list_pending(Queue::Cache, 10).await.expect("list");
+    assert_eq!(
+        pending.len(),
+        2,
+        "the producer's job and the retried job must both be pending",
+    );
+    assert!(
+        pending.contains(&producer_key),
+        "the producer's pending body must survive the retry",
+    );
+    let (index_storage_key, _) = h
+        .store
+        .get_lock_key_index_raw(Queue::Cache, lock_key)
+        .await
+        .expect("read index")
+        .expect("index present");
+    assert_eq!(
+        index_storage_key, producer_key,
+        "the retry must not clobber the producer's fresh index",
+    );
+}
+
+/// A corrupt index met on the dead-letter path is retired inside the same
+/// transaction; the job still dead-letters instead of erroring out.
+async fn run_dead_letter_with_corrupt_index_still_dead_letters(h: Harness) {
+    let lock_key = "cache.ns:sha256:corrupt-dl";
+    let mut env = dummy_envelope(lock_key);
+    env.max_attempts = 1;
+    h.store.enqueue(env).await.expect("enqueue");
+
+    let claimed = h
+        .store
+        .claim_one(Queue::Cache)
+        .await
+        .expect("claim")
+        .claimed
+        .expect("Some");
+    let storage_key = claimed.storage_key.clone();
+    // The claim retired the index; plant a corrupt one in its place.
+    let index_path = plant_corrupt_index(&h, lock_key).await;
+
+    assert!(matches!(
+        h.store
+            .fail(claimed, "final error")
+            .await
+            .expect("fail must dead-letter, not propagate the parse error"),
+        FailOutcome::MovedToDeadLetter
+    ));
+
+    assert!(
+        matches!(
+            h.store.read_pending(Queue::Cache, &storage_key).await,
+            Err(crate::registry::job_store::Error::NotFound)
+        ),
+        "the pending file must be consumed by the dead-letter",
+    );
+    let record = h
+        .store
+        .read_failed(Queue::Cache, &storage_key)
+        .await
+        .expect("the failed record must be written");
+    assert_eq!(record.last_error, "final error");
+    assert!(
+        h.raw.head(&index_path).await.is_err(),
+        "the corrupt index must be retired alongside the dead-letter",
+    );
+}
+
+/// A corrupt index met on the completion path is retired inside the same
+/// transaction; the job still completes instead of failing over.
+async fn run_complete_with_corrupt_index_still_completes(h: Harness) {
+    let lock_key = "cache.ns:sha256:corrupt-complete";
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue");
+    let claimed = h
+        .store
+        .claim_one(Queue::Cache)
+        .await
+        .expect("claim")
+        .claimed
+        .expect("Some");
+    let index_path = plant_corrupt_index(&h, lock_key).await;
+
+    assert!(matches!(
+        h.store
+            .complete(claimed, Transaction::builder().build())
+            .await
+            .expect("complete"),
+        CompleteOutcome::Completed
+    ));
+    assert!(
+        h.raw.head(&index_path).await.is_err(),
+        "the corrupt index must be retired alongside the completion",
+    );
+    assert!(
+        h.store
+            .list_pending(Queue::Cache, 10)
+            .await
+            .expect("list")
+            .is_empty(),
+        "the queue must be empty after the completion",
+    );
+}
+
+#[tokio::test]
+async fn corrupt_index_is_counted_and_retired_by_reconcile() {
+    let dir = TempDir::new().expect("temp dir");
+    run_corrupt_index_is_counted_and_retired_by_reconcile(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn corrupt_index_is_counted_and_retired_by_reconcile_memory() {
+    run_corrupt_index_is_counted_and_retired_by_reconcile(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn enqueue_recovers_from_corrupt_index() {
+    let dir = TempDir::new().expect("temp dir");
+    run_enqueue_recovers_from_corrupt_index(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn enqueue_recovers_from_corrupt_index_memory() {
+    run_enqueue_recovers_from_corrupt_index(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn reindex_corrects_corrupt_index() {
+    let dir = TempDir::new().expect("temp dir");
+    run_reindex_corrects_corrupt_index(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn reindex_corrects_corrupt_index_memory() {
+    run_reindex_corrects_corrupt_index(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn fail_retry_leaves_concurrent_producers_index() {
+    let dir = TempDir::new().expect("temp dir");
+    run_fail_retry_leaves_concurrent_producers_index(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn fail_retry_leaves_concurrent_producers_index_memory() {
+    run_fail_retry_leaves_concurrent_producers_index(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn dead_letter_with_corrupt_index_still_dead_letters() {
+    let dir = TempDir::new().expect("temp dir");
+    run_dead_letter_with_corrupt_index_still_dead_letters(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn dead_letter_with_corrupt_index_still_dead_letters_memory() {
+    run_dead_letter_with_corrupt_index_still_dead_letters(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn complete_with_corrupt_index_still_completes() {
+    let dir = TempDir::new().expect("temp dir");
+    run_complete_with_corrupt_index_still_completes(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn complete_with_corrupt_index_still_completes_memory() {
+    run_complete_with_corrupt_index_still_completes(harness_memory()).await;
+}
+
+// =========================================================================
 // complete() commit-failure fail-over (no hot loop)
 // =========================================================================
 
 /// When the work-product commit fails, `complete` must fail the job over
-/// (retry/dead-letter) rather than returning an error that leaves the pending
-/// file re-claimable forever. Regression test for the in-process cache-fill
-/// hot loop (doc/reviews/20260603-in-process-cache-fill-broken.md).
+/// (retry/dead-letter) rather than leaving the pending file re-claimable forever.
 async fn run_complete_commit_failure_fails_job_over(h: Harness) {
     h.store
         .enqueue(dummy_envelope("cache.ns:sha256:commitfail"))
@@ -594,9 +918,8 @@ async fn run_complete_commit_failure_fails_job_over(h: Harness) {
         .expect("Some");
     let original_key = claimed.storage_key.clone();
 
-    // Seed a key, then hand `complete` a work-product transaction whose
-    // `PutIfAbsent` on that key is guaranteed to fail (the key already exists),
-    // forcing the merged commit to abort.
+    // Hand `complete` a work-product `PutIfAbsent` on an existing key so the
+    // merged commit aborts.
     let collide_key = "collide-key";
     h.raw
         .put(collide_key, Bytes::from_static(b"x"))
@@ -622,9 +945,7 @@ async fn run_complete_commit_failure_fails_job_over(h: Harness) {
         "a commit failure must fail the job over to a backed-off retry",
     );
 
-    // The job is re-queued (with backoff and a bumped attempt count) under a new
-    // storage key, not deleted, and not left at the original key to be
-    // re-claimed immediately.
+    // Re-queued under a new backed-off key, not deleted or left re-claimable.
     let pending = h.store.list_pending(Queue::Cache, 10).await.expect("list");
     assert_eq!(
         pending.len(),
@@ -841,6 +1162,280 @@ async fn run_delete_pending_removes_record_and_index(h: Harness) {
     );
 }
 
+/// A corrupt dedup index must not block an admin pending delete: the delete
+/// succeeds and retires the corrupt index in the same transaction, rather than
+/// propagating the parse error.
+async fn run_delete_pending_with_corrupt_index_still_deletes(h: Harness) {
+    let lock_key = "cache.ns:sha256:corrupt-del-pending";
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue");
+    let (pending, _) = h
+        .store
+        .list_pending_page(Queue::Cache, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(pending.len(), 1);
+    let key = pending[0].clone();
+
+    // Overwrite the live index with unparseable bytes.
+    let index_path = plant_corrupt_index(&h, lock_key).await;
+
+    h.store
+        .delete_job(Queue::Cache, JobState::Pending, &key)
+        .await
+        .expect("a corrupt index must not abort the pending delete");
+
+    assert!(
+        matches!(
+            h.store.read_pending(Queue::Cache, &key).await,
+            Err(crate::registry::job_store::Error::NotFound)
+        ),
+        "the pending file must be deleted",
+    );
+    assert!(
+        h.raw.head(&index_path).await.is_err(),
+        "the corrupt index must be retired alongside the pending delete",
+    );
+}
+
+// =========================================================================
+// Structural enumerators
+// =========================================================================
+
+async fn run_list_queue_dirs_includes_unknown_queue(h: Harness) {
+    // A real enqueue creates `_jobs/pending/cache/`.
+    h.store
+        .enqueue(dummy_envelope("cache.ns:sha256:known"))
+        .await
+        .expect("enqueue");
+
+    // Plant an unknown queue directory the engine would never produce; the
+    // structural-scrub target.
+    h.raw
+        .put(
+            &path_builder::job_pending_path("bogus-queue", "0000000000000000-x"),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .expect("seed unknown queue");
+
+    let dirs = h
+        .store
+        .list_queue_dirs(JobState::Pending)
+        .await
+        .expect("list pending queue dirs");
+    assert!(
+        dirs.contains(&"cache".to_string()),
+        "the known queue dir must be listed; got {dirs:?}"
+    );
+    assert!(
+        dirs.contains(&"bogus-queue".to_string()),
+        "an unknown queue dir must be listed so scrub can flag it; got {dirs:?}"
+    );
+    assert!(
+        !dirs.contains(&"replication".to_string()),
+        "a queue with no directory must not be listed; got {dirs:?}"
+    );
+}
+
+async fn run_list_queue_dirs_empty_partition_is_empty(h: Harness) {
+    let pending = h
+        .store
+        .list_queue_dirs(JobState::Pending)
+        .await
+        .expect("list pending queue dirs");
+    assert!(
+        pending.is_empty(),
+        "an untouched pending partition must list no queue dirs; got {pending:?}"
+    );
+
+    let failed = h
+        .store
+        .list_queue_dirs(JobState::Failed)
+        .await
+        .expect("list failed queue dirs");
+    assert!(
+        failed.is_empty(),
+        "an untouched failed partition must list no queue dirs; got {failed:?}"
+    );
+}
+
+async fn run_list_lock_key_index_keys_enumerates_entries(h: Harness) {
+    // Each enqueue writes one dedup-index file under `_jobs/index/cache/`.
+    let lock_keys = [
+        "cache.ns:sha256:a",
+        "cache.ns:sha256:b",
+        "cache.ns:sha256:c",
+    ];
+    for lock_key in lock_keys {
+        h.store
+            .enqueue(dummy_envelope(lock_key))
+            .await
+            .expect("enqueue");
+    }
+
+    let mut keys = h
+        .store
+        .list_lock_key_index_keys(Queue::Cache)
+        .await
+        .expect("list index keys");
+    assert_eq!(
+        keys.len(),
+        lock_keys.len(),
+        "one index entry per enqueued lock_key; got {keys:?}"
+    );
+
+    // Draining the keyset pager must yield the same stems and terminate: this
+    // small set fits one page, so the first page carries no continuation.
+    let (first_page, next) = h
+        .store
+        .list_lock_key_index_keys_page(Queue::Cache, None)
+        .await
+        .expect("first index page");
+    assert_eq!(
+        next, None,
+        "a sub-page set must not report a continuation token; got {next:?}"
+    );
+    let mut paged = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let (page, cursor) = h
+            .store
+            .list_lock_key_index_keys_page(Queue::Cache, after.as_deref())
+            .await
+            .expect("index page");
+        paged.extend(page);
+        match cursor {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    paged.sort();
+    let mut expected = keys.clone();
+    expected.sort();
+    assert_eq!(
+        paged, expected,
+        "draining pages must enumerate the same stems as the collect-all"
+    );
+    assert_eq!(
+        first_page.len(),
+        keys.len(),
+        "the single page must carry every stem"
+    );
+
+    // The enumerated stems are the encoded lock keys (`.json` stripped); each
+    // must address a readable index file under the queue's index directory.
+    keys.sort();
+    let index_dir = path_builder::job_lock_key_index_dir("cache");
+    for key in &keys {
+        h.raw
+            .get(&format!("{index_dir}/{key}.json"))
+            .await
+            .expect("enumerated index file must be readable");
+    }
+
+    // A different queue with no index entries is empty via both APIs.
+    let replication = h
+        .store
+        .list_lock_key_index_keys(Queue::Replication)
+        .await
+        .expect("list index keys for empty queue");
+    assert!(
+        replication.is_empty(),
+        "a queue with no dedup indexes must enumerate nothing; got {replication:?}"
+    );
+    let (empty_page, empty_next) = h
+        .store
+        .list_lock_key_index_keys_page(Queue::Replication, None)
+        .await
+        .expect("empty queue index page");
+    assert!(
+        empty_page.is_empty() && empty_next.is_none(),
+        "an empty queue must yield an empty page with no continuation; got {empty_page:?}/{empty_next:?}"
+    );
+}
+
+async fn run_list_lock_key_index_keys_detects_dangling_entry(h: Harness) {
+    let lock_key = "cache.ns:sha256:dangling";
+    // Seed only the index file, no pending envelope: the dangling-lock-key
+    // reconcile target.
+    h.raw
+        .put(
+            &path_builder::job_lock_key_index_path("cache", lock_key),
+            Bytes::from(serialize_lock_key_index("0000000000000000-gone").expect("serialize")),
+        )
+        .await
+        .expect("seed dangling index");
+
+    let keys = h
+        .store
+        .list_lock_key_index_keys(Queue::Cache)
+        .await
+        .expect("list index keys");
+    assert_eq!(
+        keys.len(),
+        1,
+        "the dangling index must be enumerated; got {keys:?}"
+    );
+
+    // No pending body backs it.
+    let (pending, _) = h
+        .store
+        .list_pending_page(Queue::Cache, 10, None)
+        .await
+        .expect("list pending");
+    assert!(
+        pending.is_empty(),
+        "the dangling index has no pending envelope; got {pending:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_queue_dirs_includes_unknown_queue() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_queue_dirs_includes_unknown_queue(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_queue_dirs_includes_unknown_queue_memory() {
+    run_list_queue_dirs_includes_unknown_queue(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn list_queue_dirs_empty_partition_is_empty() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_queue_dirs_empty_partition_is_empty(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_queue_dirs_empty_partition_is_empty_memory() {
+    run_list_queue_dirs_empty_partition_is_empty(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn list_lock_key_index_keys_enumerates_entries() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_lock_key_index_keys_enumerates_entries(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_lock_key_index_keys_enumerates_entries_memory() {
+    run_list_lock_key_index_keys_enumerates_entries(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn list_lock_key_index_keys_detects_dangling_entry() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_lock_key_index_keys_detects_dangling_entry(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_lock_key_index_keys_detects_dangling_entry_memory() {
+    run_list_lock_key_index_keys_detects_dangling_entry(harness_memory()).await;
+}
+
 #[tokio::test]
 async fn list_pending_page_is_keyset_ordered() {
     let dir = TempDir::new().expect("temp dir");
@@ -883,6 +1478,17 @@ async fn delete_pending_removes_record_and_index() {
 #[tokio::test]
 async fn delete_pending_removes_record_and_index_memory() {
     run_delete_pending_removes_record_and_index(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn delete_pending_with_corrupt_index_still_deletes() {
+    let dir = TempDir::new().expect("temp dir");
+    run_delete_pending_with_corrupt_index_still_deletes(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn delete_pending_with_corrupt_index_still_deletes_memory() {
+    run_delete_pending_with_corrupt_index_still_deletes(harness_memory()).await;
 }
 
 // =========================================================================

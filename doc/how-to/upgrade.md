@@ -155,7 +155,7 @@ Update any clients of the old `/v2/_ext/...` endpoints to the new `/_ext/...` pa
 
 ---
 
-## 1.2.x → Next
+## 1.2.x → 1.3.0
 
 ### Durable Queue Shared Lock (Breaking Change)
 
@@ -256,7 +256,7 @@ See [Set Up Access Control](set-up-access-control.md) for the full `mount-blob` 
 
 The `_catalog` listing is now derived directly from stored content rather than from a maintained namespace-registry index. A namespace is listed exactly when it holds at least one revision or tag, so the catalog is deterministic and strongly consistent.
 
-**Who is affected:** No one needs to act. Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written, and `scrub` prunes them automatically (its layout-migration step runs on every scrub).
+**Who is affected:** No one needs to act. Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written, and a committed scrub (`scrub --commit`) prunes them automatically; a report-only run leaves them in place.
 
 ### Manifest-Reference Validation Now Permissive by Default
 
@@ -274,3 +274,58 @@ allow_missing_manifest_references = false
 ```
 
 `subject` referrers are accepted regardless of this setting, and pull-through cache-fill writes are trusted, independent of the flag.
+
+---
+
+## 1.3.x → 1.4.0
+
+### Scrub Redesigned to Rebuild-and-Sweep
+
+#### What Changed
+
+`scrub` is now a single **rebuild-and-sweep** operation with behavior changes operators must know:
+
+- **Report-only by default.** `scrub` classifies everything but performs no storage mutation at all without the new `--commit` gate; its only report-only write is the best-effort `_scrub-audit/latest.json` run marker. The sweep deletions, the rebuild's additive repairs, the legacy blob-index convergence, and the `_registry/` prune all land only under `--commit`. A scheduled job that previously deleted (or relied on scrub's repairs) must now pass `--commit`.
+- **The per-checker flags are removed.** The work each one did is folded into the unconditional per-revision rebuild (links, blob-index grants, referrer back-links, `media_type`) and the raw-enumeration sweep (orphan blobs, stale and bare grants, orphan links, missing-body revisions, de-configured namespaces, unrecognized keys). Passing a removed flag is now an argument-parsing error, so an unedited 1.3 scheduled job fails at startup instead of running with different semantics.
+- **Every garbage-collection reap is age-gated on the new maintenance grace** (`[global] maintenance_grace_secs`, default 48 hours): a candidate is deleted only once its backend `last_modified` is older than the grace, and an object without a `last_modified` is never reaped. A bare blob-ownership self-grant (a blob a namespace owns with no link referencing it) is revoked once past the grace: what 1.3 did only under the opt-in `--orphan-grants <age>` flag now happens on every `--commit` run. An explicit blob DELETE still reclaims immediately.
+- **New exit codes.** `scrub` now exits `2` (degraded) and `3` (aborted) in addition to `0`/`1`. Schedulers treat any non-zero code as a failure: a systemd oneshot unit reports the run failed, and a Kubernetes CronJob with `restartPolicy: OnFailure` re-runs the pod. Re-running a degraded or aborted scrub is safe.
+- **One maintenance lock.** Every `scrub` run and every mutating `policy`/`replication` run takes the single `maintenance:registry` lock; a concurrent maintenance command refuses with exit 1. Any mutating run is refused on the `memory` lock strategy. The new `[global] maintenance_lock_max_hold_secs` knob (default 24 hours) caps one run's hold; size it above your worst-case scrub duration.
+
+#### Migration
+
+Update scheduled scrub jobs:
+
+- Remove `-m` / `--manifests`, `-l` / `--links`, `-M` / `--media-types`, `-t` / `--tags`, `-R` / `--referrers`, `-n` / `--orphan-namespaces`, `-b` / `--blobs`, `--orphan-grants`, and `--reconcile-blob-index` from every invocation: they now fail argument parsing. The rebuild and sweep do their work automatically.
+- Replace `-d` / `--dry-run` with the report-only default (omit all flags). Both write nothing to registry state (the only write is the best-effort `_scrub-audit/latest.json` run marker); the alias is deprecated and mutually exclusive with `--commit`.
+- Add `--commit` to any job that must actually delete. A mutating run is refused when the metadata store's `lock_strategy` is `memory`; set it to `s3` or `redis`, or keep the job report-only.
+- Adjust alerting for the new exit codes: systemd and Kubernetes treat `2` (degraded) and `3` (aborted) as failures, so a completed-but-degraded run pages like a crash unless your monitoring reads the `_scrub-audit/latest.json` marker or the logs.
+- Retention (`-r` / `--retention`) and replication (`--replicate`) still work but are deprecated aliases for `angos policy` and `angos replication`.
+
+**Complete the rolling upgrade before the first committed scrub.** Run `angos scrub --commit` only after every replica runs 1.4.0 and no 1.3 scrub can still start: the 1.4 sweep's safety model (maintenance lock, grace, per-blob push locks) assumes no 1.3 maintenance process is mutating the same storage. Report-only runs are safe at any point.
+
+The removed per-checker flags map onto the unified passes as follows:
+
+| Old flag | Status | Replacement |
+|----------|--------|-------------|
+| `-m, --manifests`         | removed (parse error) | unified rebuild (re-derives manifest links, runs unconditionally) |
+| `-l, --links`             | removed (parse error) | rebuild (referrer back-links) plus sweep (phantom/orphan link removal) |
+| `-M, --media-types`       | removed (parse error) | rebuild (`media_type` re-derivation) |
+| `-t, --tags`              | removed (parse error) | sweep missing-body deletion; invalid-tag cleanup runs unconditionally |
+| `-R, --referrers`         | removed (parse error) | sweep orphan-referrer removal |
+| `-n, --orphan-namespaces` | removed (parse error) | sweep config-ownership deletion (report-only, then `--commit`) |
+| `-b, --blobs`             | removed (parse error) | sweep orphan-blob byte reap plus stale tracked-grant purge |
+| `--orphan-grants`         | removed (parse error) | sweep bare self-grant revocation after the maintenance grace |
+| `--reconcile-blob-index`  | removed (parse error) | rebuild grant re-derivation |
+| `-d, --dry-run`           | deprecated (mutates no registry state) | the report-only default (omit flags); `--commit` to delete |
+| `-r, --retention`         | deprecated (still works) | `angos policy --retention` |
+| `--replicate`             | deprecated (still works) | `angos replication` |
+
+#### Converge the Blob Index Fleet-Wide
+
+Legacy single-file blob indexes (`index.json`) keep working at runtime, and every committed scrub (`--commit`) automatically drains them into the sharded `refs/{namespace}.json` layout (a report-only run counts them without rewriting). After upgrading, **run `scrub --commit` once across every replica in your fleet** so the whole registry converges; preview with a report-only run first.
+
+#### Deferred: Legacy Blob-Index Read Fallback Removal
+
+The runtime still keeps the legacy single-file blob-index **read fallback**: a blob whose index has not yet converged is still served from its legacy `index.json`, so a manifest referenced only through legacy state stays readable. This fallback is **not removed in 1.4.0**.
+
+A future release will drop the read fallback, but only after fleet-wide convergence is verified. Before that release, run `scrub` across the fleet (as above) so no blob is left in legacy-only form. Until then no action is forced beyond running scrub to converge.

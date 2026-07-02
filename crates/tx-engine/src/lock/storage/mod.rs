@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::lock::Error;
+use crate::lock::primitive::MAX_LOCK_TTL_SECS;
 
 /// Serialized body of a lock object stored at `.tx-locks/<shard>/<key>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +48,12 @@ pub struct LockBody {
     /// never matches a freshly minted nonce.
     #[serde(default)]
     pub writer_nonce: Uuid,
+    /// Recovery margin declared by the holder: peers and janitors treat the
+    /// lock as reclaimable only after this many seconds of silence, even once
+    /// the TTL has lapsed. 0 means steal on TTL expiry; `#[serde(default)]`
+    /// keeps bodies written before this field existed readable.
+    #[serde(default)]
+    pub recovery_margin_secs: u64,
 }
 
 impl LockBody {
@@ -56,8 +63,21 @@ impl LockBody {
     #[must_use]
     pub fn is_expired(&self, last_modified: Option<DateTime<Utc>>) -> bool {
         let reference = last_modified.unwrap_or(self.refreshed_at);
-        let expiry = reference + Duration::seconds(self.ttl_secs.min(3600).cast_signed());
+        let expiry = reference + Duration::seconds(self.ttl_secs.min(MAX_LOCK_TTL_SECS).cast_signed());
         Utc::now() > expiry
+    }
+
+    /// Returns `true` when the lock has not been refreshed for at least
+    /// `margin_secs`, measured from `last_modified` (server timestamp, preferred)
+    /// or `refreshed_at`. The long-hold scrub lock uses this so a genuinely dead
+    /// holder is reclaimed only after a wide margin, never a live holder whose
+    /// fast heartbeat briefly lagged. Unlike [`is_expired`](Self::is_expired) the
+    /// margin is not capped, so a long crash-recovery window does not require
+    /// raising the per-refresh TTL.
+    #[must_use]
+    pub fn is_stale_beyond(&self, last_modified: Option<DateTime<Utc>>, margin_secs: u64) -> bool {
+        let reference = last_modified.unwrap_or(self.refreshed_at);
+        Utc::now() > reference + Duration::seconds(margin_secs.cast_signed())
     }
 }
 
@@ -137,4 +157,65 @@ pub trait LockStorage: Send + Sync + Debug {
 
     /// Returns a human-readable label for metrics / startup logs.
     fn label(&self) -> &'static str;
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    use super::LockBody;
+
+    fn body_refreshed_secs_ago(secs: i64, ttl_secs: u64) -> LockBody {
+        LockBody {
+            refreshed_at: Utc::now() - Duration::seconds(secs),
+            ttl_secs,
+            writer_nonce: Uuid::new_v4(),
+            recovery_margin_secs: 0,
+        }
+    }
+
+    #[test]
+    fn body_without_margin_field_defaults_to_zero() {
+        // The exact shape a 1.3 writer produces: no recovery_margin_secs field.
+        let json = format!(
+            r#"{{"refreshed_at":"{}","ttl_secs":30,"writer_nonce":"{}"}}"#,
+            Utc::now().to_rfc3339(),
+            Uuid::new_v4()
+        );
+        let body: LockBody = serde_json::from_str(&json).expect("1.3-shaped body parses");
+        assert_eq!(
+            body.recovery_margin_secs, 0,
+            "bodies written before the field existed must default to steal-on-expiry"
+        );
+    }
+
+    #[test]
+    fn is_stale_beyond_respects_a_wide_margin() {
+        // A holder refreshed 10s ago with a short ttl is already expired, but not
+        // stale beyond a 600s recovery margin: a live holder must not be stolen.
+        let body = body_refreshed_secs_ago(10, 9);
+        assert!(body.is_expired(None), "expired against the 9s ttl");
+        assert!(
+            !body.is_stale_beyond(None, 600),
+            "10s of silence is within the 600s recovery margin"
+        );
+    }
+
+    #[test]
+    fn is_stale_beyond_reclaims_a_long_dead_holder() {
+        // A holder silent for 700s is stale beyond the 600s margin, so a crashed
+        // run is still reclaimed.
+        let body = body_refreshed_secs_ago(700, 9);
+        assert!(body.is_stale_beyond(None, 600));
+    }
+
+    #[test]
+    fn is_stale_beyond_uses_server_last_modified_when_present() {
+        // refreshed_at says long ago, but a fresh server last_modified proves the
+        // holder is alive; the margin must key on the server timestamp.
+        let body = body_refreshed_secs_ago(10_000, 9);
+        let fresh = Some(Utc::now() - Duration::seconds(5));
+        assert!(!body.is_stale_beyond(fresh, 600));
+    }
 }

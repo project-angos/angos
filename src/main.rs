@@ -14,7 +14,9 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    command::{argon, scrub, server, worker},
+    command::{
+        argon, policy as policy_command, replication as replication_command, scrub, server, worker,
+    },
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
     metrics_provider::initialize_metrics,
 };
@@ -70,8 +72,7 @@ fn set_tracing(
             .build();
 
         let tracer = tracer_provider.tracer("angos");
-        // Clone before registering globally so the caller retains a handle to shut
-        // down the batch exporter and flush in-flight spans before the process exits.
+        // Clone so the caller retains a handle to flush spans before exit.
         global::set_tracer_provider(tracer_provider.clone());
         let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
 
@@ -107,15 +108,21 @@ struct GlobalArguments {
 #[argh(subcommand)]
 enum SubCommand {
     Argon(argon::Options),
+    Policy(policy_command::Options),
+    Replication(replication_command::Options),
     Scrub(scrub::Options),
     Serve(server::Options),
     Worker(worker::Options),
 }
 
 fn main() {
-    rustls::crypto::aws_lc_rs::default_provider()
+    if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .is_err()
+    {
+        eprintln!("Failed to install rustls crypto provider");
+        exit(1);
+    }
 
     let cli_args: GlobalArguments = argh::from_env();
 
@@ -135,12 +142,18 @@ fn main() {
         exit(1);
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.global.max_concurrent_requests)
         .enable_all()
         .build()
-        .expect("Failed to create Tokio runtime")
-        .block_on(run_command(cli_args, config));
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Failed to create Tokio runtime: {e}");
+            exit(1);
+        }
+    };
+    runtime.block_on(run_command(cli_args, config));
 }
 
 async fn run_command(cli_args: GlobalArguments, config: Configuration) {
@@ -162,8 +175,24 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
                 1
             }
         },
+        SubCommand::Policy(policy_options) => match run_policy(policy_options, config).await {
+            Ok(code) => code,
+            Err(err) => {
+                error!("Policy error: {err}");
+                1
+            }
+        },
+        SubCommand::Replication(replication_options) => {
+            match run_replication(replication_options, config).await {
+                Ok(code) => code,
+                Err(err) => {
+                    error!("Replication error: {err}");
+                    1
+                }
+            }
+        }
         SubCommand::Scrub(scrub_options) => match run_scrub(scrub_options, config).await {
-            Ok(()) => 0,
+            Ok(code) => code,
             Err(err) => {
                 error!("Scrub error: {err}");
                 1
@@ -198,9 +227,35 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
     }
 }
 
-async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
+async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<i32, scrub::Error> {
     let mut scrub = scrub::Command::new(&options, &config).await?;
-    scrub.run().await
+    let outcome = scrub.run().await?;
+    info!(
+        status = ?outcome.status,
+        exit_code = outcome.exit_code,
+        "scrub finished"
+    );
+    Ok(outcome.exit_code)
+}
+
+async fn run_policy(
+    options: policy_command::Options,
+    config: Configuration,
+) -> Result<i32, policy_command::Error> {
+    let policy = policy_command::Command::new(&options, &config).await?;
+    let status = policy.run().await?;
+    info!(?status, exit_code = status.exit_code(), "policy finished");
+    Ok(status.exit_code())
+}
+
+async fn run_replication(
+    options: replication_command::Options,
+    config: Configuration,
+) -> Result<i32, replication_command::Error> {
+    let replication = replication_command::Command::new(&options, &config).await?;
+    let status = replication.run().await?;
+    info!(?status, exit_code = status.exit_code(), "replication finished");
+    Ok(status.exit_code())
 }
 
 async fn run_worker(
@@ -263,8 +318,8 @@ async fn shutdown_signal() {
     }
 
     #[cfg(not(unix))]
-    {
-        ctrl_c.await.expect("failed to listen for Ctrl+C");
+    if let Err(e) = ctrl_c.await {
+        warn!("Failed to listen for Ctrl+C, shutting down: {e}");
     }
 }
 
@@ -275,10 +330,7 @@ mod tests {
         InMemorySpanExporterBuilder, SdkTracerProvider, SimpleSpanProcessor,
     };
 
-    /// Verifies that spans emitted before `provider.shutdown()` are flushed to
-    /// the exporter.  With `SimpleSpanProcessor` each span is exported
-    /// synchronously when it ends, so `force_flush` followed by `shutdown`
-    /// must leave the span visible in the exporter's buffer.
+    /// Spans emitted before `provider.shutdown()` are flushed to the exporter.
     #[test]
     fn tracer_provider_shutdown_flushes_spans() {
         let exporter = InMemorySpanExporterBuilder::new().build();

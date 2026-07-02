@@ -1,66 +1,23 @@
 use std::fmt;
 
 use crate::{
-    oci::{Digest, MediaType, Namespace, Tag},
-    registry::{
-        job_store::{JobState, Queue},
-        metadata_store::LinkKind,
-    },
+    oci::{Digest, Namespace, Tag},
+    registry::job_store::{JobState, Queue},
 };
 
-/// A single mutation that a scrub checker has decided to perform.
-///
-/// Checkers produce `Action` values via their `ActionSink`; the `Executor`
-/// applies them (or skips them in dry-run mode) in one place.
+/// The mutate gate an [`Action`] rides: `Policy` actions are enabled by the
+/// dedicated `policy`/`replication` commands (and scrub's deprecated
+/// `-r`/`--replicate` aliases); every GC/repair action mutates only under
+/// scrub's `--commit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionCategory {
+    Policy,
+    Gc,
+}
+
+/// A single mutation a scrub checker has decided to perform, produced via an
+/// `ActionSink` and applied (or skipped in dry-run) by the `Executor`.
 pub enum Action {
-    MigrateBlobIndex(Digest),
-    /// Delete the dead namespace-registry objects (`_registry/`) left by the
-    /// pre-1.3 maintained catalog index; the catalog is now derived from content.
-    PruneLegacyNamespaceRegistry,
-    DeleteOrphanBlob(Digest),
-    RemoveBlobIndexLink {
-        namespace: Namespace,
-        blob: Digest,
-        link: LinkKind,
-    },
-    /// Re-add a blob-index grant the index is missing relative to a manifest that
-    /// still references the blob (the additive half of a blob-index reconcile).
-    /// Idempotent: re-inserting a present link is a no-op.
-    GrantBlobIndexLink {
-        namespace: Namespace,
-        blob: Digest,
-        link: LinkKind,
-    },
-    /// Revoke a namespace's orphaned blob-ownership grant (no manifest in the
-    /// namespace references the blob), reclaiming the bytes when it was the last
-    /// reference anywhere.
-    RemoveOrphanBlobGrant {
-        namespace: Namespace,
-        blob: Digest,
-    },
-    RecreateLink {
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-    },
-    AddReferrer {
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-        referrer: Digest,
-    },
-    RemoveReferrer {
-        namespace: Namespace,
-        link: LinkKind,
-        referrer: Digest,
-    },
-    SetMediaType {
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-        media_type: MediaType,
-        display_name: String,
-    },
     DeleteTag {
         namespace: Namespace,
         tag: Tag,
@@ -86,11 +43,6 @@ pub enum Action {
     DeleteExpiredUpload {
         namespace: Namespace,
         uuid: String,
-    },
-    DeleteOrphanReferrer {
-        namespace: Namespace,
-        subject: Digest,
-        referrer: Digest,
     },
     AbortMultipartUpload {
         key: String,
@@ -124,90 +76,29 @@ pub enum Action {
     },
 }
 
+impl Action {
+    /// The per-category mutate gate this action rides. Exhaustive so a future
+    /// variant is forced to pick a category.
+    pub fn category(&self) -> ActionCategory {
+        match self {
+            Action::DeleteTag { .. }
+            | Action::DeleteOrphanManifest { .. }
+            | Action::EnqueueReplicationPush { .. }
+            | Action::EnqueueReplicationDelete { .. } => ActionCategory::Policy,
+            Action::DeleteInvalidTag { .. }
+            | Action::DeleteInvalidNamespace { .. }
+            | Action::DeleteInvalidUploadNamespace { .. }
+            | Action::DeleteExpiredUpload { .. }
+            | Action::AbortMultipartUpload { .. }
+            | Action::DeleteOrphanJob { .. } => ActionCategory::Gc,
+        }
+    }
+}
+
 impl fmt::Display for Action {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Action::MigrateBlobIndex(digest) => {
-                write!(f, "migrate blob index layout for '{digest}'")
-            }
-            Action::PruneLegacyNamespaceRegistry => {
-                write!(
-                    f,
-                    "prune the legacy namespace-registry index ('_registry/')"
-                )
-            }
-            Action::DeleteOrphanBlob(digest) => {
-                write!(f, "delete orphan blob '{digest}'")
-            }
-            Action::RemoveBlobIndexLink {
-                namespace,
-                blob,
-                link,
-            } => {
-                write!(
-                    f,
-                    "remove invalid link from blob index '{namespace}/{blob}': '{link}'"
-                )
-            }
-            Action::GrantBlobIndexLink {
-                namespace,
-                blob,
-                link,
-            } => {
-                write!(
-                    f,
-                    "grant missing blob-index entry '{namespace}/{blob}': '{link}'"
-                )
-            }
-            Action::RemoveOrphanBlobGrant { namespace, blob } => {
-                write!(
-                    f,
-                    "revoke orphaned blob-ownership grant '{namespace}/{blob}' (no manifest references it)"
-                )
-            }
-            Action::RecreateLink {
-                namespace,
-                link,
-                target,
-            } => {
-                write!(
-                    f,
-                    "recreate invalid link from namespace '{namespace}': '{link}' -> '{target}'"
-                )
-            }
-            Action::AddReferrer {
-                namespace,
-                link,
-                referrer,
-                ..
-            } => {
-                write!(
-                    f,
-                    "add referrer {referrer} to link {link} in namespace '{namespace}'"
-                )
-            }
-            Action::RemoveReferrer {
-                namespace,
-                link,
-                referrer,
-            } => {
-                write!(
-                    f,
-                    "remove referrer {referrer} from link {link} in namespace '{namespace}'"
-                )
-            }
-            Action::SetMediaType {
-                namespace,
-                media_type,
-                display_name,
-                ..
-            } => {
-                write!(
-                    f,
-                    "set media_type '{media_type}' on {display_name} in namespace '{namespace}'"
-                )
-            }
             Action::DeleteTag { namespace, tag } => {
                 write!(f, "delete tag '{namespace}:{tag}' (policy)")
             }
@@ -225,16 +116,6 @@ impl fmt::Display for Action {
             }
             Action::DeleteExpiredUpload { namespace, uuid } => {
                 write!(f, "delete expired upload '{namespace}/{uuid}'")
-            }
-            Action::DeleteOrphanReferrer {
-                namespace,
-                subject,
-                referrer,
-            } => {
-                write!(
-                    f,
-                    "delete orphan referrer '{namespace}': subject {subject} <- {referrer}"
-                )
             }
             Action::AbortMultipartUpload { key, upload_id } => {
                 write!(f, "abort orphan multipart upload '{key}' ({upload_id})")

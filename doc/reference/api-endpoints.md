@@ -178,8 +178,8 @@ permanent last-writer-wins victory. A *backdated* timestamp is accepted and pers
 the tag's creation time, where it weakens that write in later LWW races and feeds age-based
 retention and the `top_pushed` ranking with the supplied date. The header is honored from **any
 identity allowed to push** and cannot be gated separately from `put-manifest`, so a push-capable
-identity can backdate a tag far enough to make it eligible for pruning on the next `scrub
---retention` run, an indirect delete even without a `delete-manifest` grant. Treat push on a
+identity can backdate a tag far enough to make it eligible for pruning on the next
+`angos policy --retention` run, an indirect delete even without a `delete-manifest` grant. Treat push on a
 replicated repository as trust over `created_at`, and restrict it via the CEL `access_policy` (see
 [Restrict replication writes](../how-to/set-up-access-control.md#restrict-replication-writes)).
 

@@ -102,8 +102,11 @@ pub trait TransactionExecutor: Send + Sync {
 /// `max_attempts` additional times.
 ///
 /// `build` is called once before each attempt so the transaction can
-/// incorporate fresh state on every retry. Any error returned by `build`
-/// is propagated immediately without retrying.
+/// incorporate fresh state on every retry. A [`Error::Conflict`] or
+/// [`Error::Precondition`] returned by `build` itself (a builder that
+/// revalidates its reads reports staleness this way) consumes an attempt
+/// like an execute conflict; any other `build` error is propagated
+/// immediately.
 ///
 /// The closure returns `(Transaction, T)` so callers can thread any per-attempt
 /// value out of the retry loop without needing shared mutable state.
@@ -128,11 +131,17 @@ where
 {
     let mut attempts = 0u32;
     loop {
-        let (tx, payload) = build().await?;
-        match executor.execute(tx).await {
-            Ok(o) => return Ok((o, payload)),
+        match build().await {
+            Ok((tx, payload)) => match executor.execute(tx).await {
+                Ok(o) => return Ok((o, payload)),
+                Err(Error::Conflict | Error::Precondition) if attempts < max_attempts => {
+                    debug!(attempts, max_attempts, "Transaction conflict, retrying");
+                    attempts += 1;
+                }
+                Err(e) => return Err(e),
+            },
             Err(Error::Conflict | Error::Precondition) if attempts < max_attempts => {
-                debug!(attempts, max_attempts, "Transaction conflict, retrying");
+                debug!(attempts, max_attempts, "Transaction build conflict, retrying");
                 attempts += 1;
             }
             Err(e) => return Err(e),
@@ -141,11 +150,9 @@ where
 }
 
 /// Execute a transaction built by `build`, retrying on [`Error::Conflict`]
-/// or [`Error::Precondition`] up to `max_attempts` additional times.
-///
-/// `build` is called once before each attempt so the transaction can
-/// incorporate fresh state on every retry. Any error returned by `build`
-/// is propagated immediately without retrying.
+/// or [`Error::Precondition`] up to `max_attempts` additional times; the
+/// payload-less form of [`execute_with_retry_payload`], with the same retry
+/// semantics for conflicts reported by `build` itself.
 ///
 /// Returns [`Error::Conflict`] when all attempts are exhausted.
 ///
@@ -174,18 +181,12 @@ where
     F: FnMut() -> Fut + Send,
     Fut: Future<Output = Result<Transaction, Error>> + Send,
 {
-    let mut attempts = 0u32;
-    loop {
-        let tx = build().await?;
-        match executor.execute(tx).await {
-            Ok(o) => return Ok(o),
-            Err(Error::Conflict | Error::Precondition) if attempts < max_attempts => {
-                debug!(attempts, max_attempts, "Transaction conflict, retrying");
-                attempts += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    let build = move || {
+        let fut = build();
+        async move { Ok((fut.await?, ())) }
+    };
+    let (outcome, ()) = execute_with_retry_payload(executor, build, max_attempts).await?;
+    Ok(outcome)
 }
 
 // Executor factory: hides lock-storage and executor strategy from callers
@@ -296,4 +297,97 @@ pub fn build_executor(
         lock_backend, "transactional engine executor selected"
     );
     Ok(Arc::new(exec))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use bytes::Bytes;
+
+    use angos_storage::MemoryObjectStore;
+
+    use super::*;
+    use crate::transaction::Mutation;
+
+    fn memory_executor(backend: Arc<MemoryObjectStore>) -> LockedExecutor {
+        let lock = Arc::new(
+            Lock::builder(Arc::new(MemoryLockStorage::new()))
+                .build()
+                .expect("test lock"),
+        );
+        LockedExecutor::builder(backend, lock).build()
+    }
+
+    fn put_tx(key: &str) -> Transaction {
+        Transaction::builder()
+            .mutation(Mutation::Put {
+                key: key.to_string(),
+                body: Bytes::from_static(b"v"),
+                expected: None,
+            })
+            .build()
+    }
+
+    #[tokio::test]
+    async fn build_conflict_is_retried_with_fresh_state() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        let executor = memory_executor(backend);
+        let calls = AtomicU32::new(0);
+
+        let outcome = execute_with_retry(
+            &executor,
+            || async {
+                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    return Err(Error::Conflict);
+                }
+                Ok(put_tx("k"))
+            },
+            DEFAULT_RETRY_BUDGET,
+        )
+        .await;
+
+        assert!(outcome.is_ok(), "conflicting builds must be retried");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn persistent_build_conflict_exhausts_the_budget() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        let executor = memory_executor(backend);
+        let calls = AtomicU32::new(0);
+
+        let result = execute_with_retry_payload(
+            &executor,
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(Transaction, ()), Error>(Error::Conflict)
+            },
+            2,
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Conflict)));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "initial attempt plus two retries");
+    }
+
+    #[tokio::test]
+    async fn non_retriable_build_error_propagates_immediately() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        let executor = memory_executor(backend);
+        let calls = AtomicU32::new(0);
+
+        let result = execute_with_retry(
+            &executor,
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<Transaction, Error>(Error::Build("bad plan".to_string()))
+            },
+            DEFAULT_RETRY_BUDGET,
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Build(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

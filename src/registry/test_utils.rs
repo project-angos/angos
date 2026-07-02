@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -61,9 +61,7 @@ pub fn build_test_fs_executor(root_dir: &str, sync_to_disk: bool) -> Arc<dyn Tra
     locked_executor_over(store)
 }
 
-/// Wrap an object store + executor into a [`Store`] façade for tests. The
-/// store handle is an [`ObjectStore`] (the CRUD floor plus the upload-session
-/// lifecycle), matching the façade's composed surface.
+/// Wrap an object store + executor into a [`Store`] façade for tests.
 pub fn build_store(
     object: Arc<dyn ObjectStore>,
     executor: Arc<dyn TransactionExecutor>,
@@ -131,10 +129,9 @@ pub fn create_test_registry(
     create_test_registry_with(blob_store, metadata_store, true)
 }
 
-/// Like [`create_test_registry`] but lets a test pin whether the live
-/// `accept_put_manifest` path enforces manifest-reference validation, so both
-/// the strict and the permissive (`allow_missing_manifest_references`) modes
-/// can be exercised end-to-end.
+/// Like [`create_test_registry`] but pins whether `accept_put_manifest` enforces
+/// manifest-reference validation, exercising both the strict and permissive
+/// modes.
 pub fn create_test_registry_with(
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
@@ -159,9 +156,8 @@ pub fn create_test_registry_with(
     Registry::new(blob_store, metadata_store, resolver, config).unwrap()
 }
 
-/// Write raw bytes at the canonical link path for `link` in `namespace`,
-/// bypassing the transactional `update_links` path so tests can seed
-/// hand-crafted or deliberately corrupt link files.
+/// Write raw bytes at the canonical link path, bypassing `update_links` so tests
+/// can seed hand-crafted or corrupt link files.
 pub async fn put_link_raw(store: &Store, namespace: &Namespace, link: &LinkKind, body: &[u8]) {
     store
         .put(
@@ -172,8 +168,7 @@ pub async fn put_link_raw(store: &Store, namespace: &Namespace, link: &LinkKind,
         .expect("raw link write");
 }
 
-/// Test-only helper that writes `content` directly at the canonical blob path
-/// via the underlying `ObjectStore` (no upload state machine, no namespace),
+/// Write `content` directly at the canonical blob path (no upload state machine),
 /// returning its SHA-256 digest.
 pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
     let digest = Digest::sha256_of_bytes(content);
@@ -240,6 +235,12 @@ pub trait RegistryTestCase {
     async fn cleanup(&self) {}
 }
 
+/// S3 endpoint for tests; override with `ANGOS_TEST_S3_ENDPOINT` when the
+/// default port is occupied. CI keeps the default.
+pub fn test_s3_endpoint() -> String {
+    env::var("ANGOS_TEST_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string())
+}
+
 pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
     vec![
         Box::new(FSRegistryTestCase::new()),
@@ -286,12 +287,9 @@ impl FSRegistryTestCase {
         }
     }
 
-    /// Build the blob and metadata stores over **separate** roots, the
-    /// split-backend topology a deployment can configure (distinct S3
-    /// bucket/`key_prefix`). `blob_path(digest)` then resolves to different
-    /// physical objects per store, so a manifest written through the metadata
-    /// transaction would be invisible to the blob-store read path, the
-    /// cross-store-isolation regression this fixture exercises.
+    /// Build the blob and metadata stores over separate roots, the split-backend
+    /// topology a deployment can configure. `blob_path(digest)` then resolves to
+    /// different objects per store, the cross-store-isolation case this exercises.
     pub fn with_split_backends() -> Self {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for split backends");
         let blob_path = temp_dir.path().join("blob").to_string_lossy().into_owned();
@@ -358,7 +356,7 @@ impl S3RegistryTestCase {
         let connection = S3ConnectionConfig {
             access_key_id: Secret::new("root".to_string()),
             secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
+            endpoint: test_s3_endpoint(),
             region: "region".to_string(),
             bucket: "registry".to_string(),
             key_prefix: key_prefix.clone(),
@@ -432,9 +430,7 @@ impl RegistryTestCase for S3RegistryTestCase {
     }
 }
 
-/// Build an `Arc<RegistryClient>` pointed at `uri` with a fresh in-memory
-/// cache. Callers pass a real mock-server URI, or a placeholder like
-/// `"https://unused.test"` when the client is never dialed.
+/// Build an `Arc<RegistryClient>` pointed at `uri` with a fresh in-memory cache.
 pub fn downstream_client(uri: &str) -> Arc<RegistryClient> {
     let backend = cache::Config::Memory.to_backend().unwrap();
     Arc::new(
@@ -445,8 +441,8 @@ pub fn downstream_client(uri: &str) -> Arc<RegistryClient> {
 }
 
 /// Build a test `Repository` named `name` carrying `replication` downstreams.
-/// The sole `Repository` test literal lives here, so a new struct field is
-/// edited in one place; callers vary only the downstream set.
+/// The sole `Repository` test literal lives here; callers vary only the
+/// downstream set.
 pub fn repository_with_replication(
     name: &str,
     replication: Vec<ReplicationDownstream>,

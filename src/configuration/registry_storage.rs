@@ -21,14 +21,8 @@ use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
 
 // Error
 
-/// Errors produced while building the shared storage layer (object store,
-/// transaction executor, lock primitive, capabilities probe) from a
-/// [`RegistryStorageConfig`].
-///
-/// This is intentionally narrower than the metadata-store error type:
-/// `RegistryStorageConfig::build_store` and `RegistryStorageConfig::probe`
-/// don't perform any metadata-store-specific work, so they don't borrow
-/// that subsystem's error vocabulary.
+/// Errors from building the shared storage layer (object store, transaction
+/// executor, lock primitive, capabilities probe) from a [`RegistryStorageConfig`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("storage backend failed: {0}")]
@@ -103,21 +97,13 @@ pub struct S3BackendConfig {
     pub lock_strategy: LockStrategy,
     pub link_cache_ttl: u64,
     pub access_time_debounce_secs: u64,
-    /// Explicitly declare which conditional S3 operations the provider supports.
-    /// Each boolean flag corresponds to a distinct HTTP conditional header:
-    /// - `put_if_none_match`: `PutObject` with If-None-Match: * (create-only)
-    /// - `put_if_match`: `PutObject` with If-Match: <etag> (update-only, enables CAS optimizations)
-    /// - `delete_if_match`: `DeleteObject` with If-Match: <etag> (atomic lock release)
-    ///
-    /// When set, the startup probe is skipped entirely and your declared values are used.
-    /// When absent, the probe runs automatically for S3 metadata storage to auto-detect
-    /// capabilities. With `lock_strategy = "memory"` or `"redis"`, set every flag to
-    /// `false` to skip the probe and force blob-index updates through the configured
-    /// lock backend instead of S3 CAS.
-    ///
-    /// Set explicitly to avoid startup latency from probing, or to handle S3-compatible
-    /// providers where probe results may be inaccurate. Both `put_if_none_match` and
-    /// `put_if_match` must be true for compare-and-swap (CAS) operations to be used.
+    /// Declared conditional-write support, one flag per HTTP conditional header:
+    /// `put_if_none_match` (If-None-Match: *, create-only), `put_if_match`
+    /// (If-Match, update-only), and `delete_if_match` (If-Match delete). When set,
+    /// the startup probe is skipped and these values are used; when absent, the
+    /// probe auto-detects. Both `put_if_none_match` and `put_if_match` must be true
+    /// for compare-and-swap; set all to `false` under memory/redis locking to skip
+    /// the probe and route blob-index updates through the lock backend.
     pub capabilities: Option<ConditionalCapabilities>,
 }
 
@@ -134,11 +120,8 @@ impl Default for S3BackendConfig {
 }
 
 impl<'de> Deserialize<'de> for S3BackendConfig {
-    // Custom impl because `lock_strategy` must be resolved from optional
-    // `redis` / `lock_strategy` keys via `resolve_lock_strategy`.
-    // The connection fields come in flat alongside the metadata-specific
-    // keys; flattening `S3ConnectionConfig` preserves its required/optional
-    // contract (all required except `key_prefix`).
+    // Custom impl to resolve `lock_strategy` from optional `redis` /
+    // `lock_strategy` keys and to flatten the connection fields.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -182,23 +165,17 @@ fn default_access_time_debounce() -> u64 {
 
 // RegistryStorageConfig
 
-/// Unified storage configuration for both the metadata store and the job store.
-///
-/// Both subsystems share the same `ObjectStore` and `TransactionExecutor` pair
-/// built once at startup via [`RegistryStorageConfig::build_store`].
-///
-/// The operator-facing TOML key remains `[metadata_store]` (with `.fs` or
-/// `.s3` sub-tables). The `Inherit` variant is the default and resolves to
-/// the blob-store configuration at startup.
+/// Unified storage configuration for the metadata store and the job store, which
+/// share the `ObjectStore` and `TransactionExecutor` pair built by
+/// [`RegistryStorageConfig::build_store`]. The operator-facing TOML key is
+/// `[metadata_store]` (with `.fs` or `.s3` sub-tables); the default `Inherit`
+/// variant resolves to the blob-store configuration at startup.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum RegistryStorageConfig {
-    /// Inherit blob-store credentials and root path.
-    ///
-    /// Resolved via [`crate::configuration::Configuration::resolve_registry_storage`]
-    /// before reaching [`RegistryStorageConfig::build_store`] or
-    /// [`RegistryStorageConfig::probe`].
-    /// Reaching either method with this variant is a programming error.
+    /// Inherit blob-store credentials and root path. Must be resolved via
+    /// [`crate::configuration::Configuration::resolve_registry_storage`] before
+    /// reaching `build_store` or `probe`; reaching them here is a programming error.
     #[default]
     Inherit,
     #[serde(rename = "fs")]
@@ -243,12 +220,9 @@ impl RegistryStorageConfig {
         }
     }
 
-    /// Probe the underlying S3 store for conditional-write capabilities.
-    ///
-    /// Returns `None` for FS configs (no capabilities to probe). Returns
-    /// [`Error::Coordination`] when called on the `Inherit` variant: callers
-    /// must resolve first via
-    /// [`crate::configuration::Configuration::resolve_registry_storage`].
+    /// Probe the underlying S3 store for conditional-write capabilities. Returns
+    /// `None` for FS configs and [`Error::Coordination`] for the unresolved
+    /// `Inherit` variant.
     pub async fn probe(&self) -> Result<Option<ConditionalCapabilities>, Error> {
         match self {
             RegistryStorageConfig::Inherit => Err(Error::Coordination(
@@ -269,18 +243,12 @@ impl RegistryStorageConfig {
         }
     }
 
-    /// Build the [`Store`] façade shared by the metadata store, the job store,
-    /// and the engine-maintenance loops.
-    ///
-    /// For S3 without operator-declared capabilities this probes the endpoint
-    /// to configure the executor. Server callers that want to memoize the probe
-    /// across hot-reloads should resolve capabilities up front (see
-    /// `setup::build_metadata_store`) and inject them into the config so this
-    /// path skips the probe.
+    /// Build the [`Store`] façade shared by the metadata store, job store, and
+    /// engine-maintenance loops. For S3 without declared capabilities this probes
+    /// the endpoint; callers can inject resolved capabilities to skip the probe.
     #[allow(clippy::too_many_lines)]
     pub async fn build_store(&self) -> Result<Arc<Store>, Error> {
-        // A single `ObjectStore` handle backs both the `Store` façade (CRUD plus
-        // the upload-session lifecycle) and the executor.
+        // One `ObjectStore` handle backs both the `Store` façade and the executor.
         let (object, executor): (Arc<dyn ObjectStore>, Arc<dyn TransactionExecutor>) = match self {
             RegistryStorageConfig::Inherit => {
                 return Err(Error::Coordination(
@@ -379,7 +347,7 @@ mod tests {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("root".to_string()),
                 secret_key: Secret::new("roottoor".to_string()),
-                endpoint: "http://127.0.0.1:9000".to_string(),
+                endpoint: crate::registry::test_utils::test_s3_endpoint(),
                 bucket: "registry".to_string(),
                 region: "region".to_string(),
                 key_prefix: format!("probe-test-{}", uuid::Uuid::new_v4()),

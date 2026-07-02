@@ -81,7 +81,7 @@ impl JobHandler for CacheJobHandler {
         // commit across both. The work is idempotent, so it is safe to redo on a
         // retry even though it no longer commits atomically with job completion.
         if self.blob_store.size(&digest).await.is_ok() {
-            grant_blob_reference(&self.metadata_store, &namespace, &digest)
+            grant_blob_reference(&self.blob_store, &self.metadata_store, &namespace, &digest)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
             return Ok(Transaction::builder().build());

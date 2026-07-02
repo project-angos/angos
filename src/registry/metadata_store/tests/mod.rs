@@ -2,6 +2,7 @@ mod access_time;
 mod backend;
 mod blob_index;
 mod cache;
+mod granted;
 mod legacy_fallback;
 mod list_namespaces;
 
@@ -26,7 +27,7 @@ use crate::{
         metadata_store::{BlobIndex, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore},
         path_builder,
         s3_connection::S3ConnectionConfig,
-        test_utils::{backends, build_store, put_blob_direct},
+        test_utils::{backends, build_store, put_blob_direct, test_s3_endpoint},
     },
     secret::Secret,
 };
@@ -94,7 +95,7 @@ pub fn test_config() -> TestS3Config {
         connection: S3ConnectionConfig {
             access_key_id: Secret::new("root".to_string()),
             secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
+            endpoint: test_s3_endpoint(),
             region: "region".to_string(),
             bucket: "registry".to_string(),
             key_prefix: format!("test-backend-{}", uuid::Uuid::new_v4()),
@@ -1393,7 +1394,7 @@ pub async fn test_datastore_tracked_create_with_referrer(m: Arc<MetadataStore>) 
     let digest_layer = put_blob_direct(m.store(), b"layer content").await;
     let digest_manifest = put_blob_direct(m.store(), b"manifest content").await;
 
-    m.update_links(
+    m.seed_links(
         namespace,
         &[LinkOperation::create_with_referrer(
             LinkKind::Layer(digest_layer.clone()),
@@ -1443,7 +1444,7 @@ pub async fn test_datastore_tracked_delete_with_referrer(m: Arc<MetadataStore>) 
     let first_manifest_digest = put_blob_direct(m.store(), b"manifest a content").await;
     let second_manifest_digest = put_blob_direct(m.store(), b"manifest b content").await;
 
-    m.update_links(
+    m.seed_links(
         namespace,
         &[LinkOperation::create_with_referrer(
             LinkKind::Layer(layer_digest.clone()),
@@ -1454,6 +1455,8 @@ pub async fn test_datastore_tracked_delete_with_referrer(m: Arc<MetadataStore>) 
     .await
     .unwrap();
 
+    // A merge into an existing tracked link inserts no grant, so plain
+    // `update_links` may commit it without a blob-data lock.
     m.update_links(
         namespace,
         &[LinkOperation::create_with_referrer(
@@ -1526,7 +1529,7 @@ pub async fn test_datastore_tracked_delete_removes_when_no_referrers(m: Arc<Meta
     let layer_digest = put_blob_direct(m.store(), b"layer for removal test").await;
     let manifest_digest = put_blob_direct(m.store(), b"manifest for removal test").await;
 
-    m.update_links(
+    m.seed_links(
         namespace,
         &[LinkOperation::create_with_referrer(
             LinkKind::Layer(layer_digest.clone()),
@@ -1598,7 +1601,7 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataSt
             digest_link_digest.clone(),
         ),
     ];
-    m.update_links(namespace, &ops).await.unwrap();
+    m.seed_links(namespace, &ops).await.unwrap();
 
     let tag_meta = m
         .read_link(namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
@@ -1970,9 +1973,8 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
     let base_link = LinkKind::Digest(base_digest.clone());
     create_link(&m, namespace, &base_link, &base_digest).await;
 
-    // Build a Descriptor for the referrer WITHOUT creating the referrer blob.
-    // If the optimization works, list_referrers should return this descriptor
-    // directly from the stored metadata, without needing the blob in the blob store.
+    // Build a referrer Descriptor without creating its blob; list_referrers must
+    // return it from stored metadata alone.
     let referrer_digest: Digest =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .parse()

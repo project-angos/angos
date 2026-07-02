@@ -1,49 +1,30 @@
-mod blob;
-mod blob_index;
-mod layout;
-mod link_references;
-mod link_repair;
+mod jobs;
 pub mod list_all;
-mod manifest;
-mod media_type;
 mod multipart;
-mod orphan_grants;
 mod orphan_jobs;
-mod orphan_namespaces;
-mod referrer;
+mod rebuild;
 mod replication;
 mod retention;
-mod tag;
 mod upload;
 
 use async_trait::async_trait;
-pub use blob::BlobChecker;
-pub use blob_index::BlobIndexChecker;
-pub use layout::LayoutChecker;
-pub use link_references::LinkReferencesChecker;
-pub use link_repair::ensure_link;
-pub use manifest::ManifestChecker;
-pub use media_type::MediaTypeChecker;
+pub use jobs::JobChecker;
 pub use multipart::MultipartChecker;
-pub use orphan_grants::OrphanGrantChecker;
 pub use orphan_jobs::{OrphanJobChecker, OrphanQueue};
-pub use orphan_namespaces::OrphanNamespaceChecker;
-pub use referrer::ReferrerChecker;
+pub use rebuild::{DanglingReference, RebuildChecker, ReferenceKind};
 pub use replication::ReplicationChecker;
 pub use retention::RetentionChecker;
-pub use tag::DigestLinkChecker;
 pub use upload::UploadChecker;
 
 use crate::{
     command::scrub::{error::Error, executor::ActionSink},
-    oci::{Namespace, Tag},
+    oci::Namespace,
 };
 
-/// A checker that operates on a single namespace at a time.
-///
-/// Implementations must not contain `dry_run` logic; they emit `Action` values
-/// to the supplied `sink` and the `Executor` decides whether to apply or skip
-/// each one.
+/// A checker over a single namespace. Implementations emit `Action` values to
+/// the sink for the `Executor` to apply or skip; [`RebuildChecker`] is the
+/// exception, committing through one atomic `update_links` transaction and
+/// carrying its own `dry_run` field.
 #[async_trait]
 pub trait NamespaceChecker: Send + Sync {
     async fn check(
@@ -53,24 +34,8 @@ pub trait NamespaceChecker: Send + Sync {
     ) -> Result<(), Error>;
 }
 
-/// A checker that operates across the entire store (not namespace-scoped).
-///
-/// `BlobChecker` and `MultipartChecker` implement this trait because their
-/// work spans the whole store, not a single namespace.
+/// A checker whose work spans the whole store rather than a single namespace.
 #[async_trait]
 pub trait StoreChecker: Send + Sync {
     async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error>;
-}
-
-/// A checker that inspects a single already-validated tag. The tag walk is
-/// driven once by `Command::scrub_metadata`, which dispatches every valid tag
-/// to each enabled `TagChecker`.
-#[async_trait]
-pub trait TagChecker: Send + Sync {
-    async fn check_tag(
-        &self,
-        namespace: &Namespace,
-        tag: &Tag,
-        sink: &mut (dyn ActionSink + Send),
-    ) -> Result<(), Error>;
 }

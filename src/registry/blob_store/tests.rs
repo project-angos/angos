@@ -96,73 +96,6 @@ async fn seed_blob(store: &BlobStore, content: &[u8]) -> Digest {
     seed_blob_with(store, content, Algorithm::Sha256).await
 }
 
-/// Drain `list_blobs` one page at a time until the token is `None`, collecting
-/// every blob surfaced.
-async fn drain_blobs(store: &BlobStore, page_size: u16) -> Vec<Digest> {
-    let mut walked = Vec::new();
-    let mut marker = None;
-    loop {
-        let (page, next) = store.list_blobs(page_size, marker).await.unwrap();
-        assert!(page.len() <= usize::from(page_size));
-        walked.extend(page);
-        match next {
-            Some(next_marker) => marker = Some(next_marker),
-            None => break,
-        }
-    }
-    walked
-}
-
-pub async fn test_datastore_list_blobs(store: &BlobStore) {
-    let blob_contents = [
-        b"aaa_content_1".to_vec(),
-        b"bbb_content_2".to_vec(),
-        b"ccc_content_3".to_vec(),
-    ];
-
-    let mut digests = Vec::new();
-    for content in &blob_contents {
-        digests.push(seed_blob(store, content).await);
-    }
-
-    // A single large page returns every blob with no continuation.
-    let (blobs, token) = store.list_blobs(10, None).await.unwrap();
-    assert!(token.is_none());
-    assert!(blobs.len() >= digests.len());
-    for digest in &digests {
-        assert!(blobs.contains(digest));
-    }
-
-    // Draining one or two at a time surfaces every blob exactly once.
-    for page_size in [1, 2] {
-        let walked = drain_blobs(store, page_size).await;
-        assert_eq!(walked.len(), digests.len());
-        for digest in &digests {
-            assert!(
-                walked.contains(digest),
-                "page_size {page_size} missed {digest}"
-            );
-        }
-    }
-}
-
-pub async fn test_datastore_list_blobs_across_algorithms(store: &BlobStore) {
-    // Blobs of both algorithms live under separate prefixes; the listing must
-    // walk across the boundary and surface each exactly once.
-    let mut expected = Vec::new();
-    for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
-        for content in [b"alpha".as_slice(), b"beta".as_slice()] {
-            expected.push(seed_blob_with(store, content, algorithm).await);
-        }
-    }
-
-    let walked = drain_blobs(store, 1).await;
-    assert_eq!(walked.len(), expected.len());
-    for digest in &expected {
-        assert!(walked.contains(digest), "missed {digest}");
-    }
-}
-
 pub async fn test_datastore_blob_operations(store: &BlobStore) {
     let test_content = b"Test blob content";
     let digest = seed_blob(store, test_content).await;
@@ -252,22 +185,6 @@ use crate::registry::test_utils::backends;
 async fn list_uploads() {
     for tc in backends() {
         test_datastore_list_uploads(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn list_blobs() {
-    for tc in backends() {
-        test_datastore_list_blobs(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn list_blobs_across_algorithms() {
-    for tc in backends() {
-        test_datastore_list_blobs_across_algorithms(tc.blob_store().as_ref()).await;
         tc.cleanup().await;
     }
 }

@@ -315,8 +315,8 @@ Redis and S3 should be:
 ### Storage Maintenance
 
 - Run scrub with least privilege
-- Audit what's deleted
-- Use dry-run first
+- Review the logged deletions and the `_scrub-audit/latest.json` marker
+- Run report-only (the default, no `--commit`) first
 
 ### Monitoring
 

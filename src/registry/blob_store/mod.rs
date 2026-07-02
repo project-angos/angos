@@ -1,10 +1,8 @@
 //! Blob storage subsystem.
 //!
-//! Exposes a single [`BlobStore`] over an `Arc<Store>` façade that bundles the
-//! object store, upload-session store, optional presign backend, and the
-//! transaction executor for upload promotion. FS and S3 share one code path
-//! (the [`BlobStoreConfig`] enum only picks the storage handles); all public
-//! methods are inherent on `BlobStore`, with no caller-facing trait.
+//! A single [`BlobStore`] over an `Arc<Store>` façade bundling the object store,
+//! upload-session store, optional presign backend, and the executor for upload
+//! promotion. FS and S3 share one code path selected by [`BlobStoreConfig`].
 
 mod config;
 mod error;
@@ -22,22 +20,19 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use tokio::io::AsyncRead;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 use angos_tx_engine::{StorageError, store::Store};
 
 pub use config::BlobStoreConfig;
-// Inner config structs are only constructed by tests; production code builds
-// backends through `BlobStoreConfig`. Re-export them for test builds only.
+// Inner config structs are only constructed by tests; production builds through
+// `BlobStoreConfig`.
 #[cfg(test)]
 pub use config::{FsBackendConfig, S3BackendConfig, TransportFields};
 pub use error::Error;
 pub use multipart_cleanup::{MultipartCleanup, OrphanMultipartUpload};
 
-use crate::{
-    oci::Digest,
-    registry::{pagination, path_builder},
-};
+use crate::{oci::Digest, registry::path_builder};
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
 
@@ -50,10 +45,9 @@ pub struct UploadSummary {
 
 #[derive(Clone)]
 pub struct BlobStore {
-    /// Storage façade: object reads/writes, the upload lifecycle (including
-    /// finalization), and presigning all flow through here. The façade owns the
-    /// executor used by the upload-promotion transaction. (On FS, the backend
-    /// prunes its own empty ancestor directories on delete, callers don't.)
+    /// Storage façade: object reads/writes, the upload lifecycle, and presigning
+    /// all flow through here, and it owns the upload-promotion executor. On FS the
+    /// backend prunes its own empty ancestor directories on delete.
     pub store: Arc<Store>,
 }
 
@@ -64,48 +58,17 @@ impl Debug for BlobStore {
 }
 
 impl BlobStore {
-    /// Construct a blob store over the storage façade `store`. Build the façade
-    /// with the upload-session store enabled (and, where applicable, the
-    /// presign backend).
+    /// Construct a blob store over the storage façade `store`, built with the
+    /// upload-session store (and, where applicable, the presign backend).
     #[must_use]
     pub fn new(store: Arc<Store>) -> Self {
         BlobStore { store }
     }
 }
 
-// blob CRUD (formerly `impl BlobStore`)
+// Blob CRUD
 
 impl BlobStore {
-    #[instrument(skip(self))]
-    pub async fn list_blobs(
-        &self,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        debug!("Fetching {n} blob(s) with continuation token: {continuation_token:?}");
-
-        // Blobs are sharded by algorithm (`blobs/<algo>/<shard>/<hash>/data`); each
-        // blob is the `/data` key under its container.
-        pagination::paginate_by_algorithm(
-            n,
-            continuation_token,
-            |algorithm, limit, cursor| async move {
-                let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
-                let page = self.store.list(&blob_prefix, limit, cursor).await?;
-                let blobs = page
-                    .items
-                    .into_iter()
-                    .filter_map(|key| {
-                        let hash = key.strip_suffix("/data")?.rsplit_once('/')?.1;
-                        Digest::with_algorithm(algorithm, hash).ok()
-                    })
-                    .collect();
-                Ok((blobs, page.next_token))
-            },
-        )
-        .await
-    }
-
     #[instrument(skip(self))]
     pub async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
         let path = path_builder::blob_path(digest);
@@ -121,19 +84,6 @@ impl BlobStore {
         let path = path_builder::blob_path(digest);
         match self.store.head(&path).await {
             Ok(meta) => Ok(meta.size),
-            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// The blob bytes' last-modified time, or `None` when the backend records
-    /// none. Used to age-gate orphan-grant cleanup so an in-flight push (which
-    /// grants ownership before linking the manifest) is never reaped.
-    #[instrument(skip(self))]
-    pub async fn last_modified(&self, digest: &Digest) -> Result<Option<DateTime<Utc>>, Error> {
-        let path = path_builder::blob_path(digest);
-        match self.store.head(&path).await {
-            Ok(meta) => Ok(meta.last_modified),
             Err(StorageError::NotFound) => Err(Error::BlobNotFound),
             Err(e) => Err(e.into()),
         }
@@ -161,8 +111,8 @@ impl BlobStore {
     }
 
     /// Delete a namespace's repository subtree (its in-flight uploads) by raw
-    /// on-disk name, so scrub can reclaim an upload directory whose name fails
-    /// `Namespace` validation.
+    /// on-disk name, for a scrub of a directory whose name fails `Namespace`
+    /// validation.
     #[instrument(skip(self))]
     pub async fn delete_namespace_directory(&self, name: &str) -> Result<(), Error> {
         let prefix = path_builder::namespace_dir(name).ok_or_else(|| {
@@ -173,9 +123,9 @@ impl BlobStore {
     }
 
     /// Write `body` directly at the content-addressed blob path, for small
-    /// in-memory content (manifest bodies); layer blobs use the streaming upload
-    /// lifecycle instead. Idempotent (the digest fixes path and bytes); callers
-    /// serialise against concurrent reclaim with the blob-data lock.
+    /// in-memory content like manifest bodies; layer blobs use the streaming
+    /// upload lifecycle. Idempotent; callers serialise reclaim with the
+    /// blob-data lock.
     #[instrument(skip(self, body))]
     pub async fn put_blob(&self, digest: &Digest, body: Bytes) -> Result<(), Error> {
         self.store
@@ -185,12 +135,11 @@ impl BlobStore {
     }
 }
 
-// presigning (formerly `impl PresignedBlobStore`)
+// Presigning
 
 impl BlobStore {
-    /// Generate a presigned download URL for `digest` when the underlying
-    /// storage supports presigning. Returns `Ok(None)` when no presigning
-    /// backend was provided to the builder.
+    /// A presigned download URL for `digest`, or `Ok(None)` when no presign
+    /// backend was configured.
     #[instrument(skip(self))]
     pub async fn presigned_url(
         &self,

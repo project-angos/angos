@@ -1,15 +1,8 @@
-//! [`JobStore`]: unified job-queue storage, producer, and consumer backed by
-//! a storage façade (`Store`) carrying the object store and transaction
-//! executor.
+//! [`JobStore`]: unified job-queue storage, producer, and consumer over a
+//! `Store` façade.
 //!
-//! All write operations that require atomicity (enqueue dedup, complete,
-//! fail/retry, dead-letter) are handled by the transaction engine and never
-//! touch the object-store layer directly.
-//!
-//! The orphan self-heal inside [`JobStore::find_pending_with_lock_key`] also
-//! goes through the engine: it submits a one-mutation transaction whose read
-//! fingerprint guards against a concurrent enqueue that refreshes the index
-//! between the GET and the delete.
+//! Every atomic write (enqueue dedup, complete, fail/retry, dead-letter) goes
+//! through the transaction engine rather than the object-store layer directly.
 
 use std::{
     fmt,
@@ -36,6 +29,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use angos_backoff::Backoff;
+use angos_storage::Etag;
 use angos_tx_engine::{
     StorageError,
     error::Error as TxError,
@@ -79,9 +73,8 @@ impl From<LockError> for Error {
 // Queue
 // ---------------------------------------------------------------------------
 
-/// The set of durable job queues. Selects the storage prefix, the worker's
-/// `--queue` filter, and the dispatch handler. Serializes as its lowercase name
-/// so stored envelopes, storage paths, and metric labels keep their string form.
+/// The durable job queues. Selects the storage prefix, the worker's `--queue`
+/// filter, and the dispatch handler. Serializes as its lowercase name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Queue {
@@ -124,13 +117,9 @@ impl FromStr for Queue {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Job-queue tunables. `[global.job_queue]` does not change durability (jobs
-/// persist under the store's `_jobs/` prefix either way); it switches draining
-/// to separate `angos worker` processes and enables the queue-depth gauge.
-///
-/// Storage is inherited from the shared `[metadata_store]` configuration.
-/// The per-`lock_key` execution lock TTL is governed by the configured lock
-/// backend, so there is no job-queue-level TTL knob.
+/// Job-queue tunables. `[global.job_queue]` switches draining to separate
+/// `angos worker` processes and enables the queue-depth gauge; jobs persist
+/// under the store's `_jobs/` prefix either way.
 #[derive(Clone, Debug, Deserialize)]
 pub struct JobQueueConfig {
     #[serde(
@@ -142,11 +131,8 @@ pub struct JobQueueConfig {
     pub pending_ready_horizon_secs: u64,
 }
 
-/// Floor on `pending_refresh_interval_secs`. The same value is the documented
-/// S3 floor (sub-5s ticks induce LIST storms when multiple server replicas
-/// each refresh in parallel); applying it as a hard config-time guard prevents
-/// operators from accidentally configuring `0` or `1` and discovering the
-/// consequences in production.
+/// Floor on `pending_refresh_interval_secs`: sub-5s ticks induce LIST storms
+/// when replicas refresh in parallel, so it is enforced at config time.
 const MIN_PENDING_REFRESH_INTERVAL_SECS: u64 = 5;
 
 fn deserialize_pending_refresh_interval_secs<'de, D: Deserializer<'de>>(
@@ -174,25 +160,22 @@ fn default_pending_ready_horizon_secs() -> u64 {
 // JobEnvelope
 // ---------------------------------------------------------------------------
 
-/// Envelope that travels through the queue. The `payload` field is untyped so
-/// the envelope shape stays stable across payload churn; handlers deserialize
-/// it into a concrete type.
-///
-/// Note: `not_before` is **not** stored on the envelope. It is encoded in the
-/// storage key (the filename stem) as a sortable hex unix-millis prefix; see
-/// [`make_storage_key`]. The filename is the single source of truth so a
-/// claim loop can decide readiness from a LIST result alone.
+/// Envelope that travels through the queue. `payload` is untyped so the shape
+/// stays stable across payload churn; handlers deserialize it into a concrete
+/// type. `not_before` is encoded in the storage-key stem (see
+/// [`make_storage_key`]), not on the envelope, so a claim loop decides readiness
+/// from a LIST result alone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEnvelope {
     pub id: String,
     /// Logical queue; selects the storage prefix and the worker's `--queue`
     /// filter.
     pub queue: Queue,
-    /// Job type identifier (e.g. `"cache.fetch_blob"`). Handlers reject
-    /// envelopes whose `kind` they do not recognize.
+    /// Job type identifier (e.g. `"cache.fetch_blob"`); handlers reject an
+    /// unrecognized `kind`.
     pub kind: String,
-    /// Per-key serialization token: at most one worker holds the execution
-    /// lock per `lock_key`.
+    /// Per-key serialization token: at most one worker holds the execution lock
+    /// per `lock_key`.
     pub lock_key: String,
     pub created_at: DateTime<Utc>,
     pub attempts: u32,
@@ -201,9 +184,8 @@ pub struct JobEnvelope {
 }
 
 impl JobEnvelope {
-    /// Build an envelope with a new UUID v4, default retry budget, and a typed
-    /// payload that will be serialized to JSON. Returns `Err` only if the
-    /// payload type cannot be serialized.
+    /// Build an envelope with a fresh UUID v4, default retry budget, and a typed
+    /// payload serialized to JSON. `Err` only if the payload cannot serialize.
     pub fn new<P: Serialize>(
         queue: Queue,
         kind: impl Into<String>,
@@ -228,26 +210,20 @@ impl JobEnvelope {
 // ---------------------------------------------------------------------------
 
 /// Width of the hex unix-millis prefix in a storage key. 16 hex chars cover
-/// `u64::MAX` milliseconds (well past year 5 billion), so the prefix is
-/// fixed-width and lexicographic sort always matches time order.
+/// `u64::MAX` milliseconds, so lexicographic sort always matches time order.
 pub const STORAGE_KEY_PREFIX_LEN: usize = 16;
 
-/// Build a storage key (filename stem) encoding `not_before` as a sortable
-/// hex unix-millis prefix followed by `-<id>`. Lexicographic sort of these
-/// keys matches time order, so [`JobStore::list_pending`] returns ready
-/// envelopes first and the claim loop can stop scanning as soon as it sees a
-/// prefix in the future.
-///
-/// Negative timestamps (pre-1970) clamp to 0; the queue is not meaningful
-/// before unix epoch.
+/// Build a storage-key stem encoding `not_before` as a sortable hex unix-millis
+/// prefix followed by `-<id>`, so a lex sort matches time order and the claim
+/// loop stops scanning at the first future prefix. Pre-1970 clamps to 0.
 pub fn make_storage_key(not_before: DateTime<Utc>, id: &str) -> String {
     let millis = u64::try_from(not_before.timestamp_millis()).unwrap_or(0);
     format!("{millis:016x}-{id}")
 }
 
-/// Parse the `not_before` instant encoded in a storage-key prefix. Returns
-/// `None` for malformed keys (missing prefix, bad hex). Used by the claim
-/// loop to skip backed-off envelopes without reading their bodies.
+/// Parse the `not_before` instant from a storage-key prefix, or `None` for a
+/// malformed key. Lets the claim loop skip backed-off envelopes without reading
+/// their bodies.
 pub fn parse_not_before(storage_key: &str) -> Option<DateTime<Utc>> {
     let bytes = storage_key.as_bytes();
     if bytes.len() <= STORAGE_KEY_PREFIX_LEN || bytes[STORAGE_KEY_PREFIX_LEN] != b'-' {
@@ -258,13 +234,9 @@ pub fn parse_not_before(storage_key: &str) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(i64::try_from(millis).ok()?)
 }
 
-/// Hex unix-millis prefix (same format as [`make_storage_key`]) marking the
-/// upper bound of the ready window for the autoscaler gauge. Storage keys
-/// whose 16-hex prefix compares lexicographically greater are scheduled
+/// Hex unix-millis prefix (as [`make_storage_key`]) marking the ready window's
+/// upper bound for the autoscaler gauge: keys whose prefix sorts greater are
 /// past the horizon and excluded from the count.
-///
-/// `horizon_secs` is sourced from
-/// [`JobQueueConfig::pending_ready_horizon_secs`].
 pub fn pending_ready_cutoff_prefix(horizon_secs: u64) -> String {
     let cutoff =
         Utc::now() + ChronoDuration::seconds(i64::try_from(horizon_secs).unwrap_or(i64::MAX));
@@ -276,16 +248,13 @@ pub fn pending_ready_cutoff_prefix(horizon_secs: u64) -> String {
 // Dedup-index helpers
 // ---------------------------------------------------------------------------
 
-/// On-disk shape of the per-`lock_key` dedup index file written alongside
-/// every pending envelope. Holds the `storage_key` of the most-recent
-/// pending file for this `lock_key`, which lets `find_pending_with_lock_key`
-/// do an O(1) `HEAD <pending>` instead of LIST-scanning bodies.
+/// On-disk shape of the per-`lock_key` dedup index. Holds the `storage_key` of
+/// the most-recent pending file for this `lock_key`, so
+/// `find_pending_with_lock_key` does an O(1) `HEAD` instead of a LIST scan.
 ///
-/// The index is best-effort: a crash between writing the pending file and
-/// writing the index leaves no index (next enqueue dedup-misses, spurious
-/// duplicate eventually idempotently handled). A crash between deleting the
-/// pending file and the index leaves an orphan index; the next enqueue
-/// detects this via the absent pending and self-heals.
+/// Best-effort: a crash before the index write leaves none (next enqueue
+/// dedup-misses); a crash after deleting the pending file leaves an orphan the
+/// next enqueue self-heals.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LockKeyIndex {
     pub storage_key: String,
@@ -303,6 +272,16 @@ pub fn parse_lock_key_index(bytes: &[u8]) -> Result<LockKeyIndex, Error> {
         .map_err(|e| Error::Storage(format!("failed to parse lock-key index: {e}")))
 }
 
+/// Classified read of a per-`lock_key` dedup index file. Every reader handles
+/// `Corrupt` explicitly (retire or overwrite under its fingerprint) instead of
+/// propagating a parse error, so a corrupt index can never permanently
+/// suppress enqueues for its `lock_key`.
+enum LockKeyIndexRead {
+    Absent,
+    Valid { storage_key: String, bytes: Vec<u8> },
+    Corrupt { bytes: Vec<u8> },
+}
+
 // ---------------------------------------------------------------------------
 // Dead-letter serializer
 // ---------------------------------------------------------------------------
@@ -316,10 +295,8 @@ struct DeadLetterRecord<'a> {
     failed_at: DateTime<Utc>,
 }
 
-/// Owned, deserializable view of a dead-letter record. The borrowing
-/// [`DeadLetterRecord`] is write-only; this is its read counterpart. The
-/// flattened envelope plus `last_error`/`failed_at` round-trip the JSON
-/// written by [`serialize_dead_letter`].
+/// Owned read counterpart of the write-only [`DeadLetterRecord`], round-tripping
+/// the JSON written by [`serialize_dead_letter`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeadLetterRead {
     #[serde(flatten)]
@@ -343,24 +320,17 @@ pub fn serialize_dead_letter(envelope: &JobEnvelope, last_error: &str) -> Result
 
 /// Executor for a single job kind.
 ///
-/// Returns the work-product [`Transaction`] on success; the queue runtime
-/// merges it with the pending/index cleanup mutations and submits the whole
-/// thing as one engine transaction so the handler's effect and the queue
-/// bookkeeping commit atomically together. Return an empty [`Transaction`]
-/// when the handler has no storage-side effect to commit (the cleanup
-/// mutations still land atomically).
+/// Returns the work-product [`Transaction`] on success (empty when there is no
+/// storage-side effect); the runtime merges it with the pending/index cleanup
+/// and commits both as one engine transaction.
 ///
 /// # Idempotency
 ///
-/// `JobStore::complete` commits the work-product mutations and the
-/// pending/index deletes in a single engine transaction, so handlers whose
-/// effect is expressible as engine mutations need not be idempotent: each
-/// attempt either commits atomically or aborts cleanly.
-///
-/// Handlers with *external*, non-transactional side-effects (e.g. calls to
-/// an outside service) must still be idempotent: the engine cannot roll
-/// those back. The only re-execution path is a worker dying between claim
-/// and commit, bounded by the execution-lock TTL.
+/// Handlers whose effect is expressible as engine mutations need not be
+/// idempotent: each attempt commits atomically or aborts cleanly. Handlers with
+/// external, non-transactional side-effects must still be idempotent, since a
+/// worker dying between claim and commit (bounded by the execution-lock TTL)
+/// re-executes them.
 #[async_trait]
 pub trait JobHandler: Send + Sync {
     async fn execute(&self, envelope: &JobEnvelope) -> Result<Transaction, Error>;
@@ -370,34 +340,29 @@ pub trait JobHandler: Send + Sync {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum number of pending envelopes inspected per scan. Deeper queues fall
-/// back to lock-based serialization, which is the actual correctness primitive.
+/// Maximum pending envelopes inspected per scan. Deeper queues fall back to
+/// lock-based serialization, the actual correctness primitive.
 pub const MAX_SCAN: u16 = 1000;
 
-/// Maximum value reported by [`JobStore::count_pending`]. The gauge feeds KEDA
-/// autoscaling, which only needs ordinal granularity at high queue depths:
-/// once the queue exceeds 10x the worker pool size you're at max scale anyway.
-/// Capping here bounds S3 `LIST` cost per refresh tick to ~10 paginated calls
-/// regardless of how deep the queue actually is. Operators reading the gauge
-/// should treat the cap value as "at least this many".
+/// Cap on [`JobStore::count_pending`]. The gauge feeds KEDA autoscaling, which
+/// only needs ordinal granularity at high depths; capping bounds `LIST` cost per
+/// refresh tick. Read the cap value as "at least this many".
 pub const MAX_REPORTED_PENDING: u64 = 10_000;
 
 // ---------------------------------------------------------------------------
 // Consumer types
 // ---------------------------------------------------------------------------
 
-/// Lock key used to serialise per-`lock_key` job execution. Prefixed so it
-/// shares a namespace with the rest of the job-store's locked operations
-/// (dedup index, etc.) without colliding.
+/// Lock key serialising per-`lock_key` job execution, prefixed to avoid
+/// colliding with other locked job-store operations.
 fn job_lock_key(lock_key: &str) -> String {
     format!("job:{lock_key}")
 }
 
-/// A job claimed by a worker, ready to execute. `session` holds the
-/// distributed lock on the job's `lock_key`; its heartbeat keeps the lock
-/// alive, and the lock is released on `complete`/`fail`. `storage_key`
-/// identifies the pending file the envelope was loaded from so
-/// `complete`/`fail` can delete or rewrite that file.
+/// A job claimed by a worker, ready to execute. `session` holds the distributed
+/// lock on the `lock_key`, released on `complete`/`fail`. `storage_key` is the
+/// pending file the envelope was loaded from, for `complete`/`fail` to delete or
+/// rewrite.
 pub struct ClaimedJob {
     pub envelope: JobEnvelope,
     pub storage_key: String,
@@ -409,21 +374,18 @@ pub enum FailOutcome {
     MovedToDeadLetter,
 }
 
-/// Outcome of [`JobStore::complete`]. A failure to commit the work-product +
-/// cleanup transaction is **not** surfaced as an error the caller must handle
-/// out-of-band: the job is failed over (retried with backoff, or dead-lettered
-/// once its budget is spent) so a persistently-failing commit cannot leave the
-/// pending file re-claimable in a hot loop. The variant tells the caller which
-/// happened for logging.
+/// Outcome of [`JobStore::complete`]. A commit failure is not surfaced as an
+/// error: the job is failed over (retry or dead-letter) so a persistently
+/// failing commit cannot leave the pending file re-claimable in a hot loop.
 pub enum CompleteOutcome {
     /// The work commit and queue cleanup landed; the job is done.
     Completed,
-    /// The commit (or the dedup-index read that precedes it) failed; the job
-    /// was failed over via [`JobStore::fail`] instead.
+    /// The commit (or the preceding dedup-index read) failed; the job was failed
+    /// over via [`JobStore::fail`] instead.
     FailedOver(FailOutcome),
 }
 
-/// Which durable partition a job lives in, used to address admin mutations
+/// Which durable partition a job lives in, addressing admin mutations
 /// (`retry`/`delete`) at the correct storage prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -431,21 +393,18 @@ pub enum JobState {
     Failed,
 }
 
-/// Outcome of a single `claim_one` attempt. `claimed` is `Some` when a job was
-/// claimed; otherwise `next_ready` carries the soonest `not_before` observed
-/// across the scan so the caller can sleep until then rather than polling at
-/// full cadence through unchanged backed-off envelopes.
+/// Outcome of one `claim_one` attempt. When nothing was claimed, `next_ready`
+/// carries the soonest `not_before` seen so the caller sleeps until then rather
+/// than polling through unchanged backed-off envelopes.
 pub struct ClaimOutcome {
     pub claimed: Option<ClaimedJob>,
     pub next_ready: Option<DateTime<Utc>>,
 }
 
 impl ClaimOutcome {
-    /// How long the caller should idle before the next `claim_one` attempt.
-    /// When only backed-off envelopes were seen, the sleep extends to the
-    /// soonest `not_before`, clamped to `[poll_interval, max(poll_interval, 1 min)]`
-    /// so the worker stops re-reading unchanged envelopes every tick while
-    /// still picking up newly-enqueued ready jobs promptly.
+    /// How long to idle before the next `claim_one`. With only backed-off
+    /// envelopes seen, extends to the soonest `not_before` clamped to
+    /// `[poll_interval, max(poll_interval, 1 min)]`.
     pub fn idle_sleep(&self, poll_interval: Duration) -> Duration {
         let max_sleep = poll_interval.max(Duration::from_mins(1));
         self.next_ready.map_or(poll_interval, |t| {
@@ -477,17 +436,10 @@ fn tx_error_to_job(err: TxError) -> Error {
 // JobStore: unified producer + consumer + storage
 // ---------------------------------------------------------------------------
 
-/// Unified job-queue store: producer (`enqueue`), consumer
-/// (`claim_one` / `complete` / `fail`), and raw storage primitives
-/// (`list_pending`, `count_pending`, `find_pending_with_lock_key`).
-///
-/// All write operations that require atomicity go through the
-/// [`TransactionExecutor`]; the raw `ObjectStore` is used for reads and
-/// low-level access patterns that do not need CAS.
-///
-/// `worker_id` is an optional per-process identifier attached to structured
-/// log entries from `claim_one`; supply an empty string or any identifier when
-/// constructing for producer-only use.
+/// Unified job-queue store: producer (`enqueue`), consumer (`claim_one` /
+/// `complete` / `fail`), and raw storage primitives. Atomic writes go through
+/// the transaction executor; reads use the raw object store. `worker_id` tags
+/// `claim_one` log entries (empty for producer-only use).
 pub struct JobStore {
     store: Arc<Store>,
     worker_id: String,
@@ -497,11 +449,8 @@ pub struct JobStore {
 }
 
 impl JobStore {
-    /// Construct a new `JobStore`.
-    ///
-    /// `worker_id` is a structured-log tag that makes concurrent workers'
-    /// `claim_one` actions distinguishable in aggregated logs. Pass an empty
-    /// string for producer-only instances.
+    /// Construct a `JobStore`. `worker_id` tags `claim_one` log entries; pass an
+    /// empty string for producer-only instances.
     pub fn new(store: Arc<Store>, worker_id: impl Into<String>) -> Self {
         Self {
             store,
@@ -522,9 +471,8 @@ impl JobStore {
     // Storage primitives
     // -----------------------------------------------------------------------
 
-    /// List up to `n` pending storage keys in ascending order. Storage keys
-    /// start with a sortable hex-millis prefix, so callers can stop scanning
-    /// at the first key whose prefix is in the future.
+    /// List up to `n` pending storage keys in ascending order. The sortable
+    /// hex-millis prefix lets callers stop at the first future key.
     pub async fn list_pending(&self, queue: Queue, n: u16) -> Result<Vec<String>, Error> {
         let prefix = path_builder::job_pending_dir(queue.as_str());
         let page = self.store.list(&prefix, 1000, None).await?;
@@ -562,9 +510,8 @@ impl JobStore {
     }
 
     /// One keyset page of pending storage keys in ascending (time) order. Pass
-    /// `after = Some(last_key)` from a previous page to resume; the cursor is
-    /// the plain storage key (non-opaque). The returned `next` is `Some(key)`
-    /// when the backend reports more entries beyond this page.
+    /// `after = Some(last_key)` to resume; the cursor is the plain storage key.
+    /// `next` is `Some` when the backend reports more entries.
     pub async fn list_pending_page(
         &self,
         queue: Queue,
@@ -587,10 +534,67 @@ impl JobStore {
             .await
     }
 
+    /// List the queue sub-directory names under `_jobs/<state>/`, one per queue.
+    /// Structural scrub diffs these against the known [`Queue`] set to flag an
+    /// unknown queue directory without reading job bodies. Returns bare child
+    /// names, looping pagination to exhaustion; an absent root yields an empty
+    /// list.
+    pub async fn list_queue_dirs(&self, state: JobState) -> Result<Vec<String>, Error> {
+        let root = match state {
+            JobState::Pending => path_builder::job_pending_root_dir(),
+            JobState::Failed => path_builder::job_failed_root_dir(),
+        };
+        let mut names = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self.store.list_children(&root, 1000, token, None).await?;
+            names.extend(page.sub_prefixes);
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        Ok(names)
+    }
+
+    /// One keyset page of dedup-index stems under `_jobs/index/<queue>/`, one
+    /// per `lock_key` (`.json` stripped), so the dangling-lock-key reconcile
+    /// drains pages and keeps only one page resident. Keyset (not offset) paging
+    /// stays correct while the reconcile deletes entries between pages. Pass
+    /// `after = Some(last_stem)` to resume; `next` is `Some` when more remain.
+    pub async fn list_lock_key_index_keys_page(
+        &self,
+        queue: Queue,
+        after: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>), Error> {
+        self.list_page(&path_builder::job_lock_key_index_dir(queue.as_str()), 1000, after)
+            .await
+    }
+
+    /// Enumerate every dedup-index stem for `queue` by draining
+    /// [`Self::list_lock_key_index_keys_page`]; an absent directory yields an
+    /// empty list. Test-only convenience that buffers every stem; production
+    /// paths use the paginated method.
+    #[cfg(test)]
+    pub async fn list_lock_key_index_keys(&self, queue: Queue) -> Result<Vec<String>, Error> {
+        let mut keys = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let (page, next) = self
+                .list_lock_key_index_keys_page(queue, after.as_deref())
+                .await?;
+            keys.extend(page);
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        Ok(keys)
+    }
+
     /// Shared keyset pager over a job directory. Children are flat `<key>.json`
-    /// files, so `list_children` returns them as bare `objects` in lexicographic
-    /// (== time) order; `start_after` skips up to and including its argument, so
-    /// the cursor is suffixed with `.json` to match the stored child name.
+    /// files in lexicographic (== time) order; the cursor is suffixed `.json` to
+    /// match the stored child name for `start_after`.
     async fn list_page(
         &self,
         dir: &str,
@@ -604,8 +608,8 @@ impl JobStore {
             .into_iter()
             .filter_map(|name| name.strip_suffix(".json").map(str::to_string))
             .collect();
-        // The backend's `next_token` is the accurate "more entries exist"
-        // signal; surface our own last storage key as the (non-opaque) cursor.
+        // `next_token` is the "more entries exist" signal; the returned cursor is
+        // our own last storage key.
         let next = page
             .next_token
             .is_some()
@@ -627,9 +631,8 @@ impl JobStore {
                 let Some(stem) = name.strip_suffix(".json") else {
                     continue;
                 };
-                // Storage list returns lex-sorted keys, which equals `not_before`
-                // order due to the fixed-width hex unix-millis prefix. Stop
-                // counting at the first key past the readiness cutoff.
+                // Lex-sorted keys equal `not_before` order, so stop at the first
+                // key past the readiness cutoff.
                 if let Some(p) = stem.get(..STORAGE_KEY_PREFIX_LEN)
                     && p > cutoff_prefix.as_str()
                 {
@@ -648,9 +651,8 @@ impl JobStore {
     }
 
     /// Count dead-lettered envelopes in `queue`, capped at
-    /// [`MAX_REPORTED_PENDING`]. Feeds the server-published
-    /// `angos_job_queue_failed` gauge so dead-letters stay observable even when
-    /// `angos worker` (which has no metrics endpoint) drains the queue.
+    /// [`MAX_REPORTED_PENDING`]. Feeds the `angos_job_queue_failed` gauge so
+    /// dead-letters stay observable even when `angos worker` drains the queue.
     pub async fn count_failed(&self, queue: Queue) -> Result<u64, Error> {
         let prefix = path_builder::job_failed_dir(queue.as_str());
         let mut count: u64 = 0;
@@ -674,43 +676,34 @@ impl JobStore {
     }
 
     /// `true` when any pending job in `queue` carries `lock_key`. Best-effort
-    /// dedup backed by an O(1) index file written alongside each pending
-    /// envelope (see [`LockKeyIndex`]).
-    ///
-    /// When the index references a pending file that has vanished (orphan),
-    /// submits a one-mutation engine transaction to delete the stale index,
-    /// guarded by a read fingerprint so a concurrent enqueue that refreshes
-    /// the index between our GET and the apply is never accidentally deleted.
+    /// dedup backed by an O(1) index file (see [`LockKeyIndex`]). An orphan
+    /// index (pending file vanished) or a corrupt one is retired via a
+    /// fingerprint-guarded engine delete, so neither counts as a hit.
     pub async fn find_pending_with_lock_key(
         &self,
         queue: Queue,
         lock_key: &str,
     ) -> Result<bool, Error> {
         let index_path = path_builder::job_lock_key_index_path(queue.as_str(), lock_key);
-        let data = match self.store.get(&index_path).await {
-            Ok(d) => d,
-            Err(StorageError::NotFound) => return Ok(false),
-            Err(e) => return Err(Error::from(e)),
+        let (storage_key, data) = match self.read_lock_key_index_at(&index_path).await? {
+            LockKeyIndexRead::Absent => return Ok(false),
+            LockKeyIndexRead::Corrupt { bytes } => {
+                warn!(lock_key, "Corrupt job dedup index; retiring");
+                self.retire_corrupt_index(&index_path, &bytes).await;
+                return Ok(false);
+            }
+            LockKeyIndexRead::Valid { storage_key, bytes } => (storage_key, bytes),
         };
-        let index = parse_lock_key_index(&data)?;
 
-        let pending_key = path_builder::job_pending_path(queue.as_str(), &index.storage_key);
+        let pending_key = path_builder::job_pending_path(queue.as_str(), &storage_key);
         match self.store.head(&pending_key).await {
             Ok(_) => Ok(true),
             Err(StorageError::NotFound) => {
-                // Orphan: pending file vanished but the index lingers. Submit a
-                // one-mutation engine transaction whose Read fingerprint validates
-                // the index hasn't been refreshed by a concurrent enqueue between
-                // our GET and the apply. If it has, the engine returns Conflict
-                // and we don't delete the fresh index. Passing the index's own
-                // `storage_key` as the target makes the conditional delete fire
-                // for this orphan while reusing the shared fingerprint guard.
-                let (read, delete) = Self::conditional_index_delete(
-                    index_path,
-                    &data,
-                    &index.storage_key,
-                    &index.storage_key,
-                );
+                // Orphan: pending file vanished but the index lingers. The Read
+                // fingerprint aborts the delete (Conflict) if a concurrent
+                // enqueue refreshed the index between our GET and the apply.
+                let (read, delete) =
+                    Self::conditional_index_delete(index_path, &data, &storage_key, &storage_key);
                 let mut tx = Transaction::builder().build();
                 tx.reads.extend(read);
                 tx.mutations.extend(delete);
@@ -728,6 +721,323 @@ impl JobStore {
             }
             Err(e) => Err(Error::from(e)),
         }
+    }
+
+    /// Reconcile one dedup-index file by its already-encoded stem (as
+    /// [`Self::list_lock_key_index_keys`] yields), retiring it when its pending
+    /// envelope has vanished or the index does not parse. Returns `true` when
+    /// the index was retired, `false` when the pending file still exists or the
+    /// index is already gone.
+    ///
+    /// Unlike [`Self::find_pending_with_lock_key`] it consumes the encoded stem
+    /// directly (no double-encoding) and reads the stored `storage_key` rather
+    /// than decoding it. The orphan delete is the same fingerprint-guarded engine
+    /// transaction the enqueue self-heal runs.
+    pub async fn reconcile_orphan_lock_key_index(
+        &self,
+        queue: Queue,
+        encoded_stem: &str,
+    ) -> Result<bool, Error> {
+        let index_path = format!(
+            "{}/{encoded_stem}.json",
+            path_builder::job_lock_key_index_dir(queue.as_str())
+        );
+        let (storage_key, data) = match self.read_lock_key_index_at(&index_path).await? {
+            // The index vanished since the listing: nothing to reconcile.
+            LockKeyIndexRead::Absent => return Ok(false),
+            LockKeyIndexRead::Corrupt { bytes } => {
+                warn!(encoded_stem, "Corrupt job dedup index; retiring");
+                self.retire_corrupt_index(&index_path, &bytes).await;
+                return Ok(true);
+            }
+            LockKeyIndexRead::Valid { storage_key, bytes } => (storage_key, bytes),
+        };
+
+        let pending_key = path_builder::job_pending_path(queue.as_str(), &storage_key);
+        match self.store.head(&pending_key).await {
+            // Pending file still present: the index is live, leave it.
+            Ok(_) => Ok(false),
+            Err(StorageError::NotFound) => {
+                let (read, delete) =
+                    Self::conditional_index_delete(index_path, &data, &storage_key, &storage_key);
+                let mut tx = Transaction::builder().build();
+                tx.reads.extend(read);
+                tx.mutations.extend(delete);
+                match self.store.execute(tx).await {
+                    Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(true),
+                    Err(e) => {
+                        warn!(
+                            encoded_stem,
+                            error = %e,
+                            "Failed to remove orphan lock-key index via engine",
+                        );
+                        Ok(true)
+                    }
+                }
+            }
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    /// Read-only orphan probe: `true` when the index at `encoded_stem` points at
+    /// a pending envelope that no longer exists, or does not parse. Mirrors
+    /// [`Self::reconcile_orphan_lock_key_index`] without the delete, so a dry run
+    /// counts the indexes it would retire.
+    pub async fn is_orphan_lock_key_index(
+        &self,
+        queue: Queue,
+        encoded_stem: &str,
+    ) -> Result<bool, Error> {
+        let index_path = format!(
+            "{}/{encoded_stem}.json",
+            path_builder::job_lock_key_index_dir(queue.as_str())
+        );
+        let storage_key = match self.read_lock_key_index_at(&index_path).await? {
+            // The index vanished since the listing: nothing to reconcile.
+            LockKeyIndexRead::Absent => return Ok(false),
+            LockKeyIndexRead::Corrupt { .. } => return Ok(true),
+            LockKeyIndexRead::Valid { storage_key, .. } => storage_key,
+        };
+        let pending_key = path_builder::job_pending_path(queue.as_str(), &storage_key);
+        match self.store.head(&pending_key).await {
+            Ok(_) => Ok(false),
+            Err(StorageError::NotFound) => Ok(true),
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    /// Whether a present pending body needs its dedup index (re)created: `true`
+    /// when no entry exists for its `lock_key`, the entry does not parse, or it
+    /// points at an absent pending file (stale), `false` when it already points
+    /// at a present body.
+    ///
+    /// The reverse of [`Self::is_orphan_lock_key_index`]: that keys on the index,
+    /// this keys on a present body. Read-only, so a dry run counts the re-indexes
+    /// it would perform; unlike [`Self::reindex_orphan_pending_body`] it does not
+    /// probe the execution lock (a lock probe writes), so it may count a body a
+    /// real run would skip because a worker is executing it. `storage_key` is
+    /// the body's stem; a vanished body yields `false`.
+    pub async fn needs_reindex_pending(
+        &self,
+        queue: Queue,
+        storage_key: &str,
+    ) -> Result<bool, Error> {
+        let envelope = match self.read_pending(queue, storage_key).await {
+            Ok(envelope) => envelope,
+            // The body vanished since the listing: nothing to re-index.
+            Err(Error::NotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), &envelope.lock_key);
+        match self.read_lock_key_index_at(&index_path).await? {
+            LockKeyIndexRead::Absent | LockKeyIndexRead::Corrupt { .. } => Ok(true),
+            LockKeyIndexRead::Valid {
+                storage_key: index_storage_key,
+                ..
+            } if index_storage_key == storage_key => Ok(false),
+            // Points elsewhere: stale only when that target's body is absent.
+            LockKeyIndexRead::Valid {
+                storage_key: index_storage_key,
+                ..
+            } => {
+                let other = path_builder::job_pending_path(queue.as_str(), &index_storage_key);
+                match self.store.head(&other).await {
+                    Ok(_) => Ok(false),
+                    Err(StorageError::NotFound) => Ok(true),
+                    Err(e) => Err(Error::from(e)),
+                }
+            }
+        }
+    }
+
+    /// Re-index a present pending body whose dedup index is missing, corrupt,
+    /// or stale, pointing the entry at this body. Returns `true` when a
+    /// re-index was performed (or raced a concurrent enqueue that already
+    /// refreshed it), `false` when it already pointed at a present body.
+    ///
+    /// A body whose `job:{lock_key}` execution lock is held is skipped: a
+    /// claimed job's pending body stays on disk until `complete`, and its
+    /// index was retired at claim time on purpose so a same-`lock_key` enqueue
+    /// starts a fresh pending file instead of coalescing into the in-flight
+    /// job. The lock is held across the re-index itself, so a claim cannot
+    /// slip in between the probe and the write.
+    ///
+    /// The reverse direction of [`Self::reconcile_orphan_lock_key_index`]: a
+    /// missing entry is created with the enqueue `PutIfAbsent`, a corrupt or
+    /// stale one is corrected with a fingerprint-guarded conditional `Put`.
+    /// Idempotent.
+    pub async fn reindex_orphan_pending_body(
+        &self,
+        queue: Queue,
+        storage_key: &str,
+    ) -> Result<bool, Error> {
+        let envelope = match self.read_pending(queue, storage_key).await {
+            Ok(envelope) => envelope,
+            // The body vanished since the listing: nothing to re-index.
+            Err(Error::NotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let Some(session) = self
+            .store
+            .executor()
+            .try_acquire(&[job_lock_key(&envelope.lock_key)])
+            .await
+            .map_err(tx_error_to_job)?
+        else {
+            // A worker is executing this lock_key right now; re-indexing would
+            // re-enable coalescing against a job that already read its state.
+            return Ok(false);
+        };
+        let result = self
+            .reindex_pending_body_locked(queue, storage_key, &envelope)
+            .await;
+        session.release().await;
+        result
+    }
+
+    /// The re-index body, run while holding the `job:{lock_key}` execution lock.
+    async fn reindex_pending_body_locked(
+        &self,
+        queue: Queue,
+        storage_key: &str,
+        envelope: &JobEnvelope,
+    ) -> Result<bool, Error> {
+        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), &envelope.lock_key);
+        let index_body = Bytes::from(serialize_lock_key_index(storage_key)?);
+
+        match self.read_lock_key_index_at(&index_path).await? {
+            LockKeyIndexRead::Absent => self.put_if_absent_index(index_path, index_body).await,
+            LockKeyIndexRead::Corrupt { bytes } => {
+                self.conditional_reindex(index_path, &bytes, index_body)
+                    .await
+            }
+            LockKeyIndexRead::Valid {
+                storage_key: index_storage_key,
+                ..
+            } if index_storage_key == storage_key => Ok(false),
+            // Points elsewhere: correct only when that target's body is absent.
+            LockKeyIndexRead::Valid {
+                storage_key: index_storage_key,
+                bytes,
+            } => {
+                let other = path_builder::job_pending_path(queue.as_str(), &index_storage_key);
+                match self.store.head(&other).await {
+                    Ok(_) => Ok(false),
+                    Err(StorageError::NotFound) => {
+                        self.conditional_reindex(index_path, &bytes, index_body)
+                            .await
+                    }
+                    Err(e) => Err(Error::from(e)),
+                }
+            }
+        }
+    }
+
+    /// Create a missing dedup index with a `PutIfAbsent`. A concurrent enqueue
+    /// that wins surfaces as `Conflict`/`Precondition`; either way a fresh index
+    /// now exists, so both join the acted-on arm.
+    async fn put_if_absent_index(
+        &self,
+        index_path: String,
+        index_body: Bytes,
+    ) -> Result<bool, Error> {
+        let tx = Transaction::builder()
+            .mutation(Mutation::PutIfAbsent {
+                key: index_path,
+                body: index_body,
+            })
+            .build();
+        match self.store.execute(tx).await {
+            Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(true),
+            Err(e) => Err(tx_error_to_job(e)),
+        }
+    }
+
+    /// Correct a stale dedup index with a fingerprint-guarded conditional `Put`,
+    /// so a concurrent enqueue that refreshes the entry turns the write into a
+    /// no-op conflict rather than clobbering it.
+    async fn conditional_reindex(
+        &self,
+        index_path: String,
+        stale_body: &[u8],
+        index_body: Bytes,
+    ) -> Result<bool, Error> {
+        let read = Read {
+            key: index_path.clone(),
+            fingerprint: Sha256::digest(stale_body).into(),
+        };
+        let mut tx = Transaction::builder()
+            .mutation(Mutation::Put {
+                key: index_path,
+                body: index_body,
+                expected: None,
+            })
+            .build();
+        tx.reads.push(read);
+        match self.store.execute(tx).await {
+            Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(true),
+            Err(e) => Err(tx_error_to_job(e)),
+        }
+    }
+
+    /// The `_jobs/<state>/<queue>` directory of a queue name outside the
+    /// recognized [`Queue`] set.
+    fn unknown_queue_dir(state: JobState, queue_name: &str) -> String {
+        match state {
+            JobState::Pending => path_builder::job_pending_dir(queue_name),
+            JobState::Failed => path_builder::job_failed_dir(queue_name),
+        }
+    }
+
+    /// Newest `last_modified` across the objects of an unknown queue directory,
+    /// or `None` when it holds no objects. An object reporting no
+    /// `last_modified` is an error: the directory's age cannot be established,
+    /// so the caller must not remove it.
+    pub async fn unknown_queue_newest_mtime(
+        &self,
+        state: JobState,
+        queue_name: &str,
+    ) -> Result<Option<DateTime<Utc>>, Error> {
+        let dir = Self::unknown_queue_dir(state, queue_name);
+        let mut newest: Option<DateTime<Utc>> = None;
+        let mut token: Option<String> = None;
+        loop {
+            let page = self.store.list(&dir, 1000, token).await?;
+            for name in &page.items {
+                let key = format!("{dir}/{name}");
+                let meta = match self.store.head(&key).await {
+                    Ok(m) => m,
+                    // Removed since the listing: nothing to age.
+                    Err(StorageError::NotFound) => continue,
+                    Err(e) => return Err(Error::from(e)),
+                };
+                let Some(modified) = meta.last_modified else {
+                    return Err(Error::Storage(format!(
+                        "object '{key}' reports no last-modified time; \
+                         the directory's age cannot be established"
+                    )));
+                };
+                newest = Some(newest.map_or(modified, |t| t.max(modified)));
+            }
+            match page.next_token {
+                Some(t) => token = Some(t),
+                None => return Ok(newest),
+            }
+        }
+    }
+
+    /// Remove the `_jobs/<state>/<queue>` subtree for a queue directory whose
+    /// name is not a recognized [`Queue`]. A newer replica may operate a queue
+    /// this binary does not recognize, so the caller must first establish the
+    /// directory is quiescent via [`Self::unknown_queue_newest_mtime`]. An
+    /// absent prefix is a no-op.
+    pub async fn delete_unknown_queue_dir(
+        &self,
+        state: JobState,
+        queue_name: &str,
+    ) -> Result<(), Error> {
+        let dir = Self::unknown_queue_dir(state, queue_name);
+        self.store.delete_prefix(&dir).await.map_err(Error::from)
     }
 
     /// Return the raw bytes of the per-`lock_key` dedup index alongside the
@@ -752,21 +1062,65 @@ impl JobStore {
         self.store.get(key).await.map_err(Error::from)
     }
 
+    /// Read and classify the dedup index at `index_path`. `Err` only for
+    /// storage failures; an unparseable body is returned as `Corrupt` with its
+    /// raw bytes so the caller can retire it under a fingerprint guard.
+    async fn read_lock_key_index_at(&self, index_path: &str) -> Result<LockKeyIndexRead, Error> {
+        let bytes = match self.store.get(index_path).await {
+            Ok(d) => d,
+            Err(StorageError::NotFound) => return Ok(LockKeyIndexRead::Absent),
+            Err(e) => return Err(Error::from(e)),
+        };
+        match parse_lock_key_index(&bytes) {
+            Ok(index) => Ok(LockKeyIndexRead::Valid {
+                storage_key: index.storage_key,
+                bytes,
+            }),
+            Err(_) => Ok(LockKeyIndexRead::Corrupt { bytes }),
+        }
+    }
+
+    /// Build the fingerprint-guarded `Read` + `Delete` pair retiring a corrupt
+    /// dedup index: a concurrent valid rewrite turns the delete into a no-op
+    /// conflict instead of being clobbered.
+    fn corrupt_index_delete(index_path: String, bytes: &[u8]) -> (Read, Mutation) {
+        let read = Read {
+            key: index_path.clone(),
+            fingerprint: Sha256::digest(bytes).into(),
+        };
+        let delete = Mutation::Delete {
+            key: index_path,
+            expected: None,
+        };
+        (read, delete)
+    }
+
+    /// Retire a corrupt dedup index through its own fingerprint-guarded
+    /// transaction. A concurrent rewrite wins: `Conflict`/`Precondition` are
+    /// treated as success, any other failure is logged and swallowed.
+    async fn retire_corrupt_index(&self, index_path: &str, bytes: &[u8]) {
+        let (read, delete) = Self::corrupt_index_delete(index_path.to_string(), bytes);
+        let mut tx = Transaction::builder().mutation(delete).build();
+        tx.reads.push(read);
+        if let Err(e) = self.store.execute(tx).await
+            && !matches!(e, TxError::Conflict | TxError::Precondition)
+        {
+            warn!(
+                index_path,
+                error = %tx_error_to_job(e),
+                "Failed to retire corrupt lock-key index",
+            );
+        }
+    }
+
     /// Build the read dependency and conditional `Delete` that retire a
-    /// per-`lock_key` dedup index, but only when the index still points at
-    /// `target_storage_key`.
+    /// per-`lock_key` dedup index, only when it still points at
+    /// `target_storage_key` (else the returned pair is empty).
     ///
-    /// `index_storage_key` / `index_body` are the parsed `storage_key` and the
-    /// raw bytes of the current index (as returned by
-    /// [`Self::get_lock_key_index_raw`]). When the index points elsewhere the
-    /// returned pair is empty and the caller leaves the index untouched.
-    ///
-    /// The `Read` carries a fingerprint of `index_body`, so an index refreshed
-    /// by a concurrent enqueue between the read and the apply turns the delete
-    /// into a no-op conflict rather than clobbering the fresh index. Four
-    /// call sites fold this into their own transactions: the orphan self-heal
-    /// in `find_pending_with_lock_key`, `retire_claimed_index`, `complete`, and
-    /// `fail_dead_letter`.
+    /// `index_storage_key` / `index_body` come from
+    /// [`Self::get_lock_key_index_raw`]. The `Read` fingerprints `index_body`, so
+    /// an index refreshed by a concurrent enqueue turns the delete into a no-op
+    /// conflict. Callers fold this into their own transactions.
     fn conditional_index_delete(
         index_path: String,
         index_body: &[u8],
@@ -787,12 +1141,10 @@ impl JobStore {
         (Some(read), Some(delete))
     }
 
-    /// Retire the dedup index of a just-claimed job so a same-`lock_key`
-    /// enqueue arriving mid-execution starts a fresh pending file rather than
-    /// coalescing into the already-resolved job and silently dropping its write.
-    /// The pending file stays as the crash-recovery record, and the delete is
-    /// conditional plus fingerprint-guarded so a producer's newer index is
-    /// never clobbered.
+    /// Retire the dedup index of a just-claimed job so a same-`lock_key` enqueue
+    /// arriving mid-execution starts a fresh pending file instead of coalescing
+    /// into the resolved job. The delete is conditional and fingerprint-guarded
+    /// so a producer's newer index is never clobbered.
     async fn retire_claimed_index(&self, queue: Queue, lock_key: &str, storage_key: &str) {
         let (index_storage_key, body) = match self.get_lock_key_index_raw(queue, lock_key).await {
             Ok(Some(found)) => found,
@@ -822,45 +1174,17 @@ impl JobStore {
     // Producer: enqueue
     // -----------------------------------------------------------------------
 
-    /// Enqueue a job.
-    ///
-    /// Fast-path: `find_pending_with_lock_key` checks the dedup index and
-    /// self-heals orphans (same semantics as a HEAD index + HEAD pending).
-    ///
-    /// Slow-path: submit a transaction with `PutIfAbsent` on both the index
-    /// and the pending file. If two replicas race and both observe absence,
-    /// only one wins at the engine's Prepare/Apply stage; the loser receives
-    /// `Conflict` or `Precondition` and we treat that as a dedup hit.
-    pub async fn enqueue(&self, envelope: JobEnvelope) -> Result<(), Error> {
-        // Fast path: index present and pending exists, a hit, no writes needed.
-        if self
-            .find_pending_with_lock_key(envelope.queue, &envelope.lock_key)
-            .await
-            .unwrap_or(false)
-        {
-            metrics_provider()
-                .job_queue_enqueued_total
-                .with_label_values(&[envelope.queue.as_str(), "hit"])
-                .inc();
-            return Ok(());
-        }
-
-        // Slow path: build the transaction.
+    /// Build the two-`PutIfAbsent` enqueue transaction against a fresh
+    /// time-keyed storage key. Index first, then pending: the CAS executor
+    /// aborts cleanly if the first `PutIfAbsent` fails (another replica
+    /// claimed this `lock_key`).
+    fn build_enqueue_tx(envelope: &JobEnvelope, pending_body: Bytes) -> Result<Transaction, Error> {
         let storage_key = make_storage_key(Utc::now(), &envelope.id);
         let pending_path = path_builder::job_pending_path(envelope.queue.as_str(), &storage_key);
         let index_path =
             path_builder::job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
-
-        let pending_body = Bytes::from(
-            serde_json::to_vec(&envelope)
-                .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?,
-        );
         let index_body = Bytes::from(serialize_lock_key_index(&storage_key)?);
-
-        // Mutation order matters: index first, then pending. The CAS executor
-        // aborts cleanly if the first mutation's PutIfAbsent fails, meaning
-        // another replica already claimed this lock_key.
-        let tx = Transaction::builder()
+        Ok(Transaction::builder()
             .mutation(Mutation::PutIfAbsent {
                 key: index_path,
                 body: index_body,
@@ -869,24 +1193,67 @@ impl JobStore {
                 key: pending_path,
                 body: pending_body,
             })
-            .build();
+            .build())
+    }
 
-        // A `Conflict` or `Precondition` here means another replica won the
-        // race: treat as a dedup hit, not an error.
+    fn record_enqueue(queue: Queue, outcome: &'static str) {
+        metrics_provider()
+            .job_queue_enqueued_total
+            .with_label_values(&[queue.as_str(), outcome])
+            .inc();
+    }
+
+    /// Enqueue a job. Fast path: `find_pending_with_lock_key` is a dedup hit
+    /// and self-heals orphan and corrupt indexes. Slow path: a transaction
+    /// `PutIfAbsent`s both the index and the pending file; a `Conflict` /
+    /// `Precondition` is re-adjudicated by re-probing (a genuine racing
+    /// producer is a dedup hit, a corrupt or orphan index is retired and the
+    /// transaction retried once) so a job is never silently dropped.
+    pub async fn enqueue(&self, envelope: JobEnvelope) -> Result<(), Error> {
+        // Fast path: index and pending both present, a hit with no writes.
+        if self
+            .find_pending_with_lock_key(envelope.queue, &envelope.lock_key)
+            .await
+            .unwrap_or(false)
+        {
+            Self::record_enqueue(envelope.queue, "hit");
+            return Ok(());
+        }
+
+        let pending_body = Bytes::from(
+            serde_json::to_vec(&envelope)
+                .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?,
+        );
+
+        let tx = Self::build_enqueue_tx(&envelope, pending_body.clone())?;
         match self.store.execute(tx).await {
             Ok(_) => {
-                metrics_provider()
-                    .job_queue_enqueued_total
-                    .with_label_values(&[envelope.queue.as_str(), "miss"])
-                    .inc();
+                Self::record_enqueue(envelope.queue, "miss");
                 Ok(())
             }
             Err(TxError::Conflict | TxError::Precondition) => {
-                metrics_provider()
-                    .job_queue_enqueued_total
-                    .with_label_values(&[envelope.queue.as_str(), "hit"])
-                    .inc();
-                Ok(())
+                if self
+                    .find_pending_with_lock_key(envelope.queue, &envelope.lock_key)
+                    .await?
+                {
+                    Self::record_enqueue(envelope.queue, "hit");
+                    return Ok(());
+                }
+                // The conflicting index was orphan or corrupt and the re-probe
+                // retired it: retry once with a fresh storage key.
+                let retry = Self::build_enqueue_tx(&envelope, pending_body)?;
+                match self.store.execute(retry).await {
+                    Ok(_) => {
+                        Self::record_enqueue(envelope.queue, "miss");
+                        Ok(())
+                    }
+                    Err(TxError::Conflict | TxError::Precondition) => Err(Error::Storage(format!(
+                        "enqueue for lock_key '{}' lost the dedup race twice or its index is \
+                         corrupt; job not enqueued",
+                        envelope.lock_key
+                    ))),
+                    Err(e) => Err(tx_error_to_job(e)),
+                }
             }
             Err(e) => Err(tx_error_to_job(e)),
         }
@@ -897,9 +1264,8 @@ impl JobStore {
     // -----------------------------------------------------------------------
 
     /// Claim the next available job from `queue`, self-throttling on backend
-    /// failure: a storage error sleeps an exponential, capped backoff before
-    /// returning so the caller can loop without managing retry timing itself.
-    /// The backoff resets on the next successful claim.
+    /// failure with an exponential capped backoff that resets on the next
+    /// successful claim.
     pub async fn claim_one(&self, queue: Queue) -> Result<ClaimOutcome, Error> {
         match self.try_claim_one(queue).await {
             Ok(outcome) => {
@@ -916,23 +1282,16 @@ impl JobStore {
         }
     }
 
-    /// Walk pending storage keys in ascending order (`list_pending` returns
-    /// them sorted by the hex unix-millis prefix, i.e. by `not_before`). Stops
-    /// at the first key whose prefix is in the future without reading its body:
-    /// the prefix is the authoritative readiness signal. When no claim is made,
-    /// `next_ready` carries that first future instant so the caller can sleep
-    /// until then.
-    ///
-    /// On a successful claim the job's dedup index is retired (see
-    /// [`Self::retire_claimed_index`]) so a same-`lock_key` enqueue arriving
-    /// while the job runs is not coalesced into the already-resolved job.
+    /// Walk pending storage keys in ascending (`not_before`) order, stopping at
+    /// the first future prefix without reading its body; `next_ready` then
+    /// carries that instant. A successful claim retires the job's dedup index
+    /// (see [`Self::retire_claimed_index`]).
     async fn try_claim_one(&self, queue: Queue) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
         let mut next_ready: Option<DateTime<Utc>> = None;
         for storage_key in self.list_pending(queue, MAX_SCAN).await? {
-            // Read the readiness time off the filename; never GET the body for
-            // a backed-off entry. A missing/malformed prefix falls through to
-            // the body read so legacy keys (if any) still work.
+            // Read readiness off the filename; a backed-off entry never GETs its
+            // body. A malformed prefix falls through to the body read.
             if let Some(not_before) = parse_not_before(&storage_key)
                 && not_before > now
             {
@@ -951,6 +1310,20 @@ impl JobStore {
                 .await
                 .map_err(tx_error_to_job)?
             {
+                // Re-read under the lock: the job may have completed (pending
+                // file deleted) between the pre-lock body read and this
+                // acquisition, and a finished job must never be re-executed.
+                let envelope = match self.read_pending(queue, &storage_key).await {
+                    Ok(envelope) => envelope,
+                    Err(Error::NotFound) => {
+                        session.release().await;
+                        continue;
+                    }
+                    Err(e) => {
+                        session.release().await;
+                        return Err(e);
+                    }
+                };
                 debug!(
                     lock_key = envelope.lock_key.as_str(),
                     worker_id = self.worker_id.as_str(),
@@ -974,15 +1347,10 @@ impl JobStore {
         })
     }
 
-    /// Mark a claimed job as complete and release its execution lock.
-    ///
-    /// `handler_tx` carries the handler's work-product mutations (empty for
-    /// no-op handlers). This method appends the pending-file delete and a
-    /// conditional dedup-index delete, submits the merged transaction, and
-    /// releases the execution lock once the commit settles. The work commit
-    /// and the queue cleanup land atomically; the lock release follows
-    /// immediately after Reap so the next worker can claim this `lock_key`
-    /// without waiting on TTL.
+    /// Mark a claimed job complete and release its execution lock. Appends the
+    /// pending-file delete and a conditional dedup-index delete to `handler_tx`,
+    /// commits the merged transaction atomically, then releases the lock so the
+    /// next worker can claim this `lock_key` without waiting on TTL.
     pub async fn complete(
         &self,
         claimed: ClaimedJob,
@@ -1003,36 +1371,34 @@ impl JobStore {
             expected: None,
         });
 
-        // We hold the execution lock, so no concurrent worker can swing the
-        // index. The conditional read is a belt-and-braces guard that costs
-        // one HEAD; if the index points elsewhere we leave it alone. A corrupt
-        // index cannot be matched or fingerprinted, so we delete it
-        // unconditionally: safe because we are the unique writer here.
-        match self.get_raw(&index_path).await {
-            Ok(body) => match parse_lock_key_index(&body) {
-                Ok(index) => {
-                    let (read, delete) = Self::conditional_index_delete(
-                        index_path,
-                        &body,
-                        &index.storage_key,
-                        &storage_key,
-                    );
-                    tx.reads.extend(read);
-                    tx.mutations.extend(delete);
-                }
-                Err(_) => {
-                    tx.mutations.push(Mutation::Delete {
-                        key: index_path,
-                        expected: None,
-                    });
-                }
-            },
-            Err(Error::NotFound) => {}
+        // The execution lock excludes other workers but not producers: the
+        // conditional read leaves an index pointing at someone else's pending
+        // body alone, and a corrupt index is retired under its fingerprint so
+        // a producer's concurrent valid rewrite survives.
+        match self.read_lock_key_index_at(&index_path).await {
+            Ok(LockKeyIndexRead::Valid {
+                storage_key: index_storage_key,
+                bytes,
+            }) => {
+                let (read, delete) = Self::conditional_index_delete(
+                    index_path,
+                    &bytes,
+                    &index_storage_key,
+                    &storage_key,
+                );
+                tx.reads.extend(read);
+                tx.mutations.extend(delete);
+            }
+            Ok(LockKeyIndexRead::Corrupt { bytes }) => {
+                let (read, delete) = Self::corrupt_index_delete(index_path, &bytes);
+                tx.reads.push(read);
+                tx.mutations.push(delete);
+            }
+            Ok(LockKeyIndexRead::Absent) => {}
             Err(e) => {
-                // We could not read the dedup index to build the cleanup. Fail
-                // the job over rather than returning an error that would leave
-                // the pending file re-claimable in a hot loop; we still hold the
-                // lock, so `fail` remains the unique writer for this `lock_key`.
+                // Cannot read the dedup index to build the cleanup: fail the job
+                // over rather than leave the pending file re-claimable in a hot
+                // loop. We still hold the lock, so `fail` is the sole writer.
                 let claimed = ClaimedJob {
                     envelope,
                     storage_key,
@@ -1051,11 +1417,9 @@ impl JobStore {
                 Ok(CompleteOutcome::Completed)
             }
             Err(e) => {
-                // The work commit + queue cleanup did not land (e.g. a transient
-                // backend error, or a mutation referencing storage the executor
-                // cannot resolve). Treat it as a failed attempt and fail the job
-                // over (backoff then dead-letter) instead of leaving it to be
-                // re-claimed immediately, forever. We still hold the lock.
+                // The commit did not land: fail the job over (backoff then
+                // dead-letter) instead of leaving it to be re-claimed forever.
+                // We still hold the lock.
                 let err = tx_error_to_job(e);
                 let claimed = ClaimedJob {
                     envelope,
@@ -1069,13 +1433,10 @@ impl JobStore {
         }
     }
 
-    /// Record a failure. The job is either re-queued with backoff or moved to
-    /// the dead-letter store when its retry budget is exhausted. On retry the
-    /// envelope is rewritten to a *new* storage key encoding the bumped
-    /// `not_before`; the previous key is deleted afterwards. A crash between
-    /// the two writes re-runs the previous envelope at its old (already
-    /// elapsed) `not_before`, which the handler-side idempotency contract
-    /// already covers.
+    /// Record a failure: re-queue with backoff, or dead-letter once the retry
+    /// budget is spent. A retry rewrites the envelope to a new storage key
+    /// encoding the bumped `not_before`, then deletes the old key; a crash
+    /// between the two re-runs the envelope, covered by handler idempotency.
     pub async fn fail(&self, claimed: ClaimedJob, err: &str) -> Result<FailOutcome, Error> {
         let ClaimedJob {
             envelope,
@@ -1101,9 +1462,54 @@ impl JobStore {
             .await
     }
 
-    /// Single transaction replaces the pending file and updates the index, then
-    /// deletes the old pending. The execution lock is held across the call and
-    /// released explicitly afterwards.
+    /// Fold a fingerprint-guarded index `Put` into `tx`: the write lands only
+    /// while the entry still carries the `observed` bytes.
+    fn fold_guarded_index_put(
+        tx: &mut Transaction,
+        index_path: String,
+        observed: &[u8],
+        index_body: Bytes,
+    ) {
+        tx.reads.push(Read {
+            key: index_path.clone(),
+            fingerprint: Sha256::digest(observed).into(),
+        });
+        tx.mutations.push(Mutation::Put {
+            key: index_path,
+            body: index_body,
+            expected: None,
+        });
+    }
+
+    /// Build the unconditional pending swap of a retry: write the backed-off
+    /// envelope under its new key and delete the old one.
+    fn pending_swap_tx(
+        new_pending_path: &str,
+        pending_body: &Bytes,
+        old_pending_path: &str,
+    ) -> Transaction {
+        Transaction::builder()
+            .mutation(Mutation::Put {
+                key: new_pending_path.to_string(),
+                body: pending_body.clone(),
+                expected: None,
+            })
+            .mutation(Mutation::Delete {
+                key: old_pending_path.to_string(),
+                expected: None,
+            })
+            .build()
+    }
+
+    /// Single transaction replaces the pending file, deletes the old pending,
+    /// and re-points the dedup index at the new key. The execution lock is held
+    /// across the call and released explicitly afterwards.
+    ///
+    /// The execution lock excludes consumers, not producers: a same-`lock_key`
+    /// enqueue after the claim-time retire owns the index, so the update is
+    /// fingerprint-guarded and skipped when the entry points at someone else's
+    /// pending body. A guard conflict re-executes the pending swap alone; the
+    /// stale index is healed by the enqueue fast path and the scrub reconcile.
     async fn fail_retry(
         &self,
         session: LockSession,
@@ -1125,37 +1531,71 @@ impl JobStore {
         );
         let index_body = Bytes::from(serialize_lock_key_index(&new_storage_key)?);
 
-        // We hold the execution lock, so we are the unique writer for this
-        // lock_key. The index update is unconditional (no read fingerprint
-        // needed): no concurrent producer can swing the index while we hold the
-        // execution lock.
-        let tx = Transaction::builder()
-            .mutation(Mutation::Put {
-                key: new_pending_path,
-                body: pending_body,
-                expected: None,
-            })
-            .mutation(Mutation::Put {
-                key: index_path,
-                body: index_body,
-                expected: None,
-            })
-            .mutation(Mutation::Delete {
-                key: old_pending_path,
-                expected: None,
-            })
-            .build();
+        let mut tx = Self::pending_swap_tx(&new_pending_path, &pending_body, &old_pending_path);
+        match self.read_lock_key_index_at(&index_path).await {
+            Ok(LockKeyIndexRead::Absent) => {
+                tx.mutations.push(Mutation::PutIfAbsent {
+                    key: index_path,
+                    body: index_body,
+                });
+            }
+            Ok(LockKeyIndexRead::Valid { storage_key, bytes })
+                if storage_key == old_storage_key =>
+            {
+                Self::fold_guarded_index_put(&mut tx, index_path, &bytes, index_body);
+            }
+            Ok(LockKeyIndexRead::Corrupt { bytes }) => {
+                Self::fold_guarded_index_put(&mut tx, index_path, &bytes, index_body);
+            }
+            // Points at a concurrent producer's fresh pending body: theirs.
+            Ok(LockKeyIndexRead::Valid { .. }) => {}
+            // The swap must land regardless; leave the index to its healers.
+            Err(e) => {
+                warn!(
+                    lock_key = updated.lock_key.as_str(),
+                    error = %e,
+                    "Failed to read dedup index at retry; skipping the index update",
+                );
+            }
+        }
 
-        let result = self.store.execute(tx).await;
+        let result = match self.store.execute(tx).await {
+            Ok(_) => Ok(()),
+            // The index swung between read and execute (a producer's enqueue):
+            // it is theirs, so re-execute the pending swap without touching it.
+            Err(TxError::Conflict | TxError::Precondition) => {
+                let swap =
+                    Self::pending_swap_tx(&new_pending_path, &pending_body, &old_pending_path);
+                self.store.execute(swap).await.map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
         session.release().await;
         result.map_err(tx_error_to_job)?;
 
         Ok(FailOutcome::Retried { next_at })
     }
 
+    /// Build the unconditional dead-letter pair: write the failed record and
+    /// delete the pending file.
+    fn dead_letter_tx(failed_path: &str, failed_body: &Bytes, pending_path: &str) -> Transaction {
+        Transaction::builder()
+            .mutation(Mutation::Put {
+                key: failed_path.to_string(),
+                body: failed_body.clone(),
+                expected: None,
+            })
+            .mutation(Mutation::Delete {
+                key: pending_path.to_string(),
+                expected: None,
+            })
+            .build()
+    }
+
     /// Single transaction writes the failed record and removes the pending and
     /// (conditionally) the index. The execution lock is held across the call
-    /// and released explicitly afterwards.
+    /// and released explicitly afterwards. A corrupt index is retired under its
+    /// fingerprint; a guard conflict re-executes the dead-letter pair alone.
     async fn fail_dead_letter(
         &self,
         session: LockSession,
@@ -1168,44 +1608,48 @@ impl JobStore {
 
         let failed_body = Bytes::from(serialize_dead_letter(&envelope, err)?);
 
-        let mut tx = Transaction::builder()
-            .mutation(Mutation::Put {
-                key: failed_path,
-                body: failed_body,
-                expected: None,
-            })
-            .mutation(Mutation::Delete {
-                key: pending_path,
-                expected: None,
-            })
-            .build();
+        let mut tx = Self::dead_letter_tx(&failed_path, &failed_body, &pending_path);
 
-        // Conditionally include the index delete: only when the index still
-        // points at our storage_key. Read the index to get the fingerprint.
+        // Include the index delete only when it still points at our
+        // storage_key or does not parse.
         let index_path =
             path_builder::job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
-        match self
-            .get_lock_key_index_raw(envelope.queue, &envelope.lock_key)
-            .await
-        {
-            Ok(Some((index_storage_key, body))) => {
+        match self.read_lock_key_index_at(&index_path).await {
+            Ok(LockKeyIndexRead::Valid {
+                storage_key: index_storage_key,
+                bytes,
+            }) => {
                 let (read, delete) = Self::conditional_index_delete(
                     index_path,
-                    &body,
+                    &bytes,
                     &index_storage_key,
                     &storage_key,
                 );
                 tx.reads.extend(read);
                 tx.mutations.extend(delete);
             }
-            Ok(None) => {}
+            Ok(LockKeyIndexRead::Corrupt { bytes }) => {
+                let (read, delete) = Self::corrupt_index_delete(index_path, &bytes);
+                tx.reads.push(read);
+                tx.mutations.push(delete);
+            }
+            Ok(LockKeyIndexRead::Absent) => {}
             Err(e) => {
                 session.release().await;
                 return Err(e);
             }
         }
 
-        let result = self.store.execute(tx).await;
+        let result = match self.store.execute(tx).await {
+            Ok(_) => Ok(()),
+            // The index swung between read and execute (a producer's enqueue):
+            // it is theirs, so re-execute the dead-letter pair without it.
+            Err(TxError::Conflict | TxError::Precondition) => {
+                let pair = Self::dead_letter_tx(&failed_path, &failed_body, &pending_path);
+                self.store.execute(pair).await.map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
         session.release().await;
         result.map_err(tx_error_to_job)?;
 
@@ -1216,22 +1660,19 @@ impl JobStore {
     // Administrative mutations (operator-driven retry / delete)
     // -----------------------------------------------------------------------
 
-    /// Move a dead-letter record back to pending with its retry budget reset to
-    /// zero. Atomic: a single transaction `PutIfAbsent`s a fresh pending file
-    /// (new `not_before` = now) and deletes the failed record under an `ETag`
-    /// fence. Returns [`Error::NotFound`] when the failed record is already
-    /// gone (a stale key).
+    /// Move a dead-letter record back to pending with attempts reset to zero.
+    /// Atomic: one transaction `PutIfAbsent`s a fresh pending file and deletes
+    /// the failed record under an `ETag` fence. [`Error::NotFound`] for a stale
+    /// key.
     ///
-    /// The dedup index is deliberately **not** re-established: a retried job has
-    /// no `lock_key` index entry, so a concurrent producer enqueuing the same
-    /// `lock_key` may create a second pending file. That is safe: the
-    /// per-`lock_key` execution lock still serialises the two, and the handler
-    /// contract makes a redundant run idempotent.
+    /// The dedup index is not re-established, so a concurrent same-`lock_key`
+    /// enqueue may create a second pending file; the execution lock still
+    /// serialises the two and the handler contract makes the redundant run
+    /// idempotent.
     pub async fn retry_failed(&self, queue: Queue, storage_key: &str) -> Result<(), Error> {
         let failed_path = path_builder::job_failed_path(queue.as_str(), storage_key);
-        // HEAD first for the fencing ETag (`None` when the backend does not
-        // surface ETags, giving an unconditional delete, still safe: the new pending
-        // key is fresh so a double-retry collides at `PutIfAbsent`).
+        // Fencing ETag (`None` gives an unconditional delete, still safe: the
+        // fresh pending key collides a double-retry at `PutIfAbsent`).
         let expected = self.store.head(&failed_path).await?.etag;
 
         let mut envelope = self.read_failed(queue, storage_key).await?.envelope;
@@ -1255,26 +1696,21 @@ impl JobStore {
             })
             .build();
 
-        // A concurrent retry that won the race surfaces as `Conflict` (its
-        // pending key collided) or `Precondition` (the failed record it deleted
-        // is gone); either way the job is back in flight, so both join the
-        // success arm.
+        // A concurrent retry that won surfaces as Conflict/Precondition; either
+        // way the job is back in flight, so both join the success arm.
         match self.store.execute(tx).await {
             Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(()),
             Err(e) => Err(tx_error_to_job(e)),
         }
     }
 
-    /// Delete a job by `state`/`storage_key`. Failed records are removed with a
-    /// single ETag-fenced delete. Pending deletes additionally fold in the
-    /// conditional dedup-index delete (only when the index still points at this
-    /// key), mirroring [`Self::fail_dead_letter`].
+    /// Delete a job by `state`/`storage_key`. Failed records use a single
+    /// ETag-fenced delete; pending deletes also fold in the conditional
+    /// dedup-index delete, mirroring [`Self::fail_dead_letter`].
     ///
-    /// Deleting a *pending* job is best-effort against a worker that may be
-    /// mid-execution: the operator holds no execution lock, so a claim already
-    /// in flight still commits its handler effect. The `ETag` fence prevents
-    /// clobbering a file the worker has since rewritten (retry) or removed.
-    /// Returns [`Error::NotFound`] for a stale key.
+    /// A pending delete is best-effort: the operator holds no execution lock, so
+    /// an in-flight claim still commits, but the `ETag` fence prevents clobbering
+    /// a file the worker rewrote or removed. [`Error::NotFound`] for a stale key.
     pub async fn delete_job(
         &self,
         queue: Queue,
@@ -1301,44 +1737,66 @@ impl JobStore {
         }
     }
 
+    /// Build the ETag-fenced delete of a pending file alone (no dedup index).
+    /// The fence keeps the delete from clobbering a file a worker rewrote; the
+    /// guard-conflict retry re-runs it after dropping the index delete.
+    fn pending_delete_tx(pending_path: &str, expected: Option<Etag>) -> Transaction {
+        Transaction::builder()
+            .mutation(Mutation::Delete {
+                key: pending_path.to_string(),
+                expected,
+            })
+            .build()
+    }
+
     async fn delete_pending(&self, queue: Queue, storage_key: &str) -> Result<(), Error> {
         let pending_path = path_builder::job_pending_path(queue.as_str(), storage_key);
-        // Read the envelope (for its `lock_key`) and HEAD for the fence; a
-        // missing pending file surfaces as `NotFound` for a 404.
+        // Read the envelope (for its `lock_key`) and HEAD for the fence.
         let envelope = self.read_pending(queue, storage_key).await?;
         let expected = self.store.head(&pending_path).await?.etag;
 
-        let mut tx = Transaction::builder()
-            .mutation(Mutation::Delete {
-                key: pending_path,
-                expected,
-            })
-            .build();
+        let mut tx = Self::pending_delete_tx(&pending_path, expected.clone());
 
-        // Fold a conditional index delete: only when the index still points at
-        // this storage key. The read fingerprint turns a concurrent index
-        // refresh into a no-op conflict rather than clobbering a fresh index.
+        // Fold the index delete only when it still points at this key or does
+        // not parse; a corrupt index is retired under its fingerprint so it can
+        // never block the admin delete, mirroring `fail_dead_letter`.
         let index_path = path_builder::job_lock_key_index_path(queue.as_str(), &envelope.lock_key);
-        match self.get_lock_key_index_raw(queue, &envelope.lock_key).await {
-            Ok(Some((index_storage_key, body))) => {
+        match self.read_lock_key_index_at(&index_path).await? {
+            LockKeyIndexRead::Valid {
+                storage_key: index_storage_key,
+                bytes,
+            } => {
                 let (read, delete) = Self::conditional_index_delete(
                     index_path,
-                    &body,
+                    &bytes,
                     &index_storage_key,
                     storage_key,
                 );
                 tx.reads.extend(read);
                 tx.mutations.extend(delete);
             }
-            Ok(None) => {}
-            Err(e) => return Err(e),
+            LockKeyIndexRead::Corrupt { bytes } => {
+                let (read, delete) = Self::corrupt_index_delete(index_path, &bytes);
+                tx.reads.push(read);
+                tx.mutations.push(delete);
+            }
+            LockKeyIndexRead::Absent => {}
         }
 
-        self.store
-            .execute(tx)
-            .await
-            .map(|_| ())
-            .map_err(tx_error_to_job)
+        // The index swung between read and execute (a producer's enqueue): it is
+        // theirs, so re-run the fenced pending delete alone.
+        match self.store.execute(tx).await {
+            Ok(_) => Ok(()),
+            Err(TxError::Conflict | TxError::Precondition) => {
+                let retry = Self::pending_delete_tx(&pending_path, expected);
+                self.store
+                    .execute(retry)
+                    .await
+                    .map(|_| ())
+                    .map_err(tx_error_to_job)
+            }
+            Err(e) => Err(tx_error_to_job(e)),
+        }
     }
 }
 
@@ -1346,15 +1804,10 @@ impl JobStore {
 // Queue-depth gauge refresh loop
 // ---------------------------------------------------------------------------
 
-/// Refresh the queue-depth gauges (`angos_job_queue_pending` and
-/// `angos_job_queue_failed`) for `queue` on every `period` tick, until
-/// `shutdown` is cancelled. Uses `tokio::time::interval` so the cadence stays
-/// fixed across slow count calls; missed ticks are coalesced rather than
-/// catching up.
-///
-/// `ready_horizon_secs` is forwarded to `count_pending`: only envelopes ready
-/// within that window contribute to the pending gauge. The server runs this
-/// loop so both gauges are scrapeable even when `angos worker` drains the queue.
+/// Refresh the `angos_job_queue_pending` and `angos_job_queue_failed` gauges for
+/// `queue` on every `period` tick until `shutdown`. Missed ticks are coalesced.
+/// `ready_horizon_secs` forwards to `count_pending`. Run by the server so both
+/// gauges stay scrapeable even when `angos worker` drains the queue.
 pub async fn queue_depth_refresh_loop(
     store: Arc<JobStore>,
     queue: Queue,
@@ -1364,7 +1817,7 @@ pub async fn queue_depth_refresh_loop(
 ) {
     let mut timer = interval(period);
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Consume the immediate first tick so the first refresh happens after `period`.
+    // Consume the immediate first tick so the first refresh is after `period`.
     timer.tick().await;
 
     loop {

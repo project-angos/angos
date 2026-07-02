@@ -26,6 +26,30 @@ pub fn revisions<'a>(
     }))
 }
 
+pub fn layer_links<'a>(
+    metadata_store: &'a Arc<MetadataStore>,
+    namespace: &'a Namespace,
+) -> ResultStream<'a, Digest> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_layer_links(namespace, PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
+pub fn config_links<'a>(
+    metadata_store: &'a Arc<MetadataStore>,
+    namespace: &'a Namespace,
+) -> ResultStream<'a, Digest> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_config_links(namespace, PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
 pub fn tags<'a>(
     metadata_store: &'a Arc<MetadataStore>,
     namespace: &'a Namespace,
@@ -62,35 +86,24 @@ pub fn uploads<'a>(
     }))
 }
 
-pub fn blobs(blob_store: &Arc<BlobStore>) -> ResultStream<'_, Digest> {
-    Box::pin(paginated(move |marker| async move {
-        blob_store
-            .list_blobs(PAGE_SIZE, marker)
-            .await
-            .map_err(Error::from)
-    }))
+/// Streams every namespace marked by any registry subtree, not just
+/// `_manifests`, so the walk also visits upload-only and link-only namespaces
+/// the manifest-keyed catalog skips. Backed by ONE tree walk
+/// (`collect_all_namespaces`); the buffered set is one `String` per namespace.
+pub fn all_namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, String> {
+    Box::pin(
+        stream::once(async move {
+            metadata_store
+                .collect_all_namespaces()
+                .await
+                .map_err(Error::from)
+        })
+        .map_ok(|names| stream::iter(names.into_iter().map(Ok)))
+        .try_flatten(),
+    )
 }
 
-pub fn namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, String> {
-    Box::pin(paginated(move |marker| async move {
-        metadata_store
-            .list_namespaces(PAGE_SIZE, marker)
-            .await
-            .map_err(Error::from)
-    }))
-}
-
-pub fn upload_namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, String> {
-    Box::pin(paginated(move |marker| async move {
-        metadata_store
-            .list_upload_namespaces(PAGE_SIZE, marker)
-            .await
-            .map_err(Error::from)
-    }))
-}
-
-/// Drives a paginated source as a stream. Each yielded item is one entry from
-/// the underlying source; pages are fetched lazily, one at a time.
+/// Drives a paginated source as a stream, fetching one page lazily at a time.
 fn paginated<T, F, Fut>(fetch: F) -> impl Stream<Item = Result<T, Error>>
 where
     T: Send,
@@ -153,38 +166,6 @@ mod tests {
             }
 
             assert_eq!(collected, vec![digest]);
-            test_case.cleanup().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn namespaces_streams_each_stored_namespace() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let metadata_store = test_case.metadata_store();
-            let namespace = &Namespace::new("list-all-test/namespaces").unwrap();
-
-            let (digest, _) =
-                crate::registry::test_utils::create_test_blob(registry, namespace, b"manifest")
-                    .await;
-            metadata_store
-                .update_links(
-                    namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Digest(digest.clone()),
-                        digest.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
-
-            let mut stream = namespaces(&metadata_store);
-            let mut collected: Vec<String> = Vec::new();
-            while let Some(item) = stream.next().await {
-                collected.push(item.unwrap());
-            }
-
-            assert!(collected.contains(&namespace.to_string()));
             test_case.cleanup().await;
         }
     }

@@ -176,7 +176,9 @@ async fn worker_loop(
                 Ok(outcome) => match outcome.claimed {
                     None => sleep(outcome.idle_sleep(poll_interval)).await,
                     Some(claimed) => {
-                        execute_one(
+                        // The daemon keeps retrying; a per-job failure is logged
+                        // inside `execute_one`, not surfaced to the loop.
+                        let _ = execute_one(
                             snapshot.consumer.as_ref(),
                             snapshot.handler.as_ref(),
                             claimed,

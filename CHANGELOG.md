@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.4.0 (UNRELEASED)
+
+### Added
+
+- New `angos policy` subcommand enforces retention.
+- New `angos replication` subcommand reconciles replicated repositories with their downstreams.
+- New `[global] maintenance_grace_secs` knob (default 48h): every scrub garbage-collection reap requires the candidate's backend `last_modified` to be older than the grace, and an object without one is never reaped.
+- New `[global] maintenance_lock_max_hold_secs` knob (default 24h) caps how long one maintenance run may hold the shared maintenance lock before it self-cancels.
+- New `[global] max_concurrent_scrub_tasks` knob bounds per-node scrub/policy/replication fan-out (default 16).
+- New `scrub --delete-unrecognized` flag deletes keys matching no known storage layout, gated on `--commit` and the maintenance grace.
+- New `scrub --jobs` flag reconciles the job dedup index both ways: it retires dangling entries whose pending envelope is gone and re-indexes a pending job whose entry is missing or stale, skipping claimed in-flight jobs.
+- New `scrub --prune-unknown` modifier opts into deleting otherwise report-only structurally-invalid objects (invalid-named namespaces, unknown job-queue directories).
+- New `scrub --reclaim-engine` flag runs one on-demand pass of the engine's pure-delete janitors (orphan `.tx-bodies/` staging, expired `.tx-locks/`).
+- `scrub`, `policy`, and `replication` end every run with a summary of action counts and findings, and scrub writes its status, exit code, run mode (`commit` / `report-only` / `dry-run`, so a watcher can tell performed deletions from would-counts), and tallies to `_scrub-audit/latest.json`.
+
+### Changed
+
+- `scrub` is redesigned to **rebuild-and-sweep**: every run re-derives each revision's links, ownership grants, referrer back-links, and media type from its manifest, then sweeps raw storage for orphan blobs, stale grants, orphan links, missing-body revisions, de-configured namespaces, and unrecognized keys.
+- `scrub` is **report-only by default**: without `--commit` it performs no storage mutation at all except the run marker; sweep deletions, the rebuild's repairs, the legacy blob-index convergence, and the `_registry/` prune all require `--commit`.
+- De-configured namespace deletion is scoped to the namespace's own data; a nested namespace that still resolves to a configured repository is never touched.
+- Stale blob-index entries of every kind (tag/digest/referrer as well as layer/config/manifest) are purged once past the maintenance grace, so a phantom entry can no longer pin bytes or shield a manifest from retention indefinitely.
+- `scrub`, `policy`, and `replication` exit `0` clean, `1` refused, `2` degraded, `3` aborted; schedulers such as systemd and Kubernetes treat `2` and `3` as failures.
+- Every `scrub` run and every mutating `policy`/`replication` run takes the single shared maintenance lock, and a mutating run is refused on the `memory` lock strategy.
+- Manifest pushes hold the per-blob lock for each newly referenced blob, so storage maintenance can never reclaim bytes a concurrent push references.
+- An unreferenced bare blob-ownership self-grant is revoked once older than the maintenance grace, reclaiming bytes that pinned storage indefinitely; an explicit blob DELETE still reclaims immediately.
+- The scrub rebuild preserves each link's creation and last-pull times, so last-pull retention rules stay accurate across maintenance runs.
+- Namespaces not owned by any configured repository are deleted by the sweep under `--commit` (grants revoked, uploads included), refusing to run when no repositories are configured.
+- Scrub also visits namespaces holding no manifests, reclaiming orphan links and stranded uploads such namespaces previously retained.
+
+### Deprecated
+
+- `scrub --dry-run` (`-d`) is deprecated in favour of the report-only default; it writes nothing to registry state (only the run marker) and is mutually exclusive with `--commit`.
+- `scrub --retention` (`-r`) is a deprecated alias for `angos policy --retention`; it still runs unchanged.
+- `scrub --replicate` is a deprecated alias for `angos replication`; it still runs unchanged.
+- The legacy single-file blob-index read fallback is retained so an unconverged blob is still served from its legacy `index.json`, with removal deferred until after fleet-wide convergence.
+
+### Removed
+
+- The scrub per-checker flags `-m`/`--manifests`, `-l`/`--links`, `-M`/`--media-types`, `-t`/`--tags`, `-R`/`--referrers`, `-n`/`--orphan-namespaces`, `-b`/`--blobs`, `--orphan-grants`, and `--reconcile-blob-index` are removed and fail argument parsing; their work runs unconditionally in the rebuild and sweep.
+
+### Fixed
+
+- Scrub removes phantom back-references and the orphan links they kept alive, reclaiming the blob bytes they pinned.
+- A bare self-grant re-confirmed by a concurrent upload dedup or cross-repo mount (which rewrites the grant shard without creating a link file) is kept by the sweep: the revocation re-probes the shard's freshness under the per-blob lock.
+- A tag concurrently re-pointed at a new manifest survives a manifest-delete or missing-body cascade: cascade tag deletes are conditioned on the target they were planned against.
+- The lock janitor honors a lock's declared recovery margin, so a slow maintenance run no longer has its lock stolen mid-run.
+- A corrupt job dedup-index entry is retired and rebuilt automatically instead of silently suppressing every later replication or cache job with the same key.
+- The periodic body janitor reaps orphan `.tx-bodies/` staging directories whose transaction intent never landed; a path bug previously made every sweep a silent no-op.
+
 ## 1.3.0
 
 ### Added
