@@ -123,7 +123,7 @@ pub async fn build_registry(
     };
 
     if let (Some(token), Some(handles)) = (engine_maintenance, maintenance_handles) {
-        bootstrap::spawn_engine_maintenance(&handles, token);
+        tokio::spawn(handles.maintenance(token));
     }
 
     let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config)

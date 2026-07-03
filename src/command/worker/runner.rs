@@ -82,7 +82,6 @@ mod tests {
 
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
     use angos_tx_engine::{
-        executor::build_executor,
         lock::{LockSession, LockStrategy},
         store::Store,
         transaction::Transaction,
@@ -106,16 +105,10 @@ mod tests {
     fn make_store(dir: &TempDir) -> Arc<JobStore> {
         let object: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(dir.path().to_str().expect("valid path")).build());
-        let executor = build_executor(
-            object.clone(),
-            None,
-            LockStrategy::Memory,
-            None,
-            false,
-            false,
-        )
-        .expect("build executor");
-        let facade = Arc::new(Store::builder(object, executor).build());
+        let facade = Arc::new(
+            Store::new(object, None, LockStrategy::Memory, None, false, false)
+                .expect("build store"),
+        );
         Arc::new(JobStore::new(facade, "test-worker"))
     }
 

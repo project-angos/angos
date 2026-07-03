@@ -20,7 +20,7 @@ use tokio::select;
 use tracing::debug;
 use uuid::Uuid;
 
-use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
+use angos_storage::{Error as StorageError, ObjectStore};
 
 use crate::{
     error::Error,
@@ -226,14 +226,6 @@ impl TransactionExecutor for LockedExecutor {
 
     async fn acquire(&self, keys: &[String]) -> Result<LockSession, Error> {
         self.lock.acquire(keys).await.map_err(Error::Lock)
-    }
-
-    fn lock(&self) -> Arc<Lock> {
-        Arc::clone(&self.lock)
-    }
-
-    fn conditional_store(&self) -> Option<Arc<dyn ConditionalStore>> {
-        None
     }
 }
 

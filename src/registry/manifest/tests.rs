@@ -3275,8 +3275,7 @@ mod noop_suppression_tests {
             metadata_store::{LinkKind, LinkOperation, MetadataStore},
             repository_resolver::RepositoryResolver,
             test_utils::{
-                build_store, build_test_fs_executor, downstream_client, repository_with_downstream,
-                sole_pending_payload,
+                build_store, downstream_client, repository_with_downstream, sole_pending_payload,
             },
         },
         replication::REPLICATION_DELETE_MANIFEST_KIND,
@@ -3293,8 +3292,7 @@ mod noop_suppression_tests {
     fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
         crate::metrics_provider::init_for_tests();
         let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let executor = build_test_fs_executor(root, false);
-        let store = build_store(object, executor);
+        let store = build_store(object);
         let metadata_store = Arc::new(
             MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
@@ -3920,8 +3918,7 @@ mod dispatch_replication_tests {
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
             test_utils::{
-                build_store, build_test_fs_executor, downstream_client,
-                repository_with_replication, sole_pending_payload,
+                build_store, downstream_client, repository_with_replication, sole_pending_payload,
             },
         },
         replication::{
@@ -3967,8 +3964,7 @@ mod dispatch_replication_tests {
     /// test can count pending jobs.
     fn build_registry_with(root: &str, repository: Repository) -> (Registry, Arc<JobStore>) {
         let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let executor = build_test_fs_executor(root, false);
-        let store = build_store(object, executor);
+        let store = build_store(object);
         let metadata_store = Arc::new(
             MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)

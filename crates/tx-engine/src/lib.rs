@@ -43,7 +43,7 @@ pub use angos_storage::{
 /// them to auto-detect support when using S3 metadata storage.
 ///
 /// Values are surfaced from [`probe_conditional_capabilities`] and passed
-/// back through the configuration layer to [`build_executor`].
+/// back through the configuration layer to [`Store::new`](crate::store::Store::new).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConditionalCapabilities {
     /// `PutObject` with `If-None-Match: *`: create-only, reject if object exists.

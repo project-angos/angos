@@ -1,8 +1,8 @@
 //! Conditional-write capability probing.
 //!
 //! [`probe_conditional_capabilities`] tests each S3 conditional operation
-//! independently against the live store. The result drives [`build_executor`]'s
-//! choice between [`CasExecutor`] and [`LockedExecutor`].
+//! independently against the live store. The result drives the executor
+//! choice (CAS or locked) in [`Store::new`](crate::store::Store::new).
 
 use bytes::Bytes;
 use tracing::{info, warn};

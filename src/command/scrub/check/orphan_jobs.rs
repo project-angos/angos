@@ -254,7 +254,7 @@ mod tests {
             metadata_store::MetadataStore,
             repository::Upstream,
             repository_resolver::RepositoryResolver,
-            test_utils::{build_store, build_test_fs_executor},
+            test_utils::build_store,
         },
         registry_client::RegistryClient,
         replication::{
@@ -277,8 +277,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
         let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let executor = build_test_fs_executor(root, false);
-        let store = build_store(object, executor);
+        let store = build_store(object);
         let metadata_store = Arc::new(
             MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)

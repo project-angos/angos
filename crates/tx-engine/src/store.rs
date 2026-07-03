@@ -1,12 +1,14 @@
 //! Storage façade: the single seam subsystems use for storage.
 //!
 //! [`Store`] composes the storage handles a subsystem needs (an
-//! [`ObjectStore`], the CRUD floor plus the upload-session lifecycle, plus
-//! an optional presign capability) together with the [`TransactionExecutor`]
-//! that commits coordinated writes. Subsystems (`metadata_store`, `blob_store`,
-//! `job_store`) hold a single `Arc<Store>` for their per-operation storage
-//! access; the concrete backends are constructed from `angos_storage` at the
-//! configuration seam.
+//! [`ObjectStore`], the CRUD floor plus the upload-session lifecycle)
+//! together with the [`TransactionExecutor`] that commits coordinated writes.
+//! [`Store::new`] is the engine's construction seam: it builds the lock
+//! primitive and selects the executor from operator-level inputs, so
+//! subsystems (`metadata_store`, `job_store`) hold a single `Arc<Store>` and
+//! never instantiate locks or executors directly. [`Store::maintenance`]
+//! returns the engine's background loops (recovery, body janitor, lock
+//! janitor) wired over the same primitives; the caller spawns it.
 //!
 //! The façade stays domain-agnostic: it speaks only `String` keys and `Bytes`
 //! bodies. Registry domain types (`Digest`, `LinkKind`, OCI hashing, serde)
@@ -24,19 +26,32 @@ use std::{
     fmt,
     future::Future,
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
 };
 
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use angos_storage::{
-    BoxedReader, ByteStream, ChildrenPage, Error as StorageError, MultipartUploadPage, ObjectMeta,
-    ObjectStore, Page, PresignedStore,
+    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error as StorageError,
+    MultipartUploadPage, ObjectMeta, ObjectStore, Page,
 };
 
+#[cfg(feature = "redis")]
+use crate::lock::storage::redis::RedisLockStorage;
 use crate::{
     error::Error,
-    executor::{Outcome, TransactionExecutor, execute_with_retry_payload},
+    executor::{
+        Outcome, TransactionExecutor, cas::CasExecutor, execute_with_retry_payload,
+        locked::LockedExecutor,
+    },
+    janitor::{BodyJanitor, LockJanitor},
+    lock::{
+        LockStrategy,
+        primitive::Lock,
+        storage::{LockStorage, memory::MemoryLockStorage, s3::S3LockStorage},
+    },
+    recovery::RecoveryLoop,
     transaction::{Mutation, Transaction},
 };
 
@@ -59,12 +74,13 @@ pub struct Snapshot {
 }
 
 /// Storage façade composing storage capabilities with the transaction
-/// executor. Construct via [`Store::builder`].
+/// executor. Construct via [`Store::new`].
 #[derive(Clone)]
 pub struct Store {
     object: Arc<dyn ObjectStore>,
-    presign: Option<Arc<dyn PresignedStore>>,
     executor: Arc<dyn TransactionExecutor>,
+    lock: Arc<Lock>,
+    conditional: Option<Arc<dyn ConditionalStore>>,
 }
 
 impl fmt::Debug for Store {
@@ -74,21 +90,158 @@ impl fmt::Debug for Store {
 }
 
 impl Store {
-    #[must_use]
-    pub fn builder(
+    /// Build a [`Store`] from operator-level inputs.
+    ///
+    /// This is the engine's single construction seam. Subsystems call it with
+    /// their [`ObjectStore`] (and optional [`ConditionalStore`]) plus the
+    /// operator's [`LockStrategy`]; they never instantiate `Lock`,
+    /// `LockStorage`, or any executor type directly.
+    ///
+    /// - When `conditional` is `Some(...)` and `supports_cas` is `true`, the
+    ///   engine selects a CAS executor. Otherwise it falls back to a locked
+    ///   executor. The caller is responsible for probing conditional
+    ///   capabilities (via [`crate::probe::probe_conditional_capabilities`])
+    ///   and setting `supports_cas` accordingly.
+    /// - For [`LockStrategy::S3`] the caller must provide `s3_lock_store` (a
+    ///   [`ConditionalStore`] tuned for short-lived lock requests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Build`] when `LockStrategy::S3` is selected without an
+    /// `s3_lock_store`, when the `redis` feature is not enabled and Redis is
+    /// selected, or when the underlying lock or executor builder rejects its
+    /// inputs.
+    pub fn new(
         object: Arc<dyn ObjectStore>,
-        executor: Arc<dyn TransactionExecutor>,
-    ) -> StoreBuilder {
-        StoreBuilder {
+        conditional: Option<Arc<dyn ConditionalStore>>,
+        lock_strategy: LockStrategy,
+        s3_lock_store: Option<Arc<dyn ConditionalStore>>,
+        s3_lock_delete_if_match: bool,
+        supports_cas: bool,
+    ) -> Result<Self, Error> {
+        // Capture a stable label for the lock-object backend before the match
+        // below moves `lock_strategy`. Logged alongside the executor choice so
+        // operators are not misled into reading the lock strategy as the
+        // coordination path: both executors share this backend.
+        let lock_backend = match &lock_strategy {
+            LockStrategy::Memory => "memory",
+            #[cfg(feature = "redis")]
+            LockStrategy::Redis(_) => "redis",
+            LockStrategy::S3(_) => "s3",
+        };
+
+        // Each arm yields the lock-object storage plus a `LockBuilder` primed
+        // with the per-strategy tuning carried in the strategy config. The
+        // tuning is threaded directly into the builder (never stored as a
+        // Config field), and the Lock is built once after the match.
+        let lock_builder = match lock_strategy {
+            LockStrategy::Memory => {
+                let storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
+                // Memory backend: keep builder defaults.
+                Lock::builder(storage)
+            }
+            #[cfg(feature = "redis")]
+            LockStrategy::Redis(config) => {
+                let storage: Arc<dyn LockStorage> =
+                    Arc::new(RedisLockStorage::new(&config).map_err(|e| {
+                        Error::Build(format!("failed to build Redis lock storage: {e}"))
+                    })?);
+                // Redis TTL is enforced natively by the storage; only the retry
+                // tuning is threaded into the lock primitive.
+                Lock::builder(storage)
+                    .max_retries(config.max_retries)
+                    .retry_delay_ms(config.retry_delay_ms)
+            }
+            LockStrategy::S3(config) => {
+                let lock_store = s3_lock_store.ok_or_else(|| {
+                    Error::Build("S3 lock strategy requires an S3 conditional store".to_string())
+                })?;
+                let storage: Arc<dyn LockStorage> =
+                    Arc::new(S3LockStorage::new(lock_store, s3_lock_delete_if_match));
+                Lock::builder(storage)
+                    .ttl_secs(config.ttl_secs)
+                    .max_retries(config.max_retries)
+                    .retry_delay_ms(config.retry_delay_ms)
+                    .max_hold_secs(config.max_hold_secs)
+            }
+        };
+
+        let lock = Arc::new(
+            lock_builder
+                .build()
+                .map_err(|e| Error::Build(format!("failed to build lock: {e}")))?,
+        );
+
+        // The conditional store is retained only when the CAS executor uses
+        // it on the healthy path, so `maintenance` replays stale intents with
+        // the same primitives the executor used.
+        if supports_cas && let Some(cs) = conditional {
+            let executor: Arc<dyn TransactionExecutor> =
+                Arc::new(CasExecutor::builder(cs.clone(), lock.clone()).build());
+            info!(
+                executor = "cas",
+                lock_backend, "transactional engine executor selected"
+            );
+            return Ok(Self {
+                object,
+                executor,
+                lock,
+                conditional: Some(cs),
+            });
+        }
+
+        let executor: Arc<dyn TransactionExecutor> =
+            Arc::new(LockedExecutor::builder(object.clone(), lock.clone()).build());
+        info!(
+            executor = "locked",
+            lock_backend, "transactional engine executor selected"
+        );
+        Ok(Self {
             object,
-            presign: None,
             executor,
+            lock,
+            conditional: None,
+        })
+    }
+
+    /// The engine maintenance loops (recovery, body janitor, lock janitor)
+    /// joined into a single future that runs until `cancellation` fires. The
+    /// caller decides where it runs (typically `tokio::spawn`); spawn it once
+    /// per process per shared [`ObjectStore`].
+    ///
+    /// The loops use the engine's default intervals and coordinate through
+    /// the executor's own primitives: recovery takes ownership of stale
+    /// intents via the engine lock and, on CAS deployments, replays with the
+    /// same conditional store the healthy path uses.
+    pub fn maintenance(
+        &self,
+        cancellation: CancellationToken,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let mut recovery = RecoveryLoop::builder(self.object.clone())
+            .lock(self.lock.clone())
+            .cancellation(cancellation.clone());
+        if let Some(cs) = &self.conditional {
+            recovery = recovery.conditional_store(cs.clone());
+        }
+        let recovery = recovery.build();
+
+        let body_janitor = BodyJanitor::builder(self.object.clone())
+            .cancellation(cancellation.clone())
+            .build();
+
+        let mut lock_janitor = LockJanitor::builder(self.object.clone()).cancellation(cancellation);
+        if let Some(cs) = &self.conditional {
+            lock_janitor = lock_janitor.conditional_store(cs.clone());
+        }
+        let lock_janitor = lock_janitor.build();
+
+        async move {
+            tokio::join!(recovery.run(), body_janitor.run(), lock_janitor.run());
         }
     }
 
-    /// The transaction executor backing this store. Wiring code uses it to
-    /// reach the lock primitive and conditional store for the recovery loop
-    /// and lock janitor.
+    /// The transaction executor backing this store. Subsystems use it for
+    /// single-shot transaction execution and engine-lock sessions.
     #[must_use]
     pub fn executor(&self) -> &Arc<dyn TransactionExecutor> {
         &self.executor
@@ -431,60 +584,6 @@ impl Store {
     pub async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
         self.object.complete_upload(key).await
     }
-
-    // Presign / prune
-
-    /// Generate a presigned download URL for `key`, or `Ok(None)` when no
-    /// presign backend is wired.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the backend [`StorageError`] from the presign operation.
-    pub async fn presigned_get(
-        &self,
-        key: &str,
-        ttl: Duration,
-        content_type: Option<&str>,
-    ) -> Result<Option<String>, StorageError> {
-        match &self.presign {
-            Some(presign) => Ok(Some(presign.presign_get(key, ttl, content_type).await?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Whether a presign backend is wired (S3 has one; FS does not).
-    #[must_use]
-    pub fn supports_presign(&self) -> bool {
-        self.presign.is_some()
-    }
-}
-
-/// Builder for [`Store`]. The object store and transaction executor are
-/// required and supplied to [`Store::builder`]; the presign capability is an
-/// optional fluent setter and reflects what the underlying backend supports.
-pub struct StoreBuilder {
-    object: Arc<dyn ObjectStore>,
-    presign: Option<Arc<dyn PresignedStore>>,
-    executor: Arc<dyn TransactionExecutor>,
-}
-
-impl StoreBuilder {
-    /// Set the presign backend. Enables [`Store::presigned_get`].
-    #[must_use]
-    pub fn presign(mut self, presign: Arc<dyn PresignedStore>) -> Self {
-        self.presign = Some(presign);
-        self
-    }
-
-    /// Consume the builder and produce the [`Store`].
-    #[must_use]
-    pub fn build(self) -> Store {
-        Store {
-            object: self.object,
-            presign: self.presign,
-            executor: self.executor,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -496,20 +595,13 @@ mod tests {
     use angos_storage::{Error as StorageError, MemoryObjectStore};
 
     use crate::{
-        executor::locked::LockedExecutor,
-        lock::{primitive::Lock, storage::memory::MemoryLockStorage},
+        lock::LockStrategy,
         store::Store,
         transaction::{Mutation, Transaction},
     };
 
     fn store_over(backend: Arc<MemoryObjectStore>) -> Store {
-        let lock = Arc::new(
-            Lock::builder(Arc::new(MemoryLockStorage::new()))
-                .build()
-                .expect("lock"),
-        );
-        let executor = Arc::new(LockedExecutor::builder(backend.clone(), lock).build());
-        Store::builder(backend, executor).build()
+        Store::new(backend, None, LockStrategy::Memory, None, false, false).expect("store")
     }
 
     #[tokio::test]

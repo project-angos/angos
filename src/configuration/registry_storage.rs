@@ -9,7 +9,7 @@ use angos_storage::{
 };
 use angos_tx_engine::{
     ConditionalCapabilities,
-    executor::{TransactionExecutor, build_executor},
+    error::Error as EngineError,
     lock::{
         LockStrategy, resolve_lock_strategy, storage::redis::RedisLockStorageConfig as LockConfig,
     },
@@ -46,6 +46,15 @@ impl From<angos_storage::Error> for Error {
 impl From<angos_s3_client::Error> for Error {
     fn from(e: angos_s3_client::Error) -> Self {
         Error::StorageBackend(e.to_string())
+    }
+}
+
+impl From<EngineError> for Error {
+    fn from(e: EngineError) -> Self {
+        match &e {
+            EngineError::Storage(_) => Error::StorageBackend(e.to_string()),
+            _ => Error::Coordination(e.to_string()),
+        }
     }
 }
 
@@ -259,9 +268,7 @@ impl RegistryStorageConfig {
             RegistryStorageConfig::S3(config) => {
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
                 let storage = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
-                let caps = probe_conditional_capabilities(storage.as_ref())
-                    .await
-                    .map_err(|e| Error::StorageBackend(e.to_string()))?;
+                let caps = probe_conditional_capabilities(storage.as_ref()).await?;
                 Self::ensure_s3_cas_supported(&config.lock_strategy, &caps)?;
                 Ok(Some(caps))
             }
@@ -277,11 +284,8 @@ impl RegistryStorageConfig {
     /// across hot-reloads should resolve capabilities up front (see
     /// `setup::build_metadata_store`) and inject them into the config so this
     /// path skips the probe.
-    #[allow(clippy::too_many_lines)]
     pub async fn build_store(&self) -> Result<Arc<Store>, Error> {
-        // A single `ObjectStore` handle backs both the `Store` façade (CRUD plus
-        // the upload-session lifecycle) and the executor.
-        let (object, executor): (Arc<dyn ObjectStore>, Arc<dyn TransactionExecutor>) = match self {
+        let store = match self {
             RegistryStorageConfig::Inherit => {
                 return Err(Error::Coordination(
                     "RegistryStorageConfig::Inherit reached build_store(); callers must \
@@ -304,16 +308,14 @@ impl RegistryStorageConfig {
                         .sync_to_disk(config.sync_to_disk)
                         .build(),
                 );
-                let executor = build_executor(
-                    object.clone(),
+                Store::new(
+                    object,
                     None,
                     config.lock_strategy.clone(),
                     None,
                     false,
                     false,
-                )
-                .map_err(|e| Error::Coordination(e.to_string()))?;
-                (object, executor)
+                )?
             }
             RegistryStorageConfig::S3(config) => {
                 info!(
@@ -337,31 +339,25 @@ impl RegistryStorageConfig {
                     LockStrategy::S3(s3_lock_config) => {
                         let lock_http = S3HttpBackend::new(
                             &config.connection.to_lock_client_config(s3_lock_config),
-                        )
-                        .map_err(|e| {
-                            Error::Coordination(format!("Failed to initialize S3 lock client: {e}"))
-                        })?;
+                        )?;
                         let lock_backend = StorageS3Backend::builder(Arc::new(lock_http)).build();
                         Some(Arc::new(lock_backend))
                     }
                     LockStrategy::Redis(_) | LockStrategy::Memory => None,
                 };
 
-                let executor = build_executor(
-                    object.clone(),
+                Store::new(
+                    object,
                     Some(conditional_store),
                     config.lock_strategy.clone(),
                     s3_lock_store,
                     caps_resolved.delete_if_match,
                     caps_resolved.supports_cas(),
-                )
-                .map_err(|e| Error::Coordination(e.to_string()))?;
-
-                (object, executor)
+                )?
             }
         };
 
-        Ok(Arc::new(Store::builder(object, executor).build()))
+        Ok(Arc::new(store))
     }
 }
 

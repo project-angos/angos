@@ -21,8 +21,8 @@ use crate::{
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         repository_resolver::RepositoryResolver,
         test_utils::{
-            build_store, build_test_fs_executor, downstream_client, put_blob_direct,
-            repository_with_replication, seed_manifest,
+            build_store, downstream_client, put_blob_direct, repository_with_replication,
+            seed_manifest,
         },
     },
     registry_client::RegistryClient,
@@ -205,8 +205,7 @@ async fn execute_rejects_unknown_kind() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -249,8 +248,7 @@ async fn execute_errors_on_removed_downstream() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -289,8 +287,7 @@ async fn execute_pushes_manifest_with_head_before_put() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -374,8 +371,7 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -479,8 +475,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .cache(cache::Config::Memory.to_backend().unwrap())
@@ -619,8 +614,7 @@ async fn execute_skips_blob_present_on_downstream() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -680,8 +674,7 @@ async fn execute_push_stamps_resolved_source_timestamp() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -757,8 +750,7 @@ async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -829,8 +821,7 @@ async fn execute_push_surfaces_immutable_conflict_409_as_error() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -890,8 +881,7 @@ async fn execute_push_treats_superseded_409_as_success() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -957,8 +947,7 @@ async fn execute_delete_manifest_calls_downstream_delete() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -992,8 +981,7 @@ async fn handler_with_downstream(
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -1175,8 +1163,7 @@ async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
@@ -1230,8 +1217,7 @@ async fn execute_tagless_push_with_deleted_revision_is_noop_success() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap();
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)

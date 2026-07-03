@@ -1,12 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
 
-use angos_tx_engine::{
-    janitor::{BodyJanitor, LockJanitor},
-    recovery::RecoveryLoop,
-    store::Store,
-};
-use tokio_util::sync::CancellationToken;
-
 use crate::{
     cache::{self, Cache},
     configuration::{RegistryStorageConfig, registry_storage},
@@ -49,49 +42,6 @@ impl From<blob_store::Error> for Error {
     fn from(e: blob_store::Error) -> Self {
         Self::BlobStore(e)
     }
-}
-
-/// Spawn the transactional-engine maintenance loops (recovery + body janitor
-/// + lock janitor).
-///
-/// These subsystems clean up the engine's `.tx-log/`, `.tx-bodies/`, and
-/// `.tx-locks/` namespaces. They use the engine's default intervals (recovery:
-/// 30 s; body janitor: 5 min sweep, 1 h orphan age; lock janitor: 5 min
-/// sweep, 5 min orphan-age grace on top of each lock's own TTL) and shut down
-/// when `cancellation` fires. Spawning them is idempotent in effect, but
-/// should happen once per process per shared `ObjectStore`.
-///
-/// The recovery loop and lock janitor take their lock primitive and
-/// conditional store from `executor` so they coordinate through the same
-/// primitives the healthy path uses: recovery takes ownership of stale
-/// intents via the executor's lock and (on CAS deployments) replays with the
-/// executor's conditional store.
-pub fn spawn_engine_maintenance(store: &Store, cancellation: CancellationToken) {
-    let object = store.object_store().clone();
-    let executor = store.executor();
-    let lock = executor.lock();
-    let conditional_store = executor.conditional_store();
-
-    let mut recovery_builder = RecoveryLoop::builder(object.clone())
-        .lock(lock)
-        .cancellation(cancellation.clone());
-    if let Some(cs) = conditional_store.clone() {
-        recovery_builder = recovery_builder.conditional_store(cs);
-    }
-    tokio::spawn(recovery_builder.build().run());
-
-    tokio::spawn(
-        BodyJanitor::builder(object.clone())
-            .cancellation(cancellation.clone())
-            .build()
-            .run(),
-    );
-
-    let mut lock_janitor_builder = LockJanitor::builder(object).cancellation(cancellation);
-    if let Some(cs) = conditional_store {
-        lock_janitor_builder = lock_janitor_builder.conditional_store(cs);
-    }
-    tokio::spawn(lock_janitor_builder.build().run());
 }
 
 pub async fn metadata_store(
