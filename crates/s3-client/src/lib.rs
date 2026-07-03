@@ -18,6 +18,8 @@ mod client;
 mod config;
 mod error;
 mod ops;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 mod xml;
 
 pub use crate::config::BackendConfig;
@@ -113,16 +115,10 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::{ops::aggregate_batch_delete_errors, *};
+    use crate::test_util::mock_config;
 
     fn test_config(overrides: impl FnOnce(&mut BackendConfig)) -> BackendConfig {
-        let mut config = BackendConfig {
-            access_key_id: "key".to_string(),
-            secret_key: "secret".to_string(),
-            endpoint: "http://localhost:9000".to_string(),
-            bucket: "test".to_string(),
-            region: "us-east-1".to_string(),
-            ..Default::default()
-        };
+        let mut config = mock_config("http://localhost:9000");
         overrides(&mut config);
         config
     }

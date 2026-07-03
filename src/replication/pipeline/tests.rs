@@ -10,11 +10,10 @@ use wiremock::{
     matchers::{header, method, path, query_param},
 };
 
-use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 use angos_tx_engine::store::Store;
 
 use crate::{
-    cache, metrics_provider,
+    metrics_provider,
     oci::{
         DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, Digest, MediaType, Namespace,
         OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference, Tag,
@@ -22,41 +21,67 @@ use crate::{
     registry::{
         DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
         blob_store::BlobStore,
-        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
-        test_utils::{build_store, put_blob_direct},
+        test_utils::{FsTestStack, downstream_client, fs_test_stack, media_type, put_blob_direct},
     },
     registry_client::{RegistryClient, UploadSession},
     replication::{
         REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP,
         pipeline::{PushContext, PushOutcome, delete_manifest, push_manifest},
     },
+    test_fixtures::mocks::mount_blob_upload_accepted,
 };
 
 const NAMESPACE: &str = "nginx";
 
-fn media_type(value: &str) -> MediaType {
-    MediaType::new(value).unwrap()
+fn test_blob_store() -> (Arc<BlobStore>, Arc<MetadataStore>, Arc<Store>, TempDir) {
+    let FsTestStack {
+        dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
+    (blob_store, metadata_store, store, dir)
 }
 
-fn downstream_client(uri: &str) -> RegistryClient {
-    let backend = cache::Config::Memory.to_backend().unwrap();
-    RegistryClient::builder(uri.to_string(), reqwest::Client::new(), backend)
-        .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-        .build()
+/// The modal test `PushContext`: same-namespace downstream, no remapping,
+/// four concurrent pushes, no source timestamp.
+fn push_context<'a>(
+    client: &'a RegistryClient,
+    blob_store: &'a Arc<BlobStore>,
+    metadata_store: &'a Arc<MetadataStore>,
+    namespace: &'a Namespace,
+) -> PushContext<'a> {
+    PushContext {
+        downstream: client,
+        blob_store,
+        metadata_store,
+        namespace,
+        downstream_namespace: namespace,
+        downstream_local_namespace: None,
+        downstream_target_namespace: None,
+        max_concurrent_pushes: 4,
+        source_ts: None,
+    }
 }
 
-fn test_blob_store(root: &str) -> (Arc<BlobStore>, Arc<MetadataStore>, Arc<Store>) {
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    (blob_store, metadata_store, store)
+/// Mounts the plain happy-path manifest PUT: 201 echoing `digest` in
+/// `Docker-Content-Digest`, expected exactly once.
+async fn mount_manifest_put(
+    server: &MockServer,
+    namespace: &str,
+    reference: &str,
+    digest: &Digest,
+) {
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{namespace}/manifests/{reference}")))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header(DOCKER_CONTENT_DIGEST, digest.to_string().as_str()),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
 }
 
 /// A wiremock responder recording the order in which the index vs. its
@@ -82,12 +107,10 @@ impl Respond for OrderRecorder {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let subject = put_blob_direct(&store, b"subject-bytes").await;
     let config = put_blob_direct(&store, br#"{"c":1}"#).await;
@@ -110,44 +133,11 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
-        )
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
-        )
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
-        .respond_with(ResponseTemplate::new(201))
-        .mount(&mock_server)
-        .await;
+    mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config]).await;
 
     // No `OCI-Subject` response header => OCI-1.0 downstream => fallback
     // expected.
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     // The pipeline GETs the existing fallback index first (404 => start fresh).
     let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
@@ -184,17 +174,7 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -215,8 +195,7 @@ async fn referrers_fallback_put_is_timestamp_less() {
     // just-merged descriptor.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let subject = put_blob_direct(&store, b"subject-bytes").await;
     let manifest = json!({
@@ -270,15 +249,8 @@ async fn referrers_fallback_put_is_timestamp_less() {
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
+        ..push_context(&client, &blob_store, &metadata_store, &namespace)
     };
     push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
         .await
@@ -292,8 +264,7 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
     // built from an empty base and drop the subject's sibling referrers.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let subject = put_blob_direct(&store, b"subject-bytes").await;
     let config = put_blob_direct(&store, br#"{"c":1}"#).await;
@@ -315,42 +286,10 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
-        )
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
-        )
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
-        .respond_with(ResponseTemplate::new(201))
-        .mount(&mock_server)
-        .await;
+    mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config]).await;
 
     // No `OCI-Subject` response => OCI-1.0 => fallback runs.
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     // The fallback index GET fails with 500; the merge PUT must not run.
     let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
@@ -368,17 +307,7 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(
         &ctx,
         &manifest_digest,
@@ -402,8 +331,7 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
     // from empty and drop the subject's existing sibling referrers.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let subject = put_blob_direct(&store, b"subject-bytes").await;
     // Config-less manifest, so no blob upload mocks are needed.
@@ -421,14 +349,7 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
     let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
     // No `OCI-Subject` response => OCI-1.0 => fallback runs.
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     // The fallback GET returns a 200 whose JSON body has no `manifests`
     // array; the merge PUT must not run.
@@ -454,17 +375,7 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes).await;
 
     assert!(
@@ -476,14 +387,12 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn concurrent_same_subject_referrers_merge_without_lost_update() {
     // Without the store lock both concurrent merges read the same base
     // index and one descriptor vanishes from the final PUT.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let subject = put_blob_direct(&store, b"subject-bytes").await;
     let referrer = |name: &str| {
@@ -506,15 +415,7 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
 
     // No `OCI-Subject` response => OCI-1.0 => the fallback runs.
     for (tag, digest) in [("v1", &digest_a), ("v2", &digest_b)] {
-        Mock::given(method("PUT"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/{tag}")))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .insert_header(DOCKER_CONTENT_DIGEST, digest.to_string().as_str()),
-            )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
+        mount_manifest_put(&mock_server, NAMESPACE, tag, digest).await;
     }
 
     // A stateful fallback endpoint: GET serves what the last PUT stored, so
@@ -556,17 +457,7 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let (a, b) = tokio::join!(
         push_manifest(&ctx, &digest_a, None, Some("v1"), bytes_a),
         push_manifest(&ctx, &digest_b, None, Some("v2"), bytes_b),
@@ -594,8 +485,7 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
 async fn no_referrers_fallback_when_downstream_indexes_subject() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let subject = put_blob_direct(&store, b"subject-bytes").await;
     let manifest = json!({
@@ -626,17 +516,7 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
     // Any fallback-tag PUT would 404 (no mock) and surface as an error.
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -654,8 +534,7 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
 async fn index_lands_after_its_child_manifest() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let child = json!({
         "schemaVersion": 2,
@@ -709,17 +588,7 @@ async fn index_lands_after_its_child_manifest() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &index_digest,
@@ -743,8 +612,7 @@ async fn index_lands_after_all_children_when_fanned_out() {
     // after every child, and no child may be dropped by the fan-out.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let mut child_digests = Vec::new();
     let mut manifests = Vec::new();
@@ -787,17 +655,7 @@ async fn index_lands_after_all_children_when_fanned_out() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &index_digest,
@@ -833,15 +691,13 @@ async fn index_lands_after_all_children_when_fanned_out() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
     // A sibling namespace already referencing the blobs becomes the mount `from`.
     const SIBLING: &str = "other/repo";
 
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let config = put_blob_direct(&store, br#"{"c":1}"#).await;
     let layer = put_blob_direct(&store, b"layer-bytes").await;
@@ -894,29 +750,11 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
         .expect(2)
         .mount(&mock_server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -936,8 +774,7 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
 
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let config = put_blob_direct(&store, br#"{"c":1}"#).await;
     let manifest = json!({
@@ -998,29 +835,11 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
         .expect(1)
         .mount(&mock_server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -1056,8 +875,7 @@ fn oci_error_body(code: &str) -> serde_json::Value {
 async fn push_manifest_stamps_source_timestamp_header() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
     Mock::given(method("PUT"))
@@ -1074,15 +892,8 @@ async fn push_manifest_stamps_source_timestamp_header() {
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
+        ..push_context(&client, &blob_store, &metadata_store, &namespace)
     };
     push_manifest(
         &ctx,
@@ -1103,8 +914,7 @@ async fn push_manifest_skips_put_when_downstream_already_converged() {
     // fail the push.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
     Mock::given(method("HEAD"))
@@ -1120,17 +930,7 @@ async fn push_manifest_skips_put_when_downstream_already_converged() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1155,8 +955,7 @@ async fn repeated_layer_digest_uploads_the_blob_once() {
     // every mock is pinned to `.expect(1)`.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let layer = put_blob_direct(&store, b"twice-listed layer").await;
     let manifest = json!({
@@ -1170,59 +969,12 @@ async fn repeated_layer_digest_uploads_the_blob_once() {
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/{layer}")))
-        .respond_with(ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
-        .respond_with(ResponseTemplate::new(201))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&layer]).await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
         .await
         .expect("a manifest repeating a layer digest must push it once");
@@ -1237,8 +989,7 @@ async fn converged_skip_head_sends_standard_accept_headers() {
     // so the converged skip would never fire.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
     let digest_str = manifest_digest.to_string();
@@ -1273,17 +1024,7 @@ async fn converged_skip_head_sends_standard_accept_headers() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1298,15 +1039,13 @@ async fn converged_skip_head_sends_standard_accept_headers() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn converged_manifest_with_blobs_sends_exactly_one_head() {
     // The converged skip runs before child recursion and the blob sweep,
     // so a redelivered already-converged manifest costs one manifest HEAD:
     // zero blob HEADs, zero uploads, zero PUTs.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let config = put_blob_direct(&store, br#"{"c":1}"#).await;
     let layer_a = put_blob_direct(&store, b"layer-a-bytes").await;
@@ -1369,17 +1108,7 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1403,8 +1132,7 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
     // downstream already holds is not re-PUT while the index still lands.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let child = json!({
         "schemaVersion": 2,
@@ -1448,29 +1176,11 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
         .expect(0)
         .mount(&mock_server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, index_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &index_digest).await;
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let outcome = push_manifest(
         &ctx,
         &index_digest,
@@ -1490,8 +1200,7 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
     // retries; treating it as absent would start a pointless full upload.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let config = put_blob_direct(&store, br#"{"c":1}"#).await;
     let manifest = json!({
@@ -1528,17 +1237,7 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1556,14 +1255,12 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn failed_patch_cancels_the_upload_session() {
     // A PATCH failure must best-effort DELETE the open session exactly
     // once and still propagate the original upload error.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let config = put_blob_direct(&store, br#"{"c":1}"#).await;
     let manifest = json!({
@@ -1615,17 +1312,7 @@ async fn failed_patch_cancels_the_upload_session() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1649,8 +1336,7 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
     // stranding the referrer.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let subject = put_blob_direct(&store, b"subject-bytes").await;
     // Config-less manifest, so no blob mocks are needed.
@@ -1680,15 +1366,7 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
         .await;
 
     // The re-issued primary PUT returns no `OCI-Subject` (OCI-1.0 downstream).
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
     Mock::given(method("GET"))
@@ -1705,17 +1383,7 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
         .await
         .expect("a converged subject-bearing manifest must re-push the referrers fallback");
@@ -1728,8 +1396,7 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
     // The PUT must still run so receiver-side LWW can arbitrate the divergence.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
     let other_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
@@ -1742,29 +1409,11 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
         )
         .mount(&mock_server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -1784,33 +1433,14 @@ async fn push_manifest_puts_when_downstream_head_returns_404() {
     // 404 and the PUT must still run.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -1831,8 +1461,7 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
     // `Content-Type` and the receiver rejects it 400.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let manifest = json!({ "schemaVersion": 2, "layers": [] });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
@@ -1866,17 +1495,7 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
         .await
         .expect("a typeless body must recover its Content-Type from the revision link");
@@ -1890,8 +1509,7 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
     // by digest must recover its Content-Type from its own revision link.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
 
     let child = json!({ "schemaVersion": 2, "layers": [] });
     let child_bytes = serde_json::to_vec(&child).unwrap();
@@ -1944,17 +1562,7 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     push_manifest(&ctx, &index_digest, None, Some("v1"), index_bytes)
         .await
         .expect("a typeless child must recover its Content-Type and the index must land");
@@ -1966,8 +1574,7 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
 async fn push_manifest_treats_lww_superseded_409_as_success() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
     Mock::given(method("PUT"))
@@ -1982,15 +1589,8 @@ async fn push_manifest_treats_lww_superseded_409_as_success() {
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
         source_ts: Some("2026-06-03T00:00:00Z"),
+        ..push_context(&client, &blob_store, &metadata_store, &namespace)
     };
     push_manifest(
         &ctx,
@@ -2009,8 +1609,7 @@ async fn push_manifest_treats_lww_superseded_409_as_success() {
 async fn push_manifest_propagates_immutable_409_as_error() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
     // A 409 with the immutable-tag `CONFLICT` code is not an LWW loss.
@@ -2023,17 +1622,7 @@ async fn push_manifest_propagates_immutable_409_as_error() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(
         &ctx,
         &manifest_digest,
@@ -2065,8 +1654,7 @@ async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
         .mount(&mock_server)
         .await;
 
-    let dir = TempDir::new().unwrap();
-    let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
+    let (_, metadata_store, _, _dir) = test_blob_store();
     delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
@@ -2093,8 +1681,7 @@ async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
         .mount(&mock_server)
         .await;
 
-    let dir = TempDir::new().unwrap();
-    let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
+    let (_, metadata_store, _, _dir) = test_blob_store();
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
@@ -2126,8 +1713,7 @@ async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
         .mount(&mock_server)
         .await;
 
-    let dir = TempDir::new().unwrap();
-    let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
+    let (_, metadata_store, _, _dir) = test_blob_store();
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
@@ -2154,8 +1740,7 @@ async fn delete_manifest_propagates_non_superseded_409_as_error() {
         .mount(&mock_server)
         .await;
 
-    let dir = TempDir::new().unwrap();
-    let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
+    let (_, metadata_store, _, _dir) = test_blob_store();
     let result = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &metadata_store,
@@ -2179,8 +1764,7 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
     // strand it on the downstream.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (blob_store, metadata_store, _store) = test_blob_store(dir.path().to_str().unwrap());
+    let (blob_store, metadata_store, _store, _dir) = test_blob_store();
 
     let absent = Digest::sha256_of_bytes(b"never-written-locally");
     let session = UploadSession {
@@ -2196,17 +1780,7 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
 
     let client = downstream_client(&mock_server.uri());
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        downstream: &client,
-        blob_store: &blob_store,
-        metadata_store: &metadata_store,
-        namespace: &namespace,
-        downstream_namespace: &namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
-        source_ts: None,
-    };
+    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
     let result = super::upload_into_session(&ctx, &absent, &session).await;
     assert!(result.is_err(), "a missing local blob must fail the upload");
 
@@ -2231,8 +1805,7 @@ fn referrer_manifest(subject: &Digest) -> (Vec<u8>, Digest) {
 async fn deleting_last_referrer_removes_the_fallback_tag() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
+    let (_, metadata_store, _, _dir) = test_blob_store();
 
     let subject = Digest::sha256_of_bytes(b"the-subject");
     let (referrer_body, referrer) = referrer_manifest(&subject);
@@ -2299,8 +1872,7 @@ async fn deleting_last_referrer_removes_the_fallback_tag() {
 async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
+    let (_, metadata_store, _, _dir) = test_blob_store();
 
     let subject = Digest::sha256_of_bytes(b"shared-subject");
     let (referrer_body, referrer) = referrer_manifest(&subject);

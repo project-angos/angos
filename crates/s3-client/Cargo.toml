@@ -6,6 +6,9 @@ edition = "2024"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
+[features]
+test-util = []
+
 [dependencies]
 angos-backoff = { path = "../backoff" }
 base64 = "0.22.1"
@@ -22,11 +25,11 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"
 smallvec = "1.15"
-tokio = { version = "1.52.3", features = ["io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["io-util"] }
 tracing = "0.1.44"
 url = "2.5.8"
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["io-util", "sync", "time", "macros", "rt", "rt-multi-thread"] }
-wiremock = "0.6.5"
+tokio = { workspace = true, features = ["io-util", "sync", "time", "macros", "rt", "rt-multi-thread"] }
+wiremock = { workspace = true }

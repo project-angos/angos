@@ -227,13 +227,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use serde_json::json;
-    use tempfile::TempDir;
-
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
-    use angos_tx_engine::store::Store;
 
     use crate::{
-        cache,
         command::scrub::{
             action::Action,
             check::{
@@ -242,19 +237,16 @@ mod tests {
             },
             executor::{ActionSink, DryRunSink, Executor},
         },
-        metrics_provider,
         oci::{Namespace, Tag},
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             Repository,
-            blob_store::BlobStore,
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
             job_store::{FailOutcome, JobEnvelope, JobState, JobStore, Queue},
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::MetadataStore,
             repository::Upstream,
             repository_resolver::RepositoryResolver,
-            test_utils::build_store,
+            test_utils::{FsTestStack, downstream_client, fs_test_stack},
         },
         registry_client::RegistryClient,
         replication::{
@@ -272,31 +264,14 @@ mod tests {
     const GHOST_NAMESPACE: &str = "ghost/app";
     const DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
-    /// FS-backed metadata store so the tests run without S3.
-    fn fs_metadata_store() -> (Arc<MetadataStore>, Arc<Store>, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let store = build_store(object);
-        let metadata_store = Arc::new(
-            MetadataStore::builder(store.clone())
-                .link_cache_ttl(0)
-                .access_time_debounce_secs(0)
-                .build(),
-        );
-        (metadata_store, store, dir)
+    /// Job store over the shared test store, under this suite's worker id.
+    fn orphan_job_store(metadata_store: &MetadataStore) -> Arc<JobStore> {
+        Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"))
     }
 
-    /// Registry client whose URL is never contacted by these checkers.
-    fn client() -> RegistryClient {
-        let backend = cache::Config::Memory.to_backend().unwrap();
-        RegistryClient::builder(
-            "http://127.0.0.1:1".to_string(),
-            reqwest::Client::new(),
-            backend,
-        )
-        .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-        .build()
+    /// Bare registry client for [`Upstream`]; never dialed by these checkers.
+    fn upstream_client() -> RegistryClient {
+        Arc::into_inner(downstream_client("http://127.0.0.1:1")).expect("unshared test client")
     }
 
     fn repository(
@@ -329,15 +304,18 @@ mod tests {
     /// Resolver with a pull-through repository whose only downstream is
     /// [`DOWNSTREAM`], plus a configured repository with no upstreams.
     fn resolver() -> Arc<RepositoryResolver> {
-        let downstream =
-            ReplicationDownstream::builder(DOWNSTREAM.to_string(), Arc::new(client()), 4)
-                .mode(ReplicationMode::EventReconcile)
-                .prune(false)
-                .build();
+        let downstream = ReplicationDownstream::builder(
+            DOWNSTREAM.to_string(),
+            downstream_client("http://127.0.0.1:1"),
+            4,
+        )
+        .mode(ReplicationMode::EventReconcile)
+        .prune(false)
+        .build();
         let mut repositories = HashMap::new();
         repositories.insert(
             REPO.to_string(),
-            repository(REPO, vec![client()], vec![downstream]),
+            repository(REPO, vec![upstream_client()], vec![downstream]),
         );
         repositories.insert(
             LOCAL_REPO.to_string(),
@@ -401,9 +379,12 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_pending_replication_job_emits_delete_action() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         enqueue_push(&job_store, REMOVED_DOWNSTREAM, NAMESPACE).await;
         let keys = job_store
@@ -431,9 +412,12 @@ mod tests {
 
     #[tokio::test]
     async fn configured_downstream_job_emits_nothing() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
 
@@ -452,9 +436,12 @@ mod tests {
 
     #[tokio::test]
     async fn unresolvable_namespace_replication_job_emits_delete_action() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         // The downstream name is configured, but only for `nginx`; the payload
         // namespace resolves to no repository at all.
@@ -478,9 +465,12 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_failed_replication_job_emits_action_with_failed_state() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         let envelope = build_envelope(&push_payload(REMOVED_DOWNSTREAM, NAMESPACE)).unwrap();
         dead_letter(&job_store, Queue::Replication, envelope).await;
@@ -505,9 +495,12 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_replication_payload_is_skipped_without_action() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         let envelope = JobEnvelope::new(
             Queue::Replication,
@@ -543,10 +536,13 @@ mod tests {
     /// configured job survives.
     #[tokio::test]
     async fn end_to_end_deletes_only_the_orphan_replication_job() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            blob_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
         enqueue_push(&job_store, REMOVED_DOWNSTREAM, NAMESPACE).await;
@@ -585,9 +581,12 @@ mod tests {
     /// `DryRunSink` applies nothing, so both jobs remain.
     #[tokio::test]
     async fn dry_run_leaves_both_replication_jobs_in_place() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
         enqueue_push(&job_store, REMOVED_DOWNSTREAM, NAMESPACE).await;
@@ -610,9 +609,12 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_pending_cache_job_with_unresolvable_namespace_emits_delete_action() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
         let keys = job_store.list_pending(Queue::Cache, 10).await.unwrap();
@@ -637,9 +639,12 @@ mod tests {
 
     #[tokio::test]
     async fn configured_pull_through_cache_job_emits_nothing() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         enqueue_cache_fill(&job_store, NAMESPACE).await;
 
@@ -658,9 +663,12 @@ mod tests {
 
     #[tokio::test]
     async fn cache_job_for_non_pull_through_repository_emits_delete_action() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         // The namespace resolves to a configured repository, but one with no
         // upstreams: a fill job for it can never fetch anything.
@@ -684,9 +692,12 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_failed_cache_job_emits_action_with_failed_state() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         dead_letter(&job_store, Queue::Cache, cache_envelope(GHOST_NAMESPACE)).await;
 
@@ -712,9 +723,12 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_cache_payload_is_skipped_without_action() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         let envelope = JobEnvelope::new(
             Queue::Cache,
@@ -747,10 +761,13 @@ mod tests {
     /// job and the configured pull-through job survives.
     #[tokio::test]
     async fn end_to_end_deletes_only_the_orphan_cache_job() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            blob_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         enqueue_cache_fill(&job_store, NAMESPACE).await;
         enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
@@ -780,9 +797,12 @@ mod tests {
     /// `DryRunSink` applies nothing, so both jobs remain.
     #[tokio::test]
     async fn dry_run_leaves_both_cache_jobs_in_place() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
-        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let job_store = orphan_job_store(&metadata_store);
 
         enqueue_cache_fill(&job_store, NAMESPACE).await;
         enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;

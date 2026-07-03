@@ -6,7 +6,9 @@ use wiremock::{
     matchers::{body_json, header, method},
 };
 
-use super::common::{build_dispatcher, create_test_event, create_test_webhook_config};
+use super::common::{
+    build_dispatcher, create_test_event, create_test_webhook_config, single_hook_dispatcher,
+};
 use crate::{
     configuration::RegexPattern,
     event_webhook::{config::DeliveryPolicy, dispatcher::EventDispatcher, event::EventKind},
@@ -58,13 +60,13 @@ async fn dispatch_sends_post_with_json_body() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "test-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "test-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -81,13 +83,13 @@ async fn dispatch_sends_event_kind_header() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "test-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "test-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -104,13 +106,13 @@ async fn dispatch_sends_authorization_bearer_header() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "test-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, Some("my-token"), 0),
+    let dispatcher = single_hook_dispatcher(
+        "test-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        Some("my-token"),
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -168,13 +170,13 @@ async fn dispatch_records_delivery_total_metric() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "metrics-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "metrics-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     let families = prometheus::gather();
@@ -217,13 +219,13 @@ async fn dispatch_records_delivery_duration_metric() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "duration-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "duration-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     let families = prometheus::gather();

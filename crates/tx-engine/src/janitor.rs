@@ -462,8 +462,8 @@ mod tests {
     use uuid::Uuid;
 
     use angos_storage::{
-        BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error as StorageError, Etag,
-        MemoryObjectStore, MultipartUploadPage, ObjectMeta, ObjectStore, Page,
+        ConditionalStore, Error as StorageError, MemoryObjectStore, ObjectStore,
+        test_util::{HookedStore, StoreHook, StoreOp},
     };
 
     use crate::janitor::LockJanitor;
@@ -562,124 +562,19 @@ mod tests {
             .expect("unparseable body left alone");
     }
 
-    /// `MemoryObjectStore` returns `last_modified: None` from `head`. A
-    /// `ConditionalStore` wrapper that returns a fixed etag from `head` and
-    /// always answers `PreconditionFailed` on `delete_if_match` simulates a
-    /// fresh acquire that raced in between our HEAD and DELETE.
-    #[derive(Debug)]
-    struct RacingConditionalStore {
-        inner: Arc<MemoryObjectStore>,
-        fixed_etag: Etag,
-    }
+    /// Answers `PreconditionFailed` for every conditional write, simulating a
+    /// fresh acquire that raced in between the janitor's HEAD and DELETE.
+    struct AlwaysRaced;
 
-    impl RacingConditionalStore {
-        fn new(inner: Arc<MemoryObjectStore>) -> Self {
-            Self {
-                inner,
-                fixed_etag: Etag::new("\"stale\""),
+    #[async_trait]
+    impl StoreHook for AlwaysRaced {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            match op {
+                StoreOp::PutIfAbsent { .. }
+                | StoreOp::PutIfMatch { .. }
+                | StoreOp::DeleteIfMatch { .. } => Err(StorageError::PreconditionFailed),
+                _ => Ok(()),
             }
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for RacingConditionalStore {
-        async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-            self.inner.get(key).await
-        }
-        async fn get_stream(
-            &self,
-            key: &str,
-            offset: Option<u64>,
-        ) -> Result<(BoxedReader, u64), StorageError> {
-            self.inner.get_stream(key, offset).await
-        }
-        async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
-            self.inner.put(key, data).await
-        }
-        async fn delete(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.delete(key).await
-        }
-        async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
-            self.inner.delete_prefix(prefix).await
-        }
-        async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-            let mut m = self.inner.head(key).await?;
-            m.etag = Some(self.fixed_etag.clone());
-            Ok(m)
-        }
-        async fn list(
-            &self,
-            prefix: &str,
-            n: u16,
-            token: Option<String>,
-        ) -> Result<Page<String>, StorageError> {
-            self.inner.list(prefix, n, token).await
-        }
-        async fn list_children(
-            &self,
-            prefix: &str,
-            n: u16,
-            token: Option<String>,
-            start_after: Option<String>,
-        ) -> Result<ChildrenPage, StorageError> {
-            self.inner
-                .list_children(prefix, n, token, start_after)
-                .await
-        }
-        async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
-            self.inner.copy(source, destination).await
-        }
-        async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.create_upload(key).await
-        }
-        async fn write_upload(
-            &self,
-            key: &str,
-            body: ByteStream,
-            len: Option<u64>,
-        ) -> Result<u64, StorageError> {
-            self.inner.write_upload(key, body, len).await
-        }
-        async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.complete_upload(key).await
-        }
-        async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.abort_upload(key).await
-        }
-        async fn list_multipart_uploads(
-            &self,
-            key_marker: Option<&str>,
-            upload_id_marker: Option<&str>,
-        ) -> Result<MultipartUploadPage, StorageError> {
-            self.inner
-                .list_multipart_uploads(key_marker, upload_id_marker)
-                .await
-        }
-    }
-
-    #[async_trait]
-    impl ConditionalStore for RacingConditionalStore {
-        async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), StorageError> {
-            let body = self.inner.get(key).await?;
-            Ok((body, Some(self.fixed_etag.clone())))
-        }
-        async fn put_if_absent(
-            &self,
-            _key: &str,
-            _data: Bytes,
-        ) -> Result<Option<Etag>, StorageError> {
-            Err(StorageError::PreconditionFailed)
-        }
-        async fn put_if_match(
-            &self,
-            _key: &str,
-            _etag: &Etag,
-            _data: Bytes,
-        ) -> Result<Option<Etag>, StorageError> {
-            Err(StorageError::PreconditionFailed)
-        }
-        async fn delete_if_match(&self, _key: &str, _etag: &Etag) -> Result<(), StorageError> {
-            Err(StorageError::PreconditionFailed)
         }
     }
 
@@ -687,7 +582,8 @@ mod tests {
     async fn conditional_delete_precondition_failed_leaves_lock_in_place() {
         let inner = Arc::new(MemoryObjectStore::new());
         write_lock(&inner, "00/raced", &expired_body()).await;
-        let racing = Arc::new(RacingConditionalStore::new(inner.clone()));
+        let racing: Arc<HookedStore<Arc<dyn ConditionalStore>, AlwaysRaced>> =
+            Arc::new(HookedStore::new(inner.clone(), AlwaysRaced));
 
         let janitor = LockJanitor::builder(racing.clone() as Arc<dyn ObjectStore>)
             .conditional_store(racing.clone() as Arc<dyn ConditionalStore>)

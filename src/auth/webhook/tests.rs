@@ -1,9 +1,6 @@
 use std::{fs, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
-use hyper::{
-    HeaderMap, Method,
-    http::request::{Builder, Parts},
-};
+use hyper::{HeaderMap, Method, http::request::Builder};
 use reqwest::Client;
 use url::Url;
 use wiremock::{
@@ -31,7 +28,10 @@ use crate::{
     identity::{Action, ClientIdentity},
     oci::{Digest, Namespace, Reference, Tag},
     secret::Secret,
-    test_fixtures::webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
+    test_fixtures::{
+        requests::parts_with_uri,
+        webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
+    },
 };
 
 #[test]
@@ -156,23 +156,13 @@ fn test_set_forwarded_method_header() {
 
 #[test]
 fn test_set_forwarded_proto_header() {
-    let request = Builder::new()
-        .uri("https://example.com/path")
-        .body(())
-        .unwrap();
-
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/path");
     let mut headers = HeaderMap::new();
 
     assert!(set_forwarded_proto_header(&parts, &mut headers).is_ok());
     assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "https");
 
-    let request = Builder::new()
-        .uri("http://example.com/path")
-        .body(())
-        .unwrap();
-
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("http://example.com/path");
     let mut headers = HeaderMap::new();
 
     assert!(set_forwarded_proto_header(&parts, &mut headers).is_ok());
@@ -196,12 +186,7 @@ fn test_set_forwarded_host_header() {
 
 #[test]
 fn test_set_forwarded_uri_header() {
-    let request = Builder::new()
-        .uri("https://example.com/v2/test/manifests/latest")
-        .body(())
-        .unwrap();
-
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/v2/test/manifests/latest");
     let mut headers = HeaderMap::new();
 
     assert!(set_forwarded_uri_header(&parts, &mut headers).is_ok());
@@ -326,12 +311,6 @@ fn test_set_registry_identity_id_header() {
 
     assert!(set_registry_identity_id_header(&identity, &mut headers).is_ok());
     assert_eq!(headers.get("X-Registry-Identity-ID").unwrap(), &user_id);
-
-    let identity = ClientIdentity::new(None);
-    let mut headers = HeaderMap::new();
-    assert!(set_registry_username_header(&identity, &mut headers).is_ok());
-
-    assert!(headers.get("X-Registry-Identity-ID").is_none());
 }
 
 #[test]
@@ -586,11 +565,7 @@ async fn test_authorize_success() {
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
-    let request = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     assert_eq!(
         webhook.authorize(&action, &identity, &parts).await,
@@ -616,11 +591,7 @@ async fn test_authorize_denied() {
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
-    let request = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     assert_eq!(
         webhook.authorize(&action, &identity, &parts).await,
@@ -649,11 +620,7 @@ async fn test_authorize_with_bearer_token() {
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
-    let request = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     assert_eq!(
         webhook.authorize(&action, &identity, &parts).await,
@@ -683,11 +650,7 @@ async fn test_authorize_with_basic_auth() {
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
-    let request = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     assert_eq!(
         webhook.authorize(&action, &identity, &parts).await,
@@ -745,11 +708,7 @@ async fn test_authorize_uses_cache() {
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
-    let request = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     assert_eq!(
         webhook.authorize(&action, &identity, &parts).await,
@@ -772,11 +731,7 @@ async fn test_authorize_returns_err_on_unreachable_url() {
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
-    let request = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     let result = webhook.authorize(&action, &identity, &parts).await;
     let err = result.expect_err("unreachable URL must produce Err, not Ok(false)");
@@ -799,14 +754,7 @@ async fn test_authorize_does_not_cache_transport_errors() {
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
-    let request_parts = {
-        let (parts, ()) = Builder::new()
-            .uri("https://example.com/v2/")
-            .body(())
-            .unwrap()
-            .into_parts();
-        parts
-    };
+    let request_parts = parts_with_uri("https://example.com/v2/");
 
     // First call: point at an unreachable port to produce TransportError.
     let mut unreachable_config =
@@ -849,15 +797,6 @@ fn build_webhook_against(mock_server: &MockServer) -> WebhookAuthorizer {
     build_test_webhook("test".to_string(), config, cache).unwrap()
 }
 
-fn empty_request_parts() -> Parts {
-    let (parts, ()) = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
-    parts
-}
-
 // Webhook returns `status` exactly once (the mock's `expect(1)` enforces it).
 // First call must return Ok(false); second call must hit the cache and return
 // Ok(false) without re-contacting the webhook.
@@ -872,7 +811,7 @@ async fn assert_cacheable_explicit_deny(status: u16) {
     let webhook = build_webhook_against(&mock_server);
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
-    let parts = empty_request_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     assert_eq!(
         webhook.authorize(&action, &identity, &parts).await,
@@ -904,7 +843,7 @@ async fn assert_unavailable_not_cached(status: u16) {
     let webhook = build_webhook_against(&mock_server);
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
-    let parts = empty_request_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     assert!(
         webhook.authorize(&action, &identity, &parts).await.is_err(),
@@ -983,11 +922,7 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
-    let request = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     assert_eq!(
         webhook.authorize(&action, &identity, &parts).await,
@@ -1024,11 +959,7 @@ async fn test_authorize_timeout_does_not_cache_and_retries() {
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     let first = slow_webhook.authorize(&action, &identity, &parts).await;
     assert!(first.is_err(), "timed-out request must return Err");
@@ -1088,11 +1019,7 @@ async fn test_authorize_cache_entry_expires_and_refetches() {
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = Builder::new()
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("https://example.com/v2/");
 
     // First call: goes to the network, gets 200, caches the allow decision.
     assert_eq!(

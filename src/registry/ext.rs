@@ -721,9 +721,12 @@ mod tests {
         ExtPlatform, analyze_manifest, build_digest_to_tags_map_from_pairs,
         extract_docker_referrer, extract_in_toto_predicate, parent_refs_for,
     };
-    use crate::oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType,
-        Platform as OciPlatform, Tag,
+    use crate::{
+        oci::{
+            DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest,
+            Platform as OciPlatform, Tag,
+        },
+        registry::test_utils::media_type,
     };
 
     fn digest(hex_suffix: &str) -> Digest {
@@ -734,10 +737,6 @@ mod tests {
 
     fn test_digest() -> Digest {
         digest("abc1")
-    }
-
-    fn media_type(value: &str) -> MediaType {
-        MediaType::new(value).unwrap()
     }
 
     fn descriptor_with_annotations(annotations: HashMap<String, String>) -> Descriptor {

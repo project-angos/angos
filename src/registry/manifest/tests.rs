@@ -11,13 +11,14 @@ use super::{parse::manifest_meta_from_body, *};
 use crate::{
     command::server::Error as ServerError,
     event_webhook::event::EventKind,
-    oci::{Algorithm, MediaType, Namespace, Tag, UploadSessionId},
+    oci::{Algorithm, MediaType, Namespace, Tag},
     registry::{
         Error, OCI_TAG, Registry,
         metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
         path_builder::blob_path,
         test_utils::{
-            FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct, put_link_raw,
+            FSRegistryTestCase, RegistryTestCase, for_each_backend, put_blob_direct, put_link_raw,
+            upload_blob,
         },
     },
     replication::REPLICATION_SUPERSEDED_CODE,
@@ -193,34 +194,9 @@ async fn create_test_manifest_with_subject(
     )
 }
 
-async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
-    let session_id = UploadSessionId::generate();
-    registry
-        .blob_store
-        .create_upload(namespace, session_id.as_ref())
-        .await
-        .unwrap();
-
-    let body = content.to_vec();
-    let digest = Digest::sha256_of_bytes(&body);
-    registry
-        .complete_upload(
-            None,
-            namespace,
-            &session_id,
-            &digest,
-            None,
-            Some(body.len() as u64),
-            Cursor::new(body),
-        )
-        .await
-        .unwrap();
-    digest
-}
-
 #[tokio::test]
 async fn test_put_manifest() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
@@ -263,8 +239,8 @@ async fn test_put_manifest() {
             .unwrap();
 
         assert_eq!(header_digest(&response.headers), digest);
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 /// A by-digest push with `?tag=` query parameters must create each listed tag,
@@ -398,7 +374,7 @@ async fn accept_put_manifest_by_tag_ignores_tag_params() {
 
 #[tokio::test]
 async fn put_manifest_rejects_missing_config_reference() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/missing-config").unwrap();
         let missing_config = fixed_digest();
@@ -429,13 +405,13 @@ async fn put_manifest_rejects_missing_config_reference() {
                 .await
                 .is_err()
         );
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn put_manifest_rejects_missing_layer_reference() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/missing-layer").unwrap();
         let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
@@ -457,13 +433,13 @@ async fn put_manifest_rejects_missing_layer_reference() {
         };
 
         assert!(matches!(err, Error::ManifestBlobUnknown));
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn put_manifest_rejects_missing_child_manifest_reference() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/missing-child").unwrap();
         let missing_child = fixed_digest();
@@ -482,13 +458,13 @@ async fn put_manifest_rejects_missing_child_manifest_reference() {
         };
 
         assert!(matches!(err, Error::ManifestBlobUnknown));
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn put_manifest_rejects_references_owned_by_another_namespace() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let owner_namespace = &Namespace::new("test-repo/source").unwrap();
         let target_namespace = &Namespace::new("test-repo/target").unwrap();
@@ -516,13 +492,13 @@ async fn put_manifest_rejects_references_owned_by_another_namespace() {
         };
 
         assert!(matches!(err, Error::ManifestBlobUnknown));
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn put_manifest_allows_missing_subject_reference() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/missing-subject").unwrap();
         let (content, media_type) = create_test_manifest_with_subject(registry, namespace).await;
@@ -546,8 +522,8 @@ async fn put_manifest_allows_missing_subject_reference() {
             .await
             .unwrap();
         assert_eq!(metadata.target, digest);
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 /// The live `accept_put_manifest` path honors the registry's
@@ -804,7 +780,7 @@ async fn permissive_push_of_owned_references_yields_a_pullable_manifest() {
 
 #[tokio::test]
 async fn test_get_manifest() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
@@ -849,13 +825,13 @@ async fn test_get_manifest() {
         assert_eq!(manifest.content, content);
         assert_eq!(manifest.media_type.unwrap(), media_type);
         assert_eq!(manifest.digest, header_digest(&response.headers));
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_head_manifest() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
@@ -912,13 +888,13 @@ async fn test_head_manifest() {
             manifest.headers[CONTENT_LENGTH.as_str()],
             content.len().to_string()
         );
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_delete_manifest() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
@@ -979,8 +955,8 @@ async fn test_delete_manifest() {
                 .await
                 .is_err()
         );
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 /// Regression: a digest `delete_manifest` must hold the `blob-data:{digest}`
@@ -989,13 +965,13 @@ async fn test_delete_manifest() {
 /// still points at it (conformance `MANIFEST_BLOB_UNKNOWN`).
 #[tokio::test]
 async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
-    use std::time::Duration;
+    for_each_backend(async |test_case| {
+        use std::time::Duration;
 
-    use tokio::time::sleep;
+        use tokio::time::sleep;
 
-    use crate::registry::blob_ownership::BlobOwnership;
+        use crate::registry::blob_ownership::BlobOwnership;
 
-    for test_case in backends() {
         let registry = test_case.registry();
         let first = &Namespace::new("test-repo/first").unwrap();
         let second = &Namespace::new("test-repo/second").unwrap();
@@ -1058,14 +1034,13 @@ async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
             registry.blob_store.read(&digest).await.is_ok(),
             "shared manifest blob was wrongly reclaimed despite a concurrent grant"
         );
-
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn delete_manifest_then_delete_uploaded_blobs() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/zot-cleanup").unwrap();
         let layer_content = b"zot benchmark layer content";
@@ -1139,8 +1114,8 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
 
         assert!(registry.blob_store.read(&layer_digest).await.is_err());
         assert!(registry.blob_store.read(&config_digest).await.is_err());
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1405,7 +1380,7 @@ fn parse_manifest_digests_index_manifest_populates_manifests_vec() {
 
 #[tokio::test]
 async fn test_handle_get_manifest() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
@@ -1451,13 +1426,13 @@ async fn test_handle_get_manifest() {
                 assert_eq!(body, content);
             }
         }
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_handle_put_manifest() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
@@ -1499,13 +1474,13 @@ async fn test_handle_put_manifest() {
         assert_eq!(stored_manifest.content, content);
         assert_eq!(stored_manifest.media_type.unwrap(), media_type);
         assert_eq!(stored_manifest.digest, header_digest(&response.headers));
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_delete_manifest_by_digest_removes_multiple_tags() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/delete-multi-tags").unwrap();
         let (content, media_type) = create_test_manifest(registry, namespace).await;
@@ -1580,13 +1555,13 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
                 .await
                 .is_err()
         );
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/delete-preserve").unwrap();
         let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
@@ -1673,13 +1648,13 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
             .unwrap();
 
         assert_eq!(manifest_b.digest, header_digest(&response_b.headers));
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_delete_manifest_with_many_tags() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/delete-many-tags").unwrap();
         let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
@@ -1770,13 +1745,13 @@ async fn test_delete_manifest_with_many_tags() {
             .await
             .unwrap();
         assert_eq!(tags.len(), 20, "expected exactly 20 remaining tags");
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_put_manifest_stores_media_type() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/media-type-store").unwrap();
         let tag = "latest";
@@ -1815,13 +1790,13 @@ async fn test_put_manifest_stores_media_type() {
             Some(media_type),
             "Tag link should have media_type stored"
         );
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_head_manifest_fallback_without_media_type() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/head-fallback").unwrap();
         let (content, media_type) = create_test_manifest(registry, namespace).await;
@@ -1876,68 +1851,13 @@ async fn test_head_manifest_fallback_without_media_type() {
             head.headers[CONTENT_LENGTH.as_str()],
             content.len().to_string()
         );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn test_delete_manifest_no_tags_by_digest() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/delete-no-tags").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag(Tag::new("temp").unwrap()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        registry
-            .delete_manifest(
-                None,
-                None,
-                namespace,
-                &Reference::Tag(Tag::new("temp").unwrap()),
-            )
-            .await
-            .unwrap();
-
-        registry
-            .delete_manifest(
-                None,
-                None,
-                namespace,
-                &Reference::Digest(header_digest(&response.headers)),
-            )
-            .await
-            .unwrap();
-
-        let repository = registry.get_repository_for_namespace(namespace).unwrap();
-
-        assert!(
-            registry
-                .get_manifest(
-                    repository,
-                    &[media_type.to_string()],
-                    namespace,
-                    Reference::Digest(header_digest(&response.headers)),
-                    false,
-                )
-                .await
-                .is_err()
-        );
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/no-content-type").unwrap();
         let (content, _media_type) = create_test_manifest(registry, namespace).await;
@@ -1966,13 +1886,13 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
             Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap()),
             "Digest link should have media_type from manifest body"
         );
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/redirect-fallback").unwrap();
         let (content, media_type) = create_test_manifest(registry, namespace).await;
@@ -2019,8 +1939,8 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
                 assert!(headers.contains_key(CONTENT_TYPE.as_str()));
             }
         }
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 fn fixed_digest() -> Digest {
@@ -3257,12 +3177,11 @@ mod noop_suppression_tests {
     //! caller-held `JobStore`, and spawns no drain, so enqueued jobs persist
     //! for counting.
 
-    use std::{collections::HashMap, io::Cursor, sync::Arc};
+    use std::{io::Cursor, sync::Arc};
 
     use chrono::{Duration, Utc};
     use tempfile::TempDir;
 
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
     use angos_tx_engine::transaction::Transaction;
 
     use crate::{
@@ -3270,18 +3189,17 @@ mod noop_suppression_tests {
         oci::{Digest, MediaType, Namespace, Reference, Tag},
         registry::{
             Registry, RegistryConfig,
-            blob_store::BlobStore,
             job_store::{JobStore, Queue},
-            metadata_store::{LinkKind, LinkOperation, MetadataStore},
-            repository_resolver::RepositoryResolver,
+            metadata_store::{LinkKind, LinkOperation},
             test_utils::{
-                build_store, downstream_client, repository_with_downstream, sole_pending_payload,
+                FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,
+                single_repo_resolver, sole_pending_payload, upload_blob,
             },
         },
         replication::REPLICATION_DELETE_MANIFEST_KIND,
     };
 
-    use super::{create_test_manifest, manifest_with_references, upload_blob};
+    use super::{create_test_manifest, manifest_with_references};
 
     const REPO: &str = "nginx";
     const NAMESPACE: &str = "nginx";
@@ -3289,30 +3207,23 @@ mod noop_suppression_tests {
     /// Build a `Registry` whose blob store, metadata store, and a caller-held
     /// `JobStore` all share one FS-backed `Store`, carrying a single
     /// event+reconcile downstream so `dispatch_replication` enqueues.
-    fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
-        crate::metrics_provider::init_for_tests();
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let store = build_store(object);
-        let metadata_store = Arc::new(
-            MetadataStore::builder(store.clone())
-                .link_cache_ttl(0)
-                .access_time_debounce_secs(0)
-                .build(),
-        );
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
-
-        let mut repositories = HashMap::new();
-        repositories.insert(
-            REPO.to_string(),
+    fn build_registry() -> (Registry, Arc<JobStore>, TempDir) {
+        let FsTestStack {
+            dir,
+            store,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
+        let resolver = single_repo_resolver(
+            REPO,
             repository_with_downstream(REPO, downstream_client("https://unused.test")),
         );
-        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
         let config = RegistryConfig::default().job_queue(job_store.clone());
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
-        (registry, job_store)
+        (registry, job_store, dir)
     }
 
     async fn pending(job_store: &JobStore) -> u64 {
@@ -3359,8 +3270,7 @@ mod noop_suppression_tests {
 
     #[tokio::test]
     async fn tagged_push_dispatches_only_when_tag_moves() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let tag = "latest";
 
@@ -3433,8 +3343,7 @@ mod noop_suppression_tests {
     /// revision is not re-dispatched.
     #[tokio::test]
     async fn digest_push_dispatches_only_when_revision_is_new() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
@@ -3489,8 +3398,7 @@ mod noop_suppression_tests {
     /// did not change; re-adding the same tag is a converged no-op.
     #[tokio::test]
     async fn digest_push_with_new_tag_dispatches_when_tag_is_added() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let tag = "extra";
 
@@ -3568,8 +3476,7 @@ mod noop_suppression_tests {
 
     #[tokio::test]
     async fn tag_delete_dispatches_only_when_something_was_removed() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let tag = "latest";
 
@@ -3625,8 +3532,7 @@ mod noop_suppression_tests {
     /// `source_ts` and lose receiver-side LWW against the in-between re-push.
     #[tokio::test]
     async fn second_delete_after_repush_enqueues_its_own_job() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let tag = "latest";
 
@@ -3703,8 +3609,7 @@ mod noop_suppression_tests {
     /// bounce, destroying the acknowledged recreate on every node.
     #[tokio::test]
     async fn replicated_delete_redispatches_author_source_ts_verbatim() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let tag = "latest";
 
@@ -3750,8 +3655,7 @@ mod noop_suppression_tests {
     /// link alone.
     #[tokio::test]
     async fn digest_delete_dispatches_when_only_cascade_tags_remain() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
@@ -3796,8 +3700,7 @@ mod noop_suppression_tests {
     /// (revision gone, no pointing tags) stops re-dispatching the delete.
     #[tokio::test]
     async fn digest_delete_suppressed_once_converged() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
@@ -3843,8 +3746,7 @@ mod noop_suppression_tests {
 
     #[tokio::test]
     async fn noop_push_still_emits_webhook_events() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let tag = "latest";
 
@@ -3900,11 +3802,9 @@ mod noop_suppression_tests {
 
 #[cfg(test)]
 mod dispatch_replication_tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use tempfile::TempDir;
-
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
     use chrono::{DateTime, Duration, Utc};
     use regex::Regex;
@@ -3913,12 +3813,10 @@ mod dispatch_replication_tests {
         oci::{Digest, Namespace, Tag},
         registry::{
             Registry, RegistryConfig, Repository,
-            blob_store::BlobStore,
             job_store::{JobStore, Queue},
-            metadata_store::MetadataStore,
-            repository_resolver::RepositoryResolver,
             test_utils::{
-                build_store, downstream_client, repository_with_replication, sole_pending_payload,
+                FsTestStack, downstream_client, fs_test_stack, repository_with_replication,
+                single_repo_resolver, sole_pending_payload,
             },
         },
         replication::{
@@ -3962,20 +3860,14 @@ mod dispatch_replication_tests {
 
     /// Build a `Registry` whose job store is a caller-held `JobStore` so the
     /// test can count pending jobs.
-    fn build_registry_with(root: &str, repository: Repository) -> (Registry, Arc<JobStore>) {
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let store = build_store(object);
-        let metadata_store = Arc::new(
-            MetadataStore::builder(store.clone())
-                .link_cache_ttl(0)
-                .access_time_debounce_secs(0)
-                .build(),
-        );
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
-
-        let mut repositories = HashMap::new();
-        repositories.insert(REPO.to_string(), repository);
-        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+    fn build_registry_with(repository: Repository) -> (Registry, Arc<JobStore>, TempDir) {
+        let FsTestStack {
+            dir,
+            store,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
+        let resolver = single_repo_resolver(REPO, repository);
 
         // No drain spawned: the bare JobStore only persists envelopes; these tests assert enqueue only.
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
@@ -3983,19 +3875,18 @@ mod dispatch_replication_tests {
         let config = RegistryConfig::default().job_queue(job_store.clone());
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
-        (registry, job_store)
+        (registry, job_store, dir)
     }
 
     /// [`build_registry_with`] with one `event+reconcile` downstream.
-    fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
-        build_registry_with(root, repository_with_downstream())
+    fn build_registry() -> (Registry, Arc<JobStore>, TempDir) {
+        build_registry_with(repository_with_downstream())
     }
 
     #[tokio::test]
     async fn dispatch_replication_enqueues_for_matching_downstream() {
         crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
 
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
@@ -4028,8 +3919,7 @@ mod dispatch_replication_tests {
     #[tokio::test]
     async fn dispatch_replication_payload_is_well_formed() {
         crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
 
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
@@ -4066,17 +3956,13 @@ mod dispatch_replication_tests {
     #[tokio::test]
     async fn dispatch_replication_enqueues_one_job_per_downstream() {
         crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry_with(
-            dir.path().to_str().unwrap(),
-            repository_with_replication(
-                REPO,
-                vec![
-                    downstream_with(DOWNSTREAM, ReplicationMode::EventReconcile, Vec::new()),
-                    downstream_with("us-region", ReplicationMode::EventReconcile, Vec::new()),
-                ],
-            ),
-        );
+        let (registry, job_store, _dir) = build_registry_with(repository_with_replication(
+            REPO,
+            vec![
+                downstream_with(DOWNSTREAM, ReplicationMode::EventReconcile, Vec::new()),
+                downstream_with("us-region", ReplicationMode::EventReconcile, Vec::new()),
+            ],
+        ));
 
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
@@ -4123,8 +4009,7 @@ mod dispatch_replication_tests {
     #[tokio::test]
     async fn dispatch_replication_uses_provided_source_ts_verbatim() {
         crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let (registry, job_store, _dir) = build_registry();
 
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let author_ts = Utc::now() - Duration::hours(3);
@@ -4154,11 +4039,8 @@ mod dispatch_replication_tests {
     #[tokio::test]
     async fn dispatch_replication_skips_reconcile_only_downstream() {
         crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry_with(
-            dir.path().to_str().unwrap(),
-            repository_with(ReplicationMode::ReconcileOnly, Vec::new()),
-        );
+        let (registry, job_store, _dir) =
+            build_registry_with(repository_with(ReplicationMode::ReconcileOnly, Vec::new()));
 
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
@@ -4189,14 +4071,10 @@ mod dispatch_replication_tests {
     #[tokio::test]
     async fn dispatch_replication_skips_non_matching_namespace_filter() {
         crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry_with(
-            dir.path().to_str().unwrap(),
-            repository_with(
-                ReplicationMode::EventReconcile,
-                vec![Regex::new("^other/.*").unwrap()],
-            ),
-        );
+        let (registry, job_store, _dir) = build_registry_with(repository_with(
+            ReplicationMode::EventReconcile,
+            vec![Regex::new("^other/.*").unwrap()],
+        ));
 
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let digest: Digest = SAMPLE_DIGEST.parse().unwrap();

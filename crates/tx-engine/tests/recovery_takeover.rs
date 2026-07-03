@@ -31,43 +31,39 @@ use std::sync::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
 use angos_storage::{
-    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error as StorageError, Etag,
-    MemoryObjectStore, MultipartUploadPage, ObjectMeta, ObjectStore, Page,
+    ConditionalStore, Error as StorageError, Etag, MemoryObjectStore, ObjectStore,
+    test_util::{HookedStore, StoreHook, StoreOp},
 };
 
 use angos_tx_engine::{
     error::Error as TxError,
-    executor::TransactionExecutor,
-    intent::{IntentRecord, MutationProgress, MutationRecord},
+    executor::{TransactionExecutor, locked::LockedExecutor},
+    intent::{MutationProgress, MutationRecord},
     lock::{
         Error as LockError,
         primitive::Lock,
         storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
     },
-    recovery::RecoveryLoop,
     transaction::{Mutation, Transaction},
 };
 
-mod common;
+use angos_tx_engine::test_util;
 
-/// Wrapper that counts `put` calls per key. Used to prove a recovery
+/// Hook that counts `put` calls on one key. Used to prove a recovery
 /// mutation applied at most once across two racing sweeps.
-#[derive(Debug)]
-struct PutCountingStore {
-    inner: Arc<MemoryObjectStore>,
+struct KeyPutCounter {
     target_key: String,
     target_puts: AtomicUsize,
 }
 
-impl PutCountingStore {
-    fn new(inner: Arc<MemoryObjectStore>, target_key: impl Into<String>) -> Self {
+impl KeyPutCounter {
+    fn new(target_key: impl Into<String>) -> Self {
         Self {
-            inner,
             target_key: target_key.into(),
             target_puts: AtomicUsize::new(0),
         }
@@ -79,152 +75,63 @@ impl PutCountingStore {
 }
 
 #[async_trait]
-impl ObjectStore for PutCountingStore {
-    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        self.inner.get(key).await
-    }
-    async fn get_stream(
-        &self,
-        key: &str,
-        offset: Option<u64>,
-    ) -> Result<(BoxedReader, u64), StorageError> {
-        self.inner.get_stream(key, offset).await
-    }
-    async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
-        if key == self.target_key {
+impl StoreHook for KeyPutCounter {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        if let StoreOp::Put { key, .. } = op
+            && key == self.target_key
+        {
             self.target_puts.fetch_add(1, Ordering::AcqRel);
         }
-        self.inner.put(key, data).await
-    }
-    async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.delete(key).await
-    }
-    async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
-        self.inner.delete_prefix(prefix).await
-    }
-    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-        self.inner.head(key).await
-    }
-    async fn list(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-    ) -> Result<Page<String>, StorageError> {
-        self.inner.list(prefix, n, token).await
-    }
-    async fn list_children(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-        start_after: Option<String>,
-    ) -> Result<ChildrenPage, StorageError> {
-        self.inner
-            .list_children(prefix, n, token, start_after)
-            .await
-    }
-    async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
-        self.inner.copy(source, destination).await
-    }
-    async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.create_upload(key).await
-    }
-    async fn write_upload(
-        &self,
-        key: &str,
-        body: ByteStream,
-        len: Option<u64>,
-    ) -> Result<u64, StorageError> {
-        self.inner.write_upload(key, body, len).await
-    }
-    async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.complete_upload(key).await
-    }
-    async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.abort_upload(key).await
-    }
-    async fn list_multipart_uploads(
-        &self,
-        key_marker: Option<&str>,
-        upload_id_marker: Option<&str>,
-    ) -> Result<MultipartUploadPage, StorageError> {
-        self.inner
-            .list_multipart_uploads(key_marker, upload_id_marker)
-            .await
+        Ok(())
     }
 }
 
 /// Two recovery loops on the same backing store and the same `Arc<Lock>` race
 /// to take over a stale intent. The intent has one mutation marked `Applied`
 /// (so recovery enters replay-forward) and one `Pending` mutation that writes
-/// to a sentinel destination key. We wrap the store with a `PutCountingStore`
+/// to a sentinel destination key. We wrap the store with a put-counting hook
 /// to assert the sentinel was `put` exactly once across both racing sweeps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_recovery_loops_apply_each_mutation_exactly_once() {
     let inner = Arc::new(MemoryObjectStore::new());
-    let counting = Arc::new(PutCountingStore::new(inner.clone(), "race/dst"));
-    let lock = common::memory_lock();
+    let counting: Arc<HookedStore<Arc<dyn ObjectStore>, KeyPutCounter>> = Arc::new(
+        HookedStore::new(inner.clone(), KeyPutCounter::new("race/dst")),
+    );
+    let lock = test_util::memory_lock();
 
     let tx_id = Uuid::new_v4();
-    inner
-        .put(
-            &format!(".tx-bodies/{tx_id}/0"),
-            Bytes::from_static(b"sibling-body"),
-        )
-        .await
-        .unwrap();
-    inner
-        .put(
-            &format!(".tx-bodies/{tx_id}/1"),
-            Bytes::from_static(b"staged-body"),
-        )
-        .await
-        .unwrap();
+    let sibling_ref =
+        test_util::stage_body(&*inner, tx_id, 0, Bytes::from_static(b"sibling-body")).await;
+    let dst_ref =
+        test_util::stage_body(&*inner, tx_id, 1, Bytes::from_static(b"staged-body")).await;
 
-    let intent = IntentRecord {
-        id: tx_id,
-        created_at: Utc::now() - ChronoDuration::seconds(3600),
-        ttl_secs: 1,
-        reads: vec![],
-        mutations: vec![
+    let intent = test_util::stale_intent(
+        tx_id,
+        vec![
             // Already-applied sibling so `any_applied()` is true and recovery
             // enters replay-forward.
             MutationRecord::PutIfAbsent {
                 key: "race/sibling".to_string(),
-                body_ref: format!(".tx-bodies/{tx_id}/0"),
+                body_ref: sibling_ref,
             },
             // Pending mutation under test.
             MutationRecord::Put {
                 key: "race/dst".to_string(),
-                body_ref: format!(".tx-bodies/{tx_id}/1"),
+                body_ref: dst_ref,
                 expected: None,
             },
         ],
-        coarse_lock_keys: vec![],
-        progress: vec![MutationProgress::Applied, MutationProgress::Pending],
-    };
-    inner
-        .put(
-            &format!(".tx-log/{tx_id}.json"),
-            Bytes::from(serde_json::to_vec(&intent).unwrap()),
-        )
-        .await
-        .unwrap();
+        vec![MutationProgress::Applied, MutationProgress::Pending],
+    );
+    test_util::put_intent(&*inner, &intent).await;
 
-    let recovery_a = RecoveryLoop::builder(counting.clone() as Arc<dyn ObjectStore>)
-        .lock(lock.clone())
-        .interval(std::time::Duration::from_hours(1))
-        .build();
-    let recovery_b = RecoveryLoop::builder(counting.clone() as Arc<dyn ObjectStore>)
-        .lock(lock.clone())
-        .interval(std::time::Duration::from_hours(1))
-        .build();
-
-    tokio::join!(recovery_a.sweep(), recovery_b.sweep());
+    tokio::join!(
+        test_util::sweep_once(counting.clone(), lock.clone()),
+        test_util::sweep_once(counting.clone(), lock),
+    );
 
     assert_eq!(
-        counting.target_put_count(),
+        counting.hook().target_put_count(),
         1,
         "exactly one sweep must have applied the pending mutation"
     );
@@ -238,7 +145,7 @@ async fn concurrent_recovery_loops_apply_each_mutation_exactly_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn already_applied_mutations_are_skipped() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = common::memory_lock();
+    let lock = test_util::memory_lock();
 
     // Pre-write a sentinel at key 0; recovery must not overwrite it.
     store
@@ -250,54 +157,35 @@ async fn already_applied_mutations_are_skipped() {
         .unwrap();
 
     let tx_id = Uuid::new_v4();
-    store
-        .put(
-            &format!(".tx-bodies/{tx_id}/0"),
-            Bytes::from_static(b"would-overwrite-sentinel"),
-        )
-        .await
-        .unwrap();
-    store
-        .put(
-            &format!(".tx-bodies/{tx_id}/1"),
-            Bytes::from_static(b"pending-body"),
-        )
-        .await
-        .unwrap();
+    let k0_ref = test_util::stage_body(
+        &*store,
+        tx_id,
+        0,
+        Bytes::from_static(b"would-overwrite-sentinel"),
+    )
+    .await;
+    let k1_ref =
+        test_util::stage_body(&*store, tx_id, 1, Bytes::from_static(b"pending-body")).await;
 
-    let intent = IntentRecord {
-        id: tx_id,
-        created_at: Utc::now() - ChronoDuration::seconds(3600),
-        ttl_secs: 1,
-        reads: vec![],
-        mutations: vec![
+    let intent = test_util::stale_intent(
+        tx_id,
+        vec![
             MutationRecord::Put {
                 key: "applied/k0".to_string(),
-                body_ref: format!(".tx-bodies/{tx_id}/0"),
+                body_ref: k0_ref,
                 expected: None,
             },
             MutationRecord::Put {
                 key: "applied/k1".to_string(),
-                body_ref: format!(".tx-bodies/{tx_id}/1"),
+                body_ref: k1_ref,
                 expected: None,
             },
         ],
-        coarse_lock_keys: vec![],
-        progress: vec![MutationProgress::Applied, MutationProgress::Pending],
-    };
-    store
-        .put(
-            &format!(".tx-log/{tx_id}.json"),
-            Bytes::from(serde_json::to_vec(&intent).unwrap()),
-        )
-        .await
-        .unwrap();
+        vec![MutationProgress::Applied, MutationProgress::Pending],
+    );
+    test_util::put_intent(&*store, &intent).await;
 
-    let recovery = RecoveryLoop::builder(store.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .interval(std::time::Duration::from_hours(1))
-        .build();
-    recovery.sweep().await;
+    test_util::sweep_once(store.clone(), lock).await;
 
     let k0 = store.get("applied/k0").await.expect("k0 must survive");
     assert_eq!(
@@ -319,7 +207,7 @@ async fn already_applied_mutations_are_skipped() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = common::memory_lock();
+    let lock = test_util::memory_lock();
 
     // Land the final body at the destination first; capture its etag (different
     // from any "stale" etag we record in the intent).
@@ -331,22 +219,11 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
 
     // Stage the same body in .tx-bodies (so its sha256 matches the live body).
     let tx_id = Uuid::new_v4();
-    store
-        .put(
-            &format!(".tx-bodies/{tx_id}/0"),
-            Bytes::from_static(b"final-body"),
-        )
-        .await
-        .unwrap();
+    let dst_ref = test_util::stage_body(&*store, tx_id, 0, Bytes::from_static(b"final-body")).await;
     // Sibling already-applied mutation: write a tombstone body and pre-land it
     // so its replay is a CAS no-op.
-    store
-        .put(
-            &format!(".tx-bodies/{tx_id}/1"),
-            Bytes::from_static(b"sibling"),
-        )
-        .await
-        .unwrap();
+    let sibling_ref =
+        test_util::stage_body(&*store, tx_id, 1, Bytes::from_static(b"sibling")).await;
     store
         .put_if_absent("cas/sibling", Bytes::from_static(b"sibling"))
         .await
@@ -358,55 +235,31 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
     let stale_etag = Etag::new("stale-etag-from-build-time");
     assert_ne!(stale_etag, live_etag, "stale etag must differ from live");
 
-    let intent = IntentRecord {
-        id: tx_id,
-        created_at: Utc::now() - ChronoDuration::seconds(3600),
-        ttl_secs: 1,
-        reads: vec![],
-        mutations: vec![
+    let intent = test_util::stale_intent(
+        tx_id,
+        vec![
             MutationRecord::PutIfAbsent {
                 key: "cas/sibling".to_string(),
-                body_ref: format!(".tx-bodies/{tx_id}/1"),
+                body_ref: sibling_ref,
             },
             MutationRecord::Put {
                 key: "cas/dst".to_string(),
-                body_ref: format!(".tx-bodies/{tx_id}/0"),
+                body_ref: dst_ref,
                 expected: Some(stale_etag),
             },
         ],
-        coarse_lock_keys: vec![],
-        progress: vec![MutationProgress::Applied, MutationProgress::Pending],
-    };
-    store
-        .put(
-            &format!(".tx-log/{tx_id}.json"),
-            Bytes::from(serde_json::to_vec(&intent).unwrap()),
-        )
-        .await
-        .unwrap();
+        vec![MutationProgress::Applied, MutationProgress::Pending],
+    );
+    test_util::put_intent(&*store, &intent).await;
 
-    let cs: Arc<dyn ConditionalStore> = store.clone();
-    let recovery = RecoveryLoop::builder(store.clone() as Arc<dyn ObjectStore>)
-        .conditional_store(cs)
-        .lock(lock)
-        .interval(std::time::Duration::from_hours(1))
-        .build();
-    recovery.sweep().await;
+    test_util::sweep_once_cas(store.clone(), lock).await;
 
     // Even though the etag mismatched, the live body matches the staged body,
     // so recovery treats the mutation as already-applied: intent is reaped,
     // dst body is unchanged.
     let body = store.get("cas/dst").await.expect("dst still present");
     assert_eq!(body, b"final-body");
-    assert!(
-        store
-            .list(".tx-log/", 10, None)
-            .await
-            .unwrap()
-            .items
-            .is_empty(),
-        "intent must be reaped after stale-stamp recovery"
-    );
+    test_util::assert_no_orphans(&*store).await;
 }
 
 /// CAS-mode recovery: when the live body's hash does NOT match the staged
@@ -415,7 +268,7 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cas_recovery_stops_on_true_contention() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = common::memory_lock();
+    let lock = test_util::memory_lock();
 
     // Live body at the destination has different content from the staged body.
     let _live_etag = store
@@ -425,21 +278,11 @@ async fn cas_recovery_stops_on_true_contention() {
         .expect("etag");
 
     let tx_id = Uuid::new_v4();
-    store
-        .put(
-            &format!(".tx-bodies/{tx_id}/0"),
-            Bytes::from_static(b"our-staged-body"),
-        )
-        .await
-        .unwrap();
+    let dst_ref =
+        test_util::stage_body(&*store, tx_id, 0, Bytes::from_static(b"our-staged-body")).await;
     // Sibling already-applied so replay_forward runs.
-    store
-        .put(
-            &format!(".tx-bodies/{tx_id}/1"),
-            Bytes::from_static(b"sibling"),
-        )
-        .await
-        .unwrap();
+    let sibling_ref =
+        test_util::stage_body(&*store, tx_id, 1, Bytes::from_static(b"sibling")).await;
     store
         .put_if_absent("cas/sibling", Bytes::from_static(b"sibling"))
         .await
@@ -447,50 +290,33 @@ async fn cas_recovery_stops_on_true_contention() {
         .expect("etag");
 
     let stale_etag = Etag::new("stale-etag-from-build-time");
-    let intent = IntentRecord {
-        id: tx_id,
-        created_at: Utc::now() - ChronoDuration::seconds(3600),
-        ttl_secs: 1,
-        reads: vec![],
-        mutations: vec![
+    let intent = test_util::stale_intent(
+        tx_id,
+        vec![
             MutationRecord::PutIfAbsent {
                 key: "cas/sibling".to_string(),
-                body_ref: format!(".tx-bodies/{tx_id}/1"),
+                body_ref: sibling_ref,
             },
             MutationRecord::Put {
                 key: "cas/dst".to_string(),
-                body_ref: format!(".tx-bodies/{tx_id}/0"),
+                body_ref: dst_ref,
                 expected: Some(stale_etag),
             },
         ],
-        coarse_lock_keys: vec![],
-        progress: vec![MutationProgress::Applied, MutationProgress::Pending],
-    };
-    store
-        .put(
-            &format!(".tx-log/{tx_id}.json"),
-            Bytes::from(serde_json::to_vec(&intent).unwrap()),
-        )
-        .await
-        .unwrap();
+        vec![MutationProgress::Applied, MutationProgress::Pending],
+    );
+    test_util::put_intent(&*store, &intent).await;
 
-    let cs: Arc<dyn ConditionalStore> = store.clone();
-    let recovery = RecoveryLoop::builder(store.clone() as Arc<dyn ObjectStore>)
-        .conditional_store(cs)
-        .lock(lock)
-        .interval(std::time::Duration::from_hours(1))
-        .build();
-    recovery.sweep().await;
+    test_util::sweep_once_cas(store.clone(), lock).await;
 
     // Live body is untouched (CAS would have refused), and the intent stays in
     // place for the next sweep.
     let body = store.get("cas/dst").await.expect("dst still present");
     assert_eq!(body, b"someone-elses-body");
-    let logs = store.list(".tx-log/", 10, None).await.unwrap().items;
     assert_eq!(
-        logs.len(),
+        test_util::list_count(&*store, ".tx-log/").await,
         1,
-        "true contention must leave intent for next sweep, got {logs:?}"
+        "true contention must leave intent for next sweep"
     );
 }
 
@@ -512,7 +338,7 @@ async fn cas_recovery_stops_on_true_contention() {
 #[tokio::test]
 async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = common::memory_lock();
+    let lock = test_util::memory_lock();
 
     // mutation[0]: unconditional Put, will succeed normally.
     // mutation[1]: conditional Put with a stale etag, will return
@@ -531,7 +357,7 @@ async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
 
     let stale_etag = Etag::new("\"stale-etag-never-matches\"");
 
-    let executor = common::cas_executor(store.clone(), lock);
+    let executor = test_util::cas_executor(store.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -556,12 +382,8 @@ async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
     store.get("exec/dst0").await.expect("dst0 present");
     store.get("exec/dst1").await.expect("dst1 present");
 
-    // Intent must have been reaped (no .tx-log/ entries).
-    let logs = store.list(".tx-log/", 10, None).await.unwrap().items;
-    assert!(
-        logs.is_empty(),
-        "intent must be reaped after successful commit: {logs:?}"
-    );
+    // Intent and staged bodies must have been reaped.
+    test_util::assert_no_orphans(&*store).await;
 }
 
 /// Executor-path: mutation[0] lands and is stamped `Applied`. mutation[1]
@@ -572,7 +394,7 @@ async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
 #[tokio::test]
 async fn cas_executor_true_contention_mid_apply_leaves_intent() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = common::memory_lock();
+    let lock = test_util::memory_lock();
 
     // Pre-land mutation[1]'s destination with a *different* body from what
     // the transaction will stage. This is true contention.
@@ -585,7 +407,7 @@ async fn cas_executor_true_contention_mid_apply_leaves_intent() {
     let stale_etag = Etag::new("\"stale-etag-never-matches\"");
     let our_staged_body = Bytes::from_static(b"our-staged-body");
 
-    let executor = common::cas_executor(store.clone(), lock);
+    let executor = test_util::cas_executor(store.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -611,34 +433,30 @@ async fn cas_executor_true_contention_mid_apply_leaves_intent() {
     assert_eq!(body, b"someone-elses-body");
 
     // Intent must NOT have been reaped: recovery must be able to converge it.
-    let logs = store.list(".tx-log/", 10, None).await.unwrap().items;
     assert_eq!(
-        logs.len(),
+        test_util::list_count(&*store, ".tx-log/").await,
         1,
-        "intent must be preserved for recovery on true contention: {logs:?}"
+        "intent must be preserved for recovery on true contention"
     );
 }
 
-/// Store wrapper that blocks the canonical Apply `put` of one specific key
-/// until the test releases a gate, and counts how many times that key is
-/// written. Used to hold a `LockedExecutor::execute()` in-flight, mid-Apply,
-/// while it still owns the working-set lock.
-#[derive(Debug)]
-struct GatedStore {
-    inner: Arc<MemoryObjectStore>,
+/// Hook that blocks the canonical Apply `put` of one specific key until the
+/// test releases a gate, and counts how many times that key is written. Used
+/// to hold a `LockedExecutor::execute()` in-flight, mid-Apply, while it still
+/// owns the working-set lock.
+struct KeyGate {
     target_key: String,
-    /// Fired by the wrapper once the gated `put` is reached (owner is now
+    /// Fired by the hook once the gated `put` is reached (owner is now
     /// in-flight mid-Apply, still holding the lock).
     reached: Arc<Notify>,
-    /// Awaited by the wrapper; the test fires it to let the owner proceed.
+    /// Awaited by the hook; the test fires it to let the owner proceed.
     gate: Arc<Notify>,
     target_puts: AtomicUsize,
 }
 
-impl GatedStore {
-    fn new(inner: Arc<MemoryObjectStore>, target_key: impl Into<String>) -> Self {
+impl KeyGate {
+    fn new(target_key: impl Into<String>) -> Self {
         Self {
-            inner,
             target_key: target_key.into(),
             reached: Arc::new(Notify::new()),
             gate: Arc::new(Notify::new()),
@@ -652,19 +470,11 @@ impl GatedStore {
 }
 
 #[async_trait]
-impl ObjectStore for GatedStore {
-    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        self.inner.get(key).await
-    }
-    async fn get_stream(
-        &self,
-        key: &str,
-        offset: Option<u64>,
-    ) -> Result<(BoxedReader, u64), StorageError> {
-        self.inner.get_stream(key, offset).await
-    }
-    async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
-        if key == self.target_key {
+impl StoreHook for KeyGate {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        if let StoreOp::Put { key, .. } = op
+            && key == self.target_key
+        {
             // Signal we have reached the gated write, then block until released.
             // Count the write only after the gate opens so a count of 1 proves
             // the owner, and only the owner, applied the mutation.
@@ -672,64 +482,7 @@ impl ObjectStore for GatedStore {
             self.gate.notified().await;
             self.target_puts.fetch_add(1, Ordering::AcqRel);
         }
-        self.inner.put(key, data).await
-    }
-    async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.delete(key).await
-    }
-    async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
-        self.inner.delete_prefix(prefix).await
-    }
-    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-        self.inner.head(key).await
-    }
-    async fn list(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-    ) -> Result<Page<String>, StorageError> {
-        self.inner.list(prefix, n, token).await
-    }
-    async fn list_children(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-        start_after: Option<String>,
-    ) -> Result<ChildrenPage, StorageError> {
-        self.inner
-            .list_children(prefix, n, token, start_after)
-            .await
-    }
-    async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
-        self.inner.copy(source, destination).await
-    }
-    async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.create_upload(key).await
-    }
-    async fn write_upload(
-        &self,
-        key: &str,
-        body: ByteStream,
-        len: Option<u64>,
-    ) -> Result<u64, StorageError> {
-        self.inner.write_upload(key, body, len).await
-    }
-    async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.complete_upload(key).await
-    }
-    async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.abort_upload(key).await
-    }
-    async fn list_multipart_uploads(
-        &self,
-        key_marker: Option<&str>,
-        upload_id_marker: Option<&str>,
-    ) -> Result<MultipartUploadPage, StorageError> {
-        self.inner
-            .list_multipart_uploads(key_marker, upload_id_marker)
-            .await
+        Ok(())
     }
 }
 
@@ -745,22 +498,20 @@ impl ObjectStore for GatedStore {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
     let inner = Arc::new(MemoryObjectStore::new());
-    let gated = Arc::new(GatedStore::new(inner.clone(), "live/dst"));
+    let gated: Arc<HookedStore<Arc<dyn ObjectStore>, KeyGate>> =
+        Arc::new(HookedStore::new(inner.clone(), KeyGate::new("live/dst")));
     // One shared lock primitive so the owner and recovery contend on the same
     // working-set lock: exactly the production wiring on a single replica's
     // store, and equivalent to the cross-replica lock-object race.
-    let lock = common::memory_lock();
+    let lock = test_util::memory_lock();
 
     // Executor intent TTL of 0 makes the in-flight intent immediately stale, so
     // the recovery sweep reaches its `try_acquire(lock_set)` while the owner is
     // still holding the lock: the precise window under test.
     let executor = Arc::new(
-        angos_tx_engine::executor::locked::LockedExecutor::builder(
-            gated.clone() as Arc<dyn ObjectStore>,
-            lock.clone(),
-        )
-        .ttl_secs(0)
-        .build(),
+        LockedExecutor::builder(gated.clone() as Arc<dyn ObjectStore>, lock.clone())
+            .ttl_secs(0)
+            .build(),
     );
 
     let tx = Transaction::builder()
@@ -779,31 +530,26 @@ async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
 
     // Wait until the owner is parked at the gate (holding the lock, intent
     // written and already stale).
-    gated.reached.notified().await;
+    gated.hook().reached.notified().await;
 
     // Sanity: the intent is on disk and stale; the owner has not yet applied.
-    let logs = inner.list(".tx-log/", 10, None).await.unwrap().items;
     assert_eq!(
-        logs.len(),
+        test_util::list_count(&*inner, ".tx-log/").await,
         1,
-        "owner must have written its intent: {logs:?}"
+        "owner must have written its intent"
     );
     assert_eq!(
-        gated.target_put_count(),
+        gated.hook().target_put_count(),
         0,
         "owner must still be blocked before the gated apply"
     );
 
     // Run recovery over the same store + same lock while the owner holds it.
-    let recovery = RecoveryLoop::builder(gated.clone() as Arc<dyn ObjectStore>)
-        .lock(lock.clone())
-        .interval(std::time::Duration::from_hours(1))
-        .build();
-    recovery.sweep().await;
+    test_util::sweep_once(gated.clone(), lock.clone()).await;
 
     // Recovery must not have applied anything: it could not take the lock.
     assert_eq!(
-        gated.target_put_count(),
+        gated.hook().target_put_count(),
         0,
         "recovery must not apply while the live owner holds the working-set lock"
     );
@@ -813,13 +559,13 @@ async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
     );
 
     // Release the gate; let the owner finish.
-    gated.gate.notify_one();
+    gated.hook().gate.notify_one();
     let outcome = owner.await.expect("owner task joined");
     assert!(outcome.is_ok(), "owner must commit: {outcome:?}");
 
     // Exactly one apply of the canonical key, by the owner.
     assert_eq!(
-        gated.target_put_count(),
+        gated.hook().target_put_count(),
         1,
         "the mutation must apply exactly once"
     );
@@ -827,13 +573,7 @@ async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
     assert_eq!(body, b"owner-body");
 
     // The owner reaped its own intent + bodies; nothing left for recovery.
-    let logs = inner.list(".tx-log/", 10, None).await.unwrap().items;
-    assert!(logs.is_empty(), "no orphan .tx-log/ objects: {logs:?}");
-    let bodies = inner.list(".tx-bodies/", 10, None).await.unwrap().items;
-    assert!(
-        bodies.is_empty(),
-        "no orphan .tx-bodies/ objects: {bodies:?}"
-    );
+    test_util::assert_no_orphans(&*inner).await;
 }
 
 /// Lock storage that hands out a fresh `ETag` on acquire but then reports a
@@ -916,7 +656,10 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
     // Gate the SECOND mutation's canonical write. The first mutation lands
     // normally; the executor then parks on `gate/blocked`, holding the lock,
     // while the heartbeat fires ownership_lost.
-    let gated = Arc::new(GatedStore::new(inner.clone(), "gate/blocked"));
+    let gated: Arc<HookedStore<Arc<dyn ObjectStore>, KeyGate>> = Arc::new(HookedStore::new(
+        inner.clone(),
+        KeyGate::new("gate/blocked"),
+    ));
 
     // ttl_secs = 9 means a heartbeat tick at ~3s. The first tick observes a Mismatch
     // (ownership lost) and cancels the session while we are parked at the gate.
@@ -928,13 +671,7 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
             .expect("lock builder"),
     );
 
-    let executor = Arc::new(
-        angos_tx_engine::executor::locked::LockedExecutor::builder(
-            gated.clone() as Arc<dyn ObjectStore>,
-            lock,
-        )
-        .build(),
-    );
+    let executor = test_util::locked_executor(gated.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -956,9 +693,9 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
 
     // Wait until the executor is parked at the gated second write (first
     // mutation already applied, lock still held).
-    gated.reached.notified().await;
+    gated.hook().reached.notified().await;
     assert_eq!(
-        gated.target_put_count(),
+        gated.hook().target_put_count(),
         0,
         "the gated mutation must not have landed before cancellation"
     );
@@ -979,7 +716,7 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
     // The gated mutation never landed: dropping the apply future cancelled the
     // in-flight write before it could pass the gate.
     assert_eq!(
-        gated.target_put_count(),
+        gated.hook().target_put_count(),
         0,
         "the remaining mutation must not be applied after lock loss"
     );
@@ -989,15 +726,14 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
     );
 
     // The intent is left in place for recovery on a mid-apply abort.
-    let logs = inner.list(".tx-log/", 10, None).await.unwrap().items;
     assert_eq!(
-        logs.len(),
+        test_util::list_count(&*inner, ".tx-log/").await,
         1,
-        "a mid-apply abort must preserve the intent for recovery: {logs:?}"
+        "a mid-apply abort must preserve the intent for recovery"
     );
 
     // Release the gate so the parked `put` task (if any reference remains) can
     // unwind cleanly; the future was already dropped, so this is a no-op safety
     // valve.
-    gated.gate.notify_one();
+    gated.hook().gate.notify_one();
 }

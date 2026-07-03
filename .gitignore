@@ -19,3 +19,4 @@ tls.d/*.csr
 /test*
 /zb*
 .DS_Store
+/.cargo/

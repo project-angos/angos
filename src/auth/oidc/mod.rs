@@ -137,57 +137,35 @@ fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String>
 mod tests {
     use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use hyper::{Request, header::AUTHORIZATION};
-    use jsonwebtoken::Algorithm;
     use serde_json::json;
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
-    };
+    use wiremock::MockServer;
 
     use super::*;
     use crate::{
-        auth::oidc::validator::tests::make_token,
+        auth::oidc::{
+            provider::github::tests::default_github_config,
+            validator::tests::{build_test_provider_config, make_token, valid_claims},
+        },
         cache,
         identity::ClientIdentity,
-        test_fixtures::oidc::{KID, jwk_x, jwk_y},
+        test_fixtures::{
+            mocks::{mount_jwks, static_jwks_response},
+            oidc::KID,
+            requests::{empty_parts, parts_with_authorization, parts_with_basic_auth},
+        },
     };
 
-    fn build_config(mock_server: &MockServer) -> Config {
+    fn build_config(issuer: &str) -> Config {
         Config::Generic(generic::ProviderConfig {
-            issuer: mock_server.uri(),
-            jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
-            jwks_refresh_interval: 3600,
             required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::ES256],
-        })
-    }
-
-    fn static_jwks_response() -> serde_json::Value {
-        json!({
-            "keys": [{
-                "kty": "EC",
-                "use": "sig",
-                "kid": KID,
-                "crv": "P-256",
-                "x": jwk_x(),
-                "y": jwk_y(),
-                "alg": "ES256"
-            }]
+            ..build_test_provider_config(issuer)
         })
     }
 
     fn make_test_token(issuer: &str) -> String {
-        let mut claims = HashMap::new();
-        claims.insert("iss".to_string(), json!(issuer));
+        let mut claims = valid_claims(issuer, "unused");
+        claims.remove("aud");
         claims.insert("sub".to_string(), json!("test-user"));
-        claims.insert(
-            "exp".to_string(),
-            json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-        );
-        claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
         make_token(&claims, KID)
     }
 
@@ -234,14 +212,7 @@ mod tests {
 
     #[test]
     fn test_config_to_backend_generic() {
-        let config = Config::Generic(generic::ProviderConfig {
-            issuer: "https://auth.example.com".to_string(),
-            jwks_uri: Some("https://auth.example.com/jwks".to_string()),
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        });
+        let config = build_config("https://auth.example.com");
 
         let provider = config.to_backend();
         assert_eq!(provider.issuer(), "https://auth.example.com");
@@ -250,14 +221,7 @@ mod tests {
 
     #[test]
     fn test_config_to_backend_github() {
-        let config = Config::GitHub(github::ProviderConfig {
-            issuer: "https://token.actions.githubusercontent.com".to_string(),
-            jwks_uri: "https://token.actions.githubusercontent.com/.well-known/jwks".to_string(),
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        });
+        let config = Config::GitHub(default_github_config());
 
         let provider = config.to_backend();
         assert_eq!(
@@ -269,14 +233,7 @@ mod tests {
 
     #[test]
     fn test_oidc_validator_new_generic() {
-        let config = Config::Generic(generic::ProviderConfig {
-            issuer: "https://auth.example.com".to_string(),
-            jwks_uri: Some("https://auth.example.com/jwks".to_string()),
-            jwks_refresh_interval: 3600,
-            required_audience: Some("test-audience".to_string()),
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        });
+        let config = Config::Generic(build_test_provider_config("https://auth.example.com"));
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let client = test_http_client();
@@ -290,14 +247,7 @@ mod tests {
 
     #[test]
     fn test_oidc_validator_new_github() {
-        let config = Config::GitHub(github::ProviderConfig {
-            issuer: "https://token.actions.githubusercontent.com".to_string(),
-            jwks_uri: "https://token.actions.githubusercontent.com/.well-known/jwks".to_string(),
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        });
+        let config = Config::GitHub(default_github_config());
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator =
@@ -314,13 +264,9 @@ mod tests {
     async fn test_validate_token_success() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
-            .and(path("/.well-known/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-            .mount(&mock_server)
-            .await;
+        mount_jwks(&mock_server, static_jwks_response()).await;
 
-        let config = build_config(&mock_server);
+        let config = build_config(&mock_server.uri());
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
@@ -341,14 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_token_invalid() {
-        let config = Config::Generic(generic::ProviderConfig {
-            issuer: "https://auth.example.com".to_string(),
-            jwks_uri: Some("https://auth.example.com/jwks".to_string()),
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        });
+        let config = build_config("https://auth.example.com");
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
@@ -367,13 +306,9 @@ mod tests {
     async fn test_authenticate_with_bearer_token() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
-            .and(path("/.well-known/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-            .mount(&mock_server)
-            .await;
+        mount_jwks(&mock_server, static_jwks_response()).await;
 
-        let config = build_config(&mock_server);
+        let config = build_config(&mock_server.uri());
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
@@ -383,12 +318,7 @@ mod tests {
         );
 
         let token = make_test_token(&mock_server.uri());
-        let request = Request::builder()
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .body(())
-            .unwrap();
-
-        let (parts, ()) = request.into_parts();
+        let parts = parts_with_authorization(&format!("Bearer {token}"));
         let mut identity = ClientIdentity::new(None);
 
         let result = validator.authenticate(&parts, &mut identity).await;
@@ -405,25 +335,15 @@ mod tests {
     async fn test_authenticate_with_basic_auth_matching_provider() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
-            .and(path("/.well-known/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-            .mount(&mock_server)
-            .await;
+        mount_jwks(&mock_server, static_jwks_response()).await;
 
-        let config = build_config(&mock_server);
+        let config = build_config(&mock_server.uri());
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator =
             OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
         let token = make_test_token(&mock_server.uri());
-        let credentials = BASE64_STANDARD.encode(format!("github:{token}"));
-        let request = Request::builder()
-            .header(AUTHORIZATION, format!("Basic {credentials}"))
-            .body(())
-            .unwrap();
-
-        let (parts, ()) = request.into_parts();
+        let parts = parts_with_basic_auth("github", &token);
         let mut identity = ClientIdentity::new(None);
 
         let result = validator.authenticate(&parts, &mut identity).await;
@@ -435,26 +355,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_with_basic_auth_non_matching_provider() {
-        let config = Config::Generic(generic::ProviderConfig {
-            issuer: "https://auth.example.com".to_string(),
-            jwks_uri: Some("https://auth.example.com/jwks".to_string()),
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        });
+        let config = build_config("https://auth.example.com");
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator =
             OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
-        let credentials = BASE64_STANDARD.encode("wrong-provider:token");
-        let request = Request::builder()
-            .header(AUTHORIZATION, format!("Basic {credentials}"))
-            .body(())
-            .unwrap();
-
-        let (parts, ()) = request.into_parts();
+        let parts = parts_with_basic_auth("wrong-provider", "token");
         let mut identity = ClientIdentity::new(None);
 
         let result = validator.authenticate(&parts, &mut identity).await;
@@ -466,14 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_no_credentials() {
-        let config = Config::Generic(generic::ProviderConfig {
-            issuer: "https://auth.example.com".to_string(),
-            jwks_uri: Some("https://auth.example.com/jwks".to_string()),
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        });
+        let config = build_config("https://auth.example.com");
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
@@ -483,9 +383,7 @@ mod tests {
             cache,
         );
 
-        let request = Request::builder().body(()).unwrap();
-
-        let (parts, ()) = request.into_parts();
+        let parts = empty_parts();
         let mut identity = ClientIdentity::new(None);
 
         let result = validator.authenticate(&parts, &mut identity).await;
@@ -497,14 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_with_invalid_token() {
-        let config = Config::Generic(generic::ProviderConfig {
-            issuer: "https://auth.example.com".to_string(),
-            jwks_uri: Some("https://auth.example.com/jwks".to_string()),
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        });
+        let config = build_config("https://auth.example.com");
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
@@ -514,12 +405,7 @@ mod tests {
             cache,
         );
 
-        let request = Request::builder()
-            .header(AUTHORIZATION, "Bearer invalid-token")
-            .body(())
-            .unwrap();
-
-        let (parts, ()) = request.into_parts();
+        let parts = parts_with_authorization("Bearer invalid-token");
         let mut identity = ClientIdentity::new(None);
 
         let result = validator.authenticate(&parts, &mut identity).await;
@@ -532,13 +418,9 @@ mod tests {
     async fn test_authenticate_populates_identity() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
-            .and(path("/.well-known/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-            .mount(&mock_server)
-            .await;
+        mount_jwks(&mock_server, static_jwks_response()).await;
 
-        let config = build_config(&mock_server);
+        let config = build_config(&mock_server.uri());
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "my-provider".to_string(),
@@ -558,12 +440,7 @@ mod tests {
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
         let token = make_token(&claims, KID);
-        let request = Request::builder()
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .body(())
-            .unwrap();
-
-        let (parts, ()) = request.into_parts();
+        let parts = parts_with_authorization(&format!("Bearer {token}"));
         let socket_addr: SocketAddr = "192.168.1.1:8080".parse().unwrap();
         let mut identity = ClientIdentity::new(Some(socket_addr));
 

@@ -26,9 +26,8 @@ use crate::{
         metadata_store::{BlobIndex, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore},
         path_builder,
         s3_connection::S3ConnectionConfig,
-        test_utils::{backends, put_blob_direct},
+        test_utils::{for_each_backend, media_type, put_blob_direct, s3_test_connection},
     },
-    secret::Secret,
 };
 
 /// Configuration for a test S3 metadata backend.
@@ -91,14 +90,7 @@ impl TestS3Config {
 pub fn test_config() -> TestS3Config {
     metrics_provider::init_for_tests();
     TestS3Config {
-        connection: S3ConnectionConfig {
-            access_key_id: Secret::new("root".to_string()),
-            secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            region: "region".to_string(),
-            bucket: "registry".to_string(),
-            key_prefix: format!("test-backend-{}", uuid::Uuid::new_v4()),
-        },
+        connection: s3_test_connection(format!("test-backend-{}", uuid::Uuid::new_v4())),
         lock_strategy: LockStrategy::Memory,
         link_cache_ttl: 30,
         access_time_debounce_secs: 0,
@@ -118,10 +110,6 @@ pub fn test_backend_with_cache(config: &TestS3Config) -> (MetadataStore, Arc<Cac
         )
         .unwrap();
     (backend, cache)
-}
-
-fn media_type(value: &str) -> MediaType {
-    MediaType::new(value).unwrap()
 }
 
 pub fn test_backend_with_debounce(config: &TestS3Config, debounce_secs: u64) -> MetadataStore {
@@ -183,9 +171,8 @@ pub async fn test_datastore_list_namespaces(m: Arc<MetadataStore>) {
         create_link(&m, namespace, &tag_link, &digest).await;
     }
 
-    let (listed_namespaces, token) = m.list_namespaces(10, None).await.unwrap();
+    let (listed_namespaces, _) = m.list_namespaces(10, None).await.unwrap();
     assert_eq!(listed_namespaces, namespaces);
-    assert!(token.is_none() || listed_namespaces.len() >= namespaces.len());
 
     let (page1, token1) = m.list_namespaces(2, None).await.unwrap();
     assert_eq!(page1, ["repo1", "repo2"]);
@@ -514,66 +501,66 @@ pub async fn test_datastore_link_operations(m: Arc<MetadataStore>) {
 
 #[tokio::test]
 async fn test_list_namespaces() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_namespaces(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_tags() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_tags(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_tag_names_includes_malformed() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_tag_names_includes_malformed(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_delete_tag_directory_guards_unsafe_names() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_delete_tag_directory_guards_unsafe_names(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_referrers() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_referrers(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_revisions() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_revisions(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_revisions_across_algorithms() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_revisions_across_algorithms(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_link_operations() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_link_operations(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_list_namespaces_deduplication(m: Arc<MetadataStore>) {
@@ -682,26 +669,26 @@ pub async fn test_datastore_list_namespaces_single_item_pages(m: Arc<MetadataSto
 
 #[tokio::test]
 async fn test_list_namespaces_deduplication() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_namespaces_deduplication(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_namespaces_many_namespaces_pagination() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_namespaces_many_namespaces_pagination(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_namespaces_single_item_pages() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_namespaces_single_item_pages(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_list_tags_many_tags_pagination(m: Arc<MetadataStore>) {
@@ -801,18 +788,18 @@ pub async fn test_datastore_list_tags_single_item_pages(m: Arc<MetadataStore>) {
 
 #[tokio::test]
 async fn test_list_tags_many_tags_pagination() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_tags_many_tags_pagination(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_tags_single_item_pages() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_tags_single_item_pages(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_update_links(m: Arc<MetadataStore>) {
@@ -854,10 +841,10 @@ pub async fn test_update_links(m: Arc<MetadataStore>) {
 
 #[tokio::test]
 async fn test_update_links_batched() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_update_links(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_read_link_access_time_update(m: Arc<MetadataStore>) {
@@ -892,10 +879,10 @@ pub async fn test_datastore_read_link_access_time_update(m: Arc<MetadataStore>) 
 
 #[tokio::test]
 async fn test_read_link_access_time_update() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_read_link_access_time_update(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_read_link_concurrent_readonly(m: Arc<MetadataStore>) {
@@ -922,10 +909,10 @@ pub async fn test_datastore_read_link_concurrent_readonly(m: Arc<MetadataStore>)
 
 #[tokio::test]
 async fn test_read_link_concurrent_readonly() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_read_link_concurrent_readonly(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_list_referrers_parallel_correctness(m: Arc<MetadataStore>) {
@@ -1152,26 +1139,26 @@ pub async fn test_datastore_list_referrers_deterministic_order(m: Arc<MetadataSt
 
 #[tokio::test]
 async fn test_list_referrers_parallel_correctness() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_referrers_parallel_correctness(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_referrers_with_artifact_type_filter() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_referrers_with_artifact_type_filter(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_list_referrers_deterministic_order() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_referrers_deterministic_order(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_parallel_multiple_creates(m: Arc<MetadataStore>) {
@@ -1233,10 +1220,10 @@ pub async fn test_datastore_parallel_multiple_creates(m: Arc<MetadataStore>) {
 
 #[tokio::test]
 async fn test_parallel_multiple_creates() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_parallel_multiple_creates(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) {
@@ -1321,10 +1308,10 @@ pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) 
 
 #[tokio::test]
 async fn test_parallel_mixed_create_delete() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_parallel_mixed_create_delete(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_parallel_blob_index_correctness(m: Arc<MetadataStore>) {
@@ -1381,10 +1368,10 @@ pub async fn test_datastore_parallel_blob_index_correctness(m: Arc<MetadataStore
 
 #[tokio::test]
 async fn test_parallel_blob_index_correctness() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_parallel_blob_index_correctness(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_tracked_create_with_referrer(m: Arc<MetadataStore>) {
@@ -1430,10 +1417,10 @@ pub async fn test_datastore_tracked_create_with_referrer(m: Arc<MetadataStore>) 
 
 #[tokio::test]
 async fn test_tracked_create_with_referrer() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_tracked_create_with_referrer(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_tracked_delete_with_referrer(m: Arc<MetadataStore>) {
@@ -1514,10 +1501,10 @@ pub async fn test_datastore_tracked_delete_with_referrer(m: Arc<MetadataStore>) 
 
 #[tokio::test]
 async fn test_tracked_delete_with_referrer() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_tracked_delete_with_referrer(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_tracked_delete_removes_when_no_referrers(m: Arc<MetadataStore>) {
@@ -1572,10 +1559,10 @@ pub async fn test_datastore_tracked_delete_removes_when_no_referrers(m: Arc<Meta
 
 #[tokio::test]
 async fn test_tracked_delete_removes_when_no_referrers() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_tracked_delete_removes_when_no_referrers(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataStore>) {
@@ -1672,10 +1659,10 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(m: Arc<MetadataSt
 
 #[tokio::test]
 async fn test_mixed_tracked_untracked_operations() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_mixed_tracked_untracked_operations(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_batch_deduplicates_same_digest_operations(m: Arc<MetadataStore>) {
@@ -1713,10 +1700,10 @@ pub async fn test_datastore_batch_deduplicates_same_digest_operations(m: Arc<Met
 
 #[tokio::test]
 async fn test_batch_deduplicates_same_digest_operations() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_batch_deduplicates_same_digest_operations(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_batch_handles_mixed_insert_remove_same_digest(m: Arc<MetadataStore>) {
@@ -1751,11 +1738,11 @@ pub async fn test_datastore_batch_handles_mixed_insert_remove_same_digest(m: Arc
 
 #[tokio::test]
 async fn test_batch_handles_mixed_insert_remove_same_digest() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_batch_handles_mixed_insert_remove_same_digest(test_case.metadata_store())
             .await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_batch_deletes_empty_blob_container(m: Arc<MetadataStore>) {
@@ -1782,10 +1769,10 @@ pub async fn test_datastore_batch_deletes_empty_blob_container(m: Arc<MetadataSt
 
 #[tokio::test]
 async fn test_batch_deletes_empty_blob_container() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_batch_deletes_empty_blob_container(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_batch_multiple_unique_digests(m: Arc<MetadataStore>) {
@@ -1837,10 +1824,10 @@ pub async fn test_datastore_batch_multiple_unique_digests(m: Arc<MetadataStore>)
 
 #[tokio::test]
 async fn test_batch_multiple_unique_digests() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_batch_multiple_unique_digests(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_batch_preserves_existing_blob_index_entries(m: Arc<MetadataStore>) {
@@ -1882,11 +1869,11 @@ pub async fn test_datastore_batch_preserves_existing_blob_index_entries(m: Arc<M
 
 #[tokio::test]
 async fn test_batch_preserves_existing_blob_index_entries() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_batch_preserves_existing_blob_index_entries(test_case.metadata_store())
             .await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 async fn create_link_with_media_type(
@@ -1911,7 +1898,7 @@ async fn create_link_with_media_type(
 
 #[tokio::test]
 async fn test_link_metadata_media_type() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let m = test_case.metadata_store();
         let namespace = Namespace::new("media-type-test").unwrap();
         let digest = put_blob_direct(m.store(), b"test content").await;
@@ -1933,13 +1920,13 @@ async fn test_link_metadata_media_type() {
             .unwrap();
         assert_eq!(link.media_type, Some(MediaType::new(media_type).unwrap()));
         assert_eq!(link.target, digest);
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn test_link_without_media_type_has_none() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let m = test_case.metadata_store();
         let namespace = Namespace::new("no-media-type-test").unwrap();
         let digest = put_blob_direct(m.store(), b"test content 2").await;
@@ -1958,8 +1945,8 @@ async fn test_link_without_media_type_has_none() {
             .unwrap();
         assert_eq!(link.media_type, None);
         assert_eq!(link.target, digest);
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<MetadataStore>) {
@@ -2035,10 +2022,10 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
 
 #[tokio::test]
 async fn test_list_referrers_with_stored_descriptor() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         test_datastore_list_referrers_with_stored_descriptor(test_case.metadata_store()).await;
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[test]

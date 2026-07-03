@@ -121,13 +121,13 @@ mod tests {
         oci::{Digest, Namespace},
         registry::{
             metadata_store::{LinkKind, LinkOperation},
-            test_utils::backends,
+            test_utils::for_each_backend,
         },
     };
 
     #[tokio::test]
     async fn revisions_streams_each_stored_revision() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let namespace = &Namespace::new("list-all-test/revisions").unwrap();
@@ -153,13 +153,13 @@ mod tests {
             }
 
             assert_eq!(collected, vec![digest]);
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn namespaces_streams_each_stored_namespace() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let namespace = &Namespace::new("list-all-test/namespaces").unwrap();
@@ -185,7 +185,7 @@ mod tests {
             }
 
             assert!(collected.contains(&namespace.to_string()));
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

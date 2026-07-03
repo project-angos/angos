@@ -300,8 +300,8 @@ mod tests {
     };
 
     use angos_storage::{
-        BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error as StorageError, Etag,
-        MemoryObjectStore, ObjectMeta, ObjectStore, Page,
+        ConditionalStore, Error as StorageError, Etag, MemoryObjectStore,
+        test_util::{HookedStore, StoreHook, StoreOp},
     };
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -546,7 +546,7 @@ mod tests {
         assert!(matches!(out, MatchReconcile::Retry));
     }
 
-    // fault-injecting ConditionalStore for end-to-end retry tests
+    // fault-injecting hook for end-to-end retry tests
 
     /// One injected fault for a conditional write.
     #[derive(Clone, Copy)]
@@ -558,10 +558,11 @@ mod tests {
         ErrorNoLand,
     }
 
-    /// Wraps a real [`MemoryObjectStore`] and injects transport faults into the
-    /// conditional writes. Only the methods [`S3LockStorage`] actually calls are
-    /// backed by the inner store; the rest are unreachable in these tests.
-    struct FlakyStore {
+    /// Injects transport faults into the conditional calls of a wrapped
+    /// [`MemoryObjectStore`]. `inner` is a clone sharing the wrapped store's
+    /// map, so a `LandThenError` fault can land the write itself before
+    /// failing, and tests can seed or inspect objects directly.
+    struct FaultScript {
         inner: MemoryObjectStore,
         absent_faults: Mutex<VecDeque<Fault>>,
         match_faults: Mutex<VecDeque<Fault>>,
@@ -571,144 +572,70 @@ mod tests {
         get_calls: AtomicUsize,
     }
 
-    impl std::fmt::Debug for FlakyStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("FlakyStore").finish_non_exhaustive()
-        }
-    }
-
-    impl FlakyStore {
-        fn new(absent: &[Fault], refresh: &[Fault]) -> Arc<Self> {
-            Arc::new(Self {
-                inner: MemoryObjectStore::new(),
-                absent_faults: Mutex::new(absent.iter().copied().collect()),
-                match_faults: Mutex::new(refresh.iter().copied().collect()),
-                get_faults: Mutex::new(VecDeque::new()),
-                absent_calls: AtomicUsize::new(0),
-                match_calls: AtomicUsize::new(0),
-                get_calls: AtomicUsize::new(0),
-            })
-        }
-
+    impl FaultScript {
         fn set_get_faults(&self, faults: &[Fault]) {
             *self.get_faults.lock().unwrap() = faults.iter().copied().collect();
         }
     }
 
-    #[async_trait]
-    impl ObjectStore for FlakyStore {
-        async fn get(&self, _key: &str) -> Result<Vec<u8>, StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn get_stream(
-            &self,
-            _key: &str,
-            _offset: Option<u64>,
-        ) -> Result<(BoxedReader, u64), StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn put(&self, _key: &str, _data: Bytes) -> Result<(), StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn delete(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.delete(key).await
-        }
-        async fn delete_prefix(&self, _prefix: &str) -> Result<(), StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn head(&self, _key: &str) -> Result<ObjectMeta, StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn list(
-            &self,
-            _prefix: &str,
-            _n: u16,
-            _token: Option<String>,
-        ) -> Result<Page<String>, StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn list_children(
-            &self,
-            _prefix: &str,
-            _n: u16,
-            _token: Option<String>,
-            _start_after: Option<String>,
-        ) -> Result<ChildrenPage, StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn copy(&self, _source: &str, _destination: &str) -> Result<(), StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn create_upload(&self, _key: &str) -> Result<(), StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn write_upload(
-            &self,
-            _key: &str,
-            _body: ByteStream,
-            _len: Option<u64>,
-        ) -> Result<u64, StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn complete_upload(&self, _key: &str) -> Result<(), StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
-        async fn abort_upload(&self, _key: &str) -> Result<(), StorageError> {
-            unimplemented!("not used by S3LockStorage")
-        }
+    fn injected() -> StorageError {
+        StorageError::Backend("injected transport error".into())
+    }
+
+    type FlakyStore = HookedStore<Arc<dyn ConditionalStore>, FaultScript>;
+
+    fn flaky_store(absent: &[Fault], refresh: &[Fault]) -> Arc<FlakyStore> {
+        let inner = MemoryObjectStore::new();
+        let script = FaultScript {
+            inner: inner.clone(),
+            absent_faults: Mutex::new(absent.iter().copied().collect()),
+            match_faults: Mutex::new(refresh.iter().copied().collect()),
+            get_faults: Mutex::new(VecDeque::new()),
+            absent_calls: AtomicUsize::new(0),
+            match_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+        };
+        Arc::new(HookedStore::new(Arc::new(inner), script))
     }
 
     #[async_trait]
-    impl ConditionalStore for FlakyStore {
-        async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), StorageError> {
-            self.get_calls.fetch_add(1, Ordering::SeqCst);
-            if self.get_faults.lock().unwrap().pop_front().is_some() {
-                return Err(StorageError::Backend("injected transport error".into()));
+    impl StoreHook for FaultScript {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            match op {
+                StoreOp::GetWithEtag { .. } => {
+                    self.get_calls.fetch_add(1, Ordering::SeqCst);
+                    let fault = self.get_faults.lock().unwrap().pop_front();
+                    if fault.is_some() {
+                        return Err(injected());
+                    }
+                    Ok(())
+                }
+                StoreOp::PutIfAbsent { key, data } => {
+                    self.absent_calls.fetch_add(1, Ordering::SeqCst);
+                    let fault = self.absent_faults.lock().unwrap().pop_front();
+                    match fault {
+                        Some(Fault::LandThenError) => {
+                            let _ = self.inner.put_if_absent(key, data.clone()).await;
+                            Err(injected())
+                        }
+                        Some(Fault::ErrorNoLand) => Err(injected()),
+                        None => Ok(()),
+                    }
+                }
+                StoreOp::PutIfMatch { key, etag, data } => {
+                    self.match_calls.fetch_add(1, Ordering::SeqCst);
+                    let fault = self.match_faults.lock().unwrap().pop_front();
+                    match fault {
+                        Some(Fault::LandThenError) => {
+                            let _ = self.inner.put_if_match(key, etag, data.clone()).await;
+                            Err(injected())
+                        }
+                        Some(Fault::ErrorNoLand) => Err(injected()),
+                        None => Ok(()),
+                    }
+                }
+                _ => Ok(()),
             }
-            self.inner.get_with_etag(key).await
-        }
-
-        async fn put_if_absent(
-            &self,
-            key: &str,
-            data: Bytes,
-        ) -> Result<Option<Etag>, StorageError> {
-            self.absent_calls.fetch_add(1, Ordering::SeqCst);
-            let fault = self.absent_faults.lock().unwrap().pop_front();
-            match fault {
-                Some(Fault::LandThenError) => {
-                    let _ = self.inner.put_if_absent(key, data).await;
-                    Err(StorageError::Backend("injected transport error".into()))
-                }
-                Some(Fault::ErrorNoLand) => {
-                    Err(StorageError::Backend("injected transport error".into()))
-                }
-                None => self.inner.put_if_absent(key, data).await,
-            }
-        }
-
-        async fn put_if_match(
-            &self,
-            key: &str,
-            etag: &Etag,
-            data: Bytes,
-        ) -> Result<Option<Etag>, StorageError> {
-            self.match_calls.fetch_add(1, Ordering::SeqCst);
-            let fault = self.match_faults.lock().unwrap().pop_front();
-            match fault {
-                Some(Fault::LandThenError) => {
-                    let _ = self.inner.put_if_match(key, etag, data).await;
-                    Err(StorageError::Backend("injected transport error".into()))
-                }
-                Some(Fault::ErrorNoLand) => {
-                    Err(StorageError::Backend("injected transport error".into()))
-                }
-                None => self.inner.put_if_match(key, etag, data).await,
-            }
-        }
-
-        async fn delete_if_match(&self, _key: &str, _etag: &Etag) -> Result<(), StorageError> {
-            unimplemented!("not used by these tests")
         }
     }
 
@@ -717,7 +644,7 @@ mod tests {
         // The PUT lands but the ack is lost (transport error). The reconcile
         // read-back finds our own body, so the acquire succeeds: the exact
         // regression this layer repairs.
-        let store = FlakyStore::new(&[Fault::LandThenError], &[]);
+        let store = flaky_store(&[Fault::LandThenError], &[]);
         let lock = S3LockStorage::new(store.clone(), true);
 
         let outcome = lock.put_if_absent("k", b"the-body".to_vec()).await.unwrap();
@@ -726,9 +653,9 @@ mod tests {
             matches!(outcome, PutIfAbsentOutcome::Created(_)),
             "a transport error on a PUT that landed must still report Created, not an error"
         );
-        assert_eq!(store.absent_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.hook().absent_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            store.get_calls.load(Ordering::SeqCst),
+            store.hook().get_calls.load(Ordering::SeqCst),
             1,
             "exactly one reconcile read-back confirms ownership"
         );
@@ -736,14 +663,14 @@ mod tests {
 
     #[tokio::test]
     async fn put_if_absent_transport_error_without_landing_retries_then_creates() {
-        let store = FlakyStore::new(&[Fault::ErrorNoLand], &[]);
+        let store = flaky_store(&[Fault::ErrorNoLand], &[]);
         let lock = S3LockStorage::new(store.clone(), true);
 
         let outcome = lock.put_if_absent("k", b"the-body".to_vec()).await.unwrap();
 
         assert!(matches!(outcome, PutIfAbsentOutcome::Created(_)));
         assert_eq!(
-            store.absent_calls.load(Ordering::SeqCst),
+            store.hook().absent_calls.load(Ordering::SeqCst),
             2,
             "a non-landing transport error retries the conditional create once"
         );
@@ -752,8 +679,9 @@ mod tests {
     #[tokio::test]
     async fn put_if_absent_competitor_after_transport_error_is_already_exists() {
         // Seed a competitor's lock object, then fault our acquire's PUT.
-        let store = FlakyStore::new(&[Fault::ErrorNoLand], &[]);
+        let store = flaky_store(&[Fault::ErrorNoLand], &[]);
         store
+            .hook()
             .inner
             .put_if_absent(&lock_path("k"), Bytes::from_static(b"competitor"))
             .await
@@ -772,16 +700,16 @@ mod tests {
     async fn put_if_absent_genuine_precondition_is_terminal() {
         // No faults: the second acquire hits a real PreconditionFailed and must
         // NOT reconcile or retry.
-        let store = FlakyStore::new(&[], &[]);
+        let store = flaky_store(&[], &[]);
         let lock = S3LockStorage::new(store.clone(), true);
 
         lock.put_if_absent("k", b"first".to_vec()).await.unwrap();
-        let gets_before = store.get_calls.load(Ordering::SeqCst);
+        let gets_before = store.hook().get_calls.load(Ordering::SeqCst);
         let outcome = lock.put_if_absent("k", b"second".to_vec()).await.unwrap();
 
         assert!(matches!(outcome, PutIfAbsentOutcome::AlreadyExists));
         assert_eq!(
-            store.get_calls.load(Ordering::SeqCst),
+            store.hook().get_calls.load(Ordering::SeqCst),
             gets_before,
             "a genuine PreconditionFailed must be terminal: no reconcile read-back"
         );
@@ -790,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn put_if_absent_budget_exhausted_propagates_error() {
         let faults = vec![Fault::ErrorNoLand; MAX_CONDITIONAL_ATTEMPTS as usize];
-        let store = FlakyStore::new(&faults, &[]);
+        let store = flaky_store(&faults, &[]);
         let lock = S3LockStorage::new(store.clone(), true);
 
         let result = lock.put_if_absent("k", b"the-body".to_vec()).await;
@@ -800,7 +728,7 @@ mod tests {
             "a persistent transport error must surface after the bounded retries"
         );
         assert_eq!(
-            store.absent_calls.load(Ordering::SeqCst),
+            store.hook().absent_calls.load(Ordering::SeqCst),
             MAX_CONDITIONAL_ATTEMPTS as usize,
             "the conditional create is attempted exactly MAX_CONDITIONAL_ATTEMPTS times"
         );
@@ -809,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn put_if_match_lost_ack_landed_returns_updated() {
         // Create the object, capture its ETag, then fault a refresh that lands.
-        let store = FlakyStore::new(&[], &[Fault::LandThenError]);
+        let store = flaky_store(&[], &[Fault::LandThenError]);
         let lock = S3LockStorage::new(store.clone(), true);
 
         let PutIfAbsentOutcome::Created(Some(etag)) =
@@ -828,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_if_match_takeover_during_transport_error_is_mismatch() {
-        let store = FlakyStore::new(&[], &[Fault::ErrorNoLand]);
+        let store = flaky_store(&[], &[Fault::ErrorNoLand]);
         let lock = S3LockStorage::new(store.clone(), true);
 
         let PutIfAbsentOutcome::Created(Some(stale_etag)) =
@@ -838,8 +766,14 @@ mod tests {
         };
 
         // A competitor rotates the object's ETag and body out from under us.
-        let (_body, live_etag) = store.inner.get_with_etag(&lock_path("k")).await.unwrap();
+        let (_body, live_etag) = store
+            .hook()
+            .inner
+            .get_with_etag(&lock_path("k"))
+            .await
+            .unwrap();
         store
+            .hook()
             .inner
             .put_if_match(
                 &lock_path("k"),
@@ -866,13 +800,14 @@ mod tests {
     async fn get_with_etag_retries_transient_read_error_then_succeeds() {
         // A stale-lock-recovery read (the path behind the DELETE 500) hits a
         // transport blip, then succeeds, so the acquire must not fail.
-        let store = FlakyStore::new(&[], &[]);
+        let store = flaky_store(&[], &[]);
         store
+            .hook()
             .inner
             .put_if_absent(&lock_path("k"), Bytes::from_static(b"held"))
             .await
             .unwrap();
-        store.set_get_faults(&[Fault::ErrorNoLand]);
+        store.hook().set_get_faults(&[Fault::ErrorNoLand]);
         let lock = S3LockStorage::new(store.clone(), true);
 
         let (body, _etag, _) = lock.get_with_etag("k").await.unwrap();
@@ -882,7 +817,7 @@ mod tests {
             "the read must recover after a transient blip"
         );
         assert_eq!(
-            store.get_calls.load(Ordering::SeqCst),
+            store.hook().get_calls.load(Ordering::SeqCst),
             2,
             "one transient read error is retried exactly once before succeeding"
         );
@@ -890,8 +825,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_with_etag_read_budget_exhausted_propagates_error() {
-        let store = FlakyStore::new(&[], &[]);
-        store.set_get_faults(&vec![Fault::ErrorNoLand; MAX_CONDITIONAL_ATTEMPTS as usize]);
+        let store = flaky_store(&[], &[]);
+        store
+            .hook()
+            .set_get_faults(&vec![Fault::ErrorNoLand; MAX_CONDITIONAL_ATTEMPTS as usize]);
         let lock = S3LockStorage::new(store.clone(), true);
 
         let result = lock.get_with_etag("k").await;
@@ -901,7 +838,7 @@ mod tests {
             "a persistent read transport error surfaces after the bounded retries"
         );
         assert_eq!(
-            store.get_calls.load(Ordering::SeqCst),
+            store.hook().get_calls.load(Ordering::SeqCst),
             MAX_CONDITIONAL_ATTEMPTS as usize,
             "the read is attempted exactly MAX_CONDITIONAL_ATTEMPTS times"
         );

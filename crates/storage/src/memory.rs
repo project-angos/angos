@@ -2,14 +2,17 @@
 //!
 //! Stores objects in a `HashMap<String, (Bytes, Etag)>` guarded by a `Mutex`.
 //! Every write generates a fresh monotonic etag so the store can also serve
-//! as a [`ConditionalStore`] for CAS-based testing and for in-process
-//! deployments that need the transactional engine's CAS executor.
+//! as a [`ConditionalStore`] for CAS-based testing.
 //!
 //! `get_stream` returns a cursor over an in-memory clone; `copy` clones the
 //! entry in-place (with a fresh etag).
 //!
-//! Intended for deployments that do not configure `[global.job_queue]` and for
-//! tests that need an object store without a filesystem or S3 dependency.
+//! Test fixture only: no production or configuration path constructs it
+//! (`BlobStoreConfig`/`RegistryStorageConfig` are FS or S3, and the
+//! in-process job queue runs on the metadata store's engine). It is the fast,
+//! deterministic substrate for the tx-engine executor/lock/chaos tests and
+//! the conformance suites in `crate::tests`, which hold it to the same trait
+//! contract as the real backends.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -427,146 +430,13 @@ impl ConditionalStore for MemoryObjectStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use bytes::Bytes;
-    use tokio::io::AsyncReadExt;
 
+    use crate::ObjectStore;
     use crate::memory::MemoryObjectStore;
-    use crate::{ConditionalStore, Etag, ObjectStore, Page};
 
     fn store() -> MemoryObjectStore {
         MemoryObjectStore::new()
-    }
-
-    #[tokio::test]
-    async fn put_and_get_roundtrip() {
-        let s = store();
-        s.put("k", Bytes::from("hello")).await.unwrap();
-        assert_eq!(s.get("k").await.unwrap(), b"hello");
-    }
-
-    #[tokio::test]
-    async fn get_missing_returns_not_found() {
-        let s = store();
-        assert!(matches!(s.get("absent").await, Err(crate::Error::NotFound)));
-    }
-
-    #[tokio::test]
-    async fn head_returns_size() {
-        let s = store();
-        s.put("k", Bytes::from("abcde")).await.unwrap();
-        let meta = s.head("k").await.unwrap();
-        assert_eq!(meta.size, 5);
-    }
-
-    #[tokio::test]
-    async fn head_missing_returns_not_found() {
-        let s = store();
-        assert!(matches!(
-            s.head("absent").await,
-            Err(crate::Error::NotFound)
-        ));
-    }
-
-    #[tokio::test]
-    async fn delete_removes_key() {
-        let s = store();
-        s.put("k", Bytes::from("v")).await.unwrap();
-        s.delete("k").await.unwrap();
-        assert!(matches!(s.get("k").await, Err(crate::Error::NotFound)));
-    }
-
-    #[tokio::test]
-    async fn delete_missing_is_ok() {
-        let s = store();
-        s.delete("absent").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn delete_prefix_removes_matching_keys() {
-        let s = store();
-        s.put("jobs/a", Bytes::from("1")).await.unwrap();
-        s.put("jobs/b", Bytes::from("2")).await.unwrap();
-        s.put("other/c", Bytes::from("3")).await.unwrap();
-
-        s.delete_prefix("jobs/").await.unwrap();
-
-        assert!(matches!(s.get("jobs/a").await, Err(crate::Error::NotFound)));
-        assert!(matches!(s.get("jobs/b").await, Err(crate::Error::NotFound)));
-        assert_eq!(s.get("other/c").await.unwrap(), b"3");
-    }
-
-    #[tokio::test]
-    async fn delete_prefix_empty_is_ok() {
-        let s = store();
-        s.delete_prefix("nonexistent/").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn delete_prefix_is_directory_scoped_not_string_prefix() {
-        // Regression: a non-slash prefix is a directory boundary, so a sibling
-        // that merely shares a string prefix must survive.
-        let s = store();
-        s.put("a/b/1", Bytes::from("1")).await.unwrap();
-        s.put("a/b/c/2", Bytes::from("2")).await.unwrap();
-        s.put("a/bc/3", Bytes::from("3")).await.unwrap();
-
-        s.delete_prefix("a/b").await.unwrap();
-
-        assert!(matches!(s.get("a/b/1").await, Err(crate::Error::NotFound)));
-        assert!(matches!(
-            s.get("a/b/c/2").await,
-            Err(crate::Error::NotFound)
-        ));
-        assert_eq!(s.get("a/bc/3").await.unwrap(), b"3");
-    }
-
-    #[tokio::test]
-    async fn delete_prefix_empty_prefix_is_noop() {
-        // An empty prefix must not wipe the entire store.
-        let s = store();
-        s.put("a/1", Bytes::from("1")).await.unwrap();
-        s.put("b/1", Bytes::from("2")).await.unwrap();
-
-        s.delete_prefix("").await.unwrap();
-
-        assert_eq!(s.get("a/1").await.unwrap(), b"1");
-        assert_eq!(s.get("b/1").await.unwrap(), b"2");
-    }
-
-    #[tokio::test]
-    async fn list_returns_sorted_suffixes() {
-        let s = store();
-        s.put("dir/c.json", Bytes::from("3")).await.unwrap();
-        s.put("dir/a.json", Bytes::from("1")).await.unwrap();
-        s.put("dir/b.json", Bytes::from("2")).await.unwrap();
-        s.put("other/d.json", Bytes::from("4")).await.unwrap();
-
-        let page = s.list("dir/", 10, None).await.unwrap();
-        assert_eq!(page.items, vec!["a.json", "b.json", "c.json"]);
-        assert!(page.next_token.is_none());
-    }
-
-    #[tokio::test]
-    async fn list_paginates_with_token() {
-        let s = store();
-        for i in 0..5u8 {
-            s.put(&format!("p/{i:02}.json"), Bytes::from(vec![i]))
-                .await
-                .unwrap();
-        }
-
-        let page1 = s.list("p/", 2, None).await.unwrap();
-        assert_eq!(page1.items.len(), 2);
-        assert!(page1.next_token.is_some());
-
-        let page2 = s.list("p/", 2, page1.next_token).await.unwrap();
-        assert_eq!(page2.items.len(), 2);
-
-        let page3 = s.list("p/", 2, page2.next_token).await.unwrap();
-        assert_eq!(page3.items.len(), 1);
-        assert!(page3.next_token.is_none());
     }
 
     #[tokio::test]
@@ -603,63 +473,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_empty_prefix_returns_empty() {
-        let s = store();
-        let page: Page<String> = s.list("empty/", 10, None).await.unwrap();
-        assert!(page.items.is_empty());
-        assert!(page.next_token.is_none());
-    }
-
-    #[tokio::test]
-    async fn get_stream_with_offset() {
-        let s = store();
-        s.put("k", Bytes::from("abcde")).await.unwrap();
-
-        let (mut reader, total) = s.get_stream("k", Some(2)).await.unwrap();
-        assert_eq!(total, 5);
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"cde");
-    }
-
-    #[tokio::test]
-    async fn copy_clones_object() {
-        let s = store();
-        s.put("src", Bytes::from("data")).await.unwrap();
-        s.copy("src", "dst").await.unwrap();
-        assert_eq!(s.get("dst").await.unwrap(), b"data");
-        assert_eq!(s.get("src").await.unwrap(), b"data");
-    }
-
-    /// Exercises the trait-default `move_object` (copy + delete); the memory
-    /// backend does not override it.
-    #[tokio::test]
-    async fn move_object_relocates_and_removes_source() {
-        let s = store();
-        s.put("src", Bytes::from("data")).await.unwrap();
-        s.move_object("src", "dst").await.unwrap();
-        assert_eq!(s.get("dst").await.unwrap(), b"data");
-        assert!(matches!(s.head("src").await, Err(crate::Error::NotFound)));
-    }
-
-    #[tokio::test]
-    async fn copy_missing_source_returns_not_found() {
-        let s = store();
-        assert!(matches!(
-            s.copy("absent", "dst").await,
-            Err(crate::Error::NotFound)
-        ));
-    }
-
-    #[tokio::test]
-    async fn shared_clones_see_same_data() {
-        let s = Arc::new(store());
-        let s2 = s.clone();
-        s.put("shared", Bytes::from("x")).await.unwrap();
-        assert_eq!(s2.get("shared").await.unwrap(), b"x");
-    }
-
-    #[tokio::test]
     async fn head_returns_etag_that_changes_after_put() {
         let s = store();
         s.put("k", Bytes::from("v1")).await.unwrap();
@@ -667,50 +480,5 @@ mod tests {
         s.put("k", Bytes::from("v2")).await.unwrap();
         let e2 = s.head("k").await.unwrap().etag.unwrap();
         assert_ne!(e1, e2, "etag must change on overwrite");
-    }
-
-    #[tokio::test]
-    async fn put_if_absent_fails_when_present() {
-        let s = store();
-        s.put_if_absent("k", Bytes::from("v1")).await.unwrap();
-        let again = s.put_if_absent("k", Bytes::from("v2")).await;
-        assert!(matches!(again, Err(crate::Error::PreconditionFailed)));
-        assert_eq!(s.get("k").await.unwrap(), b"v1");
-    }
-
-    #[tokio::test]
-    async fn put_if_match_requires_current_etag() {
-        let s = store();
-        let etag = s
-            .put_if_absent("k", Bytes::from("v1"))
-            .await
-            .unwrap()
-            .unwrap();
-        let stale = Etag::new("\"stale\"".to_string());
-        assert!(matches!(
-            s.put_if_match("k", &stale, Bytes::from("nope")).await,
-            Err(crate::Error::PreconditionFailed)
-        ));
-        s.put_if_match("k", &etag, Bytes::from("v2")).await.unwrap();
-        assert_eq!(s.get("k").await.unwrap(), b"v2");
-    }
-
-    #[tokio::test]
-    async fn delete_if_match_requires_current_etag() {
-        let s = store();
-        let etag = s
-            .put_if_absent("k", Bytes::from("v"))
-            .await
-            .unwrap()
-            .unwrap();
-        let stale = Etag::new("\"stale\"".to_string());
-        assert!(matches!(
-            s.delete_if_match("k", &stale).await,
-            Err(crate::Error::PreconditionFailed)
-        ));
-        s.delete_if_match("k", &etag).await.unwrap();
-        assert!(matches!(s.get("k").await, Err(crate::Error::NotFound)));
-        // Missing key is idempotent success.
-        s.delete_if_match("k", &etag).await.unwrap();
     }
 }

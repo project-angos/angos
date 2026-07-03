@@ -87,41 +87,17 @@ impl AuthMiddleware for MtlsValidator {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{
-        io::{self, Write},
-        sync::{Arc, Mutex},
-    };
+    use std::sync::Arc;
 
-    use hyper::{Request, StatusCode};
+    use hyper::StatusCode;
     use tracing::Level;
-    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::test_fixtures::mtls::{cert_der, minimal_cert_der};
-
-    /// Collects tracing output into a shared buffer; every clone appends to
-    /// the same buffer.
-    #[derive(Clone)]
-    struct LogCapture(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for LogCapture {
-        type Writer = LogCapture;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    use crate::test_fixtures::{
+        logging::LogCapture,
+        mtls::{cert_der, minimal_cert_der},
+        requests::empty_parts,
+    };
 
     /// The parse error is logged server-side while the client only sees the
     /// generic "Invalid certificate". This must remain the ONLY test driving
@@ -130,10 +106,10 @@ pub mod tests {
     /// could cache the `error!` as disabled and make the log assertion flaky.
     #[test]
     fn malformed_certificate_is_logged_but_not_leaked_to_client() {
-        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let capture = LogCapture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(Level::DEBUG)
-            .with_writer(LogCapture(Arc::clone(&buffer)))
+            .with_writer(capture.clone())
             .with_ansi(false)
             .finish();
 
@@ -143,10 +119,10 @@ pub mod tests {
                 .unwrap();
             runtime.block_on(async {
                 let validator = MtlsValidator::new();
-                let peer_cert = PeerCertificate(Arc::new(vec![0u8; 100]));
-                let mut request = Request::builder().body(()).unwrap();
-                request.extensions_mut().insert(peer_cert);
-                let (parts, ()) = request.into_parts();
+                let mut parts = empty_parts();
+                parts
+                    .extensions
+                    .insert(PeerCertificate(Arc::new(vec![0u8; 100])));
                 let mut identity = ClientIdentity::new(None);
                 validator.authenticate(&parts, &mut identity).await
             })
@@ -168,7 +144,7 @@ pub mod tests {
             err => panic!("expected Unauthorized, got {err:?}"),
         }
 
-        let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let logs = capture.contents();
         assert!(
             logs.contains("Failed to parse client certificate"),
             "the parse error must be logged server-side; logs were: {logs}"
@@ -180,8 +156,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_no_certificate() {
         let validator = MtlsValidator::new();
-        let request = Request::builder().body(()).unwrap();
-        let (parts, ()) = request.into_parts();
+        let parts = empty_parts();
         let mut identity = ClientIdentity::new(None);
 
         let result = validator.authenticate(&parts, &mut identity).await;
@@ -195,11 +170,10 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_with_valid_certificate() {
         let validator = MtlsValidator::new();
-        let peer_cert = PeerCertificate(Arc::new(cert_der()));
-
-        let mut request = Request::builder().body(()).unwrap();
-        request.extensions_mut().insert(peer_cert);
-        let (parts, ()) = request.into_parts();
+        let mut parts = empty_parts();
+        parts
+            .extensions
+            .insert(PeerCertificate(Arc::new(cert_der())));
 
         let mut identity = ClientIdentity::new(None);
 
@@ -214,11 +188,10 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_with_minimal_certificate() {
         let validator = MtlsValidator::new();
-        let peer_cert = PeerCertificate(Arc::new(minimal_cert_der()));
-
-        let mut request = Request::builder().body(()).unwrap();
-        request.extensions_mut().insert(peer_cert);
-        let (parts, ()) = request.into_parts();
+        let mut parts = empty_parts();
+        parts
+            .extensions
+            .insert(PeerCertificate(Arc::new(minimal_cert_der())));
 
         let mut identity = ClientIdentity::new(None);
 

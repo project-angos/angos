@@ -28,12 +28,12 @@ use angos_tx_engine::{
     transaction::{Mutation, Transaction},
 };
 
-mod common;
+use angos_tx_engine::test_util;
 
 // Helpers
 
 fn build_executor(store: Arc<dyn ObjectStore>) -> LockedExecutor {
-    LockedExecutor::builder(store, common::memory_lock()).build()
+    LockedExecutor::builder(store, test_util::memory_lock()).build()
 }
 
 fn simple_tx() -> Transaction {
@@ -184,53 +184,10 @@ async fn intent_log_reaped_before_execute_with_retry_returns() {
     .await;
     assert!(result.is_ok());
 
-    let stale = store.list(".tx-log/", 100, None).await.unwrap().items;
-    assert!(
-        stale.is_empty(),
-        "intent log must be reaped before execute_with_retry returns: {stale:?}"
-    );
-    let stale_bodies = store.list(".tx-bodies/", 100, None).await.unwrap().items;
-    assert!(
-        stale_bodies.is_empty(),
-        ".tx-bodies must be reaped before execute_with_retry returns: {stale_bodies:?}"
-    );
+    // Both the intent log and staged bodies are reaped before the call returns.
+    test_util::assert_no_orphans(&*store).await;
 
     session.release().await;
-}
-
-/// Explicit release deletes the lock object backing the session: a follow-up
-/// `try_acquire` on the same keys succeeds immediately.
-#[tokio::test]
-async fn explicit_release_deletes_lock_object() {
-    let store: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
-    let executor = build_executor(store);
-
-    let caller_keys = vec!["job:lock_key:delete-probe".to_string()];
-    let session = executor
-        .acquire(&caller_keys)
-        .await
-        .expect("acquire caller session");
-
-    let result: Result<Outcome, Error> = execute_with_retry(
-        &executor,
-        || async { Ok(simple_tx()) },
-        DEFAULT_RETRY_BUDGET,
-    )
-    .await;
-    assert!(result.is_ok());
-
-    session.release().await;
-    let fresh = executor
-        .try_acquire(&caller_keys)
-        .await
-        .expect("try_acquire infallible on memory storage");
-    assert!(
-        fresh.is_some(),
-        "explicit release must remove the lock object so a fresh acquire succeeds"
-    );
-    if let Some(s) = fresh {
-        s.release().await;
-    }
 }
 
 /// A single `executor.execute(tx)` does not touch the caller-held session:

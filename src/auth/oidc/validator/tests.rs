@@ -24,10 +24,13 @@ use crate::{
     cache,
     command::server::Error,
     identity::OidcClaims,
-    test_fixtures::oidc::{KID, alt_private_key_pem, jwk_x, jwk_y, private_key_pem},
+    test_fixtures::{
+        mocks::{mount_jwks, static_jwks_response},
+        oidc::{KID, alt_private_key_pem, jwk_x, jwk_y, private_key_pem},
+    },
 };
 
-fn build_test_provider_config(uri: &str) -> ProviderConfig {
+pub fn build_test_provider_config(uri: &str) -> ProviderConfig {
     ProviderConfig {
         issuer: uri.to_string(),
         jwks_uri: Some(format!("{uri}/.well-known/jwks")),
@@ -50,21 +53,6 @@ fn verify_jwt(
     verify_jwt_with_header(token, &header, jwks, provider_name, provider)
 }
 
-/// Returns the JWKS JSON body for the `private_key_pem()` fixture.
-fn static_jwks_response() -> serde_json::Value {
-    json!({
-        "keys": [{
-            "kty": "EC",
-            "use": "sig",
-            "kid": KID,
-            "crv": "P-256",
-            "x": jwk_x(),
-            "y": jwk_y(),
-            "alg": "ES256"
-        }]
-    })
-}
-
 #[tokio::test]
 async fn test_fetch_jwks_with_explicit_uri() {
     let mock_server = MockServer::start().await;
@@ -79,19 +67,11 @@ async fn test_fetch_jwks_with_explicit_uri() {
         }]
     });
 
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, jwks_response).await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
-        jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -131,19 +111,12 @@ async fn test_fetch_jwks_with_discovery() {
         .mount(&mock_server)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, jwks_response).await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
         jwks_uri: None,
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -180,12 +153,8 @@ async fn test_fetch_jwks_uses_cache() {
         .await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
-        jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -211,12 +180,8 @@ async fn test_fetch_jwks_http_error() {
         .await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
-        jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -249,12 +214,9 @@ async fn test_fetch_oidc_configuration_success() {
         .await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
         jwks_uri: None,
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -289,12 +251,9 @@ async fn test_fetch_oidc_configuration_uses_cache() {
         .await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
         jwks_uri: None,
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -324,12 +283,9 @@ async fn test_fetch_oidc_configuration_issuer_mismatch() {
         .await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
         jwks_uri: None,
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -364,12 +320,9 @@ async fn test_fetch_oidc_configuration_http_error() {
         .await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
         jwks_uri: None,
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -392,12 +345,8 @@ async fn test_fetch_jwks_network_error_returns_provider_unavailable() {
     drop(listener);
 
     let config = ProviderConfig {
-        issuer: url.clone(),
-        jwks_uri: Some(format!("{url}/.well-known/jwks")),
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&url)
     };
 
     let provider = Provider::new(config);
@@ -420,21 +369,10 @@ async fn test_fetch_jwks_network_error_returns_provider_unavailable() {
 async fn test_validate_oidc_token_success() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, static_jwks_response()).await;
 
-    let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
-    claims.insert("iss".to_string(), json!(mock_server.uri()));
+    let mut claims = valid_claims(&mock_server.uri(), "test-audience");
     claims.insert("sub".to_string(), json!("test-user"));
-    claims.insert("aud".to_string(), json!("test-audience"));
-    claims.insert(
-        "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-    );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
     let token = make_token(&claims, KID);
 
@@ -546,24 +484,12 @@ async fn test_validate_oidc_token_invalid_signature() {
     let mock_server = MockServer::start().await;
 
     // JWKS advertises private_key_pem()'s public key; token is signed with the alt key.
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, static_jwks_response()).await;
 
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(KID.to_string());
 
-    let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
-    claims.insert("iss".to_string(), json!(mock_server.uri()));
-    claims.insert("sub".to_string(), json!("test-user"));
-    claims.insert("aud".to_string(), json!("test-audience"));
-    claims.insert(
-        "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-    );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+    let claims = valid_claims(&mock_server.uri(), "test-audience");
 
     let alt_key =
         EncodingKey::from_ec_pem(alt_private_key_pem().as_bytes()).expect("alt key must parse");
@@ -588,24 +514,12 @@ async fn test_validate_oidc_token_invalid_signature() {
 #[tokio::test]
 async fn test_validate_oidc_token_rejects_disallowed_algorithm_before_jwks_fetch() {
     let mock_server = MockServer::start().await;
-    let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
-    claims.insert("iss".to_string(), json!(mock_server.uri()));
-    claims.insert("sub".to_string(), json!("test-user"));
-    claims.insert("aud".to_string(), json!("test-audience"));
-    claims.insert(
-        "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-    );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+    let claims = valid_claims(&mock_server.uri(), "test-audience");
 
     let token = make_token(&claims, KID);
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
-        jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
-        jwks_refresh_interval: 3600,
-        required_audience: Some("test-audience".to_string()),
-        clock_skew_tolerance: 60,
         allowed_algorithms: vec![Algorithm::RS256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -625,16 +539,9 @@ async fn test_validate_oidc_token_rejects_disallowed_algorithm_before_jwks_fetch
 async fn test_validate_oidc_token_expired() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, static_jwks_response()).await;
 
-    let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
-    claims.insert("iss".to_string(), json!(mock_server.uri()));
-    claims.insert("sub".to_string(), json!("test-user"));
-    claims.insert("aud".to_string(), json!("test-audience"));
+    let mut claims = valid_claims(&mock_server.uri(), "test-audience");
     claims.insert(
         "exp".to_string(),
         json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp()),
@@ -666,21 +573,9 @@ async fn test_validate_oidc_token_expired() {
 async fn test_validate_oidc_token_wrong_issuer() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, static_jwks_response()).await;
 
-    let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
-    claims.insert("iss".to_string(), json!("https://wrong-issuer.com"));
-    claims.insert("sub".to_string(), json!("test-user"));
-    claims.insert("aud".to_string(), json!("test-audience"));
-    claims.insert(
-        "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-    );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+    let claims = valid_claims("https://wrong-issuer.com", "test-audience");
 
     let token = make_token(&claims, KID);
 
@@ -698,21 +593,9 @@ async fn test_validate_oidc_token_wrong_issuer() {
 async fn test_validate_oidc_token_wrong_audience() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, static_jwks_response()).await;
 
-    let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
-    claims.insert("iss".to_string(), json!(mock_server.uri()));
-    claims.insert("sub".to_string(), json!("test-user"));
-    claims.insert("aud".to_string(), json!("wrong-audience"));
-    claims.insert(
-        "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-    );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+    let claims = valid_claims(&mock_server.uri(), "wrong-audience");
 
     let token = make_token(&claims, KID);
 
@@ -730,36 +613,15 @@ async fn test_validate_oidc_token_wrong_audience() {
 async fn test_validate_oidc_token_missing_kid() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, static_jwks_response()).await;
 
     // No kid in header, so the validator must reject because JWKS keys require kid matching.
-    let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
-    claims.insert("iss".to_string(), json!(mock_server.uri()));
-    claims.insert("sub".to_string(), json!("test-user"));
-    claims.insert("aud".to_string(), json!("test-audience"));
-    claims.insert(
-        "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-    );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+    let claims = valid_claims(&mock_server.uri(), "test-audience");
 
     let header = Header::new(Algorithm::ES256);
     let token = encode(&header, &claims, &encoding_key()).unwrap();
 
-    let config = ProviderConfig {
-        issuer: mock_server.uri(),
-        jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
-        jwks_refresh_interval: 3600,
-        required_audience: Some("test-audience".to_string()),
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
-    };
-
-    let provider = Provider::new(config);
+    let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
     let client = Client::new();
     let cache = cache::Config::Memory.to_backend().unwrap();
 
@@ -779,30 +641,16 @@ async fn test_validate_oidc_token_missing_kid() {
 async fn test_validate_oidc_token_no_audience_validation() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, static_jwks_response()).await;
 
-    let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
-    claims.insert("iss".to_string(), json!(mock_server.uri()));
-    claims.insert("sub".to_string(), json!("test-user"));
-    claims.insert(
-        "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-    );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+    let mut claims = valid_claims(&mock_server.uri(), "unused");
+    claims.remove("aud");
 
     let token = make_token(&claims, KID);
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
-        jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -820,19 +668,11 @@ async fn test_validate_oidc_token_invalid_jwt_format() {
     let mock_server = MockServer::start().await;
 
     let jwks_response = json!({ "keys": [] });
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
-        .mount(&mock_server)
-        .await;
+    mount_jwks(&mock_server, jwks_response).await;
 
     let config = ProviderConfig {
-        issuer: mock_server.uri(),
-        jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
-        jwks_refresh_interval: 3600,
         required_audience: None,
-        clock_skew_tolerance: 60,
-        allowed_algorithms: vec![Algorithm::ES256],
+        ..build_test_provider_config(&mock_server.uri())
     };
 
     let provider = Provider::new(config);
@@ -879,7 +719,7 @@ pub fn make_token(claims: &HashMap<String, serde_json::Value>, kid: &str) -> Str
     encode(&header, claims, &encoding_key()).expect("token encoding must succeed")
 }
 
-fn valid_claims(issuer: &str, audience: &str) -> HashMap<String, serde_json::Value> {
+pub fn valid_claims(issuer: &str, audience: &str) -> HashMap<String, serde_json::Value> {
     let mut claims = HashMap::new();
     claims.insert("iss".to_string(), json!(issuer));
     claims.insert("sub".to_string(), json!("unit-test-subject"));

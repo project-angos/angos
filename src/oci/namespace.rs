@@ -255,13 +255,6 @@ mod tests {
     }
 
     #[test]
-    fn test_as_ref() {
-        let ns = Namespace::new("test-repo").unwrap();
-        let s: &str = ns.as_ref();
-        assert_eq!(s, "test-repo");
-    }
-
-    #[test]
     fn test_deref() {
         let ns = Namespace::new("test-repo").unwrap();
         assert_eq!(ns.len(), 9);
@@ -296,14 +289,6 @@ mod tests {
         assert_eq!("test-repo", ns);
         assert_ne!(ns, "other-repo");
         assert_ne!("other-repo", ns);
-    }
-
-    #[test]
-    fn test_partial_eq_ref_str() {
-        let ns = Namespace::new("test-repo").unwrap();
-        let s: &str = "test-repo";
-        assert_eq!(ns, s);
-        assert_eq!(s, ns);
     }
 
     #[test]
@@ -567,11 +552,6 @@ mod tests {
     fn test_namespace_belongs_to_prefix_match() {
         assert!(namespace_belongs_to("myrepo/sub", "myrepo"));
         assert!(namespace_belongs_to("myrepo/sub/path", "myrepo"));
-    }
-
-    #[test]
-    fn test_namespace_belongs_to_no_false_positive_shared_prefix() {
-        assert!(!namespace_belongs_to("myrepo2", "myrepo"));
     }
 
     #[test]

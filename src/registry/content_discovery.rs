@@ -159,13 +159,13 @@ mod tests {
         oci::{MediaType, Namespace, Reference, Tag},
         registry::{
             metadata_store::{LinkKind, LinkOperation},
-            test_utils::{backends, create_test_blob, put_blob_direct},
+            test_utils::{create_test_blob, for_each_backend, put_blob_direct},
         },
     };
 
     #[tokio::test]
     async fn test_list_catalog_entries() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
 
             let (namespaces, token) = registry.list_catalog_entries(None, None).await.unwrap();
@@ -182,13 +182,13 @@ mod tests {
                 .unwrap();
             assert!(namespaces.is_empty());
             assert!(token.is_none());
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_list_tag_entries() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
 
@@ -267,8 +267,8 @@ mod tests {
                 .unwrap();
             assert_eq!(tags.len(), 2);
             assert!(token.is_none());
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     // list_catalog_entries pagination: write N namespaces then page through them
@@ -358,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_referrers_with_manifest() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
 
@@ -414,7 +414,7 @@ mod tests {
 
             assert_eq!(referrers.len(), 1);
             assert_eq!(referrers[0].digest, referrer_manifest_digest);
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

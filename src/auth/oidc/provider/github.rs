@@ -79,11 +79,22 @@ impl OidcProvider for Provider {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use hyper::StatusCode;
 
     use super::*;
     use crate::command::server::Error;
+
+    pub fn default_github_config() -> ProviderConfig {
+        ProviderConfig {
+            issuer: default_github_issuer(),
+            jwks_uri: default_github_jwks_uri(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
+            required_audience: None,
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
+        }
+    }
 
     #[test]
     fn test_config_deserialize_minimal() {
@@ -176,16 +187,7 @@ mod tests {
 
     #[test]
     fn test_validate_provider_claims_success() {
-        let config = ProviderConfig {
-            issuer: default_github_issuer(),
-            jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
-            required_audience: None,
-            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
+        let provider = Provider::new(default_github_config());
 
         let mut claims = HashMap::new();
         claims.insert("repository".to_string(), serde_json::json!("org/repo"));
@@ -197,16 +199,7 @@ mod tests {
 
     #[test]
     fn test_validate_provider_claims_missing_repository() {
-        let config = ProviderConfig {
-            issuer: default_github_issuer(),
-            jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
-            required_audience: None,
-            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
+        let provider = Provider::new(default_github_config());
 
         let mut claims = HashMap::new();
         claims.insert("actor".to_string(), serde_json::json!("user"));
@@ -225,16 +218,7 @@ mod tests {
 
     #[test]
     fn test_validate_provider_claims_missing_actor() {
-        let config = ProviderConfig {
-            issuer: default_github_issuer(),
-            jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
-            required_audience: None,
-            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
+        let provider = Provider::new(default_github_config());
 
         let mut claims = HashMap::new();
         claims.insert("repository".to_string(), serde_json::json!("org/repo"));
@@ -253,16 +237,7 @@ mod tests {
 
     #[test]
     fn test_validate_provider_claims_empty() {
-        let config = ProviderConfig {
-            issuer: default_github_issuer(),
-            jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
-            required_audience: None,
-            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
+        let provider = Provider::new(default_github_config());
         let claims = HashMap::new();
         let result = provider.validate_provider_claims(&claims);
         assert!(matches!(&result, Err(Error::Unauthorized(_))));

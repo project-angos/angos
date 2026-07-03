@@ -1,13 +1,11 @@
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{header, method},
 };
 
-use super::common::{
-    TEST_SHUTDOWN_TIMEOUT, build_dispatcher, create_test_event, create_test_webhook_config,
-};
+use super::common::{TEST_SHUTDOWN_TIMEOUT, create_test_event, single_hook_dispatcher};
 use crate::event_webhook::config::DeliveryPolicy;
 
 #[tokio::test]
@@ -25,13 +23,8 @@ async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "async-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
-    );
-
-    let dispatcher = build_dispatcher(webhooks);
+    let dispatcher =
+        single_hook_dispatcher("async-hook", &server.uri(), DeliveryPolicy::Async, None, 0);
 
     let start = std::time::Instant::now();
     let result = dispatcher.dispatch(&event).await;
@@ -60,13 +53,8 @@ async fn dispatch_async_policy_eventually_delivers() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "async-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
-    );
-
-    let dispatcher = build_dispatcher(webhooks);
+    let dispatcher =
+        single_hook_dispatcher("async-hook", &server.uri(), DeliveryPolicy::Async, None, 0);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 

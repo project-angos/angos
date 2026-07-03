@@ -146,7 +146,6 @@ mod tests {
     #[test]
     fn test_128_chars_accepted() {
         let tag = "a".repeat(128);
-        assert_eq!(tag.len(), 128);
         assert!(Tag::new(&tag).is_ok());
     }
 
@@ -154,7 +153,6 @@ mod tests {
     #[test]
     fn test_129_chars_rejected() {
         let tag = "a".repeat(129);
-        assert_eq!(tag.len(), 129);
         assert!(Tag::new(&tag).is_err());
     }
 

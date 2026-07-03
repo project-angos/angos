@@ -448,7 +448,9 @@ mod tests {
             blob_store::BlobStore,
             metadata_store::LinkOperation,
             repository_resolver::RepositoryResolver,
-            test_utils::{self, backends, put_blob_direct},
+            test_utils::{
+                self, FSRegistryTestCase, RegistryTestCase, for_each_backend, put_blob_direct,
+            },
         },
     };
 
@@ -618,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enforce_retention_with_policy() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -661,13 +663,13 @@ mod tests {
                 .await;
 
             assert!(tag_link.is_ok());
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_enforce_retention_no_policy() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -700,13 +702,13 @@ mod tests {
                 .await;
 
             assert!(tag_link.is_ok());
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_orphan_manifest_deleted_with_policy() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
@@ -746,13 +748,13 @@ mod tests {
                     .await
                     .is_err()
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_orphan_manifest_kept_without_policy() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
@@ -785,13 +787,13 @@ mod tests {
                     .await
                     .is_ok()
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_index_child_manifest_protected() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
@@ -842,13 +844,13 @@ mod tests {
                     .await
                     .is_err()
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_delete_tag_action_emitted_without_storage_mutation() {
-        let test_case = backends().into_iter().next().unwrap();
+        let test_case = FSRegistryTestCase::new();
         let namespace = &Namespace::new("test-repo/app").unwrap();
         let registry = test_case.registry();
         let metadata_store = test_case.metadata_store();
@@ -900,7 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn retention_checker_continues_after_missing_blob_in_one_revision() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
@@ -957,8 +959,8 @@ mod tests {
                     .is_err(),
                 "healthy revision after the broken one must still be processed"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     fn make_manifest(tag: &Tag) -> ManifestImage {

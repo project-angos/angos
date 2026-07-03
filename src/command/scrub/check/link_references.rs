@@ -153,7 +153,9 @@ mod tests {
         registry::{
             Registry,
             metadata_store::{LinkKind, LinkOperation},
-            test_utils::{self, FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct},
+            test_utils::{
+                self, FSRegistryTestCase, RegistryTestCase, for_each_backend, put_blob_direct,
+            },
         },
     };
 
@@ -221,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_link_references_checker_fixes_missing_references() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -268,13 +270,13 @@ mod tests {
                 layer_link_after.referenced_by.contains(&manifest_digest),
                 "Layer link should have manifest digest in referenced_by after check"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_dry_run_makes_no_writes() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/dry-run").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -311,13 +313,13 @@ mod tests {
                 layer_link.referenced_by.is_empty(),
                 "Vec sink must not write: layer referenced_by should remain empty"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_reference_not_found_is_skipped() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/not-found").unwrap();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -371,13 +373,13 @@ mod tests {
                 matches!(config_result, Err(metadata_store::Error::ReferenceNotFound)),
                 "Config link should still not exist after check"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn link_references_checker_emits_delete_orphan_manifest_when_blob_missing() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/missing-blob").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -405,13 +407,13 @@ mod tests {
                     .is_err(),
                 "revision link must be removed when its manifest blob is missing"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn link_references_checker_dry_run_captures_delete_orphan_manifest() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/missing-blob-dry").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -446,8 +448,8 @@ mod tests {
                     .is_ok(),
                 "revision link must not be touched under Vec sink"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -487,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn link_references_checker_prunes_phantom_referrer_from_layer() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/prune-phantom").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -544,13 +546,13 @@ mod tests {
                 after.referenced_by.contains(&manifest_digest),
                 "real referrer must be retained after check"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn link_references_checker_keeps_existing_valid_referrers() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/keep-valid").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -611,13 +613,13 @@ mod tests {
                 after.referenced_by.contains(&manifest_b),
                 "referrer B must be retained"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn link_references_checker_dry_run_captures_remove_referrer() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/dry-remove").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -669,7 +671,7 @@ mod tests {
                 unchanged.referenced_by.contains(&phantom),
                 "on-disk referenced_by must be unchanged under Vec sink"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

@@ -74,8 +74,6 @@ pub struct ChildrenPage {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use crate::types::Etag;
 
     #[test]
@@ -94,14 +92,5 @@ mod tests {
         assert_eq!(json, "\"etag-value\"");
         let round_trip: Etag = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_trip, etag);
-    }
-
-    #[test]
-    fn etag_works_as_hashmap_key() {
-        let mut map: HashMap<Etag, u32> = HashMap::new();
-        map.insert(Etag::new("a"), 1);
-        map.insert(Etag::new("b"), 2);
-        assert_eq!(map.get(&Etag::new("a")), Some(&1));
-        assert_eq!(map.get(&Etag::new("c")), None);
     }
 }

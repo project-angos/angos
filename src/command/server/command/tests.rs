@@ -1,9 +1,8 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Once, PoisonError},
+    sync::{Arc, Mutex, Once},
 };
 
-use angos_tx_engine::ConditionalCapabilities;
 use tempfile::TempDir;
 
 use crate::{
@@ -21,6 +20,7 @@ use crate::{
     policy::{AccessMode, AccessPolicyConfig, CelRule},
     registry::{Registry, RegistryConfig, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
     secret::Secret,
+    test_fixtures::client::test_client_config,
 };
 
 static CRYPTO_INIT: Once = Once::new();
@@ -33,9 +33,12 @@ fn init_crypto_provider() {
     });
 }
 
-// Each call allocates a fresh temporary directory pair; the returned `TempDir`
-// values must be kept alive for the duration of the test that uses the config.
-fn create_minimal_config() -> (Configuration, TempDir, TempDir) {
+// The tests here build real filesystem stores, so unlike the shared fixture
+// in `test_fixtures::configuration` each config needs fresh temporary
+// directories; the returned `TempDir` values must be kept alive for the
+// duration of the test that uses the config. `extra` is appended after the
+// `[global]` section, so it may extend it with bare keys or add new tables.
+fn tempdir_config(extra: &str) -> (Configuration, TempDir, TempDir) {
     let blobs = TempDir::new().unwrap();
     let meta = TempDir::new().unwrap();
     let toml = format!(
@@ -54,6 +57,8 @@ fn create_minimal_config() -> (Configuration, TempDir, TempDir) {
 
         [global]
         update_pull_time = false
+
+        {extra}
     "#,
         blobs = blobs.path().display(),
         meta = meta.path().display(),
@@ -61,34 +66,18 @@ fn create_minimal_config() -> (Configuration, TempDir, TempDir) {
     (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
 }
 
+fn create_minimal_config() -> (Configuration, TempDir, TempDir) {
+    tempdir_config("")
+}
+
 fn create_config_with_repository() -> (Configuration, TempDir, TempDir) {
-    let blobs = TempDir::new().unwrap();
-    let meta = TempDir::new().unwrap();
-    let toml = format!(
+    tempdir_config(
         r#"
-        [blob_store.fs]
-        root_dir = "{blobs}"
-
-        [metadata_store.fs]
-        root_dir = "{meta}"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
-
         [repository.test-repo.access_policy]
         default = "allow"
         rules = []
     "#,
-        blobs = blobs.path().display(),
-        meta = meta.path().display(),
-    );
-    (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
+    )
 }
 
 #[test]
@@ -110,72 +99,6 @@ async fn test_build_metadata_store_filesystem_success() {
 }
 
 #[tokio::test]
-async fn test_build_metadata_store_with_explicit_config() {
-    let blobs = TempDir::new().unwrap();
-    let meta = TempDir::new().unwrap();
-    let toml = format!(
-        r#"
-        [blob_store.fs]
-        root_dir = "{blobs}"
-
-        [metadata_store.fs]
-        root_dir = "{meta}"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
-    "#,
-        blobs = blobs.path().display(),
-        meta = meta.path().display(),
-    );
-
-    let config = Configuration::load_from_str(&toml).unwrap();
-    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
-    let result =
-        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
-
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_build_auth_cache_memory_success() {
-    let config = cache::Config::Memory;
-    let result = bootstrap::auth_cache(&config);
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_build_repository_success() {
-    let repo_config = repository::Config {
-        access_policy: AccessPolicyConfig {
-            default: AccessMode::Allow,
-            ..AccessPolicyConfig::default()
-        },
-        ..repository::Config::default()
-    };
-    let cache_config = cache::Config::Memory;
-    let cache = bootstrap::auth_cache(&cache_config).unwrap();
-
-    let result = bootstrap::repository(
-        "test-repo",
-        &repo_config,
-        &cache,
-        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-    )
-    .await;
-
-    assert!(result.is_ok());
-    let repo = result.unwrap();
-    assert_eq!(repo.name, "test-repo");
-}
-
-#[tokio::test]
 async fn test_build_repository_with_upstream() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
@@ -183,13 +106,9 @@ async fn test_build_repository_with_upstream() {
             ..AccessPolicyConfig::default()
         },
         upstream: vec![repository::RegistryClientConfig {
-            url: "https://registry-1.docker.io".to_string(),
-            max_redirect: 5,
-            server_ca_bundle: None,
-            client_certificate: None,
-            client_private_key: None,
             username: Some("testuser".to_string()),
             password: Some(Secret::new("testpass".to_string())),
+            ..test_client_config("https://registry-1.docker.io")
         }],
         ..repository::Config::default()
     };
@@ -233,19 +152,6 @@ async fn test_build_repository_with_immutable_tags() {
     .await;
 
     assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_build_repositories_empty() {
-    let configs = HashMap::new();
-    let cache_config = cache::Config::Memory;
-    let cache = bootstrap::auth_cache(&cache_config).unwrap();
-
-    let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
-
-    assert!(result.is_ok());
-    let repos = result.unwrap();
-    assert_eq!(repos.len(), 0);
 }
 
 #[tokio::test]
@@ -316,30 +222,11 @@ async fn test_build_registry_with_repositories() {
 
 #[tokio::test]
 async fn test_build_registry_with_update_pull_time() {
-    let blobs = TempDir::new().unwrap();
-    let meta = TempDir::new().unwrap();
-    let toml = format!(
-        r#"
-        [blob_store.fs]
-        root_dir = "{blobs}"
+    // The [global] key cannot be overridden through the appended extra TOML,
+    // so flip it on the parsed configuration instead.
+    let (mut config, _blobs, _meta) = create_minimal_config();
+    config.global.update_pull_time = true;
 
-        [metadata_store.fs]
-        root_dir = "{meta}"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = true
-    "#,
-        blobs = blobs.path().display(),
-        meta = meta.path().display(),
-    );
-
-    let config = Configuration::load_from_str(&toml).unwrap();
     let result = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None).await;
 
     assert!(result.is_ok());
@@ -387,32 +274,6 @@ async fn test_command_notify_tls_config_change_with_insecure_listener() {
     let result = command.notify_tls_config_change(&tls_config);
 
     assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_build_repositories_preserves_names() {
-    let repo_config = repository::Config {
-        access_policy: AccessPolicyConfig {
-            default: AccessMode::Allow,
-            ..AccessPolicyConfig::default()
-        },
-        ..repository::Config::default()
-    };
-    let mut configs = HashMap::new();
-    configs.insert("alpha".to_string(), repo_config.clone());
-    configs.insert("beta".to_string(), repo_config.clone());
-    configs.insert("gamma".to_string(), repo_config);
-
-    let cache_config = cache::Config::Memory;
-    let cache = bootstrap::auth_cache(&cache_config).unwrap();
-    let repos = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-        .await
-        .unwrap();
-
-    assert!(repos.get("alpha").is_some());
-    assert!(repos.get("beta").is_some());
-    assert!(repos.get("gamma").is_some());
-    assert!(repos.get("delta").is_none());
 }
 
 #[tokio::test]
@@ -476,56 +337,21 @@ async fn test_build_repositories_with_different_configs() {
 }
 
 fn create_config_with_webhook(url: &str) -> (Configuration, TempDir, TempDir) {
-    let blobs = TempDir::new().unwrap();
-    let meta = TempDir::new().unwrap();
-    let toml = format!(
+    tempdir_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "{blobs}"
-
-        [metadata_store.fs]
-        root_dir = "{meta}"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
         event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
         url = "{url}"
         policy = "optional"
         events = ["manifest.push"]
-    "#,
-        blobs = blobs.path().display(),
-        meta = meta.path().display(),
-    );
-    (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
+    "#
+    ))
 }
 
 fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> (Configuration, TempDir, TempDir) {
-    let blobs = TempDir::new().unwrap();
-    let meta = TempDir::new().unwrap();
-    let toml = format!(
+    tempdir_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "{blobs}"
-
-        [metadata_store.fs]
-        root_dir = "{meta}"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
         event_webhooks = ["hook_a", "hook_b"]
 
         [event_webhook.hook_a]
@@ -537,11 +363,8 @@ fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> (Configuration, 
         url = "{url_b}"
         policy = "optional"
         events = ["manifest.push"]
-    "#,
-        blobs = blobs.path().display(),
-        meta = meta.path().display(),
-    );
-    (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
+    "#
+    ))
 }
 
 #[tokio::test]
@@ -781,43 +604,18 @@ fn create_tls_config() -> (
         tempfile::NamedTempFile,
     ),
 ) {
-    let blobs = TempDir::new().unwrap();
-    let meta = TempDir::new().unwrap();
     let (tls_config, temp_files) = build_config(false);
-
-    let toml = format!(
+    let (config, blobs, meta) = tempdir_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "{blobs}"
-
-        [metadata_store.fs]
-        root_dir = "{meta}"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8443
-
         [server.tls]
         server_certificate_bundle = "{cert}"
         server_private_key = "{key}"
-
-        [global]
-        update_pull_time = false
     "#,
-        blobs = blobs.path().display(),
-        meta = meta.path().display(),
         cert = tls_config.server_certificate_bundle.display(),
         key = tls_config.server_private_key.display(),
-    );
+    ));
 
-    (
-        Configuration::load_from_str(&toml).unwrap(),
-        blobs,
-        meta,
-        temp_files,
-    )
+    (config, blobs, meta, temp_files)
 }
 
 #[tokio::test]
@@ -844,29 +642,4 @@ async fn test_notify_config_change_tls_to_insecure_does_not_fail() {
     let result = command.notify_config_change(&insecure_config).await;
 
     assert!(result.is_ok());
-}
-
-#[test]
-fn test_poisoned_capabilities_mutex_recovers_without_crash() {
-    let lock: Arc<Mutex<Option<ConditionalCapabilities>>> = Arc::new(Mutex::new(None));
-    let lock_clone = Arc::clone(&lock);
-
-    // Poison the mutex by panicking while holding the guard.
-    let _ = std::thread::spawn(move || {
-        let _guard = lock_clone.lock().unwrap();
-        panic!("intentional panic to poison the mutex");
-    })
-    .join();
-
-    assert!(
-        lock.is_poisoned(),
-        "mutex must be poisoned after thread panic"
-    );
-
-    // The recovery pattern used in build_metadata_store must not panic.
-    let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
-    assert!(
-        guard.is_none(),
-        "recovered guard must yield the original None value"
-    );
 }

@@ -121,6 +121,7 @@ name = "angos-storage"
 version = "0.1.0"
 dependencies = [
  "angos-s3-client",
+ "angos-storage",
  "async-trait",
  "bytes",
  "bytesize",
@@ -142,6 +143,7 @@ version = "0.1.0"
 dependencies = [
  "angos-backoff",
  "angos-storage",
+ "angos-tx-engine",
  "async-trait",
  "bytes",
  "chrono",

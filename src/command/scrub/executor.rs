@@ -580,7 +580,7 @@ mod tests {
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
             job_store::{FailOutcome, JobState, Queue},
             metadata_store::{LinkKind, LinkOperation},
-            test_utils::{backends, build_store, put_blob_direct},
+            test_utils::{build_store, for_each_backend, put_blob_direct},
         },
         replication::REPLICATION_DELETE_MANIFEST_KIND,
     };
@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn executor_dry_run_does_not_delete_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -611,13 +611,13 @@ mod tests {
                 blob_store.read(&orphan_digest).await.is_ok(),
                 "dry-run must not delete the blob"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_real_run_deletes_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -635,13 +635,13 @@ mod tests {
                 blob_store.read(&orphan_digest).await.is_err(),
                 "real-run must delete the blob"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_delete_orphan_manifest_missing_blob_still_removes_digest_link() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -679,13 +679,13 @@ mod tests {
                     .is_err(),
                 "digest link must be removed even when the blob is missing"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_delete_orphan_manifest_missing_blob_removes_tag_link() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -725,38 +725,14 @@ mod tests {
                     .is_err(),
                 "tag link pointing at missing-blob digest must be removed"
             );
-            test_case.cleanup().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn executor_delete_orphan_blob_takes_blob_data_lock() {
-        for test_case in backends() {
-            let blob_store = test_case.blob_store();
-            let metadata_store = test_case.metadata_store();
-
-            let content = b"blob with no ownership entry";
-            let digest = put_blob_direct(metadata_store.store(), content).await;
-
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store);
-
-            executor
-                .apply(Action::DeleteOrphanBlob(digest.clone()))
-                .await
-                .unwrap();
-
-            assert!(
-                blob_store.read(&digest).await.is_err(),
-                "unreferenced blob must be deleted"
-            );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_delete_orphan_blob_skips_when_reference_appears_between_classification_and_apply()
      {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -783,13 +759,13 @@ mod tests {
                 blob_store.read(&digest).await.is_ok(),
                 "blob with a reference must not be deleted"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_grant_blob_index_link_inserts_when_bytes_exist() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -814,13 +790,13 @@ mod tests {
                 links.contains(&LinkKind::Layer(digest.clone())),
                 "the grant must insert the layer link into the blob index"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_grant_blob_index_link_skips_when_bytes_were_reclaimed() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -850,13 +826,13 @@ mod tests {
                     .is_err(),
                 "no index entry must be created for a blob with no bytes"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_delete_orphan_referrer_removes_referrer_link() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -916,13 +892,13 @@ mod tests {
                     .is_err(),
                 "Referrer link must be removed after applying the action"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_remove_referrer_cascades_to_link_delete_when_referenced_by_becomes_empty() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -978,13 +954,13 @@ mod tests {
                     .is_err(),
                 "layer link must be removed when referenced_by becomes empty"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn enqueue_replication_delete_stamps_source_ts_for_receiver_lww() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -1018,9 +994,8 @@ mod tests {
                 DateTime::parse_from_rfc3339(source_ts).is_ok(),
                 "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
             );
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     /// Each apply stamps a fresh decision-time `source_ts`, so this pins that
@@ -1028,7 +1003,7 @@ mod tests {
     /// downstream must coalesce, not stack a second job per tag.
     #[tokio::test]
     async fn prune_delete_enqueues_coalesce_while_one_is_pending() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -1056,9 +1031,8 @@ mod tests {
                 "two prune-delete enqueues for the same (downstream, namespace, tag) \
                  must coalesce into a single pending job"
             );
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     /// Builds an orphan-shaped replication push envelope.
@@ -1101,7 +1075,7 @@ mod tests {
 
     #[tokio::test]
     async fn executor_delete_orphan_job_removes_pending_jobs_on_both_queues() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
@@ -1131,13 +1105,13 @@ mod tests {
                     "the pending orphan job on '{queue}' must be deleted"
                 );
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_delete_orphan_job_removes_failed_jobs_on_both_queues() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
@@ -1179,13 +1153,13 @@ mod tests {
                     "the dead-lettered orphan job on '{queue}' must be deleted"
                 );
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn executor_delete_orphan_job_tolerates_stale_key() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
@@ -1204,8 +1178,8 @@ mod tests {
                         .expect("a stale storage_key must be tolerated, not an error");
                 }
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -11,58 +11,40 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{Duration, Utc};
+use uuid::Uuid;
 
 use angos_storage::{
-    ByteStream, ChildrenPage, ConditionalStore, Error as StorageError, Etag, MemoryObjectStore,
-    MultipartUploadPage, ObjectMeta, ObjectStore, Page,
+    ConditionalStore, Error as StorageError, MemoryObjectStore, ObjectStore,
+    test_util::{HookedStore, StoreHook, StoreOp},
 };
 
 use angos_tx_engine::{
     executor::TransactionExecutor,
-    intent::{MutationProgress, MutationRecord},
-    recovery::RecoveryLoop,
+    intent::{IntentRecord, MutationProgress, MutationRecord},
     transaction::{Mutation, Transaction},
 };
 
-mod common;
+use angos_tx_engine::test_util;
 
-// CrashingStore: wraps MemoryObjectStore and fails on a specific write call number
-
-/// A store that delegates all reads to the inner store but injects a failure
-/// on the N-th write (`put`, `delete`, `delete_prefix`, `copy`).
-///
-/// When `permanent` is set, every write at or after `crash_on` fails. This is
-/// useful for simulating a process death that prevents subsequent reap steps
-/// from running, leaving the intent log in place for inspection.
-#[derive(Debug, Clone)]
-struct CrashingStore {
-    inner: Arc<MemoryObjectStore>,
-    write_count: Arc<AtomicUsize>,
+/// Fails the N-th write-class call (`put`, `delete`, `delete_prefix`,
+/// `copy`, and the conditional writes), simulating a process crash at that
+/// point in the lifecycle. When `permanent` is set, every write at or after
+/// `crash_on` fails, modelling a death that also prevents later reap steps.
+struct CrashPlan {
+    write_count: AtomicUsize,
     crash_on: usize,
     permanent: bool,
 }
 
-impl CrashingStore {
-    fn new(inner: Arc<MemoryObjectStore>, crash_on: usize) -> Self {
-        Self {
-            inner,
-            write_count: Arc::new(AtomicUsize::new(0)),
-            crash_on,
-            permanent: false,
+#[async_trait]
+impl StoreHook for CrashPlan {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        if !op.is_write() {
+            return Ok(());
         }
-    }
-
-    fn new_permanent_from(inner: Arc<MemoryObjectStore>, crash_on: usize) -> Self {
-        Self {
-            inner,
-            write_count: Arc::new(AtomicUsize::new(0)),
-            crash_on,
-            permanent: true,
-        }
-    }
-
-    fn check_crash(&self) -> Result<(), StorageError> {
         let n = self.write_count.fetch_add(1, Ordering::Relaxed);
         let hit = if self.permanent {
             n >= self.crash_on
@@ -77,147 +59,33 @@ impl CrashingStore {
     }
 }
 
-#[async_trait::async_trait]
-impl ObjectStore for CrashingStore {
-    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        self.inner.get(key).await
-    }
+type CrashingStore = HookedStore<Arc<dyn ConditionalStore>, CrashPlan>;
 
-    async fn get_stream(
-        &self,
-        key: &str,
-        offset: Option<u64>,
-    ) -> Result<(angos_storage::BoxedReader, u64), StorageError> {
-        self.inner.get_stream(key, offset).await
-    }
-
-    async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
-        self.check_crash()?;
-        self.inner.put(key, data).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        self.check_crash()?;
-        self.inner.delete(key).await
-    }
-
-    async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
-        self.check_crash()?;
-        self.inner.delete_prefix(prefix).await
-    }
-
-    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-        self.inner.head(key).await
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-    ) -> Result<Page<String>, StorageError> {
-        self.inner.list(prefix, n, token).await
-    }
-
-    async fn list_children(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-        start_after: Option<String>,
-    ) -> Result<ChildrenPage, StorageError> {
-        self.inner
-            .list_children(prefix, n, token, start_after)
-            .await
-    }
-
-    async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
-        self.check_crash()?;
-        self.inner.copy(source, destination).await
-    }
-
-    async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.create_upload(key).await
-    }
-
-    async fn write_upload(
-        &self,
-        key: &str,
-        body: ByteStream,
-        len: Option<u64>,
-    ) -> Result<u64, StorageError> {
-        self.inner.write_upload(key, body, len).await
-    }
-
-    async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.complete_upload(key).await
-    }
-
-    async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.inner.abort_upload(key).await
-    }
-
-    async fn list_multipart_uploads(
-        &self,
-        key_marker: Option<&str>,
-        upload_id_marker: Option<&str>,
-    ) -> Result<MultipartUploadPage, StorageError> {
-        self.inner
-            .list_multipart_uploads(key_marker, upload_id_marker)
-            .await
-    }
+/// Store that fails exactly the `crash_on`-th write.
+fn crashing_store(inner: Arc<MemoryObjectStore>, crash_on: usize) -> Arc<CrashingStore> {
+    Arc::new(HookedStore::new(
+        inner,
+        CrashPlan {
+            write_count: AtomicUsize::new(0),
+            crash_on,
+            permanent: false,
+        },
+    ))
 }
 
-#[async_trait::async_trait]
-impl ConditionalStore for CrashingStore {
-    async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), StorageError> {
-        self.inner.get_with_etag(key).await
-    }
-
-    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<Option<Etag>, StorageError> {
-        self.check_crash()?;
-        self.inner.put_if_absent(key, data).await
-    }
-
-    async fn put_if_match(
-        &self,
-        key: &str,
-        etag: &Etag,
-        data: Bytes,
-    ) -> Result<Option<Etag>, StorageError> {
-        self.check_crash()?;
-        self.inner.put_if_match(key, etag, data).await
-    }
-
-    async fn delete_if_match(&self, key: &str, etag: &Etag) -> Result<(), StorageError> {
-        self.check_crash()?;
-        self.inner.delete_if_match(key, etag).await
-    }
+/// Store that fails every write at and after the `crash_on`-th.
+fn crashing_store_permanent(inner: Arc<MemoryObjectStore>, crash_on: usize) -> Arc<CrashingStore> {
+    Arc::new(HookedStore::new(
+        inner,
+        CrashPlan {
+            write_count: AtomicUsize::new(0),
+            crash_on,
+            permanent: true,
+        },
+    ))
 }
 
 // Helpers
-
-async fn assert_no_prefix_inner(store: &MemoryObjectStore, prefix: &str) {
-    let items = store.list(prefix, 1000, None).await.unwrap().items;
-    assert!(
-        items.is_empty(),
-        "Orphan keys found under {prefix}: {items:?}"
-    );
-}
-
-/// Run the recovery loop's sweep once against the inner store.
-///
-/// Wires a fresh in-process `Lock` so the recovery path under test exercises
-/// the same ownership-takeover code path production uses; the lock is
-/// uncontended in these single-process scenarios.
-async fn run_recovery(inner: Arc<MemoryObjectStore>) {
-    let lock = common::memory_lock();
-    let recovery = RecoveryLoop::builder(inner as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .interval(std::time::Duration::from_hours(1))
-        .build();
-    recovery.sweep().await;
-}
 
 /// Backdate every intent under `.tx-log/` so the recovery loop treats it as stale.
 async fn backdate_intents(inner: &MemoryObjectStore) {
@@ -225,10 +93,9 @@ async fn backdate_intents(inner: &MemoryObjectStore) {
     for suffix in &suffixes {
         let key = format!(".tx-log/{suffix}");
         if let Ok(body) = inner.get(&key).await
-            && let Ok(mut record) =
-                serde_json::from_slice::<angos_tx_engine::intent::IntentRecord>(&body)
+            && let Ok(mut record) = serde_json::from_slice::<IntentRecord>(&body)
         {
-            record.created_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+            record.created_at = Utc::now() - Duration::seconds(3600);
             record.ttl_secs = 1;
             inner
                 .put(&key, Bytes::from(serde_json::to_vec(&record).unwrap()))
@@ -249,10 +116,10 @@ async fn backdate_intents(inner: &MemoryObjectStore) {
 async fn crash_before_intent() {
     let inner = Arc::new(MemoryObjectStore::new());
     // Write 0 = body staging; write 1 = intent PUT (which we crash on).
-    let crashing = Arc::new(CrashingStore::new(inner.clone(), 1));
+    let crashing = crashing_store(inner.clone(), 1);
 
-    let lock = common::memory_lock();
-    let executor = common::locked_executor(crashing.clone(), lock);
+    let lock = test_util::memory_lock();
+    let executor = test_util::locked_executor(crashing.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -273,7 +140,7 @@ async fn crash_before_intent() {
     );
 
     // Run recovery. There is no intent (it never landed), so nothing to replay.
-    run_recovery(inner.clone()).await;
+    test_util::sweep_once(inner.clone(), test_util::memory_lock()).await;
 
     // After recovery: canonical key still absent.
     assert!(
@@ -290,10 +157,10 @@ async fn crash_after_intent_before_apply() {
     let inner = Arc::new(MemoryObjectStore::new());
     // Write 0 = body staging; write 1 = intent PUT; write 2 = first apply.
     // Crash on write 2.
-    let crashing = Arc::new(CrashingStore::new(inner.clone(), 2));
+    let crashing = crashing_store(inner.clone(), 2);
 
-    let lock = common::memory_lock();
-    let executor = common::locked_executor(crashing.clone(), lock);
+    let lock = test_util::memory_lock();
+    let executor = test_util::locked_executor(crashing.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -312,11 +179,10 @@ async fn crash_after_intent_before_apply() {
     // Force a stale intent by backdating created_at.
     backdate_intents(&inner).await;
 
-    run_recovery(inner.clone()).await;
+    test_util::sweep_once(inner.clone(), test_util::memory_lock()).await;
 
     // After recovery: no orphans.
-    assert_no_prefix_inner(&inner, ".tx-log/").await;
-    assert_no_prefix_inner(&inner, ".tx-bodies/").await;
+    test_util::assert_no_orphans(&*inner).await;
 }
 
 /// Injecting a crash during Reap (after all mutations are applied) does not
@@ -328,10 +194,10 @@ async fn crash_during_reap() {
     // We want the transaction to complete Apply but crash on the first Reap write
     // (delete_prefix for bodies). Count: body_staging=0, intent=1, apply=2,
     // stamp=3, reap bodies delete_prefix=4.
-    let crashing = Arc::new(CrashingStore::new(inner.clone(), 4));
+    let crashing = crashing_store(inner.clone(), 4);
 
-    let lock = common::memory_lock();
-    let executor = common::locked_executor(crashing.clone(), lock);
+    let lock = test_util::memory_lock();
+    let executor = test_util::locked_executor(crashing.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -347,10 +213,9 @@ async fn crash_during_reap() {
     // Backdate any remaining intents.
     backdate_intents(&inner).await;
 
-    run_recovery(inner.clone()).await;
+    test_util::sweep_once(inner.clone(), test_util::memory_lock()).await;
 
-    assert_no_prefix_inner(&inner, ".tx-log/").await;
-    assert_no_prefix_inner(&inner, ".tx-bodies/").await;
+    test_util::assert_no_orphans(&*inner).await;
 }
 
 /// An intent with at least one `Applied` progress slot is fully committed;
@@ -358,7 +223,7 @@ async fn crash_during_reap() {
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_replays_fully_stamped_intent() {
     let inner = Arc::new(MemoryObjectStore::new());
-    let tx_id = uuid::Uuid::new_v4();
+    let tx_id = Uuid::new_v4();
 
     // Write the canonical key directly (simulating a completed Apply).
     inner
@@ -369,40 +234,25 @@ async fn recovery_replays_fully_stamped_intent() {
     // Stage the body for the replayed mutation. Recovery's replay path re-reads
     // the body and PUTs it unconditionally; the canonical bytes happen to be
     // the same as the staged bytes here, so replay is a no-op observationally.
-    inner
-        .put(
-            &format!(".tx-bodies/{tx_id}/0"),
-            Bytes::from_static(b"already-there"),
-        )
-        .await
-        .unwrap();
+    let body_ref =
+        test_util::stage_body(&*inner, tx_id, 0, Bytes::from_static(b"already-there")).await;
 
     // Write a stale intent with the only mutation marked Applied.
-    let intent = angos_tx_engine::intent::IntentRecord {
-        id: tx_id,
-        created_at: chrono::Utc::now() - chrono::Duration::seconds(3600),
-        ttl_secs: 1,
-        reads: vec![],
-        mutations: vec![MutationRecord::Put {
+    let intent = test_util::stale_intent(
+        tx_id,
+        vec![MutationRecord::Put {
             key: "stamped/key".to_owned(),
-            body_ref: format!(".tx-bodies/{tx_id}/0"),
+            body_ref,
             expected: None,
         }],
-        coarse_lock_keys: vec![],
-        progress: vec![MutationProgress::Applied],
-    };
-    inner
-        .put(
-            &format!(".tx-log/{tx_id}.json"),
-            Bytes::from(serde_json::to_vec(&intent).unwrap()),
-        )
-        .await
-        .unwrap();
+        vec![MutationProgress::Applied],
+    );
+    test_util::put_intent(&*inner, &intent).await;
 
-    run_recovery(inner.clone()).await;
+    test_util::sweep_once(inner.clone(), test_util::memory_lock()).await;
 
-    // Intent reaped; canonical key intact.
-    assert_no_prefix_inner(&inner, ".tx-log/").await;
+    // Intent and staged body reaped; canonical key intact.
+    test_util::assert_no_orphans(&*inner).await;
     let body = inner
         .get("stamped/key")
         .await
@@ -450,10 +300,10 @@ async fn manifest_push_crash_mid_apply_recovery_converges() {
     //   write 11: Reap intent delete
     for crash_on in 0usize..=11 {
         let inner = Arc::new(MemoryObjectStore::new());
-        let crashing = Arc::new(CrashingStore::new(inner.clone(), crash_on));
+        let crashing = crashing_store(inner.clone(), crash_on);
 
-        let lock = common::memory_lock();
-        let executor = common::locked_executor(crashing.clone(), lock);
+        let lock = test_util::memory_lock();
+        let executor = test_util::locked_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::PutIfAbsent {
@@ -477,7 +327,7 @@ async fn manifest_push_crash_mid_apply_recovery_converges() {
         // Backdate any live intents so recovery treats them as stale.
         backdate_intents(&inner).await;
 
-        run_recovery(inner.clone()).await;
+        test_util::sweep_once(inner.clone(), test_util::memory_lock()).await;
 
         // Invariant 1: before the intent lands (writes 0-3), no canonical keys.
         if crash_on <= 3 {
@@ -495,8 +345,14 @@ async fn manifest_push_crash_mid_apply_recovery_converges() {
             );
         }
 
-        // Invariant 2: recovery always cleans .tx-log/ orphans.
-        assert_no_prefix_inner(&inner, ".tx-log/").await;
+        // Invariant 2: recovery always cleans .tx-log/ orphans. Bodies staged
+        // before a pre-intent crash legitimately remain for the janitor, so
+        // only .tx-log/ is checked.
+        assert_eq!(
+            test_util::list_count(&*inner, ".tx-log/").await,
+            0,
+            "recovery must leave a clean .tx-log/ (crash_on={crash_on})"
+        );
     }
 }
 
@@ -520,10 +376,10 @@ async fn partial_apply_error_preserves_intent_for_recovery() {
     // applied and stamped. Being non-permanent, the later reap writes would
     // succeed, which is exactly the scenario the buggy unconditional reap
     // mishandled.
-    let crashing = Arc::new(CrashingStore::new(inner.clone(), 5));
+    let crashing = crashing_store(inner.clone(), 5);
 
-    let lock = common::memory_lock();
-    let executor = common::locked_executor(crashing.clone(), lock);
+    let lock = test_util::memory_lock();
+    let executor = test_util::locked_executor(crashing.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -546,16 +402,15 @@ async fn partial_apply_error_preserves_intent_for_recovery() {
 
     // With the fix, the intent survives (any mutation applied → no reap).
     // Without the fix it would have been reaped, making recovery impossible.
-    let intents = inner.list(".tx-log/", 100, None).await.unwrap().items;
     assert_eq!(
-        intents.len(),
+        test_util::list_count(&*inner, ".tx-log/").await,
         1,
         "intent must survive a partial-apply error so recovery can converge"
     );
 
     // Backdate + run recovery; it replays-forward idempotently.
     backdate_intents(&inner).await;
-    run_recovery(inner.clone()).await;
+    test_util::sweep_once(inner.clone(), test_util::memory_lock()).await;
 
     // Both canonical keys present with correct bodies.
     let b0 = inner
@@ -570,15 +425,14 @@ async fn partial_apply_error_preserves_intent_for_recovery() {
     assert_eq!(b1, b"body-1");
 
     // No orphans: recovery reaped the intent and staged bodies.
-    assert_no_prefix_inner(&inner, ".tx-log/").await;
-    assert_no_prefix_inner(&inner, ".tx-bodies/").await;
+    test_util::assert_no_orphans(&*inner).await;
 }
 
 // Progress-vector invariants under both executors
 
 /// Read the (only) intent under `.tx-log/` directly, bypassing the recovery
 /// loop, and return its parsed form.
-async fn read_only_intent(inner: &MemoryObjectStore) -> angos_tx_engine::intent::IntentRecord {
+async fn read_only_intent(inner: &MemoryObjectStore) -> IntentRecord {
     let suffixes = inner.list(".tx-log/", 100, None).await.unwrap().items;
     assert_eq!(
         suffixes.len(),
@@ -597,8 +451,6 @@ async fn read_only_intent(inner: &MemoryObjectStore) -> angos_tx_engine::intent:
 /// `Applied` and the remaining suffix `Pending`.
 #[tokio::test(flavor = "multi_thread")]
 async fn progress_vector_reflects_apply_state_locked() {
-    use angos_tx_engine::intent::MutationProgress;
-
     // Three mutations: writes 0,1,2 = body stage; 3 = intent;
     //   4 = apply0, 5 = stamp0, 6 = apply1, 7 = stamp1,
     //   8 = apply2, 9 = stamp2, 10 = reap-prefix, 11 = reap-intent.
@@ -607,9 +459,9 @@ async fn progress_vector_reflects_apply_state_locked() {
     // Applied; the intent remains for inspection.
     {
         let inner = Arc::new(MemoryObjectStore::new());
-        let crashing = Arc::new(CrashingStore::new_permanent_from(inner.clone(), 10));
-        let lock = common::memory_lock();
-        let executor = common::locked_executor(crashing.clone(), lock);
+        let crashing = crashing_store_permanent(inner.clone(), 10);
+        let lock = test_util::memory_lock();
+        let executor = test_util::locked_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::Put {
@@ -646,9 +498,9 @@ async fn progress_vector_reflects_apply_state_locked() {
     // Pending.
     {
         let inner = Arc::new(MemoryObjectStore::new());
-        let crashing = Arc::new(CrashingStore::new_permanent_from(inner.clone(), 6));
-        let lock = common::memory_lock();
-        let executor = common::locked_executor(crashing.clone(), lock);
+        let crashing = crashing_store_permanent(inner.clone(), 6);
+        let lock = test_util::memory_lock();
+        let executor = test_util::locked_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::Put {
@@ -682,15 +534,13 @@ async fn progress_vector_reflects_apply_state_locked() {
 /// Applied-vs-Pending classification is identical.
 #[tokio::test(flavor = "multi_thread")]
 async fn progress_vector_reflects_apply_state_cas() {
-    use angos_tx_engine::intent::MutationProgress;
-
     // (a) Crash permanently from the Reap step (write 10) onward: every
     // mutation Applied; the intent remains for inspection.
     {
         let inner = Arc::new(MemoryObjectStore::new());
-        let crashing = Arc::new(CrashingStore::new_permanent_from(inner.clone(), 10));
-        let lock = common::memory_lock();
-        let executor = common::cas_executor(crashing.clone(), lock);
+        let crashing = crashing_store_permanent(inner.clone(), 10);
+        let lock = test_util::memory_lock();
+        let executor = test_util::cas_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::Put {
@@ -725,9 +575,9 @@ async fn progress_vector_reflects_apply_state_cas() {
     // applies + stamps mutation 0, then every subsequent write fails.
     {
         let inner = Arc::new(MemoryObjectStore::new());
-        let crashing = Arc::new(CrashingStore::new_permanent_from(inner.clone(), 6));
-        let lock = common::memory_lock();
-        let executor = common::cas_executor(crashing.clone(), lock);
+        let crashing = crashing_store_permanent(inner.clone(), 6);
+        let lock = test_util::memory_lock();
+        let executor = test_util::cas_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::Put {

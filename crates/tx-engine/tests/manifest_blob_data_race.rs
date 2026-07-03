@@ -28,7 +28,7 @@ use angos_tx_engine::{
     transaction::{Mutation, Transaction},
 };
 
-mod common;
+use angos_tx_engine::test_util;
 
 const BLOB_KEY: &str = "blob-data/sha256:dead";
 const COARSE_KEY: &str = "blob-data:sha256:dead";
@@ -86,8 +86,8 @@ fn push_and_delete_declare_matching_coarse_lock() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cas_executor_serialises_push_and_delete() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = common::memory_lock();
-    let executor = common::cas_executor(store.clone(), lock.clone());
+    let lock = test_util::memory_lock();
+    let executor = test_util::cas_executor(store.clone(), lock.clone());
 
     // Hold the coarse lock from outside so the in-flight push must wait.
     let held = lock
@@ -132,8 +132,8 @@ async fn cas_executor_serialises_push_and_delete() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_push_and_delete_converge_to_consistent_state() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = common::memory_lock();
-    let executor = common::cas_executor(store.clone(), lock);
+    let lock = test_util::memory_lock();
+    let executor = test_util::cas_executor(store.clone(), lock);
 
     let barrier = Arc::new(Barrier::new(2));
 

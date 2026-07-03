@@ -126,6 +126,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::registry::test_utils::media_type;
 
     const VALID_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
@@ -136,10 +137,6 @@ mod tests {
 
     fn other_digest() -> Digest {
         Digest::sha256(OTHER_HASH).unwrap()
-    }
-
-    fn media_type(value: &str) -> MediaType {
-        MediaType::new(value).unwrap()
     }
 
     fn minimal_descriptor() -> Descriptor {

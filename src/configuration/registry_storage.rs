@@ -365,21 +365,14 @@ impl RegistryStorageConfig {
 mod tests {
     use super::*;
     use crate::{
-        registry::{blob_store, s3_connection::S3ConnectionConfig},
+        registry::{blob_store, s3_connection::S3ConnectionConfig, test_utils::s3_test_connection},
         secret::Secret,
     };
     use angos_tx_engine::lock::S3LockConfig;
 
     fn s3_config_with_lock_strategy(lock_strategy: LockStrategy) -> RegistryStorageConfig {
         RegistryStorageConfig::S3(S3BackendConfig {
-            connection: S3ConnectionConfig {
-                access_key_id: Secret::new("root".to_string()),
-                secret_key: Secret::new("roottoor".to_string()),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                bucket: "registry".to_string(),
-                region: "region".to_string(),
-                key_prefix: format!("probe-test-{}", uuid::Uuid::new_v4()),
-            },
+            connection: s3_test_connection(format!("probe-test-{}", uuid::Uuid::new_v4())),
             lock_strategy,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,

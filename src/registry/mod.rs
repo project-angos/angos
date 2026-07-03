@@ -412,7 +412,7 @@ impl Drop for Registry {
 
 #[cfg(test)]
 mod in_process_replication_tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     use tempfile::TempDir;
     use tokio::time::{sleep, timeout};
@@ -421,8 +421,6 @@ mod in_process_replication_tests {
         matchers::{method, path},
     };
 
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
-
     use crate::{
         oci::{Namespace, Tag},
         registry::{
@@ -430,10 +428,9 @@ mod in_process_replication_tests {
             blob_store::BlobStore,
             job_store::{JobEnvelope, JobStore, Queue},
             metadata_store::MetadataStore,
-            repository_resolver::RepositoryResolver,
             test_utils::{
-                build_store, downstream_client, repository_with_downstream,
-                repository_with_replication, seed_manifest,
+                FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,
+                repository_with_replication, seed_manifest, single_repo_resolver,
             },
         },
         registry_client::RegistryClient,
@@ -451,35 +448,27 @@ mod in_process_replication_tests {
     /// `[global.job_queue]`) over `repository`, plus the shared stores for
     /// seeding local state.
     fn build_registry_with(
-        root: &str,
         repository: Repository,
-    ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let store = build_store(object);
-        let metadata_store = Arc::new(
-            MetadataStore::builder(store.clone())
-                .link_cache_ttl(0)
-                .access_time_debounce_secs(0)
-                .build(),
-        );
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
-
-        let mut repositories = HashMap::new();
-        repositories.insert(REPO.to_string(), repository);
-        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+    ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>, TempDir) {
+        let FsTestStack {
+            dir,
+            store: _,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
+        let resolver = single_repo_resolver(REPO, repository);
 
         let config = RegistryConfig::default();
         let registry =
             Registry::new(blob_store.clone(), metadata_store.clone(), resolver, config).unwrap();
 
-        (registry, blob_store, metadata_store)
+        (registry, blob_store, metadata_store, dir)
     }
 
     fn build_registry(
-        root: &str,
         client: Arc<RegistryClient>,
-    ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
-        build_registry_with(root, repository_with_downstream(REPO, client))
+    ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>, TempDir) {
+        build_registry_with(repository_with_downstream(REPO, client))
     }
 
     /// The drained job runs the full push pipeline (HEAD-before-PUT blobs, PUT
@@ -490,10 +479,8 @@ mod in_process_replication_tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().to_str().unwrap();
         let client = downstream_client(&mock_server.uri());
-        let (registry, _blob_store, metadata_store) = build_registry(root, client);
+        let (registry, _blob_store, metadata_store, _dir) = build_registry(client);
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (manifest_digest, config_digest, layer_digest) =
@@ -624,11 +611,8 @@ mod in_process_replication_tests {
     #[tokio::test]
     async fn no_replication_loop_when_no_downstream_configured() {
         crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, _blob_store, _metadata_store) = build_registry_with(
-            dir.path().to_str().unwrap(),
-            repository_without_downstream(),
-        );
+        let (registry, _blob_store, _metadata_store, _dir) =
+            build_registry_with(repository_without_downstream());
 
         registry
             .job_queue

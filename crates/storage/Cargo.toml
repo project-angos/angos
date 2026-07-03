@@ -6,6 +6,9 @@ edition = "2024"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
+[features]
+test-util = []
+
 [dependencies]
 angos-s3-client = { path = "../s3-client" }
 async-trait = "0.1.89"
@@ -13,15 +16,18 @@ bytes = "1.12.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 futures-util = { version = "0.3.32", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
-tempfile = "3.27"
+tempfile = { workspace = true }
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["fs", "io-util", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
 tokio-util = { version = "0.7.18", features = ["io-util", "rt"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
+# Self-reference so the crate's own tests and doctests see the
+# feature-gated test-util surface.
+angos-storage = { path = ".", features = ["test-util"] }
+angos-s3-client = { path = "../s3-client", features = ["test-util"] }
 bytesize = "2.4.0"
 serde_json = "1.0.150"
-tempfile = "3.27"
-tokio = { version = "1.52.3", features = ["io-util", "sync", "macros", "rt", "rt-multi-thread"] }
-uuid = { version = "1.23.4", features = ["v4"] }
+tokio = { workspace = true, features = ["io-util", "sync", "macros", "rt", "rt-multi-thread"] }
+uuid = { workspace = true, features = ["v4"] }

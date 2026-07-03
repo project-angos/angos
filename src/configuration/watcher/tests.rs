@@ -7,7 +7,10 @@ use notify::{
 use tempfile::TempDir;
 
 use super::{classify::is_k8s_data_symlink, *};
-use crate::configuration::listeners::ServerTlsConfig;
+use crate::{
+    configuration::listeners::ServerTlsConfig,
+    test_fixtures::configuration::{MINIMAL_CONFIG_TOML, config_toml},
+};
 
 fn make_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
     Event {
@@ -106,24 +109,14 @@ fn classify_modify_on_unrelated_path_is_irrelevant() {
     );
 }
 
-const MINIMAL_CONFIG: &str = r#"
-[server]
-bind_address = "0.0.0.0"
-"#;
-
-const MINIMAL_TLS_CONFIG_TEMPLATE: &str = r#"
-[server]
-bind_address = "0.0.0.0"
-
-[server.tls]
-server_certificate_bundle = "{cert_path}"
-server_private_key = "{key_path}"
-"#;
-
 fn minimal_tls_config(cert_path: &str, key_path: &str) -> String {
-    MINIMAL_TLS_CONFIG_TEMPLATE
-        .replace("{cert_path}", cert_path)
-        .replace("{key_path}", key_path)
+    config_toml(&format!(
+        r#"
+        [server.tls]
+        server_certificate_bundle = "{cert_path}"
+        server_private_key = "{key_path}"
+    "#
+    ))
 }
 
 struct TestNotifier {
@@ -217,7 +210,7 @@ where
 async fn test_regular_config_change() {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
-    fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+    fs::write(&config_path, MINIMAL_CONFIG_TOML).unwrap();
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
@@ -248,7 +241,7 @@ bind_address = "127.0.0.1"
 #[cfg(unix)]
 async fn test_kubernetes_config_mount() {
     let temp_dir = TempDir::new().unwrap();
-    create_k8s_mount(temp_dir.path(), &[("config.toml", MINIMAL_CONFIG)]);
+    create_k8s_mount(temp_dir.path(), &[("config.toml", MINIMAL_CONFIG_TOML)]);
 
     let config_path = temp_dir.path().join("config.toml");
     let notifier = Arc::new(TestNotifier::new());
@@ -366,7 +359,7 @@ async fn test_kubernetes_tls_mount() {
 async fn test_invalid_config_recovery() {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
-    fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+    fs::write(&config_path, MINIMAL_CONFIG_TOML).unwrap();
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
@@ -778,7 +771,7 @@ async fn startup_with_invalid_toml_recovers_on_valid_write() {
 
     // Now write a valid config; the watcher must detect it and call
     // notify_config_change at least once.
-    fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+    fs::write(&config_path, MINIMAL_CONFIG_TOML).unwrap();
 
     let detected = wait_for_condition(
         || notifier.config_change_count() >= 1,
@@ -805,7 +798,7 @@ async fn startup_with_invalid_toml_recovers_on_valid_write() {
 async fn burst_config_writes_produce_bounded_reloads() {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
-    fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+    fs::write(&config_path, MINIMAL_CONFIG_TOML).unwrap();
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(

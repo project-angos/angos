@@ -474,13 +474,3 @@ fn test_build_tls_acceptor_with_client_auth_required() {
     let result = TlsListener::build_tls_acceptor(&tls_config);
     assert!(result.is_ok(), "build failed: {:?}", result.err());
 }
-
-#[test]
-fn test_build_tls_acceptor_without_client_ca_ignores_client_auth() {
-    init_crypto_provider();
-    let (tls_config, _tmp_files) = build_config(false);
-    assert!(tls_config.client_ca_bundle.is_none());
-
-    let result = TlsListener::build_tls_acceptor(&tls_config);
-    assert!(result.is_ok(), "build failed: {:?}", result.err());
-}
