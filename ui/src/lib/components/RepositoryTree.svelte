@@ -6,6 +6,7 @@
 		formatTimeAgo,
 		isInteractiveTarget,
 		manifestUrl,
+		selectedUploadsConfirmKey,
 		uploadConfirmKey,
 		type TreeRowNode
 	} from '$lib/utils';
@@ -18,6 +19,7 @@
 		namespace: string;
 		rows: TreeRowNode[];
 		uploads: UploadEntry[];
+		selectedUploads: Set<string>;
 		deleteConfirm: string | null;
 		deleting: boolean;
 		expanded: Set<string>;
@@ -26,6 +28,8 @@
 		ondeletemanifest: (digest: string) => void;
 		ondeletetag: (tag: string) => void;
 		oncancelupload: (uuid: string) => void;
+		onuploadselectionchange: (selected: Set<string>) => void;
+		oncancelselecteduploads: () => void;
 	}
 
 	let {
@@ -33,6 +37,7 @@
 		namespace,
 		rows,
 		uploads,
+		selectedUploads,
 		deleteConfirm,
 		deleting,
 		expanded,
@@ -40,8 +45,30 @@
 		onconfirmchange,
 		ondeletemanifest,
 		ondeletetag,
-		oncancelupload
+		oncancelupload,
+		onuploadselectionchange,
+		oncancelselecteduploads
 	}: Props = $props();
+
+	const allUploadsSelected = $derived(
+		uploads.length > 0 && uploads.every((upload) => selectedUploads.has(upload.uuid))
+	);
+
+	function toggleUploadSelection(uuid: string) {
+		const selected = new Set(selectedUploads);
+		if (selected.has(uuid)) {
+			selected.delete(uuid);
+		} else {
+			selected.add(uuid);
+		}
+		onuploadselectionchange(selected);
+	}
+
+	function toggleAllUploads() {
+		onuploadselectionchange(
+			allUploadsSelected ? new Set() : new Set(uploads.map((upload) => upload.uuid))
+		);
+	}
 
 	function handleRowClick(event: MouseEvent, targetDigest: string) {
 		if (isInteractiveTarget(event)) return;
@@ -51,9 +78,30 @@
 
 {#if uploads.length > 0}
 	<Card title="Uploads in progress" count={uploads.length} variant="warning">
+		{#snippet headerActions()}
+			{#if selectedUploads.size > 0}
+				<DeleteButton
+					label={`cancel selected (${selectedUploads.size})`}
+					isConfirming={deleteConfirm === selectedUploadsConfirmKey}
+					disabled={deleting}
+					onconfirm={oncancelselecteduploads}
+					oncancel={() => onconfirmchange(null)}
+					onrequestconfirm={() => onconfirmchange(selectedUploadsConfirmKey)}
+				/>
+			{/if}
+		{/snippet}
 		<table>
 			<thead>
 				<tr>
+					<th class="col-select">
+						<input
+							type="checkbox"
+							aria-label="Select all uploads"
+							checked={allUploadsSelected}
+							disabled={deleting}
+							onchange={toggleAllUploads}
+						/>
+					</th>
 					<th>UUID</th>
 					<th>Size</th>
 					<th>Started</th>
@@ -63,6 +111,15 @@
 			<tbody>
 				{#each uploads as upload}
 					<tr>
+						<td class="col-select">
+							<input
+								type="checkbox"
+								aria-label={`Select upload ${upload.uuid}`}
+								checked={selectedUploads.has(upload.uuid)}
+								disabled={deleting}
+								onchange={() => toggleUploadSelection(upload.uuid)}
+							/>
+						</td>
 						<td><code class="uuid">{upload.uuid}</code></td>
 						<td>{formatSize(upload.size)}</td>
 						<td>{formatTimeAgo(upload.started_at)}</td>

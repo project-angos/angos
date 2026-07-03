@@ -224,6 +224,19 @@ h3 {
 	gap: 0.5rem;
 }
 
+/* Delete controls in a card header stay as compact as their table
+   counterparts so their appearance does not change the header height. */
+.header-actions button.danger,
+.header-actions .delete-confirm button {
+	padding: 0.2rem 0.5rem;
+	font-size: 0.6875rem;
+	line-height: 1;
+}
+
+.header-actions > button.danger {
+	border-radius: 3px;
+}
+
 /* ===== TABLES ===== */
 table {
 	width: 100%;
@@ -922,6 +935,10 @@ a:hover {
 
 .col-actions {
 	width: 140px;
+}
+
+.col-select {
+	width: 36px;
 }
 
 /* ===== SCROLLBAR ===== */
