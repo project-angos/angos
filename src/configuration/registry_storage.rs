@@ -1,23 +1,32 @@
-use std::sync::Arc;
+#[cfg(feature = "s3-backend")]
+use std::sync::PoisonError;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Deserializer};
 use tracing::info;
 
+#[cfg(feature = "s3-backend")]
 use angos_s3_client::Backend as S3HttpBackend;
-use angos_storage::{
-    ConditionalStore, ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
-};
+use angos_storage::ObjectStore;
+#[cfg(feature = "fs-backend")]
+use angos_storage::fs::Backend as StorageFsBackend;
+#[cfg(feature = "s3-backend")]
+use angos_storage::{ConditionalStore, s3::Backend as StorageS3Backend};
+#[cfg(feature = "s3-backend")]
+use angos_tx_engine::probe::probe_conditional_capabilities;
 use angos_tx_engine::{
     ConditionalCapabilities,
     error::Error as EngineError,
     lock::{
-        LockStrategy, resolve_lock_strategy, storage::redis::RedisLockStorageConfig as LockConfig,
+        LockStrategy, RedisLockStorageConfig as LockConfig, default_lock_strategy,
+        resolve_lock_strategy,
     },
-    probe::probe_conditional_capabilities,
     store::Store,
 };
 
-use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
+use crate::registry::blob_store;
+#[cfg(feature = "s3-backend")]
+use crate::registry::s3_connection::S3ConnectionConfig;
 
 // Error
 
@@ -43,6 +52,7 @@ impl From<angos_storage::Error> for Error {
     }
 }
 
+#[cfg(feature = "s3-backend")]
 impl From<angos_s3_client::Error> for Error {
     fn from(e: angos_s3_client::Error) -> Self {
         Error::StorageBackend(e.to_string())
@@ -60,6 +70,7 @@ impl From<EngineError> for Error {
 
 // FS backend config
 
+#[cfg(feature = "fs-backend")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct FsBackendConfig {
     pub root_dir: String,
@@ -67,16 +78,7 @@ pub struct FsBackendConfig {
     pub sync_to_disk: bool,
 }
 
-impl Default for FsBackendConfig {
-    fn default() -> Self {
-        Self {
-            root_dir: String::new(),
-            lock_strategy: LockStrategy::Memory,
-            sync_to_disk: false,
-        }
-    }
-}
-
+#[cfg(feature = "fs-backend")]
 impl<'de> Deserialize<'de> for FsBackendConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -106,6 +108,7 @@ impl<'de> Deserialize<'de> for FsBackendConfig {
 
 // S3 backend config
 
+#[cfg(feature = "s3-backend")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct S3BackendConfig {
     pub connection: S3ConnectionConfig,
@@ -130,18 +133,7 @@ pub struct S3BackendConfig {
     pub capabilities: Option<ConditionalCapabilities>,
 }
 
-impl Default for S3BackendConfig {
-    fn default() -> Self {
-        Self {
-            connection: S3ConnectionConfig::default(),
-            lock_strategy: LockStrategy::Memory,
-            link_cache_ttl: default_link_cache_ttl(),
-            access_time_debounce_secs: default_access_time_debounce(),
-            capabilities: None,
-        }
-    }
-}
-
+#[cfg(feature = "s3-backend")]
 impl<'de> Deserialize<'de> for S3BackendConfig {
     // Custom impl because `lock_strategy` must be resolved from optional
     // `redis` / `lock_strategy` keys via `resolve_lock_strategy`.
@@ -181,10 +173,40 @@ impl<'de> Deserialize<'de> for S3BackendConfig {
     }
 }
 
+#[cfg(feature = "s3-backend")]
+impl S3BackendConfig {
+    /// S3 lock strategy requires compare-and-swap (If-None-Match + If-Match).
+    /// Returns a Coordination error when the strategy is S3 but the provider
+    /// lacks CAS.
+    fn ensure_cas_supported(&self, caps: &ConditionalCapabilities) -> Result<(), Error> {
+        if matches!(self.lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
+            return Err(Error::Coordination(format!(
+                "S3 lock strategy requires If-None-Match and If-Match support, but the provider \
+                 reports put_if_none_match={}, put_if_match={}. Use lock_strategy = redis or \
+                 lock_strategy = memory instead.",
+                caps.put_if_none_match, caps.put_if_match
+            )));
+        }
+        Ok(())
+    }
+
+    /// Probe the endpoint for conditional-write capabilities and validate
+    /// them against the configured lock strategy.
+    async fn probe(&self) -> Result<ConditionalCapabilities, Error> {
+        let http = S3HttpBackend::new(&self.connection.to_client_config())?;
+        let storage = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
+        let caps = probe_conditional_capabilities(storage.as_ref()).await?;
+        self.ensure_cas_supported(&caps)?;
+        Ok(caps)
+    }
+}
+
+#[cfg(feature = "s3-backend")]
 fn default_link_cache_ttl() -> u64 {
     30
 }
 
+#[cfg(feature = "s3-backend")]
 fn default_access_time_debounce() -> u64 {
     60
 }
@@ -205,75 +227,118 @@ pub enum RegistryStorageConfig {
     /// Inherit blob-store credentials and root path.
     ///
     /// Resolved via [`crate::configuration::Configuration::resolve_registry_storage`]
-    /// before reaching [`RegistryStorageConfig::build_store`] or
-    /// [`RegistryStorageConfig::probe`].
-    /// Reaching either method with this variant is a programming error.
+    /// before reaching [`RegistryStorageConfig::build_store`].
+    /// Reaching that method with this variant is a programming error.
     #[default]
     Inherit,
+    #[cfg(feature = "fs-backend")]
     #[serde(rename = "fs")]
     FS(FsBackendConfig),
+    #[cfg(feature = "s3-backend")]
     #[serde(rename = "s3")]
     S3(S3BackendConfig),
 }
 
 impl RegistryStorageConfig {
-    /// S3 lock strategy requires compare-and-swap (If-None-Match + If-Match). Returns
-    /// a Coordination error when the strategy is S3 but the provider lacks CAS.
-    fn ensure_s3_cas_supported(
-        lock_strategy: &LockStrategy,
-        caps: &ConditionalCapabilities,
-    ) -> Result<(), Error> {
-        if matches!(lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
-            return Err(Error::Coordination(format!(
-                "S3 lock strategy requires If-None-Match and If-Match support, but the provider \
-                 reports put_if_none_match={}, put_if_match={}. Use lock_strategy = redis or \
-                 lock_strategy = memory instead.",
-                caps.put_if_none_match, caps.put_if_match
-            )));
-        }
-        Ok(())
-    }
-
     /// Build a `RegistryStorageConfig` that mirrors the given blob-store config.
-    pub fn from_blob_store(blob: &blob_store::BlobStoreConfig) -> Self {
-        match blob {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Coordination`] when this build has no default lock strategy
+    /// (`memory-lock` disabled): inheritance cannot pick a lock backend, so
+    /// `[metadata_store]` must be configured explicitly.
+    pub fn from_blob_store(blob: &blob_store::BlobStoreConfig) -> Result<Self, Error> {
+        let lock_strategy = default_lock_strategy().ok_or_else(|| {
+            Error::Coordination(
+                "[metadata_store] inherits the blob store using the memory lock strategy, \
+                 which is not compiled into this build; configure [metadata_store.fs] or \
+                 [metadata_store.s3] with an explicit lock_strategy"
+                    .to_string(),
+            )
+        })?;
+        Ok(match blob {
+            #[cfg(feature = "fs-backend")]
             blob_store::BlobStoreConfig::FS(config) => RegistryStorageConfig::FS(FsBackendConfig {
                 root_dir: config.root_dir.clone(),
                 sync_to_disk: config.sync_to_disk,
-                ..Default::default()
+                lock_strategy,
             }),
+            #[cfg(feature = "s3-backend")]
             blob_store::BlobStoreConfig::S3(config) => {
                 info!("Auto-configuring S3 metadata-store from blob-store");
                 RegistryStorageConfig::S3(S3BackendConfig {
                     connection: config.connection.clone(),
-                    ..Default::default()
+                    lock_strategy,
+                    link_cache_ttl: default_link_cache_ttl(),
+                    access_time_debounce_secs: default_access_time_debounce(),
+                    capabilities: None,
                 })
             }
+        })
+    }
+
+    /// The configured lock strategy; `None` for the unresolved `Inherit`
+    /// variant.
+    pub fn lock_strategy(&self) -> Option<&LockStrategy> {
+        match self {
+            RegistryStorageConfig::Inherit => None,
+            #[cfg(feature = "fs-backend")]
+            RegistryStorageConfig::FS(config) => Some(&config.lock_strategy),
+            #[cfg(feature = "s3-backend")]
+            RegistryStorageConfig::S3(config) => Some(&config.lock_strategy),
         }
     }
 
-    /// Probe the underlying S3 store for conditional-write capabilities.
-    ///
-    /// Returns `None` for FS configs (no capabilities to probe). Returns
-    /// [`Error::Coordination`] when called on the `Inherit` variant: callers
-    /// must resolve first via
-    /// [`crate::configuration::Configuration::resolve_registry_storage`].
-    pub async fn probe(&self) -> Result<Option<ConditionalCapabilities>, Error> {
+    /// Metadata-store cache tuning as `(link_cache_ttl,
+    /// access_time_debounce_secs)`; zero (disabled) for backends without
+    /// link caching.
+    pub fn link_cache_tuning(&self) -> (u64, u64) {
         match self {
-            RegistryStorageConfig::Inherit => Err(Error::Coordination(
-                "RegistryStorageConfig::Inherit reached probe(); callers must \
-                 resolve via Configuration::resolve_registry_storage first"
-                    .to_string(),
-            )),
+            #[cfg(feature = "s3-backend")]
             RegistryStorageConfig::S3(config) => {
-                let http = S3HttpBackend::new(&config.connection.to_client_config())?;
-                let storage = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
-                let caps = probe_conditional_capabilities(storage.as_ref()).await?;
-                Self::ensure_s3_cas_supported(&config.lock_strategy, &caps)?;
-                Ok(Some(caps))
+                (config.link_cache_ttl, config.access_time_debounce_secs)
             }
-            RegistryStorageConfig::FS(_) => Ok(None),
+            _ => (0, 0),
         }
+    }
+
+    /// Resolve S3 conditional-write capabilities once, memoizing them in
+    /// `cache` so config hot-reloads rebuild stores without re-probing the
+    /// endpoint. Injecting the result means [`RegistryStorageConfig::build_store`]
+    /// skips its own probe. No-op unless this is an S3 config without
+    /// operator-declared capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Any probe failure, surfaced as this module's [`Error`].
+    #[cfg_attr(
+        not(feature = "s3-backend"),
+        allow(
+            unused_variables,
+            clippy::unused_async,
+            clippy::unnecessary_wraps,
+            reason = "without s3-backend there are no capabilities to resolve"
+        )
+    )]
+    pub async fn memoize_capabilities(
+        &mut self,
+        cache: &Mutex<Option<ConditionalCapabilities>>,
+    ) -> Result<(), Error> {
+        #[cfg(feature = "s3-backend")]
+        if let RegistryStorageConfig::S3(config) = self
+            && config.capabilities.is_none()
+        {
+            let cached = cache.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            let caps = if let Some(caps) = cached {
+                caps
+            } else {
+                let probed = config.probe().await?;
+                *cache.lock().unwrap_or_else(PoisonError::into_inner) = Some(probed.clone());
+                probed
+            };
+            config.capabilities = Some(caps);
+        }
+        Ok(())
     }
 
     /// Build the [`Store`] façade shared by the metadata store, the job store,
@@ -284,6 +349,10 @@ impl RegistryStorageConfig {
     /// across hot-reloads should resolve capabilities up front (see
     /// `setup::build_metadata_store`) and inject them into the config so this
     /// path skips the probe.
+    #[cfg_attr(
+        not(feature = "s3-backend"),
+        allow(clippy::unused_async, reason = "only the S3 arm awaits (the probe)")
+    )]
     pub async fn build_store(&self) -> Result<Arc<Store>, Error> {
         let store = match self {
             RegistryStorageConfig::Inherit => {
@@ -293,6 +362,7 @@ impl RegistryStorageConfig {
                         .to_string(),
                 ));
             }
+            #[cfg(feature = "fs-backend")]
             RegistryStorageConfig::FS(config) => {
                 if matches!(config.lock_strategy, LockStrategy::S3(_)) {
                     return Err(Error::Coordination(
@@ -317,18 +387,17 @@ impl RegistryStorageConfig {
                     false,
                 )?
             }
+            #[cfg(feature = "s3-backend")]
             RegistryStorageConfig::S3(config) => {
                 info!(
                     "Using S3 storage backend with lock_strategy={:?}",
                     config.lock_strategy
                 );
-                let caps = match &config.capabilities {
-                    Some(declared) => Some(declared.clone()),
-                    None => self.probe().await?,
+                let caps_resolved = match &config.capabilities {
+                    Some(declared) => declared.clone(),
+                    None => config.probe().await?,
                 };
-
-                let caps_resolved = caps.unwrap_or_default();
-                Self::ensure_s3_cas_supported(&config.lock_strategy, &caps_resolved)?;
+                config.ensure_cas_supported(&caps_resolved)?;
 
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
                 let backend = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
@@ -370,14 +439,14 @@ mod tests {
     };
     use angos_tx_engine::lock::S3LockConfig;
 
-    fn s3_config_with_lock_strategy(lock_strategy: LockStrategy) -> RegistryStorageConfig {
-        RegistryStorageConfig::S3(S3BackendConfig {
+    fn s3_config_with_lock_strategy(lock_strategy: LockStrategy) -> S3BackendConfig {
+        S3BackendConfig {
             connection: s3_test_connection(format!("probe-test-{}", uuid::Uuid::new_v4())),
             lock_strategy,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
             capabilities: None,
-        })
+        }
     }
 
     #[tokio::test]
@@ -388,9 +457,7 @@ mod tests {
             result.is_ok(),
             "Probe should succeed against the S3 backend with S3 lock strategy: {result:?}"
         );
-        let caps = result
-            .unwrap()
-            .expect("S3 lock strategy should return capabilities");
+        let caps = result.unwrap();
         assert!(
             caps.put_if_none_match,
             "the S3 backend should support If-None-Match"
@@ -406,9 +473,7 @@ mod tests {
             result.is_ok(),
             "Probe should succeed for Memory lock strategy: {result:?}"
         );
-        let caps = result
-            .unwrap()
-            .expect("S3 metadata store should return detected capabilities");
+        let caps = result.unwrap();
         assert!(
             caps.put_if_none_match,
             "the S3 backend should support If-None-Match"
@@ -417,17 +482,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_probe_fs_config_is_noop() {
-        let config = RegistryStorageConfig::FS(FsBackendConfig {
+    async fn test_memoize_capabilities_is_noop_for_fs() {
+        let mut config = RegistryStorageConfig::FS(FsBackendConfig {
             root_dir: "/tmp/probe-test".to_string(),
             lock_strategy: LockStrategy::Memory,
             sync_to_disk: false,
         });
-        let result = config.probe().await;
-        assert!(result.is_ok(), "Probe should be no-op for FS config");
+        let cache = Mutex::new(None);
+        config
+            .memoize_capabilities(&cache)
+            .await
+            .expect("memoize must be a no-op for FS configs");
         assert!(
-            result.unwrap().is_none(),
-            "FS config should return no capabilities"
+            cache.lock().unwrap().is_none(),
+            "FS config must not populate the capabilities cache"
         );
     }
 
@@ -437,7 +505,7 @@ mod tests {
             root_dir: "/var/lib/registry".to_string(),
             sync_to_disk: true,
         });
-        match RegistryStorageConfig::from_blob_store(&blob) {
+        match RegistryStorageConfig::from_blob_store(&blob).unwrap() {
             RegistryStorageConfig::FS(c) => {
                 assert_eq!(c.root_dir, "/var/lib/registry");
                 assert!(c.sync_to_disk);
@@ -461,7 +529,7 @@ mod tests {
             },
             ..blob_store::S3BackendConfig::default()
         });
-        match RegistryStorageConfig::from_blob_store(&blob) {
+        match RegistryStorageConfig::from_blob_store(&blob).unwrap() {
             RegistryStorageConfig::S3(c) => {
                 assert_eq!(c.connection.bucket, "test-bucket");
                 assert_eq!(c.connection.region, "us-east-1");

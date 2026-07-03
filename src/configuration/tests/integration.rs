@@ -438,7 +438,7 @@ fn test_metadata_store_s3_with_redis() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_registry_storage();
+    let metadata_config = config.resolve_registry_storage().unwrap();
 
     match metadata_config {
         RegistryStorageConfig::S3(s3_config) => {
@@ -472,7 +472,7 @@ fn test_metadata_store_fs_with_redis() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_registry_storage();
+    let metadata_config = config.resolve_registry_storage().unwrap();
 
     match metadata_config {
         RegistryStorageConfig::FS(fs_config) => {
@@ -762,7 +762,7 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_registry_storage();
+    let metadata_config = config.resolve_registry_storage().unwrap();
 
     match metadata_config {
         RegistryStorageConfig::S3(s3_config) => {
@@ -903,7 +903,7 @@ fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_registry_storage();
+    let metadata_config = config.resolve_registry_storage().unwrap();
 
     match metadata_config {
         RegistryStorageConfig::S3(s3_config) => match &s3_config.lock_strategy {
@@ -943,7 +943,7 @@ fn test_metadata_store_s3_lock_strategy_memory() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_registry_storage();
+    let metadata_config = config.resolve_registry_storage().unwrap();
 
     match metadata_config {
         RegistryStorageConfig::S3(s3_config) => {

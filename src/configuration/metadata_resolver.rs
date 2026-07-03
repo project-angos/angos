@@ -1,14 +1,26 @@
-use crate::configuration::{Configuration, RegistryStorageConfig};
+use crate::configuration::{Configuration, RegistryStorageConfig, registry_storage};
 
 impl Configuration {
-    pub fn resolve_registry_storage(&self) -> RegistryStorageConfig {
+    /// Resolve `[metadata_store]` to a concrete backend config, mapping
+    /// `Inherit` onto the blob-store settings.
+    ///
+    /// # Errors
+    ///
+    /// [`registry_storage::Error`] when inheritance cannot pick a default
+    /// lock strategy (build without `memory-lock`); explicit configs never
+    /// fail.
+    #[allow(
+        clippy::match_wildcard_for_single_variants,
+        reason = "backend variants are feature-gated; the wildcard stays correct in every combination"
+    )]
+    pub fn resolve_registry_storage(
+        &self,
+    ) -> Result<RegistryStorageConfig, registry_storage::Error> {
         match &self.registry_storage {
             RegistryStorageConfig::Inherit => {
                 RegistryStorageConfig::from_blob_store(&self.blob_store)
             }
-            RegistryStorageConfig::FS(_) | RegistryStorageConfig::S3(_) => {
-                self.registry_storage.clone()
-            }
+            concrete => Ok(concrete.clone()),
         }
     }
 }
@@ -37,7 +49,7 @@ mod tests {
             "absent [metadata_store] section must deserialise as Inherit"
         );
 
-        let resolved = config.resolve_registry_storage();
+        let resolved = config.resolve_registry_storage().unwrap();
         match resolved {
             RegistryStorageConfig::FS(fs_config) => {
                 assert_eq!(fs_config.root_dir, "/data/blobs");
@@ -71,7 +83,7 @@ mod tests {
             "explicit [metadata_store.fs] must not be Inherit"
         );
 
-        let resolved = config.resolve_registry_storage();
+        let resolved = config.resolve_registry_storage().unwrap();
         match resolved {
             RegistryStorageConfig::FS(fs_config) => {
                 assert_eq!(fs_config.root_dir, "/custom/metadata");
@@ -107,7 +119,7 @@ mod tests {
             "explicit [metadata_store.s3] must not be Inherit"
         );
 
-        let resolved = config.resolve_registry_storage();
+        let resolved = config.resolve_registry_storage().unwrap();
         match resolved {
             RegistryStorageConfig::S3(s3_config) => {
                 assert_eq!(s3_config.connection.bucket, "metadata-bucket");
@@ -142,7 +154,7 @@ mod tests {
             "absent [metadata_store] section must deserialise as Inherit"
         );
 
-        let resolved = config.resolve_registry_storage();
+        let resolved = config.resolve_registry_storage().unwrap();
         match resolved {
             RegistryStorageConfig::S3(s3_config) => {
                 assert_eq!(s3_config.connection.bucket, "my-bucket");

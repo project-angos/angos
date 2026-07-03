@@ -1,22 +1,25 @@
 //! Storage backends for the lock primitive.
 //!
 //! The [`LockStorage`] trait defines the minimal set of operations the concrete
-//! [`Lock`](crate::lock::Lock) needs from its storage layer. Three implementations
-//! are provided:
+//! [`Lock`](crate::lock::Lock) needs from its storage layer. Three
+//! implementations are provided, each behind its own feature flag:
 //!
-//! - [`MemoryLockStorage`](memory::MemoryLockStorage): in-process mutex map
+//! - `MemoryLockStorage` (feature `memory-lock`): in-process mutex map
 //!   (no TTL; suitable for single-process deployments and tests).
-//! - [`S3LockStorage`](s3::S3LockStorage): uses `put_if_absent`,
+//! - `S3LockStorage` (feature `s3-lock`): uses `put_if_absent`,
 //!   `put_if_match`, and conditional delete on S3-compatible stores that
 //!   advertise CAS support.
-//! - [`RedisLockStorage`](redis::RedisLockStorage) (feature `redis`): Redis
-//!   `SET NX EX` plus Lua scripts for atomic refresh and release; suitable for
-//!   FS deployments under heavy concurrent load.
+//! - `RedisLockStorage` (feature `redis-lock`): Redis `SET NX EX` plus Lua
+//!   scripts for atomic refresh and release; suitable for FS deployments
+//!   under heavy concurrent load.
 
+#[cfg(feature = "memory-lock")]
 pub mod memory;
+
+#[cfg(feature = "s3-lock")]
 pub mod s3;
 
-#[cfg(feature = "redis")]
+#[cfg(feature = "redis-lock")]
 pub mod redis;
 
 use std::fmt::Debug;
@@ -38,7 +41,7 @@ pub struct LockBody {
     pub ttl_secs: u64,
     /// Per-write random nonce that makes every serialized lock body globally
     /// unique. After a conditional write returns an ambiguous (status-less)
-    /// transport error, [`S3LockStorage`](s3::S3LockStorage) reads the object
+    /// transport error, the S3 lock storage reads the object
     /// back and treats a byte-for-byte match as proof that *its own* write
     /// landed despite the lost acknowledgement, rather than a competitor's
     /// identical-looking body. The nonce is what makes that comparison

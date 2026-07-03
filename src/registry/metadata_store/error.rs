@@ -3,11 +3,13 @@ use std::fmt;
 use angos_tx_engine::lock;
 
 use crate::oci;
+#[cfg(feature = "s3-backend")]
 use angos_s3_client as s3_client;
 use angos_tx_engine::StorageError;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
+    #[cfg(feature = "s3-backend")]
     DataStore(s3_client::Error),
     Coordination(String),
     InvalidData(String),
@@ -21,6 +23,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            #[cfg(feature = "s3-backend")]
             Error::DataStore(err) => write!(f, "Data store error: {err}"),
             Error::Coordination(msg) => write!(f, "Coordination error: {msg}"),
             Error::InvalidData(msg) => write!(f, "Invalid data: {msg}"),
@@ -33,6 +36,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[cfg(feature = "s3-backend")]
 impl From<s3_client::Error> for Error {
     fn from(err: s3_client::Error) -> Self {
         match err {

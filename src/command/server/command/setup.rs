@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     cache::Cache,
     command::{bootstrap, server::error::Error},
-    configuration::{Configuration, RegistryStorageConfig},
+    configuration::Configuration,
     registry::{Registry, RegistryConfig, job_store::JobStore, metadata_store::MetadataStore},
 };
 
@@ -27,31 +27,16 @@ pub async fn build_metadata_store(
     cache: &Arc<Cache>,
     cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
 ) -> Result<Arc<MetadataStore>, Error> {
-    let mut storage_config = config.resolve_registry_storage();
+    let mut storage_config = config.resolve_registry_storage().map_err(Error::from)?;
 
     // Resolve S3 conditional-write capabilities once and memoize them so a
     // config hot-reload rebuilds the metadata store without re-probing the
     // endpoint. Operator-declared capabilities skip this entirely. Injecting
     // the resolved value into the config means `build_store` won't re-probe.
-    if matches!(&storage_config, RegistryStorageConfig::S3(b) if b.capabilities.is_none()) {
-        let cached = cached_capabilities
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let caps = if let Some(caps) = cached {
-            caps
-        } else {
-            let probed = storage_config.probe().await.map_err(Error::from)?;
-            let resolved = probed.unwrap_or_default();
-            *cached_capabilities
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(resolved.clone());
-            resolved
-        };
-        if let RegistryStorageConfig::S3(ref mut backend_config) = storage_config {
-            backend_config.capabilities = Some(caps);
-        }
-    }
+    storage_config
+        .memoize_capabilities(cached_capabilities)
+        .await
+        .map_err(Error::from)?;
 
     bootstrap::metadata_store(&storage_config, cache)
         .await
@@ -99,7 +84,7 @@ pub async fn build_registry(
     // Always fetch the shared storage handles when this is the initial
     // bootstrap so we can spawn the engine maintenance loops against the same
     // store the metadata/job paths use.
-    let storage_config = config.resolve_registry_storage();
+    let storage_config = config.resolve_registry_storage().map_err(Error::from)?;
     let maintenance_handles = if engine_maintenance.is_some() || config.global.job_queue.is_some() {
         Some(storage_config.build_store().await?)
     } else {

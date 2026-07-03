@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.3.1
 
+### Added
+
+- New Cargo features (`fs-backend`, `s3-backend`, `memory-lock`, `redis-lock`, `s3-lock`, all enabled by default) select the storage and lock backends compiled into the binary, so slim builds can ship only the backends they deploy.
+
 ## Changed
 
 - Storage coordination now runs entirely on the metadata store: the blob store holds only blob bytes (its backend no longer carries `.tx-log/`/`.tx-bodies/` prefixes) and the in-process job queue persists on the metadata store.

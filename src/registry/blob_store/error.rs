@@ -3,18 +3,23 @@ use std::{fmt, io, num::TryFromIntError, string::FromUtf8Error};
 use sha2::digest::common::hazmat::DeserializeStateError;
 
 use crate::oci;
+#[cfg(feature = "s3-backend")]
 use angos_s3_client as s3_client;
 use angos_tx_engine::StorageError;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
+    #[cfg(feature = "s3-backend")]
     DataStore(s3_client::Error),
     HashSerialization(String),
     DigestAlgorithmUnavailable(oci::Algorithm),
     JSONSerialization(String),
     StorageBackend(String),
     UploadBodyRead(String),
-    UploadBodySize { expected: u64, actual: u64 },
+    UploadBodySize {
+        expected: u64,
+        actual: u64,
+    },
     InvalidFormat(String),
     UploadNotFound,
     BlobNotFound,
@@ -24,6 +29,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            #[cfg(feature = "s3-backend")]
             Error::DataStore(err) => write!(f, "Data store error: {err}"),
             Error::HashSerialization(e) => write!(f, "Hash state management error: {e}"),
             Error::DigestAlgorithmUnavailable(algorithm) => write!(
@@ -47,6 +53,7 @@ impl fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "s3-backend")]
 impl From<s3_client::Error> for Error {
     fn from(err: s3_client::Error) -> Self {
         match err {

@@ -1,5 +1,6 @@
 use std::io;
 
+#[cfg(feature = "s3")]
 use angos_s3_client::Error as S3Error;
 use thiserror::Error as ThisError;
 
@@ -36,6 +37,7 @@ impl From<io::Error> for Error {
     }
 }
 
+#[cfg(feature = "s3")]
 impl From<S3Error> for Error {
     fn from(error: S3Error) -> Self {
         match error {

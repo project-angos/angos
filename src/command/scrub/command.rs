@@ -130,8 +130,10 @@ impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
         let blob_backend = Arc::new(config.blob_store.build_backend()?);
-        let metadata_store =
-            bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
+        let storage_config = config
+            .resolve_registry_storage()
+            .map_err(bootstrap::Error::from)?;
+        let metadata_store = bootstrap::metadata_store(&storage_config, &auth_cache).await?;
         let repositories = bootstrap::repositories(
             &config.repository,
             &auth_cache,

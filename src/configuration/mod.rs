@@ -225,18 +225,18 @@ fn validate_durable_queue_lock(config: &Configuration) -> Result<(), Error> {
     if config.global.job_queue.is_none() {
         return Ok(());
     }
-    let lock_strategy = match config.resolve_registry_storage() {
-        RegistryStorageConfig::FS(fs) => fs.lock_strategy,
-        RegistryStorageConfig::S3(s3) => s3.lock_strategy,
-        // `resolve_registry_storage` must map `Inherit` to a concrete backend;
-        // fail closed rather than silently skip the lock check.
-        RegistryStorageConfig::Inherit => {
-            return Err(Error::InvalidFormat(
-                "[metadata_store] did not resolve to a concrete backend before \
-                 durable-queue lock validation"
-                    .to_string(),
-            ));
-        }
+    let resolved = config
+        .resolve_registry_storage()
+        .map_err(|e| Error::InvalidFormat(e.to_string()))?;
+    // `resolve_registry_storage` must map `Inherit` to a concrete backend
+    // (`lock_strategy()` is `None` only for `Inherit`); fail closed rather
+    // than silently skip the lock check.
+    let Some(lock_strategy) = resolved.lock_strategy() else {
+        return Err(Error::InvalidFormat(
+            "[metadata_store] did not resolve to a concrete backend before \
+             durable-queue lock validation"
+                .to_string(),
+        ));
     };
     if matches!(lock_strategy, LockStrategy::Memory) {
         return Err(Error::InvalidFormat(

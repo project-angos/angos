@@ -1,4 +1,4 @@
-//! Redis lock storage (feature `redis`).
+//! Redis lock storage (feature `redis-lock`).
 //!
 //! Uses Redis `SET NX EX` for `put_if_absent` (atomic acquire) and Lua scripts
 //! for conditional refresh (`put_if_match`) and ownership-checked delete
@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use redis::Client;
 
 use crate::lock::{
-    Error,
+    Error, RedisLockStorageConfig,
     storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
 };
 
@@ -49,44 +49,6 @@ end
 redis.call('DEL', KEYS[1])
 return 1
 ";
-
-/// Configuration for the Redis lock storage.
-///
-/// This is a DTO. Deserialized from operator config; used to construct a
-/// [`RedisLockStorage`]. Not held as a runtime field.
-#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
-pub struct RedisLockStorageConfig {
-    pub url: String,
-    pub ttl: usize,
-    #[serde(default)]
-    pub key_prefix: String,
-    #[serde(default = "RedisLockStorageConfig::default_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "RedisLockStorageConfig::default_retry_delay_ms")]
-    pub retry_delay_ms: u64,
-}
-
-impl RedisLockStorageConfig {
-    fn default_max_retries() -> u32 {
-        100
-    }
-
-    fn default_retry_delay_ms() -> u64 {
-        10
-    }
-}
-
-impl Default for RedisLockStorageConfig {
-    fn default() -> Self {
-        Self {
-            url: "redis://localhost:6379".to_string(),
-            ttl: 30,
-            key_prefix: String::new(),
-            max_retries: Self::default_max_retries(),
-            retry_delay_ms: Self::default_retry_delay_ms(),
-        }
-    }
-}
 
 /// Redis-backed lock storage.
 ///

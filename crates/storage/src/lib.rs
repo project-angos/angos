@@ -17,9 +17,11 @@
 //!
 //! # Backends
 //!
-//! - [`fs::Backend`]: [`ObjectStore`] on top of `tokio::fs`.
-//! - [`s3::Backend`]: [`ObjectStore`] + [`ConditionalStore`]
-//!   + [`PresignedStore`] wrapping [`angos_s3_client::Backend`].
+//! Each backend is compiled in by its feature flag (both are default):
+//!
+//! - `fs::Backend` (feature `fs`): [`ObjectStore`] on top of `tokio::fs`.
+//! - `s3::Backend` (feature `s3`): [`ObjectStore`] + [`ConditionalStore`]
+//!   + [`PresignedStore`] wrapping `angos_s3_client::Backend`.
 
 mod conditional;
 mod error;
@@ -32,7 +34,9 @@ pub mod test_util;
 mod types;
 mod upload_session;
 
+#[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(feature = "s3")]
 pub mod s3;
 
 #[cfg(test)]

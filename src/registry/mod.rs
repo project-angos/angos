@@ -21,6 +21,7 @@ pub mod pagination;
 mod path_builder;
 pub mod repository;
 pub mod repository_resolver;
+#[cfg(feature = "s3-backend")]
 pub mod s3_connection;
 #[cfg(test)]
 pub mod test_utils;

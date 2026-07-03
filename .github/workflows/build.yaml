@@ -25,6 +25,11 @@ jobs:
       run: cargo fmt -- --check
     - name: Check clippy
       run: cargo clippy -- -D warnings
+    - name: Check feature combinations
+      run: |
+        cargo clippy --no-default-features --features fs-backend,memory-lock -- -D warnings
+        cargo clippy --no-default-features --features s3-backend,s3-lock -- -D warnings
+        cargo clippy --no-default-features --features fs-backend,s3-backend,redis-lock -- -D warnings
   rust-test:
     # We need to a redis backend for the tests
     runs-on: ubuntu-latest

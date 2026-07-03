@@ -7,8 +7,11 @@ edition = "2024"
 pedantic = { level = "warn", priority = -1 }
 
 [features]
-redis = ["dep:redis"]
-test-util = []
+default = ["memory-lock"]
+memory-lock = []
+redis-lock = ["dep:redis"]
+s3-lock = []
+test-util = ["memory-lock"]
 
 [dependencies]
 angos-backoff = { workspace = true }
@@ -30,7 +33,7 @@ uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 # Self-reference so the integration tests (compiled as external crates) see
-# the feature-gated test-util surface.
-angos-tx-engine = { workspace = true, features = ["test-util"] }
+# the feature-gated test-util surface and every lock backend under test.
+angos-tx-engine = { workspace = true, features = ["test-util", "s3-lock"] }
 angos-storage = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

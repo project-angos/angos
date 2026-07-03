@@ -26,13 +26,14 @@
 //! ## Storage flavours
 //!
 //! [`Lock`] is parameterised by a [`LockStorage`] implementation selected at
-//! startup from the operator's `lock_strategy` config:
+//! startup from the operator's `lock_strategy` config. Each backend is
+//! compiled in by its feature flag:
 //!
 //! | `lock_strategy` | [`LockStorage`] impl | Notes |
 //! |---|---|---|
-//! | `memory` | [`MemoryLockStorage`] | In-process; single-process only (default for FS deployments) |
-//! | `redis`  | [`RedisLockStorage`] | Feature `redis`; suitable for FS stores under heavy load |
-//! | `s3`     | [`S3LockStorage`] | CAS-capable S3; uses `.tx-locks/<shard>/<key>` objects |
+//! | `memory` | `MemoryLockStorage` (feature `memory-lock`) | In-process; single-process only (default for FS deployments) |
+//! | `redis`  | `RedisLockStorage` (feature `redis-lock`) | Suitable for FS stores under heavy load |
+//! | `s3`     | `S3LockStorage` (feature `s3-lock`) | CAS-capable S3; uses `.tx-locks/<shard>/<key>` objects |
 
 use std::{fmt::Debug, future::Future, pin::Pin};
 
@@ -62,7 +63,7 @@ pub enum Error {
     NotFound,
 }
 
-#[cfg(feature = "redis")]
+#[cfg(feature = "redis-lock")]
 impl From<::redis::RedisError> for Error {
     fn from(err: ::redis::RedisError) -> Self {
         Error::Lock(format!("Redis error: {err}"))
@@ -155,11 +156,55 @@ impl Drop for LockSession {
 }
 
 // Lock strategy config
+//
+// The strategy configs below are plain DTOs: they parse in every build so the
+// configuration layer never depends on which lock storages are compiled in.
+// Capability enforcement happens once, in `Store::new`, when the selected
+// strategy's storage is constructed.
+
+/// Configuration for the Redis lock storage.
+///
+/// This is a DTO. Deserialized from operator config; used to construct a
+/// `RedisLockStorage` (feature `redis-lock`). Not held as a runtime field.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct RedisLockStorageConfig {
+    pub url: String,
+    pub ttl: usize,
+    #[serde(default)]
+    pub key_prefix: String,
+    #[serde(default = "RedisLockStorageConfig::default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "RedisLockStorageConfig::default_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+}
+
+impl RedisLockStorageConfig {
+    fn default_max_retries() -> u32 {
+        100
+    }
+
+    fn default_retry_delay_ms() -> u64 {
+        10
+    }
+}
+
+impl Default for RedisLockStorageConfig {
+    fn default() -> Self {
+        Self {
+            url: "redis://localhost:6379".to_string(),
+            ttl: 30,
+            key_prefix: String::new(),
+            max_retries: Self::default_max_retries(),
+            retry_delay_ms: Self::default_retry_delay_ms(),
+        }
+    }
+}
 
 /// Parsed configuration for the S3-backed lock storage.
 ///
 /// This is a DTO: deserialized from operator config and used to construct an
-/// [`S3LockStorage`]. Not held as a field on any runtime struct.
+/// S3 lock storage (feature `s3-lock`). Not held as a field on any runtime
+/// struct.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct S3LockConfig {
     #[serde(
@@ -252,14 +297,31 @@ impl Default for S3LockConfig {
 /// Determines which [`LockStorage`] implementation is constructed at startup.
 /// Deserialized from operator configuration; selection is per-deployment.
 /// `lock_strategy = "memory" | "redis" | "s3"` selects the lock-object storage
-/// backend.
+/// backend. Every strategy parses in every build; constructing one requires
+/// its feature (`memory-lock`, `redis-lock`, `s3-lock`), enforced by
+/// [`Store::new`](crate::store::Store::new).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum LockStrategy {
     Memory,
-    #[cfg(feature = "redis")]
-    Redis(storage::redis::RedisLockStorageConfig),
+    Redis(RedisLockStorageConfig),
     S3(S3LockConfig),
+}
+
+/// The lock strategy used when the operator does not configure one.
+///
+/// `None` in builds without the `memory-lock` feature: Redis needs a URL and
+/// S3 locking is opt-in, so those builds must set `lock_strategy` explicitly.
+#[must_use]
+pub fn default_lock_strategy() -> Option<LockStrategy> {
+    #[cfg(feature = "memory-lock")]
+    {
+        Some(LockStrategy::Memory)
+    }
+    #[cfg(not(feature = "memory-lock"))]
+    {
+        None
+    }
 }
 
 /// Resolve the active [`LockStrategy`] from operator config, applying
@@ -272,15 +334,11 @@ pub enum LockStrategy {
 ///
 /// Returns `Err(E::custom(...))` when both `lock_strategy` and `redis` are
 /// provided, when S3 lock strategy is requested on a non-S3 metadata store,
-/// or when the Redis feature is not enabled.
-#[allow(
-    clippy::ignored_unit_patterns,
-    reason = "redis param is Option<()> when feature is disabled; () wildcard is correct in that branch"
-)]
+/// or when no strategy is configured and the build has no default (no
+/// `memory-lock` feature).
 pub fn resolve_lock_strategy<E: serde::de::Error>(
     lock_strategy: Option<LockStrategy>,
-    #[cfg(feature = "redis")] redis: Option<storage::redis::RedisLockStorageConfig>,
-    #[cfg(not(feature = "redis"))] redis: Option<()>,
+    redis: Option<RedisLockStorageConfig>,
     allow_s3: bool,
 ) -> Result<LockStrategy, E> {
     match (lock_strategy, redis) {
@@ -291,12 +349,12 @@ pub fn resolve_lock_strategy<E: serde::de::Error>(
             "S3 lock strategy is not supported for filesystem metadata store",
         )),
         (Some(strategy), None) => Ok(strategy),
-        #[cfg(feature = "redis")]
         (None, Some(redis_config)) => Ok(LockStrategy::Redis(redis_config)),
-        #[cfg(not(feature = "redis"))]
-        (None, Some(_)) => Err(E::custom(
-            "redis lock strategy requested but the 'redis' feature is not enabled",
-        )),
-        (None, None) => Ok(LockStrategy::Memory),
+        (None, None) => default_lock_strategy().ok_or_else(|| {
+            E::custom(
+                "no lock_strategy configured and this build has no default lock backend \
+                 (the 'memory-lock' feature is disabled); set lock_strategy explicitly",
+            )
+        }),
     }
 }

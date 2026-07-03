@@ -8,8 +8,8 @@ members = ["crates/backoff", "crates/s3-client", "crates/storage", "crates/tx-en
 [workspace.dependencies]
 angos-backoff = { path = "crates/backoff" }
 angos-s3-client = { path = "crates/s3-client" }
-angos-storage = { path = "crates/storage" }
-angos-tx-engine = { path = "crates/tx-engine" }
+angos-storage = { path = "crates/storage", default-features = false }
+angos-tx-engine = { path = "crates/tx-engine", default-features = false }
 async-trait = "0.1.89"
 base64 = "0.22.1"
 bytes = "1.12.0"
@@ -41,6 +41,17 @@ name = "angos"
 version = "1.3.0"
 edition = "2024"
 
+# Storage backends and lock backends are selected at compile time. All are
+# enabled by default; slim builds pick an explicit set, e.g.
+# `cargo build --no-default-features --features s3-backend,s3-lock`.
+[features]
+default = ["fs-backend", "s3-backend", "memory-lock", "redis-lock", "s3-lock"]
+fs-backend = ["angos-storage/fs"]
+s3-backend = ["dep:angos-s3-client", "angos-storage/s3"]
+memory-lock = ["angos-tx-engine/memory-lock"]
+redis-lock = ["angos-tx-engine/redis-lock"]
+s3-lock = ["s3-backend", "angos-tx-engine/s3-lock"]
+
 [profile.release]
 opt-level = 3
 codegen-units = 1
@@ -48,9 +59,9 @@ lto = "fat"
 
 [dependencies]
 angos-backoff = { workspace = true }
-angos-s3-client = { workspace = true }
+angos-s3-client = { workspace = true, optional = true }
 angos-storage = { workspace = true }
-angos-tx-engine = { workspace = true, features = ["redis"] }
+angos-tx-engine = { workspace = true }
 arc-swap = "1.9.1"
 argh = "0.1.19"
 argon2 = "0.5.3"

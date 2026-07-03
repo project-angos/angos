@@ -50,15 +50,10 @@ pub async fn metadata_store(
 ) -> Result<Arc<MetadataStore>, Error> {
     let store = config.build_store().await?;
 
-    let s3_ttl = if let RegistryStorageConfig::S3(s3_cfg) = config {
-        (s3_cfg.link_cache_ttl, s3_cfg.access_time_debounce_secs)
-    } else {
-        (0, 0)
-    };
-
+    let (link_cache_ttl, access_time_debounce_secs) = config.link_cache_tuning();
     let mut builder = MetadataStore::builder(store)
-        .link_cache_ttl(s3_ttl.0)
-        .access_time_debounce_secs(s3_ttl.1);
+        .link_cache_ttl(link_cache_ttl)
+        .access_time_debounce_secs(access_time_debounce_secs);
 
     // Wire in the auth cache for link-metadata caching (only meaningful on S3,
     // where link_cache_ttl > 0 by default).

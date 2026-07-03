@@ -37,8 +37,12 @@ use angos_storage::{
     MultipartUploadPage, ObjectMeta, ObjectStore, Page,
 };
 
-#[cfg(feature = "redis")]
+#[cfg(feature = "memory-lock")]
+use crate::lock::storage::memory::MemoryLockStorage;
+#[cfg(feature = "redis-lock")]
 use crate::lock::storage::redis::RedisLockStorage;
+#[cfg(feature = "s3-lock")]
+use crate::lock::storage::s3::S3LockStorage;
 use crate::{
     error::Error,
     executor::{
@@ -46,11 +50,7 @@ use crate::{
         locked::LockedExecutor,
     },
     janitor::{BodyJanitor, LockJanitor},
-    lock::{
-        LockStrategy,
-        primitive::Lock,
-        storage::{LockStorage, memory::MemoryLockStorage, s3::S3LockStorage},
-    },
+    lock::{LockStrategy, primitive::Lock, storage::LockStorage},
     recovery::RecoveryLoop,
     transaction::{Mutation, Transaction},
 };
@@ -107,10 +107,25 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Build`] when `LockStrategy::S3` is selected without an
-    /// `s3_lock_store`, when the `redis` feature is not enabled and Redis is
-    /// selected, or when the underlying lock or executor builder rejects its
-    /// inputs.
+    /// Returns [`Error::Build`] when the selected strategy's lock feature
+    /// (`memory-lock`, `redis-lock`, `s3-lock`) is not compiled in, when
+    /// `LockStrategy::S3` is selected without an `s3_lock_store`, or when the
+    /// underlying lock or executor builder rejects its inputs.
+    #[cfg_attr(
+        not(feature = "s3-lock"),
+        allow(
+            unused_variables,
+            clippy::needless_pass_by_value,
+            reason = "the s3_lock_* params only feed the S3 arm, which needs s3-lock"
+        )
+    )]
+    #[cfg_attr(
+        not(any(feature = "redis-lock", feature = "s3-lock")),
+        allow(
+            clippy::needless_pass_by_value,
+            reason = "lock_strategy carries no payload to consume without redis-lock/s3-lock"
+        )
+    )]
     pub fn new(
         object: Arc<dyn ObjectStore>,
         conditional: Option<Arc<dyn ConditionalStore>>,
@@ -125,7 +140,6 @@ impl Store {
         // coordination path: both executors share this backend.
         let lock_backend = match &lock_strategy {
             LockStrategy::Memory => "memory",
-            #[cfg(feature = "redis")]
             LockStrategy::Redis(_) => "redis",
             LockStrategy::S3(_) => "s3",
         };
@@ -133,14 +147,25 @@ impl Store {
         // Each arm yields the lock-object storage plus a `LockBuilder` primed
         // with the per-strategy tuning carried in the strategy config. The
         // tuning is threaded directly into the builder (never stored as a
-        // Config field), and the Lock is built once after the match.
+        // Config field), and the Lock is built once after the match. Every
+        // strategy parses in every build; this is the single seam where a
+        // strategy whose lock feature is not compiled in gets rejected.
         let lock_builder = match lock_strategy {
+            #[cfg(feature = "memory-lock")]
             LockStrategy::Memory => {
                 let storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
                 // Memory backend: keep builder defaults.
                 Lock::builder(storage)
             }
-            #[cfg(feature = "redis")]
+            #[cfg(not(feature = "memory-lock"))]
+            LockStrategy::Memory => {
+                return Err(Error::Build(
+                    "lock_strategy = memory is not compiled into this build \
+                     (enable the memory-lock feature)"
+                        .to_string(),
+                ));
+            }
+            #[cfg(feature = "redis-lock")]
             LockStrategy::Redis(config) => {
                 let storage: Arc<dyn LockStorage> =
                     Arc::new(RedisLockStorage::new(&config).map_err(|e| {
@@ -152,6 +177,15 @@ impl Store {
                     .max_retries(config.max_retries)
                     .retry_delay_ms(config.retry_delay_ms)
             }
+            #[cfg(not(feature = "redis-lock"))]
+            LockStrategy::Redis(_) => {
+                return Err(Error::Build(
+                    "lock_strategy = redis is not compiled into this build \
+                     (enable the redis-lock feature)"
+                        .to_string(),
+                ));
+            }
+            #[cfg(feature = "s3-lock")]
             LockStrategy::S3(config) => {
                 let lock_store = s3_lock_store.ok_or_else(|| {
                     Error::Build("S3 lock strategy requires an S3 conditional store".to_string())
@@ -163,6 +197,14 @@ impl Store {
                     .max_retries(config.max_retries)
                     .retry_delay_ms(config.retry_delay_ms)
                     .max_hold_secs(config.max_hold_secs)
+            }
+            #[cfg(not(feature = "s3-lock"))]
+            LockStrategy::S3(_) => {
+                return Err(Error::Build(
+                    "lock_strategy = s3 is not compiled into this build \
+                     (enable the s3-lock feature)"
+                        .to_string(),
+                ));
             }
         };
 

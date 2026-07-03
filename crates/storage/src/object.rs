@@ -1,3 +1,4 @@
+#[cfg(any(test, feature = "fs", feature = "s3", feature = "test-util"))]
 use std::borrow::Cow;
 
 use async_trait::async_trait;
@@ -19,6 +20,7 @@ use crate::{
 /// with `/` are returned unchanged.
 ///
 /// Backends share this so their `delete_prefix` semantics agree byte-for-byte.
+#[cfg(any(test, feature = "fs", feature = "s3", feature = "test-util"))]
 #[must_use]
 pub fn dir_prefix(prefix: &str) -> Cow<'_, str> {
     if prefix.is_empty() || prefix.ends_with('/') {

@@ -467,7 +467,7 @@ fn create_pull_through_config() -> Configuration {
 async fn create_pull_through_registry(config: &Configuration) -> Registry {
     let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
-    let storage_config = config.resolve_registry_storage();
+    let storage_config = config.resolve_registry_storage().unwrap();
     let handles = storage_config.build_store().await.unwrap();
     let metadata_store = Arc::new(MetadataStore::builder(handles).build());
 

@@ -7,16 +7,19 @@ edition = "2024"
 pedantic = { level = "warn", priority = -1 }
 
 [features]
+default = ["fs", "s3"]
+fs = ["dep:tempfile"]
+s3 = ["dep:angos-s3-client"]
 test-util = []
 
 [dependencies]
-angos-s3-client = { workspace = true }
+angos-s3-client = { workspace = true, optional = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
-tempfile = { workspace = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
 tokio-util = { workspace = true, features = ["rt"] }
@@ -24,8 +27,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 # Self-reference so the crate's own tests and doctests see the
-# feature-gated test-util surface.
-angos-storage = { workspace = true, features = ["test-util"] }
+# feature-gated test-util surface and both backends under test.
+angos-storage = { workspace = true, features = ["test-util", "fs", "s3"] }
 angos-s3-client = { workspace = true, features = ["test-util"] }
 bytesize = { workspace = true }
 serde_json = { workspace = true }

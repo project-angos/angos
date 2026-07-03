@@ -9,19 +9,23 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "s3-backend")]
 use bytesize::ByteSize;
 use serde::Deserialize;
 
+#[cfg(feature = "s3-backend")]
 use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3TransportConfig};
-use angos_storage::{
-    ObjectStore, PresignedStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
-};
+use angos_storage::ObjectStore;
+#[cfg(feature = "fs-backend")]
+use angos_storage::fs::Backend as StorageFsBackend;
+#[cfg(feature = "s3-backend")]
+use angos_storage::{PresignedStore, s3::Backend as StorageS3Backend};
 
-use crate::registry::{
-    blob_store::{BlobStore, Error},
-    s3_connection::S3ConnectionConfig,
-};
+use crate::registry::blob_store::{BlobStore, Error};
+#[cfg(feature = "s3-backend")]
+use crate::registry::s3_connection::S3ConnectionConfig;
 
+#[cfg(feature = "fs-backend")]
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct FsBackendConfig {
     pub root_dir: String,
@@ -32,6 +36,7 @@ pub struct FsBackendConfig {
 /// S3-backed blob store. Connection fields are required (matching the
 /// documented schema); only `key_prefix` may be omitted. Transport fields
 /// default through [`TransportFields`]'s struct-level `#[serde(default)]`.
+#[cfg(feature = "s3-backend")]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct S3BackendConfig {
     #[serde(flatten)]
@@ -44,6 +49,7 @@ pub struct S3BackendConfig {
 /// of [`S3TransportConfig`] so the blob-store config can use
 /// `Secret`-wrapped credentials via [`S3ConnectionConfig`] while still
 /// exposing the same flat TOML keys to operators.
+#[cfg(feature = "s3-backend")]
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct TransportFields {
@@ -57,6 +63,7 @@ pub struct TransportFields {
     pub max_attempts: u32,
 }
 
+#[cfg(feature = "s3-backend")]
 impl Default for TransportFields {
     fn default() -> Self {
         let t = S3TransportConfig::default();
@@ -76,15 +83,24 @@ impl Default for TransportFields {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum BlobStoreConfig {
+    #[cfg(feature = "fs-backend")]
     #[serde(rename = "fs")]
     FS(FsBackendConfig),
+    #[cfg(feature = "s3-backend")]
     #[serde(rename = "s3")]
     S3(S3BackendConfig),
 }
 
 impl Default for BlobStoreConfig {
     fn default() -> Self {
-        BlobStoreConfig::FS(FsBackendConfig::default())
+        #[cfg(feature = "fs-backend")]
+        {
+            BlobStoreConfig::FS(FsBackendConfig::default())
+        }
+        #[cfg(all(not(feature = "fs-backend"), feature = "s3-backend"))]
+        {
+            BlobStoreConfig::S3(S3BackendConfig::default())
+        }
     }
 }
 
@@ -95,8 +111,13 @@ impl BlobStoreConfig {
     /// directories on delete). S3 additionally wires the presign backend for
     /// download URLs. Neither wires a transaction executor: the blob store is
     /// pure storage and coordinates through the metadata store's lock.
+    #[cfg_attr(
+        not(feature = "s3-backend"),
+        allow(clippy::unnecessary_wraps, reason = "only the S3 arm can fail")
+    )]
     pub fn build_backend(&self) -> Result<BlobStore, Error> {
         match self {
+            #[cfg(feature = "fs-backend")]
             BlobStoreConfig::FS(config) => {
                 let object: Arc<dyn ObjectStore> = Arc::new(
                     StorageFsBackend::builder(&config.root_dir)
@@ -105,6 +126,7 @@ impl BlobStoreConfig {
                 );
                 Ok(BlobStore::new(object, None))
             }
+            #[cfg(feature = "s3-backend")]
             BlobStoreConfig::S3(config) => {
                 let transport = S3TransportConfig {
                     multipart_copy_threshold: config.transport.multipart_copy_threshold,

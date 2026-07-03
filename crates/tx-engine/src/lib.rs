@@ -12,7 +12,16 @@
 //!
 //! # Feature flags
 //!
-//! - `redis`: enables the Redis-backed lock storage.
+//! Lock-storage backends are opt-in; at least one must be enabled:
+//!
+//! - `memory-lock` (default): in-process lock storage.
+//! - `redis-lock`: Redis-backed lock storage.
+//! - `s3-lock`: lock storage over a CAS-capable S3 conditional store.
+
+#[cfg(not(any(feature = "memory-lock", feature = "redis-lock", feature = "s3-lock")))]
+compile_error!(
+    "angos-tx-engine needs at least one lock-storage feature: memory-lock, redis-lock, or s3-lock"
+);
 
 pub mod error;
 pub mod executor;

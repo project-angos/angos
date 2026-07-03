@@ -1,6 +1,20 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic)]
 
+#[cfg(not(any(feature = "fs-backend", feature = "s3-backend")))]
+compile_error!("angos needs at least one storage backend feature: fs-backend or s3-backend");
+
+#[cfg(not(any(feature = "memory-lock", feature = "redis-lock", feature = "s3-lock")))]
+compile_error!("angos needs at least one lock feature: memory-lock, redis-lock, or s3-lock");
+
+#[cfg(all(
+    feature = "fs-backend",
+    not(any(feature = "memory-lock", feature = "redis-lock"))
+))]
+compile_error!(
+    "fs-backend needs memory-lock or redis-lock: S3 locking is not supported on filesystem storage"
+);
+
 use std::{process::exit, sync::Arc, time::Duration};
 
 use argh::FromArgs;
