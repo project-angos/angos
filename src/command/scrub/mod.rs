@@ -1,5 +1,5 @@
 pub mod action;
-mod check;
+pub mod check;
 mod command;
 mod error;
 pub mod executor;

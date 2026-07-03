@@ -1,13 +1,14 @@
-use std::{num::NonZeroUsize, sync::Arc};
+use std::sync::Arc;
 
 use argh::FromArgs;
-use futures_util::{StreamExt, future::join_all};
+use futures_util::StreamExt;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     command::{
         bootstrap,
+        replicate::ReplicationDrain,
         scrub::{
             action::Action,
             check::{LayoutChecker, NamespaceChecker, StoreChecker, TagChecker, list_all},
@@ -15,20 +16,13 @@ use crate::{
             executor::{ActionSink, DryRunSink, Executor},
             setup::{self, LabeledStoreCheckers},
         },
-        worker::runner::run_once,
     },
     configuration::Configuration,
     oci::{Namespace, Tag},
-    registry::{
-        blob_store::BlobStore,
-        job_store::{JobHandler, JobStore, Queue},
-        metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-    replication::ReplicationJobHandler,
+    registry::{job_store::JobStore, metadata_store::MetadataStore},
 };
 
-#[derive(FromArgs, PartialEq, Debug)]
+#[derive(FromArgs, PartialEq, Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
 #[argh(
     subcommand,
@@ -55,7 +49,7 @@ pub struct Options {
     /// check for blob inconsistencies
     pub blobs: bool,
     #[argh(switch, short = 'r')]
-    /// enforce retention policies
+    /// deprecated, use 'angos prune': enforce retention policies
     pub retention: bool,
     #[argh(switch, short = 'l')]
     /// fix links format inconsistencies
@@ -72,10 +66,8 @@ pub struct Options {
     /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
     pub referrers: bool,
     #[argh(switch)]
-    /// reconcile replicated namespaces with their downstreams: enqueue a push for
-    /// each diverging or missing tag, and for a downstream marked prune = true a
-    /// delete for each downstream-only tag (one-way mirror; unsafe for
-    /// active-active peers)
+    /// deprecated, use 'angos replicate': reconcile replicated namespaces with
+    /// their downstreams
     pub replicate: bool,
     #[argh(switch)]
     /// delete replication jobs (pending and dead-lettered) whose downstream or
@@ -110,20 +102,9 @@ pub struct Command {
     /// [`setup::store_checkers`] and applied in one pass.
     store_checkers: LabeledStoreCheckers,
     sink: Box<dyn ActionSink + Send>,
-    /// Drains reconcile-enqueued replication jobs in-process, since no running
-    /// worker is assumed; a transiently failing push is rescheduled with backoff
-    /// onto the durable queue for a worker or a later run. `None` when dry-run or
-    /// `--replicate` is absent.
+    /// Drains reconcile-enqueued replication jobs in-process at the end of the
+    /// run. `None` when dry-run or `--replicate` is absent.
     replication_drain: Option<ReplicationDrain>,
-}
-
-/// Consumer queue and handler for draining reconcile-enqueued replication jobs
-/// in-process. `concurrency` bounds the parallel claim loops so a cold-mirror
-/// reconcile does not push one tag at a time.
-struct ReplicationDrain {
-    consumer: Arc<JobStore>,
-    handler: Box<dyn JobHandler>,
-    concurrency: NonZeroUsize,
 }
 
 impl Command {
@@ -170,7 +151,7 @@ impl Command {
                 job_store.clone(),
             );
             if options.replicate {
-                replication_drain = Some(Self::build_replication_drain(
+                replication_drain = Some(ReplicationDrain::new(
                     job_store,
                     &blob_backend,
                     &metadata_store,
@@ -192,28 +173,6 @@ impl Command {
         })
     }
 
-    /// Builds the consumer queue and handler for the in-process drain.
-    /// Reconcile-enqueued pushes carry `source_ts = None`; the handler re-derives
-    /// it from the tag's `created_at`, so the receiver still runs last-writer-wins.
-    fn build_replication_drain(
-        consumer: Arc<JobStore>,
-        blob_store: &Arc<BlobStore>,
-        metadata_store: &Arc<MetadataStore>,
-        resolver: &Arc<RepositoryResolver>,
-        concurrency: NonZeroUsize,
-    ) -> ReplicationDrain {
-        let handler = ReplicationJobHandler::new(
-            resolver.clone(),
-            blob_store.clone(),
-            metadata_store.clone(),
-        );
-        ReplicationDrain {
-            consumer,
-            handler: Box::new(handler),
-            concurrency,
-        }
-    }
-
     pub async fn run(&mut self) -> Result<(), Error> {
         self.migrate_storage_layout().await?;
         self.scrub_metadata().await?;
@@ -222,7 +181,9 @@ impl Command {
         // reclaim, and the orphan-job sweep precedes the replication drain so
         // the drain does not churn orphaned jobs through retries first.
         self.scrub_store().await;
-        self.drain_replication_jobs().await;
+        if let Some(drain) = &self.replication_drain {
+            drain.drain().await;
+        }
         self.metadata_store.flush_access_times().await;
         Ok(())
     }
@@ -309,37 +270,6 @@ impl Command {
             }
         }
     }
-
-    /// Drains reconcile-enqueued replication jobs with up to
-    /// `max_concurrent_replication_jobs` concurrent claim loops. A loop ends when
-    /// no claimable job remains, so jobs already backed off to a future time are
-    /// intentionally not awaited.
-    async fn drain_replication_jobs(&mut self) {
-        let Some(drain) = &self.replication_drain else {
-            return;
-        };
-
-        info!(
-            "Draining enqueued replication jobs to convergence ({} concurrent)",
-            drain.concurrency
-        );
-        let loops = (0..drain.concurrency.get()).map(|_| async {
-            let mut drained: u64 = 0;
-            loop {
-                match run_once(&drain.consumer, drain.handler.as_ref(), Queue::Replication).await {
-                    Ok(true) => drained += 1,
-                    Ok(false) => break,
-                    Err(e) => {
-                        warn!("Failed to claim a replication job during drain: {e}");
-                        break;
-                    }
-                }
-            }
-            drained
-        });
-        let drained: u64 = join_all(loops).await.into_iter().sum();
-        info!("Replication drain complete: processed {drained} job(s)");
-    }
 }
 
 #[cfg(test)]
@@ -387,20 +317,11 @@ mod tests {
             uploads: Some(humantime::Duration::from(std::time::Duration::from_hours(
                 1,
             ))),
-            multipart: None,
             tags: true,
             manifests: true,
             blobs: true,
             retention: true,
-            links: false,
-            reconcile_blob_index: false,
-            media_types: false,
-            referrers: false,
-            replicate: false,
-            replication_orphans: false,
-            cache_orphans: false,
-            orphan_namespaces: false,
-            orphan_grants: None,
+            ..Options::default()
         };
 
         let command = Command::new(&options, &config).await;
@@ -436,22 +357,8 @@ mod tests {
         let config = scrub_config(&path);
 
         let options = Options {
-            dry_run: false,
-            uploads: None,
-            multipart: None,
             tags: true,
-            manifests: false,
-            blobs: false,
-            retention: false,
-            links: false,
-            reconcile_blob_index: false,
-            media_types: false,
-            referrers: false,
-            replicate: false,
-            replication_orphans: false,
-            cache_orphans: false,
-            orphan_namespaces: false,
-            orphan_grants: None,
+            ..Options::default()
         };
 
         let mut cmd = Command::new(&options, &config).await.unwrap();
