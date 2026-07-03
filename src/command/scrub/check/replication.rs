@@ -326,8 +326,8 @@ mod tests {
             metadata_store::{LinkKind, LinkOperation, MetadataStore},
             repository_resolver::RepositoryResolver,
             test_utils::{
-                build_store, build_test_fs_executor, downstream_client, put_blob_direct,
-                put_link_raw, repository_with_replication, seed_manifest,
+                build_store, downstream_client, put_blob_direct, put_link_raw,
+                repository_with_replication, seed_manifest,
             },
         },
         registry_client::RegistryClient,
@@ -350,8 +350,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
         let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let executor = build_test_fs_executor(root, false);
-        let store = build_store(object, executor);
+        let store = build_store(object);
         let metadata_store = Arc::new(
             MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)

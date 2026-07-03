@@ -24,7 +24,7 @@ use crate::{
         blob_store::BlobStore,
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
-        test_utils::{build_store, build_test_fs_executor, put_blob_direct},
+        test_utils::{build_store, put_blob_direct},
     },
     registry_client::{RegistryClient, UploadSession},
     replication::{
@@ -48,8 +48,7 @@ fn downstream_client(uri: &str) -> RegistryClient {
 
 fn test_blob_store(root: &str) -> (Arc<BlobStore>, Arc<MetadataStore>, Arc<Store>) {
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let executor = build_test_fs_executor(root, false);
-    let store = build_store(object, executor);
+    let store = build_store(object);
     let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())

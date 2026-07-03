@@ -12,7 +12,7 @@ use crate::registry::job_store::{
     MAX_REPORTED_PENDING, Queue, STORAGE_KEY_PREFIX_LEN, make_storage_key, parse_lock_key_index,
     parse_not_before, serialize_dead_letter, serialize_lock_key_index,
 };
-use crate::registry::test_utils::{build_store, locked_executor_over};
+use crate::registry::test_utils::build_store;
 use crate::{metrics_provider, registry::path_builder};
 
 struct Harness {
@@ -35,7 +35,7 @@ fn harness_memory() -> Harness {
 }
 
 fn build_harness(raw: Arc<dyn ObjectStore>) -> Harness {
-    let facade = build_store(raw.clone(), locked_executor_over(raw.clone()));
+    let facade = build_store(raw.clone());
     let store = Arc::new(JobStore::new(facade, "test-worker"));
     Harness { store, raw }
 }

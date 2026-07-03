@@ -35,8 +35,8 @@ use crate::{
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
         test_utils::{
-            build_store, build_test_fs_executor, create_test_registry, downstream_client,
-            metadata_store_over, repository_with_downstream, sole_pending_payload,
+            build_store, create_test_registry, downstream_client, metadata_store_over,
+            repository_with_downstream, sole_pending_payload,
         },
     },
     replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND},
@@ -67,8 +67,7 @@ impl FsRegistryFixture {
 
         let meta_storage: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
-        let metadata_store_backend =
-            metadata_store_over(meta_storage, build_test_fs_executor(&path, false));
+        let metadata_store_backend = metadata_store_over(meta_storage);
 
         let registry = create_test_registry(blob_store, metadata_store_backend);
 
@@ -570,7 +569,7 @@ impl ReplicationFixture {
 
         let object: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
-        let store = build_store(object, build_test_fs_executor(&path, false));
+        let store = build_store(object);
         let metadata_store = Arc::new(
             MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)

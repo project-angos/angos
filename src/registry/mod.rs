@@ -432,7 +432,7 @@ mod in_process_replication_tests {
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
             test_utils::{
-                build_store, build_test_fs_executor, downstream_client, repository_with_downstream,
+                build_store, downstream_client, repository_with_downstream,
                 repository_with_replication, seed_manifest,
             },
         },
@@ -455,8 +455,7 @@ mod in_process_replication_tests {
         repository: Repository,
     ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
         let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let executor = build_test_fs_executor(root, false);
-        let store = build_store(object, executor);
+        let store = build_store(object);
         let metadata_store = Arc::new(
             MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)

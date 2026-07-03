@@ -516,14 +516,6 @@ impl TransactionExecutor for CasExecutor {
     async fn acquire(&self, keys: &[String]) -> Result<LockSession, Error> {
         self.lock.acquire(keys).await.map_err(Error::Lock)
     }
-
-    fn lock(&self) -> Arc<Lock> {
-        Arc::clone(&self.lock)
-    }
-
-    fn conditional_store(&self) -> Option<Arc<dyn ConditionalStore>> {
-        Some(Arc::clone(&self.store))
-    }
 }
 
 #[cfg(test)]

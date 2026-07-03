@@ -462,10 +462,7 @@ mod tests {
             DOCKER_CONTENT_DIGEST,
             blob_ownership::BlobOwnership,
             metadata_store::{BlobIndexOperation, LinkOperation},
-            test_utils::{
-                backends, create_test_blob, locked_executor_over, metadata_store_over,
-                put_blob_direct,
-            },
+            test_utils::{backends, create_test_blob, metadata_store_over, put_blob_direct},
         },
     };
 
@@ -865,7 +862,7 @@ mod tests {
 
         let meta_obj: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(meta_dir.path().to_str().unwrap()).build());
-        let metadata_store = metadata_store_over(meta_obj.clone(), locked_executor_over(meta_obj));
+        let metadata_store = metadata_store_over(meta_obj);
 
         let namespace = Namespace::new("kubernetes.io/kube-apiserver").unwrap();
         let content = b"layer bytes";

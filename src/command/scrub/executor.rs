@@ -580,7 +580,7 @@ mod tests {
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
             job_store::{FailOutcome, JobState, Queue},
             metadata_store::{LinkKind, LinkOperation},
-            test_utils::{backends, build_store, locked_executor_over, put_blob_direct},
+            test_utils::{backends, build_store, put_blob_direct},
         },
         replication::REPLICATION_DELETE_MANIFEST_KIND,
     };
@@ -590,10 +590,7 @@ mod tests {
     /// claim loops would otherwise claim the job and race the assertion.
     fn standalone_job_store(worker_id: &str) -> Arc<JobStore> {
         let raw = Arc::new(MemoryObjectStore::new());
-        Arc::new(JobStore::new(
-            build_store(raw.clone(), locked_executor_over(raw)),
-            worker_id,
-        ))
+        Arc::new(JobStore::new(build_store(raw), worker_id))
     }
 
     #[tokio::test]

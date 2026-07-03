@@ -11,8 +11,7 @@ use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use angos_s3_client::Backend as S3HttpBackend;
-use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageS3Backend};
-use angos_tx_engine::{executor::build_executor, lock::LockStrategy};
+use angos_storage::{ObjectStore, s3::Backend as StorageS3Backend};
 
 use crate::{
     command::server::{
@@ -799,19 +798,8 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
         key_prefix: unique_prefix.to_string(),
     };
     let http = Arc::new(S3HttpBackend::new(&conn.to_client_config()).expect("s3 http client"));
-    let raw_storage = Arc::new(StorageS3Backend::builder(http).build());
-    let object_store: Arc<dyn ObjectStore> = raw_storage.clone();
-    let cond_store: Arc<dyn ConditionalStore> = raw_storage;
-    let executor = build_executor(
-        object_store.clone(),
-        Some(cond_store),
-        LockStrategy::Memory,
-        None,
-        false,
-        false,
-    )
-    .expect("build executor");
-    let facade = build_store(object_store, executor);
+    let object_store: Arc<dyn ObjectStore> = Arc::new(StorageS3Backend::builder(http).build());
+    let facade = build_store(object_store);
     let metadata_store: Arc<MetadataStore> = Arc::new(
         MetadataStore::builder(facade)
             .access_time_debounce_secs(3600)

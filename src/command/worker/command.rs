@@ -253,7 +253,7 @@ impl WorkerContext {
         // staging is reaped. The recovery loop is backend-wide, so one
         // instance covers every drained queue.
         if let Some(token) = engine_maintenance {
-            bootstrap::spawn_engine_maintenance(&storage, token);
+            tokio::spawn(storage.maintenance(token));
         }
 
         Ok(Self {
@@ -305,7 +305,7 @@ mod tests {
             job_store::{JobEnvelope, Queue},
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
-            test_utils::{build_store, build_test_fs_executor},
+            test_utils::build_store,
         },
         replication::REPLICATION_PUSH_MANIFEST_KIND,
     };
@@ -351,8 +351,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
 
         let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let executor = build_test_fs_executor(root, false);
-        let storage = build_store(object, executor);
+        let storage = build_store(object);
         let metadata_store = Arc::new(
             MetadataStore::builder(storage.clone())
                 .link_cache_ttl(0)

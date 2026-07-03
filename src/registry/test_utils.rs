@@ -28,67 +28,32 @@ use crate::{
 };
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{
-    ConditionalStore, ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
+    ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
-use angos_tx_engine::{
-    executor::{TransactionExecutor, build_executor, locked::LockedExecutor},
-    lock::{LockStrategy, primitive::Lock, storage::memory::MemoryLockStorage},
-    store::Store,
-};
+use angos_tx_engine::{lock::LockStrategy, store::Store};
 
-/// Build a fresh in-memory lock primitive for tests.
-pub fn memory_lock() -> Arc<Lock> {
+/// Wrap an object store into a [`Store`] façade for tests, using a locked
+/// executor serialising on a fresh in-memory lock.
+pub fn build_store(object: Arc<dyn ObjectStore>) -> Arc<Store> {
     Arc::new(
-        Lock::builder(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .expect("test lock"),
+        Store::new(object, None, LockStrategy::Memory, None, false, false).expect("test store"),
     )
 }
 
-/// Build an in-process `LockedExecutor` over `store`, serialising on a fresh
-/// in-memory lock.
-pub fn locked_executor_over(store: Arc<dyn ObjectStore>) -> Arc<dyn TransactionExecutor> {
-    Arc::new(LockedExecutor::builder(store, memory_lock()).build())
-}
-
-/// Build an in-process FS-backed `LockedExecutor` suitable for unit tests.
-pub fn build_test_fs_executor(root_dir: &str, sync_to_disk: bool) -> Arc<dyn TransactionExecutor> {
-    let store = Arc::new(
-        StorageFsBackend::builder(root_dir)
-            .sync_to_disk(sync_to_disk)
-            .build(),
-    );
-    locked_executor_over(store)
-}
-
-/// Wrap an object store + executor into a [`Store`] façade for tests. The
-/// store handle is an [`ObjectStore`] (the CRUD floor plus the upload-session
-/// lifecycle), matching the façade's composed surface.
-pub fn build_store(
-    object: Arc<dyn ObjectStore>,
-    executor: Arc<dyn TransactionExecutor>,
-) -> Arc<Store> {
-    Arc::new(Store::builder(object, executor).build())
-}
-
-/// Wrap an object store + executor into a cache-less [`MetadataStore`] for
-/// tests (link cache and access-time debounce both disabled).
-pub fn metadata_store_over(
-    object: Arc<dyn ObjectStore>,
-    executor: Arc<dyn TransactionExecutor>,
-) -> Arc<MetadataStore> {
-    metadata_store_over_cached(object, executor, 0)
+/// Wrap an object store into a cache-less [`MetadataStore`] for tests (link
+/// cache and access-time debounce both disabled).
+pub fn metadata_store_over(object: Arc<dyn ObjectStore>) -> Arc<MetadataStore> {
+    metadata_store_over_cached(object, 0)
 }
 
 /// Like [`metadata_store_over`] but with a memory-backed link cache at
 /// `link_cache_ttl_secs` (`0` keeps it disabled).
 pub fn metadata_store_over_cached(
     object: Arc<dyn ObjectStore>,
-    executor: Arc<dyn TransactionExecutor>,
     link_cache_ttl_secs: u64,
 ) -> Arc<MetadataStore> {
     Arc::new(
-        MetadataStore::builder(build_store(object, executor))
+        MetadataStore::builder(build_store(object))
             .cache(cache::Config::Memory.to_backend().expect("memory cache"))
             .link_cache_ttl(link_cache_ttl_secs)
             .access_time_debounce_secs(0)
@@ -271,11 +236,9 @@ impl FSRegistryTestCase {
         });
         let blob_store = Arc::new(config.build_backend().expect("fs blob backend"));
 
-        let meta_executor = build_test_fs_executor(&path, false);
         let meta_storage: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
-        let metadata_store =
-            metadata_store_over_cached(meta_storage, meta_executor, link_cache_ttl_secs);
+        let metadata_store = metadata_store_over_cached(meta_storage, link_cache_ttl_secs);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
@@ -303,13 +266,12 @@ impl FSRegistryTestCase {
         });
         let blob_store = Arc::new(config.build_backend().expect("fs blob backend"));
 
-        let meta_executor = build_test_fs_executor(&meta_path, false);
         let meta_storage: Arc<dyn ObjectStore> = Arc::new(
             StorageFsBackend::builder(&meta_path)
                 .sync_to_disk(false)
                 .build(),
         );
-        let metadata_store = metadata_store_over_cached(meta_storage, meta_executor, 0);
+        let metadata_store = metadata_store_over_cached(meta_storage, 0);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
@@ -381,19 +343,9 @@ impl S3RegistryTestCase {
 
         let meta_http =
             Arc::new(S3HttpBackend::new(&connection.to_client_config()).expect("s3 http client"));
-        let meta_raw_storage = Arc::new(StorageS3Backend::builder(meta_http).build());
-        let meta_object_store: Arc<dyn ObjectStore> = meta_raw_storage.clone();
-        let meta_conditional: Arc<dyn ConditionalStore> = meta_raw_storage;
-        let meta_executor = build_executor(
-            meta_object_store.clone(),
-            Some(meta_conditional),
-            LockStrategy::Memory,
-            None,
-            false,
-            false,
-        )
-        .expect("s3 metadata executor");
-        let metadata_store = metadata_store_over(meta_object_store, meta_executor);
+        let meta_object_store: Arc<dyn ObjectStore> =
+            Arc::new(StorageS3Backend::builder(meta_http).build());
+        let metadata_store = metadata_store_over(meta_object_store);
 
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 

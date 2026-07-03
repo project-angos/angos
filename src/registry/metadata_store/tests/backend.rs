@@ -9,13 +9,13 @@ use crate::{
     registry::{
         metadata_store::{BlobIndex, BlobIndexOperation, LinkKind, MetadataStore},
         path_builder,
-        test_utils::{locked_executor_over, metadata_store_over},
+        test_utils::metadata_store_over,
     },
 };
 
 /// Build a backend using a shared in-memory lock over the given storage.
 fn make_backend(storage: Arc<StorageS3Backend>) -> Arc<MetadataStore> {
-    metadata_store_over(storage.clone(), locked_executor_over(storage))
+    metadata_store_over(storage)
 }
 
 /// Verify that a blob-index update applies the operation correctly to a legacy
