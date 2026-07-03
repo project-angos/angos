@@ -504,7 +504,7 @@ mod tests {
         // list and delete asserts that.
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
         let mock_server = MockServer::start().await;
 
         let content = Namespace::new("nginx/app").unwrap();
@@ -1198,7 +1198,7 @@ mod tests {
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, config_digest, layer_digest) =
@@ -1301,7 +1301,7 @@ mod tests {
     async fn scrub_replicate_deletes_downstream_only_tag() {
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, _config_digest, _layer_digest) =

@@ -3301,7 +3301,7 @@ mod noop_suppression_tests {
                 .access_time_debounce_secs(0)
                 .build(),
         );
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
         let mut repositories = HashMap::new();
         repositories.insert(
@@ -3975,7 +3975,7 @@ mod dispatch_replication_tests {
                 .access_time_debounce_secs(0)
                 .build(),
         );
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
         let mut repositories = HashMap::new();
         repositories.insert(REPO.to_string(), repository);

@@ -463,7 +463,7 @@ mod tests {
             blob_ownership::BlobOwnership,
             metadata_store::{BlobIndexOperation, LinkOperation},
             test_utils::{
-                backends, build_store, create_test_blob, locked_executor_over, metadata_store_over,
+                backends, create_test_blob, locked_executor_over, metadata_store_over,
                 put_blob_direct,
             },
         },
@@ -850,9 +850,9 @@ mod tests {
     /// Regression guard for the split-backend pull-through cache-fill failure:
     /// with the blob store and metadata store on separate backends, `cache_blob`
     /// must store the bytes in the blob store and grant the reference in the
-    /// metadata store, committing each on its own executor. The previous design
-    /// folded both into one transaction and conflicted on every layer because
-    /// the blob-index read was verified against the wrong backend.
+    /// metadata store as independent idempotent work. The previous design folded
+    /// both into one transaction and conflicted on every layer because the
+    /// blob-index read was verified against the wrong backend.
     #[tokio::test]
     async fn cache_blob_grants_reference_with_split_blob_and_metadata_backends() {
         crate::metrics_provider::init_for_tests();
@@ -861,10 +861,7 @@ mod tests {
 
         let blob_obj: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(blob_dir.path().to_str().unwrap()).build());
-        let blob_store = Arc::new(BlobStore::new(build_store(
-            blob_obj.clone(),
-            locked_executor_over(blob_obj.clone()),
-        )));
+        let blob_store = Arc::new(BlobStore::new(blob_obj.clone(), None));
 
         let meta_obj: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(meta_dir.path().to_str().unwrap()).build());

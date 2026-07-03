@@ -244,6 +244,65 @@ pub async fn test_datastore_upload_operations(store: &BlobStore) {
     assert!(upload_result.is_err());
 }
 
+/// Repeated promotion of identical content converges on one blob. Two
+/// independent uploads of the same bytes both complete: the second moves onto
+/// the already-present content-addressed path (overwriting identical bytes),
+/// yields the same digest with intact content, and both sessions are swept.
+/// Covers promotion onto an existing destination plus best-effort session
+/// cleanup; single-session crash re-drive is the caller's `size(digest)` gate.
+pub async fn test_repeated_promotion_converges(store: &BlobStore) {
+    let content = b"idempotent promotion content";
+    let first = seed_blob(store, content).await;
+    let second = seed_blob(store, content).await;
+
+    assert_eq!(first, second, "identical content must map to one blob");
+    assert_eq!(store.read(&first).await.unwrap(), content);
+
+    let namespace = Namespace::new("test/setup").unwrap();
+    let (uploads, _) = store.list_uploads(&namespace, 10, None).await.unwrap();
+    assert!(
+        uploads.is_empty(),
+        "promoted sessions must be swept: {uploads:?}"
+    );
+}
+
+/// `complete_upload` consumes the session's liveness marker, so a second call on
+/// the same session returns `UploadNotFound` and leaves the promoted blob
+/// intact. A naive S3 re-finalize would overwrite the blob with an empty object,
+/// so this guards that the marker is consumed before the multipart-complete.
+pub async fn test_complete_upload_fails_on_rerun(store: &BlobStore) {
+    let namespace = Namespace::new("test/rerun").unwrap();
+    let uuid = Uuid::new_v4().to_string();
+    let content = b"one-shot completion";
+    store.create_upload(&namespace, &uuid).await.unwrap();
+    store
+        .write_upload(
+            &namespace,
+            &uuid,
+            Box::new(Cursor::new(content.to_vec())),
+            Some(content.len() as u64),
+            Algorithm::Sha256,
+        )
+        .await
+        .unwrap();
+    let digest = Digest::sha256_of_bytes(content);
+    store
+        .complete_upload(&namespace, &uuid, &digest)
+        .await
+        .unwrap();
+
+    let rerun = store.complete_upload(&namespace, &uuid, &digest).await;
+    assert!(
+        matches!(rerun, Err(Error::UploadNotFound)),
+        "re-run of a completed session must fail: {rerun:?}"
+    );
+    assert_eq!(
+        store.read(&digest).await.unwrap(),
+        content,
+        "blob must stay intact after a rejected re-run"
+    );
+}
+
 // Test entry points: run each helper against every backend fixture
 
 use crate::registry::test_utils::backends;
@@ -300,6 +359,22 @@ async fn blob_reader_with_offset_returns_full_size() {
 async fn upload_operations() {
     for tc in backends() {
         test_datastore_upload_operations(tc.blob_store().as_ref()).await;
+        tc.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn repeated_promotion_converges() {
+    for tc in backends() {
+        test_repeated_promotion_converges(tc.blob_store().as_ref()).await;
+        tc.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn complete_upload_fails_on_rerun() {
+    for tc in backends() {
+        test_complete_upload_fails_on_rerun(tc.blob_store().as_ref()).await;
         tc.cleanup().await;
     }
 }

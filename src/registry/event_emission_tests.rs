@@ -577,7 +577,7 @@ impl ReplicationFixture {
                 .access_time_debounce_secs(0)
                 .build(),
         );
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
         let repository =
             repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test"));

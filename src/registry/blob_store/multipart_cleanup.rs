@@ -84,7 +84,7 @@ impl MultipartCleanup for BlobStore {
 
         loop {
             let page = self
-                .store
+                .object
                 .list_multipart_uploads(key_marker.as_deref(), upload_id_marker.as_deref())
                 .await?;
 
@@ -99,7 +99,7 @@ impl MultipartCleanup for BlobStore {
                     continue;
                 };
                 let startedat_path = path_builder::upload_start_date_path(&namespace, uuid);
-                if self.store.head(&startedat_path).await.is_ok() {
+                if self.object.head(&startedat_path).await.is_ok() {
                     continue;
                 }
                 orphans.push(OrphanMultipartUpload {
@@ -125,7 +125,7 @@ impl MultipartCleanup for BlobStore {
         // `abort_upload` is keyed: it aborts every in-flight multipart at the
         // key and removes any staged remainder, subsuming the per-upload-id
         // abort.
-        self.store
+        self.object
             .abort_upload(&upload.key)
             .await
             .map_err(Error::from)

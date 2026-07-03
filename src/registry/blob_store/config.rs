@@ -1,11 +1,11 @@
 //! Blob-store configuration.
 //!
 //! [`BlobStoreConfig`] is the TOML-facing enum operators write under
-//! `[blob_store.fs]` or `[blob_store.s3]`. It selects which storage
-//! backend to instantiate, but the resulting [`BlobStore`] is the same
-//! unified type regardless: each arm only wires the capabilities its
-//! backend supports (S3 presigns and runs CAS; FS needs no extra wiring) into
-//! the shared `Arc<Store>` façade the `BlobStore` wraps.
+//! `[blob_store.fs]` or `[blob_store.s3]`. It selects which storage backend to
+//! instantiate, but the resulting [`BlobStore`] is the same unified type
+//! regardless: each arm wires the object store plus, on S3, the presign
+//! backend. The blob store holds no transaction executor: blob-lifecycle
+//! serialisation lives on the metadata store's `blob-data:{digest}` lock.
 
 use std::sync::Arc;
 
@@ -14,9 +14,8 @@ use serde::Deserialize;
 
 use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3TransportConfig};
 use angos_storage::{
-    ConditionalStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
+    ObjectStore, PresignedStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
-use angos_tx_engine::{executor::build_executor, lock::LockStrategy, store::Store};
 
 use crate::registry::{
     blob_store::{BlobStore, Error},
@@ -90,28 +89,21 @@ impl Default for BlobStoreConfig {
 }
 
 impl BlobStoreConfig {
-    /// Build the unified [`Backend`].
+    /// Build the unified [`BlobStore`].
     ///
-    /// For FS the transaction executor is constructed with an in-process
-    /// memory lock strategy; the backend tidies its own empty directories on
-    /// delete, so no extra handle is wired for that. For S3 the storage
-    /// backend is also wired as a `ConditionalStore` for the CAS executor and
-    /// as a `PresignedStore` for download URLs.
+    /// FS wires only the object store (the backend prunes its own empty
+    /// directories on delete). S3 additionally wires the presign backend for
+    /// download URLs. Neither wires a transaction executor: the blob store is
+    /// pure storage and coordinates through the metadata store's lock.
     pub fn build_backend(&self) -> Result<BlobStore, Error> {
-        // Each arm wires the capabilities its backend supports (S3 presigns and
-        // runs CAS; FS needs neither, it prunes its own empty ancestors on
-        // delete); the façade build and BlobStore wrap are shared.
-        let builder = match self {
+        match self {
             BlobStoreConfig::FS(config) => {
-                let raw = Arc::new(
+                let object: Arc<dyn ObjectStore> = Arc::new(
                     StorageFsBackend::builder(&config.root_dir)
                         .sync_to_disk(config.sync_to_disk)
                         .build(),
                 );
-                let executor =
-                    build_executor(raw.clone(), None, LockStrategy::Memory, None, false, false)
-                        .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                Store::builder(raw, executor)
+                Ok(BlobStore::new(object, None))
             }
             BlobStoreConfig::S3(config) => {
                 let transport = S3TransportConfig {
@@ -127,28 +119,17 @@ impl BlobStoreConfig {
                 };
                 let http = S3HttpBackend::new(&transport)
                     .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                let raw = Arc::new(
+                let backend = Arc::new(
                     StorageS3Backend::builder(Arc::new(http))
                         .part_size(config.transport.multipart_part_size.as_u64())
                         .uniform_parts(config.transport.multipart_uniform_parts)
                         .build(),
                 );
-                let conditional: Arc<dyn ConditionalStore> = raw.clone();
-                let executor = build_executor(
-                    raw.clone(),
-                    Some(conditional),
-                    LockStrategy::Memory,
-                    None,
-                    false,
-                    false,
-                )
-                .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                Store::builder(raw.clone(), executor).presign(raw)
+                let object: Arc<dyn ObjectStore> = backend.clone();
+                let presign: Arc<dyn PresignedStore> = backend;
+                Ok(BlobStore::new(object, Some(presign)))
             }
-        };
-
-        let store = Arc::new(builder.build());
-        Ok(BlobStore::new(store))
+        }
     }
 }
 
@@ -167,7 +148,7 @@ mod tests {
             sync_to_disk: false,
         });
         let backend = config.build_backend().unwrap();
-        assert!(!backend.store.supports_presign());
+        assert!(!backend.supports_presign());
     }
 
     #[test]
@@ -184,7 +165,7 @@ mod tests {
             ..S3BackendConfig::default()
         });
         let backend = config.build_backend().unwrap();
-        assert!(backend.store.supports_presign());
+        assert!(backend.supports_presign());
     }
 
     /// `[blob_store.s3]` round-trip: flat TOML deserialises into both the

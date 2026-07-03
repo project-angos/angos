@@ -294,9 +294,11 @@ impl Registry {
 
 /// Construct the in-process job queue used when `[global.job_queue]` is absent.
 ///
-/// Sharing the registry's store backend is required: cache-fill commits and
-/// replication reads only resolve against the store holding the bytes, and
-/// jobs persisted under its `_jobs/` prefix survive restarts.
+/// The queue runs on the metadata store's coordinated `Store`: job records
+/// under its `_jobs/` prefix are committed through its transaction executor and
+/// survive restarts. The cache-fill handler resolves blob bytes and metadata
+/// grants directly through their own stores as idempotent work, so the queue
+/// needs no co-location with the blob backend.
 fn build_in_process_queue(
     resolver: &Arc<RepositoryResolver>,
     blob_store: &Arc<BlobStore>,
@@ -304,15 +306,8 @@ fn build_in_process_queue(
     cache_concurrency: NonZeroUsize,
     replication_concurrency: NonZeroUsize,
 ) -> (Arc<JobStore>, CancellationToken) {
-    // Share the registry's object store and transaction executor (the same
-    // handle the blob/metadata stores use). The cache-fill handler stages bytes
-    // into the blob store and returns a transaction that moves them into
-    // blob-data and grants metadata references; that transaction must commit
-    // against the backend where the bytes were staged. A private object store
-    // here would make those mutations fail with `NotFound`
-    // (see doc/reviews/20260603-in-process-cache-fill-broken.md).
-    let store = Arc::clone(&blob_store.store);
-    let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "in-process"));
+    let job_store: Arc<JobStore> =
+        Arc::new(JobStore::new(metadata_store.store_arc(), "in-process"));
 
     let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
         resolver.clone(),
@@ -468,7 +463,7 @@ mod in_process_replication_tests {
                 .access_time_debounce_secs(0)
                 .build(),
         );
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
         let mut repositories = HashMap::new();
         repositories.insert(REPO.to_string(), repository);
@@ -499,11 +494,11 @@ mod in_process_replication_tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
         let client = downstream_client(&mock_server.uri());
-        let (registry, blob_store, metadata_store) = build_registry(root, client);
+        let (registry, _blob_store, metadata_store) = build_registry(root, client);
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (manifest_digest, config_digest, layer_digest) =
-            seed_manifest(&blob_store.store, &metadata_store, &namespace).await;
+            seed_manifest(metadata_store.store(), &metadata_store, &namespace).await;
 
         // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
         for blob in [&config_digest, &layer_digest] {
@@ -575,7 +570,7 @@ mod in_process_replication_tests {
         .await
         .unwrap_or(false);
 
-        let inspector = JobStore::new(Arc::clone(&blob_store.store), "inspector");
+        let inspector = JobStore::new(metadata_store.store_arc(), "inspector");
 
         if !saw_put {
             let received = mock_server.received_requests().await.unwrap_or_default();

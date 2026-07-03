@@ -50,7 +50,7 @@ fn test_blob_store(root: &str) -> (Arc<BlobStore>, Arc<MetadataStore>, Arc<Store
     let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
     let executor = build_test_fs_executor(root, false);
     let store = build_store(object, executor);
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
             .link_cache_ttl(0)
