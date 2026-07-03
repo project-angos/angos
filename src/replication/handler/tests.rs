@@ -213,7 +213,7 @@ async fn execute_rejects_unknown_kind() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let mut repositories = HashMap::new();
     repositories.insert(
@@ -257,7 +257,7 @@ async fn execute_errors_on_removed_downstream() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let mut repositories = HashMap::new();
     repositories.insert(
@@ -297,7 +297,7 @@ async fn execute_pushes_manifest_with_head_before_put() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -382,7 +382,7 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     // Local content lives in the `nginx/app` sub-namespace; the mapping strips
     // `nginx` and prepends `mirror`, so the remote path is `mirror/app`.
@@ -488,7 +488,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     // Two manifests sharing the same blobs; the tag starts on `stale`.
     let config_bytes = br#"{"config":true}"#.to_vec();
@@ -627,7 +627,7 @@ async fn execute_skips_blob_present_on_downstream() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -688,7 +688,7 @@ async fn execute_push_stamps_resolved_source_timestamp() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -765,7 +765,7 @@ async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -837,7 +837,7 @@ async fn execute_push_surfaces_immutable_conflict_409_as_error() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let (_manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -898,7 +898,7 @@ async fn execute_push_treats_superseded_409_as_success() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let (_manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -965,7 +965,7 @@ async fn execute_delete_manifest_calls_downstream_delete() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let mut repositories = HashMap::new();
     repositories.insert(
@@ -1000,7 +1000,7 @@ async fn handler_with_downstream(
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     let (_manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -1183,7 +1183,7 @@ async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     // No tag seeded, so the resolve short-circuits; the unreachable
     // downstream URL makes any wrongful push error.
@@ -1238,7 +1238,7 @@ async fn execute_tagless_push_with_deleted_revision_is_noop_success() {
             .access_time_debounce_secs(0)
             .build(),
     );
-    let blob_store = Arc::new(BlobStore::new(store.clone()));
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
 
     // No revision link seeded, so the resolve short-circuits; the
     // unreachable downstream URL makes any wrongful push error.

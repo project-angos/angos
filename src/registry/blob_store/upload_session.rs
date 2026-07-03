@@ -21,14 +21,15 @@
 //! persisted session value, so the S3 backend recovers its multipart state from
 //! S3 on each call and the upload is addressed purely by its `data` key. Upload
 //! progress (size, hash) is the blob store's concern, reconstructed by reading
-//! the per-file artifacts through the engine [`Store`](angos_tx_engine::store::Store).
+//! the per-file artifacts.
 //!
-//! `complete` is two-phase:
-//! 1. [`Store::complete_upload`](angos_tx_engine::store::Store::complete_upload)
-//!    runs (S3 multipart-complete on S3; no-op finalize on FS) so the assembled
-//!    object lands at `upload_path`.
-//! 2. A single engine `Transaction` atomically moves the assembled object to
-//!    its canonical blob path and deletes the per-file session artifacts.
+//! `complete` promotes the upload under the caller's `blob-data:{digest}` lock:
+//! 1. The `startedat` liveness marker is deleted, consuming the session so a
+//!    re-run fails (`UploadNotFound`) instead of re-finalizing.
+//! 2. The object store's `complete_upload` runs (S3 multipart-complete; no-op
+//!    finalize on FS) so the assembled object lands at `upload_path`.
+//! 3. The assembled object is moved to its content-addressed blob path, then the
+//!    remaining staging artifacts are swept best-effort.
 
 use std::io::Cursor;
 
@@ -40,10 +41,7 @@ use tokio::{
 };
 use tracing::instrument;
 
-use angos_tx_engine::{
-    StorageError,
-    transaction::{Mutation, Transaction},
-};
+use angos_tx_engine::StorageError;
 
 use crate::{
     oci::{Algorithm, Digest, Namespace},
@@ -148,7 +146,7 @@ impl BlobStore {
         uuid: &str,
     ) -> Result<DateTime<Utc>, Error> {
         let key = path_builder::upload_start_date_path(namespace, uuid);
-        let data = match self.store.get(&key).await {
+        let data = match self.object.get(&key).await {
             Ok(data) => data,
             Err(StorageError::NotFound) => return Err(Error::UploadNotFound),
             Err(e) => return Err(e.into()),
@@ -166,7 +164,7 @@ impl BlobStore {
     ) -> Result<(), Error> {
         let key = path_builder::upload_start_date_path(namespace, uuid);
         let body = started_at.to_rfc3339();
-        self.store.put(&key, Bytes::from(body)).await?;
+        self.object.put(&key, Bytes::from(body)).await?;
         Ok(())
     }
 
@@ -185,7 +183,7 @@ impl BlobStore {
         let mut highest: Option<u64> = None;
         let mut token = None;
         loop {
-            let page = self.store.list(&dir, 1000, token).await?;
+            let page = self.object.list(&dir, 1000, token).await?;
             for key in &page.items {
                 // `list` yields prefix-relative keys, so the trailing path
                 // component is the checkpoint offset (cumulative bytes hashed).
@@ -208,7 +206,7 @@ impl BlobStore {
         };
         let key =
             path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
-        match self.store.get(&key).await {
+        match self.object.get(&key).await {
             Ok(data) => Ok((data, offset)),
             Err(StorageError::NotFound) => Err(Error::UploadNotFound),
             Err(e) => Err(e.into()),
@@ -226,7 +224,7 @@ impl BlobStore {
     ) -> Result<(), Error> {
         let key =
             path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
-        self.store.put(&key, Bytes::copy_from_slice(state)).await?;
+        self.object.put(&key, Bytes::copy_from_slice(state)).await?;
         Ok(())
     }
 
@@ -241,7 +239,7 @@ impl BlobStore {
         let mut uuids: Vec<String> = Vec::new();
         let mut token = None;
         loop {
-            let page = self.store.list_children(&root, 1000, token, None).await?;
+            let page = self.object.list_children(&root, 1000, token, None).await?;
             // Sub-prefix names are bare per the `ChildrenPage` contract, so the
             // upload UUIDs can be taken directly.
             uuids.extend(page.sub_prefixes);
@@ -264,7 +262,7 @@ impl BlobStore {
         let upload_path = path_builder::upload_path(namespace, uuid);
         // Begin/clear a fresh upload at the data key (clears any leaked prior
         // multipart and staged remainder).
-        self.store.create_upload(&upload_path).await?;
+        self.object.create_upload(&upload_path).await?;
 
         let hash_context = Hasher::new().state().to_bytes()?;
         let record = UploadSessionRecord {
@@ -384,7 +382,7 @@ impl BlobStore {
 
         let upload_path = path_builder::upload_path(namespace, uuid);
         let write_result = self
-            .store
+            .object
             .write_upload(&upload_path, body_stream, content_length)
             .await;
         let hash_result = finish
@@ -419,46 +417,17 @@ impl BlobStore {
         })
     }
 
-    /// Run the backend completion step and return the engine mutations that
-    /// atomically promote the staged bytes to `blob-data/<digest>` and delete
-    /// the per-file session artifacts. The caller supplies the verified digest
-    /// (its algorithm fixes the canonical blob path).
-    #[instrument(skip(self))]
-    pub async fn finalize_upload_mutations(
-        &self,
-        namespace: &Namespace,
-        uuid: &str,
-        digest: &Digest,
-    ) -> Result<(Digest, Vec<Mutation>), Error> {
-        // Confirm the session is live (UploadNotFound otherwise) before promoting.
-        self.read_session(namespace, uuid).await?;
-        let upload_key = path_builder::upload_path(namespace, uuid);
-
-        self.store.complete_upload(&upload_key).await?;
-        let blob_key = path_builder::blob_path(digest);
-
-        let mut mutations = vec![Mutation::Move {
-            src: upload_key,
-            dst: blob_key,
-        }];
-        for key in session_record_keys(namespace, uuid) {
-            mutations.push(Mutation::Delete {
-                key,
-                expected: None,
-            });
-        }
-
-        Ok((digest.clone(), mutations))
-    }
-
-    /// Finish the upload and atomically relocate the data to the canonical
-    /// blob path while deleting the per-file session artifacts.
+    /// Finish the upload and promote the assembled data to its canonical blob
+    /// path.
     ///
-    /// The two-phase finalization is composed here in the registry, not the
-    /// engine: [`Self::finalize_upload_mutations`] runs the backend completion
-    /// step (an engine *primitive*) and returns the promoting `Move` + record
-    /// `Delete` mutations, which this method commits in a single engine
-    /// [`Transaction`] via [`Store::execute`](angos_tx_engine::store::Store::execute).
+    /// The session's `startedat` liveness marker is deleted up front, consuming
+    /// the session so a re-run returns [`Error::UploadNotFound`] rather than
+    /// re-finalizing an already-completed upload (on S3 a naive re-finalize
+    /// overwrites the blob with an empty object). The caller holds the
+    /// `blob-data:{digest}` lock and skips this when the blob already exists, so
+    /// a crash after promotion is short-circuited; a crash after the marker is
+    /// consumed but before promotion makes the client re-push, and scrub
+    /// reclaims the leftover session dir.
     #[instrument(skip(self))]
     pub async fn complete_upload(
         &self,
@@ -466,24 +435,23 @@ impl BlobStore {
         uuid: &str,
         digest: &Digest,
     ) -> Result<Digest, Error> {
-        let (final_digest, mutations) = self
-            .finalize_upload_mutations(namespace, uuid, digest)
-            .await?;
+        // Confirm the session is live, then consume its liveness marker so any
+        // re-run fails at the check above instead of re-finalizing.
+        self.read_session(namespace, uuid).await?;
+        let started_at = path_builder::upload_start_date_path(namespace, uuid);
+        self.object.delete(&started_at).await?;
 
-        let mut builder = Transaction::builder();
-        for mutation in mutations {
-            builder = builder.mutation(mutation);
-        }
-        self.store
-            .execute(builder.build())
-            .await
-            .map_err(|e| Error::StorageBackend(e.to_string()))?;
+        let upload_key = path_builder::upload_path(namespace, uuid);
+        self.object.complete_upload(&upload_key).await?;
 
-        // Best-effort cleanup of staging artifacts; not in the transaction
-        // because failure here does not affect correctness.
+        let blob_key = path_builder::blob_path(digest);
+        self.object.move_object(&upload_key, &blob_key).await?;
+
+        // Sweep the remaining staging artifacts best-effort; scrub reclaims any leftover.
         let container = path_builder::upload_container_path(namespace, uuid);
-        let _ = self.store.delete_prefix(&container).await;
-        Ok(final_digest)
+        let _ = self.object.delete_prefix(&container).await;
+
+        Ok(digest.clone())
     }
 
     /// Abort the upload and delete the per-file session artifacts plus any
@@ -493,19 +461,10 @@ impl BlobStore {
         let upload_path = path_builder::upload_path(namespace, uuid);
         // Discard the upload and all backend state it owns (in-progress
         // multipart(s) and any staged remainder on S3; the staging file on FS).
-        let _ = self.store.abort_upload(&upload_path).await;
+        let _ = self.object.abort_upload(&upload_path).await;
 
         let container = path_builder::upload_container_path(namespace, uuid);
-        self.store.delete_prefix(&container).await?;
+        self.object.delete_prefix(&container).await?;
         Ok(())
     }
-}
-
-/// The per-file session artifacts deleted atomically by the finalization
-/// transaction. The bulk staging artifacts (`data`, `staged/`, the
-/// `hashstates/` tree) are swept best-effort afterwards via `delete_prefix`;
-/// only the metadata file that marks the session as live is removed in the
-/// transaction.
-fn session_record_keys(namespace: &Namespace, uuid: &str) -> Vec<String> {
-    vec![path_builder::upload_start_date_path(namespace, uuid)]
 }

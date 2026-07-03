@@ -546,7 +546,7 @@ mod tests {
     async fn end_to_end_deletes_only_the_orphan_replication_job() {
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
@@ -750,7 +750,7 @@ mod tests {
     async fn end_to_end_deletes_only_the_orphan_cache_job() {
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.clone()));
+        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         enqueue_cache_fill(&job_store, NAMESPACE).await;

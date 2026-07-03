@@ -51,7 +51,8 @@ impl StoreChecker for LayoutChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{blob_store, test_utils::put_blob_direct};
+    use crate::{oci::Digest, registry::blob_store};
+    use bytes::Bytes;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -66,7 +67,12 @@ mod tests {
             .build_backend()
             .unwrap(),
         );
-        let digest = put_blob_direct(blob_store.store.as_ref(), b"layout migration").await;
+        let content = b"layout migration";
+        let digest = Digest::sha256_of_bytes(content);
+        blob_store
+            .put_blob(&digest, Bytes::from_static(content))
+            .await
+            .unwrap();
 
         let checker = LayoutChecker::new(blob_store);
         let mut actions = Vec::new();

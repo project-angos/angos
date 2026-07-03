@@ -359,7 +359,7 @@ mod tests {
                 .access_time_debounce_secs(0)
                 .build(),
         );
-        let blob_store = Arc::new(BlobStore::new(storage.clone()));
+        let blob_store = Arc::new(BlobStore::new(storage.object_store().clone(), None));
         let repositories = Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());
 
         let context = WorkerContext {

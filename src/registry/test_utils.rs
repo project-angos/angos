@@ -423,7 +423,7 @@ impl RegistryTestCase for S3RegistryTestCase {
     async fn cleanup(&self) {
         if let Err(e) = self
             .s3_blob_store
-            .store
+            .object_store()
             .delete_prefix(&self.key_prefix)
             .await
         {

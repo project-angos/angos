@@ -1,10 +1,13 @@
 //! Blob storage subsystem.
 //!
-//! Exposes a single [`BlobStore`] over an `Arc<Store>` façade that bundles the
-//! object store, upload-session store, optional presign backend, and the
-//! transaction executor for upload promotion. FS and S3 share one code path
-//! (the [`BlobStoreConfig`] enum only picks the storage handles); all public
-//! methods are inherent on `BlobStore`, with no caller-facing trait.
+//! Exposes a single [`BlobStore`] over a plain [`ObjectStore`] plus an optional
+//! [`PresignedStore`]. The blob store is pure storage: it performs no
+//! coordination and holds no transaction executor. Blob-lifecycle serialisation
+//! lives entirely on the metadata store's `blob-data:{digest}` lock, which every
+//! caller (push, upload, delete, scrub) acquires before mutating blob bytes. FS
+//! and S3 share one code path (the [`BlobStoreConfig`] enum only picks the
+//! storage handles); all public methods are inherent on `BlobStore`, with no
+//! caller-facing trait.
 
 mod config;
 mod error;
@@ -24,7 +27,8 @@ use chrono::{DateTime, Utc};
 use tokio::io::AsyncRead;
 use tracing::{debug, instrument};
 
-use angos_tx_engine::{StorageError, store::Store};
+use angos_storage::{ObjectStore, PresignedStore};
+use angos_tx_engine::StorageError;
 
 pub use config::BlobStoreConfig;
 // Inner config structs are only constructed by tests; production code builds
@@ -50,11 +54,12 @@ pub struct UploadSummary {
 
 #[derive(Clone)]
 pub struct BlobStore {
-    /// Storage façade: object reads/writes, the upload lifecycle (including
-    /// finalization), and presigning all flow through here. The façade owns the
-    /// executor used by the upload-promotion transaction. (On FS, the backend
-    /// prunes its own empty ancestor directories on delete, callers don't.)
-    pub store: Arc<Store>,
+    /// Object reads/writes and the upload lifecycle. On FS the backend prunes
+    /// its own empty ancestor directories on delete, so callers don't.
+    object: Arc<dyn ObjectStore>,
+    /// Presign backend, when the storage supports it (S3 only). Absent for FS,
+    /// where reads stream instead.
+    presign: Option<Arc<dyn PresignedStore>>,
 }
 
 impl Debug for BlobStore {
@@ -64,12 +69,26 @@ impl Debug for BlobStore {
 }
 
 impl BlobStore {
-    /// Construct a blob store over the storage façade `store`. Build the façade
-    /// with the upload-session store enabled (and, where applicable, the
-    /// presign backend).
+    /// Construct a blob store over `object`, optionally with a `presign`
+    /// backend for signed download URLs (S3; `None` on FS).
     #[must_use]
-    pub fn new(store: Arc<Store>) -> Self {
-        BlobStore { store }
+    pub fn new(object: Arc<dyn ObjectStore>, presign: Option<Arc<dyn PresignedStore>>) -> Self {
+        BlobStore { object, presign }
+    }
+
+    /// The underlying object store. Test escape hatch for raw prefix access
+    /// (fixture cleanup, storage-seam fault injection) outside the blob API.
+    #[cfg(test)]
+    #[must_use]
+    pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.object
+    }
+
+    /// Whether a presign backend is wired (S3 has one; FS does not).
+    #[cfg(test)]
+    #[must_use]
+    pub fn supports_presign(&self) -> bool {
+        self.presign.is_some()
     }
 }
 
@@ -91,7 +110,7 @@ impl BlobStore {
             continuation_token,
             |algorithm, limit, cursor| async move {
                 let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
-                let page = self.store.list(&blob_prefix, limit, cursor).await?;
+                let page = self.object.list(&blob_prefix, limit, cursor).await?;
                 let blobs = page
                     .items
                     .into_iter()
@@ -109,7 +128,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
         let path = path_builder::blob_path(digest);
-        match self.store.get(&path).await {
+        match self.object.get(&path).await {
             Ok(data) => Ok(data),
             Err(StorageError::NotFound) => Err(Error::BlobNotFound),
             Err(e) => Err(e.into()),
@@ -119,7 +138,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn size(&self, digest: &Digest) -> Result<u64, Error> {
         let path = path_builder::blob_path(digest);
-        match self.store.head(&path).await {
+        match self.object.head(&path).await {
             Ok(meta) => Ok(meta.size),
             Err(StorageError::NotFound) => Err(Error::BlobNotFound),
             Err(e) => Err(e.into()),
@@ -132,7 +151,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn last_modified(&self, digest: &Digest) -> Result<Option<DateTime<Utc>>, Error> {
         let path = path_builder::blob_path(digest);
-        match self.store.head(&path).await {
+        match self.object.head(&path).await {
             Ok(meta) => Ok(meta.last_modified),
             Err(StorageError::NotFound) => Err(Error::BlobNotFound),
             Err(e) => Err(e.into()),
@@ -146,7 +165,7 @@ impl BlobStore {
         start_offset: Option<u64>,
     ) -> Result<(BoxedReader, u64), Error> {
         let path = path_builder::blob_path(digest);
-        match self.store.get_stream(&path, start_offset).await {
+        match self.object.get_stream(&path, start_offset).await {
             Ok((reader, total)) => Ok((reader, total)),
             Err(StorageError::NotFound) => Err(Error::BlobNotFound),
             Err(e) => Err(e.into()),
@@ -156,7 +175,7 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn delete_blob(&self, digest: &Digest) -> Result<(), Error> {
         let container = path_builder::blob_container_dir(digest);
-        self.store.delete_prefix(&container).await?;
+        self.object.delete_prefix(&container).await?;
         Ok(())
     }
 
@@ -168,7 +187,7 @@ impl BlobStore {
         let prefix = path_builder::namespace_dir(name).ok_or_else(|| {
             Error::InvalidFormat(format!("unsafe namespace directory name: '{name}'"))
         })?;
-        self.store.delete_prefix(&prefix).await?;
+        self.object.delete_prefix(&prefix).await?;
         Ok(())
     }
 
@@ -178,7 +197,7 @@ impl BlobStore {
     /// serialise against concurrent reclaim with the blob-data lock.
     #[instrument(skip(self, body))]
     pub async fn put_blob(&self, digest: &Digest, body: Bytes) -> Result<(), Error> {
-        self.store
+        self.object
             .put(&path_builder::blob_path(digest), body)
             .await?;
         Ok(())
@@ -190,19 +209,21 @@ impl BlobStore {
 impl BlobStore {
     /// Generate a presigned download URL for `digest` when the underlying
     /// storage supports presigning. Returns `Ok(None)` when no presigning
-    /// backend was provided to the builder.
+    /// backend was wired (FS).
     #[instrument(skip(self))]
     pub async fn presigned_url(
         &self,
         digest: &Digest,
         content_type: Option<&str>,
     ) -> Result<Option<String>, Error> {
+        let Some(presign) = &self.presign else {
+            return Ok(None);
+        };
         let path = path_builder::blob_path(digest);
-        let url = self
-            .store
-            .presigned_get(&path, Duration::from_mins(30), content_type)
+        let url = presign
+            .presign_get(&path, Duration::from_mins(30), content_type)
             .await?;
-        Ok(url)
+        Ok(Some(url))
     }
 }
 

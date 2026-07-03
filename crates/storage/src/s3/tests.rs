@@ -297,6 +297,31 @@ async fn upload_uniform_round_trip() {
     assert_eq!(assembled, expected);
 }
 
+/// Re-running `complete_upload` on an already-finalized session is a no-op: with
+/// the multipart gone and staging cleared it lands on the `(None, 0)` arm, which
+/// must not overwrite the promoted object with an empty one.
+#[tokio::test]
+async fn upload_complete_rerun_preserves_object() {
+    let store = backend();
+    let key = format!("up/rerun/{}/data", Uuid::new_v4());
+    let body = vec![0x5a; 1024];
+
+    store.create_upload(&key).await.unwrap();
+    store
+        .write_upload(&key, frame(body.clone()), Some(body.len() as u64))
+        .await
+        .unwrap();
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), body);
+
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(
+        store.get(&key).await.unwrap(),
+        body,
+        "a re-run must not overwrite the finalized object with an empty one"
+    );
+}
+
 /// Unknown-length upload (`None`): a chunked request with no `Content-Length`
 /// streams the body to EOF, flushing whole parts and restaging the trailing
 /// remainder. This is the `docker push` code path.

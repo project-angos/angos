@@ -634,9 +634,17 @@ impl ObjectStore for Backend {
         let staged_len = self.staged_size(key, committed_size).await?;
 
         match (upload_id, staged_len) {
-            (None, 0) => {
-                self.client.put_object(key, Bytes::new()).await?;
-            }
+            (None, 0) => match self.head(key).await {
+                // The object is already materialized: a re-run of a completed
+                // session (any upload size lands here once its multipart is
+                // finalized and staging is gone), or a prior zero-byte
+                // completion. No-op, so completing again never overwrites a
+                // finalized object with an empty one.
+                Ok(_) => {}
+                // Genuinely absent: a zero-byte upload, so create the empty object.
+                Err(Error::NotFound) => self.client.put_object(key, Bytes::new()).await?,
+                Err(e) => return Err(e),
+            },
             (None, _) => {
                 // Small upload: promote the staged remainder to the canonical
                 // key and clean up.

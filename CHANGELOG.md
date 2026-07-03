@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.3.1
+
+## Changed
+
+- Storage coordination now runs entirely on the metadata store: the blob store holds only blob bytes (its backend no longer carries `.tx-log/`/`.tx-bodies/` prefixes) and the in-process job queue persists on the metadata store.
+
 ## 1.3.0
 
 ### Added

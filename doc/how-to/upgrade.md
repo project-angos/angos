@@ -274,3 +274,13 @@ allow_missing_manifest_references = false
 ```
 
 `subject` referrers are accepted regardless of this setting, and pull-through cache-fill writes are trusted, independent of the flag.
+
+### In-Process Job Queue Moved to the Metadata Store
+
+#### What Changed
+
+The blob store is now pure storage with no transaction engine. The in-process job queue (used when `[global.job_queue]` is absent) persists its `_jobs/` records on the metadata store instead of the blob store.
+
+**Who is affected:** Only deployments that run the in-process queue **and** place the blob store and metadata store on separate backends. When both share one backend (the default), the `_jobs/` location is physically unchanged and no action is required.
+
+On a split-backend deployment, drain the in-process queue before upgrading: `_jobs/` records still pending on the blob backend become invisible to the new queue after the upgrade. Cache-fill jobs re-enqueue on the next pull, but an in-flight `event-only` replication push is not re-driven by `scrub --replicate`, so re-push affected tags if the queue was not drained. Leftover `_jobs/`, `.tx-log/`, `.tx-bodies/`, and `.tx-locks/` objects on the blob backend are inert and can be deleted manually.

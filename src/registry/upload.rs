@@ -563,12 +563,6 @@ mod tests {
         header::{LOCATION, RANGE},
     };
 
-    use angos_storage::{
-        BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
-        MultipartUploadPage, ObjectMeta, ObjectStore, Page,
-    };
-    use angos_tx_engine::store::Store;
-
     use crate::{
         auth::Authorizer,
         cache,
@@ -590,13 +584,17 @@ mod tests {
         },
         test_fixtures::configuration::load_config,
     };
+    use angos_storage::{
+        BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
+        MultipartUploadPage, ObjectMeta, ObjectStore, Page,
+    };
 
     /// Which storage operation the [`FailingStorage`] wrapper turns into a
     /// hard error. Everything else delegates to the inner backend untouched.
     #[derive(Clone, Copy)]
     enum FailOp {
-        /// Fail the session-record delete that backs `delete_upload` cleanup.
-        Delete,
+        /// Fail the best-effort container sweep at the end of promotion.
+        DeletePrefix,
         /// Fail `complete_upload`: must never run on the existing-blob path.
         CompleteUpload,
         /// Fail `write_upload`: must never run on the monolithic existing-blob
@@ -606,8 +604,8 @@ mod tests {
 
     /// Delegating storage wrapper that injects a single failure at the storage
     /// seam so upload fast-paths can be proven to avoid a given op. Wraps an
-    /// [`ObjectStore`] (the CRUD floor plus the upload-session methods), so it
-    /// stands in for the whole storage seam of the [`Store`] façade.
+    /// [`ObjectStore`] (the CRUD floor plus the upload-session methods), the
+    /// whole storage seam the blob store speaks.
     struct FailingStorage {
         inner: Arc<dyn ObjectStore>,
         fail: FailOp,
@@ -636,13 +634,13 @@ mod tests {
         }
 
         async fn delete(&self, key: &str) -> Result<(), StorageError> {
-            if matches!(self.fail, FailOp::Delete) {
-                return Err(fail("delete failed"));
-            }
             self.inner.delete(key).await
         }
 
         async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
+            if matches!(self.fail, FailOp::DeletePrefix) {
+                return Err(fail("delete_prefix failed"));
+            }
             self.inner.delete_prefix(prefix).await
         }
 
@@ -715,16 +713,14 @@ mod tests {
         }
     }
 
-    /// Rebuild `inner` with its storage seam wrapped so `fail` errors out,
-    /// reusing the same upload backend and executor.
+    /// Rebuild `inner` with its object store wrapped so `fail` errors out,
+    /// reusing the same upload backend.
     fn failing_blob_store(inner: &Arc<BlobStore>, fail: FailOp) -> Arc<BlobStore> {
-        let object = inner.store.object_store().clone();
         let failing = Arc::new(FailingStorage {
-            inner: object,
+            inner: inner.object_store().clone(),
             fail,
         });
-        let facade = Arc::new(Store::builder(failing, inner.store.executor().clone()).build());
-        Arc::new(BlobStore::new(facade))
+        Arc::new(BlobStore::new(failing, None))
     }
 
     #[tokio::test]
@@ -1517,10 +1513,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_upload_succeeds_when_cleanup_delete_fails() {
+    async fn test_complete_upload_succeeds_when_container_sweep_fails() {
         let test_case = FSRegistryTestCase::new();
         let registry = create_test_registry(
-            failing_blob_store(&RegistryTestCase::blob_store(&test_case), FailOp::Delete),
+            failing_blob_store(
+                &RegistryTestCase::blob_store(&test_case),
+                FailOp::DeletePrefix,
+            ),
             test_case.metadata_store(),
         );
         let namespace = &Namespace::new("test-repo").unwrap();
