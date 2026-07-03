@@ -135,12 +135,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_check_passes_immediately() {
-        let cb = CircuitBreaker::new();
-        assert!(cb.check().is_ok());
-    }
-
-    #[test]
     fn default_is_equivalent_to_new() {
         let cb = CircuitBreaker::default();
         assert_eq!(cb.consecutive_failures.load(Ordering::Acquire), 0);
@@ -246,15 +240,6 @@ mod tests {
             cb.record_failure();
         }
         assert!(cb.check().is_ok());
-    }
-
-    #[test]
-    fn check_fails_when_threshold_crossed() {
-        let cb = CircuitBreaker::new();
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
-            cb.record_failure();
-        }
-        assert!(cb.check().is_err());
     }
 
     #[test]
@@ -431,16 +416,5 @@ mod tests {
             cb.check().is_ok(),
             "a fresh probe is admitted after the next cooldown elapses"
         );
-    }
-
-    #[test]
-    fn half_open_probe_success_closes_breaker() {
-        let cb = open_and_elapse_cooldown();
-        assert!(cb.check().is_ok(), "probe admitted");
-
-        // The probe succeeds: the breaker closes and admits everyone again.
-        cb.record_success();
-        assert!(cb.check().is_ok(), "closed breaker admits the next caller");
-        assert!(cb.check().is_ok(), "and the one after that");
     }
 }

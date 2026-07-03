@@ -305,76 +305,76 @@ pub async fn test_complete_upload_fails_on_rerun(store: &BlobStore) {
 
 // Test entry points: run each helper against every backend fixture
 
-use crate::registry::test_utils::backends;
+use crate::registry::test_utils::for_each_backend;
 
 #[tokio::test]
 async fn list_uploads() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_datastore_list_uploads(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn list_blobs() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_datastore_list_blobs(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn list_blobs_across_algorithms() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_datastore_list_blobs_across_algorithms(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn blob_operations() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_datastore_blob_operations(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn blob_reader_returns_size() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_build_blob_reader_returns_size(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn blob_reader_with_offset_returns_full_size() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_build_blob_reader_with_offset_returns_full_size(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn upload_operations() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_datastore_upload_operations(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn repeated_promotion_converges() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_repeated_promotion_converges(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn complete_upload_fails_on_rerun() {
-    for tc in backends() {
+    for_each_backend(async |tc| {
         test_complete_upload_fails_on_rerun(tc.blob_store().as_ref()).await;
-        tc.cleanup().await;
-    }
+    })
+    .await;
 }

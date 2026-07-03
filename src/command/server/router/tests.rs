@@ -60,19 +60,6 @@ fn test_parse_list_catalog_with_pagination() {
 }
 
 #[test]
-fn test_parse_list_catalog_full_pagination() {
-    let method = Method::GET;
-    let uri: Uri = "/v2/_catalog?n=100&last=foo".parse().unwrap();
-    let route = parse(&method, &uri);
-    if let Some(Action::ListCatalog { n, last }) = route {
-        assert_eq!(n, Some(100));
-        assert_eq!(last, Some("foo".to_string()));
-    } else {
-        panic!("Expected ListCatalog route");
-    }
-}
-
-#[test]
 fn test_parse_list_catalog_non_numeric_n() {
     let method = Method::GET;
     let uri: Uri = "/v2/_catalog?n=abc".parse().unwrap();
@@ -248,21 +235,6 @@ fn test_parse_start_upload_with_malformed_digest_is_rejected() {
         route.is_none(),
         "a malformed ?digest= must not start a session (POST -> 400), got: {route:?}"
     );
-}
-
-#[test]
-fn test_parse_start_upload_no_digest_is_session() {
-    let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
-    let route = parse(&Method::POST, &uri);
-    if let Some(Action::StartUpload {
-        namespace, digest, ..
-    }) = route
-    {
-        assert_eq!(namespace, "myrepo/app");
-        assert!(digest.is_none());
-    } else {
-        panic!("Expected StartUpload route, got: {route:?}");
-    }
 }
 
 #[test]

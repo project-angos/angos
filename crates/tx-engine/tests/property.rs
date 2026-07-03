@@ -12,26 +12,17 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::runtime::Runtime;
+use uuid::Uuid;
 
 use angos_storage::{Error as StorageError, MemoryObjectStore, ObjectStore};
 
 use angos_tx_engine::{
     executor::TransactionExecutor,
-    intent::MutationProgress,
-    recovery::RecoveryLoop,
+    intent::{MutationProgress, MutationRecord},
     transaction::{Mutation, Transaction},
 };
 
-mod common;
-
-// Helper: assert no orphan keys under a prefix.
-async fn assert_no_prefix(store: &MemoryObjectStore, prefix: &str) {
-    let items = store.list(prefix, 1000, None).await.unwrap().items;
-    assert!(
-        items.is_empty(),
-        "Orphan keys found under {prefix}: {items:?}"
-    );
-}
+use angos_tx_engine::test_util;
 
 // Property tests
 
@@ -39,7 +30,7 @@ async fn assert_no_prefix(store: &MemoryObjectStore, prefix: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_mutations_are_visible_locked() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = common::locked_executor(store.clone(), common::memory_lock());
+    let executor = test_util::locked_executor(store.clone(), test_util::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -66,7 +57,7 @@ async fn committed_mutations_are_visible_locked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_orphans_after_commit_locked() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = common::locked_executor(store.clone(), common::memory_lock());
+    let executor = test_util::locked_executor(store.clone(), test_util::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -78,15 +69,14 @@ async fn no_orphans_after_commit_locked() {
 
     executor.execute(tx).await.expect("execute must succeed");
 
-    assert_no_prefix(&store, ".tx-log/").await;
-    assert_no_prefix(&store, ".tx-bodies/").await;
+    test_util::assert_no_orphans(&*store).await;
 }
 
 /// CAS executor: committed mutations are visible and no orphans remain.
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_mutations_are_visible_cas() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = common::cas_executor(store.clone(), common::memory_lock());
+    let executor = test_util::cas_executor(store.clone(), test_util::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -107,8 +97,7 @@ async fn committed_mutations_are_visible_cas() {
     assert_eq!(a, b"value-a");
     assert_eq!(b, b"value-b");
 
-    assert_no_prefix(&store, ".tx-log/").await;
-    assert_no_prefix(&store, ".tx-bodies/").await;
+    test_util::assert_no_orphans(&*store).await;
 }
 
 /// Delete mutations remove the target key.
@@ -122,7 +111,7 @@ async fn delete_mutation_removes_key() {
         .await
         .unwrap();
 
-    let executor = common::locked_executor(store.clone(), common::memory_lock());
+    let executor = test_util::locked_executor(store.clone(), test_util::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Delete {
@@ -151,7 +140,7 @@ async fn move_mutation_relocates_body_locked() {
         .await
         .unwrap();
 
-    let executor = common::locked_executor(store.clone(), common::memory_lock());
+    let executor = test_util::locked_executor(store.clone(), test_util::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Move {
@@ -180,7 +169,7 @@ async fn move_mutation_relocates_body_cas() {
         .await
         .unwrap();
 
-    let executor = common::cas_executor(store.clone(), common::memory_lock());
+    let executor = test_util::cas_executor(store.clone(), test_util::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Move {
@@ -210,7 +199,7 @@ async fn copy_mutation_propagates_body() {
         .await
         .unwrap();
 
-    let executor = common::locked_executor(store.clone(), common::memory_lock());
+    let executor = test_util::locked_executor(store.clone(), test_util::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Copy {
@@ -229,52 +218,28 @@ async fn copy_mutation_propagates_body() {
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_loop_cleans_stale_intent() {
     let store = Arc::new(MemoryObjectStore::new());
-    let cancel = tokio_util::sync::CancellationToken::new();
 
-    // Manually inject a stale intent with ttl_secs = 0 (immediately stale).
-    let tx_id = uuid::Uuid::new_v4();
-    let intent = angos_tx_engine::intent::IntentRecord {
-        id: tx_id,
-        created_at: chrono::Utc::now() - chrono::Duration::seconds(3600),
-        ttl_secs: 1,
-        reads: vec![],
-        mutations: vec![angos_tx_engine::intent::MutationRecord::Put {
+    // Manually inject a stale intent whose only mutation is still Pending.
+    let tx_id = Uuid::new_v4();
+    let body_ref = test_util::stage_body(&*store, tx_id, 0, Bytes::from_static(b"body")).await;
+    let intent = test_util::stale_intent(
+        tx_id,
+        vec![MutationRecord::Put {
             key: "recovery/key".to_owned(),
-            body_ref: format!(".tx-bodies/{tx_id}/0"),
+            body_ref,
             expected: None,
         }],
-        coarse_lock_keys: vec![],
-        progress: vec![MutationProgress::Pending],
-    };
-
-    // Write the body and intent.
-    store
-        .put(
-            &format!(".tx-bodies/{tx_id}/0"),
-            Bytes::from_static(b"body"),
-        )
-        .await
-        .unwrap();
-    let intent_json = serde_json::to_vec(&intent).unwrap();
-    store
-        .put(&format!(".tx-log/{tx_id}.json"), Bytes::from(intent_json))
-        .await
-        .unwrap();
+        vec![MutationProgress::Pending],
+    );
+    test_util::put_intent(&*store, &intent).await;
 
     // Run one sweep, wiring an uncontended lock so the path under test
     // exercises the production ownership-takeover code.
-    let recovery = RecoveryLoop::builder(store.clone() as Arc<dyn ObjectStore>)
-        .lock(common::memory_lock())
-        .cancellation(cancel.clone())
-        .interval(std::time::Duration::from_hours(1)) // Only sweep on demand.
-        .build();
+    test_util::sweep_once(store.clone(), test_util::memory_lock()).await;
 
-    recovery.sweep().await;
-
-    // After recovery: the stale intent and its bodies should be gone (rolled back
-    // because no mutations were applied) and the canonical key must be written.
-    assert_no_prefix(&store, ".tx-log/").await;
-    assert_no_prefix(&store, ".tx-bodies/").await;
+    // After recovery: the stale intent and its bodies are gone (rolled back
+    // because no mutations were applied).
+    test_util::assert_no_orphans(&*store).await;
     // The intent had no Applied progress entries, so it was rolled back:
     // the key must NOT exist.
     let result = store.get("recovery/key").await;
@@ -291,7 +256,7 @@ async fn recovery_loop_cleans_stale_intent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_disjoint_transactions_all_commit() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = common::locked_executor(store.clone(), common::memory_lock());
+    let executor = test_util::locked_executor(store.clone(), test_util::memory_lock());
 
     let mut handles = Vec::new();
     for i in 0..8u32 {

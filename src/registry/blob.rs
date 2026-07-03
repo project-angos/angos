@@ -462,7 +462,9 @@ mod tests {
             DOCKER_CONTENT_DIGEST,
             blob_ownership::BlobOwnership,
             metadata_store::{BlobIndexOperation, LinkOperation},
-            test_utils::{backends, create_test_blob, metadata_store_over, put_blob_direct},
+            test_utils::{
+                create_test_blob, for_each_backend, metadata_store_over, put_blob_direct,
+            },
         },
     };
 
@@ -473,7 +475,7 @@ mod tests {
     /// caused by dropping that lock during the transactional-engine migration.
     #[tokio::test]
     async fn delete_blob_waits_for_blob_data_lock_before_reclaiming_data() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let first = &Namespace::new("test-repo/first").unwrap();
             let second = &Namespace::new("test-repo/second").unwrap();
@@ -506,14 +508,13 @@ mod tests {
             assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
             assert!(!ownership.can_read(first, &digest).await.unwrap());
             assert!(ownership.can_read(second, &digest).await.unwrap());
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_head_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test blob content";
@@ -529,13 +530,13 @@ mod tests {
                 response.headers[CONTENT_LENGTH.as_str()],
                 content.len().to_string()
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_get_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test blob content";
@@ -558,13 +559,13 @@ mod tests {
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn get_blob_rejects_local_blob_without_namespace_ownership() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned blob content";
@@ -580,14 +581,13 @@ mod tests {
                 .get_blob(repository, &[], namespace, &digest, None)
                 .await;
             assert!(matches!(get_result, Err(Error::BlobUnknown)));
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_get_blob_with_range() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test blob content";
@@ -618,13 +618,13 @@ mod tests {
                 GetBlobResponse::Reader { .. } => panic!("Expected RangedReader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_delete_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test blob content";
@@ -654,13 +654,13 @@ mod tests {
                     .await
                     .is_err()
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn delete_blob_rejects_manifest_referenced_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"referenced blob content";
@@ -692,13 +692,13 @@ mod tests {
                     .await
                     .is_ok()
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn delete_blob_rejects_all_metadata_references() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let parent = Digest::sha256_of_bytes(b"index manifest");
@@ -737,9 +737,8 @@ mod tests {
                 assert!(matches!(result, Err(Error::BlobReferenced)));
                 assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
             }
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     fn retarget_link(link: &LinkKind, digest: &Digest) -> LinkKind {
@@ -755,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_blob_keeps_data_owned_by_other_namespace() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let first = &Namespace::new("test-repo/first").unwrap();
             let second = &Namespace::new("test-repo/second").unwrap();
@@ -775,13 +774,13 @@ mod tests {
             registry.delete_blob(second, &digest).await.unwrap();
 
             assert!(registry.blob_store.read(&digest).await.is_err());
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn delete_blob_rejects_unowned_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned delete content";
@@ -792,14 +791,13 @@ mod tests {
 
             let stored_content = registry.blob_store.read(&digest).await.unwrap();
             assert_eq!(stored_content, content);
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn cache_blob_updates_namespace_blob_index() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = Namespace::new("test-repo").unwrap();
             let content = b"cached pull-through blob content";
@@ -840,8 +838,8 @@ mod tests {
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     /// Regression guard for the split-backend pull-through cache-fill failure:
@@ -905,7 +903,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_local_blob_returns_correct_size() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"regression test blob content";
@@ -951,13 +949,13 @@ mod tests {
                     panic!("unexpected redirect from get_local_blob")
                 }
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn get_local_blob_open_ended_range_returns_partial_content() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"open ended range content";
@@ -993,13 +991,13 @@ mod tests {
                     panic!("unexpected redirect from get_local_blob")
                 }
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn get_local_blob_suffix_range_returns_tail() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"suffix range content";
@@ -1031,13 +1029,13 @@ mod tests {
                     panic!("unexpected redirect from get_local_blob")
                 }
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn get_local_blob_suffix_range_longer_than_blob_returns_full_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"short suffix";
@@ -1067,13 +1065,13 @@ mod tests {
                     panic!("unexpected redirect from get_local_blob")
                 }
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn get_local_blob_clamps_range_end_to_blob_length() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"clamped range content";
@@ -1112,13 +1110,13 @@ mod tests {
                     panic!("unexpected redirect from get_local_blob")
                 }
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn get_local_blob_rejects_range_start_at_blob_length() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"range boundary";
@@ -1135,13 +1133,13 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn get_local_blob_ignores_ranges_for_empty_blobs() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
 
@@ -1171,13 +1169,13 @@ mod tests {
                     panic!("unexpected redirect from get_local_blob")
                 }
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_head_blob_independent_of_get() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"head blob independence test";
@@ -1211,8 +1209,8 @@ mod tests {
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[test]

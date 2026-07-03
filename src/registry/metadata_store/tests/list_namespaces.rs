@@ -5,7 +5,7 @@ use crate::{
     registry::{
         metadata_store::{LinkKind, LinkOperation},
         path_builder,
-        test_utils::{self, backends},
+        test_utils::{self, for_each_backend},
     },
 };
 
@@ -15,7 +15,7 @@ use crate::{
 /// scrub or rebuild step in between.
 #[tokio::test]
 async fn list_namespaces_is_derived_from_content() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let metadata_store = test_case.metadata_store();
         let namespace = &Namespace::new("derived-catalog/repo").unwrap();
@@ -47,16 +47,15 @@ async fn list_namespaces_is_derived_from_content() {
             "a namespace whose revisions and tags were all deleted must \
              disappear from the catalog; got: {listed:?}"
         );
-
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 /// A namespace that holds only an in-progress upload (an `_uploads` child but no
 /// `_manifests`) is not a catalog entry.
 #[tokio::test]
 async fn list_namespaces_excludes_upload_only_namespace() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let metadata_store = test_case.metadata_store();
         let namespace = Namespace::new("upload-only/repo").unwrap();
         let uuid = uuid::Uuid::new_v4().to_string();
@@ -74,9 +73,8 @@ async fn list_namespaces_excludes_upload_only_namespace() {
             "a namespace with only an _uploads artifact must not appear in the \
              catalog; got: {listed:?}"
         );
-
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 /// `list_upload_namespaces` keys off the `_uploads` child, the mirror of
@@ -84,7 +82,7 @@ async fn list_namespaces_excludes_upload_only_namespace() {
 /// surfaces here but not in the catalog, and a manifest-only one the converse.
 #[tokio::test]
 async fn list_upload_namespaces_keys_off_uploads_not_manifests() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let metadata_store = test_case.metadata_store();
 
@@ -144,15 +142,15 @@ async fn list_upload_namespaces_keys_off_uploads_not_manifests() {
             "an upload-only namespace must not appear in the catalog; got: {manifest_listed:?}"
         );
 
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }
 
 /// `scrub` prunes the dead pre-1.3 namespace-registry index objects under
 /// `_registry/`, and the prune is idempotent.
 #[tokio::test]
 async fn delete_legacy_namespace_registry_prunes_dead_index() {
-    for test_case in backends() {
+    for_each_backend(async |test_case| {
         let metadata_store = test_case.metadata_store();
         for key in ["_registry/namespaces.json", "_registry/ns/ab.json"] {
             metadata_store
@@ -179,7 +177,6 @@ async fn delete_legacy_namespace_registry_prunes_dead_index() {
             .delete_legacy_namespace_registry()
             .await
             .expect("prune is idempotent");
-
-        test_case.cleanup().await;
-    }
+    })
+    .await;
 }

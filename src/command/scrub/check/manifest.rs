@@ -88,13 +88,13 @@ mod tests {
         oci::Namespace,
         registry::{
             metadata_store::{LinkKind, LinkOperation},
-            test_utils::{self, backends, put_blob_direct},
+            test_utils::{self, for_each_backend, put_blob_direct},
         },
     };
 
     #[tokio::test]
     async fn test_scrub_revisions_validates_manifest_links() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -154,13 +154,13 @@ mod tests {
 
             assert!(config_link.is_ok());
             assert!(layer_link.is_ok());
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn manifest_checker_repairs_digest_link_with_mismatched_target() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/digest-repair").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -235,13 +235,13 @@ mod tests {
                 link_meta.target, manifest_digest,
                 "revision link target must be corrected back to the path digest"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn manifest_checker_emits_recreate_link_action_for_target_mismatch_in_dry_run() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/digest-dry-run").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -330,7 +330,7 @@ mod tests {
                 stored_meta.target, wrong_digest,
                 "Vec sink must not mutate storage"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

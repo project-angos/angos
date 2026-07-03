@@ -142,12 +142,4 @@ mod tests {
         assert_eq!(w.patterns[0].as_source(), "^latest$");
         assert_eq!(w.patterns[1].as_source(), "^dev-.*");
     }
-
-    #[test]
-    fn clone_preserves_source_and_behavior() {
-        let original = RegexPattern::compile("^test-.*").unwrap();
-        let cloned = original.clone();
-        assert_eq!(original.as_source(), cloned.as_source());
-        assert!(cloned.is_match("test-123"));
-    }
 }

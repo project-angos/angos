@@ -1,63 +1,18 @@
 use bytes::Bytes;
 use tempfile::TempDir;
-use tokio::io::AsyncReadExt;
 
-use crate::{Error, ObjectStore, fs::Backend};
+use crate::tests::object_store_conformance;
+use crate::{ObjectStore, fs::Backend};
 
 fn backend(dir: &TempDir) -> Backend {
     Backend::builder(dir.path()).build()
 }
 
-#[tokio::test]
-async fn put_then_get_round_trips() {
+object_store_conformance!({
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
-    store
-        .put("a/b/c", Bytes::from_static(b"hello"))
-        .await
-        .unwrap();
-    assert_eq!(store.get("a/b/c").await.unwrap(), b"hello");
-}
-
-#[tokio::test]
-async fn get_missing_key_returns_not_found() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    assert_eq!(store.get("missing").await.unwrap_err(), Error::NotFound);
-}
-
-#[tokio::test]
-async fn delete_is_idempotent_on_missing_key() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    store.delete("ghost").await.unwrap();
-    store.delete("ghost").await.unwrap();
-}
-
-#[tokio::test]
-async fn delete_prefix_removes_subtree() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    store.put("a/1", Bytes::from_static(b"x")).await.unwrap();
-    store
-        .put("a/sub/2", Bytes::from_static(b"y"))
-        .await
-        .unwrap();
-    store.put("b/3", Bytes::from_static(b"z")).await.unwrap();
-
-    store.delete_prefix("a").await.unwrap();
-
-    assert_eq!(store.get("a/1").await.unwrap_err(), Error::NotFound);
-    assert_eq!(store.get("a/sub/2").await.unwrap_err(), Error::NotFound);
-    assert_eq!(store.get("b/3").await.unwrap(), b"z");
-}
-
-#[tokio::test]
-async fn delete_prefix_on_missing_prefix_is_success() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    store.delete_prefix("never-existed/").await.unwrap();
-}
+    (store, dir)
+});
 
 #[tokio::test]
 async fn delete_prefix_prunes_empty_ancestors_up_to_root() {
@@ -153,41 +108,17 @@ async fn prune_empty_ancestors_still_collapses_normal_in_root_chain() {
 }
 
 #[tokio::test]
-async fn head_reports_size_and_mtime() {
+async fn head_reports_mtime_but_no_etag() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
     store.put("k", Bytes::from_static(b"abcdef")).await.unwrap();
     let meta = store.head("k").await.unwrap();
-    assert_eq!(meta.size, 6);
     assert!(meta.last_modified.is_some());
     assert!(meta.etag.is_none(), "FS backend never synthesises ETags");
 }
 
 #[tokio::test]
-async fn head_missing_key_returns_not_found() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    assert_eq!(store.head("missing").await.unwrap_err(), Error::NotFound);
-}
-
-#[tokio::test]
-async fn get_stream_reports_total_size_not_remaining() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    store
-        .put("k", Bytes::from_static(b"0123456789"))
-        .await
-        .unwrap();
-
-    let (mut body, total) = store.get_stream("k", Some(3)).await.unwrap();
-    assert_eq!(total, 10);
-    let mut buf = Vec::new();
-    body.read_to_end(&mut buf).await.unwrap();
-    assert_eq!(buf, b"3456789");
-}
-
-#[tokio::test]
-async fn list_walks_recursively_in_sorted_order() {
+async fn list_at_store_root_walks_recursively_in_sorted_order() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
     for k in ["b/2", "a/1", "a/3", "c"] {
@@ -206,8 +137,8 @@ async fn list_walks_recursively_in_sorted_order() {
     assert!(page.next_token.is_none());
 }
 
-/// Listing under a non-empty prefix must strip the prefix from each item, so
-/// the FS backend matches the S3 backend's prefix-relative contract.
+/// Listing under a non-slash-terminated prefix must strip the prefix from each
+/// item, so the FS backend matches the S3 backend's prefix-relative contract.
 #[tokio::test]
 async fn list_returns_prefix_relative_keys() {
     let dir = TempDir::new().unwrap();
@@ -220,90 +151,6 @@ async fn list_returns_prefix_relative_keys() {
 
     let page = store.list("ns", 10, None).await.unwrap();
     assert_eq!(page.items, vec!["a".to_string(), "sub/b".to_string()]);
-}
-
-#[tokio::test]
-async fn list_paginates_via_continuation_token() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    for k in ["a", "b", "c"] {
-        store.put(k, Bytes::from_static(b"x")).await.unwrap();
-    }
-    let first = store.list("", 2, None).await.unwrap();
-    assert_eq!(first.items, vec!["a".to_string(), "b".to_string()]);
-    assert_eq!(first.next_token.as_deref(), Some("b"));
-
-    let second = store.list("", 2, first.next_token).await.unwrap();
-    assert_eq!(second.items, vec!["c".to_string()]);
-    assert!(second.next_token.is_none());
-}
-
-#[tokio::test]
-async fn list_children_separates_directories_from_objects() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    store.put("ns/a", Bytes::from_static(b"x")).await.unwrap();
-    store
-        .put("ns/sub/b", Bytes::from_static(b"y"))
-        .await
-        .unwrap();
-    store
-        .put("ns/sub/c", Bytes::from_static(b"z"))
-        .await
-        .unwrap();
-    store.put("ns/d", Bytes::from_static(b"w")).await.unwrap();
-
-    let page = store.list_children("ns", 10, None, None).await.unwrap();
-    assert_eq!(page.sub_prefixes, vec!["sub".to_string()]);
-    assert_eq!(page.objects, vec!["a".to_string(), "d".to_string()]);
-    assert!(page.next_token.is_none());
-}
-
-#[tokio::test]
-async fn list_children_respects_start_after() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    for k in ["ns/a", "ns/b", "ns/c"] {
-        store.put(k, Bytes::from_static(b"x")).await.unwrap();
-    }
-    let page = store
-        .list_children("ns", 10, None, Some("a".to_string()))
-        .await
-        .unwrap();
-    assert_eq!(page.objects, vec!["b".to_string(), "c".to_string()]);
-}
-
-#[tokio::test]
-async fn copy_duplicates_object() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    store
-        .put("src", Bytes::from_static(b"payload"))
-        .await
-        .unwrap();
-    store.copy("src", "dst/copied").await.unwrap();
-    assert_eq!(store.get("src").await.unwrap(), b"payload");
-    assert_eq!(store.get("dst/copied").await.unwrap(), b"payload");
-}
-
-/// `move_object` relocates the object (creating the destination's parent) and
-/// removes the source. On the filesystem backend this is a same-FS `rename`, so
-/// the body is never read into memory; the correctness contract is the same as
-/// the trait default's copy + delete.
-#[tokio::test]
-async fn move_object_relocates_and_removes_source() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    store
-        .put("src", Bytes::from_static(b"payload"))
-        .await
-        .unwrap();
-    store.move_object("src", "blob-data/moved").await.unwrap();
-    assert_eq!(store.get("blob-data/moved").await.unwrap(), b"payload");
-    assert!(
-        matches!(store.head("src").await, Err(Error::NotFound)),
-        "source must be gone after move",
-    );
 }
 
 /// `list_all_children` must return every child even when the directory
@@ -395,28 +242,18 @@ async fn concurrent_writes_under_shared_parent_all_succeed() {
     for i in 0..TASKS {
         let store = store.clone();
         handles.push(tokio::spawn(async move {
-            let key = format!("shard/file-{i}");
             store
-                .put(&key, Bytes::from(format!("body-{i}")))
+                .put(&format!("shard/file-{i}"), Bytes::from(format!("body-{i}")))
                 .await
-                .map(|()| key)
         }));
     }
 
-    let mut written = Vec::with_capacity(TASKS);
     for handle in handles {
-        let key = handle
+        handle
             .await
             .expect("write task must not panic")
             .expect("every concurrent put under a shared parent must succeed");
-        written.push(key);
     }
-
-    written.sort();
-    written.dedup();
-    let mut expected: Vec<String> = (0..TASKS).map(|i| format!("shard/file-{i}")).collect();
-    expected.sort();
-    assert_eq!(written, expected, "every key must be written exactly once");
 
     for i in 0..TASKS {
         let key = format!("shard/file-{i}");
@@ -425,17 +262,4 @@ async fn concurrent_writes_under_shared_parent_all_succeed() {
             format!("body-{i}").into_bytes(),
         );
     }
-}
-
-#[tokio::test]
-async fn copy_missing_source_returns_not_found() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    assert_eq!(
-        store
-            .copy("absent-source", "dst/whatever")
-            .await
-            .unwrap_err(),
-        Error::NotFound,
-    );
 }

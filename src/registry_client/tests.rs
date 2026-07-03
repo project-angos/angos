@@ -19,18 +19,22 @@ use crate::{
     },
     replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     secret::Secret,
+    test_fixtures::client::test_client_config,
 };
+
+/// Builds a no-auth client pointed at `mock_server`.
+fn client_for(mock_server: &MockServer) -> RegistryClient {
+    let config = test_client_config(mock_server.uri());
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
+}
 
 #[test]
 fn test_get_manifest_path() {
     let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
         username: Some("username".to_string()),
         password: Some(Secret::new("password".to_string())),
+        ..test_client_config("https://example.com")
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -45,15 +49,7 @@ fn test_get_manifest_path() {
 
 #[test]
 fn test_get_blob_path() {
-    let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
+    let config = test_client_config("https://example.com");
 
     let cache = cache::Config::Memory.to_backend().unwrap();
     let upstream =
@@ -73,13 +69,8 @@ fn test_get_blob_path() {
 #[test]
 fn test_new_with_username_only() {
     let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
         username: Some("user".to_string()),
-        password: None,
+        ..test_client_config("https://example.com")
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -91,13 +82,8 @@ fn test_new_with_username_only() {
 #[test]
 fn test_new_with_password_only() {
     let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
         password: Some(Secret::new("pass".to_string())),
+        ..test_client_config("https://example.com")
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -109,13 +95,9 @@ fn test_new_with_password_only() {
 #[test]
 fn test_new_with_both_credentials() {
     let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
         username: Some("user".to_string()),
         password: Some(Secret::new("pass".to_string())),
+        ..test_client_config("https://example.com")
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -139,19 +121,7 @@ async fn test_head_blob_success() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .head_blob(
@@ -176,19 +146,7 @@ async fn test_head_blob_not_found() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .head_blob(
@@ -215,18 +173,7 @@ async fn test_blob_exists_true_when_digest_header_absent() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let present = client
         .blob_exists(&format!(
@@ -251,18 +198,7 @@ async fn test_blob_exists_false_on_404() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let present = client
         .blob_exists(&format!(
@@ -284,18 +220,7 @@ async fn test_blob_exists_errors_on_server_error() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .blob_exists(&format!("{}/v2/test/blobs/sha256:boom", mock_server.uri()))
@@ -325,19 +250,7 @@ async fn test_head_manifest_success() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .head_manifest(
@@ -376,19 +289,7 @@ async fn test_get_manifest_success() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .get_manifest(
@@ -427,15 +328,7 @@ async fn test_get_manifest_rejects_oversized_body() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
+    let config = test_client_config(mock_server.uri());
 
     let cache = cache::Config::Memory.to_backend().unwrap();
     let client = RegistryClient::from_config(&config, cache, 7).unwrap();
@@ -497,19 +390,7 @@ async fn test_bearer_authentication() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .get_manifest(
@@ -560,15 +441,7 @@ async fn test_cached_bearer_token_is_used() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: registry_url,
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
+    let config = test_client_config(registry_url);
 
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
@@ -667,19 +540,7 @@ async fn test_bearer_tokens_are_cached_per_scope() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: registry_url,
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     assert!(client.get_manifest(&[], &alpha_location).await.is_ok());
     assert!(client.get_manifest(&[], &beta_location).await.is_ok());
@@ -759,15 +620,7 @@ async fn test_expired_bearer_token_is_refetched() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: registry_url,
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
+    let config = test_client_config(registry_url);
 
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
@@ -825,19 +678,7 @@ async fn test_concurrent_bearer_refresh_uses_single_token_exchange() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: registry_url,
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
     let results = join_all((0..10).map(|_| client.get_manifest(&[], &location))).await;
 
     assert!(results.iter().all(Result::is_ok));
@@ -873,13 +714,9 @@ async fn test_basic_authentication() {
         .await;
 
     let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
         username: Some("user".to_string()),
         password: Some(Secret::new("pass".to_string())),
+        ..test_client_config(mock_server.uri())
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -906,19 +743,7 @@ async fn test_forbidden_access() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .get_manifest(
@@ -943,19 +768,7 @@ async fn test_get_blob_success() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .get_blob(
@@ -986,19 +799,7 @@ async fn test_get_blob_not_found() {
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_for(&mock_server);
 
     let result = client
         .get_blob(
@@ -1017,13 +818,8 @@ async fn test_get_blob_not_found() {
 #[test]
 fn test_new_with_invalid_ca_bundle() {
     let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
         server_ca_bundle: Some("/nonexistent/ca.pem".to_string()),
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
+        ..test_client_config("https://example.com")
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -1066,13 +862,9 @@ fn test_registry_client_config_key_without_cert_rejected_at_deserialize() {
 #[test]
 fn test_new_with_both_certificate_and_key_invalid_files() {
     let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
         client_certificate: Some("/nonexistent/cert.pem".to_string()),
         client_private_key: Some("/nonexistent/key.pem".to_string()),
-        username: None,
-        password: None,
+        ..test_client_config("https://example.com")
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -1080,21 +872,6 @@ fn test_new_with_both_certificate_and_key_invalid_files() {
 
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), Error::Initialization(_)));
-}
-
-/// Builds a no-auth client pointed at `mock_server`.
-fn client_for(mock_server: &MockServer) -> RegistryClient {
-    let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
 }
 
 #[tokio::test]
@@ -1308,13 +1085,9 @@ async fn test_blob_upload_reuses_basic_credentials_on_patch() {
         .await;
 
     let config = RegistryClientConfig {
-        url: mock_server.uri(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
         username: Some("user".to_string()),
         password: Some(Secret::new("pass".to_string())),
+        ..test_client_config(mock_server.uri())
     };
     let cache = cache::Config::Memory.to_backend().unwrap();
     let client =
@@ -1817,15 +1590,7 @@ async fn test_delete_upload_500_is_error() {
 
 #[test]
 fn test_get_tags_list_path() {
-    let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
+    let config = test_client_config("https://example.com");
     let cache = cache::Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();

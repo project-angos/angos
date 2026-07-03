@@ -19,24 +19,19 @@ use url::Url;
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
-
 use crate::{
     event_webhook::{
         config::{DeliveryPolicy, EventWebhookConfig},
         dispatcher::EventDispatcher,
         event::EventKind,
     },
-    oci::{Digest, MediaType, Namespace, Reference, Tag, UploadSessionId},
+    oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
-        Registry, RegistryConfig, blob_store,
-        blob_store::{BlobStore, BlobStoreConfig},
+        Registry, RegistryConfig,
         job_store::{JobStore, Queue},
-        metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
         test_utils::{
-            build_store, create_test_registry, downstream_client, metadata_store_over,
-            repository_with_downstream, sole_pending_payload,
+            FsTestStack, create_test_registry, downstream_client, fs_test_stack,
+            repository_with_downstream, single_repo_resolver, sole_pending_payload, upload_blob,
         },
     },
     replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND},
@@ -53,27 +48,17 @@ struct FsRegistryFixture {
 
 impl FsRegistryFixture {
     fn new() -> Self {
-        let temp_dir = TempDir::new().expect("tempdir");
-        let path = temp_dir.path().to_string_lossy().to_string();
-
-        let blob_store = Arc::new(
-            BlobStoreConfig::FS(blob_store::FsBackendConfig {
-                root_dir: path.clone(),
-                sync_to_disk: false,
-            })
-            .build_backend()
-            .unwrap(),
-        );
-
-        let meta_storage: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
-        let metadata_store_backend = metadata_store_over(meta_storage);
-
-        let registry = create_test_registry(blob_store, metadata_store_backend);
+        let FsTestStack {
+            dir,
+            store: _,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
+        let registry = create_test_registry(blob_store, metadata_store);
 
         Self {
             registry,
-            _temp_dir: temp_dir,
+            _temp_dir: dir,
         }
     }
 }
@@ -101,31 +86,6 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
         .webhooks(webhooks)
         .build()
         .expect("dispatcher build")
-}
-
-async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
-    let session_id = UploadSessionId::generate();
-    registry
-        .blob_store
-        .create_upload(namespace, session_id.as_ref())
-        .await
-        .unwrap();
-
-    let body = content.to_vec();
-    let digest = Digest::sha256_of_bytes(&body);
-    registry
-        .complete_upload(
-            None,
-            namespace,
-            &session_id,
-            &digest,
-            None,
-            Some(body.len() as u64),
-            Cursor::new(body),
-        )
-        .await
-        .unwrap();
-    digest
 }
 
 /// Minimal valid OCI manifest bytes and its media type.
@@ -227,7 +187,7 @@ async fn digest_push_suppresses_tag_create_event() {
         .get("Docker-Content-Digest")
         .cloned()
         .expect("digest header");
-    let digest: crate::oci::Digest = digest_str.parse().expect("parse digest");
+    let digest: Digest = digest_str.parse().expect("parse digest");
 
     // Push the same manifest addressed by its digest.
     let response = fixture
@@ -342,7 +302,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
         .get("Docker-Content-Digest")
         .cloned()
         .expect("digest header");
-    let digest: crate::oci::Digest = digest_str.parse().expect("parse digest");
+    let digest: Digest = digest_str.parse().expect("parse digest");
 
     let reference = Reference::Digest(digest);
     let response = fixture
@@ -510,7 +470,7 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
         .get("Docker-Content-Digest")
         .cloned()
         .expect("digest header");
-    let digest: crate::oci::Digest = digest_str.parse().expect("parse digest");
+    let digest: Digest = digest_str.parse().expect("parse digest");
 
     let response = fixture
         .registry
@@ -564,25 +524,16 @@ struct ReplicationFixture {
 
 impl ReplicationFixture {
     fn new() -> Self {
-        let temp_dir = TempDir::new().expect("tempdir");
-        let path = temp_dir.path().to_string_lossy().to_string();
-
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
-        let store = build_store(object);
-        let metadata_store = Arc::new(
-            MetadataStore::builder(store.clone())
-                .link_cache_ttl(0)
-                .access_time_debounce_secs(0)
-                .build(),
+        let FsTestStack {
+            dir,
+            store,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
+        let resolver = single_repo_resolver(
+            REPLICATION_REPO,
+            repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test")),
         );
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
-
-        let repository =
-            repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test"));
-        let mut repositories = HashMap::new();
-        repositories.insert(REPLICATION_REPO.to_string(), repository);
-        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
@@ -592,7 +543,7 @@ impl ReplicationFixture {
         Self {
             registry,
             job_store,
-            _temp_dir: temp_dir,
+            _temp_dir: dir,
         }
     }
 }

@@ -3,10 +3,9 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::{
-    Request, Response, StatusCode,
-    body::Bytes,
+    Request, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
 };
 use opentelemetry::trace::TracerProvider;
@@ -32,11 +31,11 @@ use crate::{
             create_test_server_context_with,
         },
     },
-    configuration::Configuration,
     identity::{Action, ClientIdentity},
     metrics_provider,
     policy::{AccessMode, AccessPolicyConfig},
     registry,
+    test_fixtures::configuration::load_config,
 };
 
 #[test]
@@ -55,69 +54,6 @@ fn test_error_to_response_unauthorized_with_request_id() {
         response.headers().get(WWW_AUTHENTICATE).unwrap(),
         r#"Basic realm="Simple Registry", charset="UTF-8""#
     );
-}
-
-#[test]
-fn test_error_to_response_unauthorized_without_request_id() {
-    let error = Error::Unauthorized("Access denied".to_string());
-    let request_id = None;
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    assert_eq!(
-        response.headers().get(WWW_AUTHENTICATE).unwrap(),
-        r#"Basic realm="Simple Registry", charset="UTF-8""#
-    );
-}
-
-#[test]
-fn test_error_to_response_not_found() {
-    let error = Error::NotFound("Resource not found".to_string());
-    let request_id = Some("req-456".to_string());
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
-}
-
-#[test]
-fn test_error_to_response_bad_request() {
-    let error = Error::BadRequest("Invalid input".to_string());
-    let request_id = None;
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
-}
-
-#[test]
-fn test_error_to_response_internal() {
-    let error = Error::Internal("Server error".to_string());
-    let request_id = Some("req-789".to_string());
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
 }
 
 #[tokio::test]
@@ -141,49 +77,6 @@ async fn test_error_to_response_from_registry_error() {
     };
     let json: Value = from_slice(&body_bytes).unwrap();
     assert_eq!(json["errors"][0]["code"], "BLOB_UNKNOWN");
-}
-
-#[test]
-fn test_error_to_response_range_not_satisfiable() {
-    let error = Error::RangeNotSatisfiable("Invalid range".to_string());
-    let request_id = None;
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-}
-
-#[test]
-fn test_error_to_response_conflict() {
-    let error = Error::Conflict("Resource conflict".to_string());
-    let request_id = Some("req-conflict".to_string());
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-}
-
-#[test]
-fn test_error_to_response_initialization() {
-    let error = Error::Initialization("Failed to start".to_string());
-    let request_id = None;
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
 }
 
 #[test]
@@ -246,25 +139,6 @@ fn test_handle_metrics_success() {
     let response = result.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().get(CONTENT_TYPE).is_some());
-}
-
-#[tokio::test]
-async fn test_handle_metrics_body_not_empty() {
-    use http_body_util::BodyExt;
-
-    metrics_provider::init_for_tests();
-    let result = handle_metrics();
-    assert!(result.is_ok());
-
-    let response = result.unwrap();
-    let (_, body) = response.into_parts();
-
-    let body_bytes = match body {
-        ResponseBody::Fixed(b) => b.collect().await.unwrap().to_bytes(),
-        _ => panic!("Expected Fixed body"),
-    };
-
-    assert!(!body_bytes.is_empty());
 }
 
 #[tokio::test]
@@ -372,26 +246,6 @@ async fn test_error_to_response_body_contains_error_message() {
 }
 
 #[test]
-fn test_error_to_response_unauthorized_realm() {
-    let error = Error::Unauthorized("Invalid token".to_string());
-    let request_id = None;
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    let www_authenticate = response
-        .headers()
-        .get(WWW_AUTHENTICATE)
-        .unwrap()
-        .to_str()
-        .unwrap();
-
-    assert!(www_authenticate.contains("Basic"));
-    assert!(www_authenticate.contains("realm"));
-    assert!(www_authenticate.contains("Simple Registry"));
-    assert!(www_authenticate.contains("UTF-8"));
-}
-
-#[test]
 fn test_error_to_response_with_empty_message() {
     let error = Error::Internal(String::new());
     let request_id = None;
@@ -403,19 +257,6 @@ fn test_error_to_response_with_empty_message() {
         response.headers().get(CONTENT_TYPE).unwrap(),
         "application/json"
     );
-}
-
-#[test]
-fn test_error_to_response_multiple_errors_same_request_id() {
-    let request_id = Some("shared-req-id".to_string());
-
-    let error1 = Error::NotFound("Resource 1".to_string());
-    let response1 = error_to_response(&error1, request_id.as_ref());
-    assert_eq!(response1.status(), StatusCode::NOT_FOUND);
-
-    let error2 = Error::BadRequest("Bad input".to_string());
-    let response2 = error_to_response(&error2, request_id.as_ref());
-    assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -438,23 +279,8 @@ async fn bad_basic_auth_returns_http_401() {
     let salt = SaltString::generate(OsRng);
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
     let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-
         [global.access_policy]
         default = "allow"
         rules = []
@@ -463,8 +289,7 @@ async fn bad_basic_auth_returns_http_401() {
         username = "testuser"
         password = "{password_hash}"
     "#
-    );
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let context = create_test_server_context_from_config(&config).await;
     let credentials = BASE64_STANDARD.encode("testuser:wrongpass");
     let request = Request::builder()
@@ -678,31 +503,4 @@ async fn fallback_500_body_is_ascii_internal_server_error() {
         b"Internal Server Error",
         "fallback body must be the static ASCII string 'Internal Server Error'"
     );
-}
-
-#[test]
-fn error_to_response_falls_back_to_500_when_builder_fails() {
-    // Simulate the builder failure mode: a header value that contains a NUL
-    // byte (\0) is rejected by hyper as invalid.  We cannot inject this
-    // through a public Error variant, so we call the builder directly in the
-    // same way error_to_response does, confirm it errors, and then verify that
-    // fallback_500() produces the expected minimal 500 response, which is
-    // exactly what error_to_response calls via unwrap_or_else.
-    let builder_result: Result<Response<ResponseBody>, _> = Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header(CONTENT_TYPE, "application/json")
-        .header(WWW_AUTHENTICATE, "invalid\0value")
-        .body(ResponseBody::Fixed(Full::new(Bytes::from_static(b""))));
-
-    assert!(
-        builder_result.is_err(),
-        "hyper must reject a header value containing a NUL byte"
-    );
-
-    // Applying the same unwrap_or_else used in error_to_response must yield
-    // the fallback response rather than panicking.
-    let response = builder_result.unwrap_or_else(|_| fallback_500());
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
 }

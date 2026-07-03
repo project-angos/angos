@@ -344,22 +344,21 @@ impl Command {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
 
-    #[tokio::test]
-    async fn test_command_new_with_valid_config() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().to_string_lossy().to_string();
-
-        let config_content = format!(
+    // Scrub tests point both stores at one temporary root whose contents the
+    // assertions inspect, which the shared configuration fixture cannot
+    // express with its fixed store paths.
+    fn scrub_config(root: &str) -> Configuration {
+        let toml = format!(
             r#"
             [blob_store.fs]
-            root_dir = "{path}"
+            root_dir = "{root}"
 
             [metadata_store.fs]
-            root_dir = "{path}"
+            root_dir = "{root}"
 
             [cache.memory]
 
@@ -374,8 +373,14 @@ mod tests {
             rules = []
             "#
         );
+        Configuration::load_from_str(&toml).unwrap()
+    }
 
-        let config: Configuration = toml::from_str(&config_content).unwrap();
+    #[tokio::test]
+    async fn test_command_new_with_valid_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let config = scrub_config(&path);
 
         let options = Options {
             dry_run: true,
@@ -413,8 +418,6 @@ mod tests {
 
     #[tokio::test]
     async fn scrub_metadata_deletes_invalid_tag_directory() {
-        use tempfile::TempDir;
-
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_string_lossy().to_string();
 
@@ -430,29 +433,7 @@ mod tests {
         )
         .unwrap();
 
-        let config_content = format!(
-            r#"
-            [blob_store.fs]
-            root_dir = "{path}"
-
-            [metadata_store.fs]
-            root_dir = "{path}"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-
-            [global.retention_policy]
-            rules = []
-            "#
-        );
-
-        let config: Configuration = toml::from_str(&config_content).unwrap();
+        let config = scrub_config(&path);
 
         let options = Options {
             dry_run: false,

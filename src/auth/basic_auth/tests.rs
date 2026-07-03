@@ -4,8 +4,6 @@ use argon2::{
     Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version,
     password_hash::{SaltString, rand_core::OsRng},
 };
-use base64::{Engine, prelude::BASE64_STANDARD};
-use hyper::{Request, http::request::Parts};
 use serde::Deserialize;
 
 use crate::{
@@ -15,6 +13,7 @@ use crate::{
     },
     command::server::Error,
     identity::ClientIdentity,
+    test_fixtures::requests::{empty_parts, parts_with_basic_auth},
 };
 
 #[derive(Deserialize)]
@@ -55,30 +54,6 @@ password = "{hash2}"
 
 fn build_test_config() -> TestConfig {
     toml::from_str(&build_test_toml()).expect("Failed to parse test config")
-}
-
-fn build_basic_auth_header(username: &str, password: &str) -> String {
-    let credentials = format!("{username}:{password}");
-    let encoded = BASE64_STANDARD.encode(credentials);
-    format!("Basic {encoded}")
-}
-
-fn build_test_parts(username: &str, password: &str) -> Parts {
-    let basic_auth = build_basic_auth_header(username, password);
-
-    let request = Request::builder()
-        .header("Authorization", basic_auth)
-        .body(())
-        .unwrap();
-
-    let (parts, ()) = request.into_parts();
-    parts
-}
-
-fn build_empty_parts() -> Parts {
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-    parts
 }
 
 #[test]
@@ -142,19 +117,19 @@ async fn test_authenticate() {
     let config = build_test_config();
     let auth = BasicAuthValidator::new(&config.identity);
 
-    let parts = build_test_parts("user1", "password1");
+    let parts = parts_with_basic_auth("user1", "password1");
     let mut identity = ClientIdentity::default();
     let result = auth.authenticate(&parts, &mut identity).await.unwrap();
     assert!(matches!(result, AuthResult::Authenticated));
     assert_eq!(identity.username, Some("user1".to_string()));
     assert_eq!(identity.id, Some("id_1".to_string()));
 
-    let parts = build_test_parts("user1", "wrong_password");
+    let parts = parts_with_basic_auth("user1", "wrong_password");
     let mut identity = ClientIdentity::default();
     let result = auth.authenticate(&parts, &mut identity).await;
     assert!(matches!(result, Err(Error::Unauthorized(_))));
 
-    let parts = build_test_parts("invalid_user", "password1");
+    let parts = parts_with_basic_auth("invalid_user", "password1");
     let mut identity = ClientIdentity::default();
     let result = auth.authenticate(&parts, &mut identity).await;
     assert!(matches!(result, Err(Error::Unauthorized(_))));
@@ -165,7 +140,7 @@ async fn test_authenticate_without_authorization_header_returns_no_credentials()
     let config = build_test_config();
     let auth = BasicAuthValidator::new(&config.identity);
 
-    let parts = build_empty_parts();
+    let parts = empty_parts();
     let mut identity = ClientIdentity::default();
     let result = auth.authenticate(&parts, &mut identity).await.unwrap();
 
@@ -191,7 +166,7 @@ password = "not-a-valid-argon2-hash"
 async fn test_empty_identity_map_rejects_presented_credentials() {
     let auth = BasicAuthValidator::new(&HashMap::new());
 
-    let parts = build_test_parts("user1", "password1");
+    let parts = parts_with_basic_auth("user1", "password1");
     let mut identity = ClientIdentity::default();
     let result = auth.authenticate(&parts, &mut identity).await;
     assert!(matches!(result, Err(Error::Unauthorized(_))));

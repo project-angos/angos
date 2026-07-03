@@ -389,7 +389,7 @@ mod tests {
             repository::{Config, RegistryClientConfig, Repository},
         },
         replication::{ReplicationDownstreamConfig, ReplicationMode},
-        test_fixtures::webhook::ca_bundle_pem,
+        test_fixtures::{client::test_client_config, webhook::ca_bundle_pem},
     };
 
     const TEST_DIGEST: &str =
@@ -400,22 +400,10 @@ mod tests {
     const BLOB_PATH: &str =
         "/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-    fn registry_client_config(url: String) -> RegistryClientConfig {
-        RegistryClientConfig {
-            url,
-            max_redirect: 5,
-            server_ca_bundle: None,
-            client_certificate: None,
-            client_private_key: None,
-            username: None,
-            password: None,
-        }
-    }
-
     fn downstream_config(name: &str) -> ReplicationDownstreamConfig {
         ReplicationDownstreamConfig {
             name: name.to_string(),
-            client: registry_client_config("https://downstream.example.test".to_string()),
+            client: test_client_config("https://downstream.example.test"),
             mode: ReplicationMode::default(),
             namespace_filter: Vec::new(),
             max_concurrent_pushes: None,
@@ -469,8 +457,8 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![
-                registry_client_config(first_url),
-                registry_client_config(second_url),
+                test_client_config(first_url),
+                test_client_config(second_url),
             ],
             ..Default::default()
         };
@@ -576,15 +564,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 
@@ -603,13 +583,8 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![RegistryClientConfig {
-                url: "https://registry.example.test".to_string(),
-                max_redirect: 5,
                 server_ca_bundle: Some(ca_bundle_path.to_string_lossy().to_string()),
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
+                ..test_client_config("https://registry.example.test")
             }],
             ..Default::default()
         };
@@ -643,15 +618,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 
@@ -758,15 +725,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 
@@ -801,15 +760,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 
@@ -838,15 +789,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 
@@ -880,15 +823,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 
@@ -921,15 +856,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 
@@ -960,15 +887,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 
@@ -1006,15 +925,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config {
-            upstream: vec![RegistryClientConfig {
-                url: mock_server.uri(),
-                max_redirect: 5,
-                server_ca_bundle: None,
-                client_certificate: None,
-                client_private_key: None,
-                username: None,
-                password: None,
-            }],
+            upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
 

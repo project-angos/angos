@@ -297,14 +297,10 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
-    use tempfile::TempDir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
-
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
-    use angos_tx_engine::store::Store;
 
     use crate::{
         command::{
@@ -317,16 +313,14 @@ mod tests {
             },
             worker::runner::execute_one,
         },
-        metrics_provider,
         oci::{Digest, Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Repository,
-            blob_store::BlobStore,
             job_store::{JobStore, Queue},
-            metadata_store::{LinkKind, LinkOperation, MetadataStore},
+            metadata_store::{LinkKind, LinkOperation},
             repository_resolver::RepositoryResolver,
             test_utils::{
-                build_store, downstream_client, put_blob_direct, put_link_raw,
+                FsTestStack, downstream_client, fs_test_stack, put_blob_direct, put_link_raw,
                 repository_with_replication, seed_manifest,
             },
         },
@@ -342,22 +336,6 @@ mod tests {
     /// APIs that now take `&Namespace`.
     fn namespace() -> Namespace {
         Namespace::new(NAMESPACE).unwrap()
-    }
-
-    /// FS-backed metadata store so the tests run without S3; also returns the
-    /// store façade for seeding blobs.
-    fn fs_metadata_store() -> (Arc<MetadataStore>, Arc<Store>, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let store = build_store(object);
-        let metadata_store = Arc::new(
-            MetadataStore::builder(store.clone())
-                .link_cache_ttl(0)
-                .access_time_debounce_secs(0)
-                .build(),
-        );
-        (metadata_store, store, dir)
     }
 
     fn repository(client: Arc<RegistryClient>, mode: ReplicationMode, prune: bool) -> Repository {
@@ -403,8 +381,12 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_push_for_tag_missing_on_downstream() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
@@ -448,8 +430,12 @@ mod tests {
         // A prefixed downstream must probe the mapped path `mirror/app`, not the
         // local `nginx/app`. The `.expect(1)` on the mapped HEAD asserts this,
         // verified on `MockServer` drop.
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let content = Namespace::new("nginx/app").unwrap();
@@ -501,9 +487,12 @@ mod tests {
         // Prune on a prefixed downstream must list and delete at the mapped path
         // `mirror/app`, not the local `nginx/app`. The `.expect(1)` on the mapped
         // list and delete asserts that.
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let content = Namespace::new("nginx/app").unwrap();
@@ -592,8 +581,12 @@ mod tests {
 
     #[tokio::test]
     async fn transient_head_failure_skips_tag_without_enqueuing() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
@@ -667,8 +660,12 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_failure_does_not_abort_remaining_tags() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         for tag in ["v1", "v2"] {
@@ -720,8 +717,11 @@ mod tests {
 
     #[tokio::test]
     async fn prune_enqueue_failure_does_not_abort_remaining_deletes() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, _store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         // No local tags: both downstream tags are prune-eligible.
@@ -762,8 +762,12 @@ mod tests {
 
     #[tokio::test]
     async fn no_action_when_downstream_digest_matches() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
@@ -803,8 +807,12 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_push_when_downstream_digest_diverges() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"new-bytes").await;
@@ -849,8 +857,12 @@ mod tests {
     async fn enqueues_pushes_for_every_diverging_tag() {
         // The probe phase fans out across tags; every diverging tag must still
         // enqueue a push (no tag dropped by the concurrency).
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"new-bytes").await;
@@ -902,8 +914,12 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_delete_for_downstream_only_tag() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
@@ -959,8 +975,12 @@ mod tests {
 
     #[tokio::test]
     async fn no_delete_when_prune_disabled() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
@@ -1014,8 +1034,12 @@ mod tests {
 
     #[tokio::test]
     async fn unreadable_local_tag_is_skipped_but_never_pruned() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         put_link_raw(
@@ -1054,8 +1078,12 @@ mod tests {
 
     #[tokio::test]
     async fn skips_event_only_downstream() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
 
         let manifest = put_blob_direct(&store, b"event-only-bytes").await;
         metadata_store
@@ -1085,8 +1113,12 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_push_for_reconcile_only_downstream() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"reconcile-only-bytes").await;
@@ -1195,9 +1227,12 @@ mod tests {
     /// including `lock_key` coalescing of a duplicate enqueue.
     #[tokio::test]
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, config_digest, layer_digest) =
@@ -1298,9 +1333,12 @@ mod tests {
     /// enqueued for delete and the drain issues exactly one downstream DELETE.
     #[tokio::test]
     async fn scrub_replicate_deletes_downstream_only_tag() {
-        metrics_provider::init_for_tests();
-        let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, _config_digest, _layer_digest) =

@@ -18,7 +18,7 @@ use angos_tx_engine::{
     transaction::{Mutation, Transaction},
 };
 
-mod common;
+use angos_tx_engine::test_util;
 
 const COARSE_KEY: &str = "blob-data:dummy";
 
@@ -93,14 +93,14 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coarse_lock_serialises_under_locked_executor() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = common::locked_executor(store, common::memory_lock());
+    let executor = test_util::locked_executor(store, test_util::memory_lock());
     assert_coarse_lock_serialises(executor).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coarse_lock_serialises_under_cas_executor() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = common::cas_executor(store, common::memory_lock());
+    let executor = test_util::cas_executor(store, test_util::memory_lock());
     assert_coarse_lock_serialises(executor).await;
 }
 
@@ -110,8 +110,8 @@ async fn coarse_lock_serialises_under_cas_executor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cas_executor_holds_coarse_lock_across_apply() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = common::memory_lock();
-    let executor = common::cas_executor(store.clone(), lock.clone());
+    let lock = test_util::memory_lock();
+    let executor = test_util::cas_executor(store.clone(), lock.clone());
 
     // Pre-acquire the coarse key from outside the executor so the in-flight
     // transaction must wait. If the CAS executor neglected to acquire it,

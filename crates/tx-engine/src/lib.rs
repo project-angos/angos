@@ -23,6 +23,8 @@ pub mod periodic;
 pub mod probe;
 pub mod recovery;
 pub mod store;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod transaction;
 
 // Storage value types re-exported for convenience, so call sites that already

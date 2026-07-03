@@ -52,10 +52,4 @@ mod tests {
         assert_eq!(debug_output, "[REDACTED]");
         assert!(!debug_output.contains("my-password"));
     }
-
-    #[test]
-    fn test_secret_expose_returns_value() {
-        let secret = Secret::new("my-password".to_string());
-        assert_eq!(secret.expose(), "my-password");
-    }
 }

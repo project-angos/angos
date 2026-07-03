@@ -120,7 +120,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        registry::{blob_store, test_utils::backends},
+        registry::{blob_store, test_utils::for_each_backend},
     };
 
     fn fixed_now() -> DateTime<Utc> {
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scrub_uploads_removes_obsolete() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let blob_store = test_case.blob_store();
 
@@ -235,13 +235,13 @@ mod tests {
 
             let result = blob_store.upload_summary(&namespace, &upload_uuid).await;
             assert!(result.is_err(), "Obsolete upload should be deleted");
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_scrub_uploads_keeps_recent() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let blob_store = test_case.blob_store();
 
@@ -262,13 +262,13 @@ mod tests {
 
             let result = blob_store.upload_summary(&namespace, &upload_uuid).await;
             assert!(result.is_ok(), "Recent upload should be kept");
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_scrub_uploads_dry_run() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let blob_store = test_case.blob_store();
 
@@ -290,7 +290,7 @@ mod tests {
 
             let result = blob_store.upload_summary(&namespace, &upload_uuid).await;
             assert!(result.is_ok(), "Vec sink must not delete the upload");
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

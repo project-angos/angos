@@ -163,13 +163,13 @@ mod tests {
         oci::{MediaType, Namespace, Tag},
         registry::{
             metadata_store::LinkOperation,
-            test_utils::{self, backends, put_blob_direct},
+            test_utils::{self, for_each_backend, put_blob_direct},
         },
     };
 
     #[tokio::test]
     async fn test_media_type_checker_backfills_missing_media_type() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -244,13 +244,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(tag_link.media_type.as_deref(), Some(media_type));
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_media_type_checker_skips_links_with_media_type() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/skip").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -310,13 +310,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(digest_link.media_type.as_deref(), Some(media_type));
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_media_type_checker_dry_run() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/dry-run").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -379,13 +379,13 @@ mod tests {
                     .any(|a| matches!(a, Action::SetMediaType { .. })),
                 "Vec sink must capture SetMediaType actions"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn media_type_checker_emits_delete_orphan_manifest_when_revision_blob_missing() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/mt-missing-rev").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -437,13 +437,13 @@ mod tests {
                     .is_err(),
                 "revision link must be removed when manifest blob is missing"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn media_type_checker_emits_delete_orphan_manifest_when_tag_target_blob_missing() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/mt-missing-tag").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -508,13 +508,13 @@ mod tests {
                     .is_err(),
                 "tag link must be removed when target manifest blob is missing"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn media_type_checker_dry_run_captures_delete_orphan_manifest() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/mt-dry-missing").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -573,7 +573,7 @@ mod tests {
                     .is_ok(),
                 "revision link must not be touched under Vec sink"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

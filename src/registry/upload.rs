@@ -557,7 +557,6 @@ mod tests {
     use std::{io::Cursor, str::FromStr, sync::Arc};
 
     use async_trait::async_trait;
-    use bytes::Bytes;
     use hyper::{
         Request,
         header::{LOCATION, RANGE},
@@ -578,19 +577,19 @@ mod tests {
             path_builder,
             repository_resolver::RepositoryResolver,
             test_utils::{
-                FSRegistryTestCase, RegistryTestCase, backends, create_test_registry,
-                create_test_repositories, put_blob_direct,
+                FSRegistryTestCase, RegistryTestCase, create_test_registry,
+                create_test_repositories, for_each_backend, put_blob_direct,
             },
         },
         test_fixtures::configuration::load_config,
     };
     use angos_storage::{
-        BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
-        MultipartUploadPage, ObjectMeta, ObjectStore, Page,
+        Error as StorageError,
+        test_util::{HookedStore, StoreHook, StoreOp},
     };
 
-    /// Which storage operation the [`FailingStorage`] wrapper turns into a
-    /// hard error. Everything else delegates to the inner backend untouched.
+    /// Which storage operation the failing hook turns into a hard error.
+    /// Everything else delegates to the inner backend untouched.
     #[derive(Clone, Copy)]
     enum FailOp {
         /// Fail the best-effort container sweep at the end of promotion.
@@ -602,130 +601,33 @@ mod tests {
         WriteUpload,
     }
 
-    /// Delegating storage wrapper that injects a single failure at the storage
-    /// seam so upload fast-paths can be proven to avoid a given op. Wraps an
-    /// [`ObjectStore`] (the CRUD floor plus the upload-session methods), the
-    /// whole storage seam the blob store speaks.
-    struct FailingStorage {
-        inner: Arc<dyn ObjectStore>,
-        fail: FailOp,
-    }
-
-    fn fail(message: &str) -> StorageError {
-        StorageError::Backend(message.to_string())
-    }
-
     #[async_trait]
-    impl ObjectStore for FailingStorage {
-        async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-            self.inner.get(key).await
-        }
-
-        async fn get_stream(
-            &self,
-            key: &str,
-            offset: Option<u64>,
-        ) -> Result<(StorageBoxedReader, u64), StorageError> {
-            self.inner.get_stream(key, offset).await
-        }
-
-        async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
-            self.inner.put(key, data).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.delete(key).await
-        }
-
-        async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
-            if matches!(self.fail, FailOp::DeletePrefix) {
-                return Err(fail("delete_prefix failed"));
-            }
-            self.inner.delete_prefix(prefix).await
-        }
-
-        async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-            self.inner.head(key).await
-        }
-
-        async fn list(
-            &self,
-            prefix: &str,
-            n: u16,
-            token: Option<String>,
-        ) -> Result<Page<String>, StorageError> {
-            self.inner.list(prefix, n, token).await
-        }
-
-        async fn list_children(
-            &self,
-            prefix: &str,
-            n: u16,
-            token: Option<String>,
-            start_after: Option<String>,
-        ) -> Result<ChildrenPage, StorageError> {
-            self.inner
-                .list_children(prefix, n, token, start_after)
-                .await
-        }
-
-        async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
-            self.inner.copy(source, destination).await
-        }
-
-        async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.create_upload(key).await
-        }
-
-        async fn write_upload(
-            &self,
-            key: &str,
-            body: ByteStream,
-            len: Option<u64>,
-        ) -> Result<u64, StorageError> {
-            if matches!(self.fail, FailOp::WriteUpload) {
-                return Err(fail(
-                    "write should not be called for monolithic existing blob upload",
-                ));
-            }
-            self.inner.write_upload(key, body, len).await
-        }
-
-        async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
-            if matches!(self.fail, FailOp::CompleteUpload) {
-                return Err(fail("complete should not be called for existing blob data"));
-            }
-            self.inner.complete_upload(key).await
-        }
-
-        async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.abort_upload(key).await
-        }
-
-        async fn list_multipart_uploads(
-            &self,
-            key_marker: Option<&str>,
-            upload_id_marker: Option<&str>,
-        ) -> Result<MultipartUploadPage, StorageError> {
-            self.inner
-                .list_multipart_uploads(key_marker, upload_id_marker)
-                .await
+    impl StoreHook for FailOp {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            let message = match (self, op) {
+                (FailOp::DeletePrefix, StoreOp::DeletePrefix { .. }) => "delete_prefix failed",
+                (FailOp::CompleteUpload, StoreOp::CompleteUpload { .. }) => {
+                    "complete should not be called for existing blob data"
+                }
+                (FailOp::WriteUpload, StoreOp::WriteUpload { .. }) => {
+                    "write should not be called for monolithic existing blob upload"
+                }
+                _ => return Ok(()),
+            };
+            Err(StorageError::Backend(message.to_string()))
         }
     }
 
     /// Rebuild `inner` with its object store wrapped so `fail` errors out,
     /// reusing the same upload backend.
     fn failing_blob_store(inner: &Arc<BlobStore>, fail: FailOp) -> Arc<BlobStore> {
-        let failing = Arc::new(FailingStorage {
-            inner: inner.object_store().clone(),
-            fail,
-        });
+        let failing = Arc::new(HookedStore::new(inner.object_store().clone(), fail));
         Arc::new(BlobStore::new(failing, None))
     }
 
     #[tokio::test]
     async fn test_start_upload() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test upload content";
@@ -779,13 +681,13 @@ mod tests {
                 }
                 StartUploadResponse::Session { .. } => panic!("Expected Existing response"),
             }
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_mount_blob_grants_and_returns_existing() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
             let target = &Namespace::new("test-repo/target").unwrap();
@@ -826,15 +728,15 @@ mod tests {
                     .unwrap(),
                 "mount must grant the target namespace a reference"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_mount_blob_emits_blob_push_event() {
-        // A satisfied mount must emit blob.push so webhook consumers see the
-        // mounted blob, just as a completed upload does.
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
+            // A satisfied mount must emit blob.push so webhook consumers see the
+            // mounted blob, just as a completed upload does.
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
             let target = &Namespace::new("test-repo/target").unwrap();
@@ -862,15 +764,15 @@ mod tests {
                 events[0].digest.as_deref(),
                 Some(digest.to_string().as_str())
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_mount_blob_fallback_emits_no_event() {
-        // The session fallback grants nothing yet; its eventual upload emits the
-        // event, so the mount itself must not.
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
+            // The session fallback grants nothing yet; its eventual upload emits the
+            // event, so the mount itself must not.
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
             let target = &Namespace::new("test-repo/target").unwrap();
@@ -888,13 +790,13 @@ mod tests {
 
             assert!(matches!(response, StartUploadResponse::Session { .. }));
             assert!(events.is_empty(), "a fallback session must emit no event");
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_mount_blob_falls_back_when_source_lacks_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
             let target = &Namespace::new("test-repo/target").unwrap();
@@ -930,13 +832,13 @@ mod tests {
                     .unwrap(),
                 "a failed mount must not grant the target namespace a reference"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_mount_blob_falls_back_when_blob_absent() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
             let target = &Namespace::new("test-repo/target").unwrap();
@@ -958,13 +860,13 @@ mod tests {
                 matches!(response, StartUploadResponse::Session { .. }),
                 "an absent blob must fall back to a normal upload session"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_mount_blob_automatic_grants_referenced_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let owner = &Namespace::new("test-repo/owner").unwrap();
             let target = &Namespace::new("test-repo/target").unwrap();
@@ -1000,13 +902,13 @@ mod tests {
                     .unwrap(),
                 "automatic mount must grant the target namespace a reference"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_mount_blob_automatic_falls_back_for_unreferenced_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let target = &Namespace::new("test-repo/target").unwrap();
             let source = &Namespace::new("test-repo/source").unwrap();
@@ -1027,13 +929,13 @@ mod tests {
                 matches!(response, StartUploadResponse::Session { .. }),
                 "an unreferenced (orphan) blob must not be auto-mounted"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_mount_blob_grants_only_from_the_authorized_source() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let owner = &Namespace::new("test-repo/owner").unwrap();
             let authorized = &Namespace::new("test-repo/authorized").unwrap();
@@ -1068,13 +970,13 @@ mod tests {
                     .unwrap(),
                 "target must not be granted a reference from an unauthorized source"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn mount_source_candidates_resolves_from_and_discovery() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
             let other = &Namespace::new("test-repo/other").unwrap();
@@ -1126,14 +1028,13 @@ mod tests {
                 .await
                 .unwrap();
             assert!(candidates.is_empty());
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn authorize_mount_source_requires_read_on_the_source() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
             let content = b"mount authorization blob";
@@ -1188,14 +1089,13 @@ mod tests {
                     "a caller denied read on the source must not be allowed to mount"
                 );
             }
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_patch_upload() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test patch content";
@@ -1249,8 +1149,8 @@ mod tests {
                 summary.size,
                 (content.len() + additional_content.len()) as u64
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     // A chunked request (`Transfer-Encoding: chunked`, no `Content-Length`) is
@@ -1259,7 +1159,7 @@ mod tests {
     // is the `docker push` path.
     #[tokio::test]
     async fn patch_upload_without_content_length_streams_to_eof() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"chunked upload with no declared length";
@@ -1294,13 +1194,13 @@ mod tests {
                 registry.blob_store.read(&expected_digest).await.unwrap(),
                 content
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_complete_upload() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test complete content";
@@ -1357,18 +1257,17 @@ mod tests {
                 .unwrap();
             let namespace_links = blob_index.namespace.get(namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(expected_digest.clone())));
-
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_monolithic_complete_upload_without_prior_patch() {
-        // The whole body arrives in the final PUT with no prior PATCH, so
-        // completion takes the monolithic path that hashes only the target
-        // algorithm; verify it produces the correct digest for both.
-        for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
-            for test_case in backends() {
+        for_each_backend(async |test_case| {
+            // The whole body arrives in the final PUT with no prior PATCH, so
+            // completion takes the monolithic path that hashes only the target
+            // algorithm; verify it produces the correct digest for both.
+            for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
                 let registry = test_case.registry();
                 let namespace = &Namespace::new("test-repo").unwrap();
                 let content = b"monolithic upload body";
@@ -1403,12 +1302,13 @@ mod tests {
 
                 test_case.cleanup().await;
             }
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_sha512_patch_then_complete_upload_lifecycle() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let full_content = b"sha512 upload driven through PATCH then PUT";
@@ -1465,13 +1365,13 @@ mod tests {
                 registry.blob_store.read(&expected_digest).await.unwrap(),
                 full_content
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_sha512_complete_upload_wrong_digest_rejected() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let full_content = b"sha512 body that will not match the claimed digest";
@@ -1508,8 +1408,8 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::DigestInvalid)));
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1694,7 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_upload() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let session_id = UploadSessionId::generate();
@@ -1725,13 +1625,13 @@ mod tests {
                     .await
                     .is_err()
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_get_upload_status() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test range content";
@@ -1769,13 +1669,13 @@ mod tests {
                 response.headers[RANGE.as_str()],
                 format!("0-{}", content.len() - 1)
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_patch_upload_offset_validation_still_works() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let session_id = UploadSessionId::generate();
@@ -1798,13 +1698,13 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_complete_upload_digest_mismatch_still_rejected() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let session_id = UploadSessionId::generate();
@@ -1840,15 +1740,15 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::DigestInvalid)));
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_complete_upload_existing_blob_rejects_oversized_body() {
-        // A re-PUT of an already-present blob whose body exceeds its declared
-        // length is rejected on size, as soon as the surplus byte is read.
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
+            // A re-PUT of an already-present blob whose body exceeds its declared
+            // length is rejected on size, as soon as the surplus byte is read.
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = vec![b'x'; 100];
@@ -1875,13 +1775,13 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_write_upload_returns_digest_and_size() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let session_id = UploadSessionId::generate();
@@ -1917,13 +1817,13 @@ mod tests {
                 .unwrap();
 
             assert_eq!(size, summary.size);
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_upload_summary_size_accumulates() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let session_id = UploadSessionId::generate();
@@ -1962,8 +1862,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(summary.size, content.len() as u64);
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]

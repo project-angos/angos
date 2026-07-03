@@ -1,9 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
-use chrono::Utc;
 use reqwest::Client;
 use url::Url;
-use uuid::Uuid;
 
 use crate::{
     configuration::RegexPattern,
@@ -12,8 +10,8 @@ use crate::{
         dispatcher::{EventDispatcher, WebhookEndpoint},
         event::{Event, EventKind},
     },
-    oci::Namespace,
     secret::Secret,
+    test_fixtures::events::manifest_push_event,
 };
 
 pub const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,18 +23,25 @@ pub fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventD
         .expect("dispatcher should build in tests")
 }
 
+/// Dispatcher over exactly one webhook registered as `name`; the remaining
+/// parameters mirror [`create_test_webhook_config`].
+pub fn single_hook_dispatcher(
+    name: &str,
+    url: &str,
+    policy: DeliveryPolicy,
+    token: Option<&str>,
+    max_retries: u32,
+) -> EventDispatcher {
+    let mut webhooks = HashMap::new();
+    webhooks.insert(
+        name.to_string(),
+        create_test_webhook_config(url, policy, token, max_retries),
+    );
+    build_dispatcher(webhooks)
+}
+
 pub fn create_test_event() -> Event {
-    Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::ManifestPush,
-        namespace: Namespace::new("library/nginx").unwrap(),
-        digest: Some("sha256:abc123".to_string()),
-        reference: Some("sha256:abc123".to_string()),
-        tag: Some("latest".to_string()),
-        actor: None,
-        repository: "docker-hub".to_string(),
-    }
+    manifest_push_event("library/nginx", "docker-hub", Some("latest"))
 }
 
 pub fn create_test_config(

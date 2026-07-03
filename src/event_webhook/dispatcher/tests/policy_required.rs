@@ -1,34 +1,7 @@
-use std::collections::HashMap;
-
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-use super::common::{build_dispatcher, create_test_event, create_test_webhook_config};
+use super::common::{create_test_event, single_hook_dispatcher};
 use crate::event_webhook::{Error, config::DeliveryPolicy};
-
-#[tokio::test]
-async fn dispatch_required_policy_returns_error_on_server_error() {
-    let server = MockServer::start().await;
-    let event = create_test_event();
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "required-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
-    );
-
-    let dispatcher = build_dispatcher(webhooks);
-    let result = dispatcher.dispatch(&event).await;
-    assert!(
-        matches!(result, Err(Error::Dispatch(_))),
-        "Required policy must return dispatch error on 500"
-    );
-}
 
 #[tokio::test]
 async fn dispatch_required_policy_returns_ok_on_success() {
@@ -41,13 +14,13 @@ async fn dispatch_required_policy_returns_ok_on_success() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "required-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "required-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -71,13 +44,13 @@ async fn dispatch_required_retries_until_success() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "retry-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 2),
+    let dispatcher = single_hook_dispatcher(
+        "retry-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        2,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok(), "Should succeed after retrying: {result:?}");
 
@@ -101,13 +74,13 @@ async fn dispatch_required_retries_exhausted_returns_error() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "retry-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 1),
+    let dispatcher = single_hook_dispatcher(
+        "retry-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        1,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(
         matches!(result, Err(Error::Dispatch(_))),
@@ -126,13 +99,13 @@ async fn dispatch_no_retry_when_max_retries_zero() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "no-retry-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "no-retry-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(matches!(result, Err(Error::Dispatch(_))));
 

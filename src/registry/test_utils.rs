@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -10,15 +10,15 @@ use crate::{
     cache,
     configuration::GlobalConfig,
     metrics_provider,
-    oci::{Digest, Namespace, Tag},
-    policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
+    oci::{Digest, MediaType, Namespace, Tag, UploadSessionId},
+    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         Registry, RegistryConfig, Repository, blob_store,
         blob_store::{BlobStore, BlobStoreConfig},
         job_store::{JobStore, Queue},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
-        path_builder, repository,
+        path_builder,
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
     },
@@ -27,10 +27,27 @@ use crate::{
     secret::Secret,
 };
 use angos_s3_client::Backend as S3HttpBackend;
+use angos_s3_client::test_util::{
+    TEST_ACCESS_KEY, TEST_BUCKET, TEST_REGION, TEST_SECRET_KEY, test_endpoint,
+};
 use angos_storage::{
     ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
 use angos_tx_engine::{lock::LockStrategy, store::Store};
+
+/// Canonical connection to the live S3 test backend (rustfs, in CI and
+/// locally), single-sourced from the s3-client test fixtures so credentials,
+/// bucket, and the `ANGOS_TEST_S3_ENDPOINT` override are declared once.
+pub fn s3_test_connection(key_prefix: String) -> S3ConnectionConfig {
+    S3ConnectionConfig {
+        access_key_id: Secret::new(TEST_ACCESS_KEY.to_string()),
+        secret_key: Secret::new(TEST_SECRET_KEY.to_string()),
+        endpoint: test_endpoint(),
+        region: TEST_REGION.to_string(),
+        bucket: TEST_BUCKET.to_string(),
+        key_prefix,
+    }
+}
 
 /// Wrap an object store into a [`Store`] façade for tests, using a locked
 /// executor serialising on a fresh in-memory lock.
@@ -38,6 +55,59 @@ pub fn build_store(object: Arc<dyn ObjectStore>) -> Arc<Store> {
     Arc::new(
         Store::new(object, None, LockStrategy::Memory, None, false, false).expect("test store"),
     )
+}
+
+/// FS-backed test stack over a fresh temp directory: one [`Store`] façade
+/// shared by a cache-less [`MetadataStore`] and a presign-less [`BlobStore`].
+/// Keep the stack alive for the test's duration; dropping it deletes the
+/// directory.
+pub struct FsTestStack {
+    pub dir: TempDir,
+    pub store: Arc<Store>,
+    pub metadata_store: Arc<MetadataStore>,
+    pub blob_store: Arc<BlobStore>,
+}
+
+pub fn fs_test_stack() -> FsTestStack {
+    metrics_provider::init_for_tests();
+    let dir = TempDir::new().expect("temp dir for fs test stack");
+    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
+    let store = build_store(object);
+    let metadata_store = Arc::new(
+        MetadataStore::builder(store.clone())
+            .link_cache_ttl(0)
+            .access_time_debounce_secs(0)
+            .build(),
+    );
+    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    FsTestStack {
+        dir,
+        store,
+        metadata_store,
+        blob_store,
+    }
+}
+
+/// Resolver over a single named repository.
+pub fn single_repo_resolver(name: &str, repository: Repository) -> Arc<RepositoryResolver> {
+    let mut repositories = HashMap::new();
+    repositories.insert(name.to_string(), repository);
+    Arc::new(RepositoryResolver::new(Arc::new(repositories)).expect("test resolver"))
+}
+
+/// Run `test` once per registry backend, printing the active backend first
+/// (captured test output names it on failure) and running the case's
+/// best-effort cleanup after the body. The single home of the backend matrix;
+/// tests never iterate [`backends`] themselves.
+pub async fn for_each_backend<F>(test: F)
+where
+    F: AsyncFn(&dyn RegistryTestCase),
+{
+    for case in backends() {
+        eprintln!("running against the {} backend", case.name());
+        test(case.as_ref()).await;
+        case.cleanup().await;
+    }
 }
 
 /// Wrap an object store into a cache-less [`MetadataStore`] for tests (link
@@ -64,26 +134,10 @@ pub fn metadata_store_over_cached(
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     metrics_provider::init_for_tests();
 
-    let config = repository::Config {
-        access_policy: AccessPolicyConfig {
-            default: AccessMode::Allow,
-            ..AccessPolicyConfig::default()
-        },
-        retention_policy: RetentionPolicyConfig::default(),
-        ..repository::Config::default()
-    };
-
     let mut repositories = HashMap::new();
     repositories.insert(
         "test-repo".to_string(),
-        Repository {
-            name: Namespace::new("test-repo").unwrap(),
-            upstreams: Vec::new(),
-            replication: Vec::new(),
-            retention_policy: RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock)),
-            immutable_tags: config.immutable_tags,
-            immutable_tags_exclusions: config.immutable_tags_exclusions,
-        },
+        repository_with_replication("test-repo", Vec::new()),
     );
 
     Arc::new(repositories)
@@ -137,6 +191,38 @@ pub async fn put_link_raw(store: &Store, namespace: &Namespace, link: &LinkKind,
         .expect("raw link write");
 }
 
+/// Parse a media type that tests know to be valid.
+pub fn media_type(value: &str) -> MediaType {
+    MediaType::new(value).unwrap()
+}
+
+/// Upload `content` through the full registry upload state machine (session
+/// create plus monolithic complete), returning its SHA-256 digest.
+pub async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
+    let session_id = UploadSessionId::generate();
+    registry
+        .blob_store
+        .create_upload(namespace, session_id.as_ref())
+        .await
+        .unwrap();
+
+    let body = content.to_vec();
+    let digest = Digest::sha256_of_bytes(&body);
+    registry
+        .complete_upload(
+            None,
+            namespace,
+            &session_id,
+            &digest,
+            None,
+            Some(body.len() as u64),
+            Cursor::new(body),
+        )
+        .await
+        .unwrap();
+    digest
+}
+
 /// Test-only helper that writes `content` directly at the canonical blob path
 /// via the underlying `ObjectStore` (no upload state machine, no namespace),
 /// returning its SHA-256 digest.
@@ -182,23 +268,14 @@ pub async fn create_test_blob(
     let namespace_links = blob_index.namespace.get(namespace).unwrap();
     assert!(namespace_links.contains(&layer_link));
 
-    let repository = Repository {
-        name: Namespace::new("test-repo").unwrap(),
-        upstreams: Vec::new(),
-        replication: Vec::new(),
-        retention_policy: RetentionPolicy::new(
-            &RetentionPolicyConfig { rules: Vec::new() },
-            Arc::new(SystemClock),
-        ),
-        immutable_tags: false,
-        immutable_tags_exclusions: Vec::new(),
-    };
+    let repository = repository_with_replication("test-repo", Vec::new());
 
     (digest, repository)
 }
 
 #[async_trait::async_trait(?Send)]
 pub trait RegistryTestCase {
+    fn name(&self) -> &'static str;
     fn registry(&self) -> &Registry;
     fn blob_store(&self) -> Arc<BlobStore>;
     fn metadata_store(&self) -> Arc<MetadataStore>;
@@ -293,6 +370,10 @@ impl FSRegistryTestCase {
 
 #[async_trait::async_trait(?Send)]
 impl RegistryTestCase for FSRegistryTestCase {
+    fn name(&self) -> &'static str {
+        "fs"
+    }
+
     fn registry(&self) -> &Registry {
         &self.registry
     }
@@ -317,14 +398,7 @@ impl S3RegistryTestCase {
     pub fn new() -> Self {
         let key_prefix = format!("test-{}", Uuid::new_v4());
 
-        let connection = S3ConnectionConfig {
-            access_key_id: Secret::new("root".to_string()),
-            secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            region: "region".to_string(),
-            bucket: "registry".to_string(),
-            key_prefix: key_prefix.clone(),
-        };
+        let connection = s3_test_connection(key_prefix.clone());
 
         let s3_config = blob_store::S3BackendConfig {
             connection: connection.clone(),
@@ -360,6 +434,10 @@ impl S3RegistryTestCase {
 
 #[async_trait::async_trait(?Send)]
 impl RegistryTestCase for S3RegistryTestCase {
+    fn name(&self) -> &'static str {
+        "s3"
+    }
+
     fn registry(&self) -> &Registry {
         &self.s3_registry
     }

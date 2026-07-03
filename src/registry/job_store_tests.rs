@@ -44,6 +44,22 @@ fn dummy_envelope(lock_key: &str) -> JobEnvelope {
     JobEnvelope::new(Queue::Cache, "test.noop", lock_key, &()).expect("envelope")
 }
 
+/// Runs `test` once per job-store backend (FS over a fresh temp directory,
+/// then in-memory), printing the active backend first so captured output names
+/// it on failure. Mirrors `test_utils::for_each_backend`; the [`Harness`] type
+/// is local, so the runner lives here. The temp directory guard stays alive
+/// until both runs finish.
+async fn for_each_job_backend<F>(test: F)
+where
+    F: AsyncFn(Harness),
+{
+    let dir = TempDir::new().expect("temp dir");
+    eprintln!("running against the fs job backend");
+    test(harness(&dir)).await;
+    eprintln!("running against the memory job backend");
+    test(harness_memory()).await;
+}
+
 // =========================================================================
 // Shared test bodies
 // =========================================================================
@@ -399,18 +415,12 @@ async fn run_enqueue_after_claim_creates_second_pending(h: Harness) {
 }
 
 // =========================================================================
-// End-to-end claim cycle: FS store
+// End-to-end claim cycle
 // =========================================================================
 
 #[tokio::test]
 async fn enqueue_then_claim_succeeds() {
-    let dir = TempDir::new().expect("temp dir");
-    run_enqueue_then_claim_succeeds(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn enqueue_then_claim_succeeds_memory() {
-    run_enqueue_then_claim_succeeds(harness_memory()).await;
+    for_each_job_backend(run_enqueue_then_claim_succeeds).await;
 }
 
 // =========================================================================
@@ -419,24 +429,12 @@ async fn enqueue_then_claim_succeeds_memory() {
 
 #[tokio::test]
 async fn retry_writes_pending_with_backoff() {
-    let dir = TempDir::new().expect("temp dir");
-    run_retry_writes_pending_with_backoff(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn retry_writes_pending_with_backoff_memory() {
-    run_retry_writes_pending_with_backoff(harness_memory()).await;
+    for_each_job_backend(run_retry_writes_pending_with_backoff).await;
 }
 
 #[tokio::test]
 async fn dead_letter_after_max_attempts() {
-    let dir = TempDir::new().expect("temp dir");
-    run_dead_letter_after_max_attempts(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn dead_letter_after_max_attempts_memory() {
-    run_dead_letter_after_max_attempts(harness_memory()).await;
+    for_each_job_backend(run_dead_letter_after_max_attempts).await;
 }
 
 // =========================================================================
@@ -445,24 +443,12 @@ async fn dead_letter_after_max_attempts_memory() {
 
 #[tokio::test]
 async fn count_pending_saturates_at_cap() {
-    let dir = TempDir::new().expect("temp dir");
-    run_count_pending_saturates_at_cap(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn count_pending_saturates_at_cap_memory() {
-    run_count_pending_saturates_at_cap(harness_memory()).await;
+    for_each_job_backend(run_count_pending_saturates_at_cap).await;
 }
 
 #[tokio::test]
 async fn count_pending_excludes_envelopes_past_readiness_horizon() {
-    let dir = TempDir::new().expect("temp dir");
-    run_count_pending_excludes_envelopes_past_readiness_horizon(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn count_pending_excludes_envelopes_past_readiness_horizon_memory() {
-    run_count_pending_excludes_envelopes_past_readiness_horizon(harness_memory()).await;
+    for_each_job_backend(run_count_pending_excludes_envelopes_past_readiness_horizon).await;
 }
 
 // =========================================================================
@@ -471,24 +457,12 @@ async fn count_pending_excludes_envelopes_past_readiness_horizon_memory() {
 
 #[tokio::test]
 async fn count_failed_reflects_dead_letters() {
-    let dir = TempDir::new().expect("temp dir");
-    run_count_failed_reflects_dead_letters(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn count_failed_reflects_dead_letters_memory() {
-    run_count_failed_reflects_dead_letters(harness_memory()).await;
+    for_each_job_backend(run_count_failed_reflects_dead_letters).await;
 }
 
 #[tokio::test]
 async fn future_storage_key_yields_next_ready_without_claiming() {
-    let dir = TempDir::new().expect("temp dir");
-    run_future_storage_key_yields_next_ready_without_claiming(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn future_storage_key_yields_next_ready_without_claiming_memory() {
-    run_future_storage_key_yields_next_ready_without_claiming(harness_memory()).await;
+    for_each_job_backend(run_future_storage_key_yields_next_ready_without_claiming).await;
 }
 
 // =========================================================================
@@ -497,46 +471,22 @@ async fn future_storage_key_yields_next_ready_without_claiming_memory() {
 
 #[tokio::test]
 async fn orphan_index_is_self_healed_on_next_lookup() {
-    let dir = TempDir::new().expect("temp dir");
-    run_orphan_index_is_self_healed_on_next_lookup(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn orphan_index_is_self_healed_on_next_lookup_memory() {
-    run_orphan_index_is_self_healed_on_next_lookup(harness_memory()).await;
+    for_each_job_backend(run_orphan_index_is_self_healed_on_next_lookup).await;
 }
 
 #[tokio::test]
 async fn retry_updates_lock_key_index_to_new_storage_key() {
-    let dir = TempDir::new().expect("temp dir");
-    run_retry_updates_lock_key_index_to_new_storage_key(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn retry_updates_lock_key_index_to_new_storage_key_memory() {
-    run_retry_updates_lock_key_index_to_new_storage_key(harness_memory()).await;
+    for_each_job_backend(run_retry_updates_lock_key_index_to_new_storage_key).await;
 }
 
 #[tokio::test]
 async fn enqueue_dedup_skips_existing_lock_key() {
-    let dir = TempDir::new().expect("temp dir");
-    run_enqueue_dedup_skips_existing_lock_key(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn enqueue_dedup_skips_existing_lock_key_memory() {
-    run_enqueue_dedup_skips_existing_lock_key(harness_memory()).await;
+    for_each_job_backend(run_enqueue_dedup_skips_existing_lock_key).await;
 }
 
 #[tokio::test]
 async fn enqueue_after_claim_creates_second_pending() {
-    let dir = TempDir::new().expect("temp dir");
-    run_enqueue_after_claim_creates_second_pending(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn enqueue_after_claim_creates_second_pending_memory() {
-    run_enqueue_after_claim_creates_second_pending(harness_memory()).await;
+    for_each_job_backend(run_enqueue_after_claim_creates_second_pending).await;
 }
 
 async fn run_concurrent_enqueue_dedup(h: Harness) {
@@ -563,13 +513,7 @@ async fn run_concurrent_enqueue_dedup(h: Harness) {
 
 #[tokio::test]
 async fn concurrent_enqueue_dedup() {
-    let dir = TempDir::new().expect("temp dir");
-    run_concurrent_enqueue_dedup(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn concurrent_enqueue_dedup_memory() {
-    run_concurrent_enqueue_dedup(harness_memory()).await;
+    for_each_job_backend(run_concurrent_enqueue_dedup).await;
 }
 
 // =========================================================================
@@ -645,13 +589,7 @@ async fn run_complete_commit_failure_fails_job_over(h: Harness) {
 
 #[tokio::test]
 async fn complete_commit_failure_fails_job_over() {
-    let dir = TempDir::new().expect("temp dir");
-    run_complete_commit_failure_fails_job_over(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn complete_commit_failure_fails_job_over_memory() {
-    run_complete_commit_failure_fails_job_over(harness_memory()).await;
+    for_each_job_backend(run_complete_commit_failure_fails_job_over).await;
 }
 
 // =========================================================================
@@ -843,46 +781,22 @@ async fn run_delete_pending_removes_record_and_index(h: Harness) {
 
 #[tokio::test]
 async fn list_pending_page_is_keyset_ordered() {
-    let dir = TempDir::new().expect("temp dir");
-    run_list_pending_page_is_keyset_ordered(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn list_pending_page_is_keyset_ordered_memory() {
-    run_list_pending_page_is_keyset_ordered(harness_memory()).await;
+    for_each_job_backend(run_list_pending_page_is_keyset_ordered).await;
 }
 
 #[tokio::test]
 async fn retry_failed_resets_attempts() {
-    let dir = TempDir::new().expect("temp dir");
-    run_retry_failed_resets_attempts(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn retry_failed_resets_attempts_memory() {
-    run_retry_failed_resets_attempts(harness_memory()).await;
+    for_each_job_backend(run_retry_failed_resets_attempts).await;
 }
 
 #[tokio::test]
 async fn delete_failed_record() {
-    let dir = TempDir::new().expect("temp dir");
-    run_delete_failed_record(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn delete_failed_record_memory() {
-    run_delete_failed_record(harness_memory()).await;
+    for_each_job_backend(run_delete_failed_record).await;
 }
 
 #[tokio::test]
 async fn delete_pending_removes_record_and_index() {
-    let dir = TempDir::new().expect("temp dir");
-    run_delete_pending_removes_record_and_index(harness(&dir)).await;
-}
-
-#[tokio::test]
-async fn delete_pending_removes_record_and_index_memory() {
-    run_delete_pending_removes_record_and_index(harness_memory()).await;
+    for_each_job_backend(run_delete_pending_removes_record_and_index).await;
 }
 
 // =========================================================================

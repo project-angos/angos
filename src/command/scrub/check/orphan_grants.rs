@@ -120,7 +120,7 @@ mod tests {
         oci::Namespace,
         registry::{
             metadata_store::BlobIndexOperation,
-            test_utils::{self, backends, put_blob_direct},
+            test_utils::{self, for_each_backend, put_blob_direct},
         },
     };
 
@@ -128,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn revokes_grant_and_reclaims_bytes_when_no_manifest_references_it() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -164,13 +164,13 @@ mod tests {
                 blob_store.read(&blob).await.is_err(),
                 "the now-unreferenced bytes must be reclaimed"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn preserves_grant_when_a_manifest_references_the_blob() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -197,13 +197,13 @@ mod tests {
                     .any(|a| matches!(a, Action::RemoveOrphanBlobGrant { .. })),
                 "a grant backing a manifest reference must not be revoked"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn skips_a_grant_younger_than_min_age() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -231,13 +231,13 @@ mod tests {
                 sink.is_empty(),
                 "a grant younger than min_age must not be touched"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn dry_run_captures_the_revoke_without_mutating() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -270,14 +270,14 @@ mod tests {
                 blob_store.read(&blob).await.is_ok(),
                 "a Vec sink must not mutate storage"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn ignores_a_blob_with_only_a_real_manifest_reference() {
-        // A normal pushed image (Layer reference, no stray grant) is untouched.
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
+            // A normal pushed image (Layer reference, no stray grant) is untouched.
             let namespace = &Namespace::new(NAMESPACE).unwrap();
             let registry = test_case.registry();
             let blob_store = test_case.blob_store();
@@ -299,7 +299,7 @@ mod tests {
                     .any(|a| matches!(a, Action::RemoveOrphanBlobGrant { .. })),
                 "a normally-referenced blob must not be touched"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

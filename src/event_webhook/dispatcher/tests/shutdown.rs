@@ -4,6 +4,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use super::common::{
     TEST_SHUTDOWN_TIMEOUT, build_dispatcher, create_test_event, create_test_webhook_config,
+    single_hook_dispatcher,
 };
 use crate::event_webhook::config::DeliveryPolicy;
 
@@ -19,13 +20,13 @@ async fn test_shutdown_completes_in_flight_async_delivery() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "slow-async-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "slow-async-hook",
+        &server.uri(),
+        DeliveryPolicy::Async,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     // Immediately call shutdown: it must block until the in-flight delivery finishes
@@ -54,13 +55,8 @@ async fn test_shutdown_rejects_new_async_dispatches() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "async-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
-    );
-
-    let dispatcher = build_dispatcher(webhooks);
+    let dispatcher =
+        single_hook_dispatcher("async-hook", &server.uri(), DeliveryPolicy::Async, None, 0);
     dispatcher
         .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
         .await;
@@ -161,13 +157,13 @@ async fn test_shutdown_with_timeout_returns_after_timeout_when_tasks_are_too_slo
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "very-slow-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "very-slow-hook",
+        &server.uri(),
+        DeliveryPolicy::Async,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     let start = std::time::Instant::now();
@@ -195,13 +191,13 @@ async fn test_shutdown_with_timeout_drains_fast_tasks_within_timeout() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "fast-async-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "fast-async-hook",
+        &server.uri(),
+        DeliveryPolicy::Async,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     dispatcher
@@ -228,13 +224,13 @@ async fn test_shutdown_is_idempotent() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "idempotent-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "idempotent-hook",
+        &server.uri(),
+        DeliveryPolicy::Async,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     // Calling shutdown twice must not panic or deadlock

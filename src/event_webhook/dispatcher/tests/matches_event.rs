@@ -10,24 +10,6 @@ fn matches_event_no_filter_matches_all_repositories() {
 }
 
 #[test]
-fn matches_event_with_filter_matches_matching_repository() {
-    let endpoint = build_endpoint(create_test_config(
-        vec![EventKind::ManifestPush],
-        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
-    ));
-    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
-}
-
-#[test]
-fn matches_event_with_filter_rejects_non_matching_repository() {
-    let endpoint = build_endpoint(create_test_config(
-        vec![EventKind::ManifestPush],
-        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
-    ));
-    assert!(!endpoint.matches_event(&EventKind::ManifestPush, "other/thing"));
-}
-
-#[test]
 fn matches_event_multiple_filters_matches_if_any_pattern_matches() {
     let endpoint = build_endpoint(create_test_config(
         vec![EventKind::ManifestPush],

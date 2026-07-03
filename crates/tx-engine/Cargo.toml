@@ -6,30 +6,31 @@ edition = "2024"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
-[dependencies]
-angos-backoff = { path = "../backoff" }
-angos-storage = { path = "../storage" }
-async-trait = "0.1.89"
-bytes = "1.12.0"
-chrono = { version = "0.4.45", features = ["serde"] }
-futures-util = { version = "0.3.32", default-features = false }
-hex = "0.4.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-sha2 = "0.11.0"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
-tokio-util = { version = "0.7.18", features = ["io-util", "rt"] }
-tracing = "0.1.44"
-uuid = { version = "1.23.4", features = ["v4", "serde"] }
-
-[dependencies.redis]
-version = "1.2.4"
-features = ["tokio-comp"]
-optional = true
-
 [features]
 redis = ["dep:redis"]
+test-util = []
+
+[dependencies]
+angos-backoff = { workspace = true }
+angos-storage = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+redis = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["full", "macros", "rt-multi-thread"] }
+# Self-reference so the integration tests (compiled as external crates) see
+# the feature-gated test-util surface.
+angos-tx-engine = { workspace = true, features = ["test-util"] }
+angos-storage = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

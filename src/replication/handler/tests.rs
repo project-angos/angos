@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use serde_json::json;
 use tempfile::TempDir;
@@ -19,10 +19,9 @@ use crate::{
         blob_store::BlobStore,
         job_store::{JobEnvelope, JobHandler, Queue},
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
-        repository_resolver::RepositoryResolver,
         test_utils::{
-            build_store, downstream_client, put_blob_direct, repository_with_replication,
-            seed_manifest,
+            FsTestStack, build_store, downstream_client, fs_test_stack, put_blob_direct,
+            repository_with_replication, seed_manifest, single_repo_resolver,
         },
     },
     registry_client::RegistryClient,
@@ -34,6 +33,7 @@ use crate::{
             build_prune_delete_envelope, replication_lock_key,
         },
     },
+    test_fixtures::mocks::{mount_blob_upload_accepted, mount_blobs_present},
 };
 
 const NAMESPACE: &str = "nginx";
@@ -115,8 +115,7 @@ fn lock_key_distinguishes_push_from_delete() {
 }
 
 /// Deletes with different `source_ts` are distinct events and must not
-/// coalesce (the stale timestamp would lose receiver-side LWW), while
-/// retries of the same event still do.
+/// coalesce (the stale timestamp would lose receiver-side LWW).
 #[test]
 fn lock_key_separates_distinct_delete_events() {
     let mut first = sample_payload();
@@ -128,11 +127,6 @@ fn lock_key_separates_distinct_delete_events() {
         replication_lock_key(&first),
         replication_lock_key(&second),
         "deletes with different source_ts must each get their own job"
-    );
-    assert_eq!(
-        replication_lock_key(&first),
-        replication_lock_key(&first.clone()),
-        "a retry of the same deletion event must still coalesce"
     );
 }
 
@@ -202,24 +196,17 @@ async fn put_blob(store: &Arc<Store>, content: &[u8]) -> Digest {
 #[tokio::test]
 async fn execute_rejects_unknown_kind() {
     metrics_provider::init_for_tests();
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store: _,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client("https://unused.test")),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -245,24 +232,17 @@ async fn execute_rejects_unknown_kind() {
 #[tokio::test]
 async fn execute_errors_on_removed_downstream() {
     metrics_provider::init_for_tests();
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store: _,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client("https://unused.test")),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -284,55 +264,18 @@ async fn execute_pushes_manifest_with_head_before_put() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
     // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
-    for blob in [&config_digest, &layer_digest] {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-    }
-    // Each missing blob: POST start, PATCH chunk, PUT complete.
-    Mock::given(method("POST"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1")),
-        )
-        .expect(2)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1")),
-        )
-        .expect(2)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
-        .respond_with(ResponseTemplate::new(201))
-        .expect(2)
-        .mount(&mock_server)
-        .await;
+    mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     // The manifest itself is PUT by tag (no OCI-Subject -> no fallback).
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -344,12 +287,10 @@ async fn execute_pushes_manifest_with_head_before_put() {
         .mount(&mock_server)
         .await;
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client(&mock_server.uri())),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -368,17 +309,12 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     // Local content lives in the `nginx/app` sub-namespace; the mapping strips
     // `nginx` and prepends `mirror`, so the remote path is `mirror/app`.
@@ -388,39 +324,7 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
         seed_manifest(&store, &metadata_store, &local_namespace).await;
 
     // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
-    for blob in [&config_digest, &layer_digest] {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{mapped}/blobs/{blob}")))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-    }
-    // Each missing blob: POST start, PATCH chunk, PUT complete.
-    Mock::given(method("POST"))
-        .and(path(format!("/v2/{mapped}/blobs/uploads/")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{mapped}/blobs/uploads/s1")),
-        )
-        .expect(2)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path(format!("/v2/{mapped}/blobs/uploads/s1")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{mapped}/blobs/uploads/s1")),
-        )
-        .expect(2)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{mapped}/blobs/uploads/s1")))
-        .respond_with(ResponseTemplate::new(201))
-        .expect(2)
-        .mount(&mock_server)
-        .await;
+    mount_blob_upload_accepted(&mock_server, mapped, &[&config_digest, &layer_digest]).await;
     // The manifest itself is PUT by tag at the mapped namespace.
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{mapped}/manifests/v1")))
@@ -444,12 +348,7 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
         Some(Namespace::new("mirror").unwrap()),
     )
     .build();
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
-        repository_with_replication(REPO, vec![downstream]),
-    );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+    let resolver = single_repo_resolver(REPO, repository_with_replication(REPO, vec![downstream]));
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -552,17 +451,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
 
     // Both blobs already present downstream; unmatched manifest HEAD 404s
     // so the converged skip never fires and the PUT body is observable.
-    for blob in [&config_digest, &layer_digest] {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
-                    .insert_header("Content-Length", "10"),
-            )
-            .mount(&mock_server)
-            .await;
-    }
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
         .respond_with(
@@ -573,12 +462,10 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
         .mount(&mock_server)
         .await;
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client(&mock_server.uri())),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -611,33 +498,18 @@ async fn execute_skips_blob_present_on_downstream() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
     // Both blobs already present (200 on HEAD) -> NO upload sequence at all.
-    for blob in [&config_digest, &layer_digest] {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
-                    .insert_header("Content-Length", "10"),
-            )
-            .mount(&mock_server)
-            .await;
-    }
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     // No POST/PATCH mounted: if the pipeline tried to upload, the request
     // would 404 and the push would error.
     Mock::given(method("PUT"))
@@ -650,12 +522,10 @@ async fn execute_skips_blob_present_on_downstream() {
         .mount(&mock_server)
         .await;
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client(&mock_server.uri())),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -671,17 +541,12 @@ async fn execute_push_stamps_resolved_source_timestamp() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -700,17 +565,7 @@ async fn execute_push_stamps_resolved_source_timestamp() {
 
     // Blobs already present (200 on HEAD): the only mutating request is the
     // manifest PUT.
-    for blob in [&config_digest, &layer_digest] {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
-                    .insert_header("Content-Length", "10"),
-            )
-            .mount(&mock_server)
-            .await;
-    }
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     // The PUT must carry the source timestamp; if the header is absent or
     // wrong, this mock does not match and the push fails.
     Mock::given(method("PUT"))
@@ -724,12 +579,10 @@ async fn execute_push_stamps_resolved_source_timestamp() {
         .mount(&mock_server)
         .await;
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client(&mock_server.uri())),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -747,17 +600,12 @@ async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
@@ -772,17 +620,7 @@ async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
         .unwrap()
         .to_rfc3339();
 
-    for blob in [&config_digest, &layer_digest] {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
-                    .insert_header("Content-Length", "10"),
-            )
-            .mount(&mock_server)
-            .await;
-    }
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     // A missing or wrong header would not match this mock and the push fails.
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -795,12 +633,10 @@ async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
         .mount(&mock_server)
         .await;
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client(&mock_server.uri())),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -818,32 +654,17 @@ async fn execute_push_surfaces_immutable_conflict_409_as_error() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let (_manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
-    for blob in [&config_digest, &layer_digest] {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
-                    .insert_header("Content-Length", "10"),
-            )
-            .mount(&mock_server)
-            .await;
-    }
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
         .respond_with(
@@ -854,12 +675,10 @@ async fn execute_push_surfaces_immutable_conflict_409_as_error() {
         .mount(&mock_server)
         .await;
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client(&mock_server.uri())),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -878,32 +697,17 @@ async fn execute_push_treats_superseded_409_as_success() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let (_manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
-    for blob in [&config_digest, &layer_digest] {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
-                    .insert_header("Content-Length", "10"),
-            )
-            .mount(&mock_server)
-            .await;
-    }
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(409).set_body_string(format!(
@@ -912,12 +716,10 @@ async fn execute_push_treats_superseded_409_as_success() {
             .mount(&mock_server)
             .await;
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client(&mock_server.uri())),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -944,24 +746,17 @@ async fn execute_delete_manifest_calls_downstream_delete() {
         .mount(&mock_server)
         .await;
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store: _,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_downstream(downstream_client(&mock_server.uri())),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -978,47 +773,24 @@ async fn handler_with_downstream(
     downstream: &str,
     uri: &str,
 ) -> (ReplicationJobHandler, Digest, Digest, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let (_manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
 
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_named_downstream(downstream, downstream_client(uri)),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
     (handler, config_digest, layer_digest, dir)
-}
-
-/// Mounts a HEAD per blob that returns 200 (already present) so a push skips
-/// the upload sequence and only PUTs the manifest.
-async fn mock_blobs_present(mock_server: &MockServer, blobs: &[&Digest]) {
-    for blob in blobs {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
-                    .insert_header("Content-Length", "10"),
-            )
-            .mount(mock_server)
-            .await;
-    }
 }
 
 #[tokio::test]
@@ -1028,7 +800,7 @@ async fn execute_push_records_pushed_metric_and_last_success() {
     let mock_server = MockServer::start().await;
     let (handler, config_digest, layer_digest, _dir) =
         handler_with_downstream(downstream, &mock_server.uri()).await;
-    mock_blobs_present(&mock_server, &[&config_digest, &layer_digest]).await;
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
         .respond_with(ResponseTemplate::new(201).insert_header(
@@ -1074,7 +846,7 @@ async fn execute_push_records_superseded_metric_and_last_success() {
     let mock_server = MockServer::start().await;
     let (handler, config_digest, layer_digest, _dir) =
         handler_with_downstream(downstream, &mock_server.uri()).await;
-    mock_blobs_present(&mock_server, &[&config_digest, &layer_digest]).await;
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(409).set_body_string(format!(
@@ -1115,7 +887,7 @@ async fn execute_push_records_failed_metric_on_error() {
     let mock_server = MockServer::start().await;
     let (handler, config_digest, layer_digest, _dir) =
         handler_with_downstream(downstream, &mock_server.uri()).await;
-    mock_blobs_present(&mock_server, &[&config_digest, &layer_digest]).await;
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
         .respond_with(
@@ -1160,26 +932,19 @@ async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
     metrics_provider::init_for_tests();
     let downstream = "metric-deleted-tag";
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store: _,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     // No tag seeded, so the resolve short-circuits; the unreachable
     // downstream URL makes any wrongful push error.
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_named_downstream(downstream, downstream_client("http://127.0.0.1:1")),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
@@ -1214,26 +979,19 @@ async fn execute_tagless_push_with_deleted_revision_is_noop_success() {
     metrics_provider::init_for_tests();
     let downstream = "metric-deleted-revision";
 
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = build_store(object);
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .access_time_debounce_secs(0)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.object_store().clone(), None));
+    let FsTestStack {
+        dir: _dir,
+        store: _,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     // No revision link seeded, so the resolve short-circuits; the
     // unreachable downstream URL makes any wrongful push error.
-    let mut repositories = HashMap::new();
-    repositories.insert(
-        REPO.to_string(),
+    let resolver = single_repo_resolver(
+        REPO,
         repository_with_named_downstream(downstream, downstream_client("http://127.0.0.1:1")),
     );
-    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 

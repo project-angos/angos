@@ -235,15 +235,20 @@ mod tests {
         Algorithm, Argon2, Params, PasswordHasher, Version,
         password_hash::{SaltString, rand_core::OsRng},
     };
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use hyper::{Request, header::AUTHORIZATION};
+    use async_trait::async_trait;
 
     use super::*;
     use crate::{
+        auth::PeerCertificate,
         cache,
         configuration::Configuration,
+        identity::OidcClaims,
         metrics_provider,
-        test_fixtures::configuration::{load_config, minimal_config},
+        test_fixtures::{
+            configuration::{load_config, minimal_config},
+            mtls::cert_der,
+            requests::{empty_parts, parts_with_basic_auth},
+        },
     };
 
     fn create_minimal_config() -> Configuration {
@@ -379,35 +384,13 @@ mod tests {
         assert_eq!(validators[0].0, "custom");
     }
 
-    #[test]
-    fn test_build_oidc_validators_multiple() {
-        let config = load_config(
-            r#"
-            [auth.oidc.github]
-            provider = "github"
-
-            [auth.oidc.custom]
-            provider = "generic"
-            issuer = "https://auth.example.com"
-        "#,
-        );
-
-        let cache = cache::Config::Memory.to_backend().unwrap();
-
-        let validators =
-            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
-
-        assert_eq!(validators.len(), 2);
-    }
-
     #[tokio::test]
     async fn test_authenticate_request_no_credentials() {
         let config = create_minimal_config();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
-        let request = Request::builder().body(()).unwrap();
-        let (parts, ()) = request.into_parts();
+        let parts = empty_parts();
 
         let result = authenticator.authenticate_request(&parts, None).await;
 
@@ -436,12 +419,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
-        let credentials = BASE64_STANDARD.encode("testuser:testpass");
-        let request = Request::builder()
-            .header(AUTHORIZATION, format!("Basic {credentials}"))
-            .body(())
-            .unwrap();
-        let (parts, ()) = request.into_parts();
+        let parts = parts_with_basic_auth("testuser", "testpass");
 
         let result = authenticator.authenticate_request(&parts, None).await;
 
@@ -470,12 +448,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
-        let credentials = BASE64_STANDARD.encode("testuser:wrongpass");
-        let request = Request::builder()
-            .header(AUTHORIZATION, format!("Basic {credentials}"))
-            .body(())
-            .unwrap();
-        let (parts, ()) = request.into_parts();
+        let parts = parts_with_basic_auth("testuser", "wrongpass");
 
         let result = authenticator.authenticate_request(&parts, None).await;
 
@@ -519,8 +492,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
-        let request = Request::builder().body(()).unwrap();
-        let (parts, ()) = request.into_parts();
+        let parts = empty_parts();
         let socket_addr: SocketAddr = "192.168.1.100:8080".parse().unwrap();
 
         let result = authenticator
@@ -572,26 +544,24 @@ mod tests {
         outcome: MockOutcome,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl AuthMiddleware for MockValidator {
         async fn authenticate(
             &self,
             _parts: &Parts,
-            identity: &mut crate::identity::ClientIdentity,
-        ) -> Result<AuthResult, crate::command::server::Error> {
+            identity: &mut ClientIdentity,
+        ) -> Result<AuthResult, Error> {
             match &self.outcome {
                 MockOutcome::Authenticated => {
-                    identity.oidc = Some(crate::identity::OidcClaims {
+                    identity.oidc = Some(OidcClaims {
                         provider_name: "mock".to_string(),
                         provider_type: "Mock".to_string(),
-                        claims: std::collections::HashMap::new(),
+                        claims: HashMap::new(),
                     });
                     Ok(AuthResult::Authenticated)
                 }
                 MockOutcome::NoCredentials => Ok(AuthResult::NoCredentials),
-                MockOutcome::Fail(msg) => {
-                    Err(crate::command::server::Error::Unauthorized(msg.clone()))
-                }
+                MockOutcome::Fail(msg) => Err(Error::Unauthorized(msg.clone())),
             }
         }
     }
@@ -610,7 +580,7 @@ mod tests {
         Authenticator {
             mtls_validator: MtlsValidator::new(),
             oidc_validators,
-            basic_auth_validator: BasicAuthValidator::new(&std::collections::HashMap::new()),
+            basic_auth_validator: BasicAuthValidator::new(&HashMap::new()),
         }
     }
 
@@ -618,9 +588,8 @@ mod tests {
     async fn test_try_oidc_no_providers_returns_false() {
         let authenticator = make_authenticator_with_mocks(vec![]);
 
-        let request = Request::builder().body(()).unwrap();
-        let (parts, ()) = request.into_parts();
-        let mut identity = crate::identity::ClientIdentity::new(None);
+        let parts = empty_parts();
+        let mut identity = ClientIdentity::new(None);
 
         let result = authenticator
             .try_oidc_authentication(&parts, &mut identity)
@@ -640,9 +609,8 @@ mod tests {
             ("beta", MockOutcome::Authenticated),
         ]);
 
-        let request = Request::builder().body(()).unwrap();
-        let (parts, ()) = request.into_parts();
-        let mut identity = crate::identity::ClientIdentity::new(None);
+        let parts = empty_parts();
+        let mut identity = ClientIdentity::new(None);
 
         let result = authenticator
             .try_oidc_authentication(&parts, &mut identity)
@@ -660,9 +628,8 @@ mod tests {
             ("beta", MockOutcome::Fail("beta error".to_string())),
         ]);
 
-        let request = Request::builder().body(()).unwrap();
-        let (parts, ()) = request.into_parts();
-        let mut identity = crate::identity::ClientIdentity::new(None);
+        let parts = empty_parts();
+        let mut identity = ClientIdentity::new(None);
 
         let result = authenticator
             .try_oidc_authentication(&parts, &mut identity)
@@ -670,7 +637,7 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(
-            matches!(&err, crate::command::server::Error::Unauthorized(msg) if msg == "alpha error"),
+            matches!(&err, Error::Unauthorized(msg) if msg == "alpha error"),
             "expected alpha's error, got: {err:?}"
         );
     }
@@ -682,9 +649,8 @@ mod tests {
             ("beta", MockOutcome::NoCredentials),
         ]);
 
-        let request = Request::builder().body(()).unwrap();
-        let (parts, ()) = request.into_parts();
-        let mut identity = crate::identity::ClientIdentity::new(None);
+        let parts = empty_parts();
+        let mut identity = ClientIdentity::new(None);
 
         let result = authenticator
             .try_oidc_authentication(&parts, &mut identity)
@@ -700,9 +666,8 @@ mod tests {
 
     fn make_authenticator_with_cert_and_mocks(
         validators: Vec<(&'static str, MockOutcome)>,
-    ) -> (Authenticator, crate::auth::PeerCertificate) {
-        let cert_der = crate::test_fixtures::mtls::cert_der();
-        let peer_cert = crate::auth::PeerCertificate(Arc::new(cert_der));
+    ) -> (Authenticator, PeerCertificate) {
+        let peer_cert = PeerCertificate(Arc::new(cert_der()));
         let authenticator = make_authenticator_with_mocks(validators);
         (authenticator, peer_cert)
     }
@@ -722,9 +687,8 @@ mod tests {
             ("beta", MockOutcome::NoCredentials),
         ]);
 
-        let mut request = Request::builder().body(()).unwrap();
-        request.extensions_mut().insert(peer_cert);
-        let (parts, ()) = request.into_parts();
+        let mut parts = empty_parts();
+        parts.extensions.insert(peer_cert);
 
         let identity = authenticator
             .authenticate_request(&parts, None)
@@ -753,8 +717,7 @@ mod tests {
         let authenticator =
             make_authenticator_with_mocks(vec![("provider", MockOutcome::Authenticated)]);
 
-        let request = Request::builder().body(()).unwrap();
-        let (parts, ()) = request.into_parts();
+        let parts = empty_parts();
 
         let identity = authenticator
             .authenticate_request(&parts, None)
@@ -788,9 +751,8 @@ mod tests {
             ("beta", MockOutcome::Fail("beta rejected".to_string())),
         ]);
 
-        let mut request = Request::builder().body(()).unwrap();
-        request.extensions_mut().insert(peer_cert);
-        let (parts, ()) = request.into_parts();
+        let mut parts = empty_parts();
+        parts.extensions.insert(peer_cert);
 
         let result = authenticator.authenticate_request(&parts, None).await;
 
@@ -807,11 +769,6 @@ mod tests {
     /// The identity carries OIDC claims; username is None (basic never ran).
     #[tokio::test]
     async fn method_tracking_oidc_success_skips_basic_auth() {
-        use argon2::{
-            Algorithm, Argon2, Params, PasswordHasher, Version,
-            password_hash::{SaltString, rand_core::OsRng},
-        };
-
         metrics_provider::init_for_tests();
 
         // Generate a valid Argon2 hash, then embed it in a config string so that
@@ -844,12 +801,7 @@ mod tests {
         };
 
         // Include valid basic-auth credentials in the request.
-        let credentials = BASE64_STANDARD.encode("admin:secret");
-        let request = Request::builder()
-            .header(AUTHORIZATION, format!("Basic {credentials}"))
-            .body(())
-            .unwrap();
-        let (parts, ()) = request.into_parts();
+        let parts = parts_with_basic_auth("admin", "secret");
 
         let identity = authenticator
             .authenticate_request(&parts, None)

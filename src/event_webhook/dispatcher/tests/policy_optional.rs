@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-use super::common::{build_dispatcher, create_test_event, create_test_webhook_config};
+use super::common::{create_test_event, single_hook_dispatcher};
 use crate::event_webhook::config::DeliveryPolicy;
 
 #[tokio::test]
@@ -16,13 +14,13 @@ async fn dispatch_optional_policy_returns_ok_on_server_error() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "optional-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Optional, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "optional-hook",
+        &server.uri(),
+        DeliveryPolicy::Optional,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok(), "Optional policy must return Ok even on 500");
 }
@@ -38,13 +36,13 @@ async fn dispatch_optional_policy_returns_ok_on_success() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "optional-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Optional, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "optional-hook",
+        &server.uri(),
+        DeliveryPolicy::Optional,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -61,13 +59,13 @@ async fn dispatch_optional_retries_exhausted_returns_ok() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "retry-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Optional, None, 2),
+    let dispatcher = single_hook_dispatcher(
+        "retry-hook",
+        &server.uri(),
+        DeliveryPolicy::Optional,
+        None,
+        2,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(
         result.is_ok(),

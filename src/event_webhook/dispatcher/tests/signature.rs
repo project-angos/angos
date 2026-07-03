@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{header, method},
@@ -9,7 +7,7 @@ use crate::event_webhook::{
     config::DeliveryPolicy,
     dispatcher::{
         compute_signature,
-        tests::common::{build_dispatcher, create_test_event, create_test_webhook_config},
+        tests::common::{create_test_event, single_hook_dispatcher},
     },
 };
 
@@ -27,18 +25,13 @@ async fn dispatch_sends_hmac_signature_header() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "test-hook".to_string(),
-        create_test_webhook_config(
-            &server.uri(),
-            DeliveryPolicy::Required,
-            Some("hmac-secret"),
-            0,
-        ),
+    let dispatcher = single_hook_dispatcher(
+        "test-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        Some("hmac-secret"),
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -54,13 +47,13 @@ async fn dispatch_no_signature_header_without_token() {
         .mount(&server)
         .await;
 
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "test-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
+    let dispatcher = single_hook_dispatcher(
+        "test-hook",
+        &server.uri(),
+        DeliveryPolicy::Required,
+        None,
+        0,
     );
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 

@@ -1023,21 +1023,16 @@ mod tests {
     };
 
     use super::*;
-    use crate::{BackendConfig, client::content_md5_base64};
+    use crate::{BackendConfig, client::content_md5_base64, test_util::mock_config};
 
     const MIB: u64 = 1024 * 1024;
 
     fn test_config(endpoint: String) -> BackendConfig {
         BackendConfig {
-            access_key_id: "key".to_string(),
-            secret_key: "secret".to_string(),
-            endpoint,
-            bucket: "test-bucket".to_string(),
-            region: "us-east-1".to_string(),
             multipart_copy_threshold: ByteSize::mib(5),
             multipart_copy_chunk_size: ByteSize::mib(5),
             multipart_copy_jobs: 2,
-            ..Default::default()
+            ..mock_config(endpoint)
         }
     }
 
@@ -1050,6 +1045,28 @@ mod tests {
             operation_attempt_timeout_secs: 1,
             ..test_config(endpoint)
         }
+    }
+
+    /// Backend over [`test_config`] pointed at `server`.
+    fn mock_backend(server: &MockServer) -> Backend {
+        Backend::new(&test_config(server.uri())).unwrap()
+    }
+
+    /// Backend over [`fast_retry_config`] pointed at `server`.
+    fn fast_retry_backend(server: &MockServer) -> Backend {
+        Backend::new(&fast_retry_config(server.uri())).unwrap()
+    }
+
+    /// Asserts `server` received exactly `expected` requests.
+    async fn assert_attempts(server: &MockServer, expected: usize, msg: &str) {
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), expected, "{msg}");
+    }
+
+    /// Asserts `server` received more than one request, proving a retry ran.
+    async fn assert_retried(server: &MockServer, msg: &str) {
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.len() > 1, "{msg}, got {} attempts", requests.len());
     }
 
     fn create_multipart_upload_response() -> ResponseTemplate {
@@ -1130,7 +1147,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&test_config(server.uri())).unwrap();
+        let backend = mock_backend(&server);
         backend.copy_object("source", "destination").await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
@@ -1160,7 +1177,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&test_config(server.uri())).unwrap();
+        let backend = mock_backend(&server);
         let objects = vec!["alpha".to_string(), "needs&escaping".to_string()];
         let expected_body = xml::delete_objects_xml(&objects);
         let expected_md5 = content_md5_base64(expected_body.as_bytes());
@@ -1192,7 +1209,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&test_config(server.uri())).unwrap();
+        let backend = mock_backend(&server);
         let error = backend
             .copy_object("source", "destination")
             .await
@@ -1211,7 +1228,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&test_config(server.uri())).unwrap();
+        let backend = mock_backend(&server);
         let body = stream::iter([
             Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
             Ok::<Bytes, io::Error>(Bytes::from_static(b"world")),
@@ -1243,7 +1260,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&test_config(server.uri())).unwrap();
+        let backend = mock_backend(&server);
         let error = backend
             .complete_multipart_upload(
                 "test/file.txt",
@@ -1274,19 +1291,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&fast_retry_config(server.uri())).unwrap();
+        let backend = fast_retry_backend(&server);
         let error = backend
             .put_object_if_not_exists("object", Bytes::from_static(b"body"))
             .await
             .unwrap_err();
 
         assert!(matches!(error, Error::Io(_)));
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(
-            requests.len(),
+        assert_attempts(
+            &server,
             1,
-            "a non-idempotent conditional PUT must make exactly one attempt on a transport error"
-        );
+            "a non-idempotent conditional PUT must make exactly one attempt on a transport error",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1298,19 +1315,18 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&test_config(server.uri())).unwrap();
+        let backend = mock_backend(&server);
         let error = backend
             .put_object_if_not_exists("object", Bytes::from_static(b"body"))
             .await
             .unwrap_err();
 
         assert!(matches!(error, Error::Io(_)));
-        let requests = server.received_requests().await.unwrap();
-        assert!(
-            requests.len() > 1,
-            "a non-idempotent conditional PUT must still retry on a retryable HTTP status, got {} attempts",
-            requests.len()
-        );
+        assert_retried(
+            &server,
+            "a non-idempotent conditional PUT must still retry on a retryable HTTP status",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1323,7 +1339,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&fast_retry_config(server.uri())).unwrap();
+        let backend = fast_retry_backend(&server);
         let error = backend
             .complete_multipart_upload(
                 "object",
@@ -1338,12 +1354,12 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(
-            requests.len(),
+        assert_attempts(
+            &server,
             1,
-            "CompleteMultipartUpload must make exactly one attempt on a transport error"
-        );
+            "CompleteMultipartUpload must make exactly one attempt on a transport error",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1355,18 +1371,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        let backend = Backend::new(&fast_retry_config(server.uri())).unwrap();
+        let backend = fast_retry_backend(&server);
         let error = backend
             .put_object("object", Bytes::from_static(b"body"))
             .await
             .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
-        let requests = server.received_requests().await.unwrap();
-        assert!(
-            requests.len() > 1,
-            "an idempotent PUT must still retry on a transport error, got {} attempts",
-            requests.len()
-        );
+        assert_retried(
+            &server,
+            "an idempotent PUT must still retry on a transport error",
+        )
+        .await;
     }
 }

@@ -1,12 +1,7 @@
-use std::{
-    io::{self, Write},
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
+use std::{str::FromStr, sync::Arc};
 
 use serde_json::json;
 use tracing::Level;
-use tracing_subscriber::fmt::MakeWriter;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use super::*;
@@ -20,47 +15,16 @@ use crate::{
         RegistryConfig, Repository, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
-    test_fixtures::configuration::{load_config, minimal_config, try_load_config},
+    test_fixtures::{
+        configuration::{load_config, minimal_config, try_load_config},
+        logging::LogCapture,
+        requests::parts_with_uri,
+    },
 };
-
-#[derive(Clone, Default)]
-struct LogCapture(Arc<Mutex<Vec<u8>>>);
-
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl LogCapture {
-    fn contents(&self) -> String {
-        let bytes = self.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
-}
-
-impl Write for LogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for LogCapture {
-    type Writer = LogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(Arc::clone(&self.0))
-    }
-}
-
-fn create_minimal_config() -> Configuration {
-    minimal_config()
-}
 
 #[test]
 fn test_authorizer_new_minimal() {
-    let config = create_minimal_config();
+    let config = minimal_config();
     let cache = cache::Config::Memory.to_backend().unwrap();
 
     let authorizer = Authorizer::new(&config, &cache);
@@ -501,7 +465,7 @@ fn create_pull_through_config() -> Configuration {
 }
 
 async fn create_pull_through_registry(config: &Configuration) -> Registry {
-    let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
+    let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
     let handles = storage_config.build_store().await.unwrap();
@@ -535,12 +499,18 @@ async fn create_pull_through_registry(config: &Configuration) -> Registry {
     Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
 }
 
+/// Builds the authorizer and registry pair every `authorize_request` test needs.
+async fn authorizer_and_registry(config: &Configuration) -> (Authorizer, Registry) {
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let authorizer = Authorizer::new(config, &cache).unwrap();
+    let registry = create_pull_through_registry(config).await;
+    (authorizer, registry)
+}
+
 #[tokio::test]
 async fn test_pull_through_repo_allows_delete_manifest() {
     let config = create_pull_through_config();
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let namespace = Namespace::new("docker-io/library/nginx").unwrap();
     let reference = Reference::from_str("latest").unwrap();
@@ -549,11 +519,7 @@ async fn test_pull_through_repo_allows_delete_manifest() {
         reference,
     };
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let result = authorizer
         .authorize_request(&route, &identity, &parts, &registry)
@@ -568,9 +534,7 @@ async fn test_pull_through_repo_allows_delete_manifest() {
 #[tokio::test]
 async fn test_pull_through_repo_allows_delete_blob() {
     let config = create_pull_through_config();
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let namespace = Namespace::new("docker-io/library/nginx").unwrap();
     let digest =
@@ -578,11 +542,7 @@ async fn test_pull_through_repo_allows_delete_blob() {
             .unwrap();
     let route = Action::DeleteBlob { namespace, digest };
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let result = authorizer
         .authorize_request(&route, &identity, &parts, &registry)
@@ -597,16 +557,10 @@ async fn test_pull_through_repo_allows_delete_blob() {
 #[tokio::test]
 async fn test_pull_through_repo_blocks_push_operations() {
     let config = create_pull_through_config();
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let namespace = Namespace::new("docker-io/library/nginx").unwrap();
     let put_manifest_route = Action::PutManifest {
@@ -648,16 +602,10 @@ async fn global_deny_policy_rejects_all_requests() {
         "#,
     );
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let result = authorizer
         .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
@@ -696,16 +644,10 @@ async fn global_webhook_path_allow_when_webhook_returns_200() {
         url = mock_server.uri()
     ));
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let result = authorizer
         .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
@@ -740,16 +682,10 @@ async fn global_webhook_path_deny_when_webhook_returns_403() {
         url = mock_server.uri()
     ));
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let result = authorizer
         .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
@@ -793,16 +729,10 @@ async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {
         "#,
     );
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let action = Action::GetManifest {
         namespace: Namespace::new("no-such-repo/image").unwrap(),
@@ -842,16 +772,10 @@ async fn webhook_unreachable_fails_closed() {
         "#,
     );
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let action = Action::GetManifest {
         namespace: Namespace::new("myrepo/app").unwrap(),
@@ -873,8 +797,6 @@ async fn webhook_unreachable_fails_closed() {
 // allow was returned.
 #[tokio::test]
 async fn indeterminate_global_policy_denies_request() {
-    use crate::command::server::Error as ServerError;
-
     let config = load_config(
         r#"
             [global.access_policy]
@@ -883,16 +805,10 @@ async fn indeterminate_global_policy_denies_request() {
         "#,
     );
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(&config, &cache).unwrap();
-    let registry = create_pull_through_registry(&config).await;
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
     let identity = ClientIdentity::new(None);
-    let (parts, ()) = hyper::Request::builder()
-        .uri("/v2/")
-        .body(())
-        .unwrap()
-        .into_parts();
+    let parts = parts_with_uri("/v2/");
 
     let result = authorizer
         .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)

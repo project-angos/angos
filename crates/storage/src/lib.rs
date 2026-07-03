@@ -23,9 +23,12 @@
 
 mod conditional;
 mod error;
+#[cfg(any(test, feature = "test-util"))]
 mod memory;
 mod object;
 mod presigned;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 mod types;
 mod upload_session;
 
@@ -39,6 +42,7 @@ use tokio::io::AsyncRead;
 
 pub use crate::conditional::ConditionalStore;
 pub use crate::error::Error;
+#[cfg(any(test, feature = "test-util"))]
 pub use crate::memory::MemoryObjectStore;
 pub use crate::object::ObjectStore;
 pub use crate::presigned::PresignedStore;

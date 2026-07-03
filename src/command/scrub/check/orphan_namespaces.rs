@@ -211,7 +211,7 @@ mod tests {
             Repository,
             metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
             repository_resolver::RepositoryResolver,
-            test_utils::{self, backends, put_blob_direct},
+            test_utils::{self, for_each_backend, put_blob_direct},
         },
     };
 
@@ -260,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn clears_orphan_namespace_content() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("ghost/app").unwrap();
@@ -289,13 +289,13 @@ mod tests {
                 !catalog.contains(&"ghost/app".to_string()),
                 "the cleared namespace must drop out of the catalog; got: {catalog:?}"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn leaves_configured_namespace_untouched() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("keep/app").unwrap();
@@ -322,13 +322,13 @@ mod tests {
                 vec![Tag::new("latest").unwrap()],
                 "content must remain"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn dry_run_captures_actions_without_mutating() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("ghost/app").unwrap();
@@ -362,13 +362,13 @@ mod tests {
                 1,
                 "a capturing sink must not mutate storage"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn empty_resolver_deletes_nothing() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("ghost/app").unwrap();
@@ -395,13 +395,13 @@ mod tests {
                 1,
                 "content must remain with no repos configured"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn sweeps_dangling_tag_without_revision() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
             let namespace = Namespace::new("ghost/app").unwrap();
@@ -433,13 +433,13 @@ mod tests {
                 )),
                 "a dangling tag must still be swept"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn end_to_end_clears_only_the_orphan_namespace() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             seed_image(&metadata_store, &Namespace::new("keep/app").unwrap()).await;
@@ -462,13 +462,13 @@ mod tests {
                 !catalog.contains(&"ghost/app".to_string()),
                 "the orphan namespace must be cleared; got: {catalog:?}"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn reclaims_orphan_namespace_layer_and_config_bytes() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("ghost/app").unwrap();
@@ -520,13 +520,13 @@ mod tests {
                 !catalog.contains(&"ghost/app".to_string()),
                 "the orphan namespace must drop out of the catalog; got: {catalog:?}"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn configured_namespace_grant_is_spared() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -562,13 +562,13 @@ mod tests {
                 blob_store.read(&blob).await.is_ok(),
                 "the configured namespace's bytes must remain"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn shared_blob_survives_when_configured_namespace_references_it() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -614,13 +614,13 @@ mod tests {
                 blob_store.read(&blob).await.is_ok(),
                 "the still-referenced bytes must not be reclaimed"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn reclaims_pure_grant_only_orphan_namespace() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -657,13 +657,13 @@ mod tests {
                 blob_store.read(&blob).await.is_err(),
                 "the now-unreferenced bytes must be reclaimed"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn dry_run_does_not_revoke_grants() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -705,13 +705,13 @@ mod tests {
                 blob_store.read(&blob).await.is_ok(),
                 "a capturing sink must not reclaim the bytes"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn deletes_in_flight_upload_of_orphan_namespace() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
             let uuid = uuid::Uuid::new_v4().to_string();
@@ -735,13 +735,13 @@ mod tests {
                 )),
                 "the in-flight upload of the orphan namespace must be swept"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn reclaims_invalidly_named_orphan_namespace() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -777,13 +777,13 @@ mod tests {
                 !catalog.iter().any(|n| n == "BadNS"),
                 "the reclaimed namespace must drop out of the catalog; got: {catalog:?}"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn dry_run_captures_invalid_namespace_reclaim_without_mutating() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
@@ -812,7 +812,7 @@ mod tests {
                 metadata_store.store().get(key).await.is_ok(),
                 "a capturing sink must not mutate storage"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

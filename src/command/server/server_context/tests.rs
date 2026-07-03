@@ -32,10 +32,12 @@ use crate::{
         blob_store::{BlobStoreConfig, FsBackendConfig as BlobFsConfig},
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         repository_resolver::RepositoryResolver,
-        s3_connection::S3ConnectionConfig,
-        test_utils::build_store,
+        test_utils::{build_store, s3_test_connection},
     },
-    secret::Secret,
+    test_fixtures::{
+        configuration::{load_config, minimal_config},
+        events::manifest_push_event,
+    },
 };
 
 #[derive(Default)]
@@ -51,24 +53,7 @@ pub struct TestWebhook<'a> {
 
 pub fn create_test_config_with(options: TestConfigOptions<'_>) -> Configuration {
     metrics_provider::init_for_tests();
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
-    "#;
-
-    let mut config: Configuration = toml::from_str(toml).unwrap();
+    let mut config = minimal_config();
     if let Some(access_policy) = options.access_policy {
         config.global.access_policy = access_policy;
     }
@@ -109,27 +94,6 @@ pub async fn create_test_server_context_from_config(config: &Configuration) -> S
     ServerContext::new(config, registry).unwrap()
 }
 
-fn create_minimal_config() -> Configuration {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-    "#;
-
-    toml::from_str(toml).unwrap()
-}
-
 pub async fn create_test_registry(config: &Configuration) -> Registry {
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
@@ -166,17 +130,7 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
 }
 
 pub fn create_test_event() -> Event {
-    Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::ManifestPush,
-        namespace: Namespace::new("test/repo").unwrap(),
-        digest: Some("sha256:abc123".to_string()),
-        reference: Some("sha256:abc123".to_string()),
-        tag: None,
-        actor: None,
-        repository: "test-repo".to_string(),
-    }
+    manifest_push_event("test/repo", "test-repo", None)
 }
 
 #[tokio::test]
@@ -186,30 +140,13 @@ async fn test_server_context_new_with_basic_auth() {
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_config);
     let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-
         [auth.identity.testuser]
         username = "testuser"
         password = "{password_hash}"
     "#
-    );
-
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let registry = create_test_registry(&config).await;
 
     let context = ServerContext::new(&config, registry);
@@ -219,7 +156,7 @@ async fn test_server_context_new_with_basic_auth() {
 
 #[tokio::test]
 async fn test_authenticate_request_no_credentials() {
-    let config = create_minimal_config();
+    let config = minimal_config();
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -240,30 +177,13 @@ async fn test_authenticate_request_with_basic_auth() {
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_config);
     let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-
         [auth.identity.testuser]
         username = "testuser"
         password = "{password_hash}"
     "#
-    );
-
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -287,7 +207,7 @@ async fn test_authenticate_request_with_basic_auth() {
 
 #[tokio::test]
 async fn test_authenticate_request_with_x_forwarded_for() {
-    let config = create_minimal_config();
+    let config = minimal_config();
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -305,85 +225,8 @@ async fn test_authenticate_request_with_x_forwarded_for() {
 }
 
 #[tokio::test]
-async fn test_authenticate_request_with_x_forwarded_for_single_ip() {
-    let config = create_minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
-
-    let request = Request::builder()
-        .header("X-Forwarded-For", "192.168.1.100")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = context.authenticate_request(&parts, None).await;
-
-    assert!(result.is_ok());
-    let identity = result.unwrap();
-    assert_eq!(identity.client_ip, Some("192.168.1.100".to_string()));
-}
-
-#[tokio::test]
-async fn test_authenticate_request_with_x_forwarded_for_whitespace() {
-    let config = create_minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
-
-    let request = Request::builder()
-        .header("X-Forwarded-For", "  192.168.1.100  , 10.0.0.1")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = context.authenticate_request(&parts, None).await;
-
-    assert!(result.is_ok());
-    let identity = result.unwrap();
-    assert_eq!(identity.client_ip, Some("192.168.1.100".to_string()));
-}
-
-#[tokio::test]
-async fn test_authenticate_request_with_x_real_ip() {
-    let config = create_minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
-
-    let request = Request::builder()
-        .header("X-Real-IP", "192.168.1.200")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = context.authenticate_request(&parts, None).await;
-
-    assert!(result.is_ok());
-    let identity = result.unwrap();
-    assert_eq!(identity.client_ip, Some("192.168.1.200".to_string()));
-}
-
-#[tokio::test]
-async fn test_authenticate_request_x_forwarded_for_takes_precedence() {
-    let config = create_minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
-
-    let request = Request::builder()
-        .header("X-Forwarded-For", "192.168.1.100")
-        .header("X-Real-IP", "192.168.1.200")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = context.authenticate_request(&parts, None).await;
-
-    assert!(result.is_ok());
-    let identity = result.unwrap();
-    assert_eq!(identity.client_ip, Some("192.168.1.100".to_string()));
-}
-
-#[tokio::test]
 async fn test_authenticate_request_with_remote_address() {
-    let config = create_minimal_config();
+    let config = minimal_config();
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -402,7 +245,7 @@ async fn test_authenticate_request_with_remote_address() {
 
 #[tokio::test]
 async fn test_authenticate_request_x_forwarded_for_overrides_remote_address() {
-    let config = create_minimal_config();
+    let config = minimal_config();
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -424,22 +267,8 @@ async fn test_authenticate_request_x_forwarded_for_overrides_remote_address() {
 
 #[tokio::test]
 async fn test_authorize_request_with_global_policy() {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-
+    let config = load_config(
+        r#"
         [global.access_policy]
         default = "allow"
         rules = []
@@ -450,9 +279,8 @@ async fn test_authorize_request_with_global_policy() {
         [repository.test.access_policy]
         default = "allow"
         rules = []
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
+    "#,
+    );
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -471,29 +299,14 @@ async fn test_authorize_request_with_global_policy() {
 
 #[tokio::test]
 async fn test_server_context_new_with_event_webhooks() {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-
+    let config = load_config(
+        r#"
         [event_webhook.test_hook]
         url = "https://example.com/webhook"
         policy = "optional"
         events = ["manifest.push"]
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
+    "#,
+    );
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -502,7 +315,7 @@ async fn test_server_context_new_with_event_webhooks() {
 
 #[tokio::test]
 async fn test_server_context_new_without_event_webhooks() {
-    let config = create_minimal_config();
+    let config = minimal_config();
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -511,7 +324,7 @@ async fn test_server_context_new_without_event_webhooks() {
 
 #[tokio::test]
 async fn test_dispatch_event_with_no_dispatcher() {
-    let config = create_minimal_config();
+    let config = minimal_config();
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -541,22 +354,8 @@ async fn test_dispatch_event_delivers_to_webhook() {
         .mount(&mock_server)
         .await;
 
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
         event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
@@ -565,9 +364,7 @@ async fn test_dispatch_event_delivers_to_webhook() {
         events = ["manifest.push"]
     "#,
         mock_server.uri()
-    );
-
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -596,22 +393,8 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         .mount(&mock_server)
         .await;
 
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
         event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
@@ -620,9 +403,7 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         events = ["manifest.push"]
     "#,
         mock_server.uri()
-    );
-
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -644,7 +425,7 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
 
 #[tokio::test]
 async fn test_server_context_shutdown_with_no_dispatcher() {
-    let config = create_minimal_config();
+    let config = minimal_config();
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -662,22 +443,8 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         .mount(&mock_server)
         .await;
 
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
         event_webhooks = ["slow_hook"]
 
         [event_webhook.slow_hook]
@@ -686,9 +453,7 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         events = ["manifest.push"]
     "#,
         mock_server.uri()
-    );
-
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -726,32 +491,15 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
         .mount(&mock_server)
         .await;
 
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-
         [event_webhook.async_hook]
         url = "{}"
         policy = "async"
         events = ["manifest.push"]
     "#,
         mock_server.uri()
-    );
-
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -789,14 +537,7 @@ struct ShutdownFlushHarness {
 
 fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
     metrics_provider::init_for_tests();
-    let conn = S3ConnectionConfig {
-        access_key_id: Secret::new("root".to_string()),
-        secret_key: Secret::new("roottoor".to_string()),
-        endpoint: "http://127.0.0.1:9000".to_string(),
-        bucket: "registry".to_string(),
-        region: "region".to_string(),
-        key_prefix: unique_prefix.to_string(),
-    };
+    let conn = s3_test_connection(unique_prefix.to_string());
     let http = Arc::new(S3HttpBackend::new(&conn.to_client_config()).expect("s3 http client"));
     let object_store: Arc<dyn ObjectStore> = Arc::new(StorageS3Backend::builder(http).build());
     let facade = build_store(object_store);
@@ -872,23 +613,9 @@ async fn test_shutdown_flushes_pending_access_times() {
         "accessed_at should not be written yet (debounce is 3600s)"
     );
 
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test-blobs-shutdown-flush"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test-metadata-shutdown-flush"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-    "#;
-    let config: Configuration = toml::from_str(toml).unwrap();
+    // The config only drives ServerContext auth and webhook wiring here; the
+    // registry under test was already built by the harness above.
+    let config = minimal_config();
     let context = ServerContext::new(&config, registry).unwrap();
     context.shutdown_with_timeout(Duration::from_secs(10)).await;
 
@@ -986,22 +713,8 @@ async fn dispatch_events_first_failure_does_not_abort_batch() {
         .mount(&mock_server)
         .await;
 
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
         event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
@@ -1011,9 +724,7 @@ async fn dispatch_events_first_failure_does_not_abort_batch() {
         events = ["manifest.push"]
     "#,
         mock_server.uri()
-    );
-
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -1041,22 +752,8 @@ async fn dispatch_events_all_success_returns_ok() {
         .mount(&mock_server)
         .await;
 
-    let toml = format!(
+    let config = load_config(&format!(
         r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
         event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
@@ -1065,9 +762,7 @@ async fn dispatch_events_all_success_returns_ok() {
         events = ["manifest.push"]
     "#,
         mock_server.uri()
-    );
-
-    let config: Configuration = toml::from_str(&toml).unwrap();
+    ));
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 

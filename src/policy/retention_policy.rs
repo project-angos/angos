@@ -209,14 +209,6 @@ mod tests {
 
     use super::{super::clock::SystemClock, *};
 
-    fn rule(s: &str) -> CelRule {
-        CelRule::compile(s).unwrap()
-    }
-
-    fn system_clock() -> Arc<dyn Clock> {
-        Arc::new(SystemClock)
-    }
-
     struct FixedClock(DateTime<Utc>);
 
     impl Clock for FixedClock {
@@ -225,8 +217,23 @@ mod tests {
         }
     }
 
-    fn fixed_clock(dt: DateTime<Utc>) -> Arc<dyn Clock> {
-        Arc::new(FixedClock(dt))
+    /// Builds a policy over compiled CEL rule sources, driven by `clock`.
+    fn policy_with_clock(rules: &[&str], clock: Arc<dyn Clock>) -> RetentionPolicy {
+        let rules = rules
+            .iter()
+            .map(|source| CelRule::compile(source).unwrap())
+            .collect();
+        RetentionPolicy::new(&RetentionPolicyConfig { rules }, clock)
+    }
+
+    /// Builds a policy over CEL rule sources, driven by the system clock.
+    fn policy(rules: &[&str]) -> RetentionPolicy {
+        policy_with_clock(rules, Arc::new(SystemClock))
+    }
+
+    /// Builds a policy over CEL rule sources, driven by a clock frozen at `now`.
+    fn policy_at(now: DateTime<Utc>, rules: &[&str]) -> RetentionPolicy {
+        policy_with_clock(rules, Arc::new(FixedClock(now)))
     }
 
     fn fixed_now() -> DateTime<Utc> {
@@ -235,12 +242,7 @@ mod tests {
 
     #[test]
     fn test_top_pushed_in_top_n() {
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("top_pushed(3)")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["top_pushed(3)"]);
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
@@ -253,12 +255,7 @@ mod tests {
 
     #[test]
     fn test_top_pushed_not_in_top_n() {
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("top_pushed(2)")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["top_pushed(2)"]);
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -271,12 +268,7 @@ mod tests {
 
     #[test]
     fn test_top_pushed_orphan_manifest() {
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("top_pushed(10)")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["top_pushed(10)"]);
 
         let manifest = ManifestImage {
             tag: None,
@@ -289,12 +281,7 @@ mod tests {
 
     #[test]
     fn test_top_pulled_in_top_n() {
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("top_pulled(2)")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["top_pulled(2)"]);
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -307,12 +294,7 @@ mod tests {
 
     #[test]
     fn test_top_pulled_not_in_top_n() {
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("top_pulled(1)")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["top_pulled(1)"]);
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
@@ -326,12 +308,7 @@ mod tests {
     #[test]
     fn test_pushed_at_recent() {
         let now = fixed_now();
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("image.pushed_at > now() - days(1)")],
-            },
-            fixed_clock(now),
-        );
+        let policy = policy_at(now, &["image.pushed_at > now() - days(1)"]);
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -345,12 +322,7 @@ mod tests {
     #[test]
     fn test_pushed_at_old() {
         let now = fixed_now();
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("image.pushed_at > now() - days(1)")],
-            },
-            fixed_clock(now),
-        );
+        let policy = policy_at(now, &["image.pushed_at > now() - days(1)"]);
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -364,12 +336,7 @@ mod tests {
     #[test]
     fn test_last_pulled_at_recent() {
         let now = fixed_now();
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("image.last_pulled_at > now() - hours(1)")],
-            },
-            fixed_clock(now),
-        );
+        let policy = policy_at(now, &["image.last_pulled_at > now() - hours(1)"]);
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -383,12 +350,7 @@ mod tests {
     #[test]
     fn test_last_pulled_at_old() {
         let now = fixed_now();
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("image.last_pulled_at > now() - hours(1)")],
-            },
-            fixed_clock(now),
-        );
+        let policy = policy_at(now, &["image.last_pulled_at > now() - hours(1)"]);
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
@@ -410,12 +372,7 @@ mod tests {
     fn non_boolean_rule_retains_fail_open() {
         // A rule that returns an integer instead of a bool is a misconfiguration.
         // The evaluator must treat this as "retain" (fail-open) without panicking.
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("42")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["42"]);
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
             ..Default::default()
@@ -426,12 +383,7 @@ mod tests {
     #[test]
     fn non_boolean_rule_string_retains_fail_open() {
         // A rule that returns a string instead of a bool.
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("'keep'")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["'keep'"]);
         let manifest = ManifestImage::default();
         assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
     }
@@ -440,12 +392,7 @@ mod tests {
     fn failed_rule_evaluation_retains_fail_open() {
         // A rule that references an unbound variable fails at execution time
         // (not compile time).  The evaluator must treat this as "retain" (fail-open).
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("nonexistent_var")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["nonexistent_var"]);
         let manifest = ManifestImage::default();
         assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
     }
@@ -454,12 +401,7 @@ mod tests {
     fn non_boolean_rule_does_not_shadow_later_rules() {
         // When rule 1 returns a non-bool, the evaluator returns retain immediately
         // (fail-open), so rule 2 is never reached.  Both orderings should retain.
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("42"), rule("false")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["42", "false"]);
         let manifest = ManifestImage::default();
         assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
     }
@@ -469,7 +411,7 @@ mod tests {
     /// deleted when the operator has not expressed an intent to delete anything.
     #[test]
     fn empty_rules_retain_all() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig { rules: vec![] }, system_clock());
+        let policy = policy(&[]);
         let tagged = ManifestImage {
             tag: Some("v1".to_string()),
             ..Default::default()
@@ -487,12 +429,7 @@ mod tests {
     /// eligible for deletion rather than being retained.
     #[test]
     fn top_pushed_with_negative_count_clamps_to_zero() {
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("top_pushed(-5)")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["top_pushed(-5)"]);
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
             ..Default::default()
@@ -505,12 +442,7 @@ mod tests {
     /// effective window is empty and no tag can ever match.
     #[test]
     fn top_pulled_with_negative_count_clamps_to_zero() {
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("top_pulled(-1)")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["top_pulled(-1)"]);
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
             ..Default::default()
@@ -524,12 +456,7 @@ mod tests {
     /// returns `true`, the manifest is still retained.
     #[test]
     fn multiple_rules_first_false_then_true_retains() {
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("false"), rule("true")],
-            },
-            system_clock(),
-        );
+        let policy = policy(&["false", "true"]);
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
             ..Default::default()
@@ -540,12 +467,7 @@ mod tests {
     #[test]
     fn injected_clock_is_observed_by_now_function() {
         let fixed = fixed_now();
-        let policy = RetentionPolicy::new(
-            &RetentionPolicyConfig {
-                rules: vec![rule("image.pushed_at == now()")],
-            },
-            fixed_clock(fixed),
-        );
+        let policy = policy_at(fixed, &["image.pushed_at == now()"]);
 
         let matching = ManifestImage {
             tag: Some("v1".to_string()),

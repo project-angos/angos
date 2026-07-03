@@ -1,6 +1,41 @@
 [workspace]
 members = ["crates/backoff", "crates/s3-client", "crates/storage", "crates/tx-engine"]
 
+# Policy: every dependency used by two or more workspace members is declared
+# here (version plus the features every user shares); members reference it
+# with `workspace = true` and add only member-specific features. Dependencies
+# used by a single member stay in that member's manifest.
+[workspace.dependencies]
+angos-backoff = { path = "crates/backoff" }
+angos-s3-client = { path = "crates/s3-client" }
+angos-storage = { path = "crates/storage" }
+angos-tx-engine = { path = "crates/tx-engine" }
+async-trait = "0.1.89"
+base64 = "0.22.1"
+bytes = "1.12.0"
+bytesize = "2.4.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+futures-util = { version = "0.3.32", default-features = false }
+hex = "0.4.3"
+hmac = "0.13.0"
+md-5 = "0.11"
+parking_lot = "0.12.5"
+quick-xml = "0.40"
+redis = { version = "1.2.4", features = ["tokio-comp"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+smallvec = "1.15"
+tempfile = "3.27"
+thiserror = "2.0.18"
+tokio = "1.52.3"
+tokio-util = { version = "0.7.18", features = ["io-util"] }
+tracing = "0.1.44"
+url = "2.5.8"
+uuid = { version = "1.23.4", features = ["v4"] }
+wiremock = "0.6.5"
+
 [package]
 name = "angos"
 version = "1.3.0"
@@ -12,66 +47,68 @@ codegen-units = 1
 lto = "fat"
 
 [dependencies]
-angos-backoff = { path = "crates/backoff" }
-angos-s3-client = { path = "crates/s3-client" }
-angos-storage = { path = "crates/storage" }
-angos-tx-engine = { path = "crates/tx-engine", features = ["redis"] }
+angos-backoff = { workspace = true }
+angos-s3-client = { workspace = true }
+angos-storage = { workspace = true }
+angos-tx-engine = { workspace = true, features = ["redis"] }
 arc-swap = "1.9.1"
 argh = "0.1.19"
 argon2 = "0.5.3"
-async-trait = "0.1.89"
-base64 = "0.22.1"
-bytes = "1.12.0"
-bytesize = { version = "2.4.0", features = ["serde"] }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+bytesize = { workspace = true, features = ["serde"] }
 cel-interpreter = "0.10"
-chrono = { version = "0.4.45", features = ["serde"] }
-futures-util = { version = "0.3.32", default-features = false }
-hex = "0.4.3"
-hmac = "0.13.0"
+chrono = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
 http-body = "1.0.1"
 http-body-util = "0.1.3"
 humantime = "2.3"
-hyper = { version = "1.10" , features = ["full"]}
+hyper = { version = "1.10", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-graceful"] }
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
-md-5 = "0.11"
+md-5 = { workspace = true }
 mime_guess = "2.0.5"
 notify = "8.2"
 opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "metrics"] }
-opentelemetry-otlp = { version = "0.32.0" , features = ["grpc-tonic"]}
-parking_lot = "0.12.5"
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
+parking_lot = { workspace = true }
 password-hash = { version = "0.5", features = ["getrandom"] }
 prometheus = "0.14"
-quick-xml = "0.40"
-redis = { version = "1.2.4", features = ["tokio-comp"] }
+quick-xml = { workspace = true }
+redis = { workspace = true }
 regex = "1.12.4"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "json"] }
+reqwest = { workspace = true, features = ["json"] }
 rpassword = "7.5.4"
 rust-embed = "8.11"
 rustls = { version = "0.23.41", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 rustls-pki-types = "1.14.1"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { workspace = true }
 serde_html_form = "0.4.0"
-serde_json = "1.0.150"
-sha2 = "0.11.0"
-smallvec = "1.15"
-tempfile = "3.27"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full", "tracing"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+smallvec = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full", "tracing"] }
 tokio-rustls = "0.26.4"
-tokio-util = { version = "0.7.18", features = ["io-util", "rt"] }
+tokio-util = { workspace = true, features = ["rt"] }
 toml = "1.1.2"
-tracing = "0.1.44"
+tracing = { workspace = true }
 tracing-opentelemetry = { git = "https://github.com/tokio-rs/tracing-opentelemetry", rev = "44521fa43c79989cdfb5b7244d5f1afadef6dd7e" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-url = { version = "2.5.8", features = ["serde"] }
-uuid = { version = "1.23.4", features = ["v4", "serde"] }
+url = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["serde"] }
 x509-parser = "0.18.1"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 [dev-dependencies]
-wiremock = "0.6.5"
-rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
-p256 = { version = "0.13.2", features = ["ecdsa", "pem", "jwk"] }
+angos-s3-client = { workspace = true, features = ["test-util"] }
+angos-storage = { workspace = true, features = ["test-util"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
+p256 = { version = "0.13.2", features = ["ecdsa", "pem", "jwk"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
+wiremock = { workspace = true }

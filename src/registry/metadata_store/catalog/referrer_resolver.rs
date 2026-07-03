@@ -76,7 +76,10 @@ mod tests {
     use std::{collections::HashMap, io};
 
     use super::*;
-    use crate::oci::{Descriptor, Manifest, MediaType};
+    use crate::{
+        oci::{Descriptor, Manifest},
+        registry::test_utils::media_type,
+    };
 
     // Two distinct 64-char lowercase hex strings for use as digest hashes.
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -84,10 +87,6 @@ mod tests {
 
     fn digest(hex: &str) -> Digest {
         Digest::sha256(hex).unwrap()
-    }
-
-    fn media_type(value: &str) -> MediaType {
-        MediaType::new(value).unwrap()
     }
 
     fn descriptor_with(artifact_type: Option<&str>) -> Descriptor {

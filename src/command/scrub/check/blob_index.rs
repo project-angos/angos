@@ -171,7 +171,7 @@ mod tests {
         registry::{
             Registry,
             metadata_store::{BlobIndexOperation, LinkKind, LinkOperation},
-            test_utils::{self, backends, put_blob_direct},
+            test_utils::{self, for_each_backend, put_blob_direct},
         },
     };
 
@@ -270,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_restores_a_missing_layer_grant() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/reconcile").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -297,13 +297,13 @@ mod tests {
                 metadata_store.has_blob_references(&layer).await.unwrap(),
                 "the restored grant must again pin the layer against orphan GC"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn reconcile_is_a_noop_when_the_index_is_consistent() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/consistent").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -320,13 +320,13 @@ mod tests {
                 "a fully-consistent index must produce no grant actions, got {} action(s)",
                 sink.len()
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn dry_run_captures_the_grant_without_mutating() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/reconcile-dry").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -352,13 +352,13 @@ mod tests {
                 !layer_grant_present(&metadata_store, namespace, &layer).await,
                 "a Vec sink must not mutate the index"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn reconcile_skips_a_grant_for_a_blob_with_no_bytes() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/reconcile-missing").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -382,7 +382,7 @@ mod tests {
                 )),
                 "no grant must be emitted for a referenced blob whose bytes are missing"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

@@ -93,7 +93,7 @@ mod tests {
         oci::{Descriptor, Digest, MediaType, Namespace},
         registry::{
             metadata_store::{LinkKind, LinkOperation},
-            test_utils::{backends, put_blob_direct},
+            test_utils::{for_each_backend, put_blob_direct},
         },
     };
 
@@ -156,7 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn referrer_checker_emits_delete_for_referrer_with_no_revision_link() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/referrer-orphan").unwrap();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -214,13 +214,13 @@ mod tests {
                     .is_err(),
                 "Referrer link must be removed after checker runs"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn referrer_checker_no_action_when_referrer_revision_still_exists() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/referrer-present").unwrap();
             let metadata_store = test_case.metadata_store();
 
@@ -248,13 +248,13 @@ mod tests {
                 sink.is_empty(),
                 "No action must be emitted when referrer revision link still exists"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn referrer_checker_dry_run_captures_action_without_mutation() {
-        for test_case in backends() {
+        for_each_backend(async |test_case| {
             let namespace = &Namespace::new("test-repo/referrer-dryrun").unwrap();
             let metadata_store = test_case.metadata_store();
 
@@ -315,7 +315,7 @@ mod tests {
                     .is_ok(),
                 "Referrer link must persist when using a Vec (dry-run) sink"
             );
-            test_case.cleanup().await;
-        }
+        })
+        .await;
     }
 }

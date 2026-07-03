@@ -171,15 +171,14 @@ mod tests {
     use std::{collections::HashMap, str::FromStr};
 
     use super::*;
-    use crate::oci::{Descriptor, Manifest, MediaType, Tag};
+    use crate::{
+        oci::{Descriptor, Manifest, Tag},
+        registry::test_utils::media_type,
+    };
 
     fn d(byte: u8) -> Digest {
         let hex = format!("{byte:02x}").repeat(32);
         Digest::from_str(&format!("sha256:{hex}")).unwrap()
-    }
-
-    fn media_type(value: &str) -> MediaType {
-        MediaType::new(value).unwrap()
     }
 
     fn descriptor(digest: Digest) -> Descriptor {
