@@ -256,6 +256,8 @@ impl RetentionChecker {
             .collect()
     }
 
+    /// Per-item tolerance: a failed deletion (or its required event delivery)
+    /// is logged and skipped; the item is retried on the next run.
     async fn emit_delete_tags(
         &self,
         namespace: &Namespace,
@@ -263,11 +265,13 @@ impl RetentionChecker {
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         for tag in tags_to_delete {
-            sink.apply(Action::DeleteTag {
+            let action = Action::DeleteTag {
                 namespace: namespace.clone(),
                 tag: (*tag).clone(),
-            })
-            .await?;
+            };
+            if let Err(e) = sink.apply(action).await {
+                error!("Failed to delete tag '{namespace}:{tag}' for retention: {e}");
+            }
         }
         Ok(())
     }
@@ -435,17 +439,32 @@ impl RetentionChecker {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, str::FromStr};
+    use std::{
+        collections::{HashMap, HashSet},
+        str::FromStr,
+    };
 
     use chrono::{TimeZone, Utc};
+    use url::Url;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use super::*;
     use crate::{
-        command::scrub::{action::Action, executor::Executor},
+        command::scrub::{
+            action::Action,
+            executor::{Executor, RETENTION_ACTOR},
+        },
+        event_webhook::{
+            config::{DeliveryPolicy, EventWebhookConfig},
+            dispatcher::EventDispatcher,
+            event::EventKind,
+        },
         oci::{Digest, Namespace},
         policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
+            Registry, RegistryConfig,
             blob_store::BlobStore,
+            job_store::JobStore,
             metadata_store::LinkOperation,
             repository_resolver::RepositoryResolver,
             test_utils::{
@@ -897,6 +916,110 @@ mod tests {
                 .is_ok(),
             "Vec sink must not delete the tag"
         );
+        test_case.cleanup().await;
+    }
+
+    /// Retention deletions run through the registry, so they emit
+    /// `manifest.delete` and `tag.delete` events carrying the internal
+    /// `prune` actor.
+    #[tokio::test]
+    async fn retention_deletion_emits_events_with_internal_actor() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let webhook = EventWebhookConfig {
+            url: Url::parse(&server.uri()).unwrap(),
+            policy: DeliveryPolicy::Required,
+            token: None,
+            timeout_ms: 5_000,
+            max_retries: 0,
+            events: vec![EventKind::ManifestDelete, EventKind::TagDelete],
+            repository_filter: None,
+        };
+        let mut webhooks = HashMap::new();
+        webhooks.insert("retention-hook".to_string(), webhook);
+        let dispatcher = EventDispatcher::builder()
+            .webhooks(webhooks)
+            .build()
+            .expect("dispatcher build");
+
+        let test_case = FSRegistryTestCase::new();
+        let namespace = &Namespace::new("test-repo/app").unwrap();
+        let metadata_store = test_case.metadata_store();
+
+        let (blob_digest, _) =
+            test_utils::create_test_blob(test_case.registry(), namespace, b"retained content")
+                .await;
+        metadata_store
+            .update_links(
+                namespace,
+                &[LinkOperation::create(
+                    LinkKind::Tag(Tag::new("v0.0.1").unwrap()),
+                    blob_digest.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let resolver = Arc::new(
+            RepositoryResolver::new(test_utils::create_test_repositories())
+                .expect("test repositories must not have overlapping prefixes"),
+        );
+        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "retention-test"));
+        let registry = Arc::new(
+            Registry::new(
+                test_case.blob_store(),
+                metadata_store.clone(),
+                resolver.clone(),
+                RegistryConfig::default()
+                    .job_queue(job_store.clone())
+                    .event_dispatcher(Some(Arc::new(dispatcher))),
+            )
+            .unwrap(),
+        );
+        let mut executor = Executor::new(test_case.blob_store(), metadata_store.clone(), job_store)
+            .with_registry(registry);
+
+        let policy = Arc::new(RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.tag == 'keep-me'").unwrap()],
+            },
+            Arc::new(SystemClock),
+        ));
+        RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
+            .check(namespace, &mut executor)
+            .await
+            .unwrap();
+
+        assert!(
+            metadata_store
+                .read_link(namespace, &LinkKind::Tag(Tag::new("v0.0.1").unwrap()))
+                .await
+                .is_err(),
+            "the tag must be deleted"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let events: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            kinds.contains(&"manifest.delete") && kinds.contains(&"tag.delete"),
+            "retention must emit manifest.delete and tag.delete; got {kinds:?}"
+        );
+        for event in &events {
+            assert_eq!(
+                event["actor"]["internal"], RETENTION_ACTOR,
+                "retention events must carry the internal actor; got {event}"
+            );
+        }
         test_case.cleanup().await;
     }
 

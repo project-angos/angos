@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     command::{
-        bootstrap,
+        bootstrap, prune,
         replicate::ReplicationDrain,
         scrub::{
             action::Action,
@@ -19,7 +19,7 @@ use crate::{
     },
     configuration::Configuration,
     oci::{Namespace, Tag},
-    registry::{job_store::JobStore, metadata_store::MetadataStore},
+    registry::{Registry, job_store::JobStore, metadata_store::MetadataStore},
 };
 
 #[derive(FromArgs, PartialEq, Debug, Default)]
@@ -105,6 +105,9 @@ pub struct Command {
     /// Drains reconcile-enqueued replication jobs in-process at the end of the
     /// run. `None` when dry-run or `--replicate` is absent.
     replication_drain: Option<ReplicationDrain>,
+    /// Registry the deprecated `--retention` deletions run through; held so the
+    /// end of the run can drain in-flight async webhook deliveries.
+    retention_registry: Option<Arc<Registry>>,
 }
 
 impl Command {
@@ -137,6 +140,7 @@ impl Command {
         // non-dry-run `Executor` owns one; the drain is wired only with
         // `--replicate`.
         let mut replication_drain: Option<ReplicationDrain> = None;
+        let mut retention_registry: Option<Arc<Registry>> = None;
         let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
             Box::new(DryRunSink)
@@ -145,11 +149,24 @@ impl Command {
                 metadata_store.store_arc(),
                 format!("scrub-{}", Uuid::new_v4()),
             ));
-            let executor = Executor::new(
+            let mut executor = Executor::new(
                 blob_backend.clone(),
                 metadata_store.clone(),
                 job_store.clone(),
             );
+            // The deprecated `--retention` deletes through the registry, like
+            // `angos prune`.
+            if options.retention {
+                let registry = prune::retention_registry(
+                    config,
+                    blob_backend.clone(),
+                    metadata_store.clone(),
+                    repositories.clone(),
+                    job_store.clone(),
+                )?;
+                retention_registry = Some(registry.clone());
+                executor = executor.with_registry(registry);
+            }
             if options.replicate {
                 replication_drain = Some(ReplicationDrain::new(
                     job_store,
@@ -170,6 +187,7 @@ impl Command {
             store_checkers,
             sink,
             replication_drain,
+            retention_registry,
         })
     }
 
@@ -185,6 +203,11 @@ impl Command {
             drain.drain().await;
         }
         self.metadata_store.flush_access_times().await;
+        if let Some(registry) = &self.retention_registry {
+            registry
+                .shutdown_with_timeout(prune::EVENT_DRAIN_TIMEOUT)
+                .await;
+        }
         Ok(())
     }
 

@@ -235,6 +235,7 @@ impl Registry {
                     &metadata_store,
                     config.max_concurrent_cache_jobs,
                     config.max_concurrent_replication_jobs,
+                    config.event_dispatcher.clone(),
                 );
                 (q, Some(shutdown))
             };
@@ -353,6 +354,7 @@ fn build_in_process_queue(
     metadata_store: &Arc<MetadataStore>,
     cache_concurrency: NonZeroUsize,
     replication_concurrency: NonZeroUsize,
+    event_dispatcher: Option<Arc<EventDispatcher>>,
 ) -> (Arc<JobStore>, CancellationToken) {
     let job_store: Arc<JobStore> =
         Arc::new(JobStore::new(metadata_store.store_arc(), "in-process"));
@@ -361,6 +363,7 @@ fn build_in_process_queue(
         resolver.clone(),
         blob_store.clone(),
         metadata_store.clone(),
+        event_dispatcher,
     ));
 
     // Drain replication only when a downstream is configured: with none, the

@@ -127,8 +127,14 @@ Events are delivered as JSON via HTTP POST.
 | `id`        | string | Identity identifier                |
 | `username`  | string | Basic auth or OIDC subject         |
 | `client_ip` | string | Client IP address                  |
+| `internal`  | string | Name of the internal process that performed the operation (`prune`, `cache`); absent on client-initiated operations |
 
 All actor fields are optional and omitted when not available.
+
+Operations performed by angos itself carry the `internal` field instead of a
+client identity: retention enforcement emits `manifest.delete` / `tag.delete`
+with `internal = "prune"`, and pull-through cache fills emit `manifest.push` /
+`blob.push` with `internal = "cache"`.
 
 ---
 

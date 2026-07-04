@@ -109,6 +109,9 @@ impl From<bootstrap::Error> for Error {
             bootstrap::Error::JobQueue(inner) => {
                 Error::Initialization(format!("Failed to initialize job queue: {inner}"))
             }
+            bootstrap::Error::EventWebhook(inner) => {
+                Error::Initialization(format!("Failed to initialize event webhooks: {inner}"))
+            }
         }
     }
 }

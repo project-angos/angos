@@ -198,7 +198,11 @@ Result: Production images kept for 365 days, others for 7 days.
 
 ## Enforcing Retention Policies
 
-Retention policies are enforced by the `prune` command (`scrub --retention` is a deprecated alias):
+Retention policies are enforced by the `prune` command (`scrub --retention` is a deprecated alias). Retention deletions take the registry's standard delete path:
+
+- They emit `manifest.delete` / `tag.delete` webhook events whose actor carries `internal = "prune"`, so subscribers can tell retention apart from client deletes.
+- The manifest's blob bytes are reclaimed immediately once unreferenced (no separate `scrub --blobs` pass needed for pruned content).
+- On repositories with replication, the deletion is mirrored **only to downstreams marked `prune = true`** (authoritative one-way mirrors); additive downstreams keep their copies. Mirror deletions are enqueued on the durable job queue and drained by the running server or `angos worker`, so they complete asynchronously after the prune run exits.
 
 ```bash
 # Preview what would be deleted

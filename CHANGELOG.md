@@ -9,11 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - New `manifest.pull` and `blob.pull` event-webhook kinds fire on successful `GET` requests (including redirect responses), so pulls can be tracked externally; prefer the `async` delivery policy for these high-volume events.
+- Event payloads gain an `actor.internal` field naming the internal process behind an operation: retention deletions now emit `manifest.delete`/`tag.delete` with `internal = "prune"`, and pull-through cache fills emit `manifest.push`/`blob.push` with `internal = "cache"`.
 
 ### Changed
 
 - On an S3 metadata store, an unset `lock_strategy` now defaults to the shared S3 lock when the provider supports conditional operations, instead of the in-process memory lock.
 - With CAS coordination, access times are now stamped inline as a single conditional write whose lost races are no-ops; `access_time_debounce_secs` only applies to lock-coordinated deployments.
+- Retention deletions (`angos prune`) now run through the registry's standard delete path: blob bytes are reclaimed immediately once unreferenced, and the deletion replicates to downstreams marked `prune = true` only.
 
 ### Fixed
 

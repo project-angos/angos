@@ -23,12 +23,13 @@ use crate::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
+        cache_job_handler::CACHE_ACTOR,
         job_store::Queue,
         metadata_store::{Error as MetadataStoreError, LinkKind, LinkMetadata, LinkOperation},
     },
     replication::{
-        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
-        build_envelope,
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
+        ReplicationPushPayload, build_envelope,
     },
 };
 
@@ -78,6 +79,37 @@ fn tag_event(
         .reference(Some(reference.to_string()))
         .tag(Some(tag.to_string()))
         .actor(actor)
+}
+
+/// The `ManifestDelete` event a delete emits, plus a `TagDelete` when the
+/// reference is a tag.
+fn delete_events(
+    namespace: &Namespace,
+    repository: String,
+    digest: Option<String>,
+    reference: &Reference,
+    actor: Option<EventActor>,
+) -> Vec<Event> {
+    let mut events = vec![manifest_event(
+        EventKind::ManifestDelete,
+        namespace,
+        repository.clone(),
+        digest.clone(),
+        reference,
+        actor.clone(),
+    )];
+    if let Some(tag) = reference.as_tag() {
+        events.push(tag_event(
+            EventKind::TagDelete,
+            namespace,
+            repository,
+            digest,
+            reference,
+            tag,
+            actor,
+        ));
+    }
+    events
 }
 
 impl Registry {
@@ -244,6 +276,21 @@ impl Registry {
             None,
         )
         .await?;
+
+        // The registry gained upstream content, so webhook consumers see it
+        // like any other write. Best effort: the client operation is the
+        // pull, so a delivery failure must not fail it.
+        let event = manifest_event(
+            EventKind::ManifestPush,
+            namespace,
+            repository.name.to_string(),
+            Some(digest.to_string()),
+            &reference,
+            Some(EventActor::internal(CACHE_ACTOR)),
+        );
+        if let Err(error) = self.dispatch_events(&[event]).await {
+            warn!("Cache-fill event delivery failed: {error}");
+        }
 
         Ok(ManifestBody {
             media_type,
@@ -486,6 +533,10 @@ impl Registry {
         Ok(retained)
     }
 
+    /// Deletes a manifest or tag. The delete's initiator is read off the
+    /// `actor`: an internal actor (retention enforcement) mirrors the delete
+    /// only to downstreams marked `prune = true`, a client delete to every
+    /// matching downstream.
     #[instrument(skip(actor))]
     pub async fn delete_manifest(
         &self,
@@ -494,6 +545,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<(), Error> {
+        let client_initiated = actor.as_ref().is_none_or(EventActor::is_client);
         // A delete carries no incoming digest, so a timestamp tie keeps the
         // strictly-greater rule and the delete proceeds.
         self.check_lww_not_superseded(namespace, reference, source_ts, None)
@@ -582,26 +634,7 @@ impl Registry {
             Reference::Tag(_) => None,
         };
 
-        let mut events = vec![manifest_event(
-            EventKind::ManifestDelete,
-            namespace,
-            repository.clone(),
-            digest_str.clone(),
-            reference,
-            actor.clone(),
-        )];
-
-        if let Some(tag) = reference.as_tag() {
-            events.push(tag_event(
-                EventKind::TagDelete,
-                namespace,
-                repository,
-                digest_str,
-                reference,
-                tag,
-                actor,
-            ));
-        }
+        let events = delete_events(namespace, repository, digest_str, reference, actor);
 
         // For a tag delete the receiver keys off `payload.tag`, so no digest
         // is carried.
@@ -613,9 +646,16 @@ impl Registry {
         // dispatch is gated on a real removal. A replicated delete forwards
         // its author timestamp verbatim so the bounce can never outrank a
         // recreate authored after the original delete.
-        if existed_before {
-            self.dispatch_replication(
-                resolved_repository,
+        if existed_before && let Some(repository) = resolved_repository {
+            // An internal delete (retention) mirrors only to authoritative
+            // `prune = true` downstreams, so additive downstreams never lose
+            // content because of upstream retention.
+            let downstreams = repository
+                .replication
+                .iter()
+                .filter(|downstream| client_initiated || downstream.prune);
+            self.dispatch_replication_to(
+                downstreams,
                 namespace,
                 REPLICATION_DELETE_MANIFEST_KIND,
                 tag,
@@ -1044,7 +1084,29 @@ impl Registry {
         let Some(repository) = repository else {
             return;
         };
+        self.dispatch_replication_to(
+            repository.replication.iter(),
+            namespace,
+            kind,
+            tag,
+            digest,
+            source_ts,
+        )
+        .await;
+    }
 
+    /// [`Registry::dispatch_replication`] over a caller-selected downstream
+    /// set, for dispatches that must not fan out to every downstream (a
+    /// retention delete targets only `prune = true` mirrors).
+    async fn dispatch_replication_to<'a>(
+        &self,
+        downstreams: impl Iterator<Item = &'a ReplicationDownstream>,
+        namespace: &Namespace,
+        kind: &str,
+        tag: Option<&Tag>,
+        digest: Option<&Digest>,
+        source_ts: Option<DateTime<Utc>>,
+    ) {
         // Receiver-side last-writer-wins timestamp: authoritative for a DELETE;
         // a PUSH re-derives it at execute time, so a coalesced push never goes
         // stale. An inbound replicated delete passes its author timestamp so it
@@ -1055,9 +1117,7 @@ impl Registry {
         // The per-downstream enqueues run concurrently: each one is an index
         // GET plus a CAS transaction, and this awaits inside the client's
         // PUT/DELETE response path, so serial fan-out adds tail latency.
-        let dispatches = repository
-            .replication
-            .iter()
+        let dispatches = downstreams
             .filter(|downstream| downstream.enqueues_for(namespace.as_ref()))
             .map(|downstream| {
                 let payload = ReplicationPushPayload {

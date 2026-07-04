@@ -1,6 +1,6 @@
 mod checker;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use argh::FromArgs;
 use tracing::info;
@@ -17,9 +17,17 @@ use crate::{
         },
     },
     configuration::Configuration,
+    event_webhook::dispatcher::EventDispatcher,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
-    registry::job_store::JobStore,
+    registry::{
+        Registry, RegistryConfig, blob_store::BlobStore, job_store::JobStore,
+        metadata_store::MetadataStore, repository_resolver::RepositoryResolver,
+    },
 };
+
+/// Upper bound on draining in-flight async webhook deliveries before the
+/// process exits; deliveries still pending afterwards are aborted.
+pub const EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -46,6 +54,30 @@ pub fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Ret
     )))
 }
 
+/// Registry the retention deletions run through, with webhooks wired from
+/// configuration and a caller-held job queue so no in-process drain loops are
+/// spawned: pruned deletions enqueue their replication jobs durably and the
+/// running server or `angos worker` drains them.
+pub fn retention_registry(
+    config: &Configuration,
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
+    resolver: Arc<RepositoryResolver>,
+    job_store: Arc<JobStore>,
+) -> Result<Arc<Registry>, Error> {
+    let dispatcher = EventDispatcher::from_config(&config.event_webhook)
+        .map_err(|e| Error::Initialization(e.to_string()))?;
+    let registry = Registry::new(
+        blob_store,
+        metadata_store,
+        resolver,
+        RegistryConfig::default()
+            .job_queue(job_store)
+            .event_dispatcher(dispatcher),
+    )?;
+    Ok(Arc::new(registry))
+}
+
 /// Applies the global and per-repository retention policies to every
 /// namespace, deleting the tags the policies no longer retain. Supersedes the
 /// deprecated `scrub --retention`.
@@ -66,6 +98,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         repositories.clone(),
         global_retention_policy(&config.global.retention_policy),
     );
+    let mut registry = None;
     let mut sink: Box<dyn ActionSink + Send> = if options.dry_run {
         info!("Dry-run mode: no changes will be made to the storage");
         Box::new(DryRunSink)
@@ -74,15 +107,27 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             metadata_store.store_arc(),
             format!("prune-{}", Uuid::new_v4()),
         ));
-        Box::new(Executor::new(
+        let retention = retention_registry(
+            config,
             blob_backend.clone(),
             metadata_store.clone(),
-            job_store,
-        ))
+            repositories.clone(),
+            job_store.clone(),
+        )?;
+        registry = Some(retention.clone());
+        Box::new(
+            Executor::new(blob_backend.clone(), metadata_store.clone(), job_store)
+                .with_registry(retention),
+        )
     };
 
     check::check_namespaces(&metadata_store, &checker, sink.as_mut()).await?;
-    metadata_store.flush_access_times().await;
+    // The registry shutdown flushes pending writes and drains in-flight async
+    // webhook deliveries before the process exits.
+    match registry {
+        Some(registry) => registry.shutdown_with_timeout(EVENT_DRAIN_TIMEOUT).await,
+        None => metadata_store.flush_access_times().await,
+    }
     Ok(())
 }
 

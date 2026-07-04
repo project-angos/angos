@@ -23,21 +23,24 @@ use crate::{
     event_webhook::{
         config::{DeliveryPolicy, EventWebhookConfig},
         dispatcher::EventDispatcher,
-        event::EventKind,
+        event::{EventActor, EventKind},
     },
     oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
-        BlobMount, Registry, RegistryConfig, StartUploadResponse,
+        BlobMount, Registry, RegistryConfig, Repository, StartUploadResponse,
         blob_ownership::BlobOwnership,
         job_store::{JobStore, Queue},
         repository_resolver::RepositoryResolver,
         test_utils::{
             FsTestStack, create_test_repositories, downstream_client, fs_test_stack,
-            put_blob_direct, repository_with_downstream, single_repo_resolver,
-            sole_pending_payload, upload_blob,
+            put_blob_direct, repository_with_downstream, repository_with_replication,
+            single_repo_resolver, sole_pending_payload, upload_blob,
         },
     },
-    replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND},
+    replication::{
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
+        ReplicationMode,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -649,16 +652,20 @@ struct ReplicationFixture {
 
 impl ReplicationFixture {
     fn new() -> Self {
+        Self::with_repository(repository_with_downstream(
+            REPLICATION_REPO,
+            downstream_client("https://unused.test"),
+        ))
+    }
+
+    fn with_repository(repository: Repository) -> Self {
         let FsTestStack {
             dir,
             store,
             metadata_store,
             blob_store,
         } = fs_test_stack();
-        let resolver = single_repo_resolver(
-            REPLICATION_REPO,
-            repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test")),
-        );
+        let resolver = single_repo_resolver(REPLICATION_REPO, repository);
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
@@ -671,6 +678,23 @@ impl ReplicationFixture {
             _temp_dir: dir,
         }
     }
+}
+
+/// One authoritative `prune = true` mirror plus one additive downstream, both
+/// enqueueing on events.
+fn mirror_and_additive_downstreams() -> Vec<ReplicationDownstream> {
+    let client = downstream_client("https://unused.test");
+    vec![
+        ReplicationDownstream::builder("mirror".to_string(), client.clone(), 4)
+            .mode(ReplicationMode::EventReconcile)
+            .namespace_filter(Vec::new())
+            .prune(true)
+            .build(),
+        ReplicationDownstream::builder("additive".to_string(), client, 4)
+            .mode(ReplicationMode::EventReconcile)
+            .namespace_filter(Vec::new())
+            .build(),
+    ]
 }
 
 #[tokio::test]
@@ -770,4 +794,97 @@ async fn tag_delete_enqueues_replication_delete_job() {
     assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
     assert_eq!(payload.tag.as_deref(), Some("doomed"));
     assert_eq!(payload.namespace, REPLICATION_REPO);
+}
+
+/// A retention-initiated delete (internal actor) mirrors only to the
+/// `prune = true` downstream; the additive downstream keeps its copy.
+#[tokio::test]
+async fn retention_delete_mirrors_only_to_prune_downstreams() {
+    crate::metrics_provider::init_for_tests();
+    let fixture = ReplicationFixture::with_repository(repository_with_replication(
+        REPLICATION_REPO,
+        mirror_and_additive_downstreams(),
+    ));
+    let namespace = Namespace::new(REPLICATION_REPO).unwrap();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
+
+    fixture
+        .registry
+        .put_manifest(
+            &namespace,
+            &Reference::Tag(Tag::new("expired").unwrap()),
+            Some(&mime_type),
+            &manifest_bytes,
+        )
+        .await
+        .expect("seed put_manifest");
+
+    fixture
+        .registry
+        .delete_manifest(
+            Some(EventActor::internal("prune")),
+            None,
+            &namespace,
+            &Reference::Tag(Tag::new("expired").unwrap()),
+        )
+        .await
+        .expect("retention delete");
+
+    assert_eq!(
+        fixture
+            .job_store
+            .count_pending(Queue::Replication, 0)
+            .await
+            .unwrap(),
+        1,
+        "a retention delete must enqueue for the prune = true downstream only"
+    );
+    let payload = sole_pending_payload(&fixture.job_store).await;
+    assert_eq!(payload.downstream, "mirror");
+    assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
+    assert_eq!(payload.tag.as_deref(), Some("expired"));
+}
+
+/// A client-initiated delete fans out to every matching downstream.
+#[tokio::test]
+async fn client_delete_mirrors_to_all_downstreams() {
+    crate::metrics_provider::init_for_tests();
+    let fixture = ReplicationFixture::with_repository(repository_with_replication(
+        REPLICATION_REPO,
+        mirror_and_additive_downstreams(),
+    ));
+    let namespace = Namespace::new(REPLICATION_REPO).unwrap();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
+
+    fixture
+        .registry
+        .put_manifest(
+            &namespace,
+            &Reference::Tag(Tag::new("doomed").unwrap()),
+            Some(&mime_type),
+            &manifest_bytes,
+        )
+        .await
+        .expect("seed put_manifest");
+
+    fixture
+        .registry
+        .delete_manifest(
+            None,
+            None,
+            &namespace,
+            &Reference::Tag(Tag::new("doomed").unwrap()),
+        )
+        .await
+        .expect("client delete");
+
+    assert_eq!(
+        fixture
+            .job_store
+            .count_pending(Queue::Replication, 0)
+            .await
+            .unwrap(),
+        2,
+        "a client delete must enqueue for every matching downstream"
+    );
 }

@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     cache::{self, Cache},
     configuration::{RegistryStorageConfig, registry_storage},
+    event_webhook,
     registry::{
         self, Repository, blob_store, job_store,
         metadata_store::{self, MetadataStore},
@@ -36,6 +37,8 @@ pub enum Error {
     Overlap(#[from] OverlapError),
     #[error("failed to initialize job queue: {0}")]
     JobQueue(#[from] job_store::Error),
+    #[error("failed to initialize event webhooks: {0}")]
+    EventWebhook(#[from] event_webhook::Error),
 }
 
 impl From<blob_store::Error> for Error {

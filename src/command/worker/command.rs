@@ -20,6 +20,7 @@ use crate::{
         worker::runner::execute_one,
     },
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
+    event_webhook::dispatcher::EventDispatcher,
     registry::{
         blob_store::BlobStore,
         cache_job_handler::CacheJobHandler,
@@ -220,6 +221,7 @@ struct WorkerContext {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     repositories: Arc<RepositoryResolver>,
+    event_dispatcher: Option<Arc<EventDispatcher>>,
 }
 
 impl WorkerContext {
@@ -248,6 +250,7 @@ impl WorkerContext {
 
         let storage = config.resolve_registry_storage().build_store().await?;
         job_store::ensure_shared_lock(&storage)?;
+        let event_dispatcher = EventDispatcher::from_config(&config.event_webhook)?;
 
         // Spawn the engine maintenance loops once per worker process so any
         // crashed-mid-Apply transactions are recovered and orphan body
@@ -262,6 +265,7 @@ impl WorkerContext {
             blob_store,
             metadata_store,
             repositories,
+            event_dispatcher,
         })
     }
 
@@ -282,6 +286,7 @@ impl WorkerContext {
                 self.repositories.clone(),
                 self.blob_store.clone(),
                 self.metadata_store.clone(),
+                self.event_dispatcher.clone(),
             )),
         };
 
@@ -367,6 +372,7 @@ mod tests {
             blob_store,
             metadata_store,
             repositories,
+            event_dispatcher: None,
         };
         (context, dir)
     }

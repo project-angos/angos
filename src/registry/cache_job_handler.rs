@@ -2,10 +2,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use angos_tx_engine::transaction::Transaction;
 
 use crate::{
+    event_webhook::{
+        dispatcher::EventDispatcher,
+        event::{Event, EventActor, EventKind},
+    },
     oci::{Digest, Namespace},
     registry::{
         blob::{cache_blob, grant_blob_reference},
@@ -17,6 +22,9 @@ use crate::{
 };
 
 pub const CACHE_FETCH_BLOB_KIND: &str = "cache.fetch_blob";
+
+/// Internal-process name stamped on the events cache fills emit.
+pub const CACHE_ACTOR: &str = "cache";
 
 /// JSON payload for a [`CACHE_FETCH_BLOB_KIND`] job on the `cache` queue.
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,6 +42,7 @@ pub struct CacheJobHandler {
     resolver: Arc<RepositoryResolver>,
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
+    event_dispatcher: Option<Arc<EventDispatcher>>,
 }
 
 impl CacheJobHandler {
@@ -41,11 +50,33 @@ impl CacheJobHandler {
         resolver: Arc<RepositoryResolver>,
         blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
+        event_dispatcher: Option<Arc<EventDispatcher>>,
     ) -> Self {
         Self {
             resolver,
             blob_store,
             metadata_store,
+            event_dispatcher,
+        }
+    }
+
+    /// The namespace gained a blob, so webhook consumers see it like any
+    /// other push. Best effort: the fill is committed and idempotent, so a
+    /// delivery failure must not fail (and re-run) the job.
+    async fn emit_blob_push(&self, namespace: &Namespace, digest: &Digest) {
+        let Some(dispatcher) = &self.event_dispatcher else {
+            return;
+        };
+        let repository = self
+            .resolver
+            .resolve(namespace)
+            .map(|r| r.name.to_string())
+            .unwrap_or_default();
+        let event = Event::new(EventKind::BlobPush, namespace.clone(), repository)
+            .digest(Some(digest.to_string()))
+            .actor(Some(EventActor::internal(CACHE_ACTOR)));
+        if let Err(error) = dispatcher.dispatch(&event).await {
+            warn!("Cache-fill event delivery failed: {error}");
         }
     }
 }
@@ -84,6 +115,7 @@ impl JobHandler for CacheJobHandler {
             grant_blob_reference(&self.metadata_store, &namespace, &digest)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
+            self.emit_blob_push(&namespace, &digest).await;
             return Ok(Transaction::builder().build());
         }
 
@@ -114,7 +146,107 @@ impl JobHandler for CacheJobHandler {
         )
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
+        self.emit_blob_push(&namespace, &digest).await;
 
         Ok(Transaction::builder().build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use url::Url;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    use super::{CACHE_ACTOR, CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload, CacheJobHandler};
+    use crate::{
+        event_webhook::{
+            config::{DeliveryPolicy, EventWebhookConfig},
+            dispatcher::EventDispatcher,
+            event::EventKind,
+        },
+        oci::Namespace,
+        registry::{
+            blob_ownership::BlobOwnership,
+            job_store::{JobEnvelope, JobHandler, Queue},
+            repository_resolver::RepositoryResolver,
+            test_utils::{FsTestStack, create_test_repositories, fs_test_stack, put_blob_direct},
+        },
+    };
+
+    /// The grant path (bytes already cached) makes the blob visible to the
+    /// namespace and must emit one `blob.push` with the internal `cache` actor.
+    #[tokio::test]
+    async fn cache_fill_grant_emits_blob_push_with_internal_actor() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let webhook = EventWebhookConfig {
+            url: Url::parse(&server.uri()).unwrap(),
+            policy: DeliveryPolicy::Required,
+            token: None,
+            timeout_ms: 5_000,
+            max_retries: 0,
+            events: vec![EventKind::BlobPush],
+            repository_filter: None,
+        };
+        let mut webhooks = HashMap::new();
+        webhooks.insert("cache-hook".to_string(), webhook);
+        let dispatcher = EventDispatcher::builder()
+            .webhooks(webhooks)
+            .build()
+            .expect("dispatcher build");
+
+        let FsTestStack {
+            dir: _dir,
+            store: _,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
+        let resolver = Arc::new(
+            RepositoryResolver::new(create_test_repositories())
+                .expect("test repositories must not have overlapping prefixes"),
+        );
+        let namespace = Namespace::new("test-repo/cached").unwrap();
+        let digest = put_blob_direct(metadata_store.store(), b"already cached bytes").await;
+
+        let handler = CacheJobHandler::new(
+            resolver,
+            blob_store,
+            metadata_store.clone(),
+            Some(Arc::new(dispatcher)),
+        );
+        let envelope = JobEnvelope::new(
+            Queue::Cache,
+            CACHE_FETCH_BLOB_KIND,
+            format!("cache:{digest}"),
+            &CacheFetchBlobPayload {
+                namespace: namespace.clone(),
+                digest: digest.to_string(),
+            },
+        )
+        .unwrap();
+        handler.execute(&envelope).await.expect("cache fill");
+
+        assert!(
+            BlobOwnership::new(metadata_store.as_ref())
+                .can_read(&namespace, &digest)
+                .await
+                .unwrap(),
+            "the fill must grant the namespace a reference"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "the fill must emit one event");
+        let event: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(event["kind"], "blob.push");
+        assert_eq!(event["digest"], digest.to_string());
+        assert_eq!(
+            event["actor"]["internal"], CACHE_ACTOR,
+            "cache-fill events must carry the internal actor; got {event}"
+        );
     }
 }
