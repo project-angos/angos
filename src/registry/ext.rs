@@ -690,7 +690,7 @@ impl Registry {
             return Err(Error::NameUnknown);
         }
 
-        let all_namespaces = collect_all_pages(|token| async move {
+        let manifest_namespaces = collect_all_pages(|token| async move {
             self.metadata_store
                 .list_namespaces(1000, token)
                 .await
@@ -698,12 +698,25 @@ impl Registry {
         })
         .await?;
 
-        let mut matching_namespaces: Vec<String> = all_namespaces
+        // The catalog keys namespaces off `_manifests`, so a namespace holding
+        // only in-progress uploads is absent from it; merge the
+        // `_uploads`-keyed listing so its pending uploads still surface here.
+        let upload_namespaces = collect_all_pages(|token| async move {
+            self.metadata_store
+                .list_upload_namespaces(1000, token)
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
+
+        let mut matching_namespaces: Vec<String> = manifest_namespaces
             .into_iter()
+            .chain(upload_namespaces)
             .filter(|ns| namespace_belongs_to(ns, repository))
             .collect();
 
         matching_namespaces.sort_unstable();
+        matching_namespaces.dedup();
         Ok(matching_namespaces)
     }
 
@@ -724,9 +737,9 @@ mod tests {
     use crate::{
         oci::{
             DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest,
-            Platform as OciPlatform, Tag,
+            Namespace, Platform as OciPlatform, Tag, UploadSessionId,
         },
-        registry::test_utils::media_type,
+        registry::test_utils::{create_test_blob, for_each_backend, media_type},
     };
 
     fn digest(hex_suffix: &str) -> Digest {
@@ -1091,5 +1104,67 @@ mod tests {
         assert_eq!(p.os, "linux");
         assert_eq!(p.architecture, "arm64");
         assert_eq!(p.variant.as_deref(), Some("v8"));
+    }
+
+    /// A namespace holding only an in-progress upload has no `_manifests`
+    /// child, yet the ext listings must surface it (with its upload count) so
+    /// the UI can show and cancel its pending uploads. A namespace with both
+    /// manifests and uploads must appear exactly once.
+    #[tokio::test]
+    async fn namespaces_info_includes_upload_only_namespace() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+
+            let upload_only = Namespace::new("test-repo/upload-only").unwrap();
+            registry
+                .blob_store
+                .create_upload(&upload_only, UploadSessionId::generate().as_ref())
+                .await
+                .unwrap();
+
+            let mixed = Namespace::new("test-repo/mixed").unwrap();
+            create_test_blob(registry, &mixed, b"mixed content").await;
+            registry
+                .blob_store
+                .create_upload(&mixed, UploadSessionId::generate().as_ref())
+                .await
+                .unwrap();
+
+            let response = registry.get_namespaces_info("test-repo").await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            let namespaces = body["namespaces"].as_array().unwrap();
+
+            let entries: Vec<(&str, u64, u64)> = namespaces
+                .iter()
+                .map(|ns| {
+                    (
+                        ns["name"].as_str().unwrap(),
+                        ns["manifest_count"].as_u64().unwrap(),
+                        ns["upload_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect();
+            assert!(
+                entries.contains(&("test-repo/upload-only", 0, 1)),
+                "an upload-only namespace must be listed with its upload count; got: {entries:?}"
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|(name, _, _)| *name == "test-repo/mixed")
+                    .count(),
+                1,
+                "a namespace with manifests and uploads must be listed once; got: {entries:?}"
+            );
+
+            let response = registry.get_repositories_info().await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            let count = body["repositories"][0]["namespace_count"].as_u64().unwrap();
+            assert_eq!(
+                count, 2,
+                "the repository namespace count must include the upload-only namespace"
+            );
+        })
+        .await;
     }
 }
