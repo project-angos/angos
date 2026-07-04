@@ -235,7 +235,7 @@ Same connection options as `blob_store.s3`, plus:
 
 The link cache reduces S3 round-trips for repeated tag/layer reads. The access time debounce batches `last_pulled_at` timestamp writes in memory and flushes them periodically, reducing the critical-path operations per manifest pull from 4 (lock, read, write, unlock) to 1 (read).
 
-#### Conditional Writes (`metadata_store.s3.conditional_operations`)
+#### Conditional Operations (`metadata_store.s3.conditional_operations`)
 
 When using S3 as the metadata store, you can declare whether your S3-compatible provider supports the conditional operations Angos coordinates with. The set is all-or-nothing: `PutObject` with `If-None-Match: *`, `PutObject` with `If-Match: <etag>`, and `DeleteObject` with `If-Match: <etag>`. Declaring it avoids a startup probe and, when `true`, enables optimistic (CAS) metadata updates.
 

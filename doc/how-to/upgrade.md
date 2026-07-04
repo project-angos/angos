@@ -96,13 +96,11 @@ See [Distributed Locking](../reference/configuration.md#distributed-locking) in 
 You can declare your S3 provider's conditional operation support upfront to skip the startup probe and enable performance optimizations:
 
 ```toml
-[metadata_store.s3.capabilities]
-put_if_none_match = true
-put_if_match = true
-delete_if_match = true
+[metadata_store.s3]
+conditional_operations = true
 ```
 
-See [Conditional Capabilities](../reference/configuration.md#conditional-capabilities-metadata_stores3capabilities) in the configuration reference for details on when to use this and which providers support each capability.
+See [Conditional Operations](../reference/configuration.md#conditional-operations-metadata_stores3conditional_operations) in the configuration reference for details on when to use this and which providers support it.
 
 ---
 
