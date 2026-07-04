@@ -1,6 +1,66 @@
 use std::future::Future;
 
+use angos_storage::ChildrenPage;
+
 use crate::oci::Algorithm;
+
+/// Walk the repository tree under `root_path` and yield every path that has a
+/// `marker` child: `_manifests` for the content catalog on the metadata store,
+/// `_uploads` for upload-namespace discovery on the blob store. `_`-prefixed
+/// children are never descended into, so manifest/upload/blob substructure is
+/// not mistaken for nested namespaces.
+///
+/// `list_children(path, token)` returns one page of `path`'s immediate
+/// children on whichever store is being walked.
+pub async fn collect_namespaces_with_marker<E, List, ListFut>(
+    root_path: &str,
+    marker: &str,
+    mut list_children: List,
+) -> Result<Vec<String>, E>
+where
+    List: FnMut(String, Option<String>) -> ListFut,
+    ListFut: Future<Output = Result<ChildrenPage, E>>,
+{
+    let mut stack: Vec<(String, String)> = vec![(root_path.to_string(), String::new())];
+    let mut namespaces = Vec::new();
+
+    while let Some((path, prefix)) = stack.pop() {
+        let mut token = None;
+        let mut is_namespace = false;
+        let mut children = Vec::new();
+        loop {
+            let page = list_children(path.clone(), token).await?;
+
+            for entry in &page.sub_prefixes {
+                if entry == marker {
+                    is_namespace = true;
+                    continue;
+                }
+                if entry.starts_with('_') {
+                    continue;
+                }
+                children.push((format!("{path}/{entry}"), format!("{prefix}{entry}/")));
+            }
+
+            token = page.next_token;
+            if token.is_none() {
+                break;
+            }
+        }
+
+        if is_namespace {
+            let namespace = prefix.strip_suffix('/').unwrap_or(&prefix);
+            if !namespace.is_empty() {
+                namespaces.push(namespace.to_string());
+            }
+        }
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+
+    Ok(namespaces)
+}
 
 /// Paginate across the per-algorithm shards of a sharded store
 /// (`<root>/<algorithm>/...`), resuming via an opaque `"<algorithm>:<cursor>"`

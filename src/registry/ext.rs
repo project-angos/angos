@@ -699,10 +699,10 @@ impl Registry {
         .await?;
 
         // The catalog keys namespaces off `_manifests`, so a namespace holding
-        // only in-progress uploads is absent from it; merge the
+        // only in-progress uploads is absent from it; merge the blob store's
         // `_uploads`-keyed listing so its pending uploads still surface here.
         let upload_namespaces = collect_all_pages(|token| async move {
-            self.metadata_store
+            self.blob_store
                 .list_upload_namespaces(1000, token)
                 .await
                 .map_err(Error::from)
@@ -739,7 +739,9 @@ mod tests {
             DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest,
             Namespace, Platform as OciPlatform, Tag, UploadSessionId,
         },
-        registry::test_utils::{create_test_blob, for_each_backend, media_type},
+        registry::test_utils::{
+            FSRegistryTestCase, create_test_blob, for_each_backend, media_type,
+        },
     };
 
     fn digest(hex_suffix: &str) -> Digest {
@@ -1166,5 +1168,34 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// With the blob and metadata stores on separate backends, upload sessions
+    /// exist only on the blob store; the ext listing must discover an
+    /// upload-only namespace there, not on the metadata store's tree.
+    #[tokio::test]
+    async fn namespaces_info_finds_upload_only_namespace_across_split_backends() {
+        let test_case = FSRegistryTestCase::with_split_backends();
+        let registry = test_case.registry();
+
+        let namespace = Namespace::new("test-repo/upload-only").unwrap();
+        registry
+            .blob_store
+            .create_upload(&namespace, UploadSessionId::generate().as_ref())
+            .await
+            .unwrap();
+
+        let response = registry.get_namespaces_info("test-repo").await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let namespaces = body["namespaces"].as_array().unwrap();
+
+        assert_eq!(
+            namespaces.len(),
+            1,
+            "the upload-only namespace must be discovered on the blob store; got: {namespaces:?}"
+        );
+        assert_eq!(namespaces[0]["name"], "test-repo/upload-only");
+        assert_eq!(namespaces[0]["manifest_count"], 0);
+        assert_eq!(namespaces[0]["upload_count"], 1);
     }
 }

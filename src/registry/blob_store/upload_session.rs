@@ -257,6 +257,31 @@ impl BlobStore {
         ))
     }
 
+    /// Lists the namespaces holding an `_uploads` directory. Upload sessions
+    /// live on the blob store, so discovery walks this store: the metadata
+    /// catalog keys namespaces off `_manifests` and cannot see an upload-only
+    /// namespace when the two stores are separate backends.
+    #[instrument(skip(self))]
+    pub async fn list_upload_namespaces(
+        &self,
+        n: u16,
+        last: Option<String>,
+    ) -> Result<(Vec<String>, Option<String>), Error> {
+        let namespaces = pagination::collect_namespaces_with_marker(
+            path_builder::repository_dir(),
+            "_uploads",
+            |path, token| async move {
+                self.object
+                    .list_children(&path, 1000, token, None)
+                    .await
+                    .map_err(Error::from)
+            },
+        )
+        .await?;
+
+        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+    }
+
     #[instrument(skip(self))]
     pub async fn create_upload(&self, namespace: &Namespace, uuid: &str) -> Result<String, Error> {
         let upload_path = path_builder::upload_path(namespace, uuid);

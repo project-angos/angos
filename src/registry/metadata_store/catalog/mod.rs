@@ -27,6 +27,9 @@ use referrer_resolver::resolve_referrer_descriptor;
 const LEGACY_NAMESPACE_REGISTRY_PREFIX: &str = "_registry";
 
 impl MetadataStore {
+    /// Lists the namespaces holding manifest content (a `_manifests` child);
+    /// an `_uploads`-only namespace is not a catalog entry and is discovered
+    /// through the blob store instead, where upload sessions live.
     #[instrument(skip(self))]
     pub async fn list_namespaces(
         &self,
@@ -35,27 +38,17 @@ impl MetadataStore {
     ) -> Result<(Vec<String>, Option<String>), Error> {
         debug!("Fetching {n} namespace(s) with continuation token: {last:?}");
 
-        let namespaces = self
-            .collect_namespaces(path_builder::repository_dir(), "")
-            .await?;
-
-        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
-    }
-
-    /// Lists namespaces holding an `_uploads` directory; unlike
-    /// [`Self::list_namespaces`] these include namespaces with no manifest
-    /// content, which orphan-namespace scrub needs to sweep stranded uploads.
-    #[instrument(skip(self))]
-    pub async fn list_upload_namespaces(
-        &self,
-        n: u16,
-        last: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
-        debug!("Fetching {n} upload namespace(s) with continuation token: {last:?}");
-
-        let namespaces = self
-            .collect_namespaces_with_marker(path_builder::repository_dir(), "", "_uploads")
-            .await?;
+        let namespaces = pagination::collect_namespaces_with_marker(
+            path_builder::repository_dir(),
+            "_manifests",
+            |path, token| async move {
+                self.store()
+                    .list_children(&path, 1000, token, None)
+                    .await
+                    .map_err(Error::from)
+            },
+        )
+        .await?;
 
         Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
     }
@@ -334,71 +327,5 @@ impl MetadataStore {
             .delete_prefix(&prefix)
             .await
             .map_err(Error::from)
-    }
-
-    /// Walk the repository tree under `root_path` and yield every path that is a
-    /// namespace, i.e. has a `_manifests` child (an `_uploads`-only path is
-    /// skipped). `_`-prefixed children are never descended into, so
-    /// manifest/upload/blob substructure is not mistaken for nested namespaces.
-    async fn collect_namespaces(
-        &self,
-        root_path: &str,
-        root_prefix: &str,
-    ) -> Result<Vec<String>, Error> {
-        self.collect_namespaces_with_marker(root_path, root_prefix, "_manifests")
-            .await
-    }
-
-    /// Like [`Self::collect_namespaces`] but keys a namespace off the given
-    /// `marker` child; orphan-namespace scrub passes `_uploads` to reach
-    /// upload-only namespaces that the `_manifests`-keyed catalog omits.
-    async fn collect_namespaces_with_marker(
-        &self,
-        root_path: &str,
-        root_prefix: &str,
-        marker: &str,
-    ) -> Result<Vec<String>, Error> {
-        let mut stack: Vec<(String, String)> =
-            vec![(root_path.to_string(), root_prefix.to_string())];
-        let mut namespaces = Vec::new();
-
-        while let Some((path, prefix)) = stack.pop() {
-            let mut token = None;
-            let mut is_namespace = false;
-            let mut children = Vec::new();
-            loop {
-                let page = self.store().list_children(&path, 1000, token, None).await?;
-
-                for entry in &page.sub_prefixes {
-                    if entry == marker {
-                        is_namespace = true;
-                        continue;
-                    }
-                    if entry.starts_with('_') {
-                        continue;
-                    }
-                    let child_path = format!("{path}/{entry}");
-                    let child_prefix = format!("{prefix}{entry}/");
-                    children.push((child_path, child_prefix));
-                }
-
-                token = page.next_token;
-                if token.is_none() {
-                    break;
-                }
-            }
-
-            if is_namespace {
-                let namespace = prefix.strip_suffix('/').unwrap_or(&prefix);
-                if !namespace.is_empty() {
-                    namespaces.push(namespace.to_string());
-                }
-            }
-            for child in children.into_iter().rev() {
-                stack.push(child);
-            }
-        }
-
-        Ok(namespaces)
     }
 }
