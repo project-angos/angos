@@ -17,6 +17,7 @@
 
 	let rows: TreeRowNode[] = $state([]);
 	let uploads: UploadEntry[] = $state([]);
+	let selectedUploads: Set<string> = $state(new Set());
 
 	let manifest: Manifest | null = $state(null);
 	let digest: string | null = $state(null);
@@ -66,6 +67,7 @@
 		} else {
 			uploads = [];
 		}
+		selectedUploads = new Set();
 		loading = false;
 	}
 
@@ -166,6 +168,22 @@
 		deleting = false;
 	}
 
+	async function cancelSelectedUploads() {
+		deleting = true;
+		error = null;
+		const uuids = [...selectedUploads];
+		const results = await Promise.all(
+			uuids.map((uuid) => apiCancelUpload(fullNamespace, uuid))
+		);
+		deleteConfirm = null;
+		await loadNamespace(fullNamespace);
+		const failed = results.filter((err) => err !== null).length;
+		if (failed > 0) {
+			error = `Failed to cancel ${failed} of ${uuids.length} uploads`;
+		}
+		deleting = false;
+	}
+
 	async function downloadBlob(blobDigest: string, filename: string | null) {
 		const err = await apiDownloadBlob(fullNamespace, blobDigest, filename);
 		if (err) {
@@ -223,6 +241,7 @@
 		namespace={data.namespace}
 		{rows}
 		{uploads}
+		{selectedUploads}
 		{deleteConfirm}
 		{deleting}
 		{expanded}
@@ -231,5 +250,7 @@
 		ondeletemanifest={deleteManifestByRef}
 		ondeletetag={deleteTag}
 		oncancelupload={cancelUpload}
+		onuploadselectionchange={(selected) => selectedUploads = selected}
+		oncancelselecteduploads={cancelSelectedUploads}
 	/>
 {/if}
