@@ -119,12 +119,7 @@ RUST_LOG=info angos scrub -t -m -b
 
 **Scheduling:**
 
-Run scrub as a scheduled task for regular maintenance:
-
-```bash
-# Cron example (daily at 3 AM) - full maintenance
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub -t -m -b
-```
+Run scrub as a scheduled task for regular maintenance, with a Kubernetes CronJob or a systemd timer:
 
 ```yaml
 # Kubernetes CronJob
@@ -144,6 +139,8 @@ spec:
             args: ["-c", "/config/config.toml", "scrub", "-t", "-m", "-b"]
           restartPolicy: OnFailure
 ```
+
+On a host install, use a systemd timer instead; see [Run Storage Maintenance](../how-to/run-storage-maintenance.md#systemd-timer) for the unit files.
 
 ---
 
@@ -171,10 +168,9 @@ angos prune --dry-run
 
 # Enforce retention policies
 angos prune
-
-# Cron example (daily at 3 AM)
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml prune
 ```
+
+Schedule `prune` like `scrub`, with a Kubernetes CronJob or a systemd timer; see [Configure Retention Policies](../how-to/configure-retention-policies.md#scheduled-enforcement) for complete examples.
 
 ---
 

@@ -172,12 +172,7 @@ A downstream marked `prune = true` is treated as an **authoritative one-way mirr
 
 **Leave `prune = false` for active-active peers.** The delete does carry a `source_ts`, so the receiver applies last-writer-wins rather than deleting unconditionally. But that only protects a downstream tag dated in the future relative to the reconcile decision. A peer's legitimately-newer tag whose `created_at` predates the reconcile run is still removed.
 
-Re-running is a no-op once converged (coalesced by the queue). Schedule it like any other maintenance task:
-
-```bash
-# Cron: reconcile every replicated repository nightly at 4 AM
-0 4 * * * /usr/bin/angos -c /etc/registry/config.toml replicate
-```
+Re-running is a no-op once converged (coalesced by the queue). Schedule it like any other maintenance task, via a systemd timer (a oneshot service running `angos -c config.toml replicate`, triggered by `OnCalendar=*-*-* 04:00:00`) or a Kubernetes CronJob (`schedule: "0 4 * * *"`); see [Run Storage Maintenance](run-storage-maintenance.md#scheduling) for complete examples.
 
 ## Observability
 

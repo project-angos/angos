@@ -290,41 +290,41 @@ At startup, Angos probes the S3 provider to verify conditional write and delete 
 
 ## Scheduled Storage Maintenance
 
-For scheduled maintenance (scrub), use your system's cron scheduler or a dedicated cron container:
+Run maintenance manually with Docker Compose:
 
 ```bash
-# Run manual maintenance with Docker Compose
 docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs
 docker compose run --rm registry /angos -c /config/config.toml prune
 ```
 
-**Cron scheduling approaches:**
+Schedule it with a systemd timer on the host. Create `/etc/systemd/system/registry-maintenance.service`:
 
-1. **System cron (recommended):**
-   ```bash
-   # Add to crontab -e: run scrub daily at 3 AM
-   0 3 * * * cd /path/to/registry && docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs
-   0 4 * * * cd /path/to/registry && docker compose run --rm registry /angos -c /config/config.toml prune
-   ```
+```ini
+[Unit]
+Description=Registry storage maintenance
+Requires=docker.service
+After=docker.service
 
-2. **Docker container cron (ofelia):**
-   Add to docker-compose.yml:
-   ```yaml
-   services:
-     ofelia:
-       image: mcuadros/ofelia:latest
-       volumes:
-         - /var/run/docker.sock:/var/run/docker.sock
-       command: daemon --docker
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/registry
+ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs
+ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml prune
+```
 
-     # Add to registry service:
-     # labels:
-     #   ofelia.enabled: "true"
-     #   ofelia.job-exec.registry-scrub.schedule: "@daily"
-     #   ofelia.job-exec.registry-scrub.command: "/angos -c /config/config.toml scrub --tags --manifests --blobs"
-     #   ofelia.job-exec.registry-prune.schedule: "@daily"
-     #   ofelia.job-exec.registry-prune.command: "/angos -c /config/config.toml prune"
-   ```
+Create `/etc/systemd/system/registry-maintenance.timer`, then enable it with `systemctl enable --now registry-maintenance.timer`:
+
+```ini
+[Unit]
+Description=Daily registry storage maintenance
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
 
 ---
 
