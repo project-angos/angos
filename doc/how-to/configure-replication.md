@@ -114,7 +114,7 @@ angos -c config.toml worker --queue replication  # replication only
 
 This is the multi-replica, horizontally-scalable configuration: draining is decoupled from serving and can be scaled independently. (Pending pushes persist under `_jobs/pending/replication/` and resume after a restart in both modes.) See [Enable Durable Cache Jobs](durable-cache-jobs.md) for the job-queue setup, KEDA autoscaling, and `angos worker` details.
 
-Because the queue is drained by separate processes, `[global.job_queue]` requires a **shared** metadata-store lock strategy (`[metadata_store.s3.lock_strategy.s3]`, `[metadata_store.s3.lock_strategy.redis]`, or `[metadata_store.fs.lock_strategy.redis]`) so workers serialize on the same jobs; the default in-process `memory` lock is rejected at startup with this section. The in-process mode above (no `[global.job_queue]`) runs in a single process and works with any lock strategy.
+Because the queue is drained by separate processes, `[global.job_queue]` requires a **shared** metadata-store lock strategy (`[metadata_store.s3.lock_strategy.s3]`, `[metadata_store.s3.lock_strategy.redis]`, or `[metadata_store.fs.lock_strategy.redis]`) so workers serialize on the same jobs; the in-process `memory` lock is rejected at startup with this section. On an S3 metadata store whose provider supports conditional operations the shared S3 lock is the default, so nothing extra is needed; filesystem stores and providers without them need Redis. The in-process mode above (no `[global.job_queue]`) runs in a single process and works with any lock strategy.
 
 ## Two-Instance Active-Active Example
 

@@ -444,7 +444,7 @@ fn test_metadata_store_s3_with_redis() {
         RegistryStorageConfig::S3(s3_config) => {
             assert_eq!(s3_config.connection.bucket, "metadata-bucket");
             match &s3_config.lock_strategy {
-                LockStrategy::Redis(lock_config) => {
+                Some(LockStrategy::Redis(lock_config)) => {
                     assert_eq!(lock_config.url, "redis://localhost:6379");
                     assert_eq!(lock_config.ttl, 30);
                 }
@@ -768,7 +768,7 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
         RegistryStorageConfig::S3(s3_config) => {
             assert_eq!(s3_config.connection.bucket, "metadata-bucket");
             match &s3_config.lock_strategy {
-                LockStrategy::S3(lock_config) => {
+                Some(LockStrategy::S3(lock_config)) => {
                     assert_eq!(lock_config.ttl_secs, 30);
                     assert_eq!(lock_config.max_retries, 100);
                     assert_eq!(lock_config.retry_delay_ms, 50);
@@ -782,10 +782,12 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
     }
 }
 
-// An S3 blob store with no explicit metadata-store lock strategy inherits the
-// in-process `memory` lock, which cannot serialize across processes.
+// An S3 blob store with no explicit metadata-store lock strategy defaults to
+// the shared S3 lock when the provider supports conditional writes, so the
+// durable queue is accepted at config time; a provider that turns out to lack
+// them is rejected at startup instead.
 #[test]
-fn job_queue_rejects_inherited_memory_lock_on_s3() {
+fn job_queue_allows_unset_lock_strategy_on_s3() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -800,11 +802,78 @@ fn job_queue_rejects_inherited_memory_lock_on_s3() {
     secret_key = "secret"
     "#;
 
+    assert!(
+        Configuration::load_from_str(config).is_ok(),
+        "durable queue with an unset lock strategy on S3 must be accepted"
+    );
+}
+
+// Declaring `conditional_operations = false` pins the unset lock strategy's
+// fallback to the in-process `memory` lock, which cannot serialize across
+// processes.
+#[test]
+fn job_queue_rejects_declared_no_cas_memory_fallback_on_s3() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global.job_queue]
+
+    [blob_store.s3]
+    bucket = "blob-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "key"
+    secret_key = "secret"
+
+    [metadata_store.s3]
+    bucket = "metadata-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "key"
+    secret_key = "secret"
+    conditional_operations = false
+    "#;
+
     let err = Configuration::load_from_str(config).unwrap_err();
     let message = err.to_string();
     assert!(
         message.contains("memory") && message.contains("lock"),
-        "durable queue + inherited memory lock must be rejected, got: {message}"
+        "durable queue + declared no-CAS memory fallback must be rejected, got: {message}"
+    );
+}
+
+// An explicit `memory` lock wins over the CAS-based default and stays
+// incompatible with the durable queue.
+#[test]
+fn job_queue_rejects_explicit_memory_lock_on_s3() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global.job_queue]
+
+    [blob_store.s3]
+    bucket = "blob-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "key"
+    secret_key = "secret"
+
+    [metadata_store.s3]
+    bucket = "metadata-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "key"
+    secret_key = "secret"
+    lock_strategy = "memory"
+    "#;
+
+    let err = Configuration::load_from_str(config).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("memory") && message.contains("lock"),
+        "durable queue + explicit memory lock must be rejected, got: {message}"
     );
 }
 
@@ -907,7 +976,7 @@ fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
 
     match metadata_config {
         RegistryStorageConfig::S3(s3_config) => match &s3_config.lock_strategy {
-            LockStrategy::S3(lock_config) => {
+            Some(LockStrategy::S3(lock_config)) => {
                 assert_eq!(lock_config.ttl_secs, 60);
                 assert_eq!(lock_config.max_retries, 50);
                 assert_eq!(lock_config.retry_delay_ms, 100);
@@ -948,7 +1017,7 @@ fn test_metadata_store_s3_lock_strategy_memory() {
     match metadata_config {
         RegistryStorageConfig::S3(s3_config) => {
             assert!(
-                matches!(s3_config.lock_strategy, LockStrategy::Memory),
+                matches!(s3_config.lock_strategy, Some(LockStrategy::Memory)),
                 "Expected Memory lock strategy, got {:?}",
                 s3_config.lock_strategy
             );

@@ -225,9 +225,16 @@ fn validate_durable_queue_lock(config: &Configuration) -> Result<(), Error> {
     if config.global.job_queue.is_none() {
         return Ok(());
     }
-    let lock_strategy = match config.resolve_registry_storage() {
-        RegistryStorageConfig::FS(fs) => fs.lock_strategy,
-        RegistryStorageConfig::S3(s3) => s3.lock_strategy,
+    let memory_locked = match config.resolve_registry_storage() {
+        RegistryStorageConfig::FS(fs) => matches!(fs.lock_strategy, LockStrategy::Memory),
+        // An unset S3 lock strategy resolves against the provider's
+        // conditional-write support at startup, so only a declared
+        // `conditional_operations = false` makes the memory fallback certain
+        // here; the probed no-CAS case is rejected at startup instead.
+        RegistryStorageConfig::S3(s3) => matches!(
+            s3.resolved_lock_strategy(s3.conditional_operations.unwrap_or(true)),
+            LockStrategy::Memory
+        ),
         // `resolve_registry_storage` must map `Inherit` to a concrete backend;
         // fail closed rather than silently skip the lock check.
         RegistryStorageConfig::Inherit => {
@@ -238,7 +245,7 @@ fn validate_durable_queue_lock(config: &Configuration) -> Result<(), Error> {
             ));
         }
     };
-    if matches!(lock_strategy, LockStrategy::Memory) {
+    if memory_locked {
         return Err(Error::InvalidFormat(
             "[global.job_queue] needs a shared lock strategy so workers serialize on the \
              same jobs across processes; the in-process 'memory' lock cannot coordinate \

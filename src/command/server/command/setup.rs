@@ -9,7 +9,11 @@ use crate::{
     cache::Cache,
     command::{bootstrap, server::error::Error},
     configuration::{Configuration, RegistryStorageConfig},
-    registry::{Registry, RegistryConfig, job_store::JobStore, metadata_store::MetadataStore},
+    registry::{
+        Registry, RegistryConfig,
+        job_store::{self, JobStore},
+        metadata_store::MetadataStore,
+    },
 };
 
 /// Handle on the durable job-store and the interval the server should refresh
@@ -108,6 +112,7 @@ pub async fn build_registry(
 
     let pending = if let Some(jq_config) = &config.global.job_queue {
         if let Some(handles) = maintenance_handles.as_ref() {
+            job_store::ensure_shared_lock(handles)?;
             let job_store: Arc<JobStore> = Arc::new(JobStore::new(handles.clone(), "server"));
             registry_config = registry_config.job_queue(job_store.clone());
             Some(PendingGaugeRefresh {

@@ -201,7 +201,7 @@ For multiple registry instances, you need:
 
 ### With S3 Locking (Simplest)
 
-Selecting `lock_strategy = "s3"` activates the CAS coordinator, which uses S3 conditional requests for all coordination, no extra infrastructure being required. The provider must support the full conditional set: `PutObject` with `If-None-Match: *`, `PutObject` with `If-Match`, and `DeleteObject` with `If-Match`. Angos probes at startup and fails fast if any of them is missing. Conditional deletes make lock release and lock reclaim race-free: an instance can only ever remove its own lock object.
+The S3 lock strategy activates the CAS coordinator, which uses S3 conditional requests for all coordination, no extra infrastructure being required. It is the default on S3 metadata stores: with `lock_strategy` unset, Angos probes the provider at startup and uses it whenever the full conditional set is supported: `PutObject` with `If-None-Match: *`, `PutObject` with `If-Match`, and `DeleteObject` with `If-Match`. Selecting it explicitly makes startup fail fast if any of them is missing. Conditional deletes make lock release and lock reclaim race-free: an instance can only ever remove its own lock object.
 
 ```toml
 [blob_store.s3]
@@ -248,9 +248,9 @@ url = "redis://redis:6379"
 
 ## Locking Behavior
 
-### In-Memory Locking (Default)
+### In-Memory Locking
 
-- Used when Redis is not configured
+- Default for filesystem metadata stores and for S3 providers without conditional-operation support
 - Only safe for single-instance deployments
 - No coordination between replicas
 
@@ -269,7 +269,7 @@ retry_delay_ms = 10         # Initial retry delay; retries back off up to 1s wit
 
 ### S3 Locking
 
-Available only when using S3 for metadata (not supported with filesystem metadata stores). Uses conditional writes (`If-None-Match: *`) to implement distributed locks directly in the S3 bucket, eliminating the need for Redis. Stale locks are automatically recovered after TTL expiry.
+Available only when using S3 for metadata (not supported with filesystem metadata stores), and the default there when the provider supports the full conditional set. Uses conditional writes (`If-None-Match: *`) to implement distributed locks directly in the S3 bucket, eliminating the need for Redis. Stale locks are automatically recovered after TTL expiry.
 
 Lock operations use a dedicated S3 client with independent timeout configuration, separate from the metadata store's main S3 client. This allows tuning lock behavior independently: lock operations should fail fast rather than blocking for minutes, which is important in high-latency S3 scenarios.
 
@@ -283,7 +283,7 @@ retry_delay_ms = 50         # Delay between retries (minimum: 1)
 The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds. Transient heartbeat failures (connect errors, refresh timeouts) accumulate up to a small budget (roughly one TTL of slack) before cancelling the in-flight operation, so a short network blip does not kill in-progress work. Authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
 :::note
-The S3 provider must support conditional writes and conditional deletes. Angos probes for this capability at startup and fails fast if it is not available.
+The S3 provider must support conditional writes and conditional deletes. Angos probes for this capability at startup: an explicit `lock_strategy.s3` fails fast when any operation is missing, while an unset lock strategy falls back to the in-process memory lock.
 Known providers that support the full conditional set: AWS S3, Exoscale SOS
 :::
 
@@ -495,7 +495,7 @@ rules = ["manifest.last_pulled_at < now() - days(30)"]
 
 When using S3 locking, **never set `access_time_debounce_secs = 0`** in production. This disables buffering and causes every manifest pull to acquire and release a lock, which is expensive. Use the default 60 seconds or higher.
 
-**Note on `lock_strategy = "redis"`:** With Redis as the lock strategy, access-time flushes always go through Redis locking, even when the S3 provider supports conditional writes (`put_if_match`). On AWS S3 or Exoscale SOS, `lock_strategy = "s3"` (the CAS coordinator) is more efficient: each access-time flush is a single conditional S3 PUT instead of a Redis round-trip plus two S3 calls. `lock_strategy = "redis"` remains the right choice when running multi-replica on a provider that lacks conditional writes, or when Redis is already deployed for other reasons.
+**Note on `lock_strategy = "redis"`:** With Redis as the lock strategy, access-time flushes always go through Redis locking, even when the S3 provider supports conditional writes (`put_if_match`). On AWS S3 or Exoscale SOS, `lock_strategy = "s3"` (the CAS coordinator, and the default there) is more efficient: each access-time flush is a single conditional S3 PUT instead of a Redis round-trip plus two S3 calls. `lock_strategy = "redis"` remains the right choice when running multi-replica on a provider that lacks conditional writes, or when Redis is already deployed for other reasons.
 
 #### Blob Index Sharding
 

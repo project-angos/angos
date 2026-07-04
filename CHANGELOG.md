@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.3.2 - Unreleased
 
+### Changed
+
+- On an S3 metadata store, an unset `lock_strategy` now defaults to the shared S3 lock when the provider supports conditional operations, instead of the in-process memory lock.
+
 ### Fixed
 
 - The repository and namespace listings of the web UI now include namespaces whose only content is in-progress uploads, so those uploads can be inspected and cancelled.
