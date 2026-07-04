@@ -10,7 +10,6 @@
   "schedule": ["before 5am on monday"],
   "prConcurrentLimit": 5,
   "prHourlyLimit": 2,
-  "minimumReleaseAge": "3 days",
   "rangeStrategy": "bump",
   "separateMajorMinor": false,
   "separateMinorPatch": false,
@@ -67,39 +66,34 @@
       "semanticCommitScope": "ci"
     },
     {
-      "description": "Lockfile maintenance for angos-ui (ui/package-lock.json) — one PR.",
-      "matchUpdateTypes": ["lockFileMaintenance"],
-      "matchFileNames": ["ui/**"],
-      "groupName": "angos-ui lockfile",
-      "groupSlug": "angos-ui-lockfile",
-      "commitMessageTopic": "ui/package-lock.json",
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "ui"
-    },
-    {
-      "description": "Lockfile maintenance for website (website/package-lock.json) — one PR.",
-      "matchUpdateTypes": ["lockFileMaintenance"],
-      "matchFileNames": ["website/**"],
-      "groupName": "website lockfile",
-      "groupSlug": "website-lockfile",
-      "commitMessageTopic": "website/package-lock.json",
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "website"
-    },
-    {
-      "description": "Lockfile maintenance for angos-core (Cargo.lock) — one PR.",
+      "description": "Fold Cargo.lock maintenance into the angos-core PR.",
       "matchUpdateTypes": ["lockFileMaintenance"],
       "matchManagers": ["cargo"],
-      "groupName": "angos-core lockfile",
-      "groupSlug": "angos-core-lockfile",
-      "commitMessageTopic": "Cargo.lock",
+      "groupName": "angos-core",
+      "groupSlug": "angos-core",
+      "commitMessageTopic": "angos-core dependencies",
       "semanticCommitType": "chore",
       "semanticCommitScope": "deps"
     },
     {
-      "description": "Hold back major bumps for 7 days to let ecosystems stabilize.",
-      "matchUpdateTypes": ["major"],
-      "minimumReleaseAge": "7 days"
+      "description": "Fold ui/package-lock.json maintenance into the angos-ui PR.",
+      "matchUpdateTypes": ["lockFileMaintenance"],
+      "matchFileNames": ["ui/**"],
+      "groupName": "angos-ui",
+      "groupSlug": "angos-ui",
+      "commitMessageTopic": "angos-ui dependencies",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "ui"
+    },
+    {
+      "description": "Fold website/package-lock.json maintenance into the website PR.",
+      "matchUpdateTypes": ["lockFileMaintenance"],
+      "matchFileNames": ["website/**"],
+      "groupName": "website",
+      "groupSlug": "website",
+      "commitMessageTopic": "website dependencies",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "website"
     }
   ]
 }
