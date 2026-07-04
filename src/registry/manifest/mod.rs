@@ -7,9 +7,7 @@ use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 pub use parse::{ParsedManifestDigests, parse_manifest_digests};
 use parse::{manifest_meta_from_body, parse_and_validate_manifest};
-pub use response::{
-    DeleteManifestResponse, GetManifestResponse, HeadManifestResponse, PutManifestResponse,
-};
+pub use response::{GetManifestResponse, HeadManifestResponse, PutManifestResponse};
 use response::{
     ManifestBody, ManifestMeta, get_manifest_body_headers, get_manifest_redirect_headers,
     head_manifest_headers, put_manifest_headers,
@@ -417,7 +415,6 @@ impl Registry {
                 created_tags,
             ),
             digest: computed_digest,
-            events: Vec::new(),
             changed,
         })
     }
@@ -496,7 +493,7 @@ impl Registry {
         source_ts: Option<DateTime<Utc>>,
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<DeleteManifestResponse, Error> {
+    ) -> Result<(), Error> {
         // A delete carries no incoming digest, so a timestamp tie keeps the
         // strictly-greater rule and the delete proceeds.
         self.check_lww_not_superseded(namespace, reference, source_ts, None)
@@ -612,7 +609,7 @@ impl Registry {
             Reference::Tag(tag) => (Some(tag), None),
             Reference::Digest(digest) => (None, Some(digest)),
         };
-        // Webhook events above fire unconditionally; only the replication
+        // Webhook events fire unconditionally; only the replication
         // dispatch is gated on a real removal. A replicated delete forwards
         // its author timestamp verbatim so the bounce can never outrank a
         // recreate authored after the original delete.
@@ -628,7 +625,7 @@ impl Registry {
             .await;
         }
 
-        Ok(DeleteManifestResponse { events })
+        self.dispatch_events(&events).await
     }
 
     /// Attempts to short-circuit a manifest GET into a presigned redirect using
@@ -657,20 +654,53 @@ impl Registry {
     }
 
     /// Resolves a manifest GET request to a presigned redirect URL or the
-    /// manifest body. The redirect fast-path is taken only when the cached target
+    /// manifest body, then emits a `manifest.pull` event for the served
+    /// digest. The redirect fast-path is taken only when the cached target
     /// is authoritative (not a pull-through cache, a digest reference, or an
     /// immutable tag); mutable tags on a pull-through cache fall through to
     /// `get_manifest` to refresh if upstream has moved.
-    #[instrument(skip(self, is_tag_immutable))]
+    #[instrument(skip(self, is_tag_immutable, actor))]
     pub async fn resolve_get_manifest(
         &self,
+        actor: Option<EventActor>,
         namespace: &Namespace,
         reference: Reference,
         mime_types: &[String],
         is_tag_immutable: bool,
     ) -> Result<GetManifestResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
+        let repository_name = repository.name.to_string();
+        let event_tag = reference.as_tag().map(ToString::to_string);
+        let reference_str = reference.to_string();
 
+        let response = self
+            .resolve_get_manifest_response(
+                repository,
+                namespace,
+                reference,
+                mime_types,
+                is_tag_immutable,
+            )
+            .await?;
+
+        let event = Event::new(EventKind::ManifestPull, namespace.clone(), repository_name)
+            .digest(Some(response.digest().to_string()))
+            .reference(Some(reference_str))
+            .tag(event_tag)
+            .actor(actor);
+        self.dispatch_events(&[event]).await?;
+
+        Ok(response)
+    }
+
+    async fn resolve_get_manifest_response(
+        &self,
+        repository: &Repository,
+        namespace: &Namespace,
+        reference: Reference,
+        mime_types: &[String],
+        is_tag_immutable: bool,
+    ) -> Result<GetManifestResponse, Error> {
         let redirect_is_authoritative = !repository.is_pull_through()
             || matches!(reference, Reference::Digest(_))
             || is_tag_immutable;
@@ -891,7 +921,7 @@ impl Registry {
         } else {
             ReferencePolicy::Permissive
         };
-        let mut response = self
+        let response = self
             .store_manifest(
                 namespace,
                 &reference,
@@ -908,17 +938,17 @@ impl Registry {
             .unwrap_or_default();
         let digest_str = response.headers.get(DOCKER_CONTENT_DIGEST).cloned();
 
-        response.events.push(manifest_event(
+        let mut events = vec![manifest_event(
             EventKind::ManifestPush,
             namespace,
             repository.clone(),
             digest_str.clone(),
             &reference,
             actor.clone(),
-        ));
+        )];
 
         if let Some(tag) = reference.as_tag() {
-            response.events.push(tag_event(
+            events.push(tag_event(
                 EventKind::TagCreate,
                 namespace,
                 repository.clone(),
@@ -932,7 +962,7 @@ impl Registry {
         // Each tag created by a `?tag=` query parameter gets its own TagCreate
         // event, mirroring the by-tag push above.
         for tag in &created_tags {
-            response.events.push(tag_event(
+            events.push(tag_event(
                 EventKind::TagCreate,
                 namespace,
                 repository.clone(),
@@ -945,7 +975,7 @@ impl Registry {
 
         // No-op suppression: re-dispatching a converged replay would keep a
         // mesh cycle alive, so only a write that changed local state (per the
-        // committed transaction) is replicated. Webhook events above fire
+        // committed transaction) is replicated. Webhook events fire
         // unconditionally.
         if response.changed {
             self.replicate_manifest_push(
@@ -958,6 +988,7 @@ impl Registry {
             .await;
         }
 
+        self.dispatch_events(&events).await?;
         Ok(response)
     }
 

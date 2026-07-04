@@ -52,6 +52,10 @@ pub enum Error {
     /// so the sender can treat it as convergence rather than retry.
     #[error("{0}")]
     ReplicationSuperseded(String),
+    /// A `required`-policy webhook rejected or failed the event delivery.
+    /// The operation itself has already committed when this surfaces.
+    #[error("event delivery failed: {0}")]
+    EventDelivery(String),
     #[error("internal server error: {0}")]
     Internal(String),
 

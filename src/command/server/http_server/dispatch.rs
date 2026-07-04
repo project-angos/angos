@@ -66,11 +66,8 @@ async fn dispatch_route<'a>(
             digest,
             from,
         } => {
-            let eventful = handlers::upload::handle_mount_blob(
-                context, parts, &namespace, digest, from, identity,
-            )
-            .await?;
-            handlers::dispatch_eventful(context, eventful).await
+            handlers::upload::handle_mount_blob(context, parts, &namespace, digest, from, identity)
+                .await
         }
         Action::GetUpload { namespace, uuid } => {
             handlers::upload::handle_get_upload(context, &namespace, uuid).await

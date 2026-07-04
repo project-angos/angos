@@ -451,7 +451,11 @@ async fn test_hot_reload_changes_webhook_url_via_command() {
     command.notify_config_change(&config_b).await.unwrap();
 
     let context = command.as_insecure().unwrap().current_context();
-    context.dispatch_event(&create_test_event()).await.unwrap();
+    context
+        .registry
+        .dispatch_events(&[create_test_event()])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -481,7 +485,11 @@ async fn test_hot_reload_adds_second_webhook() {
     command.notify_config_change(&config_two).await.unwrap();
 
     let context = command.as_insecure().unwrap().current_context();
-    context.dispatch_event(&create_test_event()).await.unwrap();
+    context
+        .registry
+        .dispatch_events(&[create_test_event()])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -511,7 +519,11 @@ async fn test_hot_reload_removes_one_of_two_webhooks() {
     command.notify_config_change(&config_one).await.unwrap();
 
     let context = command.as_insecure().unwrap().current_context();
-    context.dispatch_event(&create_test_event()).await.unwrap();
+    context
+        .registry
+        .dispatch_events(&[create_test_event()])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -542,13 +554,15 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
     command.notify_config_change(&config_new).await.unwrap();
 
     old_context
-        .dispatch_event(&create_test_event())
+        .registry
+        .dispatch_events(&[create_test_event()])
         .await
         .unwrap();
 
     let new_context = command.as_insecure().unwrap().current_context();
     new_context
-        .dispatch_event(&create_test_event())
+        .registry
+        .dispatch_events(&[create_test_event()])
         .await
         .unwrap();
 }
@@ -581,7 +595,11 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
     let command = Command::new(&config).await.unwrap();
 
     let context = command.as_insecure().unwrap().current_context();
-    context.dispatch_event(&create_test_event()).await.unwrap();
+    context
+        .registry
+        .dispatch_events(&[create_test_event()])
+        .await
+        .unwrap();
     drop(context);
 
     command.shutdown_with_timeout(Duration::from_secs(10)).await;

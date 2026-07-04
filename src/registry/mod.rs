@@ -58,6 +58,7 @@ use crate::{
         RegexPattern,
         global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
     },
+    event_webhook::{dispatcher::EventDispatcher, event::Event},
     oci::{Digest, Namespace},
     registry::{
         blob_store::BlobStore,
@@ -100,6 +101,9 @@ pub struct RegistryConfig {
     /// Parallel in-process replication-push jobs. Only consulted when
     /// `job_queue` is `None`; durable deployments use `angos worker` instead.
     pub max_concurrent_replication_jobs: NonZeroUsize,
+    /// Webhook dispatcher through which operations deliver their events.
+    /// `None` (the default) disables event delivery entirely.
+    pub event_dispatcher: Option<Arc<EventDispatcher>>,
 }
 
 impl Default for RegistryConfig {
@@ -119,6 +123,7 @@ impl Default for RegistryConfig {
             job_queue: None,
             max_concurrent_cache_jobs: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
             max_concurrent_replication_jobs: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
+            event_dispatcher: None,
         }
     }
 }
@@ -178,6 +183,11 @@ impl RegistryConfig {
         self.max_concurrent_replication_jobs = value;
         self
     }
+
+    pub fn event_dispatcher(mut self, dispatcher: Option<Arc<EventDispatcher>>) -> Self {
+        self.event_dispatcher = dispatcher;
+        self
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -198,6 +208,7 @@ pub struct Registry {
     max_manifest_size_bytes: usize,
     max_blob_size_bytes: u64,
     validate_manifest_references: bool,
+    event_dispatcher: Option<Arc<EventDispatcher>>,
 }
 
 impl fmt::Debug for Registry {
@@ -242,11 +253,48 @@ impl Registry {
             max_manifest_size_bytes: config.max_manifest_size_bytes,
             max_blob_size_bytes: config.max_blob_size_bytes,
             validate_manifest_references: config.validate_manifest_references,
+            event_dispatcher: config.event_dispatcher,
         })
     }
 
     pub async fn flush_pending_writes(&self) {
         self.metadata_store.flush_access_times().await;
+    }
+
+    #[cfg(test)]
+    pub fn has_event_dispatcher(&self) -> bool {
+        self.event_dispatcher.is_some()
+    }
+
+    /// Delivers `events` to the configured webhooks, attempting every event
+    /// even if an earlier delivery fails; the first error is returned once
+    /// all have been attempted. Operations call this after they commit, so an
+    /// event is only ever delivered for a change that happened. With no
+    /// dispatcher configured this is a no-op.
+    pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
+        let Some(dispatcher) = &self.event_dispatcher else {
+            return Ok(());
+        };
+        let mut first_error: Option<Error> = None;
+        for event in events {
+            if let Err(error) = dispatcher.dispatch(event).await
+                && first_error.is_none()
+            {
+                first_error = Some(Error::EventDelivery(error.to_string()));
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Flushes pending writes and drains in-flight async webhook deliveries.
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
+        self.flush_pending_writes().await;
+        if let Some(dispatcher) = &self.event_dispatcher {
+            dispatcher.shutdown_with_timeout(timeout).await;
+        }
     }
 
     pub async fn check_ready(&self) -> Result<(), Error> {

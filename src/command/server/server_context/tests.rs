@@ -14,13 +14,11 @@ use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ObjectStore, s3::Backend as StorageS3Backend};
 
 use crate::{
-    command::server::{
-        error::Error,
-        server_context::{ServerContext, resolve_client_ip},
-    },
+    command::server::server_context::{ServerContext, resolve_client_ip},
     configuration::Configuration,
     event_webhook::{
         config::EventWebhookConfig,
+        dispatcher::EventDispatcher,
         event::{Event, EventKind},
     },
     identity::{Action, ClientIdentity},
@@ -28,7 +26,7 @@ use crate::{
     oci::{Digest, Namespace, Reference, Tag},
     policy::AccessPolicyConfig,
     registry::{
-        Registry, RegistryConfig, Repository,
+        Error as RegistryError, Registry, RegistryConfig, Repository,
         blob_store::{BlobStoreConfig, FsBackendConfig as BlobFsConfig},
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         repository_resolver::RepositoryResolver,
@@ -183,7 +181,8 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
         .max_manifest_size_bytes(config.global.max_manifest_size_bytes())
         .global_immutable_tags(config.global.immutable_tags)
-        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
+        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone())
+        .event_dispatcher(EventDispatcher::from_config(&config.event_webhook).unwrap());
 
     Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
 }
@@ -399,7 +398,7 @@ async fn test_dispatch_event_with_no_dispatcher() {
         repository: "test-repo".to_string(),
     };
 
-    let result = context.dispatch_event(&event).await;
+    let result = context.registry.dispatch_events(&[event]).await;
     assert!(result.is_ok());
 }
 
@@ -439,7 +438,7 @@ async fn test_dispatch_event_delivers_to_webhook() {
         repository: "test-repo".to_string(),
     };
 
-    let result = context.dispatch_event(&event).await;
+    let result = context.registry.dispatch_events(&[event]).await;
     assert!(result.is_ok());
 }
 
@@ -478,8 +477,8 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         repository: "test-repo".to_string(),
     };
 
-    let result = context.dispatch_event(&event).await;
-    assert!(matches!(result, Err(Error::Execution(_))));
+    let result = context.registry.dispatch_events(&[event]).await;
+    assert!(matches!(result, Err(RegistryError::EventDelivery(_))));
 }
 
 #[tokio::test]
@@ -528,7 +527,7 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         repository: "test-repo".to_string(),
     };
 
-    context.dispatch_event(&event).await.unwrap();
+    context.registry.dispatch_events(&[event]).await.unwrap();
 
     context.shutdown_with_timeout(Duration::from_secs(10)).await;
 
@@ -576,7 +575,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
         repository: "test-repo".to_string(),
     };
 
-    let _ = context.dispatch_event(&event).await;
+    let _ = context.registry.dispatch_events(&[event]).await;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -792,7 +791,7 @@ async fn dispatch_events_first_failure_does_not_abort_batch() {
         make_event(Uuid::new_v4()),
         make_event(Uuid::new_v4()),
     ];
-    let result = context.dispatch_events(&events).await;
+    let result = context.registry.dispatch_events(&events).await;
 
     assert!(result.is_err(), "a delivery failure must surface overall");
     let requests = mock_server.received_requests().await.unwrap();
@@ -826,7 +825,7 @@ async fn dispatch_events_all_success_returns_ok() {
     let context = ServerContext::new(&config, registry).unwrap();
 
     let events = vec![make_event(Uuid::new_v4()), make_event(Uuid::new_v4())];
-    let result = context.dispatch_events(&events).await;
+    let result = context.registry.dispatch_events(&events).await;
 
     assert!(result.is_ok());
     let requests = mock_server.received_requests().await.unwrap();

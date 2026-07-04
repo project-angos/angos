@@ -7,7 +7,6 @@ use crate::{
     auth::{Authenticator, Authorizer},
     command::server::error::Error,
     configuration::Configuration,
-    event_webhook::{dispatcher::EventDispatcher, event::Event},
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     registry::{BlobMount, Registry},
@@ -16,7 +15,6 @@ use crate::{
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,
     authorizer: Arc<Authorizer>,
-    dispatcher: Option<Arc<EventDispatcher>>,
     pub registry: Registry,
     pub enable_ui: bool,
     pub ui_name: String,
@@ -33,19 +31,9 @@ impl ServerContext {
         let authenticator = Arc::new(Authenticator::new(config, &cache)?);
         let authorizer = Arc::new(Authorizer::new(config, &cache)?);
 
-        let dispatcher = if config.event_webhook.is_empty() {
-            None
-        } else {
-            let dispatcher = EventDispatcher::builder()
-                .webhooks(config.event_webhook.clone())
-                .build()?;
-            Some(Arc::new(dispatcher))
-        };
-
         Ok(Self {
             authenticator,
             authorizer,
-            dispatcher,
             registry,
             enable_ui: config.ui.enabled,
             ui_name: config.ui.name.clone(),
@@ -54,7 +42,7 @@ impl ServerContext {
 
     #[cfg(test)]
     pub fn has_event_dispatcher(&self) -> bool {
-        self.dispatcher.is_some()
+        self.registry.has_event_dispatcher()
     }
 
     #[instrument(skip(self, parts))]
@@ -111,37 +99,8 @@ impl ServerContext {
         }
     }
 
-    /// Delivers one event to the webhook dispatcher; with none configured this
-    /// is a no-op `Ok`.
-    pub async fn dispatch_event(&self, event: &Event) -> Result<(), Error> {
-        match &self.dispatcher {
-            Some(dispatcher) => dispatcher.dispatch(event).await.map_err(Error::from),
-            None => Ok(()),
-        }
-    }
-
-    /// Delivers a batch of events, attempting every event even if an earlier
-    /// delivery fails. The first error is returned once all have been attempted.
-    pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
-        let mut first_error: Option<Error> = None;
-        for event in events {
-            if let Err(error) = self.dispatch_event(event).await
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
     pub async fn shutdown_with_timeout(&self, timeout: Duration) {
-        self.registry.flush_pending_writes().await;
-        if let Some(dispatcher) = &self.dispatcher {
-            dispatcher.shutdown_with_timeout(timeout).await;
-        }
+        self.registry.shutdown_with_timeout(timeout).await;
     }
 }
 

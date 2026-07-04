@@ -2,13 +2,10 @@ use hyper::{Response, StatusCode, http::request::Parts};
 
 use crate::{
     command::server::{
-        ServerContext,
-        error::Error,
-        handlers::{EventfulResponse, build_response, dispatch_eventful},
-        request::RequestHeaders,
+        ServerContext, error::Error, handlers::build_response, request::RequestHeaders,
         response_body::ResponseBody,
     },
-    event_webhook::event::{Event, EventActor, EventKind},
+    event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{Digest, Namespace},
     registry::{BlobRange, GetBlobResponse},
@@ -48,21 +45,14 @@ pub async fn handle_get_blob(
     mime_types: &[String],
     range: Option<BlobRange>,
     identity: &ClientIdentity,
-) -> Result<EventfulResponse, Error> {
+) -> Result<Response<ResponseBody>, Error> {
+    let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .resolve_get_blob(namespace, digest, mime_types, range)
+        .resolve_get_blob(actor, namespace, digest, mime_types, range)
         .await?;
 
-    let event = Event::new(
-        EventKind::BlobPull,
-        namespace.clone(),
-        context.registry.repository_name_for(namespace),
-    )
-    .digest(Some(digest.to_string()))
-    .actor(Some(EventActor::from(identity.clone())));
-
-    let response = match response {
+    match response {
         GetBlobResponse::Redirect { headers } => build_response(
             StatusCode::TEMPORARY_REDIRECT,
             headers,
@@ -76,9 +66,7 @@ pub async fn handle_get_blob(
             headers,
             ResponseBody::streaming(body),
         ),
-    }?;
-
-    Ok((response, vec![event]))
+    }
 }
 
 pub async fn dispatch_get_blob(
@@ -92,11 +80,7 @@ pub async fn dispatch_get_blob(
     let mime_types = headers.accepted_content_types();
     let range = headers.blob_range()?;
 
-    dispatch_eventful(
-        context,
-        handle_get_blob(context, namespace, &digest, &mime_types, range, identity).await?,
-    )
-    .await
+    handle_get_blob(context, namespace, &digest, &mime_types, range, identity).await
 }
 
 pub async fn dispatch_head_blob(

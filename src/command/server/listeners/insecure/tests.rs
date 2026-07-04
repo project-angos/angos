@@ -238,7 +238,11 @@ async fn test_hot_reload_changes_webhook_url() {
 
     let current_context = listener.current_context();
     let event = create_test_event();
-    current_context.dispatch_event(&event).await.unwrap();
+    current_context
+        .registry
+        .dispatch_events(&[event])
+        .await
+        .unwrap();
 }
 
 async fn create_context_with_two_webhooks(url_a: &str, url_b: &str) -> ServerContext {
@@ -283,7 +287,11 @@ async fn test_hot_reload_adds_second_webhook() {
     listener.notify_config_change(context_two);
 
     let context = listener.current_context();
-    context.dispatch_event(&create_test_event()).await.unwrap();
+    context
+        .registry
+        .dispatch_events(&[create_test_event()])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -311,7 +319,11 @@ async fn test_hot_reload_removes_one_of_two_webhooks() {
     listener.notify_config_change(context_one);
 
     let context = listener.current_context();
-    context.dispatch_event(&create_test_event()).await.unwrap();
+    context
+        .registry
+        .dispatch_events(&[create_test_event()])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -341,7 +353,8 @@ async fn test_hot_reload_in_flight_delivery_not_disrupted() {
     listener.notify_config_change(context_new);
 
     old_context
-        .dispatch_event(&create_test_event())
+        .registry
+        .dispatch_events(&[create_test_event()])
         .await
         .unwrap();
 }

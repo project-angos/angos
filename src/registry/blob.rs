@@ -5,6 +5,7 @@ use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
+    event_webhook::event::{Event, EventActor, EventKind},
     metrics_provider::metrics_provider,
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
@@ -408,13 +409,15 @@ impl Registry {
         result
     }
 
-    /// Resolves a blob GET request to either a presigned redirect URL or a stream.
+    /// Resolves a blob GET request to either a presigned redirect URL or a
+    /// stream, then emits a `blob.pull` event for the served digest.
     ///
     /// The redirect fast-path is only taken when `enable_blob_redirect` is set, the
     /// range is absent, and the blob is locally available (for pull-through repos).
-    #[instrument(skip(self))]
+    #[instrument(skip(self, actor))]
     pub async fn resolve_get_blob(
         &self,
+        actor: Option<EventActor>,
         namespace: &Namespace,
         digest: &Digest,
         mime_types: &[String],
@@ -430,19 +433,27 @@ impl Registry {
             return Err(Error::BlobUnknown);
         }
 
-        if range.is_none()
+        let repository_name = repository.name.to_string();
+        let response = if range.is_none()
             && self.enable_blob_redirect
             && has_access
             && self.blob_store.size(digest).await.is_ok()
             && let Ok(Some(presigned_url)) = self.blob_store.presigned_url(digest, None).await
         {
-            return Ok(GetBlobResponse::Redirect {
+            GetBlobResponse::Redirect {
                 headers: get_blob_redirect_headers(presigned_url, digest),
-            });
-        }
+            }
+        } else {
+            self.get_blob(repository, mime_types, namespace, digest, range)
+                .await?
+        };
 
-        self.get_blob(repository, mime_types, namespace, digest, range)
-            .await
+        let event = Event::new(EventKind::BlobPull, namespace.clone(), repository_name)
+            .digest(Some(digest.to_string()))
+            .actor(actor);
+        self.dispatch_events(&[event]).await?;
+
+        Ok(response)
     }
 }
 
