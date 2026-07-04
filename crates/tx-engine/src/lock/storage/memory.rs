@@ -81,7 +81,7 @@ impl LockStorage for MemoryLockStorage {
         inner
             .entries
             .insert(key.to_string(), Entry { body, version: v });
-        Ok(PutIfAbsentOutcome::Created(Some(etag)))
+        Ok(PutIfAbsentOutcome::Created(etag))
     }
 
     async fn put_if_match(
@@ -105,27 +105,21 @@ impl LockStorage for MemoryLockStorage {
         inner
             .entries
             .insert(key.to_string(), Entry { body, version: v });
-        Ok(PutIfMatchOutcome::Updated(Some(new_etag)))
+        Ok(PutIfMatchOutcome::Updated(new_etag))
     }
 
     async fn get_with_etag(
         &self,
         key: &str,
-    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), Error> {
+    ) -> Result<(Vec<u8>, String, Option<DateTime<Utc>>), Error> {
         let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match inner.entries.get(key) {
             None => Err(Error::NotFound),
             Some(entry) => {
                 let etag = format!("\"{}\"", entry.version);
-                Ok((entry.body.clone(), Some(etag), None))
+                Ok((entry.body.clone(), etag, None))
             }
         }
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        inner.entries.remove(key);
-        Ok(())
     }
 
     async fn delete_if_match(

@@ -1,9 +1,6 @@
 use std::str::FromStr;
 
-use angos_tx_engine::{
-    ConditionalCapabilities,
-    lock::{LockStrategy, S3LockConfig},
-};
+use angos_tx_engine::lock::{LockStrategy, S3LockConfig};
 
 use super::test_config;
 use crate::{
@@ -14,7 +11,7 @@ use crate::{
 #[tokio::test]
 async fn test_blob_index_updates_multiple_digests() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("blob-index-multi-digest-test").unwrap();
 
     let digests: Vec<Digest> = (0..5)
@@ -54,7 +51,7 @@ async fn test_blob_index_updates_multiple_digests() {
 #[tokio::test]
 async fn test_tracked_link_creates_with_referrers() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("tracked-creates-referrer-test").unwrap();
 
     let referrer_digest =
@@ -123,7 +120,7 @@ async fn test_tracked_link_creates_with_referrers() {
 #[tokio::test]
 async fn test_tracked_link_deletes_with_referrers() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("tracked-deletes-referrer-test").unwrap();
 
     let referrer_digest =
@@ -188,7 +185,7 @@ async fn test_tracked_link_deletes_with_referrers() {
 #[tokio::test]
 async fn test_mixed_creates_and_deletes_across_digests() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("mixed-ops-across-digests-test").unwrap();
 
     let digest_keep =
@@ -276,16 +273,7 @@ async fn test_has_blob_references_ignores_empty_cas_shards() {
     // CAS-capable conditional caps.
     let mut config = test_config();
     config.lock_strategy = LockStrategy::S3(S3LockConfig::default());
-    let backend = config
-        .to_backend(
-            Some(ConditionalCapabilities {
-                put_if_none_match: true,
-                put_if_match: true,
-                delete_if_match: true,
-            }),
-            None,
-        )
-        .unwrap();
+    let backend = config.to_backend(true, None).unwrap();
 
     let digest =
         Digest::from_str("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")

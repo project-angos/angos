@@ -15,7 +15,7 @@ use chrono::{Duration, Utc};
 
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageS3Backend};
-use angos_tx_engine::{ConditionalCapabilities, lock::LockStrategy, store::Store};
+use angos_tx_engine::{lock::LockStrategy, store::Store};
 
 use crate::{
     cache::Cache,
@@ -42,7 +42,7 @@ pub struct TestS3Config {
 impl TestS3Config {
     pub fn to_backend(
         &self,
-        conditional: Option<ConditionalCapabilities>,
+        conditional_operations: bool,
         cache: Option<Arc<Cache>>,
     ) -> Result<MetadataStore, Error> {
         let http = Arc::new(
@@ -51,9 +51,9 @@ impl TestS3Config {
         );
         let raw_storage = Arc::new(StorageS3Backend::builder(http.clone()).build());
         let object_store: Arc<dyn ObjectStore> = raw_storage.clone();
-        let cond_store: Arc<dyn ConditionalStore> = raw_storage;
+        let cond_store: Option<Arc<dyn ConditionalStore>> =
+            conditional_operations.then_some(raw_storage as Arc<dyn ConditionalStore>);
 
-        let caps = conditional.unwrap_or_default();
         let s3_lock_store: Option<Arc<dyn ConditionalStore>> = match &self.lock_strategy {
             LockStrategy::S3(cfg) => {
                 let lock_http = S3HttpBackend::new(&self.connection.to_lock_client_config(cfg))
@@ -67,11 +67,9 @@ impl TestS3Config {
         let facade = Arc::new(
             Store::new(
                 object_store,
-                Some(cond_store),
+                cond_store,
                 self.lock_strategy.clone(),
                 s3_lock_store,
-                caps.delete_if_match,
-                caps.supports_cas(),
             )
             .map_err(|e| Error::Coordination(e.to_string()))?,
         );
@@ -99,31 +97,14 @@ pub fn test_config() -> TestS3Config {
 
 pub fn test_backend_with_cache(config: &TestS3Config) -> (MetadataStore, Arc<Cache>) {
     let cache = Arc::new(Cache::Memory(CacheMemoryBackend::new()));
-    let backend = config
-        .to_backend(
-            Some(ConditionalCapabilities {
-                put_if_none_match: true,
-                put_if_match: true,
-                delete_if_match: false,
-            }),
-            Some(cache.clone()),
-        )
-        .unwrap();
+    let backend = config.to_backend(true, Some(cache.clone())).unwrap();
     (backend, cache)
 }
 
 pub fn test_backend_with_debounce(config: &TestS3Config, debounce_secs: u64) -> MetadataStore {
     let mut cfg = config.clone();
     cfg.access_time_debounce_secs = debounce_secs;
-    cfg.to_backend(
-        Some(ConditionalCapabilities {
-            put_if_none_match: true,
-            put_if_match: true,
-            delete_if_match: false,
-        }),
-        None,
-    )
-    .unwrap()
+    cfg.to_backend(true, None).unwrap()
 }
 
 pub fn legacy_blob_index_with(entries: Vec<(&str, Vec<LinkKind>)>) -> BlobIndex {

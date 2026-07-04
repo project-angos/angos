@@ -97,13 +97,15 @@ impl Store {
     /// operator's [`LockStrategy`]; they never instantiate `Lock`,
     /// `LockStorage`, or any executor type directly.
     ///
-    /// - When `conditional` is `Some(...)` and `supports_cas` is `true`, the
-    ///   engine selects a CAS executor. Otherwise it falls back to a locked
-    ///   executor. The caller is responsible for probing conditional
-    ///   capabilities (via [`crate::probe::probe_conditional_capabilities`])
-    ///   and setting `supports_cas` accordingly.
+    /// - `conditional` must be `Some(...)` only when the backend's support for
+    ///   the full conditional set (`put_if_absent`, `put_if_match`,
+    ///   `delete_if_match`, all surfacing `ETag`s) has been verified, via
+    ///   [`crate::probe::probe_cas_support`] or an operator declaration. Its
+    ///   presence selects the CAS executor; otherwise the engine falls back to
+    ///   a locked executor.
     /// - For [`LockStrategy::S3`] the caller must provide `s3_lock_store` (a
-    ///   [`ConditionalStore`] tuned for short-lived lock requests).
+    ///   [`ConditionalStore`] tuned for short-lived lock requests, on a
+    ///   provider satisfying the same conditional contract).
     ///
     /// # Errors
     ///
@@ -116,8 +118,6 @@ impl Store {
         conditional: Option<Arc<dyn ConditionalStore>>,
         lock_strategy: LockStrategy,
         s3_lock_store: Option<Arc<dyn ConditionalStore>>,
-        s3_lock_delete_if_match: bool,
-        supports_cas: bool,
     ) -> Result<Self, Error> {
         // Capture a stable label for the lock-object backend before the match
         // below moves `lock_strategy`. Logged alongside the executor choice so
@@ -156,8 +156,7 @@ impl Store {
                 let lock_store = s3_lock_store.ok_or_else(|| {
                     Error::Build("S3 lock strategy requires an S3 conditional store".to_string())
                 })?;
-                let storage: Arc<dyn LockStorage> =
-                    Arc::new(S3LockStorage::new(lock_store, s3_lock_delete_if_match));
+                let storage: Arc<dyn LockStorage> = Arc::new(S3LockStorage::new(lock_store));
                 Lock::builder(storage)
                     .ttl_secs(config.ttl_secs)
                     .max_retries(config.max_retries)
@@ -172,10 +171,10 @@ impl Store {
                 .map_err(|e| Error::Build(format!("failed to build lock: {e}")))?,
         );
 
-        // The conditional store is retained only when the CAS executor uses
-        // it on the healthy path, so `maintenance` replays stale intents with
-        // the same primitives the executor used.
-        if supports_cas && let Some(cs) = conditional {
+        // The conditional store is retained so `maintenance` replays stale
+        // intents and reaps cold locks with the same primitives the executor
+        // used on the healthy path.
+        if let Some(cs) = conditional {
             let executor: Arc<dyn TransactionExecutor> =
                 Arc::new(CasExecutor::builder(cs.clone(), lock.clone()).build());
             info!(
@@ -212,7 +211,9 @@ impl Store {
     /// The loops use the engine's default intervals and coordinate through
     /// the executor's own primitives: recovery takes ownership of stale
     /// intents via the engine lock and, on CAS deployments, replays with the
-    /// same conditional store the healthy path uses.
+    /// same conditional store the healthy path uses. The lock janitor runs
+    /// only on CAS deployments: lock objects exist solely on CAS-capable
+    /// backends, and it reclaims them with conditional deletes.
     pub fn maintenance(
         &self,
         cancellation: CancellationToken,
@@ -229,14 +230,18 @@ impl Store {
             .cancellation(cancellation.clone())
             .build();
 
-        let mut lock_janitor = LockJanitor::builder(self.object.clone()).cancellation(cancellation);
-        if let Some(cs) = &self.conditional {
-            lock_janitor = lock_janitor.conditional_store(cs.clone());
-        }
-        let lock_janitor = lock_janitor.build();
+        let lock_janitor = self
+            .conditional
+            .clone()
+            .map(|cs| LockJanitor::builder(cs).cancellation(cancellation).build());
 
         async move {
-            tokio::join!(recovery.run(), body_janitor.run(), lock_janitor.run());
+            let lock_janitor = async move {
+                if let Some(janitor) = lock_janitor {
+                    janitor.run().await;
+                }
+            };
+            tokio::join!(recovery.run(), body_janitor.run(), lock_janitor);
         }
     }
 
@@ -601,7 +606,7 @@ mod tests {
     };
 
     fn store_over(backend: Arc<MemoryObjectStore>) -> Store {
-        Store::new(backend, None, LockStrategy::Memory, None, false, false).expect("store")
+        Store::new(backend, None, LockStrategy::Memory, None).expect("store")
     }
 
     #[tokio::test]

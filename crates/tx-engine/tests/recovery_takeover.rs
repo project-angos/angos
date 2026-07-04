@@ -607,7 +607,7 @@ impl LockStorage for OwnershipLostLockStorage {
     ) -> Result<PutIfAbsentOutcome, LockError> {
         // Acquire always succeeds with a real ETag so the heartbeat takes the
         // fast (cached-ETag) path on its first tick.
-        Ok(PutIfAbsentOutcome::Created(Some(self.mint_etag())))
+        Ok(PutIfAbsentOutcome::Created(self.mint_etag()))
     }
 
     async fn put_if_match(
@@ -623,12 +623,8 @@ impl LockStorage for OwnershipLostLockStorage {
     async fn get_with_etag(
         &self,
         _key: &str,
-    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), LockError> {
+    ) -> Result<(Vec<u8>, String, Option<DateTime<Utc>>), LockError> {
         Err(LockError::NotFound)
-    }
-
-    async fn delete(&self, _key: &str) -> Result<(), LockError> {
-        Ok(())
     }
 
     async fn delete_if_match(

@@ -63,18 +63,16 @@ impl LockBody {
 
 /// Result of a single conditional-put-if-absent attempt.
 pub enum PutIfAbsentOutcome {
-    /// The key was absent; PUT succeeded. Carries the server `ETag` when the
-    /// backend provides one.
-    Created(Option<String>),
+    /// The key was absent; PUT succeeded. Carries the server `ETag`.
+    Created(String),
     /// The key already existed (another holder owns the lock).
     AlreadyExists,
 }
 
 /// Result of a conditional-put-if-match attempt.
 pub enum PutIfMatchOutcome {
-    /// The `ETag` matched; PUT succeeded. Carries the new `ETag` when the backend
-    /// provides one.
-    Updated(Option<String>),
+    /// The `ETag` matched; PUT succeeded. Carries the new `ETag`.
+    Updated(String),
     /// The `ETag` did not match (another writer changed the object).
     Mismatch,
 }
@@ -89,11 +87,11 @@ pub enum DeleteIfMatchOutcome {
 
 /// The narrow storage interface the lock primitive requires.
 ///
-/// Implementations must be `Send + Sync + Debug` and must provide at minimum
-/// `put_if_absent`, `put_if_match`, `get_with_etag`, and `delete`. Conditional
-/// delete is optional (`delete_if_match`); backends that do not support it
-/// should return `DeleteIfMatchOutcome::Deleted` after a plain `delete` (or
-/// fall through to the slow-path verify-then-delete in the lock release code).
+/// Every write surfaces an `ETag` (an opaque fencing token: an HTTP `ETag` on
+/// S3, a version counter in memory, the stored value on Redis) and every
+/// delete is conditional on it, so a holder can only ever remove its own lock
+/// object. Backends that cannot honour this contract do not qualify as lock
+/// storage; the CAS capability gate enforces it for S3 providers.
 #[async_trait]
 pub trait LockStorage: Send + Sync + Debug {
     /// Atomically write `body` at `key` if and only if `key` does not currently
@@ -110,30 +108,22 @@ pub trait LockStorage: Send + Sync + Debug {
         body: Vec<u8>,
     ) -> Result<PutIfMatchOutcome, Error>;
 
-    /// Read `key` and return its body bytes together with the `ETag` (if the
-    /// backend provides one) and the server-assigned `last_modified` timestamp
-    /// (if available). Returns `Err(Error::NotFound)` when the key is absent.
+    /// Read `key` and return its body bytes together with the `ETag` and the
+    /// server-assigned `last_modified` timestamp (if available). Returns
+    /// `Err(Error::NotFound)` when the key is absent.
     async fn get_with_etag(
         &self,
         key: &str,
-    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), Error>;
+    ) -> Result<(Vec<u8>, String, Option<DateTime<Utc>>), Error>;
 
-    /// Unconditionally delete `key`. A missing key is treated as success.
-    async fn delete(&self, key: &str) -> Result<(), Error>;
-
-    /// Conditionally delete `key` iff the current `ETag` equals `expected_etag`.
-    ///
-    /// The default implementation performs a plain `delete` (suitable for
-    /// backends that do not expose ETag-conditional deletes). Override when the
-    /// backend supports `If-Match` on DELETE for stronger correctness.
+    /// Atomically delete `key` if and only if the current `ETag` equals
+    /// `expected_etag`. Returns `Mismatch` when the `ETag` does not match; a
+    /// missing key counts as `Deleted`.
     async fn delete_if_match(
         &self,
         key: &str,
-        _expected_etag: &str,
-    ) -> Result<DeleteIfMatchOutcome, Error> {
-        self.delete(key).await?;
-        Ok(DeleteIfMatchOutcome::Deleted)
-    }
+        expected_etag: &str,
+    ) -> Result<DeleteIfMatchOutcome, Error>;
 
     /// Returns a human-readable label for metrics / startup logs.
     fn label(&self) -> &'static str;

@@ -284,7 +284,7 @@ max_retries = 100
 retry_delay_ms = 50
 ```
 
-At startup, Angos probes the S3 provider to verify conditional write support. If the probe fails, check that your provider supports `If-None-Match` headers or fall back to the Redis-based setup above.
+At startup, Angos probes the S3 provider to verify conditional write and delete support. If the probe fails, check that your provider supports `If-None-Match`/`If-Match` on PUT and `If-Match` on DELETE, or fall back to the Redis-based setup above.
 
 ---
 

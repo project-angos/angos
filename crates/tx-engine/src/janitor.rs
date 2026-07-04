@@ -240,18 +240,20 @@ const LOCK_LIST_PAGE_SIZE: u16 = 100;
 /// On each tick, paginates through `.tx-locks/` and for each lock object whose
 /// body has expired (TTL elapsed against the server-assigned `last_modified`
 /// when available, falling back to the embedded `refreshed_at`) by more than
-/// the configured `orphan_age`, deletes it.
+/// the configured `orphan_age`, deletes it conditionally on the `ETag`
+/// observed at HEAD, so a fresh re-acquire racing the sweep is never deleted.
 ///
 /// The lock primitive itself does opportunistic stale-lock recovery on the
 /// acquire path; this janitor handles cold keys that are never re-acquired.
+/// Lock objects only exist on CAS-capable backends, which is why the janitor
+/// requires a [`ConditionalStore`].
 ///
 /// `orphan_age` is added on top of the lock's own TTL, so a lock with a
 /// 30-second TTL is reaped at most `orphan_age + 30s` after its last refresh.
 ///
 /// Constructed via [`LockJanitor::builder`].
 pub struct LockJanitor {
-    store: Arc<dyn ObjectStore>,
-    conditional_store: Option<Arc<dyn ConditionalStore>>,
+    store: Arc<dyn ConditionalStore>,
     interval: Duration,
     orphan_age: Duration,
     cancellation: CancellationToken,
@@ -262,31 +264,19 @@ impl std::fmt::Debug for LockJanitor {
         f.debug_struct("LockJanitor")
             .field("interval", &self.interval)
             .field("orphan_age", &self.orphan_age)
-            .field("has_conditional_store", &self.conditional_store.is_some())
             .finish_non_exhaustive()
     }
 }
 
 /// Builder for [`LockJanitor`].
 pub struct LockJanitorBuilder {
-    store: Arc<dyn ObjectStore>,
-    conditional_store: Option<Arc<dyn ConditionalStore>>,
+    store: Arc<dyn ConditionalStore>,
     interval: Option<Duration>,
     orphan_age: Option<Duration>,
     cancellation: Option<CancellationToken>,
 }
 
 impl LockJanitorBuilder {
-    /// Wire a `ConditionalStore` so deletes use `delete_if_match` against the
-    /// etag observed at HEAD; without it the janitor falls back to plain
-    /// `delete`, which has a small race window against a fresh re-acquire of
-    /// the same key.
-    #[must_use]
-    pub fn conditional_store(mut self, cs: Arc<dyn ConditionalStore>) -> Self {
-        self.conditional_store = Some(cs);
-        self
-    }
-
     /// Set the sweep interval. Defaults to 5 minutes.
     #[must_use]
     pub fn interval(mut self, interval: Duration) -> Self {
@@ -314,7 +304,6 @@ impl LockJanitorBuilder {
     pub fn build(self) -> LockJanitor {
         LockJanitor {
             store: self.store,
-            conditional_store: self.conditional_store,
             interval: self.interval.unwrap_or(Duration::from_mins(5)),
             orphan_age: self
                 .orphan_age
@@ -330,10 +319,9 @@ impl LockJanitor {
     /// `store` is a required argument; all other settings are optional fluent
     /// setters on the returned builder.
     #[must_use]
-    pub fn builder(store: Arc<dyn ObjectStore>) -> LockJanitorBuilder {
+    pub fn builder(store: Arc<dyn ConditionalStore>) -> LockJanitorBuilder {
         LockJanitorBuilder {
             store,
-            conditional_store: None,
             interval: None,
             orphan_age: None,
             cancellation: None,
@@ -419,33 +407,25 @@ impl LockJanitor {
             return;
         }
 
-        if let (Some(cs), Some(etag)) = (self.conditional_store.as_ref(), meta.etag.as_ref()) {
-            match cs.delete_if_match(key, etag).await {
-                Ok(()) => {
-                    info!(key, "LockJanitor: reclaimed expired lock");
-                }
-                Err(StorageError::PreconditionFailed) => {
-                    debug!(
-                        key,
-                        "LockJanitor: lock was re-acquired between head and delete; skipping"
-                    );
-                }
-                Err(e) => {
-                    warn!(key, error = %e, "LockJanitor: conditional delete failed");
-                }
-            }
+        let Some(etag) = meta.etag.as_ref() else {
+            warn!(
+                key,
+                "LockJanitor: lock object has no ETag; leaving in place"
+            );
             return;
-        }
-
-        // Unconditional path: a fresh acquire may slip in between our HEAD and
-        // DELETE and lose its freshly-written object. Acceptable for backends
-        // that do not expose CAS; the next acquire on that key reconstructs.
-        match self.store.delete(key).await {
+        };
+        match self.store.delete_if_match(key, etag).await {
             Ok(()) => {
                 info!(key, "LockJanitor: reclaimed expired lock");
             }
+            Err(StorageError::PreconditionFailed) => {
+                debug!(
+                    key,
+                    "LockJanitor: lock was re-acquired between head and delete; skipping"
+                );
+            }
             Err(e) => {
-                warn!(key, error = %e, "LockJanitor: delete failed");
+                warn!(key, error = %e, "LockJanitor: conditional delete failed");
             }
         }
     }
@@ -494,7 +474,7 @@ mod tests {
         }
     }
 
-    fn build_janitor(store: Arc<dyn ObjectStore>) -> LockJanitor {
+    fn build_janitor(store: Arc<dyn ConditionalStore>) -> LockJanitor {
         LockJanitor::builder(store)
             .orphan_age(Duration::from_mins(1))
             .build()
@@ -505,7 +485,7 @@ mod tests {
         let store = Arc::new(MemoryObjectStore::new());
         write_lock(&store, "00/cold-key", &expired_body()).await;
 
-        let janitor = build_janitor(store.clone() as Arc<dyn ObjectStore>);
+        let janitor = build_janitor(store.clone() as Arc<dyn ConditionalStore>);
         janitor.sweep().await;
 
         let after = store.head(&lock_key("00/cold-key")).await;
@@ -517,7 +497,7 @@ mod tests {
         let store = Arc::new(MemoryObjectStore::new());
         write_lock(&store, "00/hot-key", &fresh_body()).await;
 
-        let janitor = build_janitor(store.clone() as Arc<dyn ObjectStore>);
+        let janitor = build_janitor(store.clone() as Arc<dyn ConditionalStore>);
         janitor.sweep().await;
 
         store
@@ -532,7 +512,7 @@ mod tests {
         write_lock(&store, "00/expired", &expired_body()).await;
         write_lock(&store, "01/fresh", &fresh_body()).await;
 
-        let janitor = build_janitor(store.clone() as Arc<dyn ObjectStore>);
+        let janitor = build_janitor(store.clone() as Arc<dyn ConditionalStore>);
         janitor.sweep().await;
 
         assert!(matches!(
@@ -553,7 +533,7 @@ mod tests {
             .await
             .expect("put");
 
-        let janitor = build_janitor(store.clone() as Arc<dyn ObjectStore>);
+        let janitor = build_janitor(store.clone() as Arc<dyn ConditionalStore>);
         janitor.sweep().await;
 
         store
@@ -585,8 +565,7 @@ mod tests {
         let racing: Arc<HookedStore<Arc<dyn ConditionalStore>, AlwaysRaced>> =
             Arc::new(HookedStore::new(inner.clone(), AlwaysRaced));
 
-        let janitor = LockJanitor::builder(racing.clone() as Arc<dyn ObjectStore>)
-            .conditional_store(racing.clone() as Arc<dyn ConditionalStore>)
+        let janitor = LockJanitor::builder(racing.clone() as Arc<dyn ConditionalStore>)
             .orphan_age(Duration::from_mins(1))
             .build();
         janitor.sweep().await;

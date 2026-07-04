@@ -199,7 +199,7 @@ impl Lock {
 
     /// Try once to acquire a single key. Returns `Ok(Some(etag))` on success,
     /// `Ok(None)` on contention, or `Err` on a hard storage error.
-    async fn try_acquire_one(&self, key: &str) -> Result<Option<Option<String>>, Error> {
+    async fn try_acquire_one(&self, key: &str) -> Result<Option<String>, Error> {
         let body = self.make_body()?;
         match self.storage.put_if_absent(key, body).await? {
             PutIfAbsentOutcome::Created(etag) => Ok(Some(etag)),
@@ -210,7 +210,7 @@ impl Lock {
     /// Attempt to recover a stale lock at `key`. Returns `Ok(Some(etag))` when
     /// the stale lock was claimed, `Ok(None)` when the lock is still fresh or
     /// the race was lost, `Err` on a hard error.
-    async fn try_recover_stale(&self, key: &str) -> Result<Option<Option<String>>, Error> {
+    async fn try_recover_stale(&self, key: &str) -> Result<Option<String>, Error> {
         let (data, etag, last_modified) = match self.storage.get_with_etag(key).await {
             Ok(t) => t,
             Err(Error::NotFound) => return Ok(None),
@@ -223,12 +223,6 @@ impl Lock {
         if !body.is_expired(last_modified) {
             return Ok(None);
         }
-
-        let Some(etag) = etag else {
-            return Err(Error::InvalidData(
-                "lock object missing ETag; cannot recover stale lock".to_string(),
-            ));
-        };
 
         debug!(
             key,
@@ -346,27 +340,24 @@ impl Lock {
     // internal helpers
 
     async fn try_acquire_all_sequential(&self, sorted_keys: &[String]) -> AcquireAllOutcome {
-        let mut acquired_paths: Vec<String> = Vec::new();
-        let mut etags: HashMap<String, Option<String>> = HashMap::new();
+        // Acquired (path, etag) pairs, in acquisition order, so a failed
+        // multi-key attempt can conditionally roll back exactly what it wrote.
+        let mut acquired: Vec<(String, String)> = Vec::new();
 
         for key in sorted_keys {
             match self.try_acquire_one(key).await {
                 Ok(Some(etag)) => {
-                    etags.insert(key.clone(), etag);
-                    acquired_paths.push(key.clone());
+                    acquired.push((key.clone(), etag));
                 }
                 Ok(None) => {
                     // Contended. Try stale-lock recovery.
                     match self.try_recover_stale(key).await {
                         Ok(Some(new_etag)) => {
-                            etags.insert(key.clone(), new_etag);
-                            acquired_paths.push(key.clone());
+                            acquired.push((key.clone(), new_etag));
                         }
                         Ok(None) => {
                             // Still held or lost the recovery race.
-                            return AcquireAllOutcome::Retry {
-                                acquired: acquired_paths,
-                            };
+                            return AcquireAllOutcome::Retry { acquired };
                         }
                         Err(e) => {
                             return AcquireAllOutcome::HardError(e);
@@ -374,27 +365,25 @@ impl Lock {
                     }
                 }
                 Err(e) => {
-                    self.release_paths(&acquired_paths).await;
+                    self.release_paths(&acquired).await;
                     return AcquireAllOutcome::HardError(e);
                 }
             }
         }
 
-        AcquireAllOutcome::Acquired(etags)
+        AcquireAllOutcome::Acquired(acquired.into_iter().collect())
     }
 
-    async fn release_paths(&self, paths: &[String]) {
-        for path in paths {
-            if let Err(e) = self.storage.delete(path).await {
-                warn!(path, error = %e, "Lock: failed to delete lock path during rollback");
-            }
+    async fn release_paths(&self, acquired: &[(String, String)]) {
+        for (path, etag) in acquired {
+            release_single_path(self.storage.as_ref(), path, Some(etag)).await;
         }
     }
 
     fn make_session(
         &self,
         paths: Vec<String>,
-        initial_etags: HashMap<String, Option<String>>,
+        initial_etags: HashMap<String, String>,
     ) -> LockSession {
         let cancellation = CancellationToken::new();
         let etag_cache = Arc::new(RwLock::new(initial_etags));
@@ -421,7 +410,7 @@ impl Lock {
         &self,
         paths: Vec<String>,
         cancellation: CancellationToken,
-        etag_cache: Arc<RwLock<HashMap<String, Option<String>>>>,
+        etag_cache: Arc<RwLock<HashMap<String, String>>>,
     ) -> JoinHandle<()> {
         let storage = self.storage.clone();
         let ttl_secs = self.ttl_secs;
@@ -490,7 +479,7 @@ async fn run_heartbeat_tick(
     storage: &dyn LockStorage,
     ttl_secs: u64,
     tick_deadline: Duration,
-    etag_cache: &Arc<RwLock<HashMap<String, Option<String>>>>,
+    etag_cache: &Arc<RwLock<HashMap<String, String>>>,
     consecutive_failures: &mut u32,
     _label: &'static str,
 ) -> HeartbeatOutcome {
@@ -504,10 +493,7 @@ async fn run_heartbeat_tick(
     // wall-clock per tick at ≈ one `tick_deadline` regardless of key count.
     let cached_etags: Vec<Option<String>> = {
         let cache = etag_cache.read().unwrap_or_else(PoisonError::into_inner);
-        paths
-            .iter()
-            .map(|path| cache.get(path).and_then(Option::as_ref).cloned())
-            .collect()
+        paths.iter().map(|path| cache.get(path).cloned()).collect()
     };
 
     let path_outcomes: Vec<PathTickOutcome> = join_all(paths.iter().zip(cached_etags).map(
@@ -546,10 +532,12 @@ async fn run_heartbeat_tick(
                 }
             }
             PathTickOutcome::Failure => {
+                // Forget the ETag after an ambiguous failure so the next tick
+                // (or the release) re-reads the live one before fencing on it.
                 etag_cache
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(path.clone(), None);
+                    .remove(path);
                 had_failure = true;
             }
         }
@@ -577,7 +565,7 @@ async fn run_heartbeat_tick(
 }
 
 enum PathTickOutcome {
-    Updated(Option<String>),
+    Updated(String),
     Invalidate(&'static str),
     Failure,
 }
@@ -636,14 +624,6 @@ async fn heartbeat_tick_path(
         }
     };
 
-    let Some(etag) = etag else {
-        warn!(
-            path,
-            "Lock: ETag unavailable, cannot safely refresh heartbeat"
-        );
-        return PathTickOutcome::Invalidate("etag_unavailable");
-    };
-
     let body = match make_body() {
         Ok(b) => b,
         Err(e) => {
@@ -673,7 +653,7 @@ async fn heartbeat_tick_path(
 async fn release_session(
     cancellation: CancellationToken,
     paths: Vec<String>,
-    etag_cache: Arc<RwLock<HashMap<String, Option<String>>>>,
+    etag_cache: Arc<RwLock<HashMap<String, String>>>,
     storage: Arc<dyn LockStorage>,
 ) {
     if cancellation.is_cancelled() {
@@ -686,59 +666,43 @@ async fn release_session(
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(path)
-            .and_then(Option::as_ref)
             .cloned();
 
         release_single_path(storage.as_ref(), path, cached_etag.as_ref()).await;
     }
 }
 
+/// Release one lock path with a delete conditional on its `ETag`, so a
+/// successor that already replaced the object is never deleted. An unknown
+/// `ETag` (the heartbeat forgets it after an ambiguous refresh failure) is
+/// re-read first; any residual failure leaves the object to expire via TTL
+/// and the janitor.
 async fn release_single_path(storage: &dyn LockStorage, path: &str, cached_etag: Option<&String>) {
-    // Fast path: conditional delete using cached ETag.
-    if let Some(etag) = cached_etag {
-        match storage.delete_if_match(path, etag).await {
-            Ok(DeleteIfMatchOutcome::Deleted) => return,
-            Ok(DeleteIfMatchOutcome::Mismatch) => {
-                debug!(
-                    path,
-                    "Lock: ETag changed on release; another instance owns it"
-                );
+    let etag = match cached_etag {
+        Some(etag) => etag.clone(),
+        None => match storage.get_with_etag(path).await {
+            Ok((_, etag, _)) => etag,
+            Err(Error::NotFound) => {
+                debug!(path, "Lock: already deleted");
                 return;
             }
             Err(e) => {
-                warn!(path, error = %e, "Lock: conditional delete failed, attempting plain delete");
+                warn!(path, error = %e, "Lock: release read failed, lock will expire via TTL");
+                return;
             }
-        }
-    }
+        },
+    };
 
-    // Slow path: verify ownership then delete.
-    match storage.get_with_etag(path).await {
-        Ok((data, etag, _)) => {
-            if let Ok(body) = serde_json::from_slice::<LockBody>(&data) {
-                // Only delete if we still own it.
-                if let Some(ref e) = etag {
-                    match storage.delete_if_match(path, e).await {
-                        Ok(_) => {}
-                        Err(err) => {
-                            warn!(path, error = %err, "Lock: delete_if_match failed on release slow path");
-                        }
-                    }
-                } else if let Err(err) = storage.delete(path).await {
-                    warn!(path, error = %err, "Lock: delete failed on release slow path");
-                }
-                let _ = body; // ownership confirmed via the GET
-            } else {
-                warn!(path, "Lock: corrupt lock body on release, deleting anyway");
-                if let Err(err) = storage.delete(path).await {
-                    warn!(path, error = %err, "Lock: delete failed after corrupt read");
-                }
-            }
-        }
-        Err(Error::NotFound) => {
-            debug!(path, "Lock: already deleted");
+    match storage.delete_if_match(path, &etag).await {
+        Ok(DeleteIfMatchOutcome::Deleted) => {}
+        Ok(DeleteIfMatchOutcome::Mismatch) => {
+            debug!(
+                path,
+                "Lock: ETag changed on release; another instance owns it"
+            );
         }
         Err(e) => {
-            warn!(path, error = %e, "Lock: get_with_etag failed on release, lock will expire via TTL");
+            warn!(path, error = %e, "Lock: conditional delete failed, lock will expire via TTL");
         }
     }
 }
@@ -746,9 +710,9 @@ async fn release_single_path(storage: &dyn LockStorage, path: &str, cached_etag:
 // AcquireAllOutcome
 
 enum AcquireAllOutcome {
-    Acquired(HashMap<String, Option<String>>),
+    Acquired(HashMap<String, String>),
     HardError(Error),
-    Retry { acquired: Vec<String> },
+    Retry { acquired: Vec<(String, String)> },
 }
 
 // tests
@@ -769,7 +733,10 @@ mod tests {
     use tokio::sync::Barrier;
     use uuid::Uuid;
 
-    use super::{HeartbeatOutcome, Lock, PathTickOutcome, heartbeat_tick_path, run_heartbeat_tick};
+    use super::{
+        HeartbeatOutcome, Lock, PathTickOutcome, heartbeat_tick_path, release_single_path,
+        run_heartbeat_tick,
+    };
     use crate::lock::{
         Error,
         storage::{
@@ -795,10 +762,6 @@ mod tests {
         Expired,
         /// Return a stored body that is still fresh.
         Fresh,
-        /// Return a stored body but with no `ETag` (forces `etag_unavailable`).
-        FreshNoEtag,
-        /// Return a stored, expired body but with no `ETag` (recover path can't fence).
-        ExpiredNoEtag,
         /// Key is gone.
         NotFound,
         /// Transient hard error.
@@ -823,7 +786,6 @@ mod tests {
         put_absent_error: Mutex<bool>,
         put_match_calls: AtomicUsize,
         delete_if_match_calls: AtomicUsize,
-        delete_calls: AtomicUsize,
         /// Last `delete_if_match` etag, for assertions.
         last_delete_etag: Mutex<Option<String>>,
         /// When set, `delete_if_match` reports a mismatch.
@@ -886,7 +848,7 @@ mod tests {
             if *self.put_absent_exists.lock().unwrap() {
                 Ok(PutIfAbsentOutcome::AlreadyExists)
             } else {
-                Ok(PutIfAbsentOutcome::Created(Some(self.mint_etag())))
+                Ok(PutIfAbsentOutcome::Created(self.mint_etag()))
             }
         }
 
@@ -903,7 +865,7 @@ mod tests {
                 .unwrap()
                 .expect("put_match script set")
             {
-                PutMatchScript::Updated => Ok(PutIfMatchOutcome::Updated(Some(self.mint_etag()))),
+                PutMatchScript::Updated => Ok(PutIfMatchOutcome::Updated(self.mint_etag())),
                 PutMatchScript::Mismatch => Ok(PutIfMatchOutcome::Mismatch),
                 PutMatchScript::Failure => {
                     Err(Error::StorageBackend("injected put_if_match error".into()))
@@ -914,22 +876,15 @@ mod tests {
         async fn get_with_etag(
             &self,
             _key: &str,
-        ) -> Result<(Vec<u8>, Option<String>, Option<chrono::DateTime<Utc>>), Error> {
+        ) -> Result<(Vec<u8>, String, Option<chrono::DateTime<Utc>>), Error> {
             match self.get.lock().unwrap().expect("get script set") {
-                GetScript::Expired => Ok((Self::body_bytes(true), Some(self.mint_etag()), None)),
-                GetScript::Fresh => Ok((Self::body_bytes(false), Some(self.mint_etag()), None)),
-                GetScript::FreshNoEtag => Ok((Self::body_bytes(false), None, None)),
-                GetScript::ExpiredNoEtag => Ok((Self::body_bytes(true), None, None)),
+                GetScript::Expired => Ok((Self::body_bytes(true), self.mint_etag(), None)),
+                GetScript::Fresh => Ok((Self::body_bytes(false), self.mint_etag(), None)),
                 GetScript::NotFound => Err(Error::NotFound),
                 GetScript::Failure => {
                     Err(Error::StorageBackend("injected get_with_etag error".into()))
                 }
             }
-        }
-
-        async fn delete(&self, _key: &str) -> Result<(), Error> {
-            self.delete_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
         }
 
         async fn delete_if_match(
@@ -960,10 +915,10 @@ mod tests {
             .expect("lock builder")
     }
 
-    fn cache(entries: &[(&str, Option<&str>)]) -> Arc<RwLock<HashMap<String, Option<String>>>> {
-        let map: HashMap<String, Option<String>> = entries
+    fn cache(entries: &[(&str, &str)]) -> Arc<RwLock<HashMap<String, String>>> {
+        let map: HashMap<String, String> = entries
             .iter()
-            .map(|(k, v)| ((*k).to_string(), v.map(ToString::to_string)))
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         Arc::new(RwLock::new(map))
     }
@@ -993,7 +948,7 @@ mod tests {
             heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
 
         match outcome {
-            PathTickOutcome::Updated(Some(new_etag)) => {
+            PathTickOutcome::Updated(new_etag) => {
                 assert_ne!(
                     new_etag, "\"cached\"",
                     "healthy refresh must rotate the ETag"
@@ -1017,19 +972,6 @@ mod tests {
         assert!(
             matches!(outcome, PathTickOutcome::Invalidate("file_disappeared")),
             "a missing lock object on the slow path must invalidate as file_disappeared"
-        );
-    }
-
-    #[tokio::test]
-    async fn tick_path_slow_path_no_etag_invalidates_etag_unavailable() {
-        let storage = FakeLockStorage::arc();
-        storage.set_get(GetScript::FreshNoEtag);
-
-        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None).await;
-
-        assert!(
-            matches!(outcome, PathTickOutcome::Invalidate("etag_unavailable")),
-            "an ETag-less backend on the slow path cannot safely refresh; must invalidate"
         );
     }
 
@@ -1061,7 +1003,7 @@ mod tests {
     async fn run_tick_single_failure_does_not_cancel() {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Failure);
-        let etag_cache = cache(&[("k", Some("\"cached\""))]);
+        let etag_cache = cache(&[("k", "\"cached\"")]);
         let mut consecutive = 0u32;
 
         let outcome = run_heartbeat_tick(
@@ -1082,7 +1024,7 @@ mod tests {
         assert_eq!(consecutive, 1, "the failure must be counted in the budget");
         // The cache entry is cleared so the next tick takes the slow re-read path.
         assert!(
-            etag_cache.read().unwrap().get("k").unwrap().is_none(),
+            !etag_cache.read().unwrap().contains_key("k"),
             "a failed tick clears the cached ETag"
         );
     }
@@ -1091,7 +1033,7 @@ mod tests {
     async fn run_tick_failures_escalate_after_one_ttl() {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Failure);
-        let etag_cache = cache(&[("k", Some("\"cached\""))]);
+        let etag_cache = cache(&[("k", "\"cached\"")]);
         let mut consecutive = 0u32;
 
         // ttl=9, tick=3 ⇒ ticks_per_ttl = 9 / 3 = 3 consecutive failures escalate.
@@ -1144,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn run_tick_success_resets_failure_counter() {
         let storage = FakeLockStorage::arc();
-        let etag_cache = cache(&[("k", Some("\"cached\""))]);
+        let etag_cache = cache(&[("k", "\"cached\"")]);
         let mut consecutive = 2u32;
 
         storage.set_put_match(PutMatchScript::Updated);
@@ -1162,7 +1104,7 @@ mod tests {
         assert!(matches!(outcome, HeartbeatOutcome::Continue));
         assert_eq!(consecutive, 0, "a healthy tick resets the failure budget");
         assert!(
-            etag_cache.read().unwrap().get("k").unwrap().is_some(),
+            etag_cache.read().unwrap().get("k").is_some(),
             "a healthy tick advances the cached ETag"
         );
     }
@@ -1171,7 +1113,7 @@ mod tests {
     async fn run_tick_mismatch_invalidates_immediately() {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Mismatch);
-        let etag_cache = cache(&[("k", Some("\"cached\""))]);
+        let etag_cache = cache(&[("k", "\"cached\"")]);
         let mut consecutive = 0u32;
 
         let outcome = run_heartbeat_tick(
@@ -1202,7 +1144,7 @@ mod tests {
 
         let result = lock.try_recover_stale("k").await.expect("no hard error");
         assert!(
-            matches!(result, Some(Some(_))),
+            result.is_some(),
             "an expired lock won via put_if_match must be claimed with a fresh ETag"
         );
     }
@@ -1244,19 +1186,6 @@ mod tests {
 
         let result = lock.try_recover_stale("k").await.expect("no hard error");
         assert!(result.is_none(), "a vanished key has nothing to recover");
-    }
-
-    #[tokio::test]
-    async fn recover_stale_errors_when_expired_but_no_etag() {
-        let storage = FakeLockStorage::arc();
-        storage.set_get(GetScript::ExpiredNoEtag);
-        let lock = lock_with(storage);
-
-        let result = lock.try_recover_stale("k").await;
-        assert!(
-            matches!(result, Err(Error::InvalidData(_))),
-            "an expired lock with no ETag cannot be fenced; recovery must error"
-        );
     }
 
     // acquire / try_acquire
@@ -1377,9 +1306,30 @@ mod tests {
         session.release().await;
 
         assert_eq!(
-            storage.delete_calls.load(Ordering::Relaxed),
-            0,
-            "a Mismatch on the conditional delete must not escalate to a plain delete"
+            storage.delete_if_match_calls.load(Ordering::Relaxed),
+            1,
+            "a Mismatch on the conditional delete must complete the release without escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_with_forgotten_etag_rereads_then_deletes_conditionally() {
+        // A heartbeat failure clears the cached ETag; the release must re-read
+        // the live one and still delete conditionally, never unconditionally.
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::Fresh);
+
+        release_single_path(storage.as_ref(), "k", None).await;
+
+        assert_eq!(
+            storage.delete_if_match_calls.load(Ordering::Relaxed),
+            1,
+            "the re-read path must still release through delete_if_match"
+        );
+        let used = storage.last_delete_etag.lock().unwrap().clone();
+        assert!(
+            used.is_some_and(|e| e.starts_with("\"etag-")),
+            "the conditional delete must fence on the freshly-read ETag"
         );
     }
 
@@ -1432,7 +1382,7 @@ mod tests {
             _key: &str,
             _body: Vec<u8>,
         ) -> Result<PutIfAbsentOutcome, Error> {
-            Ok(PutIfAbsentOutcome::Created(Some(self.mint_etag())))
+            Ok(PutIfAbsentOutcome::Created(self.mint_etag()))
         }
 
         async fn put_if_match(
@@ -1447,18 +1397,14 @@ mod tests {
             // caller never reaches the barrier width, so overlap is required.
             self.barrier.wait().await;
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
-            Ok(PutIfMatchOutcome::Updated(Some(self.mint_etag())))
+            Ok(PutIfMatchOutcome::Updated(self.mint_etag()))
         }
 
         async fn get_with_etag(
             &self,
             _key: &str,
-        ) -> Result<(Vec<u8>, Option<String>, Option<chrono::DateTime<Utc>>), Error> {
+        ) -> Result<(Vec<u8>, String, Option<chrono::DateTime<Utc>>), Error> {
             Err(Error::NotFound)
-        }
-
-        async fn delete(&self, _key: &str) -> Result<(), Error> {
-            Ok(())
         }
 
         async fn delete_if_match(
@@ -1479,10 +1425,10 @@ mod tests {
         let paths: Vec<String> = (0..4).map(|i| format!("k{i}")).collect();
         let storage = ConcurrencyRecordingStorage::arc(paths.len());
         let etag_cache = cache(&[
-            ("k0", Some("\"c0\"")),
-            ("k1", Some("\"c1\"")),
-            ("k2", Some("\"c2\"")),
-            ("k3", Some("\"c3\"")),
+            ("k0", "\"c0\""),
+            ("k1", "\"c1\""),
+            ("k2", "\"c2\""),
+            ("k3", "\"c3\""),
         ]);
         let mut consecutive = 0u32;
 

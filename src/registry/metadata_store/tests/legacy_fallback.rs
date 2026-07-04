@@ -1,9 +1,6 @@
 use std::{collections::HashSet, str::FromStr};
 
-use angos_tx_engine::{
-    ConditionalCapabilities,
-    lock::{LockStrategy, S3LockConfig},
-};
+use angos_tx_engine::lock::{LockStrategy, S3LockConfig};
 
 use super::{TestS3Config, legacy_blob_index_with, put_legacy_index, test_config};
 use crate::{
@@ -18,21 +15,13 @@ use angos_tx_engine::StorageError;
 fn cas_test_backend(config: &TestS3Config) -> crate::registry::metadata_store::MetadataStore {
     let mut cfg = config.clone();
     cfg.lock_strategy = LockStrategy::S3(S3LockConfig::default());
-    cfg.to_backend(
-        Some(ConditionalCapabilities {
-            put_if_none_match: true,
-            put_if_match: true,
-            delete_if_match: true,
-        }),
-        None,
-    )
-    .unwrap()
+    cfg.to_backend(true, None).unwrap()
 }
 
 #[tokio::test]
 async fn test_read_blob_index_falls_back_to_legacy_when_no_shards() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("legacy-fallback-1").unwrap();
     let digest =
         Digest::from_str("sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a")
@@ -59,7 +48,7 @@ async fn test_read_blob_index_falls_back_to_legacy_when_no_shards() {
 #[tokio::test]
 async fn test_read_blob_index_namespace_falls_back_to_legacy() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace_a = Namespace::new("legacy-fallback-2a").unwrap();
     let namespace_b = Namespace::new("legacy-fallback-2b").unwrap();
     let digest =
@@ -98,7 +87,7 @@ async fn test_read_blob_index_namespace_falls_back_to_legacy() {
 #[tokio::test]
 async fn test_has_blob_references_sees_legacy() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("legacy-fallback-3").unwrap();
     let digest =
         Digest::from_str("sha256:1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c")
@@ -125,7 +114,7 @@ async fn test_has_blob_references_sees_legacy() {
 #[tokio::test]
 async fn test_update_links_writes_to_legacy_when_present_locked() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("legacy-fallback-4").unwrap();
     let digest =
         Digest::from_str("sha256:1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d")
@@ -229,7 +218,7 @@ async fn test_update_links_writes_to_legacy_when_present_cas() {
 #[tokio::test]
 async fn test_update_links_deletes_legacy_when_emptied() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("legacy-fallback-6").unwrap();
     let digest =
         Digest::from_str("sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f")
@@ -280,7 +269,7 @@ async fn test_update_links_deletes_legacy_when_emptied() {
 #[tokio::test]
 async fn test_no_legacy_writes_still_use_shards() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace = Namespace::new("legacy-fallback-7").unwrap();
     let digest =
         Digest::from_str("sha256:2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a")
@@ -321,7 +310,7 @@ async fn test_no_legacy_writes_still_use_shards() {
 #[tokio::test]
 async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     let config = test_config();
-    let backend = config.to_backend(None, None).unwrap();
+    let backend = config.to_backend(false, None).unwrap();
     let namespace_a = Namespace::new("legacy-fallback-8a").unwrap();
     let namespace_b = Namespace::new("legacy-fallback-8b").unwrap();
     let namespace_c = Namespace::new("legacy-fallback-8c").unwrap();
