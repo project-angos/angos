@@ -80,7 +80,6 @@ region = "us-east-1"
 access_key_id = "YOUR_ACCESS_KEY"
 secret_key = "YOUR_SECRET_KEY"
 link_cache_ttl = 30
-access_time_debounce_secs = 60
 
 [metadata_store.s3.lock_strategy.s3]
 ttl_secs = 30

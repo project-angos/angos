@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
+use std::sync::Arc;
 
 use angos_tx_engine::{executor::TransactionExecutor, lock::LockSession, store::Store};
 
@@ -77,30 +74,14 @@ impl Builder {
 
     #[must_use]
     pub fn build(self) -> MetadataStore {
-        let store = self.store;
-
-        let (access_time_writer, flush_handle) = if self.access_time_debounce_secs > 0 {
-            let writer = AccessTimeWriter::new();
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let interval = Duration::from_secs(self.access_time_debounce_secs);
-
-            let flush_backend = MetadataStore {
-                store: store.clone(),
-                cache: None,
-                link_cache_ttl: self.link_cache_ttl,
-                access_time_writer: Some(writer.clone()),
-                _flush_handle: None,
-            };
-
-            MetadataStore::spawn_flush_task(flush_backend, shutdown.clone(), interval);
-
-            (Some(writer), Some(Arc::new(FlushHandle::new(shutdown))))
-        } else {
-            (None, None)
-        };
+        let (access_time_writer, flush_handle) = access_time::build_writer(
+            &self.store,
+            self.link_cache_ttl,
+            self.access_time_debounce_secs,
+        );
 
         MetadataStore {
-            store,
+            store: self.store,
             cache: self.cache,
             link_cache_ttl: self.link_cache_ttl,
             access_time_writer,
@@ -144,11 +125,5 @@ impl MetadataStore {
             .acquire(&keys)
             .await
             .map_err(|e| Error::Coordination(format!("blob-data lock acquire failed: {e}")))
-    }
-
-    pub async fn flush_access_times(&self) {
-        if let Some(writer) = &self.access_time_writer {
-            writer.flush(self).await;
-        }
     }
 }
