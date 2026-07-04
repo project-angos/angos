@@ -307,11 +307,12 @@ impl Registry {
         }
     }
 
-    /// Flushes pending writes and drains in-flight async webhook deliveries.
-    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
+    /// Flushes pending writes and drains in-flight async webhook deliveries
+    /// to completion.
+    pub async fn shutdown(&self) {
         self.flush_pending_writes().await;
         if let Some(dispatcher) = &self.event_dispatcher {
-            dispatcher.shutdown_with_timeout(timeout).await;
+            dispatcher.shutdown().await;
         }
     }
 

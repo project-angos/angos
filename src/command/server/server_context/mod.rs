@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use hyper::http::request::Parts;
 use tracing::instrument;
@@ -99,8 +99,8 @@ impl ServerContext {
         }
     }
 
-    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
-        self.registry.shutdown_with_timeout(timeout).await;
+    pub async fn shutdown(&self) {
+        self.registry.shutdown().await;
     }
 }
 

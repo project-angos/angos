@@ -150,16 +150,9 @@ impl EventDispatcher {
         Ok(Some(Arc::new(dispatcher)))
     }
 
-    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
+    pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        if tokio::time::timeout(timeout, self.drain_in_flight())
-            .await
-            .is_err()
-        {
-            let mut in_flight = self.in_flight.lock().await;
-            in_flight.abort_all();
-            warn!("Shutdown timed out; aborted unfinished async webhook deliveries");
-        }
+        self.drain_in_flight().await;
     }
 
     async fn drain_in_flight(&self) {

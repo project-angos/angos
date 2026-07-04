@@ -69,6 +69,7 @@ struct QueueRunner {
 struct Components {
     consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
+    registry: Arc<Registry>,
 }
 
 fn queue_concurrency(config: &Configuration, queue: Queue) -> NonZeroUsize {
@@ -129,6 +130,12 @@ impl Command {
         self.workers.close();
         if timeout(grace, self.workers.wait()).await.is_err() {
             warn!("Worker pool did not drain within shutdown grace period");
+        }
+        // Drain in-flight async webhook deliveries to completion. Every queue
+        // shares one registry per configuration generation, and a repeated
+        // drain on the same registry is a no-op.
+        for runner in &self.queues {
+            runner.inner.load().registry.shutdown().await;
         }
         // Stop the transactional-engine maintenance tasks alongside the worker
         // pool so they don't outlive the process's storage handles.
@@ -290,7 +297,11 @@ impl WorkerContext {
             Queue::Cache => self.registry.cache_job_handler(),
         };
 
-        Components { consumer, handler }
+        Components {
+            consumer,
+            handler,
+            registry: self.registry.clone(),
+        }
     }
 }
 

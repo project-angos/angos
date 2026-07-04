@@ -488,7 +488,7 @@ async fn test_server_context_shutdown_with_no_dispatcher() {
     let context = ServerContext::new(&config, registry).unwrap();
 
     assert!(!context.has_event_dispatcher());
-    context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    context.shutdown().await;
 }
 
 #[tokio::test]
@@ -529,7 +529,7 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
 
     context.registry.dispatch_events(&[event]).await.unwrap();
 
-    context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    context.shutdown().await;
 
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(
@@ -561,7 +561,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    context.shutdown().await;
 
     let event = Event {
         id: Uuid::new_v4(),
@@ -637,7 +637,7 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
 
 #[tokio::test]
 async fn test_shutdown_flushes_pending_access_times() {
-    // shutdown_with_timeout() must flush the S3 metadata backend's buffered
+    // shutdown() must flush the S3 metadata backend's buffered
     // access-time writes before returning. With access_time_debounce_secs > 0
     // those writes sit in a background loop and would be lost on a naïve
     // shutdown.
@@ -675,12 +675,12 @@ async fn test_shutdown_flushes_pending_access_times() {
     // registry under test was already built by the harness above.
     let config = minimal_config();
     let context = ServerContext::new(&config, registry).unwrap();
-    context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    context.shutdown().await;
 
     let after = metadata_store.read_link(&namespace, &tag).await.unwrap();
     assert!(
         after.accessed_at.is_some(),
-        "shutdown_with_timeout() must flush pending access times to S3"
+        "shutdown() must flush pending access times to S3"
     );
 }
 

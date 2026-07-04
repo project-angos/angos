@@ -1,6 +1,6 @@
 mod checker;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use argh::FromArgs;
 use tracing::info;
@@ -20,10 +20,6 @@ use crate::{
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::job_store::JobStore,
 };
-
-/// Upper bound on draining in-flight async webhook deliveries before the
-/// process exits; deliveries still pending afterwards are aborted.
-pub const EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -95,9 +91,9 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
 
     check::check_namespaces(&metadata_store, &checker, sink.as_mut()).await?;
     // The registry shutdown flushes pending writes and drains in-flight async
-    // webhook deliveries before the process exits.
+    // webhook deliveries to completion before the process exits.
     match registry {
-        Some(registry) => registry.shutdown_with_timeout(EVENT_DRAIN_TIMEOUT).await,
+        Some(registry) => registry.shutdown().await,
         None => metadata_store.flush_access_times().await,
     }
     Ok(())

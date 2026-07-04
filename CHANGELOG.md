@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - On an S3 metadata store, an unset `lock_strategy` now defaults to the shared S3 lock when the provider supports conditional operations, instead of the in-process memory lock.
 - With CAS coordination, access times are now stamped inline as a single conditional write whose lost races are no-ops; `access_time_debounce_secs` only applies to lock-coordinated deployments.
 - Retention deletions (`angos prune`) now run through the registry's standard delete path: blob bytes are reclaimed immediately once unreferenced, and the deletion replicates to downstreams marked `prune = true` only.
+- Graceful shutdown now drains in-flight async webhook deliveries to completion instead of abandoning them after a fixed timeout; each delivery stays bounded by its own request timeout, retry cap, and backoff ceiling.
+- `required`-policy webhooks now default to `max_retries = 3` (with the existing exponential backoff), so a transient endpoint failure no longer immediately fails the client operation; an explicit `max_retries` still wins.
 
 ### Fixed
 

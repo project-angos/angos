@@ -23,7 +23,7 @@ Webhooks are defined in the `[event_webhook.<name>]` section of the configuratio
 | `events`            | [string] | required | Event types to deliver (at least one)            |
 | `token`             | string   | -        | Bearer token and HMAC signing secret             |
 | `timeout_ms`        | u64      | `5000`   | HTTP request timeout in milliseconds             |
-| `max_retries`       | u32      | `0`      | Maximum retry attempts after initial failure     |
+| `max_retries`       | u32      | policy   | Maximum retry attempts after initial failure (max 16); defaults to `3` for `required`, `0` otherwise |
 | `repository_filter` | [string] | -        | Regex patterns to match repository names         |
 
 ### Webhook References
@@ -47,9 +47,12 @@ Webhooks are enabled by referencing their names in global or repository configur
 
 ### Retry Behavior
 
-Retries apply to `required`, `optional`, and `async` policies when `max_retries > 0`.
+Retries apply to `required`, `optional`, and `async` policies when
+`max_retries > 0`. Unless set explicitly, `required` webhooks retry 3 times
+(a transient endpoint hiccup should not fail the client operation) and the
+other policies do not retry.
 
-Backoff formula: `100ms * 2^(attempt - 1)`
+Backoff formula: `100ms * 2^(attempt - 1)`, capped at 10 seconds
 
 | `max_retries` | Total attempts | Delays               |
 |---------------|----------------|----------------------|
@@ -250,8 +253,9 @@ Changes that do **not** require restart:
 
 On shutdown, the dispatcher:
 1. Stops accepting new async deliveries
-2. Waits for in-flight async deliveries to complete (with timeout)
-3. Aborts and logs any deliveries that did not complete within the timeout
+2. Drains in-flight async deliveries to completion
 
-The timeout is a shutdown deadline, not a delivery guarantee. Async deliveries
-that exceed it are abandoned so shutdown can continue promptly.
+The drain is bounded, not open-ended: every delivery is limited by its own
+`timeout_ms`, its capped retry count, and the 10-second backoff ceiling, so an
+unresponsive endpoint cannot hang the shutdown. A crash (as opposed to a
+graceful shutdown) still loses in-flight async deliveries.

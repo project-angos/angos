@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     command::{
-        bootstrap, prune,
+        bootstrap,
         replicate::ReplicationDrain,
         scrub::{
             action::Action,
@@ -204,9 +204,7 @@ impl Command {
         }
         self.metadata_store.flush_access_times().await;
         if let Some(registry) = &self.retention_registry {
-            registry
-                .shutdown_with_timeout(prune::EVENT_DRAIN_TIMEOUT)
-                .await;
+            registry.shutdown().await;
         }
         Ok(())
     }
