@@ -253,7 +253,7 @@ impl Backend {
         // call may have left here.
         let scratch = scratch_key(key);
         self.abort_multiparts_at(&scratch).await?;
-        let _ = self.client.delete(&scratch).await;
+        let _ = self.client.delete_object(&scratch).await;
 
         let cap = usize::try_from(MIN_PART_SIZE).map_err(|e| Error::Backend(e.to_string()))?;
         let mut scratch_id: Option<String> = None;
@@ -332,9 +332,9 @@ impl Backend {
                 let new_committed = parts.iter().map(|p| p.size).sum::<u64>();
                 let new_read_key = staged_key(key, new_committed);
                 self.client.copy_object(&scratch, &new_read_key).await?;
-                let _ = self.client.delete(&scratch).await;
+                let _ = self.client.delete_object(&scratch).await;
                 if new_read_key != read_key {
-                    let _ = self.client.delete(&read_key).await;
+                    let _ = self.client.delete_object(&read_key).await;
                 }
                 return new_committed
                     .checked_add(flushed)
@@ -353,7 +353,7 @@ impl Backend {
                 e_tag: etag,
                 size: flushed,
             });
-            let _ = self.client.delete(&scratch).await;
+            let _ = self.client.delete_object(&scratch).await;
 
             if eof {
                 break;
@@ -364,7 +364,7 @@ impl Backend {
         // old staged remainder that was folded back in above.
         let new_committed = parts.iter().map(|p| p.size).sum::<u64>();
         if staged_len > 0 {
-            let _ = self.client.delete(&read_key).await;
+            let _ = self.client.delete_object(&read_key).await;
         }
         Ok(new_committed)
     }
@@ -400,7 +400,7 @@ impl ObjectStore for Backend {
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
         // S3 DELETE on a missing key returns 204, mapped to Ok by the client.
-        Ok(self.client.delete(key).await?)
+        Ok(self.client.delete_object(key).await?)
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
@@ -604,10 +604,10 @@ impl ObjectStore for Backend {
                 .put_object(&write_key, Bytes::from(remainder))
                 .await?;
             if staged_len > 0 && write_key != read_key {
-                let _ = self.client.delete(&read_key).await;
+                let _ = self.client.delete_object(&read_key).await;
             }
         } else if staged_len > 0 {
-            let _ = self.client.delete(&read_key).await;
+            let _ = self.client.delete_object(&read_key).await;
         }
 
         new_committed
@@ -622,7 +622,7 @@ impl ObjectStore for Backend {
         // object (deleted). `abort_multiparts_at` lists once and returns when
         // empty, so this is cheap on the common (no scratch) path.
         self.abort_multiparts_at(&scratch_key(key)).await?;
-        let _ = self.client.delete(&scratch_key(key)).await;
+        let _ = self.client.delete_object(&scratch_key(key)).await;
 
         let recovered = self.recover_upload(key).await?;
         let upload_id = recovered.upload_id;
@@ -649,7 +649,7 @@ impl ObjectStore for Backend {
                 // Small upload: promote the staged remainder to the canonical
                 // key and clean up.
                 self.client.copy_object(&read_key, key).await?;
-                let _ = self.client.delete(&read_key).await;
+                let _ = self.client.delete_object(&read_key).await;
             }
             (Some(upload_id), staged) => {
                 if staged > 0 {
@@ -673,7 +673,7 @@ impl ObjectStore for Backend {
                 self.client
                     .complete_multipart_upload(key, &upload_id, &parts)
                     .await?;
-                let _ = self.client.delete(&read_key).await;
+                let _ = self.client.delete_object(&read_key).await;
             }
         }
 
