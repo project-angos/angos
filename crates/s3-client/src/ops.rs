@@ -236,7 +236,7 @@ impl Backend {
     /// Forwards [`io::Error`] from the underlying `DELETE`: HTTP failures,
     /// S3 protocol errors, or a tripped circuit breaker. Missing objects
     /// are returned as `NotFound`.
-    pub async fn delete(&self, path: &str) -> Result<(), io::Error> {
+    pub async fn delete_object(&self, path: &str) -> Result<(), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
@@ -254,14 +254,6 @@ impl Backend {
             .map_err(|e| io_other(&e));
         self.record_io_result(&result);
         result
-    }
-
-    /// Alias kept for symmetry with the upload-side `delete_object` callers.
-    ///
-    /// # Errors
-    /// Same as [`delete`](Self::delete).
-    pub async fn delete_object(&self, path: &str) -> Result<(), io::Error> {
-        self.delete(path).await
     }
 
     /// # Errors
