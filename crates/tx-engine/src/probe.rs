@@ -1,32 +1,33 @@
 //! Conditional-write capability probing.
 //!
-//! [`probe_conditional_capabilities`] tests each S3 conditional operation
-//! independently against the live store. The result drives the executor
-//! choice (CAS or locked) in [`Store::new`](crate::store::Store::new).
+//! [`probe_cas_support`] tests the S3 conditional operations CAS coordination
+//! relies on against the live store. The verdict drives the executor choice
+//! (CAS or locked) in [`Store::new`](crate::store::Store::new).
 
 use bytes::Bytes;
 use tracing::{info, warn};
 
 use angos_storage::{ConditionalStore, Error as StorageError, Etag};
 
-use crate::{ConditionalCapabilities, error::Error};
+use crate::error::Error;
 
-/// Probe each conditional S3 operation independently.
+/// Probe whether the store supports every conditional operation CAS
+/// coordination requires.
 ///
 /// Tests `PutObject If-None-Match: *`, `PutObject If-Match: <etag>`, and
-/// `DeleteObject If-Match: <etag>` in sequence. Each probe is self-validating:
-/// bogus-ETag attempts verify that the provider actually enforces the
-/// condition.
+/// `DeleteObject If-Match: <etag>` in sequence, and requires the conditional
+/// `PUT` to surface the new `ETag` (the lock stack fences on it). Each probe
+/// is self-validating: bogus-ETag attempts verify that the provider actually
+/// enforces the condition. All operations must pass; CAS coordination is
+/// all-or-nothing.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Storage`] when the initial probe object cannot be
 /// written (e.g. the bucket does not exist or credentials are invalid).
-pub async fn probe_conditional_capabilities(
-    store: &impl ConditionalStore,
-) -> Result<ConditionalCapabilities, Error> {
+pub async fn probe_cas_support(store: &impl ConditionalStore) -> Result<bool, Error> {
     let probe_key = format!("_angos_probe_{}", uuid::Uuid::new_v4());
-    probe_conditional_capabilities_with_key(store, &probe_key).await
+    probe_cas_support_with_key(store, &probe_key).await
 }
 
 /// Inner implementation that accepts an explicit probe key.
@@ -37,10 +38,10 @@ pub async fn probe_conditional_capabilities(
 /// # Errors
 ///
 /// Returns [`Error::Storage`] when the initial probe write fails.
-pub async fn probe_conditional_capabilities_with_key(
+pub async fn probe_cas_support_with_key(
     store: &impl ConditionalStore,
     probe_key: &str,
-) -> Result<ConditionalCapabilities, Error> {
+) -> Result<bool, Error> {
     store
         .put(probe_key, Bytes::from_static(b"probe"))
         .await
@@ -69,13 +70,24 @@ pub async fn probe_conditional_capabilities_with_key(
         }
     };
 
-    // Test If-Match: <etag>: correct ETag must succeed; bogus ETag must fail.
+    // Test If-Match: <etag>: correct ETag must succeed and surface the new
+    // ETag; bogus ETag must fail.
     let put_if_match = match store.get_with_etag(probe_key).await {
         Ok((_, Some(etag))) => {
-            let correct = store
+            let correct = match store
                 .put_if_match(probe_key, &etag, Bytes::from_static(b"updated"))
                 .await
-                .is_ok();
+            {
+                Ok(Some(_)) => true,
+                Ok(None) => {
+                    warn!(
+                        "conditional probe: If-Match PUT succeeded but returned no ETag; \
+                         CAS coordination cannot fence on writes"
+                    );
+                    false
+                }
+                Err(_) => false,
+            };
             let bogus_rejected = matches!(
                 store
                     .put_if_match(
@@ -98,8 +110,32 @@ pub async fn probe_conditional_capabilities_with_key(
         }
     };
 
-    // Test DeleteObject If-Match: <etag>.
-    let delete_if_match = match store.get_with_etag(probe_key).await {
+    let delete_if_match = probe_delete_if_match(store, probe_key).await;
+
+    // Cleanup: may already have been deleted by the delete_if_match test.
+    if let Err(e) = store.delete(probe_key).await
+        && !matches!(e, StorageError::NotFound)
+    {
+        warn!("conditional probe: cleanup failed for probe object {probe_key}: {e}");
+    }
+
+    let supported = put_if_none_match && put_if_match && delete_if_match;
+
+    info!(
+        if_none_match = put_if_none_match,
+        if_match = put_if_match,
+        delete_if_match,
+        supported,
+        "S3 conditional capability probe complete"
+    );
+
+    Ok(supported)
+}
+
+/// Test `DeleteObject If-Match: <etag>`: a bogus `ETag` must be rejected and
+/// the correct one must delete the probe object.
+async fn probe_delete_if_match(store: &impl ConditionalStore, probe_key: &str) -> bool {
+    match store.get_with_etag(probe_key).await {
         Ok((_, Some(etag))) => {
             let bogus_rejected = matches!(
                 store
@@ -122,27 +158,5 @@ pub async fn probe_conditional_capabilities_with_key(
             warn!("conditional probe: failed to read probe object for delete_if_match test: {e}");
             false
         }
-    };
-
-    // Cleanup: may already have been deleted by the delete_if_match test.
-    if let Err(e) = store.delete(probe_key).await
-        && !matches!(e, StorageError::NotFound)
-    {
-        warn!("conditional probe: cleanup failed for probe object {probe_key}: {e}");
     }
-
-    let capabilities = ConditionalCapabilities {
-        put_if_none_match,
-        put_if_match,
-        delete_if_match,
-    };
-
-    info!(
-        if_none_match = capabilities.put_if_none_match,
-        if_match = capabilities.put_if_match,
-        delete_if_match = capabilities.delete_if_match,
-        "S3 conditional capability probe complete"
-    );
-
-    Ok(capabilities)
 }

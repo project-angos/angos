@@ -52,9 +52,7 @@ pub fn s3_test_connection(key_prefix: String) -> S3ConnectionConfig {
 /// Wrap an object store into a [`Store`] façade for tests, using a locked
 /// executor serialising on a fresh in-memory lock.
 pub fn build_store(object: Arc<dyn ObjectStore>) -> Arc<Store> {
-    Arc::new(
-        Store::new(object, None, LockStrategy::Memory, None, false, false).expect("test store"),
-    )
+    Arc::new(Store::new(object, None, LockStrategy::Memory, None).expect("test store"))
 }
 
 /// FS-backed test stack over a fresh temp directory: one [`Store`] façade

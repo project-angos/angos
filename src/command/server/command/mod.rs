@@ -8,8 +8,6 @@ use tokio::time::timeout;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::warn;
 
-use angos_tx_engine::ConditionalCapabilities;
-
 use crate::{
     command::server::{
         ServerContext,
@@ -49,7 +47,7 @@ struct PendingRefreshTask {
 
 pub struct Command {
     listener: ServiceListener,
-    cached_capabilities: Arc<Mutex<Option<ConditionalCapabilities>>>,
+    cached_conditional_operations: Arc<Mutex<Option<bool>>>,
     /// `None` when `[global.job_queue]` is not configured.
     pending_refresh: Option<PendingRefreshTask>,
     /// Cancellation token tied to the transactional-engine recovery loop and
@@ -59,11 +57,11 @@ pub struct Command {
 
 impl Command {
     pub async fn new(config: &Configuration) -> Result<Command, Error> {
-        let cached_capabilities = Arc::new(Mutex::new(None));
+        let cached_conditional_operations = Arc::new(Mutex::new(None));
         let engine_maintenance = CancellationToken::new();
         let (registry, pending) = setup::build_registry(
             config,
-            &cached_capabilities,
+            &cached_conditional_operations,
             Some(engine_maintenance.clone()),
         )
         .await?;
@@ -98,7 +96,7 @@ impl Command {
 
         Ok(Command {
             listener,
-            cached_capabilities,
+            cached_conditional_operations,
             pending_refresh,
             engine_maintenance,
         })
@@ -106,7 +104,7 @@ impl Command {
 
     pub async fn notify_config_change(&self, config: &Configuration) -> Result<(), Error> {
         let (registry, pending) =
-            setup::build_registry(config, &self.cached_capabilities, None).await?;
+            setup::build_registry(config, &self.cached_conditional_operations, None).await?;
 
         if pending.is_some() != self.pending_refresh.is_some() {
             warn!(

@@ -201,7 +201,7 @@ For multiple registry instances, you need:
 
 ### With S3 Locking (Simplest)
 
-Selecting `lock_strategy = "s3"` activates the CAS coordinator, which uses S3 conditional writes for all coordination, no extra infrastructure being required. The provider must support `put_if_none_match` and `put_if_match`; angos probes at startup and fails fast if either is missing. `delete_if_match` is optional and, when available, makes the coordinator's internal lock release race-free.
+Selecting `lock_strategy = "s3"` activates the CAS coordinator, which uses S3 conditional requests for all coordination, no extra infrastructure being required. The provider must support the full conditional set: `PutObject` with `If-None-Match: *`, `PutObject` with `If-Match`, and `DeleteObject` with `If-Match`. Angos probes at startup and fails fast if any of them is missing. Conditional deletes make lock release and lock reclaim race-free: an instance can only ever remove its own lock object.
 
 ```toml
 [blob_store.s3]
@@ -224,7 +224,7 @@ retry_delay_ms = 50    # Delay between retries (default: 50)
 
 ### With S3 + Redis
 
-Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. When the S3 provider supports conditional writes, Angos still uses them for blob-index shard updates; Redis remains responsible for link metadata serialization. To force all metadata write coordination through Redis, explicitly set every `[metadata_store.s3.capabilities]` flag to `false`.
+Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. When the S3 provider supports conditional writes, Angos still uses them for blob-index shard updates; Redis remains responsible for link metadata serialization. To force all metadata write coordination through Redis, explicitly set `conditional_operations = false` in `[metadata_store.s3]`.
 
 ```toml
 [blob_store.s3]
@@ -283,11 +283,11 @@ retry_delay_ms = 50         # Delay between retries (minimum: 1)
 The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds. Transient heartbeat failures (connect errors, refresh timeouts) accumulate up to a small budget (roughly one TTL of slack) before cancelling the in-flight operation, so a short network blip does not kill in-progress work. Authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
 :::note
-The S3 provider must support conditional writes. Angos probes for this capability at startup and fails fast if it is not available.
-Known providers that support conditional writes: AWS S3, Exoscale SOS
+The S3 provider must support conditional writes and conditional deletes. Angos probes for this capability at startup and fails fast if it is not available.
+Known providers that support the full conditional set: AWS S3, Exoscale SOS
 :::
 
-If your S3 provider does not support conditional writes, use Redis locking instead:
+If your S3 provider does not support them, use Redis locking instead:
 
 ```toml
 [metadata_store.s3.lock_strategy.redis]

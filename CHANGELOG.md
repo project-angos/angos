@@ -10,15 +10,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - New `angos replicate` and `angos prune` commands reconcile replication downstreams and enforce retention policies as standalone runs.
 - The web UI upload list has per-row checkboxes and a select-all toggle, so many in-progress uploads can be cancelled in one action.
+- New `conditional_operations` boolean on `[metadata_store.s3]` declares the provider's conditional-request support as one all-or-nothing set.
 
 ### Deprecated
 
 - `scrub --replicate` and `scrub --retention` are deprecated in favor of `angos replicate` and `angos prune`.
+- The `[metadata_store.s3.capabilities]` table is deprecated in favor of `conditional_operations`; it is still accepted and enables CAS only when all three flags are true.
 
 ### Changed
-=======
 
 - Storage coordination now runs entirely on the metadata store: the blob store holds only blob bytes (its backend no longer carries `.tx-log/`/`.tx-bodies/` prefixes) and the in-process job queue persists on the metadata store.
+- S3 CAS coordination now requires conditional deletes (`DeleteObject` with `If-Match`) alongside conditional puts, making lock release and lock reclaim race-free; providers lacking the full set fall back to lock-based coordination.
 
 ## 1.3.0
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::Error as _};
 use tracing::info;
 
 use angos_s3_client::Backend as S3HttpBackend;
@@ -8,12 +8,11 @@ use angos_storage::{
     ConditionalStore, ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
 use angos_tx_engine::{
-    ConditionalCapabilities,
     error::Error as EngineError,
     lock::{
         LockStrategy, resolve_lock_strategy, storage::redis::RedisLockStorageConfig as LockConfig,
     },
-    probe::probe_conditional_capabilities,
+    probe::probe_cas_support,
     store::Store,
 };
 
@@ -112,22 +111,23 @@ pub struct S3BackendConfig {
     pub lock_strategy: LockStrategy,
     pub link_cache_ttl: u64,
     pub access_time_debounce_secs: u64,
-    /// Explicitly declare which conditional S3 operations the provider supports.
-    /// Each boolean flag corresponds to a distinct HTTP conditional header:
-    /// - `put_if_none_match`: `PutObject` with If-None-Match: * (create-only)
-    /// - `put_if_match`: `PutObject` with If-Match: <etag> (update-only, enables CAS optimizations)
-    /// - `delete_if_match`: `DeleteObject` with If-Match: <etag> (atomic lock release)
+    /// Explicitly declare whether the provider supports the conditional
+    /// operations CAS coordination requires, as one all-or-nothing set:
+    /// `PutObject` with If-None-Match: *, `PutObject` with If-Match: <etag>,
+    /// and `DeleteObject` with If-Match: <etag>.
     ///
-    /// When set, the startup probe is skipped entirely and your declared values are used.
-    /// When absent, the probe runs automatically for S3 metadata storage to auto-detect
-    /// capabilities. With `lock_strategy = "memory"` or `"redis"`, set every flag to
-    /// `false` to skip the probe and force blob-index updates through the configured
-    /// lock backend instead of S3 CAS.
+    /// When set, the startup probe is skipped entirely and the declared value
+    /// is used. When absent, the probe runs automatically for S3 metadata
+    /// storage. With `lock_strategy = "memory"` or `"redis"`, set it to
+    /// `false` to skip the probe and force coordination through the
+    /// configured lock backend instead of S3 CAS.
     ///
-    /// Set explicitly to avoid startup latency from probing, or to handle S3-compatible
-    /// providers where probe results may be inaccurate. Both `put_if_none_match` and
-    /// `put_if_match` must be true for compare-and-swap (CAS) operations to be used.
-    pub capabilities: Option<ConditionalCapabilities>,
+    /// Set explicitly to avoid startup latency from probing, or for
+    /// S3-compatible providers where probe results may be inaccurate.
+    ///
+    /// The legacy `capabilities` table (three per-operation booleans) is
+    /// still accepted and maps to `true` only when all three flags are set.
+    pub conditional_operations: Option<bool>,
 }
 
 impl Default for S3BackendConfig {
@@ -137,7 +137,7 @@ impl Default for S3BackendConfig {
             lock_strategy: LockStrategy::Memory,
             link_cache_ttl: default_link_cache_ttl(),
             access_time_debounce_secs: default_access_time_debounce(),
-            capabilities: None,
+            conditional_operations: None,
         }
     }
 }
@@ -165,18 +165,42 @@ impl<'de> Deserialize<'de> for S3BackendConfig {
             #[serde(default = "default_access_time_debounce")]
             access_time_debounce_secs: u64,
             #[serde(default)]
-            capabilities: Option<ConditionalCapabilities>,
+            conditional_operations: Option<bool>,
+            #[serde(default)]
+            capabilities: Option<LegacyCapabilities>,
+        }
+
+        /// Legacy `[metadata_store.s3.capabilities]` table. Folded into
+        /// `conditional_operations`: CAS requires all three operations.
+        #[derive(Deserialize)]
+        struct LegacyCapabilities {
+            put_if_none_match: bool,
+            put_if_match: bool,
+            delete_if_match: bool,
         }
 
         let raw = Raw::deserialize(deserializer)?;
         let lock_strategy = resolve_lock_strategy(raw.lock_strategy, raw.redis, true)?;
+        let conditional_operations = match (raw.conditional_operations, raw.capabilities) {
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "cannot set both 'conditional_operations' and the legacy 'capabilities' \
+                     table; use conditional_operations",
+                ));
+            }
+            (Some(declared), None) => Some(declared),
+            (None, Some(caps)) => {
+                Some(caps.put_if_none_match && caps.put_if_match && caps.delete_if_match)
+            }
+            (None, None) => None,
+        };
 
         Ok(S3BackendConfig {
             connection: raw.connection,
             lock_strategy,
             link_cache_ttl: raw.link_cache_ttl,
             access_time_debounce_secs: raw.access_time_debounce_secs,
-            capabilities: raw.capabilities,
+            conditional_operations,
         })
     }
 }
@@ -217,19 +241,17 @@ pub enum RegistryStorageConfig {
 }
 
 impl RegistryStorageConfig {
-    /// S3 lock strategy requires compare-and-swap (If-None-Match + If-Match). Returns
-    /// a Coordination error when the strategy is S3 but the provider lacks CAS.
-    fn ensure_s3_cas_supported(
-        lock_strategy: &LockStrategy,
-        caps: &ConditionalCapabilities,
-    ) -> Result<(), Error> {
-        if matches!(lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
-            return Err(Error::Coordination(format!(
-                "S3 lock strategy requires If-None-Match and If-Match support, but the provider \
-                 reports put_if_none_match={}, put_if_match={}. Use lock_strategy = redis or \
-                 lock_strategy = memory instead.",
-                caps.put_if_none_match, caps.put_if_match
-            )));
+    /// S3 lock strategy requires the full conditional set (If-None-Match and
+    /// If-Match on PUT, If-Match on DELETE). Returns a Coordination error when
+    /// the strategy is S3 but the provider lacks it.
+    fn ensure_s3_cas_supported(lock_strategy: &LockStrategy, cas: bool) -> Result<(), Error> {
+        if matches!(lock_strategy, LockStrategy::S3(_)) && !cas {
+            return Err(Error::Coordination(
+                "S3 lock strategy requires conditional writes (If-None-Match and If-Match on \
+                 PUT, If-Match on DELETE), but the provider does not support them all. Use \
+                 lock_strategy = redis or lock_strategy = memory instead."
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -252,13 +274,13 @@ impl RegistryStorageConfig {
         }
     }
 
-    /// Probe the underlying S3 store for conditional-write capabilities.
+    /// Probe the underlying S3 store for conditional-write support.
     ///
-    /// Returns `None` for FS configs (no capabilities to probe). Returns
+    /// Returns `None` for FS configs (nothing to probe). Returns
     /// [`Error::Coordination`] when called on the `Inherit` variant: callers
     /// must resolve first via
     /// [`crate::configuration::Configuration::resolve_registry_storage`].
-    pub async fn probe(&self) -> Result<Option<ConditionalCapabilities>, Error> {
+    pub async fn probe(&self) -> Result<Option<bool>, Error> {
         match self {
             RegistryStorageConfig::Inherit => Err(Error::Coordination(
                 "RegistryStorageConfig::Inherit reached probe(); callers must \
@@ -268,9 +290,9 @@ impl RegistryStorageConfig {
             RegistryStorageConfig::S3(config) => {
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
                 let storage = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
-                let caps = probe_conditional_capabilities(storage.as_ref()).await?;
-                Self::ensure_s3_cas_supported(&config.lock_strategy, &caps)?;
-                Ok(Some(caps))
+                let cas = probe_cas_support(storage.as_ref()).await?;
+                Self::ensure_s3_cas_supported(&config.lock_strategy, cas)?;
+                Ok(Some(cas))
             }
             RegistryStorageConfig::FS(_) => Ok(None),
         }
@@ -279,10 +301,10 @@ impl RegistryStorageConfig {
     /// Build the [`Store`] façade shared by the metadata store, the job store,
     /// and the engine-maintenance loops.
     ///
-    /// For S3 without operator-declared capabilities this probes the endpoint
-    /// to configure the executor. Server callers that want to memoize the probe
-    /// across hot-reloads should resolve capabilities up front (see
-    /// `setup::build_metadata_store`) and inject them into the config so this
+    /// For S3 without an operator-declared `conditional_operations` this probes
+    /// the endpoint to configure the executor. Server callers that want to
+    /// memoize the probe across hot-reloads should resolve it up front (see
+    /// `setup::build_metadata_store`) and inject it into the config so this
     /// path skips the probe.
     pub async fn build_store(&self) -> Result<Arc<Store>, Error> {
         let store = match self {
@@ -308,32 +330,24 @@ impl RegistryStorageConfig {
                         .sync_to_disk(config.sync_to_disk)
                         .build(),
                 );
-                Store::new(
-                    object,
-                    None,
-                    config.lock_strategy.clone(),
-                    None,
-                    false,
-                    false,
-                )?
+                Store::new(object, None, config.lock_strategy.clone(), None)?
             }
             RegistryStorageConfig::S3(config) => {
                 info!(
                     "Using S3 storage backend with lock_strategy={:?}",
                     config.lock_strategy
                 );
-                let caps = match &config.capabilities {
-                    Some(declared) => Some(declared.clone()),
-                    None => self.probe().await?,
+                let cas = match config.conditional_operations {
+                    Some(declared) => declared,
+                    None => self.probe().await?.unwrap_or_default(),
                 };
-
-                let caps_resolved = caps.unwrap_or_default();
-                Self::ensure_s3_cas_supported(&config.lock_strategy, &caps_resolved)?;
+                Self::ensure_s3_cas_supported(&config.lock_strategy, cas)?;
 
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
                 let backend = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
                 let object: Arc<dyn ObjectStore> = backend.clone();
-                let conditional_store: Arc<dyn ConditionalStore> = backend;
+                let conditional_store: Option<Arc<dyn ConditionalStore>> =
+                    cas.then_some(backend as Arc<dyn ConditionalStore>);
 
                 let s3_lock_store: Option<Arc<dyn ConditionalStore>> = match &config.lock_strategy {
                     LockStrategy::S3(s3_lock_config) => {
@@ -348,11 +362,9 @@ impl RegistryStorageConfig {
 
                 Store::new(
                     object,
-                    Some(conditional_store),
+                    conditional_store,
                     config.lock_strategy.clone(),
                     s3_lock_store,
-                    caps_resolved.delete_if_match,
-                    caps_resolved.supports_cas(),
                 )?
             }
         };
@@ -376,7 +388,7 @@ mod tests {
             lock_strategy,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
-            capabilities: None,
+            conditional_operations: None,
         })
     }
 
@@ -388,14 +400,11 @@ mod tests {
             result.is_ok(),
             "Probe should succeed against the S3 backend with S3 lock strategy: {result:?}"
         );
-        let caps = result
-            .unwrap()
-            .expect("S3 lock strategy should return capabilities");
+        let cas = result.unwrap().expect("S3 lock strategy should probe");
         assert!(
-            caps.put_if_none_match,
-            "the S3 backend should support If-None-Match"
+            cas,
+            "the S3 test backend should support the full conditional set"
         );
-        assert!(caps.put_if_match, "the S3 backend should support If-Match");
     }
 
     #[tokio::test]
@@ -406,14 +415,13 @@ mod tests {
             result.is_ok(),
             "Probe should succeed for Memory lock strategy: {result:?}"
         );
-        let caps = result
+        let cas = result
             .unwrap()
-            .expect("S3 metadata store should return detected capabilities");
+            .expect("S3 metadata store should return a probe verdict");
         assert!(
-            caps.put_if_none_match,
-            "the S3 backend should support If-None-Match"
+            cas,
+            "the S3 test backend should support the full conditional set"
         );
-        assert!(caps.put_if_match, "the S3 backend should support If-Match");
     }
 
     #[tokio::test]
@@ -518,5 +526,74 @@ mod tests {
             err.to_string().contains("region"),
             "error should mention the missing `region` field, got: {err}"
         );
+    }
+
+    fn s3_toml_with(extra: &str) -> String {
+        format!(
+            r#"
+            access_key_id = "k"
+            secret_key    = "s"
+            endpoint      = "http://localhost:9000"
+            bucket        = "b"
+            region        = "r"
+            {extra}
+        "#
+        )
+    }
+
+    #[test]
+    fn legacy_capabilities_full_set_maps_to_conditional_operations_true() {
+        let toml = s3_toml_with(
+            r"
+            [capabilities]
+            put_if_none_match = true
+            put_if_match      = true
+            delete_if_match   = true
+        ",
+        );
+        let cfg: S3BackendConfig = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(cfg.conditional_operations, Some(true));
+    }
+
+    #[test]
+    fn legacy_capabilities_partial_set_maps_to_conditional_operations_false() {
+        // Conditional deletes are part of the required set, so a legacy config
+        // that lacks them declares a provider that cannot run CAS.
+        let toml = s3_toml_with(
+            r"
+            [capabilities]
+            put_if_none_match = true
+            put_if_match      = true
+            delete_if_match   = false
+        ",
+        );
+        let cfg: S3BackendConfig = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(cfg.conditional_operations, Some(false));
+    }
+
+    #[test]
+    fn conditional_operations_and_legacy_capabilities_conflict_is_rejected() {
+        let toml = s3_toml_with(
+            r"
+            conditional_operations = true
+
+            [capabilities]
+            put_if_none_match = true
+            put_if_match      = true
+            delete_if_match   = true
+        ",
+        );
+        let err = toml::from_str::<S3BackendConfig>(&toml).expect_err("conflict must be rejected");
+        assert!(
+            err.to_string().contains("conditional_operations"),
+            "error should point at the conflicting keys, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conditional_operations_round_trips() {
+        let cfg: S3BackendConfig =
+            toml::from_str(&s3_toml_with("conditional_operations = false")).expect("deserialize");
+        assert_eq!(cfg.conditional_operations, Some(false));
     }
 }

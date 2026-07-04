@@ -4,8 +4,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use angos_tx_engine::ConditionalCapabilities;
-
 use super::{test_backend_with_debounce, test_config};
 use crate::{
     cache::Cache as CacheEnum,
@@ -423,16 +421,7 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
     let mut cfg = config.clone();
     cfg.access_time_debounce_secs = 60;
     let cache = Arc::new(CacheEnum::Memory(CacheMemoryBackend::new()));
-    let backend = cfg
-        .to_backend(
-            Some(ConditionalCapabilities {
-                put_if_none_match: true,
-                put_if_match: true,
-                delete_if_match: false,
-            }),
-            Some(cache.clone()),
-        )
-        .unwrap();
+    let backend = cfg.to_backend(true, Some(cache.clone())).unwrap();
     let namespace = Namespace::new("cache-debounce-hit-ns").unwrap();
     let digest =
         Digest::from_str("sha256:db01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6")

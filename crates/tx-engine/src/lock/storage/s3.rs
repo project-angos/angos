@@ -2,9 +2,9 @@
 //!
 //! Writes lock objects at `.tx-locks/<shard>/<key>` on a
 //! [`ConditionalStore`](angos_storage::ConditionalStore) backend, using
-//! `put_if_absent` for atomic acquire and `put_if_match` for heartbeat refresh.
-//! Conditional delete is supported when the underlying provider advertises
-//! `If-Match` on DELETE.
+//! `put_if_absent` for atomic acquire, `put_if_match` for heartbeat refresh,
+//! and `delete_if_match` for release. The CAS capability gate guarantees the
+//! provider enforces all three conditions and surfaces `ETag`s.
 //!
 //! ## Transport-error resilience
 //!
@@ -27,10 +27,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest as ShaDigest, Sha256};
 use tokio::time::sleep;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use angos_backoff::Backoff;
-use angos_storage::{ConditionalStore, Error as StorageError, Etag, ObjectStore};
+use angos_storage::{ConditionalStore, Error as StorageError, Etag};
 
 use crate::lock::{
     Error,
@@ -56,6 +56,15 @@ const MAX_CONDITIONAL_ATTEMPTS: u32 = 3;
 /// The `(body, ETag, last_modified)` read-back of a lock object, as returned by
 /// [`ConditionalStore::get_with_metadata`].
 type LockReadback = Result<(Vec<u8>, Option<Etag>, Option<DateTime<Utc>>), StorageError>;
+
+/// Convert the `ETag` of a successful conditional write or read-back into the
+/// [`LockStorage`] contract's mandatory fencing token. A missing `ETag` on a
+/// CAS-verified backend is a hard anomaly, not a degraded mode.
+fn require_etag(etag: Option<String>) -> Result<String, Error> {
+    etag.ok_or_else(|| {
+        Error::StorageBackend("conditional operation surfaced no ETag for lock object".to_string())
+    })
+}
 
 /// Decision returned by [`reconcile_absent`] after reading a lock object back
 /// following an ambiguous `put_if_absent` transport error.
@@ -112,37 +121,29 @@ fn reconcile_match(readback: LockReadback, our_body: &[u8], expected_etag: &str)
 
 /// S3-backed lock storage.
 ///
-/// Uses `put_if_absent` for atomic acquire and `put_if_match` for heartbeat
-/// refresh. Conditional delete is used for release when
-/// `supports_conditional_delete` is `true`; otherwise a plain delete is used
-/// with an ownership check first.
+/// Uses `put_if_absent` for atomic acquire, `put_if_match` for heartbeat
+/// refresh, and `delete_if_match` for release, so a holder can only ever
+/// remove its own lock object.
 ///
 /// Constructed via [`S3LockStorage::new`].
 #[derive(Clone)]
 pub struct S3LockStorage {
     store: Arc<dyn ConditionalStore>,
-    supports_conditional_delete: bool,
     conditional_retry: Backoff,
 }
 
 impl Debug for S3LockStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3LockStorage")
-            .field(
-                "supports_conditional_delete",
-                &self.supports_conditional_delete,
-            )
-            .finish_non_exhaustive()
+        f.debug_struct("S3LockStorage").finish_non_exhaustive()
     }
 }
 
 impl S3LockStorage {
     /// Construct an `S3LockStorage` from an existing conditional store.
     #[must_use]
-    pub fn new(store: Arc<dyn ConditionalStore>, supports_conditional_delete: bool) -> Self {
+    pub fn new(store: Arc<dyn ConditionalStore>) -> Self {
         Self {
             store,
-            supports_conditional_delete,
             conditional_retry: Backoff::constant(Duration::from_millis(25)).with_jitter(),
         }
     }
@@ -157,7 +158,11 @@ impl LockStorage for S3LockStorage {
         loop {
             attempts += 1;
             match self.store.put_if_absent(&path, body.clone()).await {
-                Ok(etag) => return Ok(PutIfAbsentOutcome::Created(etag.map(Etag::into_inner))),
+                Ok(etag) => {
+                    return Ok(PutIfAbsentOutcome::Created(require_etag(
+                        etag.map(Etag::into_inner),
+                    )?));
+                }
                 Err(StorageError::PreconditionFailed) => {
                     return Ok(PutIfAbsentOutcome::AlreadyExists);
                 }
@@ -171,7 +176,7 @@ impl LockStorage for S3LockStorage {
                     match reconcile_absent(self.store.get_with_metadata(&path).await, body.as_ref())
                     {
                         AbsentReconcile::Created(etag) => {
-                            return Ok(PutIfAbsentOutcome::Created(etag));
+                            return Ok(PutIfAbsentOutcome::Created(require_etag(etag)?));
                         }
                         AbsentReconcile::AlreadyExists => {
                             return Ok(PutIfAbsentOutcome::AlreadyExists);
@@ -200,7 +205,9 @@ impl LockStorage for S3LockStorage {
             attempts += 1;
             match self.store.put_if_match(&path, &etag, body.clone()).await {
                 Ok(new_etag) => {
-                    return Ok(PutIfMatchOutcome::Updated(new_etag.map(Etag::into_inner)));
+                    return Ok(PutIfMatchOutcome::Updated(require_etag(
+                        new_etag.map(Etag::into_inner),
+                    )?));
                 }
                 Err(StorageError::PreconditionFailed) => return Ok(PutIfMatchOutcome::Mismatch),
                 Err(e) => {
@@ -213,7 +220,7 @@ impl LockStorage for S3LockStorage {
                         expected_etag,
                     ) {
                         MatchReconcile::Updated(new_etag) => {
-                            return Ok(PutIfMatchOutcome::Updated(new_etag));
+                            return Ok(PutIfMatchOutcome::Updated(require_etag(new_etag)?));
                         }
                         MatchReconcile::Mismatch => return Ok(PutIfMatchOutcome::Mismatch),
                         MatchReconcile::Retry => {
@@ -229,14 +236,18 @@ impl LockStorage for S3LockStorage {
     async fn get_with_etag(
         &self,
         key: &str,
-    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), Error> {
+    ) -> Result<(Vec<u8>, String, Option<DateTime<Utc>>), Error> {
         let path = lock_path(key);
         let mut attempts: u32 = 0;
         loop {
             attempts += 1;
             match self.store.get_with_metadata(&path).await {
                 Ok((body, etag, last_modified)) => {
-                    return Ok((body, etag.map(Etag::into_inner), last_modified));
+                    return Ok((
+                        body,
+                        require_etag(etag.map(Etag::into_inner))?,
+                        last_modified,
+                    ));
                 }
                 Err(StorageError::NotFound) => return Err(Error::NotFound),
                 Err(e) => {
@@ -255,32 +266,31 @@ impl LockStorage for S3LockStorage {
         }
     }
 
-    async fn delete(&self, key: &str) -> Result<(), Error> {
-        let path = lock_path(key);
-        match ObjectStore::delete(self.store.as_ref(), &path).await {
-            Ok(()) | Err(StorageError::NotFound) => Ok(()),
-            Err(e) => {
-                warn!(key, error = %e, "S3LockStorage: delete failed");
-                Err(Error::StorageBackend(e.to_string()))
-            }
-        }
-    }
-
     async fn delete_if_match(
         &self,
         key: &str,
         expected_etag: &str,
     ) -> Result<DeleteIfMatchOutcome, Error> {
-        if !self.supports_conditional_delete {
-            self.delete(key).await?;
-            return Ok(DeleteIfMatchOutcome::Deleted);
-        }
         let path = lock_path(key);
         let etag = Etag::new(expected_etag);
-        match self.store.delete_if_match(&path, &etag).await {
-            Err(StorageError::PreconditionFailed) => Ok(DeleteIfMatchOutcome::Mismatch),
-            Ok(()) | Err(StorageError::NotFound) => Ok(DeleteIfMatchOutcome::Deleted),
-            Err(e) => Err(Error::StorageBackend(e.to_string())),
+        let mut attempts: u32 = 0;
+        loop {
+            attempts += 1;
+            match self.store.delete_if_match(&path, &etag).await {
+                Err(StorageError::PreconditionFailed) => return Ok(DeleteIfMatchOutcome::Mismatch),
+                Ok(()) | Err(StorageError::NotFound) => return Ok(DeleteIfMatchOutcome::Deleted),
+                Err(e) => {
+                    // A conditional delete is safe to replay after an ambiguous
+                    // transport error: if the first attempt landed, the retry
+                    // observes an absent object (or a foreign successor) and
+                    // never deletes anything that is not ours.
+                    if attempts >= MAX_CONDITIONAL_ATTEMPTS {
+                        return Err(Error::StorageBackend(e.to_string()));
+                    }
+                    debug!(key, attempts, error = %e, "S3LockStorage: ambiguous conditional delete, retrying");
+                    sleep(self.conditional_retry.delay(0)).await;
+                }
+            }
         }
     }
 
@@ -320,7 +330,7 @@ mod tests {
     /// `MemoryObjectStore` implements `ConditionalStore`, so it stands in for a
     /// CAS-capable S3 backend with no live infrastructure.
     fn storage() -> S3LockStorage {
-        S3LockStorage::new(Arc::new(MemoryObjectStore::new()), true)
+        S3LockStorage::new(Arc::new(MemoryObjectStore::new()))
     }
 
     #[tokio::test]
@@ -329,7 +339,7 @@ mod tests {
 
         let first = s.put_if_absent("k", b"body-1".to_vec()).await.unwrap();
         assert!(
-            matches!(first, PutIfAbsentOutcome::Created(Some(_))),
+            matches!(first, PutIfAbsentOutcome::Created(_)),
             "first put_if_absent must create and return an ETag"
         );
 
@@ -344,16 +354,15 @@ mod tests {
     async fn put_if_match_updates_on_matching_etag_and_mismatches_on_stale() {
         let s = storage();
 
-        let PutIfAbsentOutcome::Created(Some(etag)) =
-            s.put_if_absent("k", b"v1".to_vec()).await.unwrap()
+        let PutIfAbsentOutcome::Created(etag) = s.put_if_absent("k", b"v1".to_vec()).await.unwrap()
         else {
-            panic!("expected Created with an ETag");
+            panic!("expected Created");
         };
 
         let updated = s.put_if_match("k", &etag, b"v2".to_vec()).await.unwrap();
         let new_etag = match updated {
-            PutIfMatchOutcome::Updated(Some(e)) => e,
-            other => panic!("expected Updated(Some(etag)), got {}", outcome_kind(&other)),
+            PutIfMatchOutcome::Updated(e) => e,
+            PutIfMatchOutcome::Mismatch => panic!("expected Updated(etag), got Mismatch"),
         };
         assert_ne!(
             new_etag, etag,
@@ -368,13 +377,6 @@ mod tests {
         );
     }
 
-    fn outcome_kind(o: &PutIfMatchOutcome) -> &'static str {
-        match o {
-            PutIfMatchOutcome::Updated(_) => "Updated",
-            PutIfMatchOutcome::Mismatch => "Mismatch",
-        }
-    }
-
     #[tokio::test]
     async fn get_with_etag_returns_body_and_etag_and_not_found_when_absent() {
         let s = storage();
@@ -385,17 +387,16 @@ mod tests {
             "get_with_etag on an absent key must be NotFound"
         );
 
-        let PutIfAbsentOutcome::Created(Some(etag)) =
+        let PutIfAbsentOutcome::Created(etag) =
             s.put_if_absent("k", b"the-body".to_vec()).await.unwrap()
         else {
-            panic!("expected Created with an ETag");
+            panic!("expected Created");
         };
 
         let (body, read_etag, _last_modified) = s.get_with_etag("k").await.unwrap();
         assert_eq!(body, b"the-body");
         assert_eq!(
-            read_etag,
-            Some(etag),
+            read_etag, etag,
             "get_with_etag must surface the same ETag the put returned"
         );
     }
@@ -404,14 +405,13 @@ mod tests {
     async fn delete_if_match_deletes_on_match_and_mismatches_on_stale() {
         let s = storage();
 
-        let PutIfAbsentOutcome::Created(Some(etag)) =
-            s.put_if_absent("k", b"v1".to_vec()).await.unwrap()
+        let PutIfAbsentOutcome::Created(etag) = s.put_if_absent("k", b"v1".to_vec()).await.unwrap()
         else {
-            panic!("expected Created with an ETag");
+            panic!("expected Created");
         };
 
         // Rotate the live ETag so the original is stale.
-        let PutIfMatchOutcome::Updated(Some(_new_etag)) =
+        let PutIfMatchOutcome::Updated(_new_etag) =
             s.put_if_match("k", &etag, b"v2".to_vec()).await.unwrap()
         else {
             panic!("expected Updated");
@@ -430,7 +430,6 @@ mod tests {
 
         // Delete with the current ETag succeeds, then the key is gone.
         let (_body, current_etag, _) = s.get_with_etag("k").await.unwrap();
-        let current_etag = current_etag.expect("etag present");
         let deleted = s.delete_if_match("k", &current_etag).await.unwrap();
         assert!(
             matches!(deleted, DeleteIfMatchOutcome::Deleted),
@@ -567,14 +566,20 @@ mod tests {
         absent_faults: Mutex<VecDeque<Fault>>,
         match_faults: Mutex<VecDeque<Fault>>,
         get_faults: Mutex<VecDeque<Fault>>,
+        delete_faults: Mutex<VecDeque<Fault>>,
         absent_calls: AtomicUsize,
         match_calls: AtomicUsize,
         get_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
     }
 
     impl FaultScript {
         fn set_get_faults(&self, faults: &[Fault]) {
             *self.get_faults.lock().unwrap() = faults.iter().copied().collect();
+        }
+
+        fn set_delete_faults(&self, faults: &[Fault]) {
+            *self.delete_faults.lock().unwrap() = faults.iter().copied().collect();
         }
     }
 
@@ -591,9 +596,11 @@ mod tests {
             absent_faults: Mutex::new(absent.iter().copied().collect()),
             match_faults: Mutex::new(refresh.iter().copied().collect()),
             get_faults: Mutex::new(VecDeque::new()),
+            delete_faults: Mutex::new(VecDeque::new()),
             absent_calls: AtomicUsize::new(0),
             match_calls: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
         };
         Arc::new(HookedStore::new(Arc::new(inner), script))
     }
@@ -634,6 +641,18 @@ mod tests {
                         None => Ok(()),
                     }
                 }
+                StoreOp::DeleteIfMatch { key, etag } => {
+                    self.delete_calls.fetch_add(1, Ordering::SeqCst);
+                    let fault = self.delete_faults.lock().unwrap().pop_front();
+                    match fault {
+                        Some(Fault::LandThenError) => {
+                            let _ = self.inner.delete_if_match(key, etag).await;
+                            Err(injected())
+                        }
+                        Some(Fault::ErrorNoLand) => Err(injected()),
+                        None => Ok(()),
+                    }
+                }
                 _ => Ok(()),
             }
         }
@@ -645,7 +664,7 @@ mod tests {
         // read-back finds our own body, so the acquire succeeds: the exact
         // regression this layer repairs.
         let store = flaky_store(&[Fault::LandThenError], &[]);
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
         let outcome = lock.put_if_absent("k", b"the-body".to_vec()).await.unwrap();
 
@@ -664,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn put_if_absent_transport_error_without_landing_retries_then_creates() {
         let store = flaky_store(&[Fault::ErrorNoLand], &[]);
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
         let outcome = lock.put_if_absent("k", b"the-body".to_vec()).await.unwrap();
 
@@ -686,7 +705,7 @@ mod tests {
             .put_if_absent(&lock_path("k"), Bytes::from_static(b"competitor"))
             .await
             .unwrap();
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
         let outcome = lock.put_if_absent("k", b"mine".to_vec()).await.unwrap();
 
@@ -701,7 +720,7 @@ mod tests {
         // No faults: the second acquire hits a real PreconditionFailed and must
         // NOT reconcile or retry.
         let store = flaky_store(&[], &[]);
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
         lock.put_if_absent("k", b"first".to_vec()).await.unwrap();
         let gets_before = store.hook().get_calls.load(Ordering::SeqCst);
@@ -719,7 +738,7 @@ mod tests {
     async fn put_if_absent_budget_exhausted_propagates_error() {
         let faults = vec![Fault::ErrorNoLand; MAX_CONDITIONAL_ATTEMPTS as usize];
         let store = flaky_store(&faults, &[]);
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
         let result = lock.put_if_absent("k", b"the-body".to_vec()).await;
 
@@ -738,12 +757,12 @@ mod tests {
     async fn put_if_match_lost_ack_landed_returns_updated() {
         // Create the object, capture its ETag, then fault a refresh that lands.
         let store = flaky_store(&[], &[Fault::LandThenError]);
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
-        let PutIfAbsentOutcome::Created(Some(etag)) =
+        let PutIfAbsentOutcome::Created(etag) =
             lock.put_if_absent("k", b"v1".to_vec()).await.unwrap()
         else {
-            panic!("expected Created with an ETag");
+            panic!("expected Created");
         };
 
         let outcome = lock.put_if_match("k", &etag, b"v2".to_vec()).await.unwrap();
@@ -757,12 +776,12 @@ mod tests {
     #[tokio::test]
     async fn put_if_match_takeover_during_transport_error_is_mismatch() {
         let store = flaky_store(&[], &[Fault::ErrorNoLand]);
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
-        let PutIfAbsentOutcome::Created(Some(stale_etag)) =
+        let PutIfAbsentOutcome::Created(stale_etag) =
             lock.put_if_absent("k", b"v1".to_vec()).await.unwrap()
         else {
-            panic!("expected Created with an ETag");
+            panic!("expected Created");
         };
 
         // A competitor rotates the object's ETag and body out from under us.
@@ -797,6 +816,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_if_match_transport_error_without_landing_retries_then_deletes() {
+        let store = flaky_store(&[], &[]);
+        let lock = S3LockStorage::new(store.clone());
+        let PutIfAbsentOutcome::Created(etag) =
+            lock.put_if_absent("k", b"v1".to_vec()).await.unwrap()
+        else {
+            panic!("expected Created");
+        };
+
+        store.hook().set_delete_faults(&[Fault::ErrorNoLand]);
+        let outcome = lock.delete_if_match("k", &etag).await.unwrap();
+
+        assert!(
+            matches!(outcome, DeleteIfMatchOutcome::Deleted),
+            "a non-landing transport error retries the conditional delete once"
+        );
+        assert_eq!(store.hook().delete_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(lock.get_with_etag("k").await, Err(Error::NotFound)),
+            "the lock object must be gone after the retried delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_if_match_lost_ack_landed_reports_deleted() {
+        // The DELETE lands but the ack is lost. The replay observes an absent
+        // object, which counts as Deleted; nothing foreign is ever removed.
+        let store = flaky_store(&[], &[]);
+        let lock = S3LockStorage::new(store.clone());
+        let PutIfAbsentOutcome::Created(etag) =
+            lock.put_if_absent("k", b"v1".to_vec()).await.unwrap()
+        else {
+            panic!("expected Created");
+        };
+
+        store.hook().set_delete_faults(&[Fault::LandThenError]);
+        let outcome = lock.delete_if_match("k", &etag).await.unwrap();
+
+        assert!(
+            matches!(outcome, DeleteIfMatchOutcome::Deleted),
+            "a transport error on a DELETE that landed must still report Deleted"
+        );
+        assert_eq!(store.hook().delete_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn get_with_etag_retries_transient_read_error_then_succeeds() {
         // A stale-lock-recovery read (the path behind the DELETE 500) hits a
         // transport blip, then succeeds, so the acquire must not fail.
@@ -808,7 +873,7 @@ mod tests {
             .await
             .unwrap();
         store.hook().set_get_faults(&[Fault::ErrorNoLand]);
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
         let (body, _etag, _) = lock.get_with_etag("k").await.unwrap();
 
@@ -829,7 +894,7 @@ mod tests {
         store
             .hook()
             .set_get_faults(&vec![Fault::ErrorNoLand; MAX_CONDITIONAL_ATTEMPTS as usize]);
-        let lock = S3LockStorage::new(store.clone(), true);
+        let lock = S3LockStorage::new(store.clone());
 
         let result = lock.get_with_etag("k").await;
 

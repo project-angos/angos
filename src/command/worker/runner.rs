@@ -105,10 +105,8 @@ mod tests {
     fn make_store(dir: &TempDir) -> Arc<JobStore> {
         let object: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(dir.path().to_str().expect("valid path")).build());
-        let facade = Arc::new(
-            Store::new(object, None, LockStrategy::Memory, None, false, false)
-                .expect("build store"),
-        );
+        let facade =
+            Arc::new(Store::new(object, None, LockStrategy::Memory, None).expect("build store"));
         Arc::new(JobStore::new(facade, "test-worker"))
     }
 

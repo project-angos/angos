@@ -153,7 +153,7 @@ impl LockStorage for RedisLockStorage {
 
         if result.as_deref() == Some("OK") {
             // The value itself serves as the ETag for Redis.
-            Ok(PutIfAbsentOutcome::Created(Some(value)))
+            Ok(PutIfAbsentOutcome::Created(value))
         } else {
             Ok(PutIfAbsentOutcome::AlreadyExists)
         }
@@ -184,7 +184,7 @@ impl LockStorage for RedisLockStorage {
             .map_err(|e| Error::StorageBackend(format!("Redis refresh script: {e}")))?;
 
         if result == 1 {
-            Ok(PutIfMatchOutcome::Updated(Some(new_value)))
+            Ok(PutIfMatchOutcome::Updated(new_value))
         } else {
             Ok(PutIfMatchOutcome::Mismatch)
         }
@@ -193,7 +193,7 @@ impl LockStorage for RedisLockStorage {
     async fn get_with_etag(
         &self,
         key: &str,
-    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), Error> {
+    ) -> Result<(Vec<u8>, String, Option<DateTime<Utc>>), Error> {
         let full_key = self.full_key(key);
         let mut conn = self
             .client
@@ -211,25 +211,9 @@ impl LockStorage for RedisLockStorage {
             None => Err(Error::NotFound),
             Some(v) => {
                 let etag = v.clone();
-                Ok((v.into_bytes(), Some(etag), None))
+                Ok((v.into_bytes(), etag, None))
             }
         }
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), Error> {
-        let full_key = self.full_key(key);
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
-
-        redis::cmd("DEL")
-            .arg(&full_key)
-            .query_async::<i32>(&mut conn)
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis DEL: {e}")))?;
-        Ok(())
     }
 
     async fn delete_if_match(

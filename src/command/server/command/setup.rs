@@ -3,7 +3,6 @@ use std::{
     time::Duration,
 };
 
-use angos_tx_engine::ConditionalCapabilities;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -25,31 +24,31 @@ pub struct PendingGaugeRefresh {
 pub async fn build_metadata_store(
     config: &Configuration,
     cache: &Arc<Cache>,
-    cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
+    cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
 ) -> Result<Arc<MetadataStore>, Error> {
     let mut storage_config = config.resolve_registry_storage();
 
-    // Resolve S3 conditional-write capabilities once and memoize them so a
-    // config hot-reload rebuilds the metadata store without re-probing the
-    // endpoint. Operator-declared capabilities skip this entirely. Injecting
-    // the resolved value into the config means `build_store` won't re-probe.
-    if matches!(&storage_config, RegistryStorageConfig::S3(b) if b.capabilities.is_none()) {
-        let cached = cached_capabilities
+    // Resolve S3 conditional-write support once and memoize it so a config
+    // hot-reload rebuilds the metadata store without re-probing the endpoint.
+    // An operator-declared value skips this entirely. Injecting the resolved
+    // value into the config means `build_store` won't re-probe.
+    if matches!(&storage_config, RegistryStorageConfig::S3(b) if b.conditional_operations.is_none())
+    {
+        let cached = *cached_conditional_operations
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let caps = if let Some(caps) = cached {
-            caps
+            .unwrap_or_else(PoisonError::into_inner);
+        let cas = if let Some(cas) = cached {
+            cas
         } else {
             let probed = storage_config.probe().await.map_err(Error::from)?;
             let resolved = probed.unwrap_or_default();
-            *cached_capabilities
+            *cached_conditional_operations
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(resolved.clone());
+                .unwrap_or_else(PoisonError::into_inner) = Some(resolved);
             resolved
         };
         if let RegistryStorageConfig::S3(ref mut backend_config) = storage_config {
-            backend_config.capabilities = Some(caps);
+            backend_config.conditional_operations = Some(cas);
         }
     }
 
@@ -69,12 +68,13 @@ pub async fn build_metadata_store(
 /// initial bootstrap.
 pub async fn build_registry(
     config: &Configuration,
-    cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
+    cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
     engine_maintenance: Option<CancellationToken>,
 ) -> Result<(Registry, Option<PendingGaugeRefresh>), Error> {
     let auth_cache = bootstrap::auth_cache(&config.cache)?;
     let blob_backend = Arc::new(config.blob_store.build_backend()?);
-    let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
+    let metadata_store =
+        build_metadata_store(config, &auth_cache, cached_conditional_operations).await?;
     let max_manifest_size_bytes = config.global.max_manifest_size_bytes();
     let repositories =
         bootstrap::repositories(&config.repository, &auth_cache, max_manifest_size_bytes).await?;
