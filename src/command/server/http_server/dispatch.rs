@@ -93,7 +93,7 @@ async fn dispatch_route<'a>(
             handlers::upload::handle_delete_upload(context, &namespace, uuid).await
         }
         Action::GetBlob { namespace, digest } => {
-            handlers::blob::dispatch_get_blob(context, parts, &namespace, digest).await
+            handlers::blob::dispatch_get_blob(context, parts, &namespace, digest, identity).await
         }
         Action::HeadBlob { namespace, digest } => {
             handlers::blob::dispatch_head_blob(context, parts, &namespace, digest).await
@@ -104,7 +104,12 @@ async fn dispatch_route<'a>(
         Action::GetManifest {
             namespace,
             reference,
-        } => handlers::manifest::dispatch_get_manifest(context, parts, &namespace, reference).await,
+        } => {
+            handlers::manifest::dispatch_get_manifest(
+                context, parts, &namespace, reference, identity,
+            )
+            .await
+        }
         Action::HeadManifest {
             namespace,
             reference,

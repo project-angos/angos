@@ -12,7 +12,7 @@ use crate::{
         request::{RequestHeaders, incoming_into_async_read},
         response_body::ResponseBody,
     },
-    event_webhook::event::EventActor,
+    event_webhook::event::{Event, EventActor, EventKind},
     identity::ClientIdentity,
     oci::{MediaType, Namespace, Reference, Tag},
     registry::GetManifestResponse,
@@ -46,22 +46,41 @@ pub async fn handle_get_manifest(
     reference: Reference,
     mime_types: &[String],
     is_tag_immutable: bool,
-) -> Result<Response<ResponseBody>, Error> {
+    identity: &ClientIdentity,
+) -> Result<EventfulResponse, Error> {
+    let tag = match &reference {
+        Reference::Tag(tag) => Some(tag.to_string()),
+        Reference::Digest(_) => None,
+    };
+    let reference_str = reference.to_string();
+
     let response = context
         .registry
         .resolve_get_manifest(namespace, reference, mime_types, is_tag_immutable)
         .await?;
 
-    match response {
-        GetManifestResponse::Redirect { headers } => build_response(
+    let event = Event::new(
+        EventKind::ManifestPull,
+        namespace.clone(),
+        context.registry.repository_name_for(namespace),
+    )
+    .digest(Some(response.digest().to_string()))
+    .reference(Some(reference_str))
+    .tag(tag)
+    .actor(Some(EventActor::from(identity.clone())));
+
+    let response = match response {
+        GetManifestResponse::Redirect { headers, .. } => build_response(
             StatusCode::TEMPORARY_REDIRECT,
             headers,
             ResponseBody::empty(),
         ),
-        GetManifestResponse::Body { headers, content } => {
-            build_response(StatusCode::OK, headers, ResponseBody::fixed(content))
-        }
-    }
+        GetManifestResponse::Body {
+            headers, content, ..
+        } => build_response(StatusCode::OK, headers, ResponseBody::fixed(content)),
+    }?;
+
+    Ok((response, vec![event]))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -116,12 +135,25 @@ pub async fn dispatch_get_manifest(
     parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
     let mime_types = headers.accepted_content_types();
     let is_immutable = context.is_reference_immutable(namespace, &reference);
 
-    handle_get_manifest(context, namespace, reference, &mime_types, is_immutable).await
+    dispatch_eventful(
+        context,
+        handle_get_manifest(
+            context,
+            namespace,
+            reference,
+            &mime_types,
+            is_immutable,
+            identity,
+        )
+        .await?,
+    )
+    .await
 }
 
 pub async fn dispatch_head_manifest(
@@ -191,66 +223,28 @@ pub async fn dispatch_delete_manifest(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use chrono::{Duration, Utc};
     use hyper::{Request, StatusCode};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use crate::{
         command::server::{
             ServerContext, error::Error, request::RequestHeaders,
-            server_context::tests::create_test_server_context_from_config,
+            server_context::tests::create_test_repo_context,
         },
-        configuration::Configuration,
         identity::ClientIdentity,
         oci::{MediaType, Namespace, Reference, Tag},
         replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     };
 
-    use super::handle_put_manifest;
+    use super::{dispatch_get_manifest, handle_put_manifest};
 
     const MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
     // A context whose resolver matches "test/*", required for the read-back path
     // (the default test config declares no [repository.*] so it would resolve none).
-    // Both stores share one unique root so a manifest written through the metadata
-    // store is readable back through the blob store, as FSRegistryTestCase does.
     async fn context_with_test_repo() -> ServerContext {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let toml = format!(
-            r#"
-            [blob_store.fs]
-            root_dir = "/tmp/angos-seam-{nonce}"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/angos-seam-{nonce}"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "127.0.0.1"
-            port = 8080
-
-            [global]
-            update_pull_time = false
-
-            [global.access_policy]
-            default = "allow"
-            rules = []
-
-            [repository.test]
-            namespace_pattern = "^test/.*"
-
-            [repository.test.access_policy]
-            default = "allow"
-            rules = []
-        "#
-        );
-        let config: Configuration = toml::from_str(&toml).unwrap();
-        create_test_server_context_from_config(&config).await
+        create_test_repo_context(None).await
     }
 
     // Distinct, reference-free manifests yield distinct digests with no blob uploads.
@@ -271,6 +265,61 @@ mod tests {
             .unwrap();
         let (parts, ()) = request.into_parts();
         RequestHeaders::new(&parts.headers).source_timestamp()
+    }
+
+    /// A tag GET emits one `manifest.pull` event carrying the resolved digest,
+    /// the requested reference, and the tag.
+    #[tokio::test]
+    async fn get_manifest_emits_pull_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let context = create_test_repo_context(Some(&server.uri())).await;
+        let namespace = Namespace::new("test/repo").unwrap();
+        let identity = ClientIdentity::new(None);
+
+        let (put_resp, _events) = handle_put_manifest(
+            &context,
+            &namespace,
+            Reference::Tag(Tag::new("latest").unwrap()),
+            MediaType::new(MEDIA_TYPE).unwrap(),
+            std::io::Cursor::new(manifest_a()),
+            Vec::new(),
+            &identity,
+            None,
+        )
+        .await
+        .expect("seeding the manifest must succeed");
+        assert_eq!(put_resp.status(), StatusCode::CREATED);
+
+        let (parts, ()) = Request::builder().body(()).unwrap().into_parts();
+        let response = dispatch_get_manifest(
+            &context,
+            &parts,
+            &namespace,
+            Reference::Tag(Tag::new("latest").unwrap()),
+            &identity,
+        )
+        .await
+        .expect("the pull must succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "exactly one pull event must be posted");
+        let event: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(event["kind"], "manifest.pull");
+        assert_eq!(event["repository"], "test");
+        assert_eq!(event["reference"], "latest");
+        assert_eq!(event["tag"], "latest");
+        assert!(
+            event["digest"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("sha256:")),
+            "the event must carry the resolved digest, got: {event}"
+        );
     }
 
     #[tokio::test]

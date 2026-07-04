@@ -8,10 +8,14 @@ use crate::{identity::ClientIdentity, oci::Namespace};
 pub enum EventKind {
     #[serde(rename = "manifest.push")]
     ManifestPush,
+    #[serde(rename = "manifest.pull")]
+    ManifestPull,
     #[serde(rename = "manifest.delete")]
     ManifestDelete,
     #[serde(rename = "blob.push")]
     BlobPush,
+    #[serde(rename = "blob.pull")]
+    BlobPull,
     #[serde(rename = "tag.create")]
     TagCreate,
     #[serde(rename = "tag.delete")]
@@ -22,8 +26,10 @@ impl EventKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             EventKind::ManifestPush => "manifest.push",
+            EventKind::ManifestPull => "manifest.pull",
             EventKind::ManifestDelete => "manifest.delete",
             EventKind::BlobPush => "blob.push",
+            EventKind::BlobPull => "blob.pull",
             EventKind::TagCreate => "tag.create",
             EventKind::TagDelete => "tag.delete",
         }
@@ -138,8 +144,10 @@ mod tests {
     #[test]
     fn event_kind_as_str_covers_all_variants() {
         assert_eq!(EventKind::ManifestPush.as_str(), "manifest.push");
+        assert_eq!(EventKind::ManifestPull.as_str(), "manifest.pull");
         assert_eq!(EventKind::ManifestDelete.as_str(), "manifest.delete");
         assert_eq!(EventKind::BlobPush.as_str(), "blob.push");
+        assert_eq!(EventKind::BlobPull.as_str(), "blob.pull");
         assert_eq!(EventKind::TagCreate.as_str(), "tag.create");
         assert_eq!(EventKind::TagDelete.as_str(), "tag.delete");
     }

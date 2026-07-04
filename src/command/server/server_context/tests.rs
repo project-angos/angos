@@ -94,6 +94,65 @@ pub async fn create_test_server_context_from_config(config: &Configuration) -> S
     ServerContext::new(config, registry).unwrap()
 }
 
+/// Context over a fresh FS root with a `test` repository matching `test/*`
+/// (the minimal config resolves no repository at all). Blob and metadata
+/// stores share the root so content written through one is readable through
+/// the other. With `webhook_url`, a required-policy webhook subscribed to the
+/// pull events is wired in.
+pub async fn create_test_repo_context(webhook_url: Option<&str>) -> ServerContext {
+    let nonce = Uuid::new_v4();
+    let webhook_ref = if webhook_url.is_some() {
+        r#"event_webhooks = ["pull_hook"]"#
+    } else {
+        ""
+    };
+    let webhook_table = webhook_url
+        .map(|url| {
+            format!(
+                r#"
+                [event_webhook.pull_hook]
+                url = "{url}"
+                policy = "required"
+                events = ["manifest.pull", "blob.pull"]
+            "#
+            )
+        })
+        .unwrap_or_default();
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/angos-test-repo-{nonce}"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/angos-test-repo-{nonce}"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "127.0.0.1"
+        port = 8080
+
+        [global]
+        update_pull_time = false
+        {webhook_ref}
+
+        [global.access_policy]
+        default = "allow"
+        rules = []
+
+        [repository.test]
+        namespace_pattern = "^test/.*"
+
+        [repository.test.access_policy]
+        default = "allow"
+        rules = []
+        {webhook_table}
+    "#
+    );
+    let config: Configuration = toml::from_str(&toml).unwrap();
+    create_test_server_context_from_config(&config).await
+}
+
 pub async fn create_test_registry(config: &Configuration) -> Registry {
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
