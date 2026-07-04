@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.3.2 - Unreleased
 
+### Added
+
+- New `manifest.pull` and `blob.pull` event-webhook kinds fire on successful `GET` requests (including redirect responses), so pulls can be tracked externally; prefer the `async` delivery policy for these high-volume events.
+
 ### Changed
 
 - On an S3 metadata store, an unset `lock_strategy` now defaults to the shared S3 lock when the provider supports conditional operations, instead of the in-process memory lock.

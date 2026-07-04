@@ -652,6 +652,7 @@ impl Registry {
 
         Some(GetManifestResponse::Redirect {
             headers: get_manifest_redirect_headers(presigned_url, &link.target, Some(media_type)),
+            digest: link.target,
         })
     }
 
@@ -706,6 +707,7 @@ impl Registry {
                     &manifest.digest,
                     manifest.media_type,
                 ),
+                digest: manifest.digest,
             });
         }
 
@@ -717,6 +719,7 @@ impl Registry {
                 content_length,
             ),
             content: manifest.content,
+            digest: manifest.digest,
         })
     }
 

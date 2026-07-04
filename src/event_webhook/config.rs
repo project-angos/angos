@@ -159,12 +159,12 @@ mod tests {
         let toml = r#"
             url = "https://example.com/async-hook"
             policy = "async"
-            events = ["manifest.push", "manifest.delete", "blob.push", "tag.create", "tag.delete"]
+            events = ["manifest.push", "manifest.pull", "manifest.delete", "blob.push", "blob.pull", "tag.create", "tag.delete"]
         "#;
 
         let config: EventWebhookConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.policy, DeliveryPolicy::Async);
-        assert_eq!(config.events.len(), 5);
+        assert_eq!(config.events.len(), 7);
     }
 
     #[test]

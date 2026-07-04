@@ -19,11 +19,23 @@ pub struct ManifestBody {
 pub enum GetManifestResponse {
     Redirect {
         headers: HeaderMap,
+        digest: Digest,
     },
     Body {
         headers: HeaderMap,
         content: Vec<u8>,
+        digest: Digest,
     },
+}
+
+impl GetManifestResponse {
+    /// The digest of the manifest being served, for pull-event reporting.
+    pub fn digest(&self) -> &Digest {
+        match self {
+            GetManifestResponse::Redirect { digest, .. }
+            | GetManifestResponse::Body { digest, .. } => digest,
+        }
+    }
 }
 
 pub struct HeadManifestResponse {

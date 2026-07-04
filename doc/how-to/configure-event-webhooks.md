@@ -6,7 +6,7 @@ title: "Event Webhooks"
 
 # Configure Event Webhooks
 
-Notify external systems when registry events occur: manifest pushes, blob uploads, tag operations, and more.
+Notify external systems when registry events occur: manifest pushes and pulls, blob uploads and pulls, tag operations, and more.
 
 ## Prerequisites
 
@@ -84,6 +84,19 @@ events = ["manifest.push", "manifest.delete", "blob.push", "tag.create", "tag.de
 ```
 
 Use this when latency matters more than delivery guarantees (e.g., analytics, dashboards).
+
+### Pull Tracking
+
+`manifest.pull` and `blob.pull` fire on every successful `GET`. They are
+high-volume, so subscribe with the `async` policy: `required` and `optional`
+put a webhook round-trip on the critical path of every pull.
+
+```toml
+[event_webhook.pull_tracking]
+url = "https://analytics.example.com/pulls"
+policy = "async"
+events = ["manifest.pull", "blob.pull"]
+```
 
 ---
 

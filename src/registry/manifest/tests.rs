@@ -1407,7 +1407,8 @@ async fn test_handle_get_manifest() {
             .unwrap();
 
         match response {
-            GetManifestResponse::Redirect { headers } => {
+            GetManifestResponse::Redirect { headers, digest } => {
+                assert_eq!(digest, header_digest(&put_response.headers));
                 assert_eq!(
                     header_digest(&headers),
                     header_digest(&put_response.headers)
@@ -1417,7 +1418,9 @@ async fn test_handle_get_manifest() {
             GetManifestResponse::Body {
                 headers,
                 content: body,
+                digest,
             } => {
+                assert_eq!(digest, header_digest(&put_response.headers));
                 assert_eq!(
                     header_digest(&headers),
                     header_digest(&put_response.headers)
@@ -1929,7 +1932,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
         // support presigned URLs (FS backend), we get a Body response, both are
         // valid; in the Body case the media_type comes from the manifest JSON.
         match response {
-            GetManifestResponse::Redirect { headers } => {
+            GetManifestResponse::Redirect { headers, .. } => {
                 assert!(
                     headers.contains_key(CONTENT_TYPE.as_str()),
                     "Redirect should still include Content-Type via fallback"

@@ -65,10 +65,20 @@ Backoff formula: `100ms * 2^(attempt - 1)`
 | Event             | Trigger                                          |
 |-------------------|--------------------------------------------------|
 | `manifest.push`   | Manifest stored successfully                     |
+| `manifest.pull`   | Manifest served to a client via `GET`            |
 | `manifest.delete` | Manifest deleted                                 |
 | `blob.push`       | Blob upload completed, or a cross-repo mount granted it to a namespace |
+| `blob.pull`       | Blob served to a client via `GET`                |
 | `tag.create`      | Tag created (part of manifest push with tag ref) |
 | `tag.delete`      | Tag deleted (part of manifest delete by tag)     |
+
+Pull events fire on successful `GET` requests only (`HEAD` probes are not
+eventful) and include responses answered with a `307` redirect to presigned
+storage URLs. `manifest.pull` carries the resolved digest, the requested
+reference, and the tag when the request was by tag. Pulls are high-volume:
+prefer the `async` policy for pull subscriptions, since `required` and
+`optional` put a webhook round-trip on the critical path of every pull, and
+`required` fails the pull when delivery fails.
 
 ---
 
