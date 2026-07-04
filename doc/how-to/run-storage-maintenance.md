@@ -93,15 +93,7 @@ RUST_LOG=info ./angos -c config.toml scrub --tags --manifests --blobs
 
 ## Scheduling
 
-### Cron (Linux/macOS)
-
-```bash
-# Daily at 3 AM - integrity checks
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs >> /var/log/registry-scrub.log 2>&1
-
-# Daily at 4 AM - retention enforcement
-0 4 * * * /usr/bin/angos -c /etc/registry/config.toml prune >> /var/log/registry-prune.log 2>&1
-```
+Schedule maintenance with a systemd timer (host installs) or a Kubernetes CronJob; both are shown below.
 
 ### Recommended Flags for Periodic Maintenance
 
@@ -225,6 +217,8 @@ Run manually:
 docker compose --profile maintenance run --rm scrub
 docker compose --profile maintenance run --rm prune
 ```
+
+To run them periodically, drive these commands from a systemd timer on the host (see [Systemd Timer](#systemd-timer) above).
 
 ---
 

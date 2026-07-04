@@ -96,7 +96,7 @@ The event path can miss changes: an instance might be down when a mutation occur
 - For each tag that diverges, or that exists locally but not on the downstream, it **enqueues a replication push** through the same handler and queue as the event path. Reconciliation does not push inline; it gets the same durable retry, backoff, dead-letter, and coalescing as live mutations.
 - By default reconciliation is **additive** (push-only) and never deletes. A downstream marked `prune = true` (an authoritative one-way mirror) is the exception: reconciliation also enumerates its tags via `list-tags` and **enqueues a delete** for any tag absent locally, so it converges exactly to the local tag set. Pruning is destructive and unsafe for active-active peers (it would remove a tag the peer authored that has not yet replicated back), so it is off by default.
 
-Running `--dry-run` reports the replication actions that would be taken without enqueuing anything: an `EnqueueReplicationPush` per diverging or downstream-missing tag, plus an `EnqueueReplicationDelete` per downstream-only tag on a `prune = true` downstream. Reconciliation is operator-driven (cron, Kubernetes CronJob, systemd timer); there is no in-server scheduler.
+Running `--dry-run` reports the replication actions that would be taken without enqueuing anything: an `EnqueueReplicationPush` per diverging or downstream-missing tag, plus an `EnqueueReplicationDelete` per downstream-only tag on a `prune = true` downstream. Reconciliation is operator-driven (Kubernetes CronJob, systemd timer, etc.); there is no in-server scheduler.
 
 ## Replication Modes
 

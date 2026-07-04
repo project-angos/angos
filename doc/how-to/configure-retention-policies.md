@@ -210,9 +210,31 @@ Retention policies are enforced by the `prune` command (`scrub --retention` is a
 
 ### Scheduled Enforcement
 
-**Cron:**
-```bash
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml prune
+**Systemd timer:**
+
+Create `/etc/systemd/system/registry-prune.service`:
+
+```ini
+[Unit]
+Description=Registry retention enforcement
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/angos -c /etc/registry/config.toml prune
+```
+
+Create `/etc/systemd/system/registry-prune.timer`, then enable it with `systemctl enable --now registry-prune.timer`:
+
+```ini
+[Unit]
+Description=Daily registry retention enforcement
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 ```
 
 **Kubernetes CronJob:**
