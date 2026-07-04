@@ -168,6 +168,8 @@ export function uploadConfirmKey(uuid: string): string {
 	return `upload:${uuid}`;
 }
 
+export const selectedUploadsConfirmKey = 'uploads:selected';
+
 const WELL_KNOWN_ANNOTATIONS: Record<string, string> = {
 	'org.opencontainers.image.created': 'created',
 	'org.opencontainers.image.authors': 'authors',

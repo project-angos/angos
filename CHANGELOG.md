@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.3.1
 
+### Added
+
+- The web UI upload list has per-row checkboxes and a select-all toggle, so many in-progress uploads can be cancelled in one action.
+
 ## Changed
 
 - Storage coordination now runs entirely on the metadata store: the blob store holds only blob bytes (its backend no longer carries `.tx-log/`/`.tx-bodies/` prefixes) and the in-process job queue persists on the metadata store.
