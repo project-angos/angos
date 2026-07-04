@@ -157,13 +157,14 @@ instead.
 
 **S3 metadata store requirements:** When `[metadata_store]` uses the S3 backend
 with the default `lock_strategy = "s3"`, the per-`lock_key` execution lock is
-held on an S3 object backed by conditional writes: the provider must support
-`put_if_none_match` and `put_if_match`. Endpoints that strip `ETag` from PUT
-responses are not supported; angos fails fast at startup rather than silently
-dropping jobs. Lock release uses `DELETE` with `If-Match: <etag>` on services
-that support it (the default); set `delete_if_match = false` under
-`[metadata_store.s3]` on endpoints without conditional delete to fall back to
-an unconditional `DELETE`.
+held on an S3 object backed by conditional requests: the provider must support
+the full conditional set (`PutObject` with `If-None-Match: *` and with
+`If-Match`, `DeleteObject` with `If-Match`). Endpoints that strip `ETag` from
+PUT responses are not supported. With an explicit `lock_strategy.s3`, angos
+fails fast at startup when any operation is missing; with an unset lock
+strategy it falls back to the in-process memory lock and refuses to start
+while `[global.job_queue]` is configured. On such providers use
+`[metadata_store.s3.lock_strategy.redis]` instead.
 
 **S3 LIST cost:** Each enqueue scans `_jobs/pending/cache/` for duplicate
 `lock_key`s. At the default `pending_refresh_interval_secs = 15` and with N

@@ -10,7 +10,8 @@ use angos_storage::{
 use angos_tx_engine::{
     error::Error as EngineError,
     lock::{
-        LockStrategy, resolve_lock_strategy, storage::redis::RedisLockStorageConfig as LockConfig,
+        LockStrategy, S3LockConfig, resolve_lock_strategy,
+        storage::redis::RedisLockStorageConfig as LockConfig,
     },
     probe::probe_cas_support,
     store::Store,
@@ -93,7 +94,8 @@ impl<'de> Deserialize<'de> for FsBackendConfig {
         }
 
         let raw = Raw::deserialize(deserializer)?;
-        let lock_strategy = resolve_lock_strategy(raw.lock_strategy, raw.redis, false)?;
+        let lock_strategy = resolve_lock_strategy(raw.lock_strategy, raw.redis, false)?
+            .unwrap_or(LockStrategy::Memory);
 
         Ok(FsBackendConfig {
             root_dir: raw.root_dir,
@@ -108,7 +110,10 @@ impl<'de> Deserialize<'de> for FsBackendConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct S3BackendConfig {
     pub connection: S3ConnectionConfig,
-    pub lock_strategy: LockStrategy,
+    /// Operator-configured lock backend. `None` means unset: the effective
+    /// strategy then follows the provider's conditional-write support (see
+    /// [`S3BackendConfig::resolved_lock_strategy`]).
+    pub lock_strategy: Option<LockStrategy>,
     pub link_cache_ttl: u64,
     pub access_time_debounce_secs: u64,
     /// Explicitly declare whether the provider supports the conditional
@@ -118,9 +123,9 @@ pub struct S3BackendConfig {
     ///
     /// When set, the startup probe is skipped entirely and the declared value
     /// is used. When absent, the probe runs automatically for S3 metadata
-    /// storage. With `lock_strategy = "memory"` or `"redis"`, set it to
-    /// `false` to skip the probe and force coordination through the
-    /// configured lock backend instead of S3 CAS.
+    /// storage. Set it to `false` to skip the probe and force coordination
+    /// through the configured lock backend instead of S3 CAS; with an unset
+    /// `lock_strategy` this also pins the default lock to `memory`.
     ///
     /// Set explicitly to avoid startup latency from probing, or for
     /// S3-compatible providers where probe results may be inaccurate.
@@ -134,10 +139,24 @@ impl Default for S3BackendConfig {
     fn default() -> Self {
         Self {
             connection: S3ConnectionConfig::default(),
-            lock_strategy: LockStrategy::Memory,
+            lock_strategy: None,
             link_cache_ttl: default_link_cache_ttl(),
             access_time_debounce_secs: default_access_time_debounce(),
             conditional_operations: None,
+        }
+    }
+}
+
+impl S3BackendConfig {
+    /// The effective lock strategy given the provider's conditional-write
+    /// support. An unset `lock_strategy` defaults to the S3 lock backend when
+    /// CAS is available, so coordination works across processes out of the
+    /// box; without CAS it falls back to the in-process memory lock.
+    pub fn resolved_lock_strategy(&self, cas: bool) -> LockStrategy {
+        match &self.lock_strategy {
+            Some(strategy) => strategy.clone(),
+            None if cas => LockStrategy::S3(S3LockConfig::default()),
+            None => LockStrategy::Memory,
         }
     }
 }
@@ -180,6 +199,8 @@ impl<'de> Deserialize<'de> for S3BackendConfig {
         }
 
         let raw = Raw::deserialize(deserializer)?;
+        // `None` (nothing configured) survives here: the effective default
+        // depends on CAS support, resolved at build time.
         let lock_strategy = resolve_lock_strategy(raw.lock_strategy, raw.redis, true)?;
         let conditional_operations = match (raw.conditional_operations, raw.capabilities) {
             (Some(_), Some(_)) => {
@@ -291,7 +312,9 @@ impl RegistryStorageConfig {
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
                 let storage = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
                 let cas = probe_cas_support(storage.as_ref()).await?;
-                Self::ensure_s3_cas_supported(&config.lock_strategy, cas)?;
+                if let Some(strategy) = &config.lock_strategy {
+                    Self::ensure_s3_cas_supported(strategy, cas)?;
+                }
                 Ok(Some(cas))
             }
             RegistryStorageConfig::FS(_) => Ok(None),
@@ -333,15 +356,13 @@ impl RegistryStorageConfig {
                 Store::new(object, None, config.lock_strategy.clone(), None)?
             }
             RegistryStorageConfig::S3(config) => {
-                info!(
-                    "Using S3 storage backend with lock_strategy={:?}",
-                    config.lock_strategy
-                );
                 let cas = match config.conditional_operations {
                     Some(declared) => declared,
                     None => self.probe().await?.unwrap_or_default(),
                 };
-                Self::ensure_s3_cas_supported(&config.lock_strategy, cas)?;
+                let lock_strategy = config.resolved_lock_strategy(cas);
+                Self::ensure_s3_cas_supported(&lock_strategy, cas)?;
+                info!("Using S3 storage backend with lock_strategy={lock_strategy:?}");
 
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
                 let backend = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
@@ -349,7 +370,7 @@ impl RegistryStorageConfig {
                 let conditional_store: Option<Arc<dyn ConditionalStore>> =
                     cas.then_some(backend as Arc<dyn ConditionalStore>);
 
-                let s3_lock_store: Option<Arc<dyn ConditionalStore>> = match &config.lock_strategy {
+                let s3_lock_store: Option<Arc<dyn ConditionalStore>> = match &lock_strategy {
                     LockStrategy::S3(s3_lock_config) => {
                         let lock_http = S3HttpBackend::new(
                             &config.connection.to_lock_client_config(s3_lock_config),
@@ -360,12 +381,7 @@ impl RegistryStorageConfig {
                     LockStrategy::Redis(_) | LockStrategy::Memory => None,
                 };
 
-                Store::new(
-                    object,
-                    conditional_store,
-                    config.lock_strategy.clone(),
-                    s3_lock_store,
-                )?
+                Store::new(object, conditional_store, lock_strategy, s3_lock_store)?
             }
         };
 
@@ -380,9 +396,8 @@ mod tests {
         registry::{blob_store, s3_connection::S3ConnectionConfig, test_utils::s3_test_connection},
         secret::Secret,
     };
-    use angos_tx_engine::lock::S3LockConfig;
 
-    fn s3_config_with_lock_strategy(lock_strategy: LockStrategy) -> RegistryStorageConfig {
+    fn s3_config_with_lock_strategy(lock_strategy: Option<LockStrategy>) -> RegistryStorageConfig {
         RegistryStorageConfig::S3(S3BackendConfig {
             connection: s3_test_connection(format!("probe-test-{}", uuid::Uuid::new_v4())),
             lock_strategy,
@@ -394,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_s3_lock_strategy_detects_s3_capabilities() {
-        let config = s3_config_with_lock_strategy(LockStrategy::S3(S3LockConfig::default()));
+        let config = s3_config_with_lock_strategy(Some(LockStrategy::S3(S3LockConfig::default())));
         let result = config.probe().await;
         assert!(
             result.is_ok(),
@@ -409,7 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_memory_lock_strategy_detects_capabilities() {
-        let config = s3_config_with_lock_strategy(LockStrategy::Memory);
+        let config = s3_config_with_lock_strategy(Some(LockStrategy::Memory));
         let result = config.probe().await;
         assert!(
             result.is_ok(),
@@ -595,5 +610,34 @@ mod tests {
         let cfg: S3BackendConfig =
             toml::from_str(&s3_toml_with("conditional_operations = false")).expect("deserialize");
         assert_eq!(cfg.conditional_operations, Some(false));
+    }
+
+    #[test]
+    fn unset_lock_strategy_resolves_from_cas_support() {
+        let cfg: S3BackendConfig = toml::from_str(&s3_toml_with("")).expect("deserialize");
+        assert_eq!(cfg.lock_strategy, None);
+        assert_eq!(
+            cfg.resolved_lock_strategy(true),
+            LockStrategy::S3(S3LockConfig::default())
+        );
+        assert_eq!(cfg.resolved_lock_strategy(false), LockStrategy::Memory);
+    }
+
+    #[test]
+    fn explicit_lock_strategy_wins_over_cas_default() {
+        let cfg: S3BackendConfig =
+            toml::from_str(&s3_toml_with(r#"lock_strategy = "memory""#)).expect("deserialize");
+        assert_eq!(cfg.resolved_lock_strategy(true), LockStrategy::Memory);
+    }
+
+    #[tokio::test]
+    async fn test_build_store_defaults_to_s3_lock_when_cas_is_supported() {
+        let config = s3_config_with_lock_strategy(None);
+        let store = config.build_store().await.expect("build store");
+        assert_eq!(
+            store.lock_backend(),
+            "s3",
+            "a CAS-capable provider with no configured lock strategy must default to the S3 lock"
+        );
     }
 }

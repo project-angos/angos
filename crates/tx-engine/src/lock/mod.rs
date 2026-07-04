@@ -262,9 +262,11 @@ pub enum LockStrategy {
     S3(S3LockConfig),
 }
 
-/// Resolve the active [`LockStrategy`] from operator config, applying
+/// Resolve the configured [`LockStrategy`] from operator config, applying
 /// precedence rules and validating constraints.
 ///
+/// Returns `Ok(None)` when the operator configured nothing; the caller picks
+/// the backend-appropriate default (memory for FS, CAS-dependent for S3).
 /// Returns a `serde::de::Error` for any configuration conflict so this
 /// function can be called from a custom `Deserialize` impl.
 ///
@@ -282,7 +284,7 @@ pub fn resolve_lock_strategy<E: serde::de::Error>(
     #[cfg(feature = "redis")] redis: Option<storage::redis::RedisLockStorageConfig>,
     #[cfg(not(feature = "redis"))] redis: Option<()>,
     allow_s3: bool,
-) -> Result<LockStrategy, E> {
+) -> Result<Option<LockStrategy>, E> {
     match (lock_strategy, redis) {
         (Some(_), Some(_)) => Err(E::custom(
             "cannot set both 'lock_strategy' and 'redis'; use lock_strategy.redis instead",
@@ -290,13 +292,13 @@ pub fn resolve_lock_strategy<E: serde::de::Error>(
         (Some(LockStrategy::S3(_)), None) if !allow_s3 => Err(E::custom(
             "S3 lock strategy is not supported for filesystem metadata store",
         )),
-        (Some(strategy), None) => Ok(strategy),
+        (Some(strategy), None) => Ok(Some(strategy)),
         #[cfg(feature = "redis")]
-        (None, Some(redis_config)) => Ok(LockStrategy::Redis(redis_config)),
+        (None, Some(redis_config)) => Ok(Some(LockStrategy::Redis(redis_config))),
         #[cfg(not(feature = "redis"))]
         (None, Some(_)) => Err(E::custom(
             "redis lock strategy requested but the 'redis' feature is not enabled",
         )),
-        (None, None) => Ok(LockStrategy::Memory),
+        (None, None) => Ok(None),
     }
 }

@@ -247,6 +247,7 @@ impl WorkerContext {
         }
 
         let storage = config.resolve_registry_storage().build_store().await?;
+        job_store::ensure_shared_lock(&storage)?;
 
         // Spawn the engine maintenance loops once per worker process so any
         // crashed-mid-Apply transactions are recovered and orphan body

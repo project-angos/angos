@@ -93,12 +93,14 @@ section accepts only the two tunables below.
 
 > **A shared lock strategy is required.** The durable queue is drained by
 > separate processes, so the per-job execution lock must be shared across them.
-> The default in-process `memory` lock cannot coordinate across processes, so
+> On an S3 metadata store whose provider supports conditional operations this
+> holds by default: the unset lock strategy resolves to the shared S3 lock.
+> The in-process `memory` lock cannot coordinate across processes, so
 > `[global.job_queue]` combined with a `memory` lock strategy is **rejected at
-> startup**. Configure the metadata store with `[metadata_store.s3.lock_strategy.s3]`
-> (S3 CAS) or `[metadata_store.s3.lock_strategy.redis]` / `[metadata_store.fs.lock_strategy.redis]`
-> (Redis), or omit `[global.job_queue]` to use
-> the single-process in-process queue.
+> startup**. On providers without conditional operations and on filesystem
+> metadata stores, configure `[metadata_store.s3.lock_strategy.redis]` /
+> `[metadata_store.fs.lock_strategy.redis]` (Redis), or omit
+> `[global.job_queue]` to use the single-process in-process queue.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -230,7 +232,7 @@ Same connection options as `blob_store.s3`, plus:
 |-----------------------------|--------------|------------|-----------------------------------------------------------------------------|
 | `link_cache_ttl`            | u64          | `30`       | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
 | `access_time_debounce_secs` | u64          | `60`       | Buffer access time writes and flush periodically, in seconds (0 to disable) |
-| `lock_strategy`             | string/table | `"memory"` | Lock backend: `"memory"` (string), or `[lock_strategy.s3]`/`[lock_strategy.redis]` (table form, see below) |
+| `lock_strategy`             | string/table | see below  | Lock backend: `"memory"` (string), or `[lock_strategy.s3]`/`[lock_strategy.redis]` (table form, see below). Unset: `s3` when the provider supports conditional operations, `memory` otherwise |
 | `conditional_operations`        | bool         | -          | Declares provider support for the conditional operations Angos coordinates with; omit to probe at startup (see below) |
 
 The link cache reduces S3 round-trips for repeated tag/layer reads. The access time debounce batches `last_pulled_at` timestamp writes in memory and flushes them periodically, reducing the critical-path operations per manifest pull from 4 (lock, read, write, unlock) to 1 (read).
@@ -242,8 +244,9 @@ When using S3 as the metadata store, you can declare whether your S3-compatible 
 **Probe behavior:**
 - When `conditional_operations` is omitted, the probe runs at startup (and on each config reload that has no cached value); the probed verdict is cached for subsequent reloads. The probe verifies each operation, including that the provider actually enforces the conditions and surfaces ETags.
 - When `conditional_operations` is set, the startup probe is skipped. The declared value is validated against the lock strategy's requirements (`lock_strategy = "s3"` requires `true`).
+- When `lock_strategy` is unset, the resolved value also selects the default lock backend: the shared S3 lock when `true`, the in-process `memory` lock when `false`.
 - With `lock_strategy = "memory"` or `"redis"`, `conditional_operations = true` is used only for blob-index shard updates. Link updates still use the configured lock backend.
-- To avoid S3 CAS entirely with `lock_strategy = "memory"` or `"redis"`, set `conditional_operations = false`.
+- To avoid S3 CAS entirely, set `conditional_operations = false`; combine with `lock_strategy = "redis"` for multi-replica deployments.
 - The `[metadata_store.s3.capabilities]` table (booleans `put_if_none_match`, `put_if_match`, `delete_if_match`) is deprecated but still accepted; it maps to `conditional_operations = true` only when all three flags are `true`. Setting both keys is rejected.
 
 **Example with explicit declaration (AWS S3, Exoscale SOS):**
@@ -287,14 +290,14 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 
 > **Note:** `lock_strategy = "s3"` selects the CAS-based coordinator and requires the provider to support the full conditional set (`If-None-Match` and `If-Match` on PUT, `If-Match` on DELETE); startup fails fast if any is missing. `lock_strategy = "memory"` and `"redis"` select the lock coordinator, but Angos still uses conditional writes for blob-index shard updates when available.
 
-**Memory** (default) uses in-process locks, suitable for single-instance deployments only:
+**Memory** uses in-process locks, suitable for single-instance deployments only. It is the default for filesystem metadata stores and for S3 providers without conditional-operation support:
 
 ```toml
 [metadata_store.s3]
 lock_strategy = "memory"
 ```
 
-**S3** uses S3 conditional requests for distributed locking without extra infrastructure: `If-None-Match: *` to acquire, `If-Match` on PUT to refresh, and `If-Match` on DELETE to release, so an instance can only ever remove its own lock object. Angos verifies the full set at startup and fails fast if any operation is missing:
+**S3** uses S3 conditional requests for distributed locking without extra infrastructure: `If-None-Match: *` to acquire, `If-Match` on PUT to refresh, and `If-Match` on DELETE to release, so an instance can only ever remove its own lock object. It is the default when the provider supports the full conditional set; Angos verifies the set at startup and fails fast if the strategy is selected explicitly and any operation is missing:
 
 ```toml
 # With defaults (empty table body; all fields use defaults)

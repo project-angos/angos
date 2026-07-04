@@ -159,9 +159,9 @@ Update any clients of the old `/v2/_ext/...` endpoints to the new `/_ext/...` pa
 
 #### What Changed
 
-A configuration that declares `[global.job_queue]` while the metadata store uses the default in-process `memory` lock strategy is now rejected at process boot (during config load and validation). The check fires only when `[global.job_queue]` is present; configurations without it (the in-process queue) are unaffected.
+A configuration that declares `[global.job_queue]` while the metadata store effectively uses the in-process `memory` lock strategy is now rejected at process boot (during config load and validation, or at startup once the provider probe resolves). The check fires only when `[global.job_queue]` is present; configurations without it (the in-process queue) are unaffected.
 
-**Who is affected:** Deployments that enabled the durable out-of-process queue with `[global.job_queue]` but left `lock_strategy` at its default. `memory` is the default lock, so a 1.2.0 durable-queue config that omitted `lock_strategy` booted on 1.2.0 (which had no such check) but fails to boot after upgrade. The boot failure reports:
+**Who is affected:** Deployments that enabled the durable out-of-process queue with `[global.job_queue]` but left `lock_strategy` unset on a filesystem metadata store or on an S3 provider without conditional-operation support; there the lock falls back to in-process `memory`, so a 1.2.0 durable-queue config that omitted `lock_strategy` booted on 1.2.0 (which had no such check) but fails to boot after upgrade. On S3 providers with conditional-operation support, an unset `lock_strategy` defaults to the shared S3 lock and such configs keep booting. The boot failure reports:
 
 ```text
 [global.job_queue] needs a shared lock strategy so workers serialize on the same jobs across processes; the in-process 'memory' lock cannot coordinate across processes. Set the metadata store's lock_strategy to "s3" or "redis", or remove [global.job_queue] to use the in-process queue.

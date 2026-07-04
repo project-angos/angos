@@ -119,17 +119,6 @@ impl Store {
         lock_strategy: LockStrategy,
         s3_lock_store: Option<Arc<dyn ConditionalStore>>,
     ) -> Result<Self, Error> {
-        // Capture a stable label for the lock-object backend before the match
-        // below moves `lock_strategy`. Logged alongside the executor choice so
-        // operators are not misled into reading the lock strategy as the
-        // coordination path: both executors share this backend.
-        let lock_backend = match &lock_strategy {
-            LockStrategy::Memory => "memory",
-            #[cfg(feature = "redis")]
-            LockStrategy::Redis(_) => "redis",
-            LockStrategy::S3(_) => "s3",
-        };
-
         // Each arm yields the lock-object storage plus a `LockBuilder` primed
         // with the per-strategy tuning carried in the strategy config. The
         // tuning is threaded directly into the builder (never stored as a
@@ -170,6 +159,10 @@ impl Store {
                 .build()
                 .map_err(|e| Error::Build(format!("failed to build lock: {e}")))?,
         );
+        // Logged alongside the executor choice so operators are not misled
+        // into reading the lock strategy as the coordination path: both
+        // executors share this backend.
+        let lock_backend = lock.storage_label();
 
         // The conditional store is retained so `maintenance` replays stale
         // intents and reaps cold locks with the same primitives the executor
@@ -201,6 +194,13 @@ impl Store {
             lock,
             conditional: None,
         })
+    }
+
+    /// Label of the lock-object backend in use (`"memory"`, `"redis"`, or
+    /// `"s3"`). `"memory"` means the lock cannot coordinate across processes.
+    #[must_use]
+    pub fn lock_backend(&self) -> &'static str {
+        self.lock.storage_label()
     }
 
     /// The engine maintenance loops (recovery, body janitor, lock janitor)

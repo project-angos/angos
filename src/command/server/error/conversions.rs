@@ -4,7 +4,7 @@ use crate::{
     command::{bootstrap, server::error::Error},
     configuration::{self, registry_storage},
     event_webhook, registry,
-    registry::blob_store,
+    registry::{blob_store, job_store},
     replication::REPLICATION_SUPERSEDED_CODE,
 };
 
@@ -119,6 +119,12 @@ impl From<registry_storage::Error> for Error {
 impl From<blob_store::Error> for Error {
     fn from(_: blob_store::Error) -> Self {
         Error::Initialization("Failed to initialize blob store".to_string())
+    }
+}
+
+impl From<job_store::Error> for Error {
+    fn from(e: job_store::Error) -> Self {
+        Error::Initialization(e.to_string())
     }
 }
 
