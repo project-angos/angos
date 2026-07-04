@@ -476,7 +476,9 @@ When using S3 for metadata, Angos includes several optimizations to reduce round
 
 In single-instance deployments, in-memory cache is sufficient. In multi-instance deployments, each instance maintains its own in-memory cache, so a write on instance A is not visible to instance B until the TTL expires. For consistency, use a shared Redis cache: when instance A writes a tag, all instances see the updated entry immediately.
 
-**Deferred access time updates**: Instead of a synchronous lock-read-write-unlock cycle on every manifest pull, access time updates are buffered in memory and flushed periodically. Configurable interval (default 60 s, `access_time_debounce_secs = 0` to disable). This reduces the critical path per pull from 4 S3 operations to 1. In multi-instance deployments, each instance maintains its own buffer, so access times may lag behind actual pulls and can be overwritten by concurrent instances (last writer wins).
+**Access time updates**: With CAS coordination, every recording pull stamps the access time inline: one read plus one conditional write, and a stamp losing the race to a concurrent writer is a no-op. No buffering is involved and `access_time_debounce_secs` is ignored.
+
+Without CAS, a synchronous stamp would be a lock-read-write-unlock cycle on every manifest pull, so access time updates are instead buffered in memory and flushed periodically. Configurable interval (default 60 s, `access_time_debounce_secs = 0` to disable). This reduces the critical path per pull from 4 S3 operations to 1. In multi-instance deployments, each instance maintains its own buffer, so access times may lag behind actual pulls and can be overwritten by concurrent instances (last writer wins).
 
 ```toml
 [metadata_store.s3]
@@ -493,9 +495,9 @@ For retention policies that use `last_pulled_at`, set thresholds in **days rathe
 rules = ["manifest.last_pulled_at < now() - days(30)"]
 ```
 
-When using S3 locking, **never set `access_time_debounce_secs = 0`** in production. This disables buffering and causes every manifest pull to acquire and release a lock, which is expensive. Use the default 60 seconds or higher.
+On lock-coordinated deployments (no CAS), **never set `access_time_debounce_secs = 0`** in production. This disables buffering and causes every manifest pull to acquire and release a lock, which is expensive. Use the default 60 seconds or higher.
 
-**Note on `lock_strategy = "redis"`:** With Redis as the lock strategy, access-time flushes always go through Redis locking, even when the S3 provider supports conditional writes (`put_if_match`). On AWS S3 or Exoscale SOS, `lock_strategy = "s3"` (the CAS coordinator, and the default there) is more efficient: each access-time flush is a single conditional S3 PUT instead of a Redis round-trip plus two S3 calls. `lock_strategy = "redis"` remains the right choice when running multi-replica on a provider that lacks conditional writes, or when Redis is already deployed for other reasons.
+**Note on `lock_strategy = "redis"`:** Redis coordinates access-time writes only when the provider's conditional operations are unavailable or disabled (`conditional_operations = false`); with CAS available, access times stamp inline through conditional writes regardless of the lock strategy. `lock_strategy = "redis"` remains the right choice when running multi-replica on a provider that lacks conditional writes, or when Redis is already deployed for other reasons.
 
 #### Blob Index Sharding
 

@@ -1,3 +1,11 @@
+//! Access-time recording: every path that stamps a link's `accessed_at`
+//! lives here.
+//!
+//! CAS deployments stamp inline with a single conditional write whose lost
+//! races are no-ops. Lock-coordinated deployments either buffer stamps in
+//! [`AccessTimeWriter`] and flush them periodically (debounce configured) or
+//! stamp inline with a read-modify-write transaction (debounce disabled).
+
 use std::{
     collections::HashMap,
     sync::{
@@ -10,10 +18,11 @@ use std::{
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use tokio::{spawn, sync::Mutex, time::sleep};
-use tracing::warn;
+use tracing::{info, instrument, warn};
 
 use angos_tx_engine::{
-    error::Error as TxError, executor::DEFAULT_RETRY_BUDGET, transaction::Mutation,
+    StorageError, error::Error as TxError, executor::DEFAULT_RETRY_BUDGET, store::Store,
+    transaction::Mutation,
 };
 
 use crate::{
@@ -24,7 +33,58 @@ use crate::{
     },
 };
 
-// Access-time write debouncing
+// Build-time wiring
+
+/// Access-time wiring decided at build time. CAS deployments stamp inline,
+/// so no writer is spun up and a configured debounce is ignored;
+/// lock-coordinated deployments with a debounce get the writer plus its
+/// background flush task.
+pub fn build_writer(
+    store: &Arc<Store>,
+    link_cache_ttl: u64,
+    debounce_secs: u64,
+) -> (Option<AccessTimeWriter>, Option<Arc<FlushHandle>>) {
+    if store.cas_enabled() {
+        if debounce_secs > 0 {
+            info!("Access-time debounce ignored: CAS deployments stamp access times inline");
+        }
+        return (None, None);
+    }
+    if debounce_secs == 0 {
+        return (None, None);
+    }
+
+    let writer = AccessTimeWriter::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let flush_backend = MetadataStore {
+        store: store.clone(),
+        cache: None,
+        link_cache_ttl,
+        access_time_writer: Some(writer.clone()),
+        _flush_handle: None,
+    };
+    spawn_flush_task(
+        flush_backend,
+        shutdown.clone(),
+        Duration::from_secs(debounce_secs),
+    );
+
+    (Some(writer), Some(Arc::new(FlushHandle::new(shutdown))))
+}
+
+fn spawn_flush_task(flush_backend: MetadataStore, shutdown: Arc<AtomicBool>, interval: Duration) {
+    spawn(async move {
+        loop {
+            sleep(interval).await;
+            flush_backend.flush_access_times().await;
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+        }
+    });
+}
+
+// Access-time write debouncing (lock-coordinated deployments)
 
 #[derive(Clone)]
 pub struct AccessTimeWriter {
@@ -78,21 +138,107 @@ impl Drop for FlushHandle {
     }
 }
 
+// Recording reads
+
 impl MetadataStore {
-    pub fn spawn_flush_task(
-        flush_backend: MetadataStore,
-        shutdown: Arc<AtomicBool>,
-        interval: Duration,
-    ) {
-        spawn(async move {
-            loop {
-                sleep(interval).await;
-                flush_backend.flush_access_times().await;
-                if shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-            }
-        });
+    /// Like [`MetadataStore::read_link`] but records the link's access time.
+    /// On CAS deployments the stamp is a single conditional write on the etag
+    /// just read; otherwise it is deferred via the debounce writer when
+    /// configured, else stamped inline with a read-modify-write transaction.
+    /// The manifest pull path uses this when pull-time tracking is enabled.
+    #[instrument(skip(self))]
+    pub async fn read_link_recording_access(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+    ) -> Result<LinkMetadata, Error> {
+        if self.store().cas_enabled() {
+            let link_data = self.stamp_link_access_time(namespace, link).await?;
+            self.cache_put(namespace, link, &link_data).await;
+            return Ok(link_data);
+        }
+        let Some(writer) = &self.access_time_writer else {
+            let link_data = self.update_link_access_time(namespace, link).await?;
+            self.cache_put(namespace, link, &link_data).await;
+            return Ok(link_data);
+        };
+        let link_data = self.read_link(namespace, link).await?;
+        writer.record(namespace, link).await;
+        Ok(link_data)
+    }
+
+    pub async fn flush_access_times(&self) {
+        if let Some(writer) = &self.access_time_writer {
+            writer.flush(self).await;
+        }
+    }
+
+    /// Stamp the access time with one conditional write on the etag just
+    /// read. Access times are advisory, so a concurrent writer winning the
+    /// race drops this stamp as a no-op; there is nothing to retry.
+    async fn stamp_link_access_time(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+    ) -> Result<LinkMetadata, Error> {
+        let link_path = path_builder::link_path(link, namespace);
+        self.store()
+            .update_advisory(&link_path, |body| {
+                let link_data = LinkMetadata::from_bytes(body.to_vec())
+                    .map_err(|e| TxError::Build(e.to_string()))?
+                    .accessed();
+                let serialized =
+                    Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
+                Ok((serialized, link_data))
+            })
+            .await
+            .map_err(tx_error_to_meta)
+    }
+
+    /// Mark the access time for `link` in `namespace` using a read-modify-write
+    /// transaction, returning the updated [`LinkMetadata`]. Concurrent updaters
+    /// resolve via content-hash conflict detection (last writer wins), which is
+    /// fine for advisory access-time stamps.
+    async fn update_link_access_time(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+    ) -> Result<LinkMetadata, Error> {
+        let link_path = path_builder::link_path(link, namespace);
+        let keys = [link_path.clone()];
+
+        let (_, link_data) = self
+            .store()
+            .update_with_payload(
+                &keys,
+                |snaps| {
+                    let link_path = link_path.clone();
+                    async move {
+                        let snap = &snaps[0];
+                        if !snap.present {
+                            return Err(TxError::Storage(StorageError::NotFound));
+                        }
+                        let link_data = LinkMetadata::from_bytes(snap.body.to_vec())
+                            .map_err(|e| TxError::Build(e.to_string()))?
+                            .accessed();
+                        let serialized =
+                            Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
+                        Ok((
+                            vec![Mutation::Put {
+                                key: link_path,
+                                body: serialized,
+                                expected: None,
+                            }],
+                            link_data,
+                        ))
+                    }
+                },
+                DEFAULT_RETRY_BUDGET,
+            )
+            .await
+            .map_err(tx_error_to_meta)?;
+
+        Ok(link_data)
     }
 
     /// Flush a single access-time update via a read-modify-write transaction.
@@ -100,7 +246,7 @@ impl MetadataStore {
     /// A content-hash read guard lets a concurrent writer's fresher timestamp win
     /// on conflict; access times are advisory, so a `Conflict` after the retry
     /// budget is silently discarded.
-    pub async fn flush_one_access_time(
+    async fn flush_one_access_time(
         &self,
         namespace: &Namespace,
         link: &LinkKind,

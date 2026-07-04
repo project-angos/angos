@@ -421,7 +421,7 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
     let mut cfg = config.clone();
     cfg.access_time_debounce_secs = 60;
     let cache = Arc::new(CacheEnum::Memory(CacheMemoryBackend::new()));
-    let backend = cfg.to_backend(true, Some(cache.clone())).unwrap();
+    let backend = cfg.to_backend(false, Some(cache.clone())).unwrap();
     let namespace = Namespace::new("cache-debounce-hit-ns").unwrap();
     let digest =
         Digest::from_str("sha256:db01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6")
@@ -459,5 +459,92 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
     assert!(
         !pending.is_empty(),
         "writer.record() should have been called even on cache hit"
+    );
+}
+
+/// CAS deployments stamp inline with a conditional write, so the configured
+/// debounce is ignored and the stamp is visible in storage immediately.
+#[tokio::test]
+async fn test_cas_ignores_debounce_and_stamps_inline() {
+    let config = test_config();
+    let mut cfg = config.clone();
+    cfg.access_time_debounce_secs = 60;
+    let backend = cfg.to_backend(true, None).unwrap();
+    let namespace = Namespace::new("cas-inline-stamp").unwrap();
+    let digest =
+        Digest::from_str("sha256:ca01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6")
+            .unwrap();
+    let tag = LinkKind::Tag(Tag::new("cas-v1").unwrap());
+
+    let ops = vec![LinkOperation::Create {
+        link: tag.clone(),
+        target: digest.clone(),
+        referrer: None,
+        media_type: None,
+        descriptor: None,
+    }];
+    backend.update_links(&namespace, &ops).await.unwrap();
+
+    assert!(
+        backend.access_time_writer.is_none(),
+        "CAS deployments must not spin up the debounce writer"
+    );
+
+    let meta = backend
+        .read_link_recording_access(&namespace, &tag)
+        .await
+        .unwrap();
+    assert_eq!(meta.target, digest);
+    assert!(
+        meta.accessed_at.is_some(),
+        "the returned metadata should carry the fresh stamp"
+    );
+
+    let raw = backend.read_link_reference(&namespace, &tag).await.unwrap();
+    assert!(
+        raw.accessed_at.is_some(),
+        "the stamp must be visible in storage immediately, without any flush"
+    );
+}
+
+/// Concurrent CAS stamps race on the same etag; losers no-op instead of
+/// retrying or failing, and every read still succeeds.
+#[tokio::test]
+async fn test_cas_concurrent_stamps_lose_races_silently() {
+    let config = test_config();
+    let backend = config.to_backend(true, None).unwrap();
+    let namespace = Namespace::new("cas-stamp-race").unwrap();
+    let digest =
+        Digest::from_str("sha256:ca02b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1")
+            .unwrap();
+    let tag = LinkKind::Tag(Tag::new("cas-race").unwrap());
+
+    let ops = vec![LinkOperation::Create {
+        link: tag.clone(),
+        target: digest.clone(),
+        referrer: None,
+        media_type: None,
+        descriptor: None,
+    }];
+    backend.update_links(&namespace, &ops).await.unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let backend = backend.clone();
+        let namespace = namespace.clone();
+        let tag = tag.clone();
+        handles.push(tokio::spawn(async move {
+            backend.read_link_recording_access(&namespace, &tag).await
+        }));
+    }
+    for handle in handles {
+        let meta = handle.await.unwrap().unwrap();
+        assert_eq!(meta.target, digest);
+    }
+
+    let raw = backend.read_link_reference(&namespace, &tag).await.unwrap();
+    assert!(
+        raw.accessed_at.is_some(),
+        "at least one racing stamp must have landed"
     );
 }

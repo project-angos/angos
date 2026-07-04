@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - On an S3 metadata store, an unset `lock_strategy` now defaults to the shared S3 lock when the provider supports conditional operations, instead of the in-process memory lock.
+- With CAS coordination, access times are now stamped inline as a single conditional write whose lost races are no-ops; `access_time_debounce_secs` only applies to lock-coordinated deployments.
 
 ### Fixed
 

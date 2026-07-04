@@ -101,10 +101,12 @@ pub fn test_backend_with_cache(config: &TestS3Config) -> (MetadataStore, Arc<Cac
     (backend, cache)
 }
 
+/// Debounce applies to lock-coordinated deployments only (CAS stamps access
+/// times inline), so this builds without conditional operations.
 pub fn test_backend_with_debounce(config: &TestS3Config, debounce_secs: u64) -> MetadataStore {
     let mut cfg = config.clone();
     cfg.access_time_debounce_secs = debounce_secs;
-    cfg.to_backend(true, None).unwrap()
+    cfg.to_backend(false, None).unwrap()
 }
 
 pub fn legacy_blob_index_with(entries: Vec<(&str, Vec<LinkKind>)>) -> BlobIndex {

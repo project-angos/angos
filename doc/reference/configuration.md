@@ -231,11 +231,11 @@ Same connection options as `blob_store.s3`, plus:
 | Option                      | Type         | Default    | Description                                                                 |
 |-----------------------------|--------------|------------|-----------------------------------------------------------------------------|
 | `link_cache_ttl`            | u64          | `30`       | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
-| `access_time_debounce_secs` | u64          | `60`       | Buffer access time writes and flush periodically, in seconds (0 to disable) |
+| `access_time_debounce_secs` | u64          | `60`       | Buffer access time writes and flush periodically, in seconds (0 to disable). Lock-coordinated deployments only; ignored with CAS |
 | `lock_strategy`             | string/table | see below  | Lock backend: `"memory"` (string), or `[lock_strategy.s3]`/`[lock_strategy.redis]` (table form, see below). Unset: `s3` when the provider supports conditional operations, `memory` otherwise |
 | `conditional_operations`        | bool         | -          | Declares provider support for the conditional operations Angos coordinates with; omit to probe at startup (see below) |
 
-The link cache reduces S3 round-trips for repeated tag/layer reads. The access time debounce batches `last_pulled_at` timestamp writes in memory and flushes them periodically, reducing the critical-path operations per manifest pull from 4 (lock, read, write, unlock) to 1 (read).
+The link cache reduces S3 round-trips for repeated tag/layer reads. On lock-coordinated deployments, the access time debounce batches `last_pulled_at` timestamp writes in memory and flushes them periodically, reducing the critical-path operations per manifest pull from 4 (lock, read, write, unlock) to 1 (read). With CAS, every pull stamps the access time inline with one conditional write (a lost race is a no-op) and the debounce setting is ignored.
 
 #### Conditional Operations (`metadata_store.s3.conditional_operations`)
 
@@ -274,7 +274,7 @@ conditional_operations = false
 - Under `lock_strategy = "memory"` or `"redis"`, `conditional_operations = true` lets Angos update blob-index shards with optimistic concurrency while the lock coordinator still protects link metadata.
 - `conditional_operations = false` keeps blob-index updates on the configured lock backend. This is valid for `lock_strategy = "memory"` or `"redis"`, but not for `lock_strategy = "s3"`.
 
-> **Warning:** Setting `access_time_debounce_secs = 0` with S3 lock strategy causes every manifest pull to perform a full lock-acquire → read → write → release cycle via S3 API. At scale with many concurrent pulls, this adds significant latency and S3 API costs. Keep the default value of 60 or higher for S3-locked deployments, or disable access time tracking entirely if not needed for retention policies.
+> **Warning:** On lock-coordinated deployments, setting `access_time_debounce_secs = 0` causes every manifest pull to perform a full lock-acquire → read → write → release cycle. At scale with many concurrent pulls, this adds significant latency and API costs. Keep the default value of 60 or higher there, or disable access time tracking entirely if not needed for retention policies. CAS deployments are unaffected: they ignore the knob and stamp inline with a single conditional write.
 
 ### Distributed Locking
 

@@ -203,6 +203,14 @@ impl Store {
         self.lock.storage_label()
     }
 
+    /// `true` when writes coordinate through storage-level conditional
+    /// operations (the CAS executor), making [`Store::update_advisory`]
+    /// available.
+    #[must_use]
+    pub fn cas_enabled(&self) -> bool {
+        self.conditional.is_some()
+    }
+
     /// The engine maintenance loops (recovery, body janitor, lock janitor)
     /// joined into a single future that runs until `cancellation` fires. The
     /// caller decides where it runs (typically `tokio::spawn`); spawn it once
@@ -517,6 +525,44 @@ impl Store {
         execute_with_retry_payload(self.executor.as_ref(), build, max_attempts).await
     }
 
+    /// Single-shot advisory read-modify-write on one key, bypassing the
+    /// transaction pipeline: one read with its etag plus one conditional
+    /// write. Only available on CAS deployments (see [`Store::cas_enabled`]).
+    ///
+    /// Advisory state tolerates lost updates, so a concurrent writer winning
+    /// the race (etag mismatch) drops this write as a successful no-op, and a
+    /// backend that surfaces no etag skips the write entirely rather than
+    /// clobbering unconditionally. `map`'s payload is returned either way.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Build`] when the store has no conditional backend, `map`'s
+    /// error, or a storage error from the read or write, including
+    /// `NotFound` when `key` is absent.
+    pub async fn update_advisory<F, T>(&self, key: &str, map: F) -> Result<T, Error>
+    where
+        F: FnOnce(Bytes) -> Result<(Bytes, T), Error> + Send,
+        T: Send,
+    {
+        let Some(conditional) = &self.conditional else {
+            return Err(Error::Build(
+                "advisory update requires the CAS executor".to_string(),
+            ));
+        };
+        let (body, etag) = conditional
+            .get_with_etag(key)
+            .await
+            .map_err(Error::Storage)?;
+        let (mapped, payload) = map(Bytes::from(body))?;
+        if let Some(etag) = etag {
+            match conditional.put_if_match(key, &etag, mapped).await {
+                Ok(_) | Err(StorageError::PreconditionFailed) => {}
+                Err(e) => return Err(Error::Storage(e)),
+            }
+        }
+        Ok(payload)
+    }
+
     // Upload lifecycle
 
     /// Begin/clear a fresh upload at `key` (discards any leaked prior upload).
@@ -600,6 +646,7 @@ mod tests {
     use angos_storage::{Error as StorageError, MemoryObjectStore};
 
     use crate::{
+        error::Error,
         lock::LockStrategy,
         store::Store,
         transaction::{Mutation, Transaction},
@@ -607,6 +654,10 @@ mod tests {
 
     fn store_over(backend: Arc<MemoryObjectStore>) -> Store {
         Store::new(backend, None, LockStrategy::Memory, None).expect("store")
+    }
+
+    fn cas_store_over(backend: Arc<MemoryObjectStore>) -> Store {
+        Store::new(backend.clone(), Some(backend), LockStrategy::Memory, None).expect("store")
     }
 
     #[tokio::test]
@@ -670,6 +721,87 @@ mod tests {
         let snap = store.read_for_update("missing").await.expect("snapshot");
         assert!(!snap.present);
         assert!(snap.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_advisory_writes_and_returns_payload() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        let store = cas_store_over(backend);
+        store
+            .put("k", Bytes::from_static(b"v1"))
+            .await
+            .expect("seed");
+
+        let payload = store
+            .update_advisory("k", |body| {
+                assert_eq!(&body[..], b"v1");
+                Ok((Bytes::from_static(b"v2"), "payload"))
+            })
+            .await
+            .expect("advisory update");
+
+        assert_eq!(payload, "payload");
+        assert_eq!(store.get("k").await.expect("get"), b"v2");
+    }
+
+    /// A write landing between the advisory read and its conditional write
+    /// must win: the advisory write is dropped as a no-op, not retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_advisory_lost_race_is_noop() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        let store = cas_store_over(backend);
+        store
+            .put("k", Bytes::from_static(b"v1"))
+            .await
+            .expect("seed");
+
+        let racer = store.clone();
+        let payload = store
+            .update_advisory("k", move |body| {
+                assert_eq!(&body[..], b"v1");
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(racer.put("k", Bytes::from_static(b"racer")))
+                })
+                .expect("racing put");
+                Ok((Bytes::from_static(b"stamped"), ()))
+            })
+            .await;
+
+        assert!(payload.is_ok(), "a lost race must not surface an error");
+        assert_eq!(
+            store.get("k").await.expect("get"),
+            b"racer",
+            "the concurrent write must win; the advisory write is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_advisory_missing_key_propagates_not_found() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        let store = cas_store_over(backend);
+
+        let err = store
+            .update_advisory("missing", |body| Ok((body, ())))
+            .await
+            .expect_err("missing key must error");
+        assert!(matches!(err, Error::Storage(StorageError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn update_advisory_requires_cas() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        let store = store_over(backend);
+        store
+            .put("k", Bytes::from_static(b"v1"))
+            .await
+            .expect("seed");
+
+        let err = store
+            .update_advisory("k", |body| Ok((body, ())))
+            .await
+            .expect_err("non-CAS store must reject advisory updates");
+        assert!(matches!(err, Error::Build(_)));
     }
 
     #[tokio::test]
