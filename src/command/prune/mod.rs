@@ -17,12 +17,8 @@ use crate::{
         },
     },
     configuration::Configuration,
-    event_webhook::dispatcher::EventDispatcher,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
-    registry::{
-        Registry, RegistryConfig, blob_store::BlobStore, job_store::JobStore,
-        metadata_store::MetadataStore, repository_resolver::RepositoryResolver,
-    },
+    registry::job_store::JobStore,
 };
 
 /// Upper bound on draining in-flight async webhook deliveries before the
@@ -54,30 +50,6 @@ pub fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Ret
     )))
 }
 
-/// Registry the retention deletions run through, with webhooks wired from
-/// configuration and a caller-held job queue so no in-process drain loops are
-/// spawned: pruned deletions enqueue their replication jobs durably and the
-/// running server or `angos worker` drains them.
-pub fn retention_registry(
-    config: &Configuration,
-    blob_store: Arc<BlobStore>,
-    metadata_store: Arc<MetadataStore>,
-    resolver: Arc<RepositoryResolver>,
-    job_store: Arc<JobStore>,
-) -> Result<Arc<Registry>, Error> {
-    let dispatcher = EventDispatcher::from_config(&config.event_webhook)
-        .map_err(|e| Error::Initialization(e.to_string()))?;
-    let registry = Registry::new(
-        blob_store,
-        metadata_store,
-        resolver,
-        RegistryConfig::default()
-            .job_queue(job_store)
-            .event_dispatcher(dispatcher),
-    )?;
-    Ok(Arc::new(registry))
-}
-
 /// Applies the global and per-repository retention policies to every
 /// namespace, deleting the tags the policies no longer retain. Supersedes the
 /// deprecated `scrub --retention`.
@@ -107,7 +79,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             metadata_store.store_arc(),
             format!("prune-{}", Uuid::new_v4()),
         ));
-        let retention = retention_registry(
+        let retention = bootstrap::registry(
             config,
             blob_backend.clone(),
             metadata_store.clone(),

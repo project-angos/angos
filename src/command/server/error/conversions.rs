@@ -112,6 +112,9 @@ impl From<bootstrap::Error> for Error {
             bootstrap::Error::EventWebhook(inner) => {
                 Error::Initialization(format!("Failed to initialize event webhooks: {inner}"))
             }
+            bootstrap::Error::Registry(inner) => {
+                Error::Initialization(format!("Failed to initialize registry: {inner}"))
+            }
         }
     }
 }

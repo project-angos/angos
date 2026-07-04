@@ -3188,7 +3188,7 @@ mod noop_suppression_tests {
     /// Build a `Registry` whose blob store, metadata store, and a caller-held
     /// `JobStore` all share one FS-backed `Store`, carrying a single
     /// event+reconcile downstream so `dispatch_replication` enqueues.
-    fn build_registry() -> (Registry, Arc<JobStore>, TempDir) {
+    fn build_registry() -> (Arc<Registry>, Arc<JobStore>, TempDir) {
         let FsTestStack {
             dir,
             store,
@@ -3829,7 +3829,7 @@ mod dispatch_replication_tests {
 
     /// Build a `Registry` whose job store is a caller-held `JobStore` so the
     /// test can count pending jobs.
-    fn build_registry_with(repository: Repository) -> (Registry, Arc<JobStore>, TempDir) {
+    fn build_registry_with(repository: Repository) -> (Arc<Registry>, Arc<JobStore>, TempDir) {
         let FsTestStack {
             dir,
             store,
@@ -3848,7 +3848,7 @@ mod dispatch_replication_tests {
     }
 
     /// [`build_registry_with`] with one `event+reconcile` downstream.
-    fn build_registry() -> (Registry, Arc<JobStore>, TempDir) {
+    fn build_registry() -> (Arc<Registry>, Arc<JobStore>, TempDir) {
         build_registry_with(repository_with_downstream())
     }
 

@@ -968,17 +968,15 @@ mod tests {
                 .expect("test repositories must not have overlapping prefixes"),
         );
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "retention-test"));
-        let registry = Arc::new(
-            Registry::new(
-                test_case.blob_store(),
-                metadata_store.clone(),
-                resolver.clone(),
-                RegistryConfig::default()
-                    .job_queue(job_store.clone())
-                    .event_dispatcher(Some(Arc::new(dispatcher))),
-            )
-            .unwrap(),
-        );
+        let registry = Registry::new(
+            test_case.blob_store(),
+            metadata_store.clone(),
+            resolver.clone(),
+            RegistryConfig::default()
+                .job_queue(job_store.clone())
+                .event_dispatcher(Some(Arc::new(dispatcher))),
+        )
+        .unwrap();
         let mut executor = Executor::new(test_case.blob_store(), metadata_store.clone(), job_store)
             .with_registry(registry);
 

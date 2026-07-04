@@ -144,7 +144,7 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
 pub fn create_test_registry(
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
-) -> Registry {
+) -> Arc<Registry> {
     create_test_registry_with(blob_store, metadata_store, true)
 }
 
@@ -156,7 +156,7 @@ pub fn create_test_registry_with(
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     validate_manifest_references: bool,
-) -> Registry {
+) -> Arc<Registry> {
     let resolver = Arc::new(
         RepositoryResolver::new(create_test_repositories())
             .expect("test repositories must not have overlapping prefixes"),
@@ -290,7 +290,7 @@ pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
 pub struct FSRegistryTestCase {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
-    registry: Registry,
+    registry: Arc<Registry>,
     temp_dir: TempDir,
 }
 
@@ -389,7 +389,7 @@ pub struct S3RegistryTestCase {
     key_prefix: String,
     s3_blob_store: Arc<BlobStore>,
     s3_metadata_store: Arc<MetadataStore>,
-    s3_registry: Registry,
+    s3_registry: Arc<Registry>,
 }
 
 impl S3RegistryTestCase {

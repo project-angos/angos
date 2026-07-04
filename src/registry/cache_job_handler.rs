@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::Weak;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -7,17 +7,12 @@ use tracing::warn;
 use angos_tx_engine::transaction::Transaction;
 
 use crate::{
-    event_webhook::{
-        dispatcher::EventDispatcher,
-        event::{Event, EventActor, EventKind},
-    },
+    event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Namespace},
     registry::{
+        Error as RegistryError, Registry,
         blob::{cache_blob, grant_blob_reference},
-        blob_store::BlobStore,
         job_store::{Error, JobEnvelope, JobHandler},
-        metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
     },
 };
 
@@ -34,50 +29,75 @@ pub struct CacheFetchBlobPayload {
     pub digest: String,
 }
 
-/// Pulls a blob from the upstream registry and writes it to the local blob
-/// store. Skips the upstream fetch when the bytes are already present locally
-/// (granting this namespace a reference instead), so concurrent fills of the
-/// same blob dedup safely; otherwise it fetches and stores the bytes.
+impl Registry {
+    /// Cache-fill a blob for a pull-through namespace: grants a reference when
+    /// the bytes are already present locally, otherwise fetches them from the
+    /// upstream and stores them, then emits `blob.push` with the internal
+    /// `cache` actor. The emission is best effort: the fill is committed and
+    /// idempotent, so a delivery failure must not fail (and re-run) the job.
+    pub async fn cache_fill_blob(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+    ) -> Result<(), RegistryError> {
+        // Bytes already present locally (cached by this or another namespace):
+        // grant this namespace a reference without re-fetching. Gate on *byte
+        // presence*, not on a `can_read` ownership link: a manifest pull records
+        // the layer's ownership link before its bytes are fetched, so a
+        // link-only short-circuit here would skip the fetch and the blob would
+        // never be cached.
+        //
+        // The grant commits on the metadata store and the bytes on the blob
+        // store; neither is folded into the job-completion transaction, because
+        // those stores can be separate backends and a single executor cannot
+        // commit across both. The work is idempotent, so it is safe to redo on a
+        // retry even though it no longer commits atomically with job completion.
+        if self.blob_store.size(digest).await.is_ok() {
+            grant_blob_reference(&self.metadata_store, namespace, digest).await?;
+        } else {
+            let repository = self.get_repository_for_namespace(namespace)?;
+            if !repository.is_pull_through() {
+                return Err(RegistryError::Internal(
+                    "repository is not a pull-through proxy".to_string(),
+                ));
+            }
+
+            let (content_length, stream) = repository.get_blob(&[], namespace, digest).await?;
+            cache_blob(
+                &self.blob_store,
+                &self.metadata_store,
+                namespace,
+                digest,
+                stream,
+                content_length,
+            )
+            .await?;
+        }
+
+        let event = Event::new(
+            EventKind::BlobPush,
+            namespace.clone(),
+            self.repository_name_for(namespace),
+        )
+        .digest(Some(digest.to_string()))
+        .actor(Some(EventActor::internal(CACHE_ACTOR)));
+        if let Err(error) = self.dispatch_events(&[event]).await {
+            warn!("Cache-fill event delivery failed: {error}");
+        }
+        Ok(())
+    }
+}
+
+/// Thin job adapter over [`Registry::cache_fill_blob`], holding a weak
+/// registry handle so the in-process claim loops it runs on never keep the
+/// registry (and their own cancellation) alive.
 pub struct CacheJobHandler {
-    resolver: Arc<RepositoryResolver>,
-    blob_store: Arc<BlobStore>,
-    metadata_store: Arc<MetadataStore>,
-    event_dispatcher: Option<Arc<EventDispatcher>>,
+    registry: Weak<Registry>,
 }
 
 impl CacheJobHandler {
-    pub fn new(
-        resolver: Arc<RepositoryResolver>,
-        blob_store: Arc<BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-        event_dispatcher: Option<Arc<EventDispatcher>>,
-    ) -> Self {
-        Self {
-            resolver,
-            blob_store,
-            metadata_store,
-            event_dispatcher,
-        }
-    }
-
-    /// The namespace gained a blob, so webhook consumers see it like any
-    /// other push. Best effort: the fill is committed and idempotent, so a
-    /// delivery failure must not fail (and re-run) the job.
-    async fn emit_blob_push(&self, namespace: &Namespace, digest: &Digest) {
-        let Some(dispatcher) = &self.event_dispatcher else {
-            return;
-        };
-        let repository = self
-            .resolver
-            .resolve(namespace)
-            .map(|r| r.name.to_string())
-            .unwrap_or_default();
-        let event = Event::new(EventKind::BlobPush, namespace.clone(), repository)
-            .digest(Some(digest.to_string()))
-            .actor(Some(EventActor::internal(CACHE_ACTOR)));
-        if let Err(error) = dispatcher.dispatch(&event).await {
-            warn!("Cache-fill event delivery failed: {error}");
-        }
+    pub fn new(registry: Weak<Registry>) -> Self {
+        Self { registry }
     }
 }
 
@@ -93,60 +113,20 @@ impl JobHandler for CacheJobHandler {
         let payload: CacheFetchBlobPayload = serde_json::from_value(envelope.payload.clone())
             .map_err(|e| Error::Storage(format!("failed to deserialize job payload: {e}")))?;
 
-        let namespace = payload.namespace;
         let digest: Digest = payload
             .digest
             .parse()
             .map_err(|e| Error::Storage(format!("invalid digest '{}': {e}", payload.digest)))?;
 
-        // Bytes already present locally (cached by this or another namespace):
-        // grant this namespace a reference without re-fetching. Gate on *byte
-        // presence*, not on a `can_read` ownership link: a manifest pull records
-        // the layer's ownership link before its bytes are fetched, so a
-        // link-only short-circuit here would skip the fetch and the blob would
-        // never be cached.
-        //
-        // The grant commits on the metadata store and the bytes on the blob
-        // store; neither is folded into the job-completion transaction, because
-        // those stores can be separate backends and a single executor cannot
-        // commit across both. The work is idempotent, so it is safe to redo on a
-        // retry even though it no longer commits atomically with job completion.
-        if self.blob_store.size(&digest).await.is_ok() {
-            grant_blob_reference(&self.metadata_store, &namespace, &digest)
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            self.emit_blob_push(&namespace, &digest).await;
-            return Ok(Transaction::builder().build());
-        }
-
-        let Some(repository) = self.resolver.resolve(&namespace) else {
-            return Err(Error::Storage(format!(
-                "no repository configured for namespace '{namespace}'"
-            )));
-        };
-
-        if !repository.is_pull_through() {
+        let Some(registry) = self.registry.upgrade() else {
             return Err(Error::Storage(
-                "repository is not a pull-through proxy".to_string(),
+                "registry shut down; the job stays leased and is re-claimed later".to_string(),
             ));
-        }
-
-        let (content_length, stream) = repository
-            .get_blob(&[], &namespace, &digest)
+        };
+        registry
+            .cache_fill_blob(&payload.namespace, &digest)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
-
-        cache_blob(
-            &self.blob_store,
-            &self.metadata_store,
-            &namespace,
-            &digest,
-            stream,
-            content_length,
-        )
-        .await
-        .map_err(|e| Error::Storage(e.to_string()))?;
-        self.emit_blob_push(&namespace, &digest).await;
 
         Ok(Transaction::builder().build())
     }
@@ -159,7 +139,7 @@ mod tests {
     use url::Url;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-    use super::{CACHE_ACTOR, CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload, CacheJobHandler};
+    use super::{CACHE_ACTOR, CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload};
     use crate::{
         event_webhook::{
             config::{DeliveryPolicy, EventWebhookConfig},
@@ -168,8 +148,9 @@ mod tests {
         },
         oci::Namespace,
         registry::{
+            Registry, RegistryConfig,
             blob_ownership::BlobOwnership,
-            job_store::{JobEnvelope, JobHandler, Queue},
+            job_store::{JobEnvelope, JobStore, Queue},
             repository_resolver::RepositoryResolver,
             test_utils::{FsTestStack, create_test_repositories, fs_test_stack, put_blob_direct},
         },
@@ -202,7 +183,7 @@ mod tests {
 
         let FsTestStack {
             dir: _dir,
-            store: _,
+            store,
             metadata_store,
             blob_store,
         } = fs_test_stack();
@@ -213,12 +194,16 @@ mod tests {
         let namespace = Namespace::new("test-repo/cached").unwrap();
         let digest = put_blob_direct(metadata_store.store(), b"already cached bytes").await;
 
-        let handler = CacheJobHandler::new(
-            resolver,
+        let registry = Registry::new(
             blob_store,
             metadata_store.clone(),
-            Some(Arc::new(dispatcher)),
-        );
+            resolver,
+            RegistryConfig::default()
+                .job_queue(Arc::new(JobStore::new(store, "cache-test")))
+                .event_dispatcher(Some(Arc::new(dispatcher))),
+        )
+        .unwrap();
+        let handler = registry.cache_job_handler();
         let envelope = JobEnvelope::new(
             Queue::Cache,
             CACHE_FETCH_BLOB_KIND,

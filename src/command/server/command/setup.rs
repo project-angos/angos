@@ -75,7 +75,7 @@ pub async fn build_registry(
     config: &Configuration,
     cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
     engine_maintenance: Option<CancellationToken>,
-) -> Result<(Registry, Option<PendingGaugeRefresh>), Error> {
+) -> Result<(Arc<Registry>, Option<PendingGaugeRefresh>), Error> {
     let auth_cache = bootstrap::auth_cache(&config.cache)?;
     let blob_backend = Arc::new(config.blob_store.build_backend()?);
     let metadata_store =

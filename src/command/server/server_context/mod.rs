@@ -15,13 +15,13 @@ use crate::{
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,
     authorizer: Arc<Authorizer>,
-    pub registry: Registry,
+    pub registry: Arc<Registry>,
     pub enable_ui: bool,
     pub ui_name: String,
 }
 
 impl ServerContext {
-    pub fn new(config: &Configuration, registry: Registry) -> Result<Self, Error> {
+    pub fn new(config: &Configuration, registry: Arc<Registry>) -> Result<Self, Error> {
         let Ok(cache) = config.cache.to_backend() else {
             return Err(Error::Initialization(
                 "Failed to initialize cache backend".to_string(),

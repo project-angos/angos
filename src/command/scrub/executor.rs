@@ -111,7 +111,7 @@ impl Executor {
             RegistryConfig::default().job_queue(job_store.clone()),
         )
         .expect("test registry");
-        Self::new(blob_store, metadata_store, job_store).with_registry(Arc::new(registry))
+        Self::new(blob_store, metadata_store, job_store).with_registry(registry)
     }
 
     /// Lands the envelope on the durable replication queue. A reconcile push

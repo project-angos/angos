@@ -151,7 +151,7 @@ pub async fn create_test_repo_context(webhook_url: Option<&str>) -> ServerContex
     create_test_server_context_from_config(&config).await
 }
 
-pub async fn create_test_registry(config: &Configuration) -> Registry {
+pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
@@ -588,7 +588,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
 }
 
 struct ShutdownFlushHarness {
-    registry: Registry,
+    registry: Arc<Registry>,
     metadata_store: Arc<MetadataStore>,
     namespace: Namespace,
 }

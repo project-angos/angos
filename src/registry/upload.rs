@@ -1892,7 +1892,7 @@ mod tests {
     fn tiny_blob_cap_registry(
         test_case: &FSRegistryTestCase,
         max_blob_size_bytes: u64,
-    ) -> Registry {
+    ) -> Arc<Registry> {
         let resolver = Arc::new(
             RepositoryResolver::new(create_test_repositories())
                 .expect("test repositories must not have overlapping prefixes"),

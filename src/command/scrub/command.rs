@@ -157,7 +157,7 @@ impl Command {
             // The deprecated `--retention` deletes through the registry, like
             // `angos prune`.
             if options.retention {
-                let registry = prune::retention_registry(
+                let registry = bootstrap::registry(
                     config,
                     blob_backend.clone(),
                     metadata_store.clone(),

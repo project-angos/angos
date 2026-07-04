@@ -48,7 +48,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 struct FsRegistryFixture {
-    registry: Registry,
+    registry: Arc<Registry>,
     _temp_dir: TempDir,
 }
 
@@ -645,7 +645,7 @@ const REPLICATION_REPO: &str = "test-repo";
 /// A `Registry` with one `event+reconcile` downstream and a caller-held
 /// `JobStore`. No drain is spawned: these tests assert enqueue only.
 struct ReplicationFixture {
-    registry: Registry,
+    registry: Arc<Registry>,
     job_store: Arc<JobStore>,
     _temp_dir: TempDir,
 }
