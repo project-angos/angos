@@ -80,9 +80,9 @@ pub fn namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, Strin
     }))
 }
 
-pub fn upload_namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, String> {
+pub fn upload_namespaces(blob_store: &Arc<BlobStore>) -> ResultStream<'_, String> {
     Box::pin(paginated(move |marker| async move {
-        metadata_store
+        blob_store
             .list_upload_namespaces(PAGE_SIZE, marker)
             .await
             .map_err(Error::from)

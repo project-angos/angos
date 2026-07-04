@@ -166,8 +166,8 @@ impl StoreChecker for OrphanNamespaceChecker {
             }
         }
         // Upload-only namespaces are absent from the catalog, so sweep them off
-        // the upload tree.
-        let mut upload_namespaces = list_all::upload_namespaces(&self.metadata_store);
+        // the blob store's upload tree.
+        let mut upload_namespaces = list_all::upload_namespaces(&self.blob_store);
         while let Some(namespace) = upload_namespaces.next().await {
             let namespace = namespace?;
             if self.resolver.resolve(&namespace).is_some() {
