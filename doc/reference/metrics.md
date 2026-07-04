@@ -355,7 +355,7 @@ time() - angos_replication_last_success_timestamp_seconds
 
 ### angos_replication_reconcile_total
 
-Replication reconcile enqueues emitted by `angos scrub --replicate`, by outcome.
+Replication reconcile enqueues emitted by `angos replicate`, by outcome.
 
 | Type    | Labels    |
 |---------|-----------|

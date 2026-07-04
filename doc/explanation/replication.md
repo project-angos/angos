@@ -90,7 +90,7 @@ LWW orders by the **originating author's write time**, not each receiver's clock
 
 ## Scrub Reconciliation
 
-The event path can miss changes: an instance might be down when a mutation occurs, or two instances might drift after a long partition. The `angos scrub --replicate` command reconciles a divergence on demand:
+The event path can miss changes: an instance might be down when a mutation occurs, or two instances might drift after a long partition. The `angos replicate` command reconciles a divergence on demand:
 
 - It walks every replicated namespace and, for each repository downstream (gated by `mode` and `namespace_filter`), probes each local tag on the downstream with `HEAD manifest` (and, when pruning is enabled, enumerates the downstream's tags with `list-tags`). These are the only OCI-required endpoints it uses, so reconciliation works against any compliant registry.
 - For each tag that diverges, or that exists locally but not on the downstream, it **enqueues a replication push** through the same handler and queue as the event path. Reconciliation does not push inline; it gets the same durable retry, backoff, dead-letter, and coalescing as live mutations.

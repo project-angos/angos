@@ -6,7 +6,7 @@ title: "Storage Maintenance"
 
 # Run Storage Maintenance
 
-Verify storage integrity and enforce retention policies using the `scrub` command.
+Verify storage integrity with the `scrub` command and enforce retention policies with the `prune` command.
 
 ## Prerequisites
 
@@ -20,8 +20,9 @@ Angos performs garbage collection **automatically** during normal operation: unr
 The `scrub` command runs as a **separate periodic process** that operates alongside the live server (no shutdown required):
 - Checking and repairing data corruption
 - Verifying storage consistency
-- Enforcing retention policies
 - Cleaning up stale uploads
+
+The `prune` command enforces retention policies the same way: a separate periodic process, no shutdown required.
 
 ## What Scrub Does
 
@@ -32,7 +33,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
 | `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
 | `-b, --blobs`                 | Check for orphaned or corrupted blobs; prune stale blob-index entries for deleted namespaces       |
-| `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
+| `-r, --retention`             | Deprecated: use `angos prune`                                                                      |
 | `-u, --uploads <duration>`    | Check upload sessions: remove broken or partial state and uploads older than the given duration    |
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
 | `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
@@ -51,15 +52,17 @@ The `scrub` command performs various maintenance operations. Each check must be 
 See what would be deleted without making changes:
 
 ```bash
-./angos -c config.toml scrub --dry-run --tags --manifests --blobs --retention
+./angos -c config.toml scrub --dry-run --tags --manifests --blobs
+./angos -c config.toml prune --dry-run
 ```
 
 ### Run Full Cleanup
 
-Run all checks (tags, manifests, blobs, and retention policies):
+Run all integrity checks (tags, manifests, blobs) and enforce retention policies:
 
 ```bash
-./angos -c config.toml scrub --tags --manifests --blobs --retention
+./angos -c config.toml scrub --tags --manifests --blobs
+./angos -c config.toml prune
 ```
 
 ### Selective Cleanup
@@ -68,7 +71,7 @@ Run only specific checks:
 
 ```bash
 # Enforce only retention policies
-./angos -c config.toml scrub --retention
+./angos -c config.toml prune
 
 # Clean up orphaned blobs only
 ./angos -c config.toml scrub --blobs
@@ -83,7 +86,7 @@ Run only specific checks:
 ### With Logging
 
 ```bash
-RUST_LOG=info ./angos -c config.toml scrub --tags --manifests --blobs --retention
+RUST_LOG=info ./angos -c config.toml scrub --tags --manifests --blobs
 ```
 
 ---
@@ -93,11 +96,11 @@ RUST_LOG=info ./angos -c config.toml scrub --tags --manifests --blobs --retentio
 ### Cron (Linux/macOS)
 
 ```bash
-# Daily at 3 AM - full cleanup
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs --retention >> /var/log/registry-scrub.log 2>&1
+# Daily at 3 AM - integrity checks
+0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs >> /var/log/registry-scrub.log 2>&1
 
-# Weekly on Sunday at 2 AM
-0 2 * * 0 /usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs --retention
+# Daily at 4 AM - retention enforcement
+0 4 * * * /usr/bin/angos -c /etc/registry/config.toml prune >> /var/log/registry-prune.log 2>&1
 ```
 
 ### Recommended Flags for Periodic Maintenance
@@ -132,7 +135,8 @@ Description=Registry Storage Maintenance
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs --retention
+ExecStart=/usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs
+ExecStart=/usr/bin/angos -c /etc/registry/config.toml prune
 Environment=RUST_LOG=info
 ```
 
@@ -176,7 +180,7 @@ spec:
           containers:
             - name: scrub
               image: ghcr.io/project-angos/angos:latest
-              args: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs", "--retention"]
+              args: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs"]
               env:
                 - name: RUST_LOG
                   value: info
@@ -191,13 +195,23 @@ spec:
           restartPolicy: OnFailure
 ```
 
+Schedule `angos prune` the same way for retention enforcement; see [Configure Retention Policies](configure-retention-policies.md) for a complete CronJob example.
+
 ### Docker Compose
 
 ```yaml
 services:
   scrub:
     image: ghcr.io/project-angos/angos:latest
-    command: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs", "--retention"]
+    command: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs"]
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    profiles:
+      - maintenance
+  prune:
+    image: ghcr.io/project-angos/angos:latest
+    command: ["-c", "/config/config.toml", "prune"]
     volumes:
       - ./config:/config:ro
       - ./data:/data
@@ -209,6 +223,7 @@ Run manually:
 
 ```bash
 docker compose --profile maintenance run --rm scrub
+docker compose --profile maintenance run --rm prune
 ```
 
 ---
@@ -236,8 +251,8 @@ See [Configure Retention Policies](configure-retention-policies.md) for detailed
 
 | Item              | Condition                        |
 |-------------------|----------------------------------|
-| Tagged manifest   | Doesn't match any retention rule |
-| Untagged manifest | Doesn't match any retention rule |
+| Tagged manifest   | With `prune`: doesn't match any retention rule |
+| Untagged manifest | With `prune`: doesn't match any retention rule |
 | Blob              | Not referenced by any manifest   |
 | Upload            | With `-u`: broken/incomplete session or older than the timeout    |
 | Whole namespace   | With `-n`: not owned by any configured `[repository]` (revisions, tags, in-flight uploads, plus the namespace's layer/config blob bytes) |
@@ -257,7 +272,7 @@ Cleared namespaces drop out of `_catalog` automatically, since the catalog is de
 
 ### Protected Items
 
-Never deleted by retention:
+Never deleted by `prune`:
 - Child manifests of multi-platform indexes
 - Manifests with referrers (signatures, SBOMs)
 
@@ -293,7 +308,8 @@ curl http://localhost:8000/_ext/_repositories | jq
 - Verify manifests aren't protected
 - Use dry-run with debug logging:
   ```bash
-  RUST_LOG=debug ./angos -c config.toml scrub --dry-run --tags --manifests --blobs --retention
+  RUST_LOG=debug ./angos -c config.toml prune --dry-run
+  RUST_LOG=debug ./angos -c config.toml scrub --dry-run --tags --manifests --blobs
   ```
 
 ### Storage Not Reduced

@@ -4,19 +4,21 @@ use chrono::Duration;
 use tracing::{info, warn};
 
 use crate::{
-    command::scrub::{
-        check::{
-            BlobChecker, BlobIndexChecker, DigestLinkChecker, LayoutChecker, LinkReferencesChecker,
-            ManifestChecker, MediaTypeChecker, MultipartChecker, NamespaceChecker,
-            OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue,
-            ReferrerChecker, ReplicationChecker, RetentionChecker, StoreChecker, TagChecker,
-            UploadChecker,
+    command::{
+        prune::{RetentionChecker, global_retention_policy},
+        replicate::ReplicationChecker,
+        scrub::{
+            check::{
+                BlobChecker, BlobIndexChecker, DigestLinkChecker, LayoutChecker,
+                LinkReferencesChecker, ManifestChecker, MediaTypeChecker, MultipartChecker,
+                NamespaceChecker, OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker,
+                OrphanQueue, ReferrerChecker, StoreChecker, TagChecker, UploadChecker,
+            },
+            command::Options,
+            error::Error,
         },
-        command::Options,
-        error::Error,
     },
     configuration::Configuration,
-    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         blob_store::BlobStore, job_store::JobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -26,17 +28,6 @@ use crate::{
 /// Store-wide checkers paired with a stable label used to name a failing checker
 /// in the scrub log.
 pub type LabeledStoreCheckers = Vec<(&'static str, Box<dyn StoreChecker>)>;
-
-fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
-    if config.rules.is_empty() {
-        return None;
-    }
-
-    Some(Arc::new(RetentionPolicy::new(
-        config,
-        Arc::new(SystemClock),
-    )))
-}
 
 pub fn namespace_checkers(
     options: &Options,
@@ -267,30 +258,7 @@ pub fn store_checkers(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::policy::CelRule;
-
-    fn rule(s: &str) -> CelRule {
-        CelRule::compile(s).unwrap()
-    }
-
-    #[test]
-    fn global_retention_policy_empty_returns_none() {
-        let config = RetentionPolicyConfig { rules: vec![] };
-        let result = global_retention_policy(&config);
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn global_retention_policy_with_rules_returns_some() {
-        let config = RetentionPolicyConfig {
-            rules: vec![rule("image.pushed_at > now() - days(30)")],
-        };
-        let result = global_retention_policy(&config);
-
-        assert!(result.is_some());
-    }
+    use crate::policy::RetentionPolicyConfig;
 
     #[test]
     fn invalid_retention_rule_fails_at_deserialize() {

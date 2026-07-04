@@ -1,4 +1,4 @@
-//! [`ReplicationChecker`]: the scrub reconciliation pass, emitting queue-enqueue
+//! [`ReplicationChecker`]: the reconciliation pass, emitting queue-enqueue
 //! actions rather than pushing inline so reconcile-discovered divergences get the
 //! same retry/backoff/coalescing as the event path. Prune is off by default and
 //! one-way-mirror-only: absence-driven deletion is unsafe for active-active peers.
@@ -11,9 +11,9 @@ use tracing::{debug, warn};
 
 use crate::{
     command::scrub::{
+        Error,
         action::Action,
         check::{NamespaceChecker, list_all},
-        error::Error,
         executor::{ActionSink, record_reconcile_outcome},
     },
     oci::{Digest, Namespace, Reference, Tag},
@@ -302,13 +302,13 @@ mod tests {
         matchers::{method, path},
     };
 
+    use super::ReplicationChecker;
     use crate::{
         command::{
             scrub::{
+                Error,
                 action::Action,
                 check::NamespaceChecker,
-                check::replication::ReplicationChecker,
-                error::Error,
                 executor::{ActionSink, Executor},
             },
             worker::runner::execute_one,

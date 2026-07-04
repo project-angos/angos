@@ -81,12 +81,12 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--tags`                  | `-t`   | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
 | `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |
 | `--blobs`                 | `-b`   | Check for blob inconsistencies, corruption, and stale blob-index entries                           |
-| `--retention`             | `-r`   | Enforce retention policies                                                                         |
+| `--retention`             | `-r`   | Deprecated: use [`angos prune`](#prune)                                                            |
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--reconcile-blob-index`  |        | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band (storage corruption, manual tampering). Reads every manifest, so it is expensive |
 | `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
-| `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams. By default reconciliation is additive: it enqueues a replication push for each diverging or downstream-missing tag and never deletes. A downstream marked `prune = true` is treated as an authoritative one-way mirror: reconciliation also enqueues a replication delete for each downstream-only tag, so prune is one-way-only by design and unsafe for active-active peers (even with receiver-side last-writer-wins it can remove a peer's newer tag). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |
+| `--replicate`             |        | Deprecated: use [`angos replicate`](#replicate)                                                    |
 | `--replication-orphans`   |        | Delete replication jobs (pending and dead-lettered) whose downstream or repository is no longer configured                                       |
 | `--cache-orphans`         |        | Delete cache jobs (pending and dead-lettered) whose repository is no longer configured for pull-through                                          |
 | `--orphan-grants <duration>` |     | Revoke blob-ownership grants older than the duration (e.g. `24h`) that no manifest references, reclaiming the bytes; cleans up blobs a replication push uploaded before its manifest lost last-writer-wins or dead-lettered |
@@ -96,13 +96,10 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 
 ```bash
 # Preview all maintenance operations
-angos scrub -d -t -m -b -r
+angos scrub -d -t -m -b
 
 # Run full storage integrity check
-angos scrub -t -m -b -r
-
-# Enforce only retention policies
-angos scrub --retention
+angos scrub -t -m -b
 
 # Check blob storage integrity
 angos scrub --blobs
@@ -113,20 +110,11 @@ angos scrub --uploads 1h
 # Cleanup orphan S3 multipart uploads older than 24 hours
 angos scrub --multipart 24h
 
-# Preview retention policy enforcement
-angos scrub --retention --dry-run
-
-# Preview replication reconciliation (enqueues nothing)
-angos scrub --replicate --dry-run
-
-# Reconcile every replicated repository with its downstreams
-angos scrub --replicate
-
 # Preview clearing namespaces no longer owned by any configured repository
 angos scrub --orphan-namespaces --dry-run
 
 # Run with verbose logging
-RUST_LOG=info angos scrub -t -m -b -r
+RUST_LOG=info angos scrub -t -m -b
 ```
 
 **Scheduling:**
@@ -135,7 +123,7 @@ Run scrub as a scheduled task for regular maintenance:
 
 ```bash
 # Cron example (daily at 3 AM) - full maintenance
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub -t -m -b -r
+0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub -t -m -b
 ```
 
 ```yaml
@@ -153,8 +141,67 @@ spec:
           containers:
           - name: scrub
             image: ghcr.io/project-angos/angos:latest
-            args: ["-c", "/config/config.toml", "scrub", "-t", "-m", "-b", "-r"]
+            args: ["-c", "/config/config.toml", "scrub", "-t", "-m", "-b"]
           restartPolicy: OnFailure
+```
+
+---
+
+### prune
+
+Enforce retention policies, deleting the tags they no longer retain. Replaces the deprecated `scrub --retention`.
+
+```bash
+angos prune [options]
+```
+
+Applies the global and per-repository retention policies to every namespace. See [Configure Retention Policies](../how-to/configure-retention-policies.md) for the policy syntax and what is protected from deletion.
+
+**Options:**
+
+| Option      | Short | Description                                    |
+|-------------|-------|------------------------------------------------|
+| `--dry-run` | `-d`  | Preview what would be deleted without changes  |
+
+**Examples:**
+
+```bash
+# Preview retention policy enforcement
+angos prune --dry-run
+
+# Enforce retention policies
+angos prune
+
+# Cron example (daily at 3 AM)
+0 3 * * * /usr/bin/angos -c /etc/registry/config.toml prune
+```
+
+---
+
+### replicate
+
+Reconcile every replicated namespace against all its configured downstreams. Replaces the deprecated `scrub --replicate`.
+
+```bash
+angos replicate [options]
+```
+
+By default reconciliation is additive: it enqueues a replication push for each diverging or downstream-missing tag and never deletes, then drains the enqueued jobs in-process. A downstream marked `prune = true` is treated as an authoritative one-way mirror: reconciliation also enqueues a replication delete for each downstream-only tag, so it is one-way-only by design and unsafe for active-active peers (even with receiver-side last-writer-wins it can remove a peer's newer tag). See [Configure Replication](../how-to/configure-replication.md).
+
+**Options:**
+
+| Option      | Short | Description                                    |
+|-------------|-------|------------------------------------------------|
+| `--dry-run` | `-d`  | Preview what would be enqueued without changes |
+
+**Examples:**
+
+```bash
+# Preview replication reconciliation (enqueues nothing)
+angos replicate --dry-run
+
+# Reconcile every replicated repository with its downstreams
+angos replicate
 ```
 
 ---

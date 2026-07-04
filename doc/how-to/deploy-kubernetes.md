@@ -269,7 +269,7 @@ url = "redis://redis:6379"
 
 ## Scheduled Storage Maintenance (CronJob)
 
-Run periodic maintenance to enforce retention policies and verify storage integrity.
+Run periodic maintenance to verify storage integrity. For retention enforcement, add a second CronJob with `args: ["-c", "/config/config.toml", "prune"]`; see [Configure Retention Policies](configure-retention-policies.md).
 
 **Important:** With S3 storage, the scrub job only needs the config volume, no data storage volume is required.
 
@@ -288,7 +288,7 @@ spec:
           containers:
             - name: scrub
               image: ghcr.io/project-angos/angos:latest
-              args: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs", "--retention"]
+              args: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs"]
               volumeMounts:
                 - name: config
                   mountPath: /config

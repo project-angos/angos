@@ -294,7 +294,8 @@ For scheduled maintenance (scrub), use your system's cron scheduler or a dedicat
 
 ```bash
 # Run manual maintenance with Docker Compose
-docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs --retention
+docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs
+docker compose run --rm registry /angos -c /config/config.toml prune
 ```
 
 **Cron scheduling approaches:**
@@ -302,7 +303,8 @@ docker compose run --rm registry /angos -c /config/config.toml scrub --tags --ma
 1. **System cron (recommended):**
    ```bash
    # Add to crontab -e: run scrub daily at 3 AM
-   0 3 * * * cd /path/to/registry && docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs --retention
+   0 3 * * * cd /path/to/registry && docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs
+   0 4 * * * cd /path/to/registry && docker compose run --rm registry /angos -c /config/config.toml prune
    ```
 
 2. **Docker container cron (ofelia):**
@@ -319,7 +321,9 @@ docker compose run --rm registry /angos -c /config/config.toml scrub --tags --ma
      # labels:
      #   ofelia.enabled: "true"
      #   ofelia.job-exec.registry-scrub.schedule: "@daily"
-     #   ofelia.job-exec.registry-scrub.command: "/angos -c /config/config.toml scrub --tags --manifests --blobs --retention"
+     #   ofelia.job-exec.registry-scrub.command: "/angos -c /config/config.toml scrub --tags --manifests --blobs"
+     #   ofelia.job-exec.registry-prune.schedule: "@daily"
+     #   ofelia.job-exec.registry-prune.command: "/angos -c /config/config.toml prune"
    ```
 
 ---

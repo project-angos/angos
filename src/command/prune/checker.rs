@@ -7,9 +7,9 @@ use tracing::{debug, error};
 
 use crate::{
     command::scrub::{
+        Error,
         action::Action,
         check::{NamespaceChecker, list_all},
-        error::Error,
         executor::ActionSink,
     },
     oci::{Digest, Namespace, Tag},

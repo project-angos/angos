@@ -87,7 +87,7 @@ Mirrors local mutations *out* to downstream registries (the outbound counterpart
 - Per-repository downstream lists, event-driven on manifest push/delete
 - Rides the durable job queue for retry, coalescing, and restart survival
 - Loop prevention via receiver-side no-op suppression; last-writer-wins tag conflict resolution
-- On-demand reconciliation via `angos scrub --replicate`
+- On-demand reconciliation via `angos replicate`
 
 See [Bi-Directional Replication](replication.md) for the full model.
 

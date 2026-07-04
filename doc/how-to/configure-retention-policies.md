@@ -15,7 +15,7 @@ Set up automated cleanup of old container images using CEL-based retention polic
 
 ## How Retention Works
 
-Retention policies define which images to **keep**. Images not matching any rule are eligible for deletion when running `scrub --retention`.
+Retention policies define which images to **keep**. Images not matching any rule are eligible for deletion when running `angos prune`.
 
 ```mermaid
 sequenceDiagram
@@ -198,21 +198,21 @@ Result: Production images kept for 365 days, others for 7 days.
 
 ## Enforcing Retention Policies
 
-Retention policies are enforced by the `scrub` command with the `--retention` flag:
+Retention policies are enforced by the `prune` command (`scrub --retention` is a deprecated alias):
 
 ```bash
 # Preview what would be deleted
-./angos -c config.toml scrub --retention --dry-run
+./angos -c config.toml prune --dry-run
 
 # Enforce retention policies
-./angos -c config.toml scrub --retention
+./angos -c config.toml prune
 ```
 
 ### Scheduled Enforcement
 
 **Cron:**
 ```bash
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub --retention
+0 3 * * * /usr/bin/angos -c /etc/registry/config.toml prune
 ```
 
 **Kubernetes CronJob:**
@@ -228,9 +228,9 @@ spec:
       template:
         spec:
           containers:
-            - name: scrub
+            - name: prune
               image: ghcr.io/project-angos/angos:latest
-              args: ["-c", "/config/config.toml", "scrub", "--retention"]
+              args: ["-c", "/config/config.toml", "prune"]
               volumeMounts:
                 - name: config
                   mountPath: /config
@@ -249,7 +249,7 @@ spec:
 ### Check What Would Be Deleted
 
 ```bash
-RUST_LOG=info ./angos scrub --retention --dry-run
+RUST_LOG=info ./angos prune --dry-run
 ```
 
 ### List Current Manifests
@@ -279,7 +279,7 @@ WARN retention rule 2 returned non-boolean value: Int(42); treating as 'retain' 
 WARN retention rule 3 evaluation failed: no such key: nonexistent_var; treating as 'retain' (fail-open)
 ```
 
-Fix the offending rule and re-run `scrub --retention --dry-run` to verify the corrected behaviour before running without `--dry-run`.
+Fix the offending rule and re-run `prune --dry-run` to verify the corrected behaviour before running without `--dry-run`.
 
 ---
 
@@ -288,17 +288,17 @@ Fix the offending rule and re-run `scrub --retention --dry-run` to verify the co
 **Images not being deleted:**
 - Check if they match any retention rule
 - Check if they're protected (index child or has referrers)
-- Verify `scrub` command is running
+- Verify `prune` command is running
 
 **Pull time not tracked:**
 - Enable `update_pull_time = true` in global config
 - Pull times are only tracked after enabling
 
 **Rules not matching:**
-- Use debug logging: `RUST_LOG=angos::command::scrub=debug`
+- Use debug logging: `RUST_LOG=angos::command::prune=debug`
 - Check that `image.tag` is null for untagged manifests
 
 ## Reference
 
 - [CEL Expressions Reference](../reference/cel-expressions.md) - Retention variables and functions
-- [CLI Reference](../reference/cli.md) - scrub command details
+- [CLI Reference](../reference/cli.md) - prune command details

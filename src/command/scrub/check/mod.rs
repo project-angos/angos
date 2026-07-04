@@ -11,14 +11,15 @@ mod orphan_grants;
 mod orphan_jobs;
 mod orphan_namespaces;
 mod referrer;
-mod replication;
-mod retention;
 mod tag;
 mod upload;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 pub use blob::BlobChecker;
 pub use blob_index::BlobIndexChecker;
+use futures_util::StreamExt;
 pub use layout::LayoutChecker;
 pub use link_references::LinkReferencesChecker;
 pub use link_repair::ensure_link;
@@ -29,14 +30,14 @@ pub use orphan_grants::OrphanGrantChecker;
 pub use orphan_jobs::{OrphanJobChecker, OrphanQueue};
 pub use orphan_namespaces::OrphanNamespaceChecker;
 pub use referrer::ReferrerChecker;
-pub use replication::ReplicationChecker;
-pub use retention::RetentionChecker;
 pub use tag::DigestLinkChecker;
+use tracing::warn;
 pub use upload::UploadChecker;
 
 use crate::{
     command::scrub::{error::Error, executor::ActionSink},
     oci::{Namespace, Tag},
+    registry::metadata_store::MetadataStore,
 };
 
 /// A checker that operates on a single namespace at a time.
@@ -51,6 +52,31 @@ pub trait NamespaceChecker: Send + Sync {
         namespace: &Namespace,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error>;
+}
+
+/// Walks every namespace and applies `checker` to each, skipping (with a
+/// warning) an enumerated name that fails validation and continuing past a
+/// failed check, since maintenance is best-effort.
+pub async fn check_namespaces(
+    metadata_store: &Arc<MetadataStore>,
+    checker: &dyn NamespaceChecker,
+    sink: &mut (dyn ActionSink + Send),
+) -> Result<(), Error> {
+    let mut namespaces = list_all::namespaces(metadata_store);
+    while let Some(namespace) = namespaces.next().await {
+        let namespace = namespace?;
+        let namespace = match Namespace::new(&namespace) {
+            Ok(namespace) => namespace,
+            Err(e) => {
+                warn!("Skipping invalid enumerated namespace '{namespace}': {e}");
+                continue;
+            }
+        };
+        if let Err(e) = checker.check(&namespace, sink).await {
+            warn!("Check failed for namespace '{namespace}': {e}");
+        }
+    }
+    Ok(())
 }
 
 /// A checker that operates across the entire store (not namespace-scoped).

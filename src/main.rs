@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    command::{argon, scrub, server, worker},
+    command::{argon, prune, replicate, scrub, server, worker},
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
     metrics_provider::initialize_metrics,
 };
@@ -107,6 +107,8 @@ struct GlobalArguments {
 #[argh(subcommand)]
 enum SubCommand {
     Argon(argon::Options),
+    Prune(prune::Options),
+    Replicate(replicate::Options),
     Scrub(scrub::Options),
     Serve(server::Options),
     Worker(worker::Options),
@@ -162,6 +164,22 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
                 1
             }
         },
+        SubCommand::Prune(prune_options) => match prune::run(&prune_options, &config).await {
+            Ok(()) => 0,
+            Err(err) => {
+                error!("Prune error: {err}");
+                1
+            }
+        },
+        SubCommand::Replicate(replicate_options) => {
+            match replicate::run(&replicate_options, &config).await {
+                Ok(()) => 0,
+                Err(err) => {
+                    error!("Replicate error: {err}");
+                    1
+                }
+            }
+        }
         SubCommand::Scrub(scrub_options) => match run_scrub(scrub_options, config).await {
             Ok(()) => 0,
             Err(err) => {
@@ -199,6 +217,12 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
 }
 
 async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
+    if options.retention {
+        warn!("'scrub --retention' is deprecated; use 'angos prune' instead");
+    }
+    if options.replicate {
+        warn!("'scrub --replicate' is deprecated; use 'angos replicate' instead");
+    }
     let mut scrub = scrub::Command::new(&options, &config).await?;
     scrub.run().await
 }
