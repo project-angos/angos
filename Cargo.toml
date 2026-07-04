@@ -20,18 +20,19 @@ hex = "0.4.3"
 hmac = "0.13.0"
 md-5 = "0.11"
 parking_lot = "0.12.5"
-quick-xml = "0.40"
+quick-xml = "0.40.1"
 redis = { version = "1.2.4", features = ["tokio-comp"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
-smallvec = "1.15"
+smallvec = "1.15.1"
 tempfile = "3.27"
 thiserror = "2.0.18"
 tokio = "1.52.3"
 tokio-util = { version = "0.7.18", features = ["io-util"] }
-tracing = "0.1.44"
+tracing = "0.1"
+tracing-opentelemetry = "0.33"
 url = "2.5.8"
 uuid = { version = "1.23.4", features = ["v4"] }
 wiremock = "0.6.5"
@@ -76,6 +77,9 @@ opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 parking_lot = { workspace = true }
+# Stays on 0.5 in lockstep with argon2: this dep exists to enable the
+# `getrandom` feature on the password-hash instance argon2 re-exports, which
+# requires both to resolve to the same crate version.
 password-hash = { version = "0.5", features = ["getrandom"] }
 prometheus = "0.14"
 quick-xml = { workspace = true }
@@ -98,7 +102,7 @@ tokio-rustls = "0.26.4"
 tokio-util = { workspace = true, features = ["rt"] }
 toml = "1.1.2"
 tracing = { workspace = true }
-tracing-opentelemetry = { git = "https://github.com/tokio-rs/tracing-opentelemetry", rev = "44521fa43c79989cdfb5b7244d5f1afadef6dd7e" }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["serde"] }
