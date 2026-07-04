@@ -20,8 +20,10 @@
     "schedule": ["before 5am on monday"]
   },
   "vulnerabilityAlerts": {
-    "enabled": false
+    "enabled": true,
+    "labels": ["security"]
   },
+  "osvVulnerabilityAlerts": true,
   "packageRules": [
     {
       "description": "Default group: everything not matched by a more specific rule below (e.g. Rust/cargo).",
