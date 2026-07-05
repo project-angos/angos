@@ -30,16 +30,27 @@ pub struct CacheFetchBlobPayload {
 }
 
 impl Registry {
-    /// Cache-fill a blob for a pull-through namespace: grants a reference when
+    /// Cache-fill a blob for a pull-through namespace: emits the `blob.push`
+    /// intent with the internal `cache` actor, then grants a reference when
     /// the bytes are already present locally, otherwise fetches them from the
-    /// upstream and stores them, then emits `blob.push` with the internal
-    /// `cache` actor. The emission is best effort: the fill is committed and
+    /// upstream and stores them. The emission is best effort: the fill is
     /// idempotent, so a delivery failure must not fail (and re-run) the job.
     pub async fn cache_fill_blob(
         &self,
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<(), RegistryError> {
+        let event = Event::new(
+            EventKind::BlobPush,
+            namespace.clone(),
+            self.repository_name_for(namespace),
+        )
+        .digest(Some(digest.to_string()))
+        .actor(Some(EventActor::internal(CACHE_ACTOR)));
+        if let Err(error) = self.dispatch_events(&[event]).await {
+            warn!("Cache-fill event delivery failed: {error}");
+        }
+
         // Bytes already present locally (cached by this or another namespace):
         // grant this namespace a reference without re-fetching. Gate on *byte
         // presence*, not on a `can_read` ownership link: a manifest pull records
@@ -74,16 +85,6 @@ impl Registry {
             .await?;
         }
 
-        let event = Event::new(
-            EventKind::BlobPush,
-            namespace.clone(),
-            self.repository_name_for(namespace),
-        )
-        .digest(Some(digest.to_string()))
-        .actor(Some(EventActor::internal(CACHE_ACTOR)));
-        if let Err(error) = self.dispatch_events(&[event]).await {
-            warn!("Cache-fill event delivery failed: {error}");
-        }
         Ok(())
     }
 }

@@ -149,7 +149,6 @@ impl Registry {
 
     async fn finish_completed_upload(
         &self,
-        actor: Option<EventActor>,
         namespace: &Namespace,
         session_key: &str,
         digest: &Digest,
@@ -157,12 +156,6 @@ impl Registry {
         if let Err(error) = self.blob_store.delete_upload(namespace, session_key).await {
             warn!("Failed to delete completed upload state: {error}");
         }
-
-        let repository = self.repository_name_for(namespace);
-        let event = Event::new(EventKind::BlobPush, namespace.clone(), repository)
-            .digest(Some(digest.to_string()))
-            .actor(actor);
-        self.dispatch_events(&[event]).await?;
 
         Ok(CompleteUploadResponse {
             headers: blob_location_headers(namespace, digest),
@@ -270,9 +263,10 @@ impl Registry {
 
     /// Starts a cross-repository blob mount from the authorized `source`,
     /// falling back to an ordinary upload session when the mount cannot be
-    /// satisfied. A satisfied mount emits a `blob.push` event (the session
-    /// fallback emits none: its eventual upload completion emits one), so a
-    /// mounted blob is as visible to webhook consumers as an uploaded one.
+    /// satisfied. The `blob.push` intent event fires before the mount attempt,
+    /// so a mounted blob is as visible to webhook consumers as an uploaded
+    /// one; the session fallback leaves a false-positive event behind and its
+    /// eventual upload completion emits one of its own.
     #[instrument(skip(actor))]
     pub async fn mount_blob(
         &self,
@@ -281,12 +275,13 @@ impl Registry {
         mount: &BlobMount,
         source: &Namespace,
     ) -> Result<StartUploadResponse, Error> {
+        let repository = self.repository_name_for(namespace);
+        let event = Event::new(EventKind::BlobPush, namespace.clone(), repository)
+            .digest(Some(mount.digest.to_string()))
+            .actor(actor);
+        self.dispatch_events(&[event]).await?;
+
         if let Some(headers) = self.try_cross_repo_mount(namespace, mount, source).await? {
-            let repository = self.repository_name_for(namespace);
-            let event = Event::new(EventKind::BlobPush, namespace.clone(), repository)
-                .digest(Some(mount.digest.to_string()))
-                .actor(actor);
-            self.dispatch_events(&[event]).await?;
             return Ok(StartUploadResponse::ExistingBlob { headers });
         }
 
@@ -428,6 +423,15 @@ impl Registry {
     {
         let session_key = session_id.to_string();
 
+        // Intent-first emission: the event fires before the finalize, so a
+        // completed blob can never go unnotified; a completion that fails
+        // past this point leaves a false-positive notification instead.
+        let repository = self.repository_name_for(namespace);
+        let event = Event::new(EventKind::BlobPush, namespace.clone(), repository)
+            .digest(Some(digest.to_string()))
+            .actor(actor);
+        self.dispatch_events(&[event]).await?;
+
         let committed = match self
             .blob_store
             .upload_summary(namespace, &session_key)
@@ -460,7 +464,7 @@ impl Registry {
                 .await?
         {
             return self
-                .finish_completed_upload(actor, namespace, &session_key, digest)
+                .finish_completed_upload(namespace, &session_key, digest)
                 .await;
         }
 
@@ -517,7 +521,7 @@ impl Registry {
         session.release().await;
         result?;
 
-        self.finish_completed_upload(actor, namespace, &session_key, digest)
+        self.finish_completed_upload(namespace, &session_key, digest)
             .await
     }
 

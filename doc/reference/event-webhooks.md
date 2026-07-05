@@ -37,11 +37,24 @@ Webhooks are enabled by referencing their names in global or repository configur
 
 ---
 
+## Delivery Semantics
+
+Events are at-least-once notifications of intent: the registry fires them
+just before performing the operation. A performed operation is therefore
+never left unnotified, while an operation that is rejected or fails after
+emission leaves a false-positive event behind. Duplicates are expected, for
+example when a client replays an idempotent push or when replication
+re-applies a converged write in a multi-replica mesh. Each emission carries
+a fresh event `id`, so consumers needing idempotency must key on the payload
+(kind, namespace, digest, tag) rather than on the `id`.
+
+---
+
 ## Delivery Policies
 
 | Policy     | Behavior                                                                                 |
 |------------|------------------------------------------------------------------------------------------|
-| `required` | Synchronous. Waits for response. Non-2xx or network failure fails the client operation.  |
+| `required` | Synchronous. Waits for response. Non-2xx or network failure fails the client operation before it is performed. |
 | `optional` | Synchronous. Waits for response. Failure is logged but does not affect the client.       |
 | `async`    | Asynchronous. Dispatched in background. Client receives response immediately.            |
 
@@ -67,10 +80,10 @@ Backoff formula: `100ms * 2^(attempt - 1)`, capped at 10 seconds
 
 | Event             | Trigger                                          |
 |-------------------|--------------------------------------------------|
-| `manifest.push`   | Manifest stored successfully                     |
+| `manifest.push`   | Manifest push (client, replication or cache fill) |
 | `manifest.pull`   | Manifest served to a client via `GET`            |
-| `manifest.delete` | Manifest deleted                                 |
-| `blob.push`       | Blob upload completed, or a cross-repo mount granted it to a namespace |
+| `manifest.delete` | Manifest delete (client or retention)            |
+| `blob.push`       | Blob upload completion, a cross-repo mount, or a cache fill |
 | `blob.pull`       | Blob served to a client via `GET`                |
 | `tag.create`      | Tag created (part of manifest push with tag ref) |
 | `tag.delete`      | Tag deleted (part of manifest delete by tag)     |

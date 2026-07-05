@@ -286,9 +286,10 @@ impl Registry {
 
     /// Delivers `events` to the configured webhooks, attempting every event
     /// even if an earlier delivery fails; the first error is returned once
-    /// all have been attempted. Operations call this after they commit, so an
-    /// event is only ever delivered for a change that happened. With no
-    /// dispatcher configured this is a no-op.
+    /// all have been attempted. Operations call this before they perform the
+    /// action, so a performed action can never go unnotified (at-least-once):
+    /// an action failing after emission leaves a false-positive notification
+    /// of its intent. With no dispatcher configured this is a no-op.
     pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
         let Some(dispatcher) = &self.event_dispatcher else {
             return Ok(());

@@ -30,6 +30,7 @@ use crate::{
         BlobMount, Registry, RegistryConfig, Repository, StartUploadResponse,
         blob_ownership::BlobOwnership,
         job_store::{JobStore, Queue},
+        metadata_store::LinkKind,
         repository_resolver::RepositoryResolver,
         test_utils::{
             FsTestStack, create_test_repositories, downstream_client, fs_test_stack,
@@ -604,10 +605,10 @@ async fn mount_emits_blob_push_event() {
     assert_eq!(events[0]["digest"], digest.to_string());
 }
 
-/// The session fallback grants nothing yet; its eventual upload emits the
-/// event, so the mount itself must not.
+/// The `blob.push` intent fires before the mount attempt, so the session
+/// fallback still leaves the (false-positive) event behind.
 #[tokio::test]
-async fn mount_fallback_emits_no_event() {
+async fn mount_fallback_still_emits_intent_event() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
@@ -620,7 +621,7 @@ async fn mount_fallback_emits_no_event() {
     // Present but unowned by `source` -> the mount falls back to a session.
     let digest = put_blob_direct(fixture.registry.metadata_store.store(), b"not owned").await;
     let mount = BlobMount {
-        digest,
+        digest: digest.clone(),
         from: Some(source.clone()),
     };
     let response = fixture
@@ -630,10 +631,53 @@ async fn mount_fallback_emits_no_event() {
         .unwrap();
 
     assert!(matches!(response, StartUploadResponse::Session { .. }));
-    assert!(
-        received_events(&server).await.is_empty(),
-        "a fallback session must emit no event"
+    let events = received_events(&server).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "the mount intent must be emitted even when the mount falls back"
     );
+    assert_eq!(events[0]["kind"], "blob.push");
+    assert_eq!(events[0]["digest"], digest.to_string());
+}
+
+/// Intent-first emission gates the action on a `required` webhook: when the
+/// delivery fails, the push is rejected before anything is stored.
+#[tokio::test]
+async fn failing_required_webhook_blocks_the_write() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
+    let namespace = Namespace::new("test-repo").unwrap();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
+
+    let tag = Tag::new("gated").unwrap();
+    let result = fixture
+        .registry
+        .accept_put_manifest(
+            None,
+            None,
+            &namespace,
+            Reference::Tag(tag.clone()),
+            mime_type,
+            Cursor::new(manifest_bytes),
+            Vec::new(),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a failing required webhook must reject the push"
+    );
+
+    fixture
+        .registry
+        .metadata_store
+        .read_link(&namespace, &LinkKind::Tag(tag))
+        .await
+        .expect_err("the manifest must not have been stored after the rejected intent");
 }
 
 // ---------------------------------------------------------------------------

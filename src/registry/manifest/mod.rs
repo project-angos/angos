@@ -20,7 +20,7 @@ use crate::{
     metrics_provider::metrics_provider,
     oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
     registry::{
-        DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
+        Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
         cache_job_handler::CACHE_ACTOR,
@@ -266,20 +266,9 @@ impl Registry {
             .get_manifest(accepted_types, namespace, &reference)
             .await?;
 
-        self.store_manifest(
-            namespace,
-            &reference,
-            media_type.as_ref(),
-            &content,
-            &[],
-            ReferencePolicy::Trusted,
-            None,
-        )
-        .await?;
-
-        // The registry gained upstream content, so webhook consumers see it
-        // like any other write. Best effort: the client operation is the
-        // pull, so a delivery failure must not fail it.
+        // The registry is about to gain upstream content, so webhook
+        // consumers see the intent like any other write. Best effort: the
+        // client operation is the pull, so a delivery failure must not fail it.
         let event = manifest_event(
             EventKind::ManifestPush,
             namespace,
@@ -291,6 +280,17 @@ impl Registry {
         if let Err(error) = self.dispatch_events(&[event]).await {
             warn!("Cache-fill event delivery failed: {error}");
         }
+
+        self.store_manifest(
+            namespace,
+            &reference,
+            media_type.as_ref(),
+            &content,
+            &[],
+            ReferencePolicy::Trusted,
+            None,
+        )
+        .await?;
 
         Ok(ManifestBody {
             media_type,
@@ -546,6 +546,21 @@ impl Registry {
         reference: &Reference,
     ) -> Result<(), Error> {
         let client_initiated = actor.as_ref().is_none_or(EventActor::is_client);
+        let resolved_repository = self.resolver.resolve(namespace);
+
+        let repository = resolved_repository
+            .map(|r| r.name.to_string())
+            .unwrap_or_default();
+        let digest_str = match reference {
+            Reference::Digest(d) => Some(d.to_string()),
+            Reference::Tag(_) => None,
+        };
+        // Intent-first emission: the events fire before the delete, so a
+        // performed delete can never go unnotified; a delete that fails past
+        // this point leaves a false-positive notification instead.
+        let events = delete_events(namespace, repository, digest_str, reference, actor);
+        self.dispatch_events(&events).await?;
+
         // A delete carries no incoming digest, so a timestamp tie keeps the
         // strictly-greater rule and the delete proceeds.
         self.check_lww_not_superseded(namespace, reference, source_ts, None)
@@ -568,7 +583,6 @@ impl Registry {
         // read a racing write can flip, which is safe: over-dispatch is
         // idempotent, and the one suppression race coincides with a concurrent
         // re-put whose own dispatch converges the mesh.
-        let resolved_repository = self.resolver.resolve(namespace);
         let existed_before = match self
             .prior_link_if_replicated(resolved_repository, namespace, reference)
             .await
@@ -626,16 +640,6 @@ impl Registry {
                 .await?;
         }
 
-        let repository = resolved_repository
-            .map(|r| r.name.to_string())
-            .unwrap_or_default();
-        let digest_str = match reference {
-            Reference::Digest(d) => Some(d.to_string()),
-            Reference::Tag(_) => None,
-        };
-
-        let events = delete_events(namespace, repository, digest_str, reference, actor);
-
         // For a tag delete the receiver keys off `payload.tag`, so no digest
         // is carried.
         let (tag, dispatch_digest) = match reference {
@@ -665,7 +669,7 @@ impl Registry {
             .await;
         }
 
-        self.dispatch_events(&events).await
+        Ok(())
     }
 
     /// Attempts to short-circuit a manifest GET into a presigned redirect using
@@ -948,35 +952,14 @@ impl Registry {
             return Err(Error::ManifestBodyTooLarge { limit });
         }
 
-        // The equal-timestamp tie-break compares digests, so only a replicated
-        // write (`source_ts` present) pays this extra hash of the body.
-        let incoming_digest = source_ts
-            .is_some()
-            .then(|| Digest::sha256_of_bytes(&request_body));
-        self.check_lww_not_superseded(namespace, &reference, source_ts, incoming_digest.as_ref())
-            .await?;
-
-        let reference_policy = if self.validate_manifest_references {
-            ReferencePolicy::Strict
-        } else {
-            ReferencePolicy::Permissive
-        };
-        let response = self
-            .store_manifest(
-                namespace,
-                &reference,
-                Some(&mime_type),
-                &request_body,
-                &created_tags,
-                reference_policy,
-                source_ts,
-            )
-            .await?;
+        // Hashed up front: the intent events fired before the store carry the
+        // content digest, and the LWW tie-break compares it on equal timestamps.
+        let digest = Digest::sha256_of_bytes(&request_body);
 
         let repository = resolved_repository
             .map(|r| r.name.to_string())
             .unwrap_or_default();
-        let digest_str = response.headers.get(DOCKER_CONTENT_DIGEST).cloned();
+        let digest_str = Some(digest.to_string());
 
         let mut events = vec![manifest_event(
             EventKind::ManifestPush,
@@ -1013,6 +996,31 @@ impl Registry {
             ));
         }
 
+        // Intent-first emission: the events fire before the write, so a
+        // performed write can never go unnotified; a write that fails past
+        // this point leaves a false-positive notification instead.
+        self.dispatch_events(&events).await?;
+
+        self.check_lww_not_superseded(namespace, &reference, source_ts, Some(&digest))
+            .await?;
+
+        let reference_policy = if self.validate_manifest_references {
+            ReferencePolicy::Strict
+        } else {
+            ReferencePolicy::Permissive
+        };
+        let response = self
+            .store_manifest(
+                namespace,
+                &reference,
+                Some(&mime_type),
+                &request_body,
+                &created_tags,
+                reference_policy,
+                source_ts,
+            )
+            .await?;
+
         // No-op suppression: re-dispatching a converged replay would keep a
         // mesh cycle alive, so only a write that changed local state (per the
         // committed transaction) is replicated. Webhook events fire
@@ -1028,7 +1036,6 @@ impl Registry {
             .await;
         }
 
-        self.dispatch_events(&events).await?;
         Ok(response)
     }
 

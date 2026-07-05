@@ -12,7 +12,7 @@ use crate::{
     command::server::Error as ServerError,
     oci::{Algorithm, MediaType, Namespace, Tag},
     registry::{
-        Error, OCI_TAG, Registry,
+        DOCKER_CONTENT_DIGEST, Error, OCI_TAG, Registry,
         metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
         path_builder::blob_path,
         test_utils::{
