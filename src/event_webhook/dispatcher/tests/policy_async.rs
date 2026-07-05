@@ -5,7 +5,7 @@ use wiremock::{
     matchers::{header, method},
 };
 
-use super::common::{TEST_SHUTDOWN_TIMEOUT, create_test_event, single_hook_dispatcher};
+use super::common::{create_test_event, single_hook_dispatcher};
 use crate::event_webhook::config::DeliveryPolicy;
 
 #[tokio::test]
@@ -36,9 +36,7 @@ async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
         "Async dispatch must return immediately, took {elapsed:?}"
     );
 
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
+    dispatcher.shutdown().await;
 }
 
 #[tokio::test]
@@ -58,9 +56,7 @@ async fn dispatch_async_policy_eventually_delivers() {
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
+    dispatcher.shutdown().await;
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(

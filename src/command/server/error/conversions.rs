@@ -70,6 +70,9 @@ impl From<registry::Error> for Error {
             registry::Error::ReplicationSuperseded(msg) => {
                 oci_error(StatusCode::CONFLICT, REPLICATION_SUPERSEDED_CODE, Some(msg))
             }
+            // Same surface a handler-side dispatch failure had before emission
+            // moved into the registry.
+            registry::Error::EventDelivery(msg) => Error::Execution(msg),
             registry::Error::Internal(msg) => oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -105,6 +108,12 @@ impl From<bootstrap::Error> for Error {
             bootstrap::Error::Overlap(inner) => Error::Initialization(inner.to_string()),
             bootstrap::Error::JobQueue(inner) => {
                 Error::Initialization(format!("Failed to initialize job queue: {inner}"))
+            }
+            bootstrap::Error::EventWebhook(inner) => {
+                Error::Initialization(format!("Failed to initialize event webhooks: {inner}"))
+            }
+            bootstrap::Error::Registry(inner) => {
+                Error::Initialization(format!("Failed to initialize registry: {inner}"))
             }
         }
     }

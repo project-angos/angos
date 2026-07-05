@@ -1,5 +1,4 @@
 use crate::{
-    event_webhook::event::Event,
     oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{HeaderMap, OCI_SUBJECT, OCI_TAG, ResponseHeaders},
 };
@@ -45,15 +44,10 @@ pub struct HeadManifestResponse {
 pub struct PutManifestResponse {
     pub headers: HeaderMap,
     pub digest: Digest,
-    pub events: Vec<Event>,
     /// Whether the write changed local state, as validated by the committed
     /// link transaction itself (no racy pre-read); gates the replication
     /// re-dispatch.
     pub changed: bool,
-}
-
-pub struct DeleteManifestResponse {
-    pub events: Vec<Event>,
 }
 
 pub fn head_manifest_headers(meta: &ManifestMeta) -> HeaderMap {

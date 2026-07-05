@@ -159,8 +159,8 @@ impl Command {
 
     pub async fn shutdown_with_timeout(&self, grace: Duration) {
         match &self.listener {
-            ServiceListener::Insecure(listener) => listener.shutdown_with_timeout(grace).await,
-            ServiceListener::Secure(listener) => listener.shutdown_with_timeout(grace).await,
+            ServiceListener::Insecure(listener) => listener.shutdown().await,
+            ServiceListener::Secure(listener) => listener.shutdown().await,
         }
 
         if let Some(refresh) = &self.pending_refresh {

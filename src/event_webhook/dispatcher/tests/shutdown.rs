@@ -3,8 +3,7 @@ use std::{collections::HashMap, time::Duration};
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use super::common::{
-    TEST_SHUTDOWN_TIMEOUT, build_dispatcher, create_test_event, create_test_webhook_config,
-    single_hook_dispatcher,
+    build_dispatcher, create_test_event, create_test_webhook_config, single_hook_dispatcher,
 };
 use crate::event_webhook::config::DeliveryPolicy;
 
@@ -30,9 +29,7 @@ async fn test_shutdown_completes_in_flight_async_delivery() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // Immediately call shutdown: it must block until the in-flight delivery finishes
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
+    dispatcher.shutdown().await;
 
     // If shutdown drained the in-flight task, the server must have received the request
     let requests = server.received_requests().await.unwrap();
@@ -57,9 +54,7 @@ async fn test_shutdown_rejects_new_async_dispatches() {
 
     let dispatcher =
         single_hook_dispatcher("async-hook", &server.uri(), DeliveryPolicy::Async, None, 0);
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
+    dispatcher.shutdown().await;
 
     // Dispatch after shutdown: delivery must be skipped. Either an error or
     // Ok with no delivery is acceptable; the absence of HTTP requests is the
@@ -83,9 +78,7 @@ async fn test_shutdown_with_no_in_flight_returns_immediately() {
     let dispatcher = build_dispatcher(webhooks);
 
     let start = std::time::Instant::now();
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
+    dispatcher.shutdown().await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -127,9 +120,7 @@ async fn test_multiple_in_flight_async_deliveries_drain_on_shutdown() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // shutdown() must drain all three concurrent in-flight deliveries
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
+    dispatcher.shutdown().await;
 
     for (label, server) in [
         ("server_a", &server_a),
@@ -147,13 +138,15 @@ async fn test_multiple_in_flight_async_deliveries_drain_on_shutdown() {
 }
 
 #[tokio::test]
-async fn test_shutdown_with_timeout_returns_after_timeout_when_tasks_are_too_slow() {
+async fn test_shutdown_drains_slow_tasks_to_completion() {
     let server = MockServer::start().await;
     let event = create_test_event();
 
-    // Endpoint takes 2 seconds, longer than our shutdown timeout of 300ms
+    // A slow endpoint must be waited for, not abandoned: the delivery is
+    // bounded by its own request timeout, so the drain terminates.
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(700)))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -167,49 +160,18 @@ async fn test_shutdown_with_timeout_returns_after_timeout_when_tasks_are_too_slo
     dispatcher.dispatch(&event).await.unwrap();
 
     let start = std::time::Instant::now();
-    // shutdown_with_timeout should give up after 300ms, not wait the full 2s
-    dispatcher
-        .shutdown_with_timeout(Duration::from_millis(300))
-        .await;
+    dispatcher.shutdown().await;
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < Duration::from_millis(700),
-        "shutdown_with_timeout must return after the timeout even if tasks are still running, took {elapsed:?}"
+        elapsed >= Duration::from_millis(700),
+        "shutdown() must wait for the slow in-flight delivery, took {elapsed:?}"
     );
-}
-
-#[tokio::test]
-async fn test_shutdown_with_timeout_drains_fast_tasks_within_timeout() {
-    let server = MockServer::start().await;
-    let event = create_test_event();
-
-    // Endpoint responds quickly (50ms), well within the 500ms timeout
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(50)))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let dispatcher = single_hook_dispatcher(
-        "fast-async-hook",
-        &server.uri(),
-        DeliveryPolicy::Async,
-        None,
-        0,
-    );
-    dispatcher.dispatch(&event).await.unwrap();
-
-    dispatcher
-        .shutdown_with_timeout(Duration::from_millis(500))
-        .await;
-
-    // Fast task should have completed, so server must have received the request
     let requests = server.received_requests().await.unwrap();
     assert_eq!(
         requests.len(),
         1,
-        "Fast in-flight delivery must complete when it finishes within the timeout"
+        "the slow in-flight delivery must be drained to completion"
     );
 }
 
@@ -234,26 +196,18 @@ async fn test_shutdown_is_idempotent() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // Calling shutdown twice must not panic or deadlock
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
+    dispatcher.shutdown().await;
+    dispatcher.shutdown().await;
 }
 
 #[tokio::test]
-async fn test_shutdown_with_timeout_is_idempotent() {
+async fn test_shutdown_is_idempotent_without_deliveries() {
     let webhooks = HashMap::new();
     let dispatcher = build_dispatcher(webhooks);
 
     // Both calls must complete without panic or deadlock
-    dispatcher
-        .shutdown_with_timeout(Duration::from_millis(100))
-        .await;
-    dispatcher
-        .shutdown_with_timeout(Duration::from_millis(100))
-        .await;
+    dispatcher.shutdown().await;
+    dispatcher.shutdown().await;
 }
 
 #[tokio::test]
@@ -290,9 +244,7 @@ async fn test_shutdown_drains_mix_of_fast_and_slow_deliveries() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // shutdown() must drain both the fast and the slow delivery
-    dispatcher
-        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
-        .await;
+    dispatcher.shutdown().await;
 
     let fast_reqs = fast_server.received_requests().await.unwrap();
     let slow_reqs = slow_server.received_requests().await.unwrap();

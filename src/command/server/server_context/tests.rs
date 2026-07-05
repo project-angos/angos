@@ -14,13 +14,11 @@ use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ObjectStore, s3::Backend as StorageS3Backend};
 
 use crate::{
-    command::server::{
-        error::Error,
-        server_context::{ServerContext, resolve_client_ip},
-    },
+    command::server::server_context::{ServerContext, resolve_client_ip},
     configuration::Configuration,
     event_webhook::{
         config::EventWebhookConfig,
+        dispatcher::EventDispatcher,
         event::{Event, EventKind},
     },
     identity::{Action, ClientIdentity},
@@ -28,7 +26,7 @@ use crate::{
     oci::{Digest, Namespace, Reference, Tag},
     policy::AccessPolicyConfig,
     registry::{
-        Registry, RegistryConfig, Repository,
+        Error as RegistryError, Registry, RegistryConfig, Repository,
         blob_store::{BlobStoreConfig, FsBackendConfig as BlobFsConfig},
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         repository_resolver::RepositoryResolver,
@@ -153,7 +151,7 @@ pub async fn create_test_repo_context(webhook_url: Option<&str>) -> ServerContex
     create_test_server_context_from_config(&config).await
 }
 
-pub async fn create_test_registry(config: &Configuration) -> Registry {
+pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
@@ -183,7 +181,8 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
         .max_manifest_size_bytes(config.global.max_manifest_size_bytes())
         .global_immutable_tags(config.global.immutable_tags)
-        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
+        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone())
+        .event_dispatcher(EventDispatcher::from_config(&config.event_webhook).unwrap());
 
     Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
 }
@@ -399,7 +398,7 @@ async fn test_dispatch_event_with_no_dispatcher() {
         repository: "test-repo".to_string(),
     };
 
-    let result = context.dispatch_event(&event).await;
+    let result = context.registry.dispatch_events(&[event]).await;
     assert!(result.is_ok());
 }
 
@@ -439,7 +438,7 @@ async fn test_dispatch_event_delivers_to_webhook() {
         repository: "test-repo".to_string(),
     };
 
-    let result = context.dispatch_event(&event).await;
+    let result = context.registry.dispatch_events(&[event]).await;
     assert!(result.is_ok());
 }
 
@@ -478,8 +477,8 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         repository: "test-repo".to_string(),
     };
 
-    let result = context.dispatch_event(&event).await;
-    assert!(matches!(result, Err(Error::Execution(_))));
+    let result = context.registry.dispatch_events(&[event]).await;
+    assert!(matches!(result, Err(RegistryError::EventDelivery(_))));
 }
 
 #[tokio::test]
@@ -489,7 +488,7 @@ async fn test_server_context_shutdown_with_no_dispatcher() {
     let context = ServerContext::new(&config, registry).unwrap();
 
     assert!(!context.has_event_dispatcher());
-    context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    context.shutdown().await;
 }
 
 #[tokio::test]
@@ -528,9 +527,9 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         repository: "test-repo".to_string(),
     };
 
-    context.dispatch_event(&event).await.unwrap();
+    context.registry.dispatch_events(&[event]).await.unwrap();
 
-    context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    context.shutdown().await;
 
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(
@@ -562,7 +561,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    context.shutdown().await;
 
     let event = Event {
         id: Uuid::new_v4(),
@@ -576,7 +575,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
         repository: "test-repo".to_string(),
     };
 
-    let _ = context.dispatch_event(&event).await;
+    let _ = context.registry.dispatch_events(&[event]).await;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -589,7 +588,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
 }
 
 struct ShutdownFlushHarness {
-    registry: Registry,
+    registry: Arc<Registry>,
     metadata_store: Arc<MetadataStore>,
     namespace: Namespace,
 }
@@ -638,7 +637,7 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
 
 #[tokio::test]
 async fn test_shutdown_flushes_pending_access_times() {
-    // shutdown_with_timeout() must flush the S3 metadata backend's buffered
+    // shutdown() must flush the S3 metadata backend's buffered
     // access-time writes before returning. With access_time_debounce_secs > 0
     // those writes sit in a background loop and would be lost on a naïve
     // shutdown.
@@ -676,12 +675,12 @@ async fn test_shutdown_flushes_pending_access_times() {
     // registry under test was already built by the harness above.
     let config = minimal_config();
     let context = ServerContext::new(&config, registry).unwrap();
-    context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    context.shutdown().await;
 
     let after = metadata_store.read_link(&namespace, &tag).await.unwrap();
     assert!(
         after.accessed_at.is_some(),
-        "shutdown_with_timeout() must flush pending access times to S3"
+        "shutdown() must flush pending access times to S3"
     );
 }
 
@@ -792,7 +791,7 @@ async fn dispatch_events_first_failure_does_not_abort_batch() {
         make_event(Uuid::new_v4()),
         make_event(Uuid::new_v4()),
     ];
-    let result = context.dispatch_events(&events).await;
+    let result = context.registry.dispatch_events(&events).await;
 
     assert!(result.is_err(), "a delivery failure must surface overall");
     let requests = mock_server.received_requests().await.unwrap();
@@ -826,7 +825,7 @@ async fn dispatch_events_all_success_returns_ok() {
     let context = ServerContext::new(&config, registry).unwrap();
 
     let events = vec![make_event(Uuid::new_v4()), make_event(Uuid::new_v4())];
-    let result = context.dispatch_events(&events).await;
+    let result = context.registry.dispatch_events(&events).await;
 
     assert!(result.is_ok());
     let requests = mock_server.received_requests().await.unwrap();

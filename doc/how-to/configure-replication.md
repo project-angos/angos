@@ -168,7 +168,7 @@ angos -c config.toml replicate
 
 By default reconciliation is **additive**: it pushes diverging or downstream-missing tags and never deletes. With `--dry-run` it previews the work without enqueuing anything: it lists an `EnqueueReplicationPush` for each diverging or downstream-missing tag and, for any downstream marked `prune = true`, an `EnqueueReplicationDelete` for each downstream-only tag.
 
-A downstream marked `prune = true` is treated as an **authoritative one-way mirror**: reconciliation also enumerates its tags (via the OCI `list-tags` endpoint) and deletes any that are absent locally, so it converges exactly to the local tag set. Pruning is **one-way-mirror-only**: enabling it on an active-active peer would delete a tag the peer authored that has not yet replicated back.
+A downstream marked `prune = true` is treated as an **authoritative one-way mirror**: reconciliation also enumerates its tags (via the OCI `list-tags` endpoint) and deletes any that are absent locally, so it converges exactly to the local tag set. Retention enforcement (`angos prune`) mirrors its deletions to `prune = true` downstreams as well, and only to those, so additive downstreams never lose content because of upstream retention. Pruning is **one-way-mirror-only**: enabling it on an active-active peer would delete a tag the peer authored that has not yet replicated back.
 
 **Leave `prune = false` for active-active peers.** The delete does carry a `source_ts`, so the receiver applies last-writer-wins rather than deleting unconditionally. But that only protects a downstream tag dated in the future relative to the reconcile decision. A peer's legitimately-newer tag whose `created_at` predates the reconcile run is still removed.
 

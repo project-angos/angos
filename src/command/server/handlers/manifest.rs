@@ -8,11 +8,11 @@ use crate::{
     command::server::{
         ServerContext,
         error::Error,
-        handlers::{EventfulResponse, build_event_response, build_response, dispatch_eventful},
+        handlers::build_response,
         request::{RequestHeaders, incoming_into_async_read},
         response_body::ResponseBody,
     },
-    event_webhook::event::{Event, EventActor, EventKind},
+    event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{MediaType, Namespace, Reference, Tag},
     registry::GetManifestResponse,
@@ -47,29 +47,14 @@ pub async fn handle_get_manifest(
     mime_types: &[String],
     is_tag_immutable: bool,
     identity: &ClientIdentity,
-) -> Result<EventfulResponse, Error> {
-    let tag = match &reference {
-        Reference::Tag(tag) => Some(tag.to_string()),
-        Reference::Digest(_) => None,
-    };
-    let reference_str = reference.to_string();
-
+) -> Result<Response<ResponseBody>, Error> {
+    let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .resolve_get_manifest(namespace, reference, mime_types, is_tag_immutable)
+        .resolve_get_manifest(actor, namespace, reference, mime_types, is_tag_immutable)
         .await?;
 
-    let event = Event::new(
-        EventKind::ManifestPull,
-        namespace.clone(),
-        context.registry.repository_name_for(namespace),
-    )
-    .digest(Some(response.digest().to_string()))
-    .reference(Some(reference_str))
-    .tag(tag)
-    .actor(Some(EventActor::from(identity.clone())));
-
-    let response = match response {
+    match response {
         GetManifestResponse::Redirect { headers, .. } => build_response(
             StatusCode::TEMPORARY_REDIRECT,
             headers,
@@ -78,9 +63,7 @@ pub async fn handle_get_manifest(
         GetManifestResponse::Body {
             headers, content, ..
         } => build_response(StatusCode::OK, headers, ResponseBody::fixed(content)),
-    }?;
-
-    Ok((response, vec![event]))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -93,7 +76,7 @@ pub async fn handle_put_manifest<S>(
     tags: Vec<Tag>,
     identity: &ClientIdentity,
     source_ts: Option<DateTime<Utc>>,
-) -> Result<EventfulResponse, Error>
+) -> Result<Response<ResponseBody>, Error>
 where
     S: AsyncRead + Unpin + Send,
 {
@@ -111,7 +94,7 @@ where
         )
         .await?;
 
-    build_event_response(StatusCode::CREATED, response.headers, response.events)
+    build_response(StatusCode::CREATED, response.headers, ResponseBody::empty())
 }
 
 pub async fn handle_delete_manifest(
@@ -120,14 +103,14 @@ pub async fn handle_delete_manifest(
     reference: Reference,
     identity: &ClientIdentity,
     source_ts: Option<DateTime<Utc>>,
-) -> Result<EventfulResponse, Error> {
+) -> Result<Response<ResponseBody>, Error> {
     let actor = Some(EventActor::from(identity.clone()));
-    let response = context
+    context
         .registry
         .delete_manifest(actor, source_ts, namespace, &reference)
         .await?;
 
-    build_event_response(StatusCode::ACCEPTED, HashMap::new(), response.events)
+    build_response(StatusCode::ACCEPTED, HashMap::new(), ResponseBody::empty())
 }
 
 pub async fn dispatch_get_manifest(
@@ -141,17 +124,13 @@ pub async fn dispatch_get_manifest(
     let mime_types = headers.accepted_content_types();
     let is_immutable = context.is_reference_immutable(namespace, &reference);
 
-    dispatch_eventful(
+    handle_get_manifest(
         context,
-        handle_get_manifest(
-            context,
-            namespace,
-            reference,
-            &mime_types,
-            is_immutable,
-            identity,
-        )
-        .await?,
+        namespace,
+        reference,
+        &mime_types,
+        is_immutable,
+        identity,
     )
     .await
 }
@@ -187,19 +166,15 @@ pub async fn dispatch_put_manifest(
 
     let body_stream = incoming_into_async_read(incoming);
 
-    dispatch_eventful(
+    handle_put_manifest(
         context,
-        handle_put_manifest(
-            context,
-            namespace,
-            reference,
-            mime_type,
-            body_stream,
-            tags,
-            identity,
-            source_ts,
-        )
-        .await?,
+        namespace,
+        reference,
+        mime_type,
+        body_stream,
+        tags,
+        identity,
+        source_ts,
     )
     .await
 }
@@ -214,11 +189,7 @@ pub async fn dispatch_delete_manifest(
     let headers = RequestHeaders::new(&parts.headers);
     let source_ts = headers.source_timestamp();
 
-    dispatch_eventful(
-        context,
-        handle_delete_manifest(context, namespace, reference, identity, source_ts).await?,
-    )
-    .await
+    handle_delete_manifest(context, namespace, reference, identity, source_ts).await
 }
 
 #[cfg(test)]
@@ -281,7 +252,7 @@ mod tests {
         let namespace = Namespace::new("test/repo").unwrap();
         let identity = ClientIdentity::new(None);
 
-        let (put_resp, _events) = handle_put_manifest(
+        let put_resp = handle_put_manifest(
             &context,
             &namespace,
             Reference::Tag(Tag::new("latest").unwrap()),
@@ -332,7 +303,7 @@ mod tests {
         // Seed the newer local tag with manifest B at a known recent source_ts so
         // created_at is stamped deterministically rather than from the wall clock.
         let newer_ts = Utc::now() - Duration::seconds(10);
-        let (seed_resp, _events) = handle_put_manifest(
+        let seed_resp = handle_put_manifest(
             &context,
             &namespace,
             tag(),

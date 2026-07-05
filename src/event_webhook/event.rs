@@ -44,6 +44,30 @@ pub struct EventActor {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
+    /// Name of the internal process that performed the operation (for
+    /// example `prune` or `cache`). Absent on client-initiated operations,
+    /// so subscribers can tell internal processes apart from clients and
+    /// from each other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal: Option<String>,
+}
+
+impl EventActor {
+    /// Actor for an operation performed by the named internal process.
+    pub fn internal(process: &str) -> Self {
+        Self {
+            id: None,
+            username: None,
+            client_ip: None,
+            internal: Some(process.to_string()),
+        }
+    }
+
+    /// `true` when the operation was client-initiated rather than performed
+    /// by an internal process.
+    pub fn is_client(&self) -> bool {
+        self.internal.is_none()
+    }
 }
 
 impl From<ClientIdentity> for EventActor {
@@ -52,6 +76,7 @@ impl From<ClientIdentity> for EventActor {
             id: identity.id,
             username: identity.username,
             client_ip: identity.client_ip,
+            internal: None,
         }
     }
 }
@@ -129,6 +154,7 @@ mod tests {
         assert_eq!(actor.id, Some("user-123".to_string()));
         assert_eq!(actor.username, Some("alice".to_string()));
         assert_eq!(actor.client_ip, Some("192.168.1.1".to_string()));
+        assert_eq!(actor.internal, None);
     }
 
     #[test]
@@ -139,6 +165,14 @@ mod tests {
         assert_eq!(actor.id, None);
         assert_eq!(actor.username, None);
         assert_eq!(actor.client_ip, None);
+        assert_eq!(actor.internal, None);
+    }
+
+    #[test]
+    fn event_actor_internal_serializes_only_the_process_name() {
+        let actor = EventActor::internal("prune");
+        let json = serde_json::to_value(&actor).unwrap();
+        assert_eq!(json, serde_json::json!({ "internal": "prune" }));
     }
 
     #[test]

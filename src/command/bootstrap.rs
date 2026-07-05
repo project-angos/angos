@@ -2,9 +2,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     cache::{self, Cache},
-    configuration::{RegistryStorageConfig, registry_storage},
+    configuration::{Configuration, RegistryStorageConfig, registry_storage},
+    event_webhook::{self, dispatcher::EventDispatcher},
     registry::{
-        self, Repository, blob_store, job_store,
+        self, Registry, RegistryConfig, Repository,
+        blob_store::{self, BlobStore},
+        job_store::{self, JobStore},
         metadata_store::{self, MetadataStore},
         repository,
         repository_resolver::{OverlapError, RepositoryResolver},
@@ -36,6 +39,10 @@ pub enum Error {
     Overlap(#[from] OverlapError),
     #[error("failed to initialize job queue: {0}")]
     JobQueue(#[from] job_store::Error),
+    #[error("failed to initialize event webhooks: {0}")]
+    EventWebhook(#[from] event_webhook::Error),
+    #[error("failed to initialize registry: {0}")]
+    Registry(#[from] registry::Error),
 }
 
 impl From<blob_store::Error> for Error {
@@ -69,6 +76,29 @@ pub async fn metadata_store(
 
 pub fn auth_cache(config: &cache::Config) -> Result<Arc<Cache>, Error> {
     config.to_backend().map_err(Error::from)
+}
+
+/// Registry over the shared stores, with webhooks wired from configuration
+/// and a caller-held job queue so no in-process drain loops are spawned.
+/// Used by the maintenance and worker commands; the server wires its own
+/// queue choice in `server setup`.
+pub fn registry(
+    config: &Configuration,
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
+    resolver: Arc<RepositoryResolver>,
+    job_store: Arc<JobStore>,
+) -> Result<Arc<Registry>, Error> {
+    let dispatcher = EventDispatcher::from_config(&config.event_webhook)?;
+    let registry = Registry::new(
+        blob_store,
+        metadata_store,
+        resolver,
+        RegistryConfig::default()
+            .job_queue(job_store)
+            .event_dispatcher(dispatcher),
+    )?;
+    Ok(registry)
 }
 
 pub async fn repository(

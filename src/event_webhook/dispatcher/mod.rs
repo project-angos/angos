@@ -137,16 +137,22 @@ impl EventDispatcher {
         EventDispatcherBuilder::default()
     }
 
-    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
-        self.shutdown.store(true, Ordering::Release);
-        if tokio::time::timeout(timeout, self.drain_in_flight())
-            .await
-            .is_err()
-        {
-            let mut in_flight = self.in_flight.lock().await;
-            in_flight.abort_all();
-            warn!("Shutdown timed out; aborted unfinished async webhook deliveries");
+    /// Build the dispatcher from the configured webhook map, `None` when no
+    /// webhook is defined. The single construction seam shared by the server
+    /// and the maintenance commands.
+    pub fn from_config(
+        webhooks: &HashMap<String, EventWebhookConfig>,
+    ) -> Result<Option<Arc<Self>>, Error> {
+        if webhooks.is_empty() {
+            return Ok(None);
         }
+        let dispatcher = Self::builder().webhooks(webhooks.clone()).build()?;
+        Ok(Some(Arc::new(dispatcher)))
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.drain_in_flight().await;
     }
 
     async fn drain_in_flight(&self) {

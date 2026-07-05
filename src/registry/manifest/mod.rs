@@ -7,9 +7,7 @@ use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 pub use parse::{ParsedManifestDigests, parse_manifest_digests};
 use parse::{manifest_meta_from_body, parse_and_validate_manifest};
-pub use response::{
-    DeleteManifestResponse, GetManifestResponse, HeadManifestResponse, PutManifestResponse,
-};
+pub use response::{GetManifestResponse, HeadManifestResponse, PutManifestResponse};
 use response::{
     ManifestBody, ManifestMeta, get_manifest_body_headers, get_manifest_redirect_headers,
     head_manifest_headers, put_manifest_headers,
@@ -22,15 +20,16 @@ use crate::{
     metrics_provider::metrics_provider,
     oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
     registry::{
-        DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
+        Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
+        cache_job_handler::CACHE_ACTOR,
         job_store::Queue,
         metadata_store::{Error as MetadataStoreError, LinkKind, LinkMetadata, LinkOperation},
     },
     replication::{
-        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
-        build_envelope,
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
+        ReplicationPushPayload, build_envelope,
     },
 };
 
@@ -80,6 +79,37 @@ fn tag_event(
         .reference(Some(reference.to_string()))
         .tag(Some(tag.to_string()))
         .actor(actor)
+}
+
+/// The `ManifestDelete` event a delete emits, plus a `TagDelete` when the
+/// reference is a tag.
+fn delete_events(
+    namespace: &Namespace,
+    repository: String,
+    digest: Option<String>,
+    reference: &Reference,
+    actor: Option<EventActor>,
+) -> Vec<Event> {
+    let mut events = vec![manifest_event(
+        EventKind::ManifestDelete,
+        namespace,
+        repository.clone(),
+        digest.clone(),
+        reference,
+        actor.clone(),
+    )];
+    if let Some(tag) = reference.as_tag() {
+        events.push(tag_event(
+            EventKind::TagDelete,
+            namespace,
+            repository,
+            digest,
+            reference,
+            tag,
+            actor,
+        ));
+    }
+    events
 }
 
 impl Registry {
@@ -235,6 +265,21 @@ impl Registry {
         let (media_type, digest, content) = repository
             .get_manifest(accepted_types, namespace, &reference)
             .await?;
+
+        // The registry is about to gain upstream content, so webhook
+        // consumers see the intent like any other write. Best effort: the
+        // client operation is the pull, so a delivery failure must not fail it.
+        let event = manifest_event(
+            EventKind::ManifestPush,
+            namespace,
+            repository.name.to_string(),
+            Some(digest.to_string()),
+            &reference,
+            Some(EventActor::internal(CACHE_ACTOR)),
+        );
+        if let Err(error) = self.dispatch_events(&[event]).await {
+            warn!("Cache-fill event delivery failed: {error}");
+        }
 
         self.store_manifest(
             namespace,
@@ -417,7 +462,6 @@ impl Registry {
                 created_tags,
             ),
             digest: computed_digest,
-            events: Vec::new(),
             changed,
         })
     }
@@ -489,6 +533,10 @@ impl Registry {
         Ok(retained)
     }
 
+    /// Deletes a manifest or tag. The delete's initiator is read off the
+    /// `actor`: an internal actor (retention enforcement) mirrors the delete
+    /// only to downstreams marked `prune = true`, a client delete to every
+    /// matching downstream.
     #[instrument(skip(actor))]
     pub async fn delete_manifest(
         &self,
@@ -496,7 +544,23 @@ impl Registry {
         source_ts: Option<DateTime<Utc>>,
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<DeleteManifestResponse, Error> {
+    ) -> Result<(), Error> {
+        let client_initiated = actor.as_ref().is_none_or(EventActor::is_client);
+        let resolved_repository = self.resolver.resolve(namespace);
+
+        let repository = resolved_repository
+            .map(|r| r.name.to_string())
+            .unwrap_or_default();
+        let digest_str = match reference {
+            Reference::Digest(d) => Some(d.to_string()),
+            Reference::Tag(_) => None,
+        };
+        // Intent-first emission: the events fire before the delete, so a
+        // performed delete can never go unnotified; a delete that fails past
+        // this point leaves a false-positive notification instead.
+        let events = delete_events(namespace, repository, digest_str, reference, actor);
+        self.dispatch_events(&events).await?;
+
         // A delete carries no incoming digest, so a timestamp tie keeps the
         // strictly-greater rule and the delete proceeds.
         self.check_lww_not_superseded(namespace, reference, source_ts, None)
@@ -519,7 +583,6 @@ impl Registry {
         // read a racing write can flip, which is safe: over-dispatch is
         // idempotent, and the one suppression race coincides with a concurrent
         // re-put whose own dispatch converges the mesh.
-        let resolved_repository = self.resolver.resolve(namespace);
         let existed_before = match self
             .prior_link_if_replicated(resolved_repository, namespace, reference)
             .await
@@ -577,48 +640,26 @@ impl Registry {
                 .await?;
         }
 
-        let repository = resolved_repository
-            .map(|r| r.name.to_string())
-            .unwrap_or_default();
-        let digest_str = match reference {
-            Reference::Digest(d) => Some(d.to_string()),
-            Reference::Tag(_) => None,
-        };
-
-        let mut events = vec![manifest_event(
-            EventKind::ManifestDelete,
-            namespace,
-            repository.clone(),
-            digest_str.clone(),
-            reference,
-            actor.clone(),
-        )];
-
-        if let Some(tag) = reference.as_tag() {
-            events.push(tag_event(
-                EventKind::TagDelete,
-                namespace,
-                repository,
-                digest_str,
-                reference,
-                tag,
-                actor,
-            ));
-        }
-
         // For a tag delete the receiver keys off `payload.tag`, so no digest
         // is carried.
         let (tag, dispatch_digest) = match reference {
             Reference::Tag(tag) => (Some(tag), None),
             Reference::Digest(digest) => (None, Some(digest)),
         };
-        // Webhook events above fire unconditionally; only the replication
+        // Webhook events fire unconditionally; only the replication
         // dispatch is gated on a real removal. A replicated delete forwards
         // its author timestamp verbatim so the bounce can never outrank a
         // recreate authored after the original delete.
-        if existed_before {
-            self.dispatch_replication(
-                resolved_repository,
+        if existed_before && let Some(repository) = resolved_repository {
+            // An internal delete (retention) mirrors only to authoritative
+            // `prune = true` downstreams, so additive downstreams never lose
+            // content because of upstream retention.
+            let downstreams = repository
+                .replication
+                .iter()
+                .filter(|downstream| client_initiated || downstream.prune);
+            self.dispatch_replication_to(
+                downstreams,
                 namespace,
                 REPLICATION_DELETE_MANIFEST_KIND,
                 tag,
@@ -628,7 +669,7 @@ impl Registry {
             .await;
         }
 
-        Ok(DeleteManifestResponse { events })
+        Ok(())
     }
 
     /// Attempts to short-circuit a manifest GET into a presigned redirect using
@@ -657,20 +698,53 @@ impl Registry {
     }
 
     /// Resolves a manifest GET request to a presigned redirect URL or the
-    /// manifest body. The redirect fast-path is taken only when the cached target
+    /// manifest body, then emits a `manifest.pull` event for the served
+    /// digest. The redirect fast-path is taken only when the cached target
     /// is authoritative (not a pull-through cache, a digest reference, or an
     /// immutable tag); mutable tags on a pull-through cache fall through to
     /// `get_manifest` to refresh if upstream has moved.
-    #[instrument(skip(self, is_tag_immutable))]
+    #[instrument(skip(self, is_tag_immutable, actor))]
     pub async fn resolve_get_manifest(
         &self,
+        actor: Option<EventActor>,
         namespace: &Namespace,
         reference: Reference,
         mime_types: &[String],
         is_tag_immutable: bool,
     ) -> Result<GetManifestResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
+        let repository_name = repository.name.to_string();
+        let event_tag = reference.as_tag().map(ToString::to_string);
+        let reference_str = reference.to_string();
 
+        let response = self
+            .resolve_get_manifest_response(
+                repository,
+                namespace,
+                reference,
+                mime_types,
+                is_tag_immutable,
+            )
+            .await?;
+
+        let event = Event::new(EventKind::ManifestPull, namespace.clone(), repository_name)
+            .digest(Some(response.digest().to_string()))
+            .reference(Some(reference_str))
+            .tag(event_tag)
+            .actor(actor);
+        self.dispatch_events(&[event]).await?;
+
+        Ok(response)
+    }
+
+    async fn resolve_get_manifest_response(
+        &self,
+        repository: &Repository,
+        namespace: &Namespace,
+        reference: Reference,
+        mime_types: &[String],
+        is_tag_immutable: bool,
+    ) -> Result<GetManifestResponse, Error> {
         let redirect_is_authoritative = !repository.is_pull_through()
             || matches!(reference, Reference::Digest(_))
             || is_tag_immutable;
@@ -878,47 +952,26 @@ impl Registry {
             return Err(Error::ManifestBodyTooLarge { limit });
         }
 
-        // The equal-timestamp tie-break compares digests, so only a replicated
-        // write (`source_ts` present) pays this extra hash of the body.
-        let incoming_digest = source_ts
-            .is_some()
-            .then(|| Digest::sha256_of_bytes(&request_body));
-        self.check_lww_not_superseded(namespace, &reference, source_ts, incoming_digest.as_ref())
-            .await?;
-
-        let reference_policy = if self.validate_manifest_references {
-            ReferencePolicy::Strict
-        } else {
-            ReferencePolicy::Permissive
-        };
-        let mut response = self
-            .store_manifest(
-                namespace,
-                &reference,
-                Some(&mime_type),
-                &request_body,
-                &created_tags,
-                reference_policy,
-                source_ts,
-            )
-            .await?;
+        // Hashed up front: the intent events fired before the store carry the
+        // content digest, and the LWW tie-break compares it on equal timestamps.
+        let digest = Digest::sha256_of_bytes(&request_body);
 
         let repository = resolved_repository
             .map(|r| r.name.to_string())
             .unwrap_or_default();
-        let digest_str = response.headers.get(DOCKER_CONTENT_DIGEST).cloned();
+        let digest_str = Some(digest.to_string());
 
-        response.events.push(manifest_event(
+        let mut events = vec![manifest_event(
             EventKind::ManifestPush,
             namespace,
             repository.clone(),
             digest_str.clone(),
             &reference,
             actor.clone(),
-        ));
+        )];
 
         if let Some(tag) = reference.as_tag() {
-            response.events.push(tag_event(
+            events.push(tag_event(
                 EventKind::TagCreate,
                 namespace,
                 repository.clone(),
@@ -932,7 +985,7 @@ impl Registry {
         // Each tag created by a `?tag=` query parameter gets its own TagCreate
         // event, mirroring the by-tag push above.
         for tag in &created_tags {
-            response.events.push(tag_event(
+            events.push(tag_event(
                 EventKind::TagCreate,
                 namespace,
                 repository.clone(),
@@ -943,9 +996,34 @@ impl Registry {
             ));
         }
 
+        // Intent-first emission: the events fire before the write, so a
+        // performed write can never go unnotified; a write that fails past
+        // this point leaves a false-positive notification instead.
+        self.dispatch_events(&events).await?;
+
+        self.check_lww_not_superseded(namespace, &reference, source_ts, Some(&digest))
+            .await?;
+
+        let reference_policy = if self.validate_manifest_references {
+            ReferencePolicy::Strict
+        } else {
+            ReferencePolicy::Permissive
+        };
+        let response = self
+            .store_manifest(
+                namespace,
+                &reference,
+                Some(&mime_type),
+                &request_body,
+                &created_tags,
+                reference_policy,
+                source_ts,
+            )
+            .await?;
+
         // No-op suppression: re-dispatching a converged replay would keep a
         // mesh cycle alive, so only a write that changed local state (per the
-        // committed transaction) is replicated. Webhook events above fire
+        // committed transaction) is replicated. Webhook events fire
         // unconditionally.
         if response.changed {
             self.replicate_manifest_push(
@@ -1013,7 +1091,29 @@ impl Registry {
         let Some(repository) = repository else {
             return;
         };
+        self.dispatch_replication_to(
+            repository.replication.iter(),
+            namespace,
+            kind,
+            tag,
+            digest,
+            source_ts,
+        )
+        .await;
+    }
 
+    /// [`Registry::dispatch_replication`] over a caller-selected downstream
+    /// set, for dispatches that must not fan out to every downstream (a
+    /// retention delete targets only `prune = true` mirrors).
+    async fn dispatch_replication_to<'a>(
+        &self,
+        downstreams: impl Iterator<Item = &'a ReplicationDownstream>,
+        namespace: &Namespace,
+        kind: &str,
+        tag: Option<&Tag>,
+        digest: Option<&Digest>,
+        source_ts: Option<DateTime<Utc>>,
+    ) {
         // Receiver-side last-writer-wins timestamp: authoritative for a DELETE;
         // a PUSH re-derives it at execute time, so a coalesced push never goes
         // stale. An inbound replicated delete passes its author timestamp so it
@@ -1024,9 +1124,7 @@ impl Registry {
         // The per-downstream enqueues run concurrently: each one is an index
         // GET plus a CAS transaction, and this awaits inside the client's
         // PUT/DELETE response path, so serial fan-out adds tail latency.
-        let dispatches = repository
-            .replication
-            .iter()
+        let dispatches = downstreams
             .filter(|downstream| downstream.enqueues_for(namespace.as_ref()))
             .map(|downstream| {
                 let payload = ReplicationPushPayload {

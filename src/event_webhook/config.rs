@@ -23,6 +23,11 @@ pub struct EventWebhookConfig {
     pub repository_filter: Option<Vec<RegexPattern>>,
 }
 
+/// Default retry budget for `required`-policy webhooks: a transient delivery
+/// failure would otherwise fail the client operation outright, so a short
+/// backed-off retry burst runs first. Other policies default to no retries.
+const REQUIRED_POLICY_DEFAULT_MAX_RETRIES: u32 = 3;
+
 #[derive(Deserialize)]
 struct EventWebhookConfigFields {
     url: Url,
@@ -32,7 +37,7 @@ struct EventWebhookConfigFields {
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
     #[serde(default, deserialize_with = "deserialize_max_retries")]
-    max_retries: u32,
+    max_retries: Option<u32>,
     events: Vec<EventKind>,
     #[serde(default)]
     repository_filter: Option<Vec<RegexPattern>>,
@@ -46,12 +51,17 @@ impl TryFrom<EventWebhookConfigFields> for EventWebhookConfig {
             return Err("event webhook must have at least one event".to_string());
         }
 
+        let max_retries = fields.max_retries.unwrap_or(match fields.policy {
+            DeliveryPolicy::Required => REQUIRED_POLICY_DEFAULT_MAX_RETRIES,
+            DeliveryPolicy::Optional | DeliveryPolicy::Async => 0,
+        });
+
         Ok(Self {
             url: fields.url,
             policy: fields.policy,
             token: fields.token,
             timeout_ms: fields.timeout_ms,
-            max_retries: fields.max_retries,
+            max_retries,
             events: fields.events,
             repository_filter: fields.repository_filter,
         })
@@ -78,15 +88,17 @@ where
     Ok(token)
 }
 
-fn deserialize_max_retries<'de, D>(deserializer: D) -> Result<u32, D::Error>
+fn deserialize_max_retries<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: Deserializer<'de>,
 {
     const MAX_RETRIES: u32 = 16;
-    let max_retries = u32::deserialize(deserializer)?;
-    if max_retries > MAX_RETRIES {
+    let max_retries = Option::<u32>::deserialize(deserializer)?;
+    if let Some(value) = max_retries
+        && value > MAX_RETRIES
+    {
         return Err(serde::de::Error::custom(format!(
-            "max_retries={max_retries} exceeds the supported maximum of {MAX_RETRIES}"
+            "max_retries={value} exceeds the supported maximum of {MAX_RETRIES}"
         )));
     }
     Ok(max_retries)
@@ -223,6 +235,28 @@ mod tests {
                 .contains("event webhook must have at least one event"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A `required`-policy webhook without an explicit `max_retries` gets the
+    /// short default burst; an explicit zero is respected.
+    #[test]
+    fn required_policy_defaults_to_short_retry_burst() {
+        let toml = r#"
+            url = "https://example.com/webhook"
+            policy = "required"
+            events = ["manifest.push"]
+        "#;
+        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.max_retries, 3);
+
+        let toml = r#"
+            url = "https://example.com/webhook"
+            policy = "required"
+            events = ["manifest.push"]
+            max_retries = 0
+        "#;
+        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.max_retries, 0, "an explicit zero must win");
     }
 
     #[test]

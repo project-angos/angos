@@ -464,7 +464,7 @@ fn create_pull_through_config() -> Configuration {
     )
 }
 
-async fn create_pull_through_registry(config: &Configuration) -> Registry {
+async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
     let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
@@ -500,7 +500,7 @@ async fn create_pull_through_registry(config: &Configuration) -> Registry {
 }
 
 /// Builds the authorizer and registry pair every `authorize_request` test needs.
-async fn authorizer_and_registry(config: &Configuration) -> (Authorizer, Registry) {
+async fn authorizer_and_registry(config: &Configuration) -> (Authorizer, Arc<Registry>) {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(config, &cache).unwrap();
     let registry = create_pull_through_registry(config).await;

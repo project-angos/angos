@@ -21,8 +21,8 @@ use crate::{
     },
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
     registry::{
+        Registry,
         blob_store::BlobStore,
-        cache_job_handler::CacheJobHandler,
         job_store::{self, JobHandler, JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -69,6 +69,7 @@ struct QueueRunner {
 struct Components {
     consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
+    registry: Arc<Registry>,
 }
 
 fn queue_concurrency(config: &Configuration, queue: Queue) -> NonZeroUsize {
@@ -129,6 +130,12 @@ impl Command {
         self.workers.close();
         if timeout(grace, self.workers.wait()).await.is_err() {
             warn!("Worker pool did not drain within shutdown grace period");
+        }
+        // Drain in-flight async webhook deliveries to completion. Every queue
+        // shares one registry per configuration generation, and a repeated
+        // drain on the same registry is a no-op.
+        for runner in &self.queues {
+            runner.inner.load().registry.shutdown().await;
         }
         // Stop the transactional-engine maintenance tasks alongside the worker
         // pool so they don't outlive the process's storage handles.
@@ -220,6 +227,7 @@ struct WorkerContext {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     repositories: Arc<RepositoryResolver>,
+    registry: Arc<Registry>,
 }
 
 impl WorkerContext {
@@ -248,6 +256,13 @@ impl WorkerContext {
 
         let storage = config.resolve_registry_storage().build_store().await?;
         job_store::ensure_shared_lock(&storage)?;
+        let registry = bootstrap::registry(
+            config,
+            blob_store.clone(),
+            metadata_store.clone(),
+            repositories.clone(),
+            Arc::new(JobStore::new(storage.clone(), "worker")),
+        )?;
 
         // Spawn the engine maintenance loops once per worker process so any
         // crashed-mid-Apply transactions are recovered and orphan body
@@ -262,6 +277,7 @@ impl WorkerContext {
             blob_store,
             metadata_store,
             repositories,
+            registry,
         })
     }
 
@@ -278,14 +294,14 @@ impl WorkerContext {
                 self.blob_store.clone(),
                 self.metadata_store.clone(),
             )),
-            Queue::Cache => Arc::new(CacheJobHandler::new(
-                self.repositories.clone(),
-                self.blob_store.clone(),
-                self.metadata_store.clone(),
-            )),
+            Queue::Cache => self.registry.cache_job_handler(),
         };
 
-        Components { consumer, handler }
+        Components {
+            consumer,
+            handler,
+            registry: self.registry.clone(),
+        }
     }
 }
 
@@ -301,9 +317,10 @@ mod tests {
     use crate::{
         metrics_provider,
         registry::{
+            Registry, RegistryConfig,
             blob_store::BlobStore,
             cache_job_handler::CACHE_FETCH_BLOB_KIND,
-            job_store::{JobEnvelope, Queue},
+            job_store::{JobEnvelope, JobStore, Queue},
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
             test_utils::build_store,
@@ -362,11 +379,20 @@ mod tests {
         let blob_store = Arc::new(BlobStore::new(storage.object_store().clone(), None));
         let repositories = Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());
 
+        let registry = Registry::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            repositories.clone(),
+            RegistryConfig::default()
+                .job_queue(Arc::new(JobStore::new(storage.clone(), "worker-test"))),
+        )
+        .unwrap();
         let context = WorkerContext {
             storage,
             blob_store,
             metadata_store,
             repositories,
+            registry,
         };
         (context, dir)
     }

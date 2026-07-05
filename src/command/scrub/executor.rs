@@ -2,16 +2,17 @@ use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     command::scrub::{action::Action, error::Error},
+    event_webhook::event::EventActor,
     metrics_provider::metrics_provider,
-    oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
+    oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
+        Registry,
         blob_store::{self, BlobStore, MultipartCleanup},
         job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore, Queue},
-        manifest::link_plan,
         metadata_store::{
             BlobIndexOperation, Error as MetadataError, LinkKind, LinkOperation, MetadataStore,
         },
@@ -21,6 +22,14 @@ use crate::{
         build_envelope, build_prune_delete_envelope,
     },
 };
+
+#[cfg(test)]
+use crate::registry::{
+    RegistryConfig, repository_resolver::RepositoryResolver, test_utils::create_test_repositories,
+};
+
+/// Internal-process name stamped on the events retention deletions emit.
+pub const RETENTION_ACTOR: &str = "prune";
 
 /// A sink that receives `Action` values produced by scrub checkers.
 #[async_trait]
@@ -45,6 +54,10 @@ pub struct Executor {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     job_store: Arc<JobStore>,
+    /// The registry the retention deletions run through, so they take the
+    /// standard delete path (locking, blob reclaim, events, replication).
+    /// Only the retention actions need it; integrity repairs never use it.
+    registry: Option<Arc<Registry>>,
 }
 
 impl Executor {
@@ -61,15 +74,44 @@ impl Executor {
             blob_store,
             metadata_store,
             job_store,
+            registry: None,
         }
     }
 
-    /// Test-only constructor that synthesizes a `JobStore`.
+    /// Wire the registry the retention actions delete through. Required for
+    /// runs that enforce retention (`prune`, `scrub --retention`).
+    #[must_use]
+    pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    fn retention_registry(&self) -> Result<&Registry, Error> {
+        self.registry.as_deref().ok_or_else(|| {
+            Error::Initialization(
+                "retention actions require a registry; construct the executor with one".to_string(),
+            )
+        })
+    }
+
+    /// Test-only constructor that synthesizes a `JobStore` and a registry
+    /// over the same stores, so the retention arms work out of the box.
     #[cfg(test)]
     #[must_use]
     pub fn new_for_test(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
-        Self::new(blob_store, metadata_store, job_store)
+        let resolver = Arc::new(
+            RepositoryResolver::new(create_test_repositories())
+                .expect("test repositories must not have overlapping prefixes"),
+        );
+        let registry = Registry::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            resolver,
+            RegistryConfig::default().job_queue(job_store.clone()),
+        )
+        .expect("test registry");
+        Self::new(blob_store, metadata_store, job_store).with_registry(registry)
     }
 
     /// Lands the envelope on the durable replication queue. A reconcile push
@@ -290,9 +332,17 @@ impl Executor {
         Ok(())
     }
 
+    /// Retention tag deletion through the registry's standard delete path,
+    /// so it emits `tag.delete`/`manifest.delete` events and, per its
+    /// internal actor, mirrors only to `prune = true` downstreams.
     async fn delete_tag(&self, namespace: Namespace, tag: Tag) -> Result<(), Error> {
-        self.metadata_store
-            .update_links(&namespace, &[LinkOperation::delete(LinkKind::Tag(tag))])
+        self.retention_registry()?
+            .delete_manifest(
+                Some(EventActor::internal(RETENTION_ACTOR)),
+                None,
+                &namespace,
+                &Reference::Tag(tag),
+            )
             .await?;
         Ok(())
     }
@@ -322,25 +372,22 @@ impl Executor {
         Ok(())
     }
 
+    /// Retention orphan-manifest deletion through the registry's standard
+    /// delete path, which also reclaims the manifest's blob bytes once
+    /// unreferenced (a missing blob body deletes metadata-only).
     async fn delete_orphan_manifest(
         &self,
         namespace: Namespace,
         digest: Digest,
     ) -> Result<(), Error> {
-        let manifest = match self.blob_store.read(&digest).await {
-            Ok(content) => Manifest::from_slice(&content).ok(),
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                warn!("Manifest blob missing for {digest}, proceeding with metadata-only deletion");
-                None
-            }
-            Err(e) => return Err(Error::from(e)),
-        };
-        let tags = self
-            .metadata_store
-            .find_tags_pointing_at(&namespace, &digest)
+        self.retention_registry()?
+            .delete_manifest(
+                Some(EventActor::internal(RETENTION_ACTOR)),
+                None,
+                &namespace,
+                &Reference::Digest(digest),
+            )
             .await?;
-        let ops = link_plan::delete(&Reference::Digest(digest), manifest.as_ref(), &tags);
-        self.metadata_store.update_links(&namespace, &ops).await?;
         Ok(())
     }
 

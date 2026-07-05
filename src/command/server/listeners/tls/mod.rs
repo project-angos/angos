@@ -133,8 +133,8 @@ impl TlsListener {
         })
     }
 
-    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
-        self.context.load().shutdown_with_timeout(timeout).await;
+    pub async fn shutdown(&self) {
+        self.context.load().shutdown().await;
     }
 
     pub fn notify_config_change(

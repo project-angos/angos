@@ -97,6 +97,8 @@ impl From<BootstrapError> for Error {
             BootstrapError::Overlap(inner) => Error::Initialization(inner.to_string()),
             BootstrapError::JobQueue(inner) => Error::Initialization(inner.to_string()),
             BootstrapError::RegistryStorage(inner) => Error::Initialization(inner.to_string()),
+            BootstrapError::EventWebhook(inner) => Error::Initialization(inner.to_string()),
+            BootstrapError::Registry(inner) => Error::from(inner),
         }
     }
 }

@@ -66,6 +66,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         repositories.clone(),
         global_retention_policy(&config.global.retention_policy),
     );
+    let mut registry = None;
     let mut sink: Box<dyn ActionSink + Send> = if options.dry_run {
         info!("Dry-run mode: no changes will be made to the storage");
         Box::new(DryRunSink)
@@ -74,15 +75,27 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             metadata_store.store_arc(),
             format!("prune-{}", Uuid::new_v4()),
         ));
-        Box::new(Executor::new(
+        let retention = bootstrap::registry(
+            config,
             blob_backend.clone(),
             metadata_store.clone(),
-            job_store,
-        ))
+            repositories.clone(),
+            job_store.clone(),
+        )?;
+        registry = Some(retention.clone());
+        Box::new(
+            Executor::new(blob_backend.clone(), metadata_store.clone(), job_store)
+                .with_registry(retention),
+        )
     };
 
     check::check_namespaces(&metadata_store, &checker, sink.as_mut()).await?;
-    metadata_store.flush_access_times().await;
+    // The registry shutdown flushes pending writes and drains in-flight async
+    // webhook deliveries to completion before the process exits.
+    match registry {
+        Some(registry) => registry.shutdown().await,
+        None => metadata_store.flush_access_times().await,
+    }
     Ok(())
 }
 

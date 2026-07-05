@@ -9,6 +9,7 @@ use crate::{
     cache::Cache,
     command::{bootstrap, server::error::Error},
     configuration::{Configuration, RegistryStorageConfig},
+    event_webhook::dispatcher::EventDispatcher,
     registry::{
         Registry, RegistryConfig,
         job_store::{self, JobStore},
@@ -74,7 +75,7 @@ pub async fn build_registry(
     config: &Configuration,
     cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
     engine_maintenance: Option<CancellationToken>,
-) -> Result<(Registry, Option<PendingGaugeRefresh>), Error> {
+) -> Result<(Arc<Registry>, Option<PendingGaugeRefresh>), Error> {
     let auth_cache = bootstrap::auth_cache(&config.cache)?;
     let blob_backend = Arc::new(config.blob_store.build_backend()?);
     let metadata_store =
@@ -93,7 +94,8 @@ pub async fn build_registry(
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone())
         .max_concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
-        .max_concurrent_replication_jobs(config.global.max_concurrent_replication_jobs);
+        .max_concurrent_replication_jobs(config.global.max_concurrent_replication_jobs)
+        .event_dispatcher(EventDispatcher::from_config(&config.event_webhook)?);
 
     // When [global.job_queue] is present, route cache-fill jobs through the
     // durable backend (so they survive restarts and let `angos worker` drain

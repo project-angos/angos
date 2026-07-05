@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use reqwest::Client;
 use url::Url;
@@ -13,8 +13,6 @@ use crate::{
     secret::Secret,
     test_fixtures::events::manifest_push_event,
 };
-
-pub const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventDispatcher {
     EventDispatcher::builder()

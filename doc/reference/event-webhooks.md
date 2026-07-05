@@ -23,7 +23,7 @@ Webhooks are defined in the `[event_webhook.<name>]` section of the configuratio
 | `events`            | [string] | required | Event types to deliver (at least one)            |
 | `token`             | string   | -        | Bearer token and HMAC signing secret             |
 | `timeout_ms`        | u64      | `5000`   | HTTP request timeout in milliseconds             |
-| `max_retries`       | u32      | `0`      | Maximum retry attempts after initial failure     |
+| `max_retries`       | u32      | policy   | Maximum retry attempts after initial failure (max 16); defaults to `3` for `required`, `0` otherwise |
 | `repository_filter` | [string] | -        | Regex patterns to match repository names         |
 
 ### Webhook References
@@ -37,19 +37,35 @@ Webhooks are enabled by referencing their names in global or repository configur
 
 ---
 
+## Delivery Semantics
+
+Events are at-least-once notifications of intent: the registry fires them
+just before performing the operation. A performed operation is therefore
+never left unnotified, while an operation that is rejected or fails after
+emission leaves a false-positive event behind. Duplicates are expected, for
+example when a client replays an idempotent push or when replication
+re-applies a converged write in a multi-replica mesh. Each emission carries
+a fresh event `id`, so consumers needing idempotency must key on the payload
+(kind, namespace, digest, tag) rather than on the `id`.
+
+---
+
 ## Delivery Policies
 
 | Policy     | Behavior                                                                                 |
 |------------|------------------------------------------------------------------------------------------|
-| `required` | Synchronous. Waits for response. Non-2xx or network failure fails the client operation.  |
+| `required` | Synchronous. Waits for response. Non-2xx or network failure fails the client operation before it is performed. |
 | `optional` | Synchronous. Waits for response. Failure is logged but does not affect the client.       |
 | `async`    | Asynchronous. Dispatched in background. Client receives response immediately.            |
 
 ### Retry Behavior
 
-Retries apply to `required`, `optional`, and `async` policies when `max_retries > 0`.
+Retries apply to `required`, `optional`, and `async` policies when
+`max_retries > 0`. Unless set explicitly, `required` webhooks retry 3 times
+(a transient endpoint hiccup should not fail the client operation) and the
+other policies do not retry.
 
-Backoff formula: `100ms * 2^(attempt - 1)`
+Backoff formula: `100ms * 2^(attempt - 1)`, capped at 10 seconds
 
 | `max_retries` | Total attempts | Delays               |
 |---------------|----------------|----------------------|
@@ -64,10 +80,10 @@ Backoff formula: `100ms * 2^(attempt - 1)`
 
 | Event             | Trigger                                          |
 |-------------------|--------------------------------------------------|
-| `manifest.push`   | Manifest stored successfully                     |
+| `manifest.push`   | Manifest push (client, replication or cache fill) |
 | `manifest.pull`   | Manifest served to a client via `GET`            |
-| `manifest.delete` | Manifest deleted                                 |
-| `blob.push`       | Blob upload completed, or a cross-repo mount granted it to a namespace |
+| `manifest.delete` | Manifest delete (client or retention)            |
+| `blob.push`       | Blob upload completion, a cross-repo mount, or a cache fill |
 | `blob.pull`       | Blob served to a client via `GET`                |
 | `tag.create`      | Tag created (part of manifest push with tag ref) |
 | `tag.delete`      | Tag deleted (part of manifest delete by tag)     |
@@ -127,8 +143,14 @@ Events are delivered as JSON via HTTP POST.
 | `id`        | string | Identity identifier                |
 | `username`  | string | Basic auth or OIDC subject         |
 | `client_ip` | string | Client IP address                  |
+| `internal`  | string | Name of the internal process that performed the operation (`prune`, `cache`); absent on client-initiated operations |
 
 All actor fields are optional and omitted when not available.
+
+Operations performed by angos itself carry the `internal` field instead of a
+client identity: retention enforcement emits `manifest.delete` / `tag.delete`
+with `internal = "prune"`, and pull-through cache fills emit `manifest.push` /
+`blob.push` with `internal = "cache"`.
 
 ---
 
@@ -244,8 +266,9 @@ Changes that do **not** require restart:
 
 On shutdown, the dispatcher:
 1. Stops accepting new async deliveries
-2. Waits for in-flight async deliveries to complete (with timeout)
-3. Aborts and logs any deliveries that did not complete within the timeout
+2. Drains in-flight async deliveries to completion
 
-The timeout is a shutdown deadline, not a delivery guarantee. Async deliveries
-that exceed it are abandoned so shutdown can continue promptly.
+The drain is bounded, not open-ended: every delivery is limited by its own
+`timeout_ms`, its capped retry count, and the 10-second backoff ceiling, so an
+unresponsive endpoint cannot hang the shutdown. A crash (as opposed to a
+graceful shutdown) still loses in-flight async deliveries.

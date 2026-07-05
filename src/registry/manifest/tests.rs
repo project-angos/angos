@@ -10,10 +10,9 @@ use serde_json::json;
 use super::{parse::manifest_meta_from_body, *};
 use crate::{
     command::server::Error as ServerError,
-    event_webhook::event::EventKind,
     oci::{Algorithm, MediaType, Namespace, Tag},
     registry::{
-        Error, OCI_TAG, Registry,
+        DOCKER_CONTENT_DIGEST, Error, OCI_TAG, Registry,
         metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
         path_builder::blob_path,
         test_utils::{
@@ -280,30 +279,8 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
     );
     assert_eq!(header_digest(&response.headers), digest);
 
-    let digest_str = digest.to_string();
-    assert!(
-        response
-            .events
-            .iter()
-            .any(|e| e.kind == EventKind::ManifestPush && e.digest.as_deref() == Some(&digest_str)),
-        "a by-digest push must emit a ManifestPush event carrying the digest"
-    );
-    for tag in ["1.2.3", "latest"] {
-        let count = response
-            .events
-            .iter()
-            .filter(|e| {
-                e.kind == EventKind::TagCreate
-                    && e.tag.as_deref() == Some(tag)
-                    && e.digest.as_deref() == Some(&digest_str)
-            })
-            .count();
-        assert_eq!(
-            count, 1,
-            "exactly one TagCreate event carrying the digest must fire for tag '{tag}'"
-        );
-    }
-
+    // Event emission for `?tag=` pushes is covered by
+    // `event_emission_tests::digest_push_with_tag_params_emits_tag_create_per_tag`.
     let repository = registry.get_repository_for_namespace(&namespace).unwrap();
     for tag in ["1.2.3", "latest"] {
         let head = registry
@@ -1398,6 +1375,7 @@ async fn test_handle_get_manifest() {
 
         let response = registry
             .resolve_get_manifest(
+                None,
                 namespace,
                 Reference::Tag(Tag::new(tag).unwrap()),
                 &[],
@@ -1919,6 +1897,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
 
         let response = registry
             .resolve_get_manifest(
+                None,
                 namespace,
                 Reference::Tag(Tag::new("latest").unwrap()),
                 &[media_type.to_string()],
@@ -3188,7 +3167,6 @@ mod noop_suppression_tests {
     use angos_tx_engine::transaction::Transaction;
 
     use crate::{
-        event_webhook::event::EventKind,
         oci::{Digest, MediaType, Namespace, Reference, Tag},
         registry::{
             Registry, RegistryConfig,
@@ -3210,7 +3188,7 @@ mod noop_suppression_tests {
     /// Build a `Registry` whose blob store, metadata store, and a caller-held
     /// `JobStore` all share one FS-backed `Store`, carrying a single
     /// event+reconcile downstream so `dispatch_replication` enqueues.
-    fn build_registry() -> (Registry, Arc<JobStore>, TempDir) {
+    fn build_registry() -> (Arc<Registry>, Arc<JobStore>, TempDir) {
         let FsTestStack {
             dir,
             store,
@@ -3747,8 +3725,10 @@ mod noop_suppression_tests {
         );
     }
 
+    /// Event emission for the no-op replay is covered by
+    /// `event_emission_tests::noop_push_still_emits_events`.
     #[tokio::test]
-    async fn noop_push_still_emits_webhook_events() {
+    async fn noop_push_does_not_enqueue_replication() {
         let (registry, job_store, _dir) = build_registry();
         let namespace = Namespace::new(NAMESPACE).unwrap();
         let tag = "latest";
@@ -3768,7 +3748,7 @@ mod noop_suppression_tests {
             .expect("seed tag push");
         let baseline = pending(&job_store).await;
 
-        let response = registry
+        registry
             .accept_put_manifest(
                 None,
                 None,
@@ -3785,20 +3765,6 @@ mod noop_suppression_tests {
             pending(&job_store).await,
             baseline,
             "the no-op replay must NOT enqueue a replication job"
-        );
-        assert!(
-            response
-                .events
-                .iter()
-                .any(|e| e.kind == EventKind::ManifestPush),
-            "a no-op push must still emit ManifestPush"
-        );
-        assert!(
-            response
-                .events
-                .iter()
-                .any(|e| e.kind == EventKind::TagCreate),
-            "a no-op tag push must still emit TagCreate"
         );
     }
 }
@@ -3863,7 +3829,7 @@ mod dispatch_replication_tests {
 
     /// Build a `Registry` whose job store is a caller-held `JobStore` so the
     /// test can count pending jobs.
-    fn build_registry_with(repository: Repository) -> (Registry, Arc<JobStore>, TempDir) {
+    fn build_registry_with(repository: Repository) -> (Arc<Registry>, Arc<JobStore>, TempDir) {
         let FsTestStack {
             dir,
             store,
@@ -3882,7 +3848,7 @@ mod dispatch_replication_tests {
     }
 
     /// [`build_registry_with`] with one `event+reconcile` downstream.
-    fn build_registry() -> (Registry, Arc<JobStore>, TempDir) {
+    fn build_registry() -> (Arc<Registry>, Arc<JobStore>, TempDir) {
         build_registry_with(repository_with_downstream())
     }
 
