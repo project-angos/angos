@@ -1,0 +1,15 @@
+// Global config for the self-hosted Renovate run (.github/workflows/renovate.yaml).
+// Repo-level rules live in renovate.json at the repository root.
+{
+  repositories: ['project-angos/angos'],
+  onboarding: false,
+  // Commit via the GitHub API so commits are attributed to the app and
+  // show up as verified. Requires the app-token auth in renovate.yaml.
+  platformCommit: 'enabled',
+  // Every postUpgradeTasks command in renovate.json must match one of these
+  // patterns, otherwise Renovate refuses to run it.
+  allowedCommands: [
+    '^cargo update$',
+    '^npm --prefix (ui|website) update$',
+  ],
+}

@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Exactly one weekly PR per subsystem (angos-core, angos-ui, website), each covering version updates, security fixes and lockfile maintenance. Dedicated vulnerability-alert PRs are disabled on purpose: Renovate cannot group them into existing PRs (they force their own branch per dependency), so security fixes ride the subsystem PRs instead.",
+  "description": "Exactly one weekly PR per subsystem (angos-core, angos-ui, website), each covering version updates, security fixes and a full lockfile refresh. lockFileMaintenance is not used: Renovate cannot group it with other update types (it warns and forces a separate branch), so the refresh is done by postUpgradeTasks (cargo update / npm update) running inside each subsystem branch — this requires the self-hosted workflow in .github/workflows/renovate.yaml. Dedicated vulnerability-alert PRs are disabled on purpose: they force their own branch per dependency, so security fixes ride the subsystem PRs instead.",
   "extends": [
     "config:recommended",
     ":semanticCommits",
@@ -8,34 +8,35 @@
   ],
   "labels": ["dependencies"],
   "timezone": "Europe/Paris",
-  "schedule": ["before 5am on monday"],
+  "schedule": ["before 10am on monday"],
   "prConcurrentLimit": 5,
-  "prHourlyLimit": 2,
+  "prHourlyLimit": 0,
   "rangeStrategy": "bump",
   "separateMajorMinor": false,
   "separateMinorPatch": false,
   "separateMultipleMajor": false,
   "rebaseWhen": "behind-base-branch",
-  "lockFileMaintenance": {
-    "enabled": true,
-    "schedule": ["before 5am on monday"]
-  },
   "vulnerabilityAlerts": {
     "enabled": false
   },
   "packageRules": [
     {
-      "description": "Core: everything not claimed by a rule below — cargo, Dockerfile, GitHub Actions, etc.",
+      "description": "Core: everything not claimed by a rule below — cargo, Dockerfile, GitHub Actions, etc. cargo update refreshes all transitive deps in Cargo.lock within the same PR (replaces lockFileMaintenance).",
       "matchPackageNames": ["*"],
       "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest", "pinDigest", "bump", "rollback", "replacement"],
       "groupName": "angos-core",
       "groupSlug": "angos-core",
       "commitMessageTopic": "angos-core dependencies",
       "semanticCommitType": "chore",
-      "semanticCommitScope": "deps"
+      "semanticCommitScope": "deps",
+      "postUpgradeTasks": {
+        "commands": ["cargo update"],
+        "executionMode": "branch",
+        "fileFilters": ["Cargo.lock"]
+      }
     },
     {
-      "description": "UI (SvelteKit): group every dependency under ui/ into one PR.",
+      "description": "UI (SvelteKit): group every dependency under ui/ into one PR, with a full package-lock.json refresh via npm update.",
       "matchFileNames": ["ui/**"],
       "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest", "pinDigest", "bump", "rollback", "replacement"],
       "groupName": "angos-ui",
@@ -43,10 +44,15 @@
       "commitMessageTopic": "angos-ui dependencies",
       "semanticCommitType": "chore",
       "semanticCommitScope": "ui",
-      "postUpdateOptions": ["npmDedupe"]
+      "postUpdateOptions": ["npmDedupe"],
+      "postUpgradeTasks": {
+        "commands": ["npm --prefix ui update"],
+        "executionMode": "branch",
+        "fileFilters": ["ui/package-lock.json"]
+      }
     },
     {
-      "description": "Website (Docusaurus): group every dependency under website/ into one PR.",
+      "description": "Website (Docusaurus): group every dependency under website/ into one PR, with a full package-lock.json refresh via npm update.",
       "matchFileNames": ["website/**"],
       "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest", "pinDigest", "bump", "rollback", "replacement"],
       "groupName": "website",
@@ -54,42 +60,12 @@
       "commitMessageTopic": "website dependencies",
       "semanticCommitType": "chore",
       "semanticCommitScope": "website",
-      "postUpdateOptions": ["npmDedupe"]
-    },
-    {
-      "description": "Fold lockfile maintenance for anything outside ui/ and website/ (Cargo.lock today) into the angos-core PR. group.branchTopic must be forced because Renovate hard-prefixes lockFileMaintenance group slugs with 'lock-file-maintenance-', which would otherwise put it on a separate branch/PR.",
-      "matchUpdateTypes": ["lockFileMaintenance"],
-      "groupName": "angos-core",
-      "groupSlug": "angos-core",
-      "group": { "branchTopic": "angos-core" },
-      "commitMessageAction": "Update",
-      "commitMessageTopic": "angos-core dependencies",
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "deps"
-    },
-    {
-      "description": "Fold ui/package-lock.json maintenance into the angos-ui PR (same forced branchTopic trick as above).",
-      "matchUpdateTypes": ["lockFileMaintenance"],
-      "matchFileNames": ["ui/**"],
-      "groupName": "angos-ui",
-      "groupSlug": "angos-ui",
-      "group": { "branchTopic": "angos-ui" },
-      "commitMessageAction": "Update",
-      "commitMessageTopic": "angos-ui dependencies",
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "ui"
-    },
-    {
-      "description": "Fold website/package-lock.json maintenance into the website PR (same forced branchTopic trick as above).",
-      "matchUpdateTypes": ["lockFileMaintenance"],
-      "matchFileNames": ["website/**"],
-      "groupName": "website",
-      "groupSlug": "website",
-      "group": { "branchTopic": "website" },
-      "commitMessageAction": "Update",
-      "commitMessageTopic": "website dependencies",
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "website"
+      "postUpdateOptions": ["npmDedupe"],
+      "postUpgradeTasks": {
+        "commands": ["npm --prefix website update"],
+        "executionMode": "branch",
+        "fileFilters": ["website/package-lock.json"]
+      }
     }
   ]
 }
