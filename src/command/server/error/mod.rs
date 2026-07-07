@@ -35,37 +35,6 @@ pub enum Error {
     },
 }
 
-impl PartialEq for Error {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Error::Initialization(a), Error::Initialization(b))
-            | (Error::Execution(a), Error::Execution(b))
-            | (Error::Unauthorized(a), Error::Unauthorized(b))
-            | (Error::BadRequest(a), Error::BadRequest(b))
-            | (Error::Conflict(a), Error::Conflict(b))
-            | (Error::RangeNotSatisfiable(a), Error::RangeNotSatisfiable(b))
-            | (Error::NotFound(a), Error::NotFound(b))
-            | (Error::ProviderUnavailable(a), Error::ProviderUnavailable(b))
-            | (Error::Internal(a), Error::Internal(b)) => a == b,
-            (Error::HttpBuild(a), Error::HttpBuild(b)) => std::ptr::eq(a, b),
-            (Error::Serialization(a), Error::Serialization(b)) => std::ptr::eq(a, b),
-            (
-                Error::Custom {
-                    status_code: sc_a,
-                    code: c_a,
-                    msg: m_a,
-                },
-                Error::Custom {
-                    status_code: sc_b,
-                    code: c_b,
-                    msg: m_b,
-                },
-            ) => sc_a == sc_b && c_a == c_b && m_a == m_b,
-            _ => false,
-        }
-    }
-}
-
 impl Error {
     pub fn status_code(&self) -> StatusCode {
         match self {

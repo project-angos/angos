@@ -568,10 +568,7 @@ async fn test_authorize_success() {
 
     let parts = parts_with_uri("https://example.com/v2/");
 
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true)
-    );
+    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
 }
 
 #[tokio::test]
@@ -594,10 +591,7 @@ async fn test_authorize_denied() {
 
     let parts = parts_with_uri("https://example.com/v2/");
 
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(false)
-    );
+    assert!(!webhook.authorize(&action, &identity, &parts).await.unwrap());
 }
 
 #[tokio::test]
@@ -623,10 +617,7 @@ async fn test_authorize_with_bearer_token() {
 
     let parts = parts_with_uri("https://example.com/v2/");
 
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true)
-    );
+    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
 }
 
 #[tokio::test]
@@ -653,10 +644,7 @@ async fn test_authorize_with_basic_auth() {
 
     let parts = parts_with_uri("https://example.com/v2/");
 
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true)
-    );
+    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
 }
 
 #[tokio::test]
@@ -684,10 +672,7 @@ async fn test_authorize_sends_correct_headers() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true)
-    );
+    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
 }
 
 #[tokio::test]
@@ -711,14 +696,8 @@ async fn test_authorize_uses_cache() {
 
     let parts = parts_with_uri("https://example.com/v2/");
 
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true)
-    );
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true)
-    );
+    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
+    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
 }
 
 #[tokio::test]
@@ -784,9 +763,8 @@ async fn test_authorize_does_not_cache_transport_errors() {
     let second = live_webhook
         .authorize(&action, &identity, &request_parts)
         .await;
-    assert_eq!(
-        second,
-        Ok(true),
+    assert!(
+        second.unwrap(),
         "second call must reach the live server, not return a cached denial"
     );
 }
@@ -814,14 +792,12 @@ async fn assert_cacheable_explicit_deny(status: u16) {
     let identity = ClientIdentity::new(None);
     let parts = parts_with_uri("https://example.com/v2/");
 
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(false),
+    assert!(
+        !webhook.authorize(&action, &identity, &parts).await.unwrap(),
         "status {status} must be an explicit deny"
     );
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(false),
+    assert!(
+        !webhook.authorize(&action, &identity, &parts).await.unwrap(),
         "second call must be served from cache"
     );
 }
@@ -850,9 +826,8 @@ async fn assert_unavailable_not_cached(status: u16) {
         webhook.authorize(&action, &identity, &parts).await.is_err(),
         "status {status} must return Err, not Ok(false)"
     );
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true),
+    assert!(
+        webhook.authorize(&action, &identity, &parts).await.unwrap(),
         "after status {status} the next call must reach the webhook again and be allowed"
     );
 }
@@ -925,9 +900,8 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
 
     let parts = parts_with_uri("https://example.com/v2/");
 
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true),
+    assert!(
+        webhook.authorize(&action, &identity, &parts).await.unwrap(),
         "cache store error must not fail authorization"
     );
     assert_eq!(
@@ -983,9 +957,8 @@ async fn test_authorize_timeout_does_not_cache_and_retries() {
     .unwrap();
 
     let second = live_webhook.authorize(&action, &identity, &parts).await;
-    assert_eq!(
-        second,
-        Ok(true),
+    assert!(
+        second.unwrap(),
         "after a timeout the next call must reach the live server: no stale cache entry"
     );
 }
@@ -1023,16 +996,14 @@ async fn test_authorize_cache_entry_expires_and_refetches() {
     let parts = parts_with_uri("https://example.com/v2/");
 
     // First call: goes to the network, gets 200, caches the allow decision.
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true),
+    assert!(
+        webhook.authorize(&action, &identity, &parts).await.unwrap(),
         "first call must be allowed"
     );
 
     // Immediate second call: served from cache, still allow, no network hop.
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(true),
+    assert!(
+        webhook.authorize(&action, &identity, &parts).await.unwrap(),
         "second call must be served from cache"
     );
 
@@ -1040,9 +1011,8 @@ async fn test_authorize_cache_entry_expires_and_refetches() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
 
     // Third call: cache expired, goes to network again, gets the fallback 403.
-    assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(false),
+    assert!(
+        !webhook.authorize(&action, &identity, &parts).await.unwrap(),
         "after TTL expiry authorization must fetch fresh from network and get deny"
     );
 }

@@ -379,28 +379,3 @@ fn test_from_event_webhook_error_mapping() {
     assert!(matches!(error, Error::Execution(_)));
     assert_eq!(error.to_string(), "webhook failed");
 }
-
-#[test]
-fn test_opaque_errors_with_same_display_are_not_equal() {
-    let http_left = Error::HttpBuild(
-        hyper::http::Response::builder()
-            .status(1000)
-            .body(())
-            .unwrap_err(),
-    );
-    let http_right = Error::HttpBuild(
-        hyper::http::Response::builder()
-            .status(1000)
-            .body(())
-            .unwrap_err(),
-    );
-    assert_eq!(http_left.to_string(), http_right.to_string());
-    assert_ne!(http_left, http_right);
-
-    let json_left =
-        Error::Serialization(serde_json::from_str::<serde_json::Value>("}").unwrap_err());
-    let json_right =
-        Error::Serialization(serde_json::from_str::<serde_json::Value>("}").unwrap_err());
-    assert_eq!(json_left.to_string(), json_right.to_string());
-    assert_ne!(json_left, json_right);
-}
