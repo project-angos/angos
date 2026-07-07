@@ -155,7 +155,9 @@ pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
-    let store = storage_config.build_store().await.unwrap();
+    let store = crate::command::bootstrap::build_store(&storage_config)
+        .await
+        .unwrap();
     let metadata_store = Arc::new(MetadataStore::builder(store).build());
 
     let mut repositories_map = HashMap::new();

@@ -252,7 +252,7 @@ impl WorkerContext {
             ));
         }
 
-        let storage = config.resolve_registry_storage().build_store().await?;
+        let storage = bootstrap::build_store(&config.resolve_registry_storage()).await?;
         job_store::ensure_shared_lock(&storage)?;
         let registry = bootstrap::registry(
             config,

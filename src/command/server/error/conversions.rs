@@ -2,8 +2,7 @@ use hyper::StatusCode;
 
 use crate::{
     command::{bootstrap, server::error::Error},
-    configuration::{self, registry_storage},
-    event_webhook, registry,
+    configuration, event_webhook, registry,
     registry::{blob_store, job_store},
     replication::REPLICATION_SUPERSEDED_CODE,
 };
@@ -96,7 +95,7 @@ impl From<bootstrap::Error> for Error {
             bootstrap::Error::MetadataStore(inner) => {
                 Error::Initialization(format!("Failed to initialize metadata store: {inner}"))
             }
-            bootstrap::Error::RegistryStorage(inner) => {
+            bootstrap::Error::StorageBackend(inner) | bootstrap::Error::Coordination(inner) => {
                 Error::Initialization(format!("Failed to initialize storage handles: {inner}"))
             }
             bootstrap::Error::Cache(inner) => {
@@ -116,12 +115,6 @@ impl From<bootstrap::Error> for Error {
                 Error::Initialization(format!("Failed to initialize registry: {inner}"))
             }
         }
-    }
-}
-
-impl From<registry_storage::Error> for Error {
-    fn from(e: registry_storage::Error) -> Self {
-        Error::Initialization(e.to_string())
     }
 }
 
