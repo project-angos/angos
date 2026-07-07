@@ -121,7 +121,7 @@ where
 pub async fn collect_all_pages<T, E, Fetch, FetchFut>(mut fetch: Fetch) -> Result<Vec<T>, E>
 where
     Fetch: FnMut(Option<String>) -> FetchFut,
-    FetchFut: std::future::Future<Output = Result<(Vec<T>, Option<String>), E>>,
+    FetchFut: Future<Output = Result<(Vec<T>, Option<String>), E>>,
 {
     let mut all = Vec::new();
     let mut marker = None;

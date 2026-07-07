@@ -167,10 +167,10 @@ pub async fn move_idempotent(
     store: &dyn ObjectStore,
     src: &str,
     dst: &str,
-) -> Result<(), angos_storage::Error> {
+) -> Result<(), StorageError> {
     store.copy(src, dst).await?;
     match store.delete(src).await {
-        Ok(()) | Err(angos_storage::Error::NotFound) => Ok(()),
+        Ok(()) | Err(StorageError::NotFound) => Ok(()),
         Err(e) => Err(e),
     }
 }

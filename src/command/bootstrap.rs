@@ -238,9 +238,11 @@ pub fn registry(
         blob_store,
         metadata_store,
         resolver,
-        RegistryConfig::default()
-            .job_queue(job_store)
-            .event_dispatcher(dispatcher),
+        RegistryConfig {
+            job_queue: Some(job_store),
+            event_dispatcher: dispatcher,
+            ..RegistryConfig::default()
+        },
     )?;
     Ok(registry)
 }

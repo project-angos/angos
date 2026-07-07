@@ -34,6 +34,25 @@ pub mod test_utils;
 pub mod upload;
 pub mod version;
 
+pub use crate::policy::AccessPolicy;
+use crate::{
+    cache,
+    configuration::{
+        RegexPattern,
+        global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
+    },
+    event_webhook::{dispatcher::EventDispatcher, event::Event},
+    oci::Namespace,
+    registry::{
+        blob_store::BlobStore,
+        cache_job_handler::CacheJobHandler,
+        job_runner::execute_one,
+        job_store::{JobHandler, JobStore, Queue},
+        metadata_store::MetadataStore,
+        repository_resolver::RepositoryResolver,
+    },
+    replication::ReplicationJobHandler,
+};
 pub use blob::{BlobRange, GetBlobResponse};
 pub use error::Error;
 pub use headers::{HeaderMap, ResponseHeaders};
@@ -56,26 +75,6 @@ pub struct JsonResponse {
     pub headers: HashMap<&'static str, String>,
     pub body: Vec<u8>,
 }
-
-pub use crate::policy::AccessPolicy;
-use crate::{
-    cache,
-    configuration::{
-        RegexPattern,
-        global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
-    },
-    event_webhook::{dispatcher::EventDispatcher, event::Event},
-    oci::Namespace,
-    registry::{
-        blob_store::BlobStore,
-        cache_job_handler::CacheJobHandler,
-        job_runner::execute_one,
-        job_store::{JobHandler, JobStore, Queue},
-        metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-    replication::ReplicationJobHandler,
-};
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
@@ -131,68 +130,6 @@ impl Default for RegistryConfig {
             max_concurrent_replication_jobs: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
             event_dispatcher: None,
         }
-    }
-}
-
-impl RegistryConfig {
-    pub fn update_pull_time(mut self, enabled: bool) -> Self {
-        self.update_pull_time = enabled;
-        self
-    }
-
-    pub fn enable_blob_redirect(mut self, enabled: bool) -> Self {
-        self.enable_blob_redirect = enabled;
-        self
-    }
-
-    pub fn enable_manifest_redirect(mut self, enabled: bool) -> Self {
-        self.enable_manifest_redirect = enabled;
-        self
-    }
-
-    pub fn global_immutable_tags(mut self, enabled: bool) -> Self {
-        self.global_immutable_tags = enabled;
-        self
-    }
-
-    pub fn global_immutable_tags_exclusions(mut self, exclusions: Vec<RegexPattern>) -> Self {
-        self.global_immutable_tags_exclusions = exclusions;
-        self
-    }
-
-    pub fn max_manifest_size_bytes(mut self, limit: usize) -> Self {
-        self.max_manifest_size_bytes = limit;
-        self
-    }
-
-    pub fn max_blob_size_bytes(mut self, limit: u64) -> Self {
-        self.max_blob_size_bytes = limit;
-        self
-    }
-
-    pub fn validate_manifest_references(mut self, enabled: bool) -> Self {
-        self.validate_manifest_references = enabled;
-        self
-    }
-
-    pub fn job_queue(mut self, queue: Arc<JobStore>) -> Self {
-        self.job_queue = Some(queue);
-        self
-    }
-
-    pub fn max_concurrent_cache_jobs(mut self, value: NonZeroUsize) -> Self {
-        self.max_concurrent_cache_jobs = value;
-        self
-    }
-
-    pub fn max_concurrent_replication_jobs(mut self, value: NonZeroUsize) -> Self {
-        self.max_concurrent_replication_jobs = value;
-        self
-    }
-
-    pub fn event_dispatcher(mut self, dispatcher: Option<Arc<EventDispatcher>>) -> Self {
-        self.event_dispatcher = dispatcher;
-        self
     }
 }
 

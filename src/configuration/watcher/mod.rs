@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use classify::{ChangeKind, classify_event, merge_change_kind};
 use notify::{Event, RecursiveMode, Watcher};
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{spawn, sync::mpsc, task::JoinHandle, time::timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::configuration::{Configuration, Error, ServerConfig, listeners::ServerTlsConfig};
@@ -57,7 +57,7 @@ pub trait ConfigNotifier: Send + Sync {
 }
 
 pub struct ConfigWatcher {
-    _handle: tokio::task::JoinHandle<()>,
+    _handle: JoinHandle<()>,
 }
 
 impl ConfigWatcher {
@@ -70,7 +70,7 @@ impl ConfigWatcher {
             return Err(Error::NotReadable(msg));
         }
 
-        let handle = tokio::spawn(async move {
+        let handle = spawn(async move {
             if let Err(e) = watch_config_loop(config_file_path, notifier).await {
                 error!("Config watcher failed: {e}");
             }

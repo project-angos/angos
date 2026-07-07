@@ -108,7 +108,10 @@ impl Executor {
             blob_store.clone(),
             metadata_store.clone(),
             resolver,
-            RegistryConfig::default().job_queue(job_store.clone()),
+            RegistryConfig {
+                job_queue: Some(job_store.clone()),
+                ..RegistryConfig::default()
+            },
         )
         .expect("test registry");
         Self::new(blob_store, metadata_store, job_store).with_registry(registry)

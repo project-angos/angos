@@ -177,7 +177,7 @@ pub async fn append_shard_for_digest(
 }
 
 /// Return the ops slice for `digest` from the map, or an empty slice.
-pub(crate) fn ops_for_digest<'a>(
+pub fn ops_for_digest<'a>(
     map: &'a HashMap<Digest, Vec<BlobIndexOperation>>,
     digest: &Digest,
 ) -> &'a [BlobIndexOperation] {
@@ -185,7 +185,7 @@ pub(crate) fn ops_for_digest<'a>(
 }
 
 /// Check whether the shard for `namespace` will be empty after applying `ops`.
-pub(crate) async fn shard_will_be_empty(
+pub async fn shard_will_be_empty(
     store: &Store,
     namespace: &Namespace,
     ops: &[BlobIndexOperation],
@@ -220,7 +220,7 @@ pub(crate) async fn shard_will_be_empty(
 
 /// Return `true` when any namespace other than `our_namespace` has a live
 /// shard entry in the refs directory.
-pub(crate) async fn any_other_namespace_references_blob(
+pub async fn any_other_namespace_references_blob(
     store: &Store,
     our_namespace: &Namespace,
     refs_prefix: &str,

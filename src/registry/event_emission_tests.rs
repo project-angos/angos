@@ -80,10 +80,7 @@ impl FsRegistryFixture {
         };
         let mut webhooks = HashMap::new();
         webhooks.insert("test-hook".to_string(), webhook);
-        let dispatcher = EventDispatcher::builder()
-            .webhooks(webhooks)
-            .build()
-            .expect("dispatcher build");
+        let dispatcher = EventDispatcher::new(webhooks).expect("dispatcher build");
 
         let FsTestStack {
             dir,
@@ -95,7 +92,10 @@ impl FsRegistryFixture {
             RepositoryResolver::new(create_test_repositories())
                 .expect("test repositories must not have overlapping prefixes"),
         );
-        let config = RegistryConfig::default().event_dispatcher(Some(Arc::new(dispatcher)));
+        let config = RegistryConfig {
+            event_dispatcher: Some(Arc::new(dispatcher)),
+            ..RegistryConfig::default()
+        };
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         Self {
@@ -713,7 +713,10 @@ impl ReplicationFixture {
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let config = RegistryConfig {
+            job_queue: Some(job_store.clone()),
+            ..RegistryConfig::default()
+        };
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         Self {

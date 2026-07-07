@@ -1895,7 +1895,10 @@ mod tests {
             RepositoryResolver::new(create_test_repositories())
                 .expect("test repositories must not have overlapping prefixes"),
         );
-        let config = RegistryConfig::default().max_blob_size_bytes(max_blob_size_bytes);
+        let config = RegistryConfig {
+            max_blob_size_bytes,
+            ..RegistryConfig::default()
+        };
         Registry::new(
             test_case.blob_store(),
             test_case.metadata_store(),

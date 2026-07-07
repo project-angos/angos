@@ -13,6 +13,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     sync::Arc,
 };
 
@@ -62,7 +63,7 @@ pub struct CasExecutor {
 }
 
 impl std::fmt::Debug for CasExecutor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CasExecutor")
             .field("ttl_secs", &self.ttl_secs)
             .finish_non_exhaustive()

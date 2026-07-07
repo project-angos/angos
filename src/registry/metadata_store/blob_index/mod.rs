@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-pub(crate) mod shard;
+pub mod shard;
 
 use self::shard::{
     SHARD_READ_CONCURRENCY, append_shard_for_digest, apply_blob_index_operations,

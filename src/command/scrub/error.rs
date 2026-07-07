@@ -7,26 +7,13 @@ use crate::{
     registry::{self, blob_store, metadata_store},
 };
 
-/// Errors that can occur during a scrub run.
+/// Errors that can occur during a scrub run. Each variant's `Display` carries
+/// a `scrub ...` prefix so log lines are unambiguously attributable.
 ///
-/// The `Initialization` string variant is retained for call sites where the
-/// source error type is not one of the typed variants below, or where the call
-/// site adds contextual information (e.g. a repository name) that is not
-/// present in the source error.
-///
-/// ## Display prefix choice
-///
-/// The original implementation emitted bare strings with no context prefix,
-/// making it impossible to distinguish a scrub error's origin in log output.
-/// The new `#[error("...")]` attributes add a minimal prefix so that log lines
-/// are unambiguously attributable.
-///
-/// ## `blob_store::Error` and `#[from]`
-///
-/// `blob_store::Error` does not implement `std::error::Error`, which is a
-/// prerequisite for `#[from]` / `#[source]` in thiserror.  A manual `From`
-/// impl is therefore provided instead; `source()` cannot chain into
-/// `blob_store::Error` until that type is migrated.
+/// The `Initialization` string variant covers call sites where the source
+/// error type is not one of the typed variants below, or where the call site
+/// adds contextual information (e.g. a repository name) that is not present
+/// in the source error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("scrub initialization failed: {0}")]
@@ -46,10 +33,9 @@ pub enum Error {
     #[error("scrub metadata store error: {0}")]
     MetadataStore(#[from] metadata_store::Error),
 
-    /// Wraps a `blob_store::Error`.
-    ///
-    /// `blob_store::Error` does not implement `std::error::Error`, so `source()`
-    /// cannot chain into it; a manual `From` impl is used instead of `#[from]`.
+    /// Wraps a `blob_store::Error`. It does not implement `std::error::Error`
+    /// (a prerequisite for `#[from]`/`#[source]` in thiserror), so a manual
+    /// `From` impl is used and `source()` cannot chain into it.
     #[error("scrub blob store error: {0}")]
     BlobStore(blob_store::Error),
 

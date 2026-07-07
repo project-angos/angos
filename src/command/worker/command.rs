@@ -381,8 +381,10 @@ mod tests {
             blob_store.clone(),
             metadata_store.clone(),
             repositories.clone(),
-            RegistryConfig::default()
-                .job_queue(Arc::new(JobStore::new(storage.clone(), "worker-test"))),
+            RegistryConfig {
+                job_queue: Some(Arc::new(JobStore::new(storage.clone(), "worker-test"))),
+                ..RegistryConfig::default()
+            },
         )
         .unwrap();
         let context = WorkerContext {

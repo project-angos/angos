@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use url::Url;
 
 use crate::{configuration::RegexPattern, event_webhook::event::EventKind, secret::Secret};
@@ -81,9 +81,7 @@ where
         .as_ref()
         .is_some_and(|token| token.expose().is_empty())
     {
-        return Err(serde::de::Error::custom(
-            "event webhook token must not be empty",
-        ));
+        return Err(D::Error::custom("event webhook token must not be empty"));
     }
     Ok(token)
 }
@@ -97,7 +95,7 @@ where
     if let Some(value) = max_retries
         && value > MAX_RETRIES
     {
-        return Err(serde::de::Error::custom(format!(
+        return Err(D::Error::custom(format!(
             "max_retries={value} exceeds the supported maximum of {MAX_RETRIES}"
         )));
     }

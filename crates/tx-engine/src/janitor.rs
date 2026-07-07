@@ -6,6 +6,7 @@
 //!   elapsed by more than `orphan_age`: the cold-key counterpart to the lock
 //!   primitive's acquire-path stale-lock recovery.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ pub struct BodyJanitor {
 }
 
 impl std::fmt::Debug for BodyJanitor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BodyJanitor")
             .field("interval", &self.interval)
             .field("orphan_age", &self.orphan_age)
@@ -260,7 +261,7 @@ pub struct LockJanitor {
 }
 
 impl std::fmt::Debug for LockJanitor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LockJanitor")
             .field("interval", &self.interval)
             .field("orphan_age", &self.orphan_age)

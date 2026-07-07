@@ -69,7 +69,7 @@ fn paginated_json_headers(link: Option<&str>) -> HeaderMap {
 }
 
 impl Registry {
-    pub(crate) async fn list_catalog_entries(
+    pub async fn list_catalog_entries(
         &self,
         n: Option<u16>,
         last: Option<String>,
@@ -82,7 +82,7 @@ impl Registry {
         Ok((namespaces, link))
     }
 
-    pub(crate) async fn list_tag_entries(
+    pub async fn list_tag_entries(
         &self,
         namespace: &Namespace,
         n: Option<u16>,

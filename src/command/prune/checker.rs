@@ -940,10 +940,7 @@ mod tests {
         };
         let mut webhooks = HashMap::new();
         webhooks.insert("retention-hook".to_string(), webhook);
-        let dispatcher = EventDispatcher::builder()
-            .webhooks(webhooks)
-            .build()
-            .expect("dispatcher build");
+        let dispatcher = EventDispatcher::new(webhooks).expect("dispatcher build");
 
         let test_case = FSRegistryTestCase::new();
         let namespace = &Namespace::new("test-repo/app").unwrap();
@@ -972,9 +969,11 @@ mod tests {
             test_case.blob_store(),
             metadata_store.clone(),
             resolver.clone(),
-            RegistryConfig::default()
-                .job_queue(job_store.clone())
-                .event_dispatcher(Some(Arc::new(dispatcher))),
+            RegistryConfig {
+                job_queue: Some(job_store.clone()),
+                event_dispatcher: Some(Arc::new(dispatcher)),
+                ..RegistryConfig::default()
+            },
         )
         .unwrap();
         let mut executor = Executor::new(test_case.blob_store(), metadata_store.clone(), job_store)

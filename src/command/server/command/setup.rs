@@ -86,18 +86,20 @@ pub async fn build_registry(
     let repositories =
         bootstrap::repositories(&config.repository, &auth_cache, max_manifest_size_bytes).await?;
 
-    let mut registry_config = RegistryConfig::default()
-        .update_pull_time(config.global.update_pull_time)
-        .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
-        .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
-        .max_manifest_size_bytes(max_manifest_size_bytes)
-        .max_blob_size_bytes(config.global.max_blob_size_bytes())
-        .validate_manifest_references(!config.global.allow_missing_manifest_references)
-        .global_immutable_tags(config.global.immutable_tags)
-        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone())
-        .max_concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
-        .max_concurrent_replication_jobs(config.global.max_concurrent_replication_jobs)
-        .event_dispatcher(EventDispatcher::from_config(&config.event_webhook)?);
+    let mut registry_config = RegistryConfig {
+        update_pull_time: config.global.update_pull_time,
+        enable_blob_redirect: config.global.resolved_enable_blob_redirect(),
+        enable_manifest_redirect: config.global.resolved_enable_manifest_redirect(),
+        max_manifest_size_bytes,
+        max_blob_size_bytes: config.global.max_blob_size_bytes(),
+        validate_manifest_references: !config.global.allow_missing_manifest_references,
+        global_immutable_tags: config.global.immutable_tags,
+        global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
+        max_concurrent_cache_jobs: config.global.max_concurrent_cache_jobs,
+        max_concurrent_replication_jobs: config.global.max_concurrent_replication_jobs,
+        event_dispatcher: EventDispatcher::from_config(&config.event_webhook)?,
+        ..RegistryConfig::default()
+    };
 
     // When [global.job_queue] is present, route cache-fill jobs through the
     // durable backend (so they survive restarts and let `angos worker` drain
@@ -118,7 +120,7 @@ pub async fn build_registry(
         if let Some(handles) = maintenance_handles.as_ref() {
             job_store::ensure_shared_lock(handles)?;
             let job_store: Arc<JobStore> = Arc::new(JobStore::new(handles.clone(), "server"));
-            registry_config = registry_config.job_queue(job_store.clone());
+            registry_config.job_queue = Some(job_store.clone());
             Some(PendingGaugeRefresh {
                 store: job_store,
                 interval: Duration::from_secs(jq_config.pending_refresh_interval_secs),

@@ -183,10 +183,7 @@ mod tests {
         };
         let mut webhooks = HashMap::new();
         webhooks.insert("cache-hook".to_string(), webhook);
-        let dispatcher = EventDispatcher::builder()
-            .webhooks(webhooks)
-            .build()
-            .expect("dispatcher build");
+        let dispatcher = EventDispatcher::new(webhooks).expect("dispatcher build");
 
         let FsTestStack {
             dir: _dir,
@@ -205,9 +202,11 @@ mod tests {
             blob_store,
             metadata_store.clone(),
             resolver,
-            RegistryConfig::default()
-                .job_queue(Arc::new(JobStore::new(store, "cache-test")))
-                .event_dispatcher(Some(Arc::new(dispatcher))),
+            RegistryConfig {
+                job_queue: Some(Arc::new(JobStore::new(store, "cache-test"))),
+                event_dispatcher: Some(Arc::new(dispatcher)),
+                ..RegistryConfig::default()
+            },
         )
         .unwrap();
         let handler = registry.cache_job_handler();

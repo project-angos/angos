@@ -3218,7 +3218,10 @@ mod noop_suppression_tests {
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let config = RegistryConfig {
+            job_queue: Some(job_store.clone()),
+            ..RegistryConfig::default()
+        };
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
         (registry, job_store, dir)
     }
@@ -3857,7 +3860,10 @@ mod dispatch_replication_tests {
         // No drain spawned: the bare JobStore only persists envelopes; these tests assert enqueue only.
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let config = RegistryConfig {
+            job_queue: Some(job_store.clone()),
+            ..RegistryConfig::default()
+        };
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         (registry, job_store, dir)

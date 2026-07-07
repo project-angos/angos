@@ -17,10 +17,7 @@ use crate::{
 
 pub fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventDispatcher {
     metrics_provider::init_for_tests();
-    EventDispatcher::builder()
-        .webhooks(webhooks)
-        .build()
-        .expect("dispatcher should build in tests")
+    EventDispatcher::new(webhooks).expect("dispatcher should build in tests")
 }
 
 /// Dispatcher over exactly one webhook registered as `name`; the remaining

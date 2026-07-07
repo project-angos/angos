@@ -3,7 +3,7 @@ use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use rustls::{
-    RootCertStore,
+    RootCertStore, ServerConfig,
     server::{WebPkiClientVerifier, danger::ClientCertVerifier},
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -177,12 +177,12 @@ impl TlsListener {
                 tls_config.client_auth
             );
             let client_cert_verifier = build_client_verifier(ca_bundle, tls_config.client_auth)?;
-            rustls::ServerConfig::builder()
+            ServerConfig::builder()
                 .with_client_cert_verifier(client_cert_verifier)
                 .with_single_cert(server_certs, server_key)
         } else {
             debug!("No client CA bundle detected; client_auth setting is ignored");
-            rustls::ServerConfig::builder()
+            ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(server_certs, server_key)
         };
