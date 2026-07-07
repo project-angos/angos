@@ -20,8 +20,8 @@ use tracing::{info, instrument, warn};
 
 use crate::{
     oci::{Digest, Tag},
-    registry::{DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT},
-    registry_client::RegistryClient,
+    registry::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT},
+    registry_client::{Error, RegistryClient},
     replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
 };
 

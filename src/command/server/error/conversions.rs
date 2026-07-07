@@ -2,7 +2,7 @@ use hyper::StatusCode;
 
 use crate::{
     command::{bootstrap, server::error::Error},
-    configuration, event_webhook, registry,
+    configuration, event_webhook, metrics_provider, registry,
     registry::{blob_store, job_store},
     replication::REPLICATION_SUPERSEDED_CODE,
 };
@@ -63,9 +63,6 @@ impl From<registry::Error> for Error {
                 oci_error(StatusCode::RANGE_NOT_SATISFIABLE, "SIZE_INVALID", None)
             }
             registry::Error::NotFound => oci_error(StatusCode::NOT_FOUND, "NOT_FOUND", None),
-            registry::Error::Conflict(msg) => {
-                oci_error(StatusCode::CONFLICT, "CONFLICT", Some(msg))
-            }
             registry::Error::ReplicationSuperseded(msg) => {
                 oci_error(StatusCode::CONFLICT, REPLICATION_SUPERSEDED_CODE, Some(msg))
             }
@@ -127,6 +124,15 @@ impl From<blob_store::Error> for Error {
 impl From<job_store::Error> for Error {
     fn from(e: job_store::Error) -> Self {
         Error::Initialization(e.to_string())
+    }
+}
+
+impl From<metrics_provider::Error> for Error {
+    fn from(error: metrics_provider::Error) -> Self {
+        match error {
+            metrics_provider::Error::Initialization(msg) => Error::Initialization(msg),
+            metrics_provider::Error::Encode(msg) => Error::Internal(msg),
+        }
     }
 }
 

@@ -10,10 +10,7 @@ use reqwest::{
 };
 use serde::Deserialize;
 
-use crate::{
-    registry::Error,
-    registry_client::{RegistryClient, parse_header},
-};
+use crate::registry_client::{Error, RegistryClient, parse_header};
 
 fn authority_for_cache_key(url: &url::Url) -> Result<&str, Error> {
     url.host_str()
@@ -208,11 +205,9 @@ impl RegistryClient {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        registry::Error,
-        registry_client::auth::{
-            BearerToken, authority_for_cache_key, parse_bearer_challenge, token_cache_key,
-        },
+    use crate::registry_client::{
+        Error,
+        auth::{BearerToken, authority_for_cache_key, parse_bearer_challenge, token_cache_key},
     };
 
     #[test]

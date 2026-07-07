@@ -3148,7 +3148,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
 #[tokio::test]
 async fn replication_superseded_maps_to_distinct_oci_code() {
     let superseded: ServerError = Error::ReplicationSuperseded("newer".to_string()).into();
-    let conflict: ServerError = Error::Conflict("immutable".to_string()).into();
+    let conflict = ServerError::Conflict("immutable".to_string());
 
     // Both are 409, but the OCI codes differ so the sender can disambiguate.
     assert_eq!(superseded.status_code(), hyper::StatusCode::CONFLICT);
