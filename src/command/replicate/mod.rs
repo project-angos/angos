@@ -16,11 +16,11 @@ use crate::{
             Error, check,
             executor::{ActionSink, DryRunSink, Executor},
         },
-        worker::runner::run_once,
     },
     configuration::Configuration,
     registry::{
         blob_store::BlobStore,
+        job_runner::run_once,
         job_store::{JobHandler, JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,

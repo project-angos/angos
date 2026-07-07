@@ -88,9 +88,11 @@ mod tests {
     };
 
     use crate::{
-        command::worker::runner::{execute_one, run_once},
         metrics_provider,
-        registry::job_store::{ClaimedJob, Error, JobEnvelope, JobHandler, JobStore, Queue},
+        registry::{
+            job_runner::{execute_one, run_once},
+            job_store::{ClaimedJob, Error, JobEnvelope, JobHandler, JobStore, Queue},
+        },
     };
 
     struct OkHandler;

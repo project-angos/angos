@@ -304,18 +304,16 @@ mod tests {
 
     use super::ReplicationChecker;
     use crate::{
-        command::{
-            scrub::{
-                Error,
-                action::Action,
-                check::NamespaceChecker,
-                executor::{ActionSink, Executor},
-            },
-            worker::runner::execute_one,
+        command::scrub::{
+            Error,
+            action::Action,
+            check::NamespaceChecker,
+            executor::{ActionSink, Executor},
         },
         oci::{Digest, Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Repository,
+            job_runner::execute_one,
             job_store::{JobStore, Queue},
             metadata_store::{LinkKind, LinkOperation},
             repository_resolver::RepositoryResolver,

@@ -20,6 +20,7 @@ mod error;
 mod event_emission_tests;
 mod ext;
 mod headers;
+pub mod job_runner;
 pub mod job_store;
 pub mod manifest;
 pub mod metadata_store;
@@ -59,7 +60,6 @@ pub struct JsonResponse {
 pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
-    command::worker::runner::execute_one,
     configuration::{
         RegexPattern,
         global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
@@ -69,6 +69,7 @@ use crate::{
     registry::{
         blob_store::BlobStore,
         cache_job_handler::CacheJobHandler,
+        job_runner::execute_one,
         job_store::{JobHandler, JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
