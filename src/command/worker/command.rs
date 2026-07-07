@@ -15,14 +15,12 @@ use uuid::Uuid;
 use angos_tx_engine::store::Store;
 
 use crate::{
-    command::{
-        bootstrap::{self, Error},
-        worker::runner::execute_one,
-    },
+    command::bootstrap::{self, Error},
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
     registry::{
         Registry,
         blob_store::BlobStore,
+        job_runner::execute_one,
         job_store::{self, JobHandler, JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
