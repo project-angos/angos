@@ -7,7 +7,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 use super::*;
 use crate::{
     cache,
-    command::server::Error as ServerError,
+    command::{bootstrap, server::Error as ServerError},
     configuration::Configuration,
     identity::{ClientCertificate, ManifestPutTarget, OidcClaims},
     oci::{Digest, Namespace, Reference, Tag},
@@ -468,7 +468,7 @@ async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
     let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
-    let handles = storage_config.build_store().await.unwrap();
+    let handles = bootstrap::build_store(&storage_config).await.unwrap();
     let metadata_store = Arc::new(MetadataStore::builder(handles).build());
 
     let mut repositories_map = HashMap::new();
