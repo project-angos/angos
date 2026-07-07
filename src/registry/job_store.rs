@@ -546,7 +546,7 @@ impl JobStore {
     /// at the first key whose prefix is in the future.
     pub async fn list_pending(&self, queue: Queue, n: u16) -> Result<Vec<String>, Error> {
         let prefix = path_builder::job_pending_dir(queue.as_str());
-        let page = self.store.list(&prefix, 1000, None).await?;
+        let page = self.store.object_store().list(&prefix, 1000, None).await?;
 
         Ok(page
             .items
@@ -562,7 +562,7 @@ impl JobStore {
         storage_key: &str,
     ) -> Result<JobEnvelope, Error> {
         let key = path_builder::job_pending_path(queue.as_str(), storage_key);
-        let data = self.store.get(&key).await?;
+        let data = self.store.object_store().get(&key).await?;
         serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("failed to parse envelope: {e}")))
     }
@@ -575,7 +575,7 @@ impl JobStore {
         storage_key: &str,
     ) -> Result<DeadLetterRead, Error> {
         let key = path_builder::job_failed_path(queue.as_str(), storage_key);
-        let data = self.store.get(&key).await?;
+        let data = self.store.object_store().get(&key).await?;
         serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("failed to parse dead-letter: {e}")))
     }
@@ -617,7 +617,11 @@ impl JobStore {
         after: Option<&str>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
         let start_after = after.map(|k| format!("{k}.json"));
-        let page = self.store.list_children(dir, n, None, start_after).await?;
+        let page = self
+            .store
+            .object_store()
+            .list_children(dir, n, None, start_after)
+            .await?;
         let keys: Vec<String> = page
             .objects
             .into_iter()
@@ -641,7 +645,7 @@ impl JobStore {
         let mut count: u64 = 0;
         let mut token: Option<String> = None;
         loop {
-            let page = self.store.list(&prefix, 1000, token).await?;
+            let page = self.store.object_store().list(&prefix, 1000, token).await?;
             for name in &page.items {
                 let Some(stem) = name.strip_suffix(".json") else {
                     continue;
@@ -675,7 +679,7 @@ impl JobStore {
         let mut count: u64 = 0;
         let mut token: Option<String> = None;
         loop {
-            let page = self.store.list(&prefix, 1000, token).await?;
+            let page = self.store.object_store().list(&prefix, 1000, token).await?;
             for name in &page.items {
                 if name.strip_suffix(".json").is_none() {
                     continue;
@@ -706,7 +710,7 @@ impl JobStore {
         lock_key: &str,
     ) -> Result<bool, Error> {
         let index_path = path_builder::job_lock_key_index_path(queue.as_str(), lock_key);
-        let data = match self.store.get(&index_path).await {
+        let data = match self.store.object_store().get(&index_path).await {
             Ok(d) => d,
             Err(StorageError::NotFound) => return Ok(false),
             Err(e) => return Err(Error::from(e)),
@@ -714,7 +718,7 @@ impl JobStore {
         let index = parse_lock_key_index(&data)?;
 
         let pending_key = path_builder::job_pending_path(queue.as_str(), &index.storage_key);
-        match self.store.head(&pending_key).await {
+        match self.store.object_store().head(&pending_key).await {
             Ok(_) => Ok(true),
             Err(StorageError::NotFound) => {
                 // Orphan: pending file vanished but the index lingers. Submit a
@@ -768,7 +772,11 @@ impl JobStore {
     }
 
     pub async fn get_raw(&self, key: &str) -> Result<Vec<u8>, Error> {
-        self.store.get(key).await.map_err(Error::from)
+        self.store
+            .object_store()
+            .get(key)
+            .await
+            .map_err(Error::from)
     }
 
     /// Build the read dependency and conditional `Delete` that retire a
@@ -1251,7 +1259,7 @@ impl JobStore {
         // HEAD first for the fencing ETag (`None` when the backend does not
         // surface ETags, giving an unconditional delete, still safe: the new pending
         // key is fresh so a double-retry collides at `PutIfAbsent`).
-        let expected = self.store.head(&failed_path).await?.etag;
+        let expected = self.store.object_store().head(&failed_path).await?.etag;
 
         let mut envelope = self.read_failed(queue, storage_key).await?.envelope;
         envelope.attempts = 0;
@@ -1303,7 +1311,7 @@ impl JobStore {
         match state {
             JobState::Failed => {
                 let failed_path = path_builder::job_failed_path(queue.as_str(), storage_key);
-                let expected = self.store.head(&failed_path).await?.etag;
+                let expected = self.store.object_store().head(&failed_path).await?.etag;
                 let tx = Transaction::builder()
                     .mutation(Mutation::Delete {
                         key: failed_path,
@@ -1325,7 +1333,7 @@ impl JobStore {
         // Read the envelope (for its `lock_key`) and HEAD for the fence; a
         // missing pending file surfaces as `NotFound` for a 404.
         let envelope = self.read_pending(queue, storage_key).await?;
-        let expected = self.store.head(&pending_path).await?.etag;
+        let expected = self.store.object_store().head(&pending_path).await?.etag;
 
         let mut tx = Transaction::builder()
             .mutation(Mutation::Delete {

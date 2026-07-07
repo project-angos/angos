@@ -38,6 +38,7 @@ impl MetadataStore {
             "_manifests",
             |path, token| async move {
                 self.store()
+                    .object_store()
                     .list_children(&path, 1000, token, None)
                     .await
                     .map_err(Error::from)
@@ -101,6 +102,7 @@ impl MetadataStore {
         loop {
             let page = self
                 .store()
+                .object_store()
                 .list_children(&tags_dir, 1000, token, None)
                 .await?;
             names.extend(page.sub_prefixes);
@@ -163,7 +165,11 @@ impl MetadataStore {
         let mut token = None;
 
         loop {
-            let page = self.store().list(&referrers_dir, 100, token).await?;
+            let page = self
+                .store()
+                .object_store()
+                .list(&referrers_dir, 100, token)
+                .await?;
 
             let digest_entries: Vec<Digest> = page
                 .items
@@ -213,7 +219,11 @@ impl MetadataStore {
         subject: &Digest,
     ) -> Result<bool, Error> {
         let referrers_dir = path_builder::manifest_referrers_dir(namespace, subject);
-        let page = self.store().list(&referrers_dir, 1, None).await?;
+        let page = self
+            .store()
+            .object_store()
+            .list(&referrers_dir, 1, None)
+            .await?;
         Ok(!page.items.is_empty())
     }
 
@@ -236,6 +246,7 @@ impl MetadataStore {
                     path_builder::manifest_revisions_link_root_dir(namespace, algorithm.as_str());
                 let page = self
                     .store()
+                    .object_store()
                     .list_children(&revisions_dir, limit, cursor, None)
                     .await?;
                 let revisions = page
@@ -258,6 +269,7 @@ impl MetadataStore {
             loop {
                 let page = self
                     .store()
+                    .object_store()
                     .list_children(&revisions_dir, 1000, token, None)
                     .await?;
 
@@ -276,6 +288,7 @@ impl MetadataStore {
     /// Idempotent: a no-op once the prefix is gone.
     pub async fn delete_legacy_namespace_registry(&self) -> Result<(), Error> {
         self.store()
+            .object_store()
             .delete_prefix(LEGACY_NAMESPACE_REGISTRY_PREFIX)
             .await
             .map_err(Error::from)
@@ -298,6 +311,7 @@ impl MetadataStore {
             )));
         }
         self.store()
+            .object_store()
             .delete_prefix(&path_builder::manifest_tag_dir(namespace, tag_name))
             .await
             .map_err(Error::from)
@@ -311,6 +325,7 @@ impl MetadataStore {
             Error::InvalidData(format!("unsafe namespace directory name: '{name}'"))
         })?;
         self.store()
+            .object_store()
             .delete_prefix(&prefix)
             .await
             .map_err(Error::from)

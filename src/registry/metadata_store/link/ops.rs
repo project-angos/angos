@@ -388,11 +388,11 @@ impl MetadataStore {
         // Post-apply cleanup (best-effort, outside the engine lock)
         for link in &result.deleted_links {
             let container = path_builder::link_container_path(link, namespace);
-            let _ = self.store().delete_prefix(&container).await;
+            let _ = self.store().object_store().delete_prefix(&container).await;
             if matches!(link, LinkKind::Tag(_))
                 && let Some((parent, _)) = container.rsplit_once('/')
             {
-                let _ = self.store().delete_prefix(parent).await;
+                let _ = self.store().object_store().delete_prefix(parent).await;
             }
         }
 
@@ -488,7 +488,7 @@ impl MetadataStore {
         &self,
         link_path: &str,
     ) -> Result<Option<(Bytes, LinkMetadata)>, TxError> {
-        match self.store().get(link_path).await {
+        match self.store().object_store().get(link_path).await {
             Ok(data) => {
                 let bytes = Bytes::from(data.clone());
                 let metadata = LinkMetadata::from_bytes(data)

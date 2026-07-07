@@ -40,7 +40,7 @@ impl MetadataStore {
         }
 
         let blob_path = path_builder::blob_path(&manifest_digest);
-        match self.store().get(&blob_path).await {
+        match self.store().object_store().get(&blob_path).await {
             Ok(data) => {
                 let manifest_len = data.len();
                 match Manifest::from_slice(&data) {

@@ -40,6 +40,7 @@ async fn test_read_blob_index_falls_back_to_legacy_when_no_shards() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
@@ -79,6 +80,7 @@ async fn test_read_blob_index_namespace_falls_back_to_legacy() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
@@ -106,6 +108,7 @@ async fn test_has_blob_references_sees_legacy() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
@@ -139,6 +142,7 @@ async fn test_update_links_writes_to_legacy_when_present_locked() {
 
     let raw = backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_path(&digest))
         .await
         .unwrap();
@@ -151,7 +155,7 @@ async fn test_update_links_writes_to_legacy_when_present_locked() {
 
     // No sharded shard should have been written.
     let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
-    match backend.store().get(&shard_path).await {
+    match backend.store().object_store().get(&shard_path).await {
         Err(StorageError::NotFound) => {}
         Ok(_) => panic!("shard must not exist when legacy file took the write"),
         Err(e) => panic!("unexpected error checking shard: {e}"),
@@ -159,6 +163,7 @@ async fn test_update_links_writes_to_legacy_when_present_locked() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
@@ -191,6 +196,7 @@ async fn test_update_links_writes_to_legacy_when_present_cas() {
 
     let raw = backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_path(&digest))
         .await
         .unwrap();
@@ -202,7 +208,7 @@ async fn test_update_links_writes_to_legacy_when_present_cas() {
     assert!(ns_links.contains(&tag));
 
     let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
-    match backend.store().get(&shard_path).await {
+    match backend.store().object_store().get(&shard_path).await {
         Err(StorageError::NotFound) => {}
         Ok(_) => panic!("shard must not exist when legacy file took the write"),
         Err(e) => panic!("unexpected error checking shard: {e}"),
@@ -210,6 +216,7 @@ async fn test_update_links_writes_to_legacy_when_present_cas() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
@@ -237,7 +244,12 @@ async fn test_update_links_deletes_legacy_when_emptied() {
 
     // Replace the shard with a legacy `index.json` carrying the same link.
     let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
-    backend.store().delete(&shard_path).await.unwrap();
+    backend
+        .store()
+        .object_store()
+        .delete(&shard_path)
+        .await
+        .unwrap();
     let legacy = legacy_blob_index_with(vec![(namespace.as_ref(), vec![tag.clone()])]);
     put_legacy_index(&backend, &digest, &legacy).await;
 
@@ -248,12 +260,12 @@ async fn test_update_links_deletes_legacy_when_emptied() {
     backend.update_links(&namespace, &delete_ops).await.unwrap();
 
     let legacy_path = path_builder::blob_index_path(&digest);
-    match backend.store().get(&legacy_path).await {
+    match backend.store().object_store().get(&legacy_path).await {
         Err(StorageError::NotFound) => {}
         Ok(_) => panic!("legacy file should be deleted once empty"),
         Err(e) => panic!("unexpected error checking legacy path: {e}"),
     }
-    match backend.store().get(&shard_path).await {
+    match backend.store().object_store().get(&shard_path).await {
         Err(StorageError::NotFound) => {}
         Ok(_) => panic!("no shard should have been written"),
         Err(e) => panic!("unexpected error checking shard: {e}"),
@@ -261,6 +273,7 @@ async fn test_update_links_deletes_legacy_when_emptied() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
@@ -286,12 +299,18 @@ async fn test_no_legacy_writes_still_use_shards() {
     backend.update_links(&namespace, &ops).await.unwrap();
 
     let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
-    let data = backend.store().get(&shard_path).await.unwrap();
+    let data = backend
+        .store()
+        .object_store()
+        .get(&shard_path)
+        .await
+        .unwrap();
     let links: HashSet<LinkKind> = serde_json::from_slice(&data).unwrap();
     assert!(links.contains(&tag));
 
     match backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_path(&digest))
         .await
     {
@@ -302,6 +321,7 @@ async fn test_no_legacy_writes_still_use_shards() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
@@ -338,6 +358,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     backend.update_links(&namespace_a, &pre_ops).await.unwrap();
     let pre_raw = backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_path(&digest))
         .await
         .unwrap();
@@ -355,6 +376,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     // Legacy file is gone.
     match backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_path(&digest))
         .await
     {
@@ -366,6 +388,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     // Shards exist with the right link sets.
     let shard_first = backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_shard_path(&digest, &namespace_a))
         .await
         .unwrap();
@@ -375,6 +398,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
 
     let shard_second = backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_shard_path(&digest, &namespace_b))
         .await
         .unwrap();
@@ -393,6 +417,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     backend.update_links(&namespace_c, &post_ops).await.unwrap();
     let shard_third = backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_shard_path(&digest, &namespace_c))
         .await
         .unwrap();
@@ -400,6 +425,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
     assert!(links_third.contains(&post_link));
     match backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_path(&digest))
         .await
     {
@@ -410,6 +436,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();

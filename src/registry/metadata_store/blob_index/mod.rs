@@ -114,6 +114,7 @@ impl MetadataStore {
         loop {
             let page = self
                 .store()
+                .object_store()
                 .list_children(&refs_dir, 1000, token, None)
                 .await?;
 
@@ -124,7 +125,7 @@ impl MetadataStore {
             let shard_results = stream::iter(page.objects.into_iter().map(|obj| {
                 let shard_path = format!("{refs_dir}/{obj}");
                 async move {
-                    match self.store().get(&shard_path).await {
+                    match self.store().object_store().get(&shard_path).await {
                         Ok(data) => {
                             // The shard filename was written from a validated
                             // `Namespace`; an undecodable name is skipped.
@@ -178,12 +179,13 @@ impl MetadataStore {
         loop {
             let page = self
                 .store()
+                .object_store()
                 .list_children(&refs_dir, 1, token, None)
                 .await?;
 
             for obj in page.objects {
                 let shard_path = format!("{refs_dir}/{obj}");
-                match self.store().get(&shard_path).await {
+                match self.store().object_store().get(&shard_path).await {
                     Ok(data) => {
                         let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
                         if !links.is_empty() {
@@ -214,7 +216,7 @@ impl MetadataStore {
         digest: &Digest,
     ) -> Result<HashSet<LinkKind>, Error> {
         let shard_path = path_builder::blob_index_shard_path(digest, namespace);
-        match self.store().get(&shard_path).await {
+        match self.store().object_store().get(&shard_path).await {
             Ok(data) => {
                 let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
                 non_empty_links_or_not_found(links)
@@ -234,6 +236,7 @@ impl MetadataStore {
     async fn read_legacy_blob_index(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
         match self
             .store()
+            .object_store()
             .get(&path_builder::blob_index_path(digest))
             .await
         {
@@ -250,7 +253,7 @@ impl MetadataStore {
         // Read the legacy file once outside the retry loop; if absent, nothing
         // to migrate. On conflict the engine re-reads under the lock, so a
         // concurrent migrator wins and we bail cleanly.
-        let data = match self.store().get(&legacy_path).await {
+        let data = match self.store().object_store().get(&legacy_path).await {
             Ok(d) => d,
             Err(StorageError::NotFound) => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -275,7 +278,7 @@ impl MetadataStore {
 
                     // Re-read each shard inside the closure so the
                     // fingerprint is fresh on every retry attempt.
-                    match self.store().get(&shard_path).await {
+                    match self.store().object_store().get(&shard_path).await {
                         Ok(shard_data) => {
                             let mut existing: HashSet<LinkKind> =
                                 serde_json::from_slice(&shard_data).unwrap_or_default();

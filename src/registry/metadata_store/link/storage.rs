@@ -23,7 +23,7 @@ impl MetadataStore {
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
-        match self.store().get(&link_path).await {
+        match self.store().object_store().get(&link_path).await {
             Ok(data) => LinkMetadata::from_bytes(data),
             Err(StorageError::NotFound) => Err(Error::ReferenceNotFound),
             Err(e) => Err(e.into()),
@@ -58,6 +58,7 @@ impl MetadataStore {
         let link_path = path_builder::link_path(link, namespace);
         let serialized = Bytes::from(serde_json::to_vec(metadata)?);
         self.store()
+            .object_store()
             .put(&link_path, serialized)
             .await
             .map_err(Error::from)

@@ -2094,6 +2094,7 @@ async fn manifest_blob_lives_in_blob_store_with_split_backends() {
         test_case
             .metadata_store()
             .store()
+            .object_store()
             .get(&blob_path(&digest))
             .await
             .is_err(),

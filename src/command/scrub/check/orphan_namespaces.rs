@@ -751,6 +751,7 @@ mod tests {
             let key = "v2/repositories/BadNS/_manifests/revisions/sha256/dead/link";
             metadata_store
                 .store()
+                .object_store()
                 .put(key, Bytes::from_static(b"sha256:dead"))
                 .await
                 .unwrap();
@@ -769,7 +770,12 @@ mod tests {
             checker.check_all(&mut executor).await.unwrap();
 
             assert!(
-                metadata_store.store().get(key).await.is_err(),
+                metadata_store
+                    .store()
+                    .object_store()
+                    .get(key)
+                    .await
+                    .is_err(),
                 "the invalidly-named namespace directory must be reclaimed"
             );
             let (catalog, _) = metadata_store.list_namespaces(100, None).await.unwrap();
@@ -790,6 +796,7 @@ mod tests {
             let key = "v2/repositories/BadNS/_manifests/revisions/sha256/dead/link";
             metadata_store
                 .store()
+                .object_store()
                 .put(key, Bytes::from_static(b"sha256:dead"))
                 .await
                 .unwrap();
@@ -809,7 +816,7 @@ mod tests {
                 "the invalid orphan namespace reclaim must be captured"
             );
             assert!(
-                metadata_store.store().get(key).await.is_ok(),
+                metadata_store.store().object_store().get(key).await.is_ok(),
                 "a capturing sink must not mutate storage"
             );
         })

@@ -150,16 +150,14 @@ where
     F: FnMut() -> Fut + Send,
     Fut: Future<Output = Result<Transaction, Error>> + Send,
 {
-    let mut attempts = 0u32;
-    loop {
-        let tx = build().await?;
-        match executor.execute(tx).await {
-            Ok(o) => return Ok(o),
-            Err(Error::Conflict | Error::Precondition) if attempts < max_attempts => {
-                debug!(attempts, max_attempts, "Transaction conflict, retrying");
-                attempts += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    let (outcome, ()) = execute_with_retry_payload(
+        executor,
+        move || {
+            let fut = build();
+            async move { fut.await.map(|tx| (tx, ())) }
+        },
+        max_attempts,
+    )
+    .await?;
+    Ok(outcome)
 }

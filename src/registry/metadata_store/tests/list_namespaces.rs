@@ -63,6 +63,7 @@ async fn list_namespaces_excludes_upload_only_namespace() {
         let upload_data_path = path_builder::upload_path(&namespace, &uuid);
         metadata_store
             .store()
+            .object_store()
             .put(&upload_data_path, Bytes::from_static(b"partial"))
             .await
             .unwrap();
@@ -149,6 +150,7 @@ async fn delete_legacy_namespace_registry_prunes_dead_index() {
         for key in ["_registry/namespaces.json", "_registry/ns/ab.json"] {
             metadata_store
                 .store()
+                .object_store()
                 .put(key, Bytes::from_static(b"{}"))
                 .await
                 .expect("seed legacy registry object");
@@ -161,7 +163,12 @@ async fn delete_legacy_namespace_registry_prunes_dead_index() {
 
         for key in ["_registry/namespaces.json", "_registry/ns/ab.json"] {
             assert!(
-                metadata_store.store().get(key).await.is_err(),
+                metadata_store
+                    .store()
+                    .object_store()
+                    .get(key)
+                    .await
+                    .is_err(),
                 "legacy registry object '{key}' must be pruned"
             );
         }

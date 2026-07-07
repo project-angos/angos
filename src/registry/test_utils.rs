@@ -181,6 +181,7 @@ pub fn create_test_registry_with(
 /// hand-crafted or deliberately corrupt link files.
 pub async fn put_link_raw(store: &Store, namespace: &Namespace, link: &LinkKind, body: &[u8]) {
     store
+        .object_store()
         .put(
             &path_builder::link_path(link, namespace),
             Bytes::copy_from_slice(body),
@@ -227,6 +228,7 @@ pub async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[
 pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
     let digest = Digest::sha256_of_bytes(content);
     store
+        .object_store()
         .put(
             &path_builder::blob_path(&digest),
             Bytes::copy_from_slice(content),
