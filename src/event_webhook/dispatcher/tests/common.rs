@@ -10,11 +10,13 @@ use crate::{
         dispatcher::{EventDispatcher, WebhookEndpoint},
         event::{Event, EventKind},
     },
+    metrics_provider,
     secret::Secret,
     test_fixtures::events::manifest_push_event,
 };
 
 pub fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventDispatcher {
+    metrics_provider::init_for_tests();
     EventDispatcher::builder()
         .webhooks(webhooks)
         .build()

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use prometheus::proto::MetricType;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, header, method},
@@ -12,6 +11,7 @@ use super::common::{
 use crate::{
     configuration::RegexPattern,
     event_webhook::{config::DeliveryPolicy, dispatcher::EventDispatcher, event::EventKind},
+    metrics_provider::metrics_provider,
 };
 
 #[test]
@@ -177,34 +177,25 @@ async fn dispatch_records_delivery_total_metric() {
         None,
         0,
     );
+    let counter = metrics_provider()
+        .event_webhook_deliveries
+        .with_label_values(&["metrics-hook", "manifest.push", "success"]);
+    let before = counter.get();
+
     dispatcher.dispatch(&event).await.unwrap();
 
-    let families = prometheus::gather();
-    let delivery_metric = families
-        .iter()
-        .find(|f| f.name() == "event_webhook_deliveries_total");
-    assert!(
-        delivery_metric.is_some(),
-        "event_webhook_deliveries_total metric must exist"
+    assert_eq!(
+        counter.get(),
+        before + 1,
+        "delivery must increment the success counter for this webhook/event"
     );
 
-    let family = delivery_metric.unwrap();
-    assert_eq!(family.get_field_type(), MetricType::COUNTER);
-
-    let metrics = family.get_metric();
-    let found = metrics.iter().any(|m| {
-        let labels: Vec<_> = m
-            .get_label()
-            .iter()
-            .map(|l| (l.name(), l.value()))
-            .collect();
-        labels.contains(&("webhook", "metrics-hook"))
-            && labels.contains(&("event", "manifest.push"))
-            && labels.contains(&("result", "success"))
-    });
+    // The counter must be exported by the same registry /metrics serves.
+    let (_, payload) = metrics_provider().gather().unwrap();
+    let text = String::from_utf8(payload).unwrap();
     assert!(
-        found,
-        "Must have metric with webhook=metrics-hook, event=manifest.push, result=success"
+        text.contains("event_webhook_deliveries_total"),
+        "event_webhook_deliveries_total must appear in the /metrics registry output"
     );
 }
 
@@ -226,32 +217,24 @@ async fn dispatch_records_delivery_duration_metric() {
         None,
         0,
     );
+    let histogram = metrics_provider()
+        .event_webhook_delivery_duration
+        .with_label_values(&["duration-hook", "manifest.push"]);
+    let before = histogram.get_sample_count();
+
     dispatcher.dispatch(&event).await.unwrap();
 
-    let families = prometheus::gather();
-    let duration_metric = families
-        .iter()
-        .find(|f| f.name() == "event_webhook_delivery_duration_seconds");
-    assert!(
-        duration_metric.is_some(),
-        "event_webhook_delivery_duration_seconds metric must exist"
+    assert_eq!(
+        histogram.get_sample_count(),
+        before + 1,
+        "delivery must record one duration sample for this webhook/event"
     );
 
-    let family = duration_metric.unwrap();
-    assert_eq!(family.get_field_type(), MetricType::HISTOGRAM);
-
-    let metrics = family.get_metric();
-    let found = metrics.iter().any(|m| {
-        let labels: Vec<_> = m
-            .get_label()
-            .iter()
-            .map(|l| (l.name(), l.value()))
-            .collect();
-        labels.contains(&("webhook", "duration-hook"))
-            && labels.contains(&("event", "manifest.push"))
-    });
+    // The histogram must be exported by the same registry /metrics serves.
+    let (_, payload) = metrics_provider().gather().unwrap();
+    let text = String::from_utf8(payload).unwrap();
     assert!(
-        found,
-        "Must have duration metric with webhook=duration-hook, event=manifest.push"
+        text.contains("event_webhook_delivery_duration_seconds"),
+        "event_webhook_delivery_duration_seconds must appear in the /metrics registry output"
     );
 }
