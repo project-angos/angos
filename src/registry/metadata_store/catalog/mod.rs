@@ -2,12 +2,8 @@
 //! enumeration endpoints, the namespace tree-walk they build on, and the prune
 //! of the dead pre-1.3 `_registry/` namespace index.
 
-use std::io;
-
 use futures_util::stream::{self, StreamExt};
 use tracing::{debug, instrument};
-
-use angos_tx_engine::StorageError;
 
 use crate::{
     oci::{Algorithm, Descriptor, Digest, Namespace, Tag},
@@ -20,7 +16,6 @@ use crate::{
 };
 
 mod referrer_resolver;
-use referrer_resolver::resolve_referrer_descriptor;
 
 /// Prefix of the pre-1.3 maintained namespace-registry index. The catalog is now
 /// derived from content, so these objects are dead and are pruned by scrub.
@@ -187,19 +182,11 @@ impl MetadataStore {
                 .map(|manifest_digest| {
                     let artifact_type = artifact_type.as_ref();
                     async move {
-                        resolve_referrer_descriptor(
+                        self.resolve_referrer_descriptor(
+                            namespace,
                             digest,
                             manifest_digest,
                             artifact_type,
-                            |link| async move { self.read_link_reference(namespace, &link).await },
-                            |path| async move {
-                                self.store().get(&path).await.map_err(|e| match e {
-                                    StorageError::NotFound => {
-                                        io::Error::new(io::ErrorKind::NotFound, e.to_string())
-                                    }
-                                    other => io::Error::other(other.to_string()),
-                                })
-                            },
                         )
                         .await
                     }

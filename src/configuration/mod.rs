@@ -1,9 +1,6 @@
-use std::{collections::HashMap, fmt, fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
-use serde::{
-    Deserialize, Deserializer,
-    de::{self, MapAccess, Visitor},
-};
+use serde::Deserialize;
 use tracing::warn;
 
 use angos_tx_engine::lock::LockStrategy;
@@ -39,7 +36,11 @@ use crate::{
     registry::{blob_store, repository},
 };
 
-#[derive(Clone, Debug)]
+/// Cross-section validation runs in the `TryFrom` conversion, so a parsed
+/// `Configuration` is always a validated one. The `cache_store` and `storage`
+/// aliases are the pre-1.0 section names.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "ConfigurationFields")]
 pub struct Configuration {
     pub server: ServerConfig,
     pub global: GlobalConfig,
@@ -53,95 +54,47 @@ pub struct Configuration {
     pub observability: Option<ObservabilityConfig>,
 }
 
-impl<'de> Deserialize<'de> for Configuration {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ConfigurationVisitor;
-
-        impl<'de> Visitor<'de> for ConfigurationVisitor {
-            type Value = Configuration;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("Angos configuration")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut server = None;
-                let mut global = None;
-                let mut ui = None;
-                let mut cache = None;
-                let mut blob_store = None;
-                let mut registry_storage = None;
-                let mut auth = None;
-                let mut repository = None;
-                let mut event_webhook = None;
-                let mut observability = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "server" => assign_once(&mut server, "server", map.next_value()?)?,
-                        "global" => assign_once(&mut global, "global", map.next_value()?)?,
-                        "ui" => assign_once(&mut ui, "ui", map.next_value()?)?,
-                        "cache" | "cache_store" => {
-                            assign_once(&mut cache, "cache", map.next_value()?)?;
-                        }
-                        "blob_store" | "storage" => {
-                            assign_once(&mut blob_store, "blob_store", map.next_value()?)?;
-                        }
-                        "metadata_store" => {
-                            assign_once(
-                                &mut registry_storage,
-                                "metadata_store",
-                                map.next_value()?,
-                            )?;
-                        }
-                        "auth" => assign_once(&mut auth, "auth", map.next_value()?)?,
-                        "repository" => {
-                            assign_once(&mut repository, "repository", map.next_value()?)?;
-                        }
-                        "event_webhook" => {
-                            assign_once(&mut event_webhook, "event_webhook", map.next_value()?)?;
-                        }
-                        "observability" => {
-                            assign_once(&mut observability, "observability", map.next_value()?)?;
-                        }
-                        _ => {
-                            let _ = map.next_value::<de::IgnoredAny>()?;
-                        }
-                    }
-                }
-
-                Configuration {
-                    server: server.ok_or_else(|| de::Error::missing_field("server"))?,
-                    global: global.unwrap_or_default(),
-                    ui: ui.unwrap_or_default(),
-                    cache: cache.unwrap_or_default(),
-                    blob_store: blob_store.unwrap_or_default(),
-                    registry_storage: registry_storage.unwrap_or_default(),
-                    auth: auth.unwrap_or_default(),
-                    repository: repository.unwrap_or_default(),
-                    event_webhook: event_webhook.unwrap_or_default(),
-                    observability: observability.unwrap_or_default(),
-                }
-                .validate()
-                .map_err(de::Error::custom)
-            }
-        }
-
-        deserializer.deserialize_map(ConfigurationVisitor)
-    }
+#[derive(Deserialize)]
+struct ConfigurationFields {
+    server: ServerConfig,
+    #[serde(default)]
+    global: GlobalConfig,
+    #[serde(default)]
+    ui: UiConfig,
+    #[serde(default, alias = "cache_store")]
+    cache: cache::Config,
+    #[serde(default, alias = "storage")]
+    blob_store: blob_store::BlobStoreConfig,
+    #[serde(default, rename = "metadata_store")]
+    registry_storage: RegistryStorageConfig,
+    #[serde(default)]
+    auth: authenticator::AuthConfig,
+    #[serde(default)]
+    repository: HashMap<String, repository::Config>,
+    #[serde(default)]
+    event_webhook: HashMap<String, EventWebhookConfig>,
+    #[serde(default)]
+    observability: Option<ObservabilityConfig>,
 }
 
-fn assign_once<T, E>(slot: &mut Option<T>, field: &'static str, value: T) -> Result<(), E>
-where
-    E: de::Error,
-{
-    if slot.replace(value).is_some() {
-        return Err(de::Error::duplicate_field(field));
+impl TryFrom<ConfigurationFields> for Configuration {
+    type Error = Error;
+
+    fn try_from(fields: ConfigurationFields) -> Result<Self, Error> {
+        Configuration {
+            server: fields.server,
+            global: fields.global,
+            ui: fields.ui,
+            cache: fields.cache,
+            blob_store: fields.blob_store,
+            registry_storage: fields.registry_storage,
+            auth: fields.auth,
+            repository: fields.repository,
+            event_webhook: fields.event_webhook,
+            observability: fields.observability,
+        }
+        .validate()
     }
-    Ok(())
 }
 
 impl Configuration {
