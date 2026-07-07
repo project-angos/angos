@@ -59,7 +59,7 @@ fn build_test_config() -> TestConfig {
 #[test]
 fn test_build_users() {
     let config = build_test_config();
-    let users = build_users(&config.identity);
+    let users = build_users(&config.identity).unwrap();
 
     assert_eq!(users.len(), 2);
     assert!(users.contains_key("user1"));
@@ -87,7 +87,7 @@ fn test_build_users() {
 #[test]
 fn test_new_auth() {
     let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity);
+    let auth = BasicAuthValidator::new(&config.identity).unwrap();
 
     assert_eq!(auth.users.len(), 2);
     assert!(auth.users.contains_key("user1"));
@@ -95,9 +95,48 @@ fn test_new_auth() {
 }
 
 #[test]
+fn duplicate_usernames_across_identities_are_rejected() {
+    let hash = hash_password_for_test("pw");
+    let config: TestConfig = toml::from_str(&format!(
+        r#"
+[identity.id_1]
+username = "shared"
+password = "{hash}"
+
+[identity.id_2]
+username = "shared"
+password = "{hash}"
+"#
+    ))
+    .expect("Failed to parse test config");
+
+    let Err(Error::Initialization(msg)) = BasicAuthValidator::new(&config.identity) else {
+        panic!("duplicate usernames must be rejected at construction");
+    };
+    assert!(
+        msg.contains("shared"),
+        "error must name the duplicate username, got: {msg}"
+    );
+}
+
+/// The unknown-username path verifies the timing-guard hash and discards the
+/// outcome. Even the exact password the guard hash encodes must not turn an
+/// unknown username into a hit.
+#[test]
+fn unknown_username_is_rejected_even_with_the_guard_password() {
+    let config = build_test_config();
+    let auth = BasicAuthValidator::new(&config.identity).unwrap();
+
+    assert_eq!(
+        auth.validate_credentials("no-such-user", "angos-timing-guard"),
+        None
+    );
+}
+
+#[test]
 fn test_validate_credentials() {
     let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity);
+    let auth = BasicAuthValidator::new(&config.identity).unwrap();
 
     let user1_id = auth.validate_credentials("user1", "password1");
     assert_eq!(user1_id, Some("id_1".to_string()));
@@ -115,7 +154,7 @@ fn test_validate_credentials() {
 #[tokio::test]
 async fn test_authenticate() {
     let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity);
+    let auth = BasicAuthValidator::new(&config.identity).unwrap();
 
     let parts = parts_with_basic_auth("user1", "password1");
     let mut identity = ClientIdentity::default();
@@ -138,7 +177,7 @@ async fn test_authenticate() {
 #[tokio::test]
 async fn test_authenticate_without_authorization_header_returns_no_credentials() {
     let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity);
+    let auth = BasicAuthValidator::new(&config.identity).unwrap();
 
     let parts = empty_parts();
     let mut identity = ClientIdentity::default();
@@ -164,7 +203,7 @@ password = "not-a-valid-argon2-hash"
 
 #[tokio::test]
 async fn test_empty_identity_map_rejects_presented_credentials() {
-    let auth = BasicAuthValidator::new(&HashMap::new());
+    let auth = BasicAuthValidator::new(&HashMap::new()).unwrap();
 
     let parts = parts_with_basic_auth("user1", "password1");
     let mut identity = ClientIdentity::default();
@@ -173,36 +212,9 @@ async fn test_empty_identity_map_rejects_presented_credentials() {
 }
 
 #[test]
-fn test_duplicate_usernames_last_wins() {
-    // Two config entries share the same username field. build_users keys by username,
-    // so one entry silently overwrites the other. The resulting map has exactly one
-    // entry for that username; which identity_id survives is non-deterministic (HashMap
-    // iteration order), but the size must be 1.
-    let hash_a = hash_password_for_test("password-a");
-    let hash_b = hash_password_for_test("password-b");
-    let toml = format!(
-        r#"
-[identity.id_a]
-username = "shared"
-password = "{hash_a}"
-
-[identity.id_b]
-username = "shared"
-password = "{hash_b}"
-"#
-    );
-
-    let config: TestConfig = toml::from_str(&toml).expect("valid TOML");
-    let users = build_users(&config.identity);
-
-    assert_eq!(users.len(), 1, "duplicate usernames collapse to one entry");
-    assert!(users.contains_key("shared"));
-}
-
-#[test]
 fn test_validate_credentials_empty_username_returns_none() {
     let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity);
+    let auth = BasicAuthValidator::new(&config.identity).unwrap();
 
     let result = auth.validate_credentials("", "password1");
     assert_eq!(result, None);
@@ -211,7 +223,7 @@ fn test_validate_credentials_empty_username_returns_none() {
 #[test]
 fn test_validate_credentials_whitespace_only_username_returns_none() {
     let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity);
+    let auth = BasicAuthValidator::new(&config.identity).unwrap();
 
     let result = auth.validate_credentials("   ", "password1");
     assert_eq!(result, None);

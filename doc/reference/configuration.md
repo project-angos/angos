@@ -366,6 +366,8 @@ ttl = 10
 
 Password hashes are validated when the configuration is parsed. An invalid Argon2 hash causes the server to fail to start with a clear error. Use `angos argon` to generate a valid hash.
 
+Usernames must be unique across all `auth.identity` entries; a duplicate causes the server to fail to start.
+
 ### OIDC (`auth.oidc.<name>`)
 
 #### GitHub Provider

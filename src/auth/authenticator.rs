@@ -68,7 +68,7 @@ impl Authenticator {
 
         let mtls_validator = MtlsValidator::new();
         let oidc_validators = Self::build_oidc_validators(auth_config, &oidc_client, cache);
-        let basic_auth_validator = BasicAuthValidator::new(&auth_config.identity);
+        let basic_auth_validator = BasicAuthValidator::new(&auth_config.identity)?;
 
         Ok(Self {
             mtls_validator,
@@ -580,7 +580,7 @@ mod tests {
         Authenticator {
             mtls_validator: MtlsValidator::new(),
             oidc_validators,
-            basic_auth_validator: BasicAuthValidator::new(&HashMap::new()),
+            basic_auth_validator: BasicAuthValidator::new(&HashMap::new()).unwrap(),
         }
     }
 
@@ -785,7 +785,7 @@ mod tests {
             password = "{password_hash}"
         "#,
         ));
-        let basic_auth_validator = BasicAuthValidator::new(&config.auth.identity);
+        let basic_auth_validator = BasicAuthValidator::new(&config.auth.identity).unwrap();
 
         let oidc_validators: OidcValidators = vec![(
             "mock-provider".to_string(),
