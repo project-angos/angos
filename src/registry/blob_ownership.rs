@@ -17,6 +17,11 @@ impl<'a> BlobOwnership<'a> {
         Self { metadata_store }
     }
 
+    /// Insert `namespace`'s blob ownership reference into the blob index.
+    /// Committed on the metadata store's executor with the engine's conflict
+    /// retry, and idempotent, so a retry re-grants harmlessly. A caller that
+    /// must serialize against a concurrent reclaim runs this inside
+    /// `MetadataStore::with_blob_data_lock`.
     pub async fn grant(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
         self.metadata_store
             .update_blob_index(

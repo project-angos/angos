@@ -14,7 +14,7 @@ use crate::{
         blob_store::{BlobStore, BoxedReader},
         cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
         job_store::{JobEnvelope, Queue},
-        metadata_store::{BlobIndexOperation, LinkKind, MetadataStore},
+        metadata_store::{LinkKind, MetadataStore},
     },
 };
 
@@ -165,52 +165,18 @@ pub async fn cache_blob(
     // so a concurrent delete cannot reclaim the blob in the window between the
     // two store-local commits. This is the same coarse lock `delete_blob` holds
     // while reclaiming, and mirrors the manifest path's bytes-then-link order.
-    let lock = metadata_store.acquire_blob_data_lock(digest).await?;
-    let result = async {
-        blob_store
-            .complete_upload(namespace, session_id.as_ref(), digest)
-            .await?;
-        grant_blob_index_reference(metadata_store, namespace, digest).await
-    }
-    .await;
-    lock.release().await;
-    result?;
+    metadata_store
+        .with_blob_data_lock(digest, async {
+            blob_store
+                .complete_upload(namespace, session_id.as_ref(), digest)
+                .await?;
+            BlobOwnership::new(metadata_store)
+                .grant(namespace, digest)
+                .await
+        })
+        .await?;
 
     info!("Caching of {digest} completed");
-    Ok(())
-}
-
-/// Grant `namespace` a reference to an already-present blob, holding the
-/// blob-data lock so the grant is serialized against a concurrent reclaim (the
-/// `bytes already present` branch of the cache-fill handler).
-pub async fn grant_blob_reference(
-    metadata_store: &MetadataStore,
-    namespace: &Namespace,
-    digest: &Digest,
-) -> Result<(), Error> {
-    let lock = metadata_store.acquire_blob_data_lock(digest).await?;
-    let result = grant_blob_index_reference(metadata_store, namespace, digest).await;
-    lock.release().await;
-    result
-}
-
-/// Insert `namespace`'s blob ownership reference into the metadata store's blob
-/// index. The caller holds the blob-data lock. Committed on the metadata store's
-/// executor with the engine's conflict retry, so it is never routed through the
-/// blob store's executor; the insert is idempotent, so a cache-fill retry
-/// re-grants harmlessly.
-async fn grant_blob_index_reference(
-    metadata_store: &MetadataStore,
-    namespace: &Namespace,
-    digest: &Digest,
-) -> Result<(), Error> {
-    metadata_store
-        .update_blob_index(
-            namespace,
-            digest,
-            BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
-        )
-        .await?;
     Ok(())
 }
 
@@ -258,40 +224,28 @@ impl Registry {
         }
     }
 
-    async fn try_get_owned_local_blob(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-        range: Option<BlobRange>,
-    ) -> Result<Option<GetBlobResponse>, Error> {
-        if !BlobOwnership::new(self.metadata_store.as_ref())
-            .can_read(namespace, digest)
-            .await?
-        {
-            return Ok(None);
-        }
-
-        self.get_local_blob(digest, range).await.map(Some)
-    }
-
-    #[instrument(skip(repository))]
-    pub async fn get_blob(
+    /// Serve the blob locally when `has_access`, else fall back to the
+    /// pull-through upstream. `has_access` is the namespace's ownership
+    /// verdict, resolved once by the caller so the hot GET path does not pay
+    /// for the blob-index read twice.
+    pub async fn get_blob_with_access(
         &self,
         repository: &Repository,
         accepted_types: &[String],
         namespace: &Namespace,
         digest: &Digest,
         range: Option<BlobRange>,
+        has_access: bool,
     ) -> Result<GetBlobResponse, Error> {
-        match self
-            .try_get_owned_local_blob(namespace, digest, range)
-            .await
-        {
-            Ok(Some(response)) => return Ok(response),
-            Ok(None) if !repository.is_pull_through() => return Err(Error::BlobUnknown),
-            Ok(None) => {}
-            Err(Error::BlobUnknown) if repository.is_pull_through() => {}
-            Err(error) => return Err(error),
+        if has_access {
+            match self.get_local_blob(digest, range).await {
+                Ok(response) => return Ok(response),
+                // Owned but the bytes are gone: a pull-through repo re-fetches.
+                Err(Error::BlobUnknown) if repository.is_pull_through() => {}
+                Err(error) => return Err(error),
+            }
+        } else if !repository.is_pull_through() {
+            return Err(Error::BlobUnknown);
         }
 
         if range.is_some() {
@@ -393,20 +347,18 @@ impl Registry {
         // in the shard without a transactional coarse lock), so a concurrent
         // reference grant cannot be missed during the unreferenced check, and the
         // blob-store reclaim cannot race a concurrent push of the same digest.
-        let session = self.acquire_blob_data_lock(digest).await?;
-        let result = async {
-            if self
-                .metadata_store
-                .revoke_blob_ownership(namespace, digest)
-                .await?
-            {
-                self.blob_store.delete_blob(digest).await?;
-            }
-            Ok::<_, Error>(())
-        }
-        .await;
-        session.release().await;
-        result
+        self.metadata_store
+            .with_blob_data_lock(digest, async {
+                if self
+                    .metadata_store
+                    .revoke_blob_ownership(namespace, digest)
+                    .await?
+                {
+                    self.blob_store.delete_blob(digest).await?;
+                }
+                Ok::<_, Error>(())
+            })
+            .await
     }
 
     /// Resolves a blob GET request to either a presigned redirect URL or a
@@ -444,7 +396,7 @@ impl Registry {
                 headers: get_blob_redirect_headers(presigned_url, digest),
             }
         } else {
-            self.get_blob(repository, mime_types, namespace, digest, range)
+            self.get_blob_with_access(repository, mime_types, namespace, digest, range, has_access)
                 .await?
         };
 
@@ -474,7 +426,7 @@ mod tests {
             blob_ownership::BlobOwnership,
             metadata_store::{BlobIndexOperation, LinkOperation},
             test_utils::{
-                create_test_blob, for_each_backend, metadata_store_over, put_blob_direct,
+                create_test_blob, for_each_backend, get_blob, metadata_store_over, put_blob_direct,
             },
         },
     };
@@ -498,7 +450,11 @@ mod tests {
 
             // Hold the blob-data lock, then start a delete: it must block on
             // the lock rather than reclaim the bytes.
-            let session = registry.acquire_blob_data_lock(&digest).await.unwrap();
+            let session = registry
+                .metadata_store
+                .acquire_blob_data_lock(&digest)
+                .await
+                .unwrap();
             let delete = registry.delete_blob(first, &digest);
             tokio::pin!(delete);
 
@@ -553,8 +509,7 @@ mod tests {
             let content = b"test blob content";
 
             let (digest, repository) = create_test_blob(registry, namespace, content).await;
-            let response = registry
-                .get_blob(&repository, &[], namespace, &digest, None)
+            let response = get_blob(registry, &repository, &[], namespace, &digest, None)
                 .await
                 .unwrap();
 
@@ -588,9 +543,7 @@ mod tests {
                 .await;
             assert!(matches!(head_result, Err(Error::BlobUnknown)));
 
-            let get_result = registry
-                .get_blob(repository, &[], namespace, &digest, None)
-                .await;
+            let get_result = get_blob(registry, repository, &[], namespace, &digest, None).await;
             assert!(matches!(get_result, Err(Error::BlobUnknown)));
         })
         .await;
@@ -608,8 +561,7 @@ mod tests {
                 start: 5,
                 end: Some(10),
             });
-            let response = registry
-                .get_blob(&repository, &[], namespace, &digest, range)
+            let response = get_blob(registry, &repository, &[], namespace, &digest, range)
                 .await
                 .unwrap();
 
@@ -835,8 +787,7 @@ mod tests {
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             let repository = registry.get_repository_for_namespace(&namespace).unwrap();
-            let response = registry
-                .get_blob(repository, &[], &namespace, &digest, None)
+            let response = get_blob(registry, repository, &[], &namespace, &digest, None)
                 .await
                 .unwrap();
 
@@ -1206,8 +1157,7 @@ mod tests {
                 content.len().to_string()
             );
 
-            let get_response = registry
-                .get_blob(&repository, &[], namespace, &digest, None)
+            let get_response = get_blob(registry, &repository, &[], namespace, &digest, None)
                 .await
                 .unwrap();
             match get_response {

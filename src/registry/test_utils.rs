@@ -13,7 +13,10 @@ use crate::{
     oci::{Digest, MediaType, Namespace, Tag, UploadSessionId},
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        Registry, RegistryConfig, Repository, blob_store,
+        Error, Registry, RegistryConfig, Repository,
+        blob::{BlobRange, GetBlobResponse},
+        blob_ownership::BlobOwnership,
+        blob_store,
         blob_store::{BlobStore, BlobStoreConfig},
         job_store::{JobStore, Queue},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -234,6 +237,32 @@ pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
         .await
         .unwrap();
     digest
+}
+
+/// Fetch a blob the way `resolve_get_blob` does minus the redirect and event
+/// paths: resolve the namespace's ownership verdict, then serve locally or
+/// through the pull-through upstream.
+pub async fn get_blob(
+    registry: &Registry,
+    repository: &Repository,
+    accepted_types: &[String],
+    namespace: &Namespace,
+    digest: &Digest,
+    range: Option<BlobRange>,
+) -> Result<GetBlobResponse, Error> {
+    let has_access = BlobOwnership::new(registry.metadata_store.as_ref())
+        .can_read(namespace, digest)
+        .await?;
+    registry
+        .get_blob_with_access(
+            repository,
+            accepted_types,
+            namespace,
+            digest,
+            range,
+            has_access,
+        )
+        .await
 }
 
 pub async fn create_test_blob(

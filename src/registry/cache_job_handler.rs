@@ -11,7 +11,8 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         Error as RegistryError, Registry,
-        blob::{cache_blob, grant_blob_reference},
+        blob::cache_blob,
+        blob_ownership::BlobOwnership,
         job_store::{Error, JobEnvelope, JobHandler},
     },
 };
@@ -64,7 +65,12 @@ impl Registry {
         // commit across both. The work is idempotent, so it is safe to redo on a
         // retry even though it no longer commits atomically with job completion.
         if self.blob_store.size(digest).await.is_ok() {
-            grant_blob_reference(&self.metadata_store, namespace, digest).await?;
+            // Grant under the blob-data lock so it is serialized against a
+            // concurrent reclaim of the already-present bytes.
+            let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+            self.metadata_store
+                .with_blob_data_lock(digest, ownership.grant(namespace, digest))
+                .await?;
         } else {
             let repository = self.get_repository_for_namespace(namespace)?;
             if !repository.is_pull_through() {

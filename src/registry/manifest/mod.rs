@@ -423,24 +423,23 @@ impl Registry {
         // blob-data lock across both so a concurrent delete cannot reclaim the
         // blob between the write and the link. A crash or LWW-supersession in
         // between leaves at most an orphan blob, which scrub reclaims.
-        let session = self.acquire_blob_data_lock(&computed_digest).await?;
-        let result = async {
-            self.blob_store
-                .put_blob(&computed_digest, Bytes::copy_from_slice(body))
-                .await?;
-            self.metadata_store
-                .store_manifest(namespace, &ops, created_at)
-                .await
-                .map_err(|e| match e {
-                    MetadataStoreError::ReplicationSuperseded(message) => {
-                        Error::ReplicationSuperseded(message)
-                    }
-                    e => Error::from(e),
-                })
-        }
-        .await;
-        session.release().await;
-        let commit = result?;
+        let commit = self
+            .metadata_store
+            .with_blob_data_lock(&computed_digest, async {
+                self.blob_store
+                    .put_blob(&computed_digest, Bytes::copy_from_slice(body))
+                    .await?;
+                self.metadata_store
+                    .store_manifest(namespace, &ops, created_at)
+                    .await
+                    .map_err(|e| match e {
+                        MetadataStoreError::ReplicationSuperseded(message) => {
+                            Error::ReplicationSuperseded(message)
+                        }
+                        e => Error::from(e),
+                    })
+            })
+            .await?;
 
         // Changed-state check from the prior target the committed transaction
         // itself validated; a missing entry fails open so a genuine write is
@@ -620,20 +619,18 @@ impl Registry {
             // blob-data lock across the unreferenced-check + reclaim so a
             // concurrent reference grant isn't missed, then reclaim the bytes
             // when the delete left the blob unreferenced.
-            let session = self.acquire_blob_data_lock(digest).await?;
-            let result = async {
-                if self
-                    .metadata_store
-                    .delete_manifest(namespace, digest, &ops, source_ts)
-                    .await?
-                {
-                    self.blob_store.delete_blob(digest).await?;
-                }
-                Ok::<_, Error>(())
-            }
-            .await;
-            session.release().await;
-            result?;
+            self.metadata_store
+                .with_blob_data_lock(digest, async {
+                    if self
+                        .metadata_store
+                        .delete_manifest(namespace, digest, &ops, source_ts)
+                        .await?
+                    {
+                        self.blob_store.delete_blob(digest).await?;
+                    }
+                    Ok::<_, Error>(())
+                })
+                .await?;
         } else {
             self.metadata_store
                 .delete_links(namespace, &ops, source_ts)

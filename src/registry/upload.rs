@@ -93,58 +93,56 @@ impl Registry {
     where
         S: AsyncRead + Unpin,
     {
-        let session = self.acquire_blob_data_lock(digest).await?;
-        let result = async {
-            if self.blob_store.size(digest).await.is_err() {
-                return Ok(false);
-            }
-
-            // The blob already exists, so there is nothing to store: hash the
-            // body into a sink under the target algorithm alone, purely to
-            // confirm it matches. With a declared length, drain at most one byte
-            // past it so an over-long body is rejected as soon as the surplus
-            // appears rather than after the whole `bound_blob_stream`-capped
-            // body is read.
-            let mut reader =
-                HashingReader::new(&mut *stream, Hasher::for_algorithm(digest.algorithm()));
-            match content_length {
-                Some(expected) => {
-                    let read = copy(
-                        &mut (&mut reader).take(expected.saturating_add(1)),
-                        &mut sink(),
-                    )
-                    .await
-                    .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
-                    if read != expected {
-                        return Err(blob_store::Error::UploadBodySize {
-                            expected,
-                            actual: read,
-                        }
-                        .into());
-                    }
+        self.metadata_store
+            .with_blob_data_lock(digest, async {
+                if self.blob_store.size(digest).await.is_err() {
+                    return Ok(false);
                 }
-                None => {
-                    copy(&mut reader, &mut sink())
+
+                // The blob already exists, so there is nothing to store: hash the
+                // body into a sink under the target algorithm alone, purely to
+                // confirm it matches. With a declared length, drain at most one byte
+                // past it so an over-long body is rejected as soon as the surplus
+                // appears rather than after the whole `bound_blob_stream`-capped
+                // body is read.
+                let mut reader =
+                    HashingReader::new(&mut *stream, Hasher::for_algorithm(digest.algorithm()));
+                match content_length {
+                    Some(expected) => {
+                        let read = copy(
+                            &mut (&mut reader).take(expected.saturating_add(1)),
+                            &mut sink(),
+                        )
                         .await
                         .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
+                        if read != expected {
+                            return Err(blob_store::Error::UploadBodySize {
+                                expected,
+                                actual: read,
+                            }
+                            .into());
+                        }
+                    }
+                    None => {
+                        copy(&mut reader, &mut sink())
+                            .await
+                            .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
+                    }
                 }
-            }
 
-            let upload_digest = reader.into_hasher().digest(digest.algorithm())?;
-            if &upload_digest != digest {
-                warn!("Expected digest '{digest}', got '{upload_digest}'");
-                return Err(Error::DigestInvalid);
-            }
+                let upload_digest = reader.into_hasher().digest(digest.algorithm())?;
+                if &upload_digest != digest {
+                    warn!("Expected digest '{digest}', got '{upload_digest}'");
+                    return Err(Error::DigestInvalid);
+                }
 
-            BlobOwnership::new(self.metadata_store.as_ref())
-                .grant(namespace, digest)
-                .await?;
+                BlobOwnership::new(self.metadata_store.as_ref())
+                    .grant(namespace, digest)
+                    .await?;
 
-            Ok(true)
-        }
-        .await;
-        session.release().await;
-        result
+                Ok(true)
+            })
+            .await
     }
 
     async fn finish_completed_upload(
@@ -173,24 +171,22 @@ impl Registry {
         mount: &BlobMount,
         source: &Namespace,
     ) -> Result<Option<HeaderMap>, Error> {
-        let session = self.acquire_blob_data_lock(&mount.digest).await?;
-        let result = async {
-            if self.blob_store.size(&mount.digest).await.is_err()
-                || !BlobOwnership::new(self.metadata_store.as_ref())
-                    .can_read(source, &mount.digest)
-                    .await?
-            {
-                return Ok(None);
-            }
+        self.metadata_store
+            .with_blob_data_lock(&mount.digest, async {
+                if self.blob_store.size(&mount.digest).await.is_err()
+                    || !BlobOwnership::new(self.metadata_store.as_ref())
+                        .can_read(source, &mount.digest)
+                        .await?
+                {
+                    return Ok(None);
+                }
 
-            BlobOwnership::new(self.metadata_store.as_ref())
-                .grant(namespace, &mount.digest)
-                .await?;
-            Ok(Some(blob_location_headers(namespace, &mount.digest)))
-        }
-        .await;
-        session.release().await;
-        result
+                BlobOwnership::new(self.metadata_store.as_ref())
+                    .grant(namespace, &mount.digest)
+                    .await?;
+                Ok(Some(blob_location_headers(namespace, &mount.digest)))
+            })
+            .await
     }
 
     /// Source namespaces whose read policy must permit the caller: `[from]`
@@ -501,25 +497,23 @@ impl Registry {
             return Err(Error::DigestInvalid);
         }
 
-        let session = self.acquire_blob_data_lock(digest).await?;
-        let result = async {
-            match self.blob_store.size(digest).await {
-                Ok(_) => {}
-                Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                    self.blob_store
-                        .complete_upload(namespace, &session_key, digest)
-                        .await?;
+        self.metadata_store
+            .with_blob_data_lock(digest, async {
+                match self.blob_store.size(digest).await {
+                    Ok(_) => {}
+                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                        self.blob_store
+                            .complete_upload(namespace, &session_key, digest)
+                            .await?;
+                    }
+                    Err(error) => return Err(Error::from(error)),
                 }
-                Err(error) => return Err(Error::from(error)),
-            }
 
-            BlobOwnership::new(self.metadata_store.as_ref())
-                .grant(namespace, digest)
-                .await
-        }
-        .await;
-        session.release().await;
-        result?;
+                BlobOwnership::new(self.metadata_store.as_ref())
+                    .grant(namespace, digest)
+                    .await
+            })
+            .await?;
 
         self.finish_completed_upload(namespace, &session_key, digest)
             .await
