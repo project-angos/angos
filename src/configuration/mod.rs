@@ -16,6 +16,7 @@ mod observability;
 pub mod regex_pattern;
 pub mod registry_storage;
 mod server;
+pub mod trusted_proxy;
 mod ui;
 pub mod watcher;
 
@@ -25,6 +26,7 @@ pub use observability::ObservabilityConfig;
 pub use regex_pattern::RegexPattern;
 pub use registry_storage::RegistryStorageConfig;
 pub use server::ServerConfig;
+pub use trusted_proxy::TrustedProxy;
 pub use ui::UiConfig;
 
 #[cfg(test)]

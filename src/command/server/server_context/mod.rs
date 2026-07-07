@@ -1,12 +1,15 @@
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
-use hyper::http::request::Parts;
+use hyper::{header::HeaderMap, http::request::Parts};
 use tracing::instrument;
 
 use crate::{
     auth::{Authenticator, Authorizer},
     command::server::error::Error,
-    configuration::Configuration,
+    configuration::{Configuration, TrustedProxy},
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     registry::{BlobMount, Registry},
@@ -15,6 +18,7 @@ use crate::{
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,
     authorizer: Arc<Authorizer>,
+    trusted_proxies: Vec<TrustedProxy>,
     pub registry: Arc<Registry>,
     pub enable_ui: bool,
     pub ui_name: String,
@@ -34,6 +38,7 @@ impl ServerContext {
         Ok(Self {
             authenticator,
             authorizer,
+            trusted_proxies: config.global.trusted_proxies.clone(),
             registry,
             enable_ui: config.ui.enabled,
             ui_name: config.ui.name.clone(),
@@ -49,13 +54,16 @@ impl ServerContext {
     pub async fn authenticate_request(
         &self,
         parts: &Parts,
-        remote_address: Option<std::net::SocketAddr>,
+        remote_address: Option<SocketAddr>,
     ) -> Result<ClientIdentity, Error> {
         let mut identity = self
             .authenticator
             .authenticate_request(parts, remote_address)
             .await?;
-        if let Some(client_ip) = resolve_client_ip(&parts.headers) {
+        if let Some(peer) = remote_address
+            && self.trusted_proxies.iter().any(|p| p.contains(peer.ip()))
+            && let Some(client_ip) = resolve_forwarded_ip(&parts.headers, &self.trusted_proxies)
+        {
             identity.client_ip = Some(client_ip);
         }
         Ok(identity)
@@ -104,12 +112,26 @@ impl ServerContext {
     }
 }
 
-fn resolve_client_ip(headers: &hyper::header::HeaderMap) -> Option<String> {
+/// Resolves the client IP forwarded by a trusted proxy: the rightmost
+/// `X-Forwarded-For` entry that is not itself a trusted proxy, else
+/// `X-Real-IP`. Only proxies append entries on the right; anything further
+/// left is client-supplied and must not be trusted.
+fn resolve_forwarded_ip(headers: &HeaderMap, proxies: &[TrustedProxy]) -> Option<String> {
     if let Some(forwarded_for) = headers.get("X-Forwarded-For")
         && let Ok(forwarded_str) = forwarded_for.to_str()
-        && let Some(first_ip) = forwarded_str.split(',').next()
     {
-        return Some(first_ip.trim().to_string());
+        for entry in forwarded_str.rsplit(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let is_proxy = entry
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| proxies.iter().any(|p| p.contains(ip)));
+            if !is_proxy {
+                return Some(entry.to_string());
+            }
+        }
     }
     if let Some(real_ip) = headers.get("X-Real-IP")
         && let Ok(ip_str) = real_ip.to_str()
