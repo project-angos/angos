@@ -14,8 +14,8 @@ use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ObjectStore, s3::Backend as StorageS3Backend};
 
 use crate::{
-    command::server::server_context::{ServerContext, resolve_client_ip},
-    configuration::Configuration,
+    command::server::server_context::{ServerContext, resolve_forwarded_ip},
+    configuration::{Configuration, TrustedProxy},
     event_webhook::{
         config::EventWebhookConfig,
         dispatcher::EventDispatcher,
@@ -264,7 +264,7 @@ async fn test_authenticate_request_with_basic_auth() {
 }
 
 #[tokio::test]
-async fn test_authenticate_request_with_x_forwarded_for() {
+async fn test_authenticate_request_ignores_x_forwarded_for_from_untrusted_peer() {
     let config = minimal_config();
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
@@ -274,12 +274,19 @@ async fn test_authenticate_request_with_x_forwarded_for() {
         .body(())
         .unwrap();
     let (parts, ()) = request.into_parts();
+    let remote_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-    let result = context.authenticate_request(&parts, None).await;
+    let result = context
+        .authenticate_request(&parts, Some(remote_addr))
+        .await;
 
     assert!(result.is_ok());
     let identity = result.unwrap();
-    assert_eq!(identity.client_ip, Some("192.168.1.100".to_string()));
+    assert_eq!(
+        identity.client_ip,
+        Some("127.0.0.1".to_string()),
+        "a peer outside trusted_proxies must not spoof its IP via headers"
+    );
 }
 
 #[tokio::test]
@@ -302,8 +309,8 @@ async fn test_authenticate_request_with_remote_address() {
 }
 
 #[tokio::test]
-async fn test_authenticate_request_x_forwarded_for_overrides_remote_address() {
-    let config = minimal_config();
+async fn test_authenticate_request_x_forwarded_for_from_trusted_proxy_overrides_remote_address() {
+    let config = load_config(r#"trusted_proxies = ["127.0.0.1"]"#);
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
@@ -684,65 +691,83 @@ async fn test_shutdown_flushes_pending_access_times() {
     );
 }
 
+fn proxies(sources: &[&str]) -> Vec<TrustedProxy> {
+    sources
+        .iter()
+        .map(|s| TrustedProxy::parse(*s).unwrap())
+        .collect()
+}
+
 #[test]
-fn test_resolve_client_ip_single_ip() {
+fn test_resolve_forwarded_ip_single_ip() {
     let mut headers = HeaderMap::new();
     headers.insert("X-Forwarded-For", "192.168.1.100".parse().unwrap());
     assert_eq!(
-        resolve_client_ip(&headers),
+        resolve_forwarded_ip(&headers, &[]),
         Some("192.168.1.100".to_string())
     );
 }
 
 #[test]
-fn test_resolve_client_ip_comma_separated() {
+fn test_resolve_forwarded_ip_takes_rightmost_untrusted_entry() {
+    // 10.0.0.1 is an intermediate trusted proxy; the entry it appended
+    // (192.168.1.100) is the client. The leftmost entries are client-supplied
+    // and must not win.
     let mut headers = HeaderMap::new();
     headers.insert(
         "X-Forwarded-For",
-        "192.168.1.100, 10.0.0.1".parse().unwrap(),
+        "1.2.3.4, 192.168.1.100, 10.0.0.1".parse().unwrap(),
     );
     assert_eq!(
-        resolve_client_ip(&headers),
+        resolve_forwarded_ip(&headers, &proxies(&["10.0.0.0/8"])),
         Some("192.168.1.100".to_string())
     );
 }
 
 #[test]
-fn test_resolve_client_ip_whitespace() {
+fn test_resolve_forwarded_ip_whitespace() {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "X-Forwarded-For",
-        "  192.168.1.100  , 10.0.0.1".parse().unwrap(),
-    );
+    headers.insert("X-Forwarded-For", "  192.168.1.100  ".parse().unwrap());
     assert_eq!(
-        resolve_client_ip(&headers),
+        resolve_forwarded_ip(&headers, &[]),
         Some("192.168.1.100".to_string())
     );
 }
 
 #[test]
-fn test_resolve_client_ip_missing_header() {
+fn test_resolve_forwarded_ip_missing_header() {
     let headers = HeaderMap::new();
-    assert_eq!(resolve_client_ip(&headers), None);
+    assert_eq!(resolve_forwarded_ip(&headers, &[]), None);
 }
 
 #[test]
-fn test_resolve_client_ip_x_real_ip_fallback() {
+fn test_resolve_forwarded_ip_x_real_ip_fallback() {
     let mut headers = HeaderMap::new();
     headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
     assert_eq!(
-        resolve_client_ip(&headers),
+        resolve_forwarded_ip(&headers, &[]),
         Some("192.168.1.200".to_string())
     );
 }
 
 #[test]
-fn test_resolve_client_ip_x_forwarded_for_takes_precedence() {
+fn test_resolve_forwarded_ip_all_entries_trusted_falls_back_to_x_real_ip() {
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Forwarded-For", "10.0.0.2, 10.0.0.1".parse().unwrap());
+    headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
+    assert_eq!(
+        resolve_forwarded_ip(&headers, &proxies(&["10.0.0.0/8"])),
+        Some("192.168.1.200".to_string())
+    );
+}
+
+#[test]
+fn test_resolve_forwarded_ip_x_forwarded_for_takes_precedence() {
     let mut headers = HeaderMap::new();
     headers.insert("X-Forwarded-For", "192.168.1.100".parse().unwrap());
     headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
     assert_eq!(
-        resolve_client_ip(&headers),
+        resolve_forwarded_ip(&headers, &[]),
         Some("192.168.1.100".to_string())
     );
 }

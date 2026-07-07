@@ -4,7 +4,7 @@ use bytesize::ByteSize;
 use serde::{Deserialize, Deserializer, de::Error as _};
 
 use crate::{
-    configuration::RegexPattern,
+    configuration::{RegexPattern, TrustedProxy},
     policy::{AccessPolicyConfig, RetentionPolicyConfig},
     registry::job_store::JobQueueConfig,
 };
@@ -73,6 +73,12 @@ pub struct GlobalConfig {
     pub event_webhooks: Vec<String>,
     #[serde(default)]
     pub job_queue: Option<JobQueueConfig>,
+    /// Proxy IPs or CIDR networks whose `X-Forwarded-For`/`X-Real-IP` headers
+    /// are honored as the client IP. From any other peer (the default, since
+    /// the list is empty) those headers are ignored and the socket address is
+    /// used, so clients cannot spoof IP-gated policies.
+    #[serde(default)]
+    pub trusted_proxies: Vec<TrustedProxy>,
 }
 
 fn default_max_concurrent_requests() -> usize {
@@ -150,6 +156,7 @@ impl Default for GlobalConfig {
             authorization_webhook: None,
             event_webhooks: Vec::new(),
             job_queue: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -201,6 +208,10 @@ mod tests {
             "manifest-reference validation is permissive by default (pre-1.2.0 behavior)"
         );
         assert!(config.authorization_webhook.is_none());
+        assert!(
+            config.trusted_proxies.is_empty(),
+            "forwarded headers must be ignored by default"
+        );
     }
 
     #[test]
@@ -217,6 +228,7 @@ mod tests {
             immutable_tags_exclusions = ["latest", "dev"]
             allow_missing_manifest_references = false
             authorization_webhook = "my-webhook"
+            trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]
             "#,
         )
         .unwrap();
@@ -239,6 +251,13 @@ mod tests {
         assert_eq!(config.immutable_tags_exclusions[0].as_source(), "latest");
         assert_eq!(config.immutable_tags_exclusions[1].as_source(), "dev");
         assert_eq!(config.authorization_webhook.as_deref(), Some("my-webhook"));
+        assert_eq!(config.trusted_proxies.len(), 2);
+    }
+
+    #[test]
+    fn invalid_trusted_proxy_is_rejected() {
+        let result = toml::from_str::<GlobalConfig>(r#"trusted_proxies = ["not-an-ip"]"#);
+        assert!(result.is_err(), "invalid entries must fail at parse time");
     }
 
     #[test]

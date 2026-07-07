@@ -96,6 +96,10 @@ rules = [
 ]
 ```
 
+`identity.client_ip` is the connection's socket address. When angos runs behind a reverse
+proxy, list the proxy in `global.trusted_proxies` so the client IP it forwards via
+`X-Forwarded-For`/`X-Real-IP` is used instead; headers from unlisted peers are ignored.
+
 ### Certificate Organization
 
 ```toml

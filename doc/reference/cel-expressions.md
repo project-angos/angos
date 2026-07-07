@@ -20,7 +20,7 @@ Information about the authenticated client.
 |----------------------|----------|--------------------------------|
 | `identity.id`        | string?  | Identity ID from configuration |
 | `identity.username`  | string?  | Authenticated username         |
-| `identity.client_ip` | string?  | Client IP address              |
+| `identity.client_ip` | string?  | Client IP address (the socket address; a forwarded address is used only when the peer is listed in `global.trusted_proxies`) |
 
 ### Certificate (`identity.certificate`)
 

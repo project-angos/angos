@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.3.2 - Unreleased
 
+### Security
+
+- `X-Forwarded-For`/`X-Real-IP` are no longer trusted unconditionally: the client IP used by access policies and webhooks now comes from these headers only when the peer is listed in the new `global.trusted_proxies` option, otherwise from the socket address.
+
 ### Added
 
 - New `manifest.pull` and `blob.pull` event-webhook kinds fire on successful `GET` requests (including redirect responses), so pulls can be tracked externally; prefer the `async` delivery policy for these high-volume events.
