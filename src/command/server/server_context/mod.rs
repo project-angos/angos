@@ -76,9 +76,10 @@ impl ServerContext {
         identity: &ClientIdentity,
         request: &Parts,
     ) -> Result<(), Error> {
-        self.authorizer
+        Ok(self
+            .authorizer
             .authorize_request(route, identity, request, &self.registry)
-            .await
+            .await?)
     }
 
     /// Resolves a source namespace whose copy of the mount's blob `identity` can
@@ -89,9 +90,10 @@ impl ServerContext {
         identity: &ClientIdentity,
         request: &Parts,
     ) -> Result<Option<Namespace>, Error> {
-        self.authorizer
+        Ok(self
+            .authorizer
             .authorize_mount_source(mount, identity, request, &self.registry)
-            .await
+            .await?)
     }
 
     pub fn is_reference_immutable(&self, namespace: &Namespace, reference: &Reference) -> bool {

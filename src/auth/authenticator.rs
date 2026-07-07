@@ -6,12 +6,12 @@ use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
+    auth::Error,
     auth::{
         AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, OidcValidator, basic_auth,
         oidc, webhook,
     },
     cache::Cache,
-    command::server::Error,
     configuration::Configuration,
     http_client::HttpClientBuilder,
     identity::ClientIdentity,

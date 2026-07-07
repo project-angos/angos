@@ -4,8 +4,8 @@ use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    auth::Error,
     auth::oidc::provider::{BaseConfig, HasBaseConfig, OidcProvider},
-    command::server::Error,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -80,10 +80,8 @@ impl OidcProvider for Provider {
 
 #[cfg(test)]
 pub mod tests {
-    use hyper::StatusCode;
-
     use super::*;
-    use crate::command::server::Error;
+    use crate::auth::Error;
 
     pub fn default_github_config() -> ProviderConfig {
         ProviderConfig {
@@ -206,9 +204,7 @@ pub mod tests {
 
         let result = provider.validate_provider_claims(&claims);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
-        match err {
+        match result.unwrap_err() {
             Error::Unauthorized(msg) => {
                 assert!(msg.contains("repository"));
             }
@@ -225,9 +221,7 @@ pub mod tests {
 
         let result = provider.validate_provider_claims(&claims);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
-        match err {
+        match result.unwrap_err() {
             Error::Unauthorized(msg) => {
                 assert!(msg.contains("actor"));
             }
@@ -241,6 +235,5 @@ pub mod tests {
         let claims = HashMap::new();
         let result = provider.validate_provider_claims(&claims);
         assert!(matches!(&result, Err(Error::Unauthorized(_))));
-        assert_eq!(result.unwrap_err().status_code(), StatusCode::UNAUTHORIZED);
     }
 }

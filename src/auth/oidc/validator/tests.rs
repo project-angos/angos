@@ -9,6 +9,7 @@ use wiremock::{
 };
 
 use crate::{
+    auth::Error,
     auth::oidc::{
         Jwk, OidcProvider,
         provider::{
@@ -22,7 +23,6 @@ use crate::{
         },
     },
     cache,
-    command::server::Error,
     identity::OidcClaims,
     test_fixtures::{
         mocks::{mount_jwks, static_jwks_response},

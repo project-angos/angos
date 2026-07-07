@@ -7,11 +7,11 @@ use argon2::{
 use serde::Deserialize;
 
 use crate::{
+    auth::Error,
     auth::{
         AuthMiddleware, AuthResult, BasicAuthValidator,
         basic_auth::{Config, build_users},
     },
-    command::server::Error,
     identity::ClientIdentity,
     test_fixtures::requests::{empty_parts, parts_with_basic_auth},
 };

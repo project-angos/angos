@@ -6,8 +6,7 @@ use tracing::{debug, error, instrument};
 use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
 use crate::{
-    auth::{AuthMiddleware, AuthResult},
-    command::server::Error,
+    auth::{AuthMiddleware, AuthResult, Error},
     identity::{ClientCertificate, ClientIdentity},
 };
 
@@ -93,10 +92,13 @@ pub mod tests {
     use tracing::Level;
 
     use super::*;
-    use crate::test_fixtures::{
-        logging::LogCapture,
-        mtls::{cert_der, minimal_cert_der},
-        requests::empty_parts,
+    use crate::{
+        command::server::Error as ServerError,
+        test_fixtures::{
+            logging::LogCapture,
+            mtls::{cert_der, minimal_cert_der},
+            requests::empty_parts,
+        },
     };
 
     /// The parse error is logged server-side while the client only sees the
@@ -131,7 +133,7 @@ pub mod tests {
         match result.unwrap_err() {
             Error::Unauthorized(msg) => {
                 assert_eq!(msg, "Invalid certificate");
-                let error = Error::Unauthorized(msg);
+                let error = ServerError::from(Error::Unauthorized(msg));
                 assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
                 let body = error.as_json(None).to_string();
                 assert!(body.contains("Invalid certificate"));
