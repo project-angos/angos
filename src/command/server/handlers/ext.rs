@@ -4,8 +4,8 @@ use crate::{
     command::server::{
         ServerContext, error::Error, handlers::build_response, response_body::ResponseBody,
     },
+    jobs::{JobState, Queue},
     oci::Namespace,
-    registry::job_store::{JobState, Queue},
 };
 
 pub async fn handle_list_repositories(

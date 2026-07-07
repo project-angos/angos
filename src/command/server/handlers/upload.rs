@@ -1,5 +1,4 @@
 use hyper::{Response, StatusCode, body::Incoming, header::CONTENT_RANGE, http::request::Parts};
-use tokio::io::AsyncRead;
 
 use crate::{
     command::server::{
@@ -79,17 +78,20 @@ pub async fn handle_get_upload(
     )
 }
 
-pub async fn handle_patch_upload<S>(
+pub async fn handle_patch_upload(
     context: &ServerContext,
+    parts: &Parts,
+    incoming: Incoming,
     namespace: &Namespace,
     uuid: UploadSessionId,
-    start_offset: Option<u64>,
-    content_length: Option<u64>,
-    body_stream: S,
-) -> Result<Response<ResponseBody>, Error>
-where
-    S: AsyncRead + Unpin + Send + Sync + 'static,
-{
+) -> Result<Response<ResponseBody>, Error> {
+    let headers = RequestHeaders::new(&parts.headers);
+    let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
+    // A missing Content-Length is a chunked (Transfer-Encoding: chunked) upload,
+    // which docker push sends; the body is then streamed to EOF.
+    let content_length = headers.content_length()?;
+    let body_stream = incoming_into_async_read(incoming);
+
     let response = context
         .registry
         .patch_upload(namespace, &uuid, start_offset, content_length, body_stream)
@@ -103,19 +105,20 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_put_upload<S>(
+pub async fn handle_put_upload(
     context: &ServerContext,
+    parts: &Parts,
+    incoming: Incoming,
     namespace: &Namespace,
     uuid: UploadSessionId,
     digest: &Digest,
-    start_offset: Option<u64>,
-    content_length: Option<u64>,
-    body_reader: S,
     identity: &ClientIdentity,
-) -> Result<Response<ResponseBody>, Error>
-where
-    S: AsyncRead + Unpin + Send + Sync + 'static,
-{
+) -> Result<Response<ResponseBody>, Error> {
+    let headers = RequestHeaders::new(&parts.headers);
+    let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
+    let content_length = headers.content_length()?;
+    let body_reader = incoming_into_async_read(incoming);
+
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
@@ -143,56 +146,4 @@ pub async fn handle_delete_upload(
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(ResponseBody::empty())?)
-}
-
-pub async fn dispatch_patch_upload(
-    context: &ServerContext,
-    parts: &Parts,
-    incoming: Incoming,
-    namespace: &Namespace,
-    uuid: UploadSessionId,
-) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
-    let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
-    // A missing Content-Length is a chunked (Transfer-Encoding: chunked) upload,
-    // which docker push sends; the body is then streamed to EOF.
-    let content_length = headers.content_length()?;
-    let body_stream = incoming_into_async_read(incoming);
-
-    handle_patch_upload(
-        context,
-        namespace,
-        uuid,
-        start_offset,
-        content_length,
-        body_stream,
-    )
-    .await
-}
-
-pub async fn dispatch_put_upload(
-    context: &ServerContext,
-    parts: &Parts,
-    incoming: Incoming,
-    namespace: &Namespace,
-    uuid: UploadSessionId,
-    digest: Digest,
-    identity: &ClientIdentity,
-) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
-    let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
-    let content_length = headers.content_length()?;
-    let body_stream = incoming_into_async_read(incoming);
-
-    handle_put_upload(
-        context,
-        namespace,
-        uuid,
-        &digest,
-        start_offset,
-        content_length,
-        body_stream,
-        identity,
-    )
-    .await
 }

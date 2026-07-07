@@ -5,8 +5,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{
     identity::{Action, ManifestPutTarget},
+    jobs::{JobState, Queue},
     oci::{Digest, Namespace, Reference, Tag, UploadSessionId},
-    registry::job_store::{JobState, Queue},
 };
 
 /// Deserializes a query string, returning `None` when a value fails to

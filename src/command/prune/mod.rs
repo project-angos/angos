@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use argh::FromArgs;
 use tracing::info;
-use uuid::Uuid;
 
 pub use checker::RetentionChecker;
 
@@ -13,12 +12,11 @@ use crate::{
         bootstrap,
         scrub::{
             Error, check,
-            executor::{ActionSink, DryRunSink, Executor},
+            executor::{ActionSink, DryRunSink, Executor, run_job_store},
         },
     },
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
-    registry::job_store::JobStore,
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -50,16 +48,11 @@ pub fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Ret
 /// namespace, deleting the tags the policies no longer retain. Supersedes the
 /// deprecated `scrub --retention`.
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
-    let auth_cache = bootstrap::auth_cache(&config.cache)?;
-    let blob_backend = Arc::new(config.blob_store.build_backend()?);
-    let metadata_store =
-        bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
-    let repositories = bootstrap::repositories(
-        &config.repository,
-        &auth_cache,
-        config.global.max_manifest_size_bytes(),
-    )
-    .await?;
+    let bootstrap::MaintenanceContext {
+        blob_store: blob_backend,
+        metadata_store,
+        repositories,
+    } = bootstrap::maintenance_context(config).await?;
 
     let checker = RetentionChecker::new(
         metadata_store.clone(),
@@ -71,10 +64,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         info!("Dry-run mode: no changes will be made to the storage");
         Box::new(DryRunSink)
     } else {
-        let job_store = Arc::new(JobStore::new(
-            metadata_store.store_arc(),
-            format!("prune-{}", Uuid::new_v4()),
-        ));
+        let job_store = run_job_store(&metadata_store, "prune");
         let retention = bootstrap::registry(
             config,
             blob_backend.clone(),

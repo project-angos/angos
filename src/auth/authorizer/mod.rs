@@ -80,19 +80,10 @@ impl fmt::Debug for AuditIdentity<'_> {
 
 impl<'a> From<&'a ClientIdentity> for AuditIdentity<'a> {
     fn from(identity: &'a ClientIdentity) -> Self {
-        let has_basic = identity.id.is_some() || identity.username.is_some();
-        let has_certificate = !identity.certificate.organizations.is_empty()
-            || !identity.certificate.common_names.is_empty();
-        let has_oidc = identity.oidc.is_some();
-
         Self {
-            auth_type: match (has_basic, has_certificate, has_oidc) {
-                (false, false, false) => "anonymous",
-                (true, false, false) => "basic",
-                (false, true, false) => "mtls",
-                (false, false, true) => "oidc",
-                _ => "multiple",
-            },
+            // The single classification the authenticator computed, so the
+            // audit log and the request span never disagree.
+            auth_type: identity.auth_method.unwrap_or("anonymous"),
             id: identity.id.as_deref(),
             username: identity.username.as_deref(),
             client_ip: identity.client_ip.as_deref(),

@@ -25,11 +25,12 @@ use crate::{
         dispatcher::EventDispatcher,
         event::{EventActor, EventKind},
     },
+    jobs::Queue,
+    jobs::store::JobStore,
     oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
         BlobMount, Registry, RegistryConfig, Repository, StartUploadResponse,
         blob_ownership::BlobOwnership,
-        job_store::{JobStore, Queue},
         metadata_store::LinkKind,
         repository_resolver::RepositoryResolver,
         test_utils::{

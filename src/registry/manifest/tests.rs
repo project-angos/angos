@@ -3183,10 +3183,10 @@ mod noop_suppression_tests {
     use angos_tx_engine::transaction::Transaction;
 
     use crate::{
+        jobs::{Queue, store::JobStore},
         oci::{Digest, MediaType, Namespace, Reference, Tag},
         registry::{
             Registry, RegistryConfig,
-            job_store::{JobStore, Queue},
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{
                 FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,
@@ -3798,10 +3798,10 @@ mod dispatch_replication_tests {
     use regex::Regex;
 
     use crate::{
+        jobs::{Queue, store::JobStore},
         oci::{Digest, Namespace, Tag},
         registry::{
             Registry, RegistryConfig, Repository,
-            job_store::{JobStore, Queue},
             test_utils::{
                 FsTestStack, downstream_client, fs_test_stack, repository_with_replication,
                 single_repo_resolver, sole_pending_payload,

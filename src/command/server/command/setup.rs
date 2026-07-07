@@ -10,11 +10,8 @@ use crate::{
     command::{bootstrap, server::error::Error},
     configuration::{Configuration, RegistryStorageConfig},
     event_webhook::dispatcher::EventDispatcher,
-    registry::{
-        Registry, RegistryConfig,
-        job_store::{self, JobStore},
-        metadata_store::MetadataStore,
-    },
+    jobs::store::{self as job_store, JobStore},
+    registry::{Registry, RegistryConfig, metadata_store::MetadataStore},
 };
 
 /// Handle on the durable job-store and the interval the server should refresh

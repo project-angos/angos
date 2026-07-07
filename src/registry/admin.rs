@@ -1,3 +1,6 @@
+//! The `/_ext` admin surface: repository/namespace info for the web UI and
+//! the jobs list/retry/delete responses, assembled as [`JsonResponse`] values.
+
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -6,15 +9,15 @@ use tracing::instrument;
 
 use crate::{
     configuration::RegexPattern,
+    jobs::store as job_store,
+    jobs::{JobState, Queue},
     oci::{
         DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType,
         Namespace, Platform as OciPlatform, Tag, namespace_belongs_to,
     },
     registry::{
-        APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders, job_store,
-        job_store::{JobState, Queue},
-        metadata_store::LinkKind,
-        pagination::collect_all_pages,
+        APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders,
+        metadata_store::LinkKind, pagination::collect_all_pages,
     },
 };
 

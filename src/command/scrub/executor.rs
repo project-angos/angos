@@ -3,16 +3,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use crate::{
     command::scrub::{action::Action, error::Error},
     event_webhook::event::EventActor,
+    jobs::store::{Error as JobStoreError, JobEnvelope, JobStore},
+    jobs::{JobState, Queue},
     metrics_provider::metrics_provider,
     oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
         Registry,
         blob_store::{self, BlobStore, MultipartCleanup},
-        job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore, Queue},
         metadata_store::{
             BlobIndexOperation, Error as MetadataError, LinkKind, LinkOperation, MetadataStore,
         },
@@ -30,6 +32,16 @@ use crate::registry::{
 
 /// Internal-process name stamped on the events retention deletions emit.
 pub const RETENTION_ACTOR: &str = "prune";
+
+/// A fresh uniquely-named job store for one maintenance run: the executor's
+/// replication-enqueue target and, when a drain is wired, its consumer.
+#[must_use]
+pub fn run_job_store(metadata_store: &MetadataStore, prefix: &str) -> Arc<JobStore> {
+    Arc::new(JobStore::new(
+        metadata_store.store_arc(),
+        format!("{prefix}-{}", Uuid::new_v4()),
+    ))
+}
 
 /// A sink that receives `Action` values produced by scrub checkers.
 #[async_trait]
@@ -610,10 +622,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        jobs::store::FailOutcome,
         oci::Digest,
         registry::{
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
-            job_store::{FailOutcome, JobState, Queue},
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{build_store, for_each_backend, put_blob_direct},
         },

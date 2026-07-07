@@ -1,8 +1,9 @@
 use tokio::select;
 use tracing::{error, info, warn};
 
-use crate::registry::job_store::{
-    ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore, Queue,
+use crate::{
+    jobs::Queue,
+    jobs::store::{ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore},
 };
 
 /// Execute one claimed job: observe the lock session's cancellation
@@ -88,11 +89,12 @@ mod tests {
     };
 
     use crate::{
-        metrics_provider,
-        registry::{
-            job_runner::{execute_one, run_once},
-            job_store::{ClaimedJob, Error, JobEnvelope, JobHandler, JobStore, Queue},
+        jobs::Queue,
+        jobs::{
+            runner::{execute_one, run_once},
+            store::{ClaimedJob, Error, JobEnvelope, JobHandler, JobStore},
         },
+        metrics_provider,
     };
 
     struct OkHandler;

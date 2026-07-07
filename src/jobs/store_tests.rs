@@ -7,13 +7,13 @@ use tempfile::TempDir;
 use angos_storage::{MemoryObjectStore, ObjectStore, fs::Backend as StorageFsBackend};
 use angos_tx_engine::transaction::{Mutation, Transaction};
 
-use crate::registry::job_store::{
+use crate::jobs::store::{
     CompleteOutcome, FailOutcome, JobEnvelope, JobQueueConfig, JobState, JobStore,
     MAX_REPORTED_PENDING, Queue, STORAGE_KEY_PREFIX_LEN, make_storage_key, parse_lock_key_index,
     parse_not_before, serialize_dead_letter, serialize_lock_key_index,
 };
+use crate::metrics_provider;
 use crate::registry::test_utils::build_store;
-use crate::{metrics_provider, registry::path_builder};
 
 struct Harness {
     store: Arc<JobStore>,
@@ -145,7 +145,7 @@ async fn run_dead_letter_after_max_attempts(h: Harness) {
     ));
     assert!(matches!(
         h.store.read_pending(Queue::Cache, &storage_key).await,
-        Err(crate::registry::job_store::Error::NotFound)
+        Err(crate::jobs::store::Error::NotFound)
     ));
 }
 
@@ -188,7 +188,7 @@ async fn run_count_pending_saturates_at_cap(h: Harness) {
         let key = make_storage_key(now, &format!("stub-{i}"));
         h.raw
             .put(
-                &path_builder::job_pending_path("cache", &key),
+                &crate::jobs::store::job_pending_path("cache", &key),
                 Bytes::from_static(b"{}"),
             )
             .await
@@ -208,7 +208,7 @@ async fn run_count_pending_excludes_envelopes_past_readiness_horizon(h: Harness)
         let key = make_storage_key(now, &format!("ready-{i}"));
         h.raw
             .put(
-                &path_builder::job_pending_path("cache", &key),
+                &crate::jobs::store::job_pending_path("cache", &key),
                 Bytes::from_static(b"{}"),
             )
             .await
@@ -219,7 +219,7 @@ async fn run_count_pending_excludes_envelopes_past_readiness_horizon(h: Harness)
         let key = make_storage_key(far_future, &format!("future-{i}"));
         h.raw
             .put(
-                &path_builder::job_pending_path("cache", &key),
+                &crate::jobs::store::job_pending_path("cache", &key),
                 Bytes::from_static(b"{}"),
             )
             .await
@@ -269,7 +269,7 @@ async fn run_orphan_index_is_self_healed_on_next_lookup(h: Harness) {
 
     let storage_key = make_storage_key(Utc::now(), "phantom-id");
     let index_data = serialize_lock_key_index(&storage_key).expect("serialize");
-    let index_path = path_builder::job_lock_key_index_path("cache", lock_key);
+    let index_path = crate::jobs::store::job_lock_key_index_path("cache", lock_key);
     h.raw
         .put(&index_path, Bytes::from(index_data))
         .await
@@ -314,7 +314,7 @@ async fn run_retry_updates_lock_key_index_to_new_storage_key(h: Harness) {
     let new_storage_key = &pending[0];
     assert_ne!(new_storage_key, &old_storage_key);
 
-    let index_path = path_builder::job_lock_key_index_path("cache", lock_key);
+    let index_path = crate::jobs::store::job_lock_key_index_path("cache", lock_key);
     let data = h.raw.get(&index_path).await.expect("read index");
     let index = parse_lock_key_index(&data).expect("parse");
     assert_eq!(&index.storage_key, new_storage_key);
@@ -646,7 +646,7 @@ async fn run_retry_failed_resets_attempts(h: Harness) {
     let body = serialize_dead_letter(&env, "boom").expect("serialize");
     h.raw
         .put(
-            &path_builder::job_failed_path("cache", &key),
+            &crate::jobs::store::job_failed_path("cache", &key),
             Bytes::from(body),
         )
         .await
@@ -668,7 +668,7 @@ async fn run_retry_failed_resets_attempts(h: Harness) {
     assert!(
         matches!(
             h.store.read_failed(Queue::Cache, &key).await,
-            Err(crate::registry::job_store::Error::NotFound)
+            Err(crate::jobs::store::Error::NotFound)
         ),
         "failed record is consumed by retry",
     );
@@ -690,7 +690,7 @@ async fn run_retry_failed_resets_attempts(h: Harness) {
     assert!(
         matches!(
             h.store.retry_failed(Queue::Cache, &key).await,
-            Err(crate::registry::job_store::Error::NotFound)
+            Err(crate::jobs::store::Error::NotFound)
         ),
         "retrying a consumed key is a stale 404",
     );
@@ -702,7 +702,7 @@ async fn run_delete_failed_record(h: Harness) {
     let body = serialize_dead_letter(&env, "boom").expect("serialize");
     h.raw
         .put(
-            &path_builder::job_failed_path("cache", &key),
+            &crate::jobs::store::job_failed_path("cache", &key),
             Bytes::from(body),
         )
         .await
@@ -714,14 +714,14 @@ async fn run_delete_failed_record(h: Harness) {
         .expect("delete");
     assert!(matches!(
         h.store.read_failed(Queue::Cache, &key).await,
-        Err(crate::registry::job_store::Error::NotFound)
+        Err(crate::jobs::store::Error::NotFound)
     ));
     assert!(
         matches!(
             h.store
                 .delete_job(Queue::Cache, JobState::Failed, &key)
                 .await,
-            Err(crate::registry::job_store::Error::NotFound)
+            Err(crate::jobs::store::Error::NotFound)
         ),
         "deleting a consumed key is a stale 404",
     );
@@ -773,7 +773,7 @@ async fn run_delete_pending_removes_record_and_index(h: Harness) {
             h.store
                 .delete_job(Queue::Cache, JobState::Pending, &key)
                 .await,
-            Err(crate::registry::job_store::Error::NotFound)
+            Err(crate::jobs::store::Error::NotFound)
         ),
         "deleting a consumed key is a stale 404",
     );
@@ -877,4 +877,22 @@ fn pending_refresh_interval_below_floor_is_rejected() {
     let cfg = toml::from_str::<JobQueueConfig>(toml_with_five)
         .expect("the floor value itself must parse");
     assert_eq!(cfg.pending_refresh_interval_secs, 5);
+}
+
+#[test]
+fn test_job_paths() {
+    use crate::jobs::store::{job_failed_path, job_lock_key_index_path, job_pending_path};
+
+    assert_eq!(
+        job_pending_path("cache", "01HABCDE"),
+        "_jobs/pending/cache/01HABCDE.json"
+    );
+    assert_eq!(
+        job_failed_path("cache", "01HABCDE"),
+        "_jobs/failed/cache/01HABCDE.json"
+    );
+    assert_eq!(
+        job_lock_key_index_path("cache", "cache.ns:sha256:abc"),
+        "_jobs/index/cache/cache.ns%3Asha256%3Aabc.json"
+    );
 }

@@ -1,9 +1,10 @@
 //! Link reference storage primitives: read/write a single link's
-//! [`LinkMetadata`], plus the cache-aware `read_link`.
+//! [`LinkMetadata`], the cache-aware `read_link`, and the link-metadata
+//! cache helpers behind it (gated on `link_cache_ttl`).
 
 #[cfg(test)]
 use bytes::Bytes;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use angos_tx_engine::StorageError;
 
@@ -62,5 +63,39 @@ impl MetadataStore {
             .put(&link_path, serialized)
             .await
             .map_err(Error::from)
+    }
+
+    fn cache_key(namespace: &Namespace, link: &LinkKind) -> String {
+        format!("link:{namespace}:{link}")
+    }
+
+    pub async fn cache_get(&self, namespace: &Namespace, link: &LinkKind) -> Option<LinkMetadata> {
+        if self.link_cache_ttl == 0 {
+            return None;
+        }
+        let cache = self.cache.as_ref()?;
+        cache
+            .retrieve::<LinkMetadata>(&Self::cache_key(namespace, link))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn cache_put(&self, namespace: &Namespace, link: &LinkKind, metadata: &LinkMetadata) {
+        if self.link_cache_ttl == 0 {
+            return;
+        }
+        if let Some(cache) = &self.cache {
+            let key = Self::cache_key(namespace, link);
+            if let Err(err) = cache.store(&key, metadata, self.link_cache_ttl).await {
+                warn!("Failed to store link metadata in cache for {namespace}/{link}: {err}");
+            }
+        }
+    }
+
+    pub async fn cache_invalidate(&self, namespace: &Namespace, link: &LinkKind) {
+        if let Some(cache) = &self.cache {
+            let _ = cache.delete_value(&Self::cache_key(namespace, link)).await;
+        }
     }
 }

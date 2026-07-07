@@ -12,12 +12,14 @@ use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 use angos_tx_engine::store::Store;
 
 use crate::{
-    cache, metrics_provider,
+    cache,
+    jobs::Queue,
+    jobs::store::{JobEnvelope, JobHandler},
+    metrics_provider,
     oci::{Digest, Namespace, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, Repository,
         blob_store::BlobStore,
-        job_store::{JobEnvelope, JobHandler, Queue},
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         test_utils::{
             FsTestStack, build_store, downstream_client, fs_test_stack, put_blob_direct,

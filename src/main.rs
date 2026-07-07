@@ -26,6 +26,7 @@ mod configuration;
 mod event_webhook;
 pub mod http_client;
 mod identity;
+mod jobs;
 mod metrics_provider;
 mod oci;
 mod policy;

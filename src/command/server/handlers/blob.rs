@@ -8,19 +8,20 @@ use crate::{
     event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{Digest, Namespace},
-    registry::{BlobRange, GetBlobResponse},
+    registry::GetBlobResponse,
 };
 
 pub async fn handle_head_blob(
     context: &ServerContext,
+    parts: &Parts,
     namespace: &Namespace,
     digest: &Digest,
-    mime_types: &[String],
 ) -> Result<Response<ResponseBody>, Error> {
+    let mime_types = RequestHeaders::new(&parts.headers).accepted_content_types();
     let repository = context.registry.get_repository_for_namespace(namespace)?;
     let response = context
         .registry
-        .head_blob(repository, mime_types, namespace, digest)
+        .head_blob(repository, &mime_types, namespace, digest)
         .await?;
 
     build_response(StatusCode::OK, response.headers, ResponseBody::empty())
@@ -40,16 +41,19 @@ pub async fn handle_delete_blob(
 
 pub async fn handle_get_blob(
     context: &ServerContext,
+    parts: &Parts,
     namespace: &Namespace,
     digest: &Digest,
-    mime_types: &[String],
-    range: Option<BlobRange>,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
+    let headers = RequestHeaders::new(&parts.headers);
+    let mime_types = headers.accepted_content_types();
+    let range = headers.blob_range()?;
+
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .resolve_get_blob(actor, namespace, digest, mime_types, range)
+        .resolve_get_blob(actor, namespace, digest, &mime_types, range)
         .await?;
 
     match response {
@@ -69,32 +73,6 @@ pub async fn handle_get_blob(
     }
 }
 
-pub async fn dispatch_get_blob(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    digest: Digest,
-    identity: &ClientIdentity,
-) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
-    let mime_types = headers.accepted_content_types();
-    let range = headers.blob_range()?;
-
-    handle_get_blob(context, namespace, &digest, &mime_types, range, identity).await
-}
-
-pub async fn dispatch_head_blob(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    digest: Digest,
-) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
-    let mime_types = headers.accepted_content_types();
-
-    handle_head_blob(context, namespace, &digest, &mime_types).await
-}
-
 #[cfg(test)]
 mod tests {
     use hyper::{Request, StatusCode};
@@ -105,7 +83,7 @@ mod tests {
         oci::Namespace, registry::test_utils::upload_blob,
     };
 
-    use super::dispatch_get_blob;
+    use super::handle_get_blob;
 
     /// A blob GET emits one `blob.pull` event carrying the blob digest.
     #[tokio::test]
@@ -122,7 +100,7 @@ mod tests {
         let digest = upload_blob(&context.registry, &namespace, b"pull event blob").await;
 
         let (parts, ()) = Request::builder().body(()).unwrap().into_parts();
-        let response = dispatch_get_blob(&context, &parts, &namespace, digest.clone(), &identity)
+        let response = handle_get_blob(&context, &parts, &namespace, &digest, &identity)
             .await
             .expect("the pull must succeed");
         assert_eq!(response.status(), StatusCode::OK);

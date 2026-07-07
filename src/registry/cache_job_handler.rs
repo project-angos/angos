@@ -8,13 +8,9 @@ use angos_tx_engine::transaction::Transaction;
 
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
+    jobs::store::{Error, JobEnvelope, JobHandler},
     oci::{Digest, Namespace},
-    registry::{
-        Error as RegistryError, Registry,
-        blob::cache_blob,
-        blob_ownership::BlobOwnership,
-        job_store::{Error, JobEnvelope, JobHandler},
-    },
+    registry::{Error as RegistryError, Registry, blob::cache_blob, blob_ownership::BlobOwnership},
 };
 
 pub const CACHE_FETCH_BLOB_KIND: &str = "cache.fetch_blob";
@@ -153,11 +149,14 @@ mod tests {
             dispatcher::EventDispatcher,
             event::EventKind,
         },
+        jobs::{
+            Queue,
+            store::{JobEnvelope, JobStore},
+        },
         oci::Namespace,
         registry::{
             Registry, RegistryConfig,
             blob_ownership::BlobOwnership,
-            job_store::{JobEnvelope, JobStore, Queue},
             repository_resolver::RepositoryResolver,
             test_utils::{FsTestStack, create_test_repositories, fs_test_stack, put_blob_direct},
         },

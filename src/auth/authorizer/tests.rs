@@ -429,13 +429,14 @@ fn log_denial_uses_audit_identity_without_oidc_claims() {
             ]),
         }),
         client_ip: Some("192.0.2.10".to_string()),
+        auth_method: Some("mtls"),
     };
 
     tracing::subscriber::with_default(subscriber, || log_denial("test reason", &identity));
 
     let logs = log_capture.contents();
     assert!(logs.contains("test reason"), "logs were: {logs}");
-    assert!(logs.contains("multiple"), "logs were: {logs}");
+    assert!(logs.contains("mtls"), "logs were: {logs}");
     assert!(logs.contains("client-123"), "logs were: {logs}");
     assert!(logs.contains("ci-bot"), "logs were: {logs}");
     assert!(logs.contains("192.0.2.10"), "logs were: {logs}");

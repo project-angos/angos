@@ -1,11 +1,9 @@
 use std::fmt;
 
 use crate::{
+    jobs::{JobState, Queue},
     oci::{Digest, MediaType, Namespace, Tag},
-    registry::{
-        job_store::{JobState, Queue},
-        metadata_store::LinkKind,
-    },
+    registry::metadata_store::LinkKind,
 };
 
 /// A single mutation that a scrub checker has decided to perform.

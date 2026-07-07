@@ -17,6 +17,7 @@ use tracing::{error, instrument, warn};
 
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
+    jobs::Queue,
     metrics_provider::metrics_provider,
     oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
     registry::{
@@ -24,8 +25,9 @@ use crate::{
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
         cache_job_handler::CACHE_ACTOR,
-        job_store::Queue,
-        metadata_store::{Error as MetadataStoreError, LinkKind, LinkMetadata, LinkOperation},
+        metadata_store::{
+            Error as MetadataStoreError, LinkKind, LinkMetadata, LinkOperation, LinksCommit,
+        },
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
@@ -423,7 +425,7 @@ impl Registry {
         // blob-data lock across both so a concurrent delete cannot reclaim the
         // blob between the write and the link. A crash or LWW-supersession in
         // between leaves at most an orphan blob, which scrub reclaims.
-        let commit = self
+        let commit: LinksCommit = self
             .metadata_store
             .with_blob_data_lock(&computed_digest, async {
                 self.blob_store

@@ -17,12 +17,11 @@ use angos_tx_engine::store::Store;
 use crate::{
     command::bootstrap::{self, Error},
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
+    jobs::Queue,
+    jobs::runner::execute_one,
+    jobs::store::{self as job_store, JobHandler, JobStore},
     registry::{
-        Registry,
-        blob_store::BlobStore,
-        job_runner::execute_one,
-        job_store::{self, JobHandler, JobStore, Queue},
-        metadata_store::MetadataStore,
+        Registry, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationJobHandler,
@@ -87,7 +86,9 @@ fn resolve_queues(requested: &[String]) -> Result<Vec<Queue>, Error> {
     let mut seen = HashSet::new();
     let mut queues = Vec::new();
     for name in requested {
-        let queue: Queue = name.parse().map_err(Error::JobQueue)?;
+        let queue: Queue = name
+            .parse()
+            .map_err(|e| Error::JobQueue(job_store::Error::Initialization(e)))?;
         if seen.insert(queue) {
             queues.push(queue);
         }
@@ -233,16 +234,11 @@ impl WorkerContext {
         config: &Configuration,
         engine_maintenance: Option<CancellationToken>,
     ) -> Result<Self, Error> {
-        let auth_cache = bootstrap::auth_cache(&config.cache)?;
-        let blob_store = Arc::new(config.blob_store.build_backend()?);
-        let metadata_store =
-            bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
-        let repositories = bootstrap::repositories(
-            &config.repository,
-            &auth_cache,
-            config.global.max_manifest_size_bytes(),
-        )
-        .await?;
+        let bootstrap::MaintenanceContext {
+            blob_store,
+            metadata_store,
+            repositories,
+        } = bootstrap::maintenance_context(config).await?;
 
         if config.global.job_queue.is_none() {
             return Err(bootstrap::Error::JobQueue(
@@ -313,15 +309,15 @@ mod tests {
 
     use super::{WorkerContext, resolve_queues};
     use crate::{
+        jobs::{
+            Queue,
+            store::{JobEnvelope, JobStore},
+        },
         metrics_provider,
         registry::{
-            Registry, RegistryConfig,
-            blob_store::BlobStore,
-            cache_job_handler::CACHE_FETCH_BLOB_KIND,
-            job_store::{JobEnvelope, JobStore, Queue},
-            metadata_store::MetadataStore,
-            repository_resolver::RepositoryResolver,
-            test_utils::build_store,
+            Registry, RegistryConfig, blob_store::BlobStore,
+            cache_job_handler::CACHE_FETCH_BLOB_KIND, metadata_store::MetadataStore,
+            repository_resolver::RepositoryResolver, test_utils::build_store,
         },
         replication::REPLICATION_PUSH_MANIFEST_KIND,
     };

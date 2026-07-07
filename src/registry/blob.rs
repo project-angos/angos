@@ -6,6 +6,8 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
+    jobs::Queue,
+    jobs::store::JobEnvelope,
     metrics_provider::metrics_provider,
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
@@ -13,7 +15,6 @@ use crate::{
         blob_ownership::BlobOwnership,
         blob_store::{BlobStore, BoxedReader},
         cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
-        job_store::{JobEnvelope, Queue},
         metadata_store::{LinkKind, MetadataStore},
     },
 };

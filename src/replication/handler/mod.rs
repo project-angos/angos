@@ -13,11 +13,12 @@ use tracing::debug;
 use angos_tx_engine::transaction::Transaction;
 
 use crate::{
+    jobs::Queue,
+    jobs::store::{Error, JobEnvelope, JobHandler},
     metrics_provider::metrics_provider,
     oci::{Digest, Namespace, Reference, Tag},
     registry::{
         blob_store::BlobStore,
-        job_store::{Error, JobEnvelope, JobHandler, Queue},
         metadata_store::{Error as MetadataStoreError, LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },

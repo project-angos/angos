@@ -3,8 +3,10 @@ use hyper::StatusCode;
 use crate::{
     auth,
     command::{bootstrap, server::error::Error},
-    configuration, event_webhook, metrics_provider, registry,
-    registry::{blob_store, job_store},
+    configuration, event_webhook,
+    jobs::store as job_store,
+    metrics_provider, registry,
+    registry::blob_store,
     registry_client::REPLICATION_SUPERSEDED_CODE,
 };
 

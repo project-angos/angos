@@ -9,6 +9,8 @@ use uuid::Uuid;
 use crate::{
     cache,
     configuration::GlobalConfig,
+    jobs::Queue,
+    jobs::store::JobStore,
     metrics_provider,
     oci::{Digest, MediaType, Namespace, Tag, UploadSessionId},
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
@@ -18,7 +20,6 @@ use crate::{
         blob_ownership::BlobOwnership,
         blob_store,
         blob_store::{BlobStore, BlobStoreConfig},
-        job_store::{JobStore, Queue},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         path_builder,

@@ -14,10 +14,10 @@ use crate::{
     cache::{self, Cache},
     configuration::{Configuration, RegistryStorageConfig, registry_storage::S3BackendConfig},
     event_webhook::{self, dispatcher::EventDispatcher},
+    jobs::store::{self as job_store, JobStore},
     registry::{
         self, Registry, RegistryConfig, Repository,
         blob_store::{self, BlobStore},
-        job_store::{self, JobStore},
         metadata_store::{self, MetadataStore},
         repository,
         repository_resolver::{OverlapError, RepositoryResolver},
@@ -216,6 +216,33 @@ pub async fn metadata_store(
     builder = builder.cache(auth_cache.clone());
 
     Ok(Arc::new(builder.build()))
+}
+
+/// The storage and repository handles every maintenance command (`prune`,
+/// `replicate`, `scrub`, `worker`) boots with.
+pub struct MaintenanceContext {
+    pub blob_store: Arc<BlobStore>,
+    pub metadata_store: Arc<MetadataStore>,
+    pub repositories: Arc<RepositoryResolver>,
+}
+
+/// Build the shared maintenance-command context: auth cache, blob backend,
+/// metadata store, and the resolved repositories, in the one canonical order.
+pub async fn maintenance_context(config: &Configuration) -> Result<MaintenanceContext, Error> {
+    let auth_cache = auth_cache(&config.cache)?;
+    let blob_store = Arc::new(config.blob_store.build_backend()?);
+    let metadata_store = metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
+    let repositories = repositories(
+        &config.repository,
+        &auth_cache,
+        config.global.max_manifest_size_bytes(),
+    )
+    .await?;
+    Ok(MaintenanceContext {
+        blob_store,
+        metadata_store,
+        repositories,
+    })
 }
 
 pub fn auth_cache(config: &cache::Config) -> Result<Arc<Cache>, Error> {

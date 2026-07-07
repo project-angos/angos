@@ -10,6 +10,7 @@ use tokio::{select, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
+mod admin;
 pub mod blob;
 pub mod blob_ownership;
 pub mod blob_store;
@@ -18,10 +19,7 @@ pub mod content_discovery;
 mod error;
 #[cfg(test)]
 mod event_emission_tests;
-mod ext;
 mod headers;
-pub mod job_runner;
-pub mod job_store;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;
@@ -42,13 +40,14 @@ use crate::{
         global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
     },
     event_webhook::{dispatcher::EventDispatcher, event::Event},
+    jobs::Queue,
+    jobs::{
+        runner::execute_one,
+        store::{JobHandler, JobStore},
+    },
     oci::Namespace,
     registry::{
-        blob_store::BlobStore,
-        cache_job_handler::CacheJobHandler,
-        job_runner::execute_one,
-        job_store::{JobHandler, JobStore, Queue},
-        metadata_store::MetadataStore,
+        blob_store::BlobStore, cache_job_handler::CacheJobHandler, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationJobHandler,
@@ -407,11 +406,14 @@ mod in_process_replication_tests {
     };
 
     use crate::{
+        jobs::{
+            Queue,
+            store::{JobEnvelope, JobStore},
+        },
         oci::{Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
-            job_store::{JobEnvelope, JobStore, Queue},
             metadata_store::MetadataStore,
             test_utils::{
                 FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,

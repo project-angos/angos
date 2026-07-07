@@ -1,6 +1,6 @@
-use std::{fs, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
-use hyper::{HeaderMap, Method, http::request::Builder};
+use hyper::{Method, http::request::Builder};
 use reqwest::Client;
 use url::Url;
 use wiremock::{
@@ -13,20 +13,12 @@ use crate::{
     auth::webhook::{
         Config, WebhookAuthorizer,
         config::WebhookAuth,
-        headers::{
-            build_header_name, build_header_value, build_headers, set_forwarded_for_header,
-            set_forwarded_headers, set_forwarded_host_header, set_forwarded_method_header,
-            set_forwarded_proto_header, set_forwarded_uri_header, set_registry_action_header,
-            set_registry_certificate_cn_header, set_registry_certificate_o_header,
-            set_registry_digest_header, set_registry_identity_id_header,
-            set_registry_namespace_header, set_registry_reference_header,
-            set_registry_username_header,
-        },
+        headers::{build_header_name, build_header_value, build_headers},
     },
     cache::{self, Cache},
     http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
-    oci::{Digest, Namespace, Reference, Tag},
+    oci::{Namespace, Reference, Tag},
     secret::Secret,
     test_fixtures::{
         requests::parts_with_uri,
@@ -140,246 +132,6 @@ fn test_build_header_value() {
 }
 
 #[test]
-fn test_set_forwarded_method_header() {
-    let request = Builder::new()
-        .method(Method::POST)
-        .uri("https://example.com/path")
-        .body(())
-        .unwrap();
-
-    let (parts, ()) = request.into_parts();
-    let mut headers = HeaderMap::new();
-
-    assert!(set_forwarded_method_header(&parts, &mut headers).is_ok());
-    assert_eq!(headers.get("X-Forwarded-Method").unwrap(), "POST");
-}
-
-#[test]
-fn test_set_forwarded_proto_header() {
-    let parts = parts_with_uri("https://example.com/path");
-    let mut headers = HeaderMap::new();
-
-    assert!(set_forwarded_proto_header(&parts, &mut headers).is_ok());
-    assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "https");
-
-    let parts = parts_with_uri("http://example.com/path");
-    let mut headers = HeaderMap::new();
-
-    assert!(set_forwarded_proto_header(&parts, &mut headers).is_ok());
-    assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "http");
-}
-
-#[test]
-fn test_set_forwarded_host_header() {
-    let request = Builder::new()
-        .uri("https://example.com/path")
-        .header("Host", "example.com")
-        .body(())
-        .unwrap();
-
-    let (parts, ()) = request.into_parts();
-    let mut headers = HeaderMap::new();
-
-    set_forwarded_host_header(&parts, &mut headers);
-    assert_eq!(headers.get("X-Forwarded-Host").unwrap(), "example.com");
-}
-
-#[test]
-fn test_set_forwarded_uri_header() {
-    let parts = parts_with_uri("https://example.com/v2/test/manifests/latest");
-    let mut headers = HeaderMap::new();
-
-    assert!(set_forwarded_uri_header(&parts, &mut headers).is_ok());
-    assert_eq!(
-        headers.get("X-Forwarded-Uri").unwrap(),
-        "https://example.com/v2/test/manifests/latest"
-    );
-}
-
-#[test]
-fn test_set_forwarded_for_header() {
-    let mut identity = ClientIdentity::new(None);
-    identity.client_ip = Some("192.168.1.1".to_string());
-
-    let mut headers = HeaderMap::new();
-
-    assert!(set_forwarded_for_header(&identity, &mut headers).is_ok());
-    assert_eq!(headers.get("X-Forwarded-For").unwrap(), "192.168.1.1");
-
-    let identity_no_ip = ClientIdentity::new(None);
-    let mut headers = HeaderMap::new();
-
-    assert!(set_forwarded_for_header(&identity_no_ip, &mut headers).is_ok());
-    assert!(headers.get("X-Forwarded-For").is_none());
-}
-
-#[test]
-fn test_set_registry_action_header() {
-    let action = Action::ApiVersion;
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_action_header(&action, &mut headers).is_ok());
-    assert_eq!(headers.get("X-Registry-Action").unwrap(), "get-api-version");
-}
-
-#[test]
-fn test_set_registry_namespace_header() {
-    let action = Action::GetManifest {
-        namespace: Namespace::new("test-namespace").unwrap(),
-        reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_namespace_header(&action, &mut headers).is_ok());
-    assert_eq!(
-        headers.get("X-Registry-Namespace").unwrap(),
-        "test-namespace"
-    );
-
-    let action = Action::ApiVersion;
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_namespace_header(&action, &mut headers).is_ok());
-    assert!(headers.get("X-Registry-Namespace").is_none());
-}
-
-#[test]
-fn test_set_registry_reference_header() {
-    let action = Action::GetManifest {
-        namespace: Namespace::new("test-namespace").unwrap(),
-        reference: Reference::Tag(Tag::new("v1.0.0").unwrap()),
-    };
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_reference_header(&action, &mut headers).is_ok());
-    assert_eq!(headers.get("X-Registry-Reference").unwrap(), "v1.0.0");
-
-    let action = Action::ApiVersion;
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_reference_header(&action, &mut headers).is_ok());
-    assert!(headers.get("X-Registry-Reference").is_none());
-}
-
-#[test]
-fn test_set_registry_digest_header() {
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-    let digest = Digest::from_str(digest).unwrap();
-    let action = Action::DeleteBlob {
-        namespace: Namespace::new("test-namespace").unwrap(),
-        digest: digest.clone(),
-    };
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_digest_header(&action, &mut headers).is_ok());
-    assert_eq!(
-        headers.get("X-Registry-Digest").unwrap(),
-        &digest.to_string()
-    );
-
-    let action = Action::ApiVersion;
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_digest_header(&action, &mut headers).is_ok());
-    assert!(headers.get("X-Registry-Digest").is_none());
-}
-
-#[test]
-fn test_set_registry_username_header() {
-    let mut identity = ClientIdentity::new(None);
-    identity.username = Some("testuser".to_string());
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_username_header(&identity, &mut headers).is_ok());
-
-    assert_eq!(headers.get("X-Registry-Username").unwrap(), "testuser");
-
-    let identity = ClientIdentity::new(None);
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_username_header(&identity, &mut headers).is_ok());
-    assert!(headers.get("X-Registry-Username").is_none());
-}
-
-#[test]
-fn test_set_registry_identity_id_header() {
-    let user_id = "user-id-123".to_string();
-    let mut identity = ClientIdentity::new(None);
-    identity.id = Some(user_id.clone());
-
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_identity_id_header(&identity, &mut headers).is_ok());
-    assert_eq!(headers.get("X-Registry-Identity-ID").unwrap(), &user_id);
-}
-
-#[test]
-fn test_set_registry_certificate_cn_header() {
-    let mut identity = ClientIdentity::new(None);
-    identity.certificate.common_names = vec!["cn1".to_string(), "cn2".to_string()];
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_certificate_cn_header(&identity, &mut headers).is_ok());
-
-    let values: Vec<_> = headers
-        .get_all("X-Registry-Certificate-CN")
-        .iter()
-        .collect();
-    assert_eq!(values.len(), 2);
-    assert_eq!(values[0], "cn1");
-    assert_eq!(values[1], "cn2");
-
-    let identity = ClientIdentity::new(None);
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_certificate_cn_header(&identity, &mut headers).is_ok());
-    assert!(headers.get("X-Registry-Certificate-CN").is_none());
-}
-
-#[test]
-fn test_set_registry_certificate_o_header() {
-    let mut identity = ClientIdentity::new(None);
-    identity.certificate.organizations = vec!["org1".to_string(), "org2".to_string()];
-
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_certificate_o_header(&identity, &mut headers).is_ok());
-
-    let values: Vec<_> = headers.get_all("X-Registry-Certificate-O").iter().collect();
-    assert_eq!(values.len(), 2);
-    assert_eq!(values[0], "org1");
-    assert_eq!(values[1], "org2");
-
-    let identity = ClientIdentity::new(None);
-    let mut headers = HeaderMap::new();
-
-    assert!(set_registry_certificate_o_header(&identity, &mut headers).is_ok());
-    assert!(headers.get("X-Registry-Certificate-O").is_none());
-}
-
-#[test]
-fn test_set_forwarded_headers() {
-    let request = Builder::new()
-        .uri("https://example.com/path")
-        .header("X-Custom-Header", "custom-value")
-        .header("X-Another-Header", "another-value")
-        .body(())
-        .unwrap();
-
-    let (parts, ()) = request.into_parts();
-    let mut headers = HeaderMap::new();
-
-    let forward_headers = vec![
-        "X-Custom-Header".to_string(),
-        "X-Another-Header".to_string(),
-    ];
-    assert!(set_forwarded_headers(&forward_headers, &parts, &mut headers).is_ok());
-
-    assert_eq!(headers.get("X-Custom-Header").unwrap(), "custom-value");
-    assert_eq!(headers.get("X-Another-Header").unwrap(), "another-value");
-}
-
-#[test]
 fn test_build_headers() {
     let request = Builder::new()
         .method(Method::GET)
@@ -420,6 +172,54 @@ fn test_build_headers() {
     assert_eq!(headers.get("X-Registry-Reference").unwrap(), "latest");
     assert_eq!(headers.get("X-Registry-Username").unwrap(), "testuser");
     assert_eq!(headers.get("X-Custom-Header").unwrap(), "custom-value");
+}
+
+/// The optional and multi-valued halves of `build_headers`: plain-http proto,
+/// absent Host/client-ip/username produce no header, digest and identity id
+/// are stamped, and every certificate CN/O value is appended.
+#[test]
+fn test_build_headers_optional_and_multi_valued_fields() {
+    let request = Builder::new()
+        .method(Method::HEAD)
+        .uri("http://example.com/v2/ns/blobs/sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let action = Action::GetBlob {
+        namespace: Namespace::new("ns").unwrap(),
+        digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .parse()
+            .unwrap(),
+    };
+
+    let mut identity = ClientIdentity::new(None);
+    identity.id = Some("user-id-123".to_string());
+    identity.certificate.common_names = vec!["cn1".to_string(), "cn2".to_string()];
+    identity.certificate.organizations = vec!["org1".to_string(), "org2".to_string()];
+
+    let headers = build_headers(&[], &action, &identity, &parts).unwrap();
+
+    assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "http");
+    assert!(headers.get("X-Forwarded-Host").is_none());
+    assert!(headers.get("X-Forwarded-For").is_none());
+    assert!(headers.get("X-Registry-Username").is_none());
+    assert!(headers.get("X-Registry-Reference").is_none());
+    assert_eq!(
+        headers.get("X-Registry-Digest").unwrap(),
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        headers.get("X-Registry-Identity-ID").unwrap(),
+        "user-id-123"
+    );
+    let cns: Vec<_> = headers
+        .get_all("X-Registry-Certificate-CN")
+        .iter()
+        .collect();
+    assert_eq!(cns, ["cn1", "cn2"]);
+    let orgs: Vec<_> = headers.get_all("X-Registry-Certificate-O").iter().collect();
+    assert_eq!(orgs, ["org1", "org2"]);
 }
 
 fn build_test_config(

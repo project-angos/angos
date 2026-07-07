@@ -4,8 +4,10 @@ use hyper::{header::InvalidHeaderValue, http::uri::InvalidUri};
 use angos_tx_engine::lock;
 
 use crate::{
-    configuration, oci, policy,
-    registry::{blob_store, cache, job_store, metadata_store},
+    configuration,
+    jobs::store as job_store,
+    oci, policy,
+    registry::{blob_store, cache, metadata_store},
     registry_client,
 };
 

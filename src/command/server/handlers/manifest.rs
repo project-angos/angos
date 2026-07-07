@@ -20,17 +20,18 @@ use crate::{
 
 pub async fn handle_head_manifest(
     context: &ServerContext,
+    parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
-    mime_types: &[String],
-    is_tag_immutable: bool,
 ) -> Result<Response<ResponseBody>, Error> {
+    let mime_types = RequestHeaders::new(&parts.headers).accepted_content_types();
+    let is_tag_immutable = context.is_reference_immutable(namespace, &reference);
     let repository = context.registry.get_repository_for_namespace(namespace)?;
     let response = context
         .registry
         .head_manifest(
             repository,
-            mime_types,
+            &mime_types,
             namespace,
             reference,
             is_tag_immutable,
@@ -42,16 +43,17 @@ pub async fn handle_head_manifest(
 
 pub async fn handle_get_manifest(
     context: &ServerContext,
+    parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
-    mime_types: &[String],
-    is_tag_immutable: bool,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
+    let mime_types = RequestHeaders::new(&parts.headers).accepted_content_types();
+    let is_tag_immutable = context.is_reference_immutable(namespace, &reference);
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .resolve_get_manifest(actor, namespace, reference, mime_types, is_tag_immutable)
+        .resolve_get_manifest(actor, namespace, reference, &mime_types, is_tag_immutable)
         .await?;
 
     match response {
@@ -66,8 +68,10 @@ pub async fn handle_get_manifest(
     }
 }
 
+/// The stream-generic core of [`handle_put_manifest`], separate so tests can
+/// drive it with an in-memory body instead of a hyper [`Incoming`].
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_put_manifest<S>(
+async fn put_manifest<S>(
     context: &ServerContext,
     namespace: &Namespace,
     reference: Reference,
@@ -99,11 +103,12 @@ where
 
 pub async fn handle_delete_manifest(
     context: &ServerContext,
+    parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
     identity: &ClientIdentity,
-    source_ts: Option<DateTime<Utc>>,
 ) -> Result<Response<ResponseBody>, Error> {
+    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
     let actor = Some(EventActor::from(identity.clone()));
     context
         .registry
@@ -113,43 +118,8 @@ pub async fn handle_delete_manifest(
     build_response(StatusCode::ACCEPTED, HashMap::new(), ResponseBody::empty())
 }
 
-pub async fn dispatch_get_manifest(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    reference: Reference,
-    identity: &ClientIdentity,
-) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
-    let mime_types = headers.accepted_content_types();
-    let is_immutable = context.is_reference_immutable(namespace, &reference);
-
-    handle_get_manifest(
-        context,
-        namespace,
-        reference,
-        &mime_types,
-        is_immutable,
-        identity,
-    )
-    .await
-}
-
-pub async fn dispatch_head_manifest(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    reference: Reference,
-) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
-    let mime_types = headers.accepted_content_types();
-    let is_immutable = context.is_reference_immutable(namespace, &reference);
-
-    handle_head_manifest(context, namespace, reference, &mime_types, is_immutable).await
-}
-
 #[allow(clippy::too_many_arguments)]
-pub async fn dispatch_put_manifest(
+pub async fn handle_put_manifest(
     context: &ServerContext,
     parts: &Parts,
     incoming: Incoming,
@@ -163,10 +133,9 @@ pub async fn dispatch_put_manifest(
         "No Content-Type header provided".to_string(),
     ))?;
     let source_ts = headers.source_timestamp();
-
     let body_stream = incoming_into_async_read(incoming);
 
-    handle_put_manifest(
+    put_manifest(
         context,
         namespace,
         reference,
@@ -177,19 +146,6 @@ pub async fn dispatch_put_manifest(
         source_ts,
     )
     .await
-}
-
-pub async fn dispatch_delete_manifest(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    reference: Reference,
-    identity: &ClientIdentity,
-) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
-    let source_ts = headers.source_timestamp();
-
-    handle_delete_manifest(context, namespace, reference, identity, source_ts).await
 }
 
 #[cfg(test)]
@@ -208,7 +164,7 @@ mod tests {
         registry_client::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     };
 
-    use super::{dispatch_get_manifest, handle_put_manifest};
+    use super::{handle_get_manifest, put_manifest};
 
     const MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
@@ -252,7 +208,7 @@ mod tests {
         let namespace = Namespace::new("test/repo").unwrap();
         let identity = ClientIdentity::new(None);
 
-        let put_resp = handle_put_manifest(
+        let put_resp = put_manifest(
             &context,
             &namespace,
             Reference::Tag(Tag::new("latest").unwrap()),
@@ -267,7 +223,7 @@ mod tests {
         assert_eq!(put_resp.status(), StatusCode::CREATED);
 
         let (parts, ()) = Request::builder().body(()).unwrap().into_parts();
-        let response = dispatch_get_manifest(
+        let response = handle_get_manifest(
             &context,
             &parts,
             &namespace,
@@ -303,7 +259,7 @@ mod tests {
         // Seed the newer local tag with manifest B at a known recent source_ts so
         // created_at is stamped deterministically rather than from the wall clock.
         let newer_ts = Utc::now() - Duration::seconds(10);
-        let seed_resp = handle_put_manifest(
+        let seed_resp = put_manifest(
             &context,
             &namespace,
             tag(),
@@ -341,7 +297,7 @@ mod tests {
         let source_ts = source_ts_from_header(&backdated);
         assert!(source_ts.is_some(), "header must parse to a source_ts");
 
-        let result = handle_put_manifest(
+        let result = put_manifest(
             &context,
             &namespace,
             tag(),

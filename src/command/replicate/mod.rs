@@ -5,7 +5,6 @@ use std::{num::NonZeroUsize, sync::Arc};
 use argh::FromArgs;
 use futures_util::future::join_all;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 pub use checker::ReplicationChecker;
 
@@ -14,15 +13,15 @@ use crate::{
         bootstrap,
         scrub::{
             Error, check,
-            executor::{ActionSink, DryRunSink, Executor},
+            executor::{ActionSink, DryRunSink, Executor, run_job_store},
         },
     },
     configuration::Configuration,
+    jobs::Queue,
+    jobs::runner::run_once,
+    jobs::store::{JobHandler, JobStore},
     registry::{
-        blob_store::BlobStore,
-        job_runner::run_once,
-        job_store::{JobHandler, JobStore, Queue},
-        metadata_store::MetadataStore,
+        blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationJobHandler,
@@ -105,16 +104,11 @@ impl ReplicationDrain {
 /// downstreams, then drains the enqueued jobs in-process. Supersedes the
 /// deprecated `scrub --replicate`.
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
-    let auth_cache = bootstrap::auth_cache(&config.cache)?;
-    let blob_backend = Arc::new(config.blob_store.build_backend()?);
-    let metadata_store =
-        bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
-    let repositories = bootstrap::repositories(
-        &config.repository,
-        &auth_cache,
-        config.global.max_manifest_size_bytes(),
-    )
-    .await?;
+    let bootstrap::MaintenanceContext {
+        blob_store: blob_backend,
+        metadata_store,
+        repositories,
+    } = bootstrap::maintenance_context(config).await?;
 
     let checker = ReplicationChecker::new(metadata_store.clone(), repositories.clone());
 
@@ -125,10 +119,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
     } else {
         // One `Arc<JobStore>` serves as both producer (Executor enqueue) and
         // consumer (end-of-run drain).
-        let job_store = Arc::new(JobStore::new(
-            metadata_store.store_arc(),
-            format!("replicate-{}", Uuid::new_v4()),
-        ));
+        let job_store = run_job_store(&metadata_store, "replicate");
         drain = Some(ReplicationDrain::new(
             job_store.clone(),
             &blob_backend,

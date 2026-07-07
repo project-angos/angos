@@ -12,9 +12,6 @@
 //! between the GET and the delete.
 
 use std::{
-    fmt,
-    fmt::{Display, Formatter},
-    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -44,7 +41,55 @@ use angos_tx_engine::{
     transaction::{Mutation, Read, Transaction},
 };
 
-use crate::{metrics_provider::metrics_provider, registry::path_builder};
+use crate::{
+    jobs::{JobState, Queue},
+    metrics_provider::metrics_provider,
+};
+
+// Storage layout of the durable queues.
+
+const JOBS_ROOT: &str = "_jobs";
+
+fn job_pending_dir(queue: &str) -> String {
+    format!("{JOBS_ROOT}/pending/{queue}")
+}
+
+pub fn job_pending_path(queue: &str, id: &str) -> String {
+    format!("{JOBS_ROOT}/pending/{queue}/{id}.json")
+}
+
+fn job_failed_dir(queue: &str) -> String {
+    format!("{JOBS_ROOT}/failed/{queue}")
+}
+
+pub fn job_failed_path(queue: &str, id: &str) -> String {
+    format!("{JOBS_ROOT}/failed/{queue}/{id}.json")
+}
+
+/// Path to the `lock_key` → `storage_key` dedup index file. Each pending
+/// envelope has at most one such file alongside it; `find_pending_with_lock_key`
+/// reads it for an O(1) lookup instead of scanning all pending bodies.
+pub fn job_lock_key_index_path(queue: &str, lock_key: &str) -> String {
+    format!(
+        "{JOBS_ROOT}/index/{queue}/{}.json",
+        encode_job_lock_key(lock_key)
+    )
+}
+
+/// Percent-encode characters that are unsafe as a filesystem filename or as
+/// part of an S3 key path component, so a `lock_key` lands on the same path
+/// regardless of backend.
+fn encode_job_lock_key(lock_key: &str) -> String {
+    lock_key
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => {
+                format!("%{:02X}", c as u32)
+            }
+            c => c.to_string(),
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Error
@@ -97,47 +142,6 @@ pub fn ensure_shared_lock(store: &Store) -> Result<(), Error> {
 // ---------------------------------------------------------------------------
 // Queue
 // ---------------------------------------------------------------------------
-
-/// The set of durable job queues. Selects the storage prefix, the worker's
-/// `--queue` filter, and the dispatch handler. Serializes as its lowercase name
-/// so stored envelopes, storage paths, and metric labels keep their string form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Queue {
-    Cache,
-    Replication,
-}
-
-impl Queue {
-    /// The on-disk / metric-label name (`"cache"` or `"replication"`).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Queue::Cache => "cache",
-            Queue::Replication => "replication",
-        }
-    }
-}
-
-impl Display for Queue {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Queue {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "cache" => Ok(Queue::Cache),
-            "replication" => Ok(Queue::Replication),
-            other => Err(Error::Initialization(format!(
-                "unknown queue '{other}'; expected 'cache' or 'replication'"
-            ))),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -442,14 +446,6 @@ pub enum CompleteOutcome {
     FailedOver(FailOutcome),
 }
 
-/// Which durable partition a job lives in, used to address admin mutations
-/// (`retry`/`delete`) at the correct storage prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobState {
-    Pending,
-    Failed,
-}
-
 /// Outcome of a single `claim_one` attempt. `claimed` is `Some` when a job was
 /// claimed; otherwise `next_ready` carries the soonest `not_before` observed
 /// across the scan so the caller can sleep until then rather than polling at
@@ -545,7 +541,7 @@ impl JobStore {
     /// start with a sortable hex-millis prefix, so callers can stop scanning
     /// at the first key whose prefix is in the future.
     pub async fn list_pending(&self, queue: Queue, n: u16) -> Result<Vec<String>, Error> {
-        let prefix = path_builder::job_pending_dir(queue.as_str());
+        let prefix = job_pending_dir(queue.as_str());
         let page = self.store.object_store().list(&prefix, 1000, None).await?;
 
         Ok(page
@@ -561,7 +557,7 @@ impl JobStore {
         queue: Queue,
         storage_key: &str,
     ) -> Result<JobEnvelope, Error> {
-        let key = path_builder::job_pending_path(queue.as_str(), storage_key);
+        let key = job_pending_path(queue.as_str(), storage_key);
         let data = self.store.object_store().get(&key).await?;
         serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("failed to parse envelope: {e}")))
@@ -574,7 +570,7 @@ impl JobStore {
         queue: Queue,
         storage_key: &str,
     ) -> Result<DeadLetterRead, Error> {
-        let key = path_builder::job_failed_path(queue.as_str(), storage_key);
+        let key = job_failed_path(queue.as_str(), storage_key);
         let data = self.store.object_store().get(&key).await?;
         serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("failed to parse dead-letter: {e}")))
@@ -590,7 +586,7 @@ impl JobStore {
         n: u16,
         after: Option<&str>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        self.list_page(&path_builder::job_pending_dir(queue.as_str()), n, after)
+        self.list_page(&job_pending_dir(queue.as_str()), n, after)
             .await
     }
 
@@ -602,7 +598,7 @@ impl JobStore {
         n: u16,
         after: Option<&str>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        self.list_page(&path_builder::job_failed_dir(queue.as_str()), n, after)
+        self.list_page(&job_failed_dir(queue.as_str()), n, after)
             .await
     }
 
@@ -640,7 +636,7 @@ impl JobStore {
     /// Count pending envelopes ready for handling within
     /// `[..., now + ready_horizon_secs]`. Capped at [`MAX_REPORTED_PENDING`].
     pub async fn count_pending(&self, queue: Queue, ready_horizon_secs: u64) -> Result<u64, Error> {
-        let prefix = path_builder::job_pending_dir(queue.as_str());
+        let prefix = job_pending_dir(queue.as_str());
         let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
         let mut count: u64 = 0;
         let mut token: Option<String> = None;
@@ -675,7 +671,7 @@ impl JobStore {
     /// `angos_job_queue_failed` gauge so dead-letters stay observable even when
     /// `angos worker` (which has no metrics endpoint) drains the queue.
     pub async fn count_failed(&self, queue: Queue) -> Result<u64, Error> {
-        let prefix = path_builder::job_failed_dir(queue.as_str());
+        let prefix = job_failed_dir(queue.as_str());
         let mut count: u64 = 0;
         let mut token: Option<String> = None;
         loop {
@@ -709,7 +705,7 @@ impl JobStore {
         queue: Queue,
         lock_key: &str,
     ) -> Result<bool, Error> {
-        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), lock_key);
+        let index_path = job_lock_key_index_path(queue.as_str(), lock_key);
         let data = match self.store.object_store().get(&index_path).await {
             Ok(d) => d,
             Err(StorageError::NotFound) => return Ok(false),
@@ -717,7 +713,7 @@ impl JobStore {
         };
         let index = parse_lock_key_index(&data)?;
 
-        let pending_key = path_builder::job_pending_path(queue.as_str(), &index.storage_key);
+        let pending_key = job_pending_path(queue.as_str(), &index.storage_key);
         match self.store.object_store().head(&pending_key).await {
             Ok(_) => Ok(true),
             Err(StorageError::NotFound) => {
@@ -760,7 +756,7 @@ impl JobStore {
         queue: Queue,
         lock_key: &str,
     ) -> Result<Option<(String, Vec<u8>)>, Error> {
-        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), lock_key);
+        let index_path = job_lock_key_index_path(queue.as_str(), lock_key);
         match self.get_raw(&index_path).await {
             Ok(data) => {
                 let index = parse_lock_key_index(&data)?;
@@ -829,7 +825,7 @@ impl JobStore {
                 return;
             }
         };
-        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), lock_key);
+        let index_path = job_lock_key_index_path(queue.as_str(), lock_key);
         let (read, delete) =
             Self::conditional_index_delete(index_path, &body, &index_storage_key, storage_key);
         if delete.is_none() {
@@ -874,9 +870,8 @@ impl JobStore {
 
         // Slow path: build the transaction.
         let storage_key = make_storage_key(Utc::now(), &envelope.id);
-        let pending_path = path_builder::job_pending_path(envelope.queue.as_str(), &storage_key);
-        let index_path =
-            path_builder::job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
+        let pending_path = job_pending_path(envelope.queue.as_str(), &storage_key);
+        let index_path = job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
 
         let pending_body = Bytes::from(
             serde_json::to_vec(&envelope)
@@ -1020,9 +1015,8 @@ impl JobStore {
             storage_key,
             session,
         } = claimed;
-        let pending_path = path_builder::job_pending_path(envelope.queue.as_str(), &storage_key);
-        let index_path =
-            path_builder::job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
+        let pending_path = job_pending_path(envelope.queue.as_str(), &storage_key);
+        let index_path = job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
 
         let mut tx = handler_tx;
         tx.mutations.push(Mutation::Delete {
@@ -1139,12 +1133,9 @@ impl JobStore {
         next_at: DateTime<Utc>,
     ) -> Result<FailOutcome, Error> {
         let new_storage_key = make_storage_key(next_at, &updated.id);
-        let new_pending_path =
-            path_builder::job_pending_path(updated.queue.as_str(), &new_storage_key);
-        let old_pending_path =
-            path_builder::job_pending_path(updated.queue.as_str(), &old_storage_key);
-        let index_path =
-            path_builder::job_lock_key_index_path(updated.queue.as_str(), &updated.lock_key);
+        let new_pending_path = job_pending_path(updated.queue.as_str(), &new_storage_key);
+        let old_pending_path = job_pending_path(updated.queue.as_str(), &old_storage_key);
+        let index_path = job_lock_key_index_path(updated.queue.as_str(), &updated.lock_key);
 
         let pending_body = Bytes::from(
             serde_json::to_vec(&updated)
@@ -1190,8 +1181,8 @@ impl JobStore {
         storage_key: String,
         err: &str,
     ) -> Result<FailOutcome, Error> {
-        let failed_path = path_builder::job_failed_path(envelope.queue.as_str(), &storage_key);
-        let pending_path = path_builder::job_pending_path(envelope.queue.as_str(), &storage_key);
+        let failed_path = job_failed_path(envelope.queue.as_str(), &storage_key);
+        let pending_path = job_pending_path(envelope.queue.as_str(), &storage_key);
 
         let failed_body = Bytes::from(serialize_dead_letter(&envelope, err)?);
 
@@ -1209,8 +1200,7 @@ impl JobStore {
 
         // Conditionally include the index delete: only when the index still
         // points at our storage_key. Read the index to get the fingerprint.
-        let index_path =
-            path_builder::job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
+        let index_path = job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
         match self
             .get_lock_key_index_raw(envelope.queue, &envelope.lock_key)
             .await
@@ -1255,7 +1245,7 @@ impl JobStore {
     /// per-`lock_key` execution lock still serialises the two, and the handler
     /// contract makes a redundant run idempotent.
     pub async fn retry_failed(&self, queue: Queue, storage_key: &str) -> Result<(), Error> {
-        let failed_path = path_builder::job_failed_path(queue.as_str(), storage_key);
+        let failed_path = job_failed_path(queue.as_str(), storage_key);
         // HEAD first for the fencing ETag (`None` when the backend does not
         // surface ETags, giving an unconditional delete, still safe: the new pending
         // key is fresh so a double-retry collides at `PutIfAbsent`).
@@ -1265,7 +1255,7 @@ impl JobStore {
         envelope.attempts = 0;
 
         let new_storage_key = make_storage_key(Utc::now(), &envelope.id);
-        let pending_path = path_builder::job_pending_path(queue.as_str(), &new_storage_key);
+        let pending_path = job_pending_path(queue.as_str(), &new_storage_key);
         let pending_body = Bytes::from(
             serde_json::to_vec(&envelope)
                 .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?,
@@ -1310,7 +1300,7 @@ impl JobStore {
     ) -> Result<(), Error> {
         match state {
             JobState::Failed => {
-                let failed_path = path_builder::job_failed_path(queue.as_str(), storage_key);
+                let failed_path = job_failed_path(queue.as_str(), storage_key);
                 let expected = self.store.object_store().head(&failed_path).await?.etag;
                 let tx = Transaction::builder()
                     .mutation(Mutation::Delete {
@@ -1329,7 +1319,7 @@ impl JobStore {
     }
 
     async fn delete_pending(&self, queue: Queue, storage_key: &str) -> Result<(), Error> {
-        let pending_path = path_builder::job_pending_path(queue.as_str(), storage_key);
+        let pending_path = job_pending_path(queue.as_str(), storage_key);
         // Read the envelope (for its `lock_key`) and HEAD for the fence; a
         // missing pending file surfaces as `NotFound` for a 404.
         let envelope = self.read_pending(queue, storage_key).await?;
@@ -1345,7 +1335,7 @@ impl JobStore {
         // Fold a conditional index delete: only when the index still points at
         // this storage key. The read fingerprint turns a concurrent index
         // refresh into a no-op conflict rather than clobbering a fresh index.
-        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), &envelope.lock_key);
+        let index_path = job_lock_key_index_path(queue.as_str(), &envelope.lock_key);
         match self.get_lock_key_index_raw(queue, &envelope.lock_key).await {
             Ok(Some((index_storage_key, body))) => {
                 let (read, delete) = Self::conditional_index_delete(
@@ -1421,5 +1411,5 @@ pub async fn queue_depth_refresh_loop(
 }
 
 #[cfg(test)]
-#[path = "job_store_tests.rs"]
+#[path = "store_tests.rs"]
 mod tests;
