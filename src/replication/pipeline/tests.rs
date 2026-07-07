@@ -24,11 +24,10 @@ use crate::{
         metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
         test_utils::{FsTestStack, downstream_client, fs_test_stack, media_type, put_blob_direct},
     },
-    registry_client::{RegistryClient, UploadSession},
-    replication::{
-        REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP,
-        pipeline::{PushContext, PushOutcome, delete_manifest, push_manifest},
+    registry_client::{
+        REPLICATION_SUPERSEDED_CODE, RegistryClient, UploadSession, X_ANGOS_SOURCE_TIMESTAMP,
     },
+    replication::pipeline::{PushContext, PushOutcome, delete_manifest, push_manifest},
     test_fixtures::mocks::mount_blob_upload_accepted,
 };
 

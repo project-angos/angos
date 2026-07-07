@@ -20,7 +20,7 @@ use crate::{
             put_link_raw, upload_blob,
         },
     },
-    replication::REPLICATION_SUPERSEDED_CODE,
+    registry_client::REPLICATION_SUPERSEDED_CODE,
 };
 
 fn header_digest(headers: &HashMap<&'static str, String>) -> Digest {

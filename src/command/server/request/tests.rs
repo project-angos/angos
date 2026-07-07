@@ -12,7 +12,7 @@ use crate::{
     command::server::{error::Error, request::RequestHeaders, response_body::ResponseBody},
     oci::MediaType,
     registry::BlobRange,
-    replication::X_ANGOS_SOURCE_TIMESTAMP,
+    registry_client::X_ANGOS_SOURCE_TIMESTAMP,
 };
 
 #[test]

@@ -5,7 +5,7 @@ use crate::{
     command::{bootstrap, server::error::Error},
     configuration, event_webhook, metrics_provider, registry,
     registry::{blob_store, job_store},
-    replication::REPLICATION_SUPERSEDED_CODE,
+    registry_client::REPLICATION_SUPERSEDED_CODE,
 };
 
 fn oci_error(status_code: StatusCode, code: &'static str, msg: Option<String>) -> Error {

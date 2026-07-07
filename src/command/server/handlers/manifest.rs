@@ -205,7 +205,7 @@ mod tests {
         },
         identity::ClientIdentity,
         oci::{MediaType, Namespace, Reference, Tag},
-        replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
+        registry_client::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     };
 
     use super::{dispatch_get_manifest, handle_put_manifest};

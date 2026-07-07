@@ -14,6 +14,4 @@ pub use crate::replication::handler::{
     REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationJobHandler,
     ReplicationPushPayload, build_envelope, build_prune_delete_envelope,
 };
-pub use crate::replication::wire::{
-    REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP, manifest_accept_types,
-};
+pub use crate::replication::wire::manifest_accept_types;

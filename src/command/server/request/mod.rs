@@ -15,7 +15,7 @@ use tokio_util::io::StreamReader;
 
 use crate::{
     command::server::error::Error, oci::MediaType, registry::BlobRange,
-    replication::X_ANGOS_SOURCE_TIMESTAMP,
+    registry_client::X_ANGOS_SOURCE_TIMESTAMP,
 };
 
 static START_END_RANGE_RE: LazyLock<Regex> =
