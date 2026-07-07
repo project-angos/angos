@@ -10,11 +10,9 @@ use wiremock::{
 use crate::{
     cache,
     oci::{Digest, MediaType, Reference, Tag},
-    registry::{
-        DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-    },
+    registry::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES},
     registry_client::{
-        DeleteManifestOutcome, RegistryClient, RegistryClientConfig,
+        DeleteManifestOutcome, Error, RegistryClient, RegistryClientConfig,
         auth::{token_cache_key, token_index_cache_key},
     },
     replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},

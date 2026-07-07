@@ -303,7 +303,7 @@ impl Repository {
                 let location = upstream
                     .client
                     .get_blob_path(upstream.remote(namespace)?.as_ref(), digest);
-                upstream.client.head_blob(accepted_types, &location).await
+                Ok(upstream.client.head_blob(accepted_types, &location).await?)
             })
         })
         .await
@@ -321,7 +321,7 @@ impl Repository {
                 let location = upstream
                     .client
                     .get_blob_path(upstream.remote(namespace)?.as_ref(), digest);
-                upstream.client.get_blob(accepted_types, &location).await
+                Ok(upstream.client.get_blob(accepted_types, &location).await?)
             })
         })
         .await
@@ -339,10 +339,10 @@ impl Repository {
                 let location = upstream
                     .client
                     .get_manifest_path(upstream.remote(namespace)?.as_ref(), reference);
-                upstream
+                Ok(upstream
                     .client
                     .head_manifest(accepted_types, &location)
-                    .await
+                    .await?)
             })
         })
         .await
@@ -360,10 +360,10 @@ impl Repository {
                 let location = upstream
                     .client
                     .get_manifest_path(upstream.remote(namespace)?.as_ref(), reference);
-                upstream
+                Ok(upstream
                     .client
                     .get_manifest(accepted_types, &location)
-                    .await
+                    .await?)
             })
         })
         .await

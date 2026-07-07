@@ -2,6 +2,7 @@
 mod tests;
 
 mod auth;
+mod error;
 mod write;
 
 use std::{future::Future, io, path::Path, sync::Arc, time::Duration};
@@ -17,15 +18,17 @@ use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
 
-pub use crate::registry_client::write::{DeleteManifestOutcome, PutManifestResult, UploadSession};
+pub use crate::registry_client::{
+    error::Error,
+    write::{DeleteManifestOutcome, PutManifestResult, UploadSession},
+};
 
 use crate::{
     cache::Cache,
     http_client::HttpClientBuilder,
     oci::{Digest, MediaType, Reference},
     registry::{
-        DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader,
-        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        DOCKER_CONTENT_DIGEST, blob_store::BoxedReader, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     },
     secret::Secret,
 };
@@ -510,7 +513,10 @@ impl RegistryClient {
         let stream = response.bytes_stream().map_err(io::Error::other);
         let mut content = Vec::with_capacity(capacity);
         let mut reader = StreamReader::new(stream).take(limit as u64 + 1);
-        reader.read_to_end(&mut content).await?;
+        reader
+            .read_to_end(&mut content)
+            .await
+            .map_err(|e| Error::Internal(format!("failed to read manifest body: {e}")))?;
 
         if content.len() > limit {
             return Err(Error::ManifestBodyTooLarge { limit });

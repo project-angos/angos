@@ -18,13 +18,13 @@ use crate::{
         Digest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference, Tag,
     },
     registry::{
-        Error as RegistryError, ParsedManifestDigests,
+        ParsedManifestDigests,
         blob_ownership::BlobOwnership,
         blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
         parse_manifest_digests,
     },
-    registry_client::{DeleteManifestOutcome, RegistryClient, UploadSession},
+    registry_client::{DeleteManifestOutcome, Error as ClientError, RegistryClient, UploadSession},
     replication::{Error, manifest_accept_types},
 };
 
@@ -101,13 +101,14 @@ pub async fn push_manifest(
     tag: Option<&str>,
     body: Vec<u8>,
 ) -> Result<PushOutcome, Error> {
-    let parsed = parse_manifest_digests(&body, media_type.as_ref()).map_err(Error::Registry)?;
+    let parsed = parse_manifest_digests(&body, media_type.as_ref())
+        .map_err(|e| Error::Internal(format!("manifest parse failed: {e}")))?;
 
     // Pushing by tag binds tag -> digest atomically on the downstream.
     let reference = match tag {
-        Some(tag) => Reference::Tag(Tag::new(tag).map_err(|e| {
-            Error::Registry(RegistryError::Internal(format!("invalid tag '{tag}': {e}")))
-        })?),
+        Some(tag) => Reference::Tag(
+            Tag::new(tag).map_err(|e| Error::Internal(format!("invalid tag '{tag}': {e}")))?,
+        ),
         None => Reference::Digest(digest.clone()),
     };
     let location = ctx
@@ -166,8 +167,7 @@ pub async fn push_manifest(
             body,
             ctx.source_ts,
         )
-        .await
-        .map_err(Error::Registry)?;
+        .await?;
 
     // An LWW loss is convergence: drop the push and skip the referrers fallback.
     if result.superseded {
@@ -223,9 +223,7 @@ async fn push_child_manifests(
     stream::iter(parsed.manifests.clone())
         .map(|child| async move {
             let child_body = ctx.blob_store.read(&child).await.map_err(|e| {
-                Error::Registry(RegistryError::Internal(format!(
-                    "failed to read local manifest blob '{child}': {e}"
-                )))
+                Error::Internal(format!("failed to read local manifest blob '{child}': {e}"))
             })?;
             Box::pin(push_manifest(ctx, &child, None, None, child_body))
                 .await
@@ -292,12 +290,7 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
     // dead-letters on a minimal downstream); a 404 means absent; a transient
     // failure fails the push so the job retries instead of doing a pointless
     // full upload.
-    if ctx
-        .downstream
-        .blob_exists(&head_location)
-        .await
-        .map_err(Error::Registry)?
-    {
+    if ctx.downstream.blob_exists(&head_location).await? {
         debug!(namespace = %ctx.namespace, %digest, "Blob already present on downstream; skipping");
         return Ok(());
     }
@@ -335,11 +328,7 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
         }
     }
 
-    let session = ctx
-        .downstream
-        .start_upload(&start_location)
-        .await
-        .map_err(Error::Registry)?;
+    let session = ctx.downstream.start_upload(&start_location).await?;
     upload_into_session(ctx, digest, &session).await
 }
 
@@ -356,9 +345,9 @@ async fn upload_into_session(
             // The session is already open; cancel it, like the patch/complete
             // failure paths, so a dying push does not strand it on the downstream.
             cancel_upload_session(ctx.downstream, &session.url).await;
-            return Err(Error::Registry(RegistryError::Internal(format!(
+            return Err(Error::Internal(format!(
                 "failed to open local blob '{digest}': {e}"
-            ))));
+            )));
         }
     };
     let patched_url = match ctx
@@ -374,12 +363,12 @@ async fn upload_into_session(
         Ok(url) => url,
         Err(e) => {
             cancel_upload_session(ctx.downstream, &session.url).await;
-            return Err(Error::Registry(e));
+            return Err(Error::Client(e));
         }
     };
     if let Err(e) = ctx.downstream.complete_upload(&patched_url, digest).await {
         cancel_upload_session(ctx.downstream, &patched_url).await;
-        return Err(Error::Registry(e));
+        return Err(Error::Client(e));
     }
 
     info!(namespace = %ctx.namespace, %digest, content_length, "Pushed blob to downstream");
@@ -422,9 +411,9 @@ async fn push_referrers_fallback(
     );
 
     let reference = Reference::from_str(&fallback_tag).map_err(|e| {
-        Error::Registry(RegistryError::Internal(format!(
+        Error::Internal(format!(
             "invalid referrers fallback tag '{fallback_tag}': {e}"
-        )))
+        ))
     })?;
     let location = downstream.get_manifest_path(downstream_namespace, &reference);
 
@@ -439,9 +428,9 @@ async fn push_referrers_fallback(
         .acquire(&lock_keys)
         .await
         .map_err(|e| {
-            Error::Registry(RegistryError::Internal(format!(
+            Error::Internal(format!(
                 "referrers fallback lock acquire failed for '{fallback_tag}': {e}"
-            )))
+            ))
         })?;
     let result = merge_referrers_fallback(downstream, &location, digest, parsed, body).await;
     session.release().await;
@@ -473,9 +462,9 @@ async fn merge_referrers_fallback(
     )
     .await
     .map_err(|_| {
-        Error::Registry(RegistryError::Internal(format!(
+        Error::Internal(format!(
             "referrers fallback GET at '{location}' timed out inside the merge lock"
-        )))
+        ))
     })??;
 
     // The blob store is content-addressed, so `digest` is already the body's
@@ -502,9 +491,7 @@ async fn merge_referrers_fallback(
         "manifests": manifests,
     });
     let index_body = serde_json::to_vec(&index).map_err(|e| {
-        Error::Registry(RegistryError::Internal(format!(
-            "failed to serialize referrers fallback index: {e}"
-        )))
+        Error::Internal(format!("failed to serialize referrers fallback index: {e}"))
     })?;
 
     // Timestamp-less PUT: the receiver then skips LWW, so the merged index can
@@ -516,11 +503,10 @@ async fn merge_referrers_fallback(
     )
     .await
     .map_err(|_| {
-        Error::Registry(RegistryError::Internal(format!(
+        Error::Internal(format!(
             "referrers fallback PUT at '{location}' timed out inside the merge lock"
-        )))
-    })?
-    .map_err(Error::Registry)?;
+        ))
+    })??;
     Ok(())
 }
 
@@ -539,17 +525,17 @@ async fn fetch_fallback_manifests(
         .await
     {
         Ok((_, _, body)) => body,
-        Err(RegistryError::ManifestUnknown) => return Ok(Vec::new()),
-        Err(e) => return Err(Error::Registry(e)),
+        Err(ClientError::ManifestUnknown) => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Client(e)),
     };
     serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|v| v.get("manifests").and_then(Value::as_array).cloned())
         .ok_or_else(|| {
-            Error::Registry(RegistryError::Internal(format!(
+            Error::Internal(format!(
                 "downstream referrers fallback index at '{location}' is not a parseable image \
                  index (missing or non-array `manifests`); refusing to overwrite it"
-            )))
+            ))
         })
 }
 
@@ -605,10 +591,7 @@ pub async fn delete_manifest(
     };
 
     let location = downstream.get_manifest_path(downstream_namespace, reference);
-    let outcome = downstream
-        .delete_manifest(&location, source_ts)
-        .await
-        .map_err(Error::Registry)?;
+    let outcome = downstream.delete_manifest(&location, source_ts).await?;
     let push_outcome = match outcome {
         DeleteManifestOutcome::Deleted => {
             info!(namespace = %namespace, %reference, "Deleted manifest on downstream");
@@ -698,9 +681,9 @@ async fn remove_referrers_fallback(
 ) -> Result<(), Error> {
     let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
     let reference = Reference::from_str(&fallback_tag).map_err(|e| {
-        Error::Registry(RegistryError::Internal(format!(
+        Error::Internal(format!(
             "invalid referrers fallback tag '{fallback_tag}': {e}"
-        )))
+        ))
     })?;
     let location = downstream.get_manifest_path(downstream_namespace, &reference);
 
@@ -710,9 +693,9 @@ async fn remove_referrers_fallback(
         .acquire(&lock_keys)
         .await
         .map_err(|e| {
-            Error::Registry(RegistryError::Internal(format!(
+            Error::Internal(format!(
                 "referrers fallback lock acquire failed for '{fallback_tag}': {e}"
-            )))
+            ))
         })?;
     let result = prune_fallback_descriptor(downstream, &location, referrer).await;
     session.release().await;
@@ -732,9 +715,9 @@ async fn prune_fallback_descriptor(
     )
     .await
     .map_err(|_| {
-        Error::Registry(RegistryError::Internal(format!(
+        Error::Internal(format!(
             "referrers fallback GET at '{location}' timed out inside the merge lock"
-        )))
+        ))
     })??;
 
     let referrer_str = referrer.to_string();
@@ -755,11 +738,10 @@ async fn prune_fallback_descriptor(
         )
         .await
         .map_err(|_| {
-            Error::Registry(RegistryError::Internal(format!(
+            Error::Internal(format!(
                 "referrers fallback DELETE at '{location}' timed out inside the merge lock"
-            )))
-        })?
-        .map_err(Error::Registry)?;
+            ))
+        })??;
         return Ok(());
     }
 
@@ -769,9 +751,7 @@ async fn prune_fallback_descriptor(
         "manifests": manifests,
     });
     let index_body = serde_json::to_vec(&index).map_err(|e| {
-        Error::Registry(RegistryError::Internal(format!(
-            "failed to serialize referrers fallback index: {e}"
-        )))
+        Error::Internal(format!("failed to serialize referrers fallback index: {e}"))
     })?;
     timeout(
         REFERRERS_MERGE_HTTP_TIMEOUT,
@@ -779,11 +759,10 @@ async fn prune_fallback_descriptor(
     )
     .await
     .map_err(|_| {
-        Error::Registry(RegistryError::Internal(format!(
+        Error::Internal(format!(
             "referrers fallback PUT at '{location}' timed out inside the merge lock"
-        )))
-    })?
-    .map_err(Error::Registry)?;
+        ))
+    })??;
     Ok(())
 }
 

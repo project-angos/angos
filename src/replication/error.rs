@@ -1,11 +1,14 @@
-use crate::registry::Error as RegistryError;
+use crate::registry_client;
 
 /// Errors raised while building or running replication machinery.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A [`crate::registry::Error`] raised while building the registry client
-    /// or touching registry storage.
-    #[error("replication registry error: {0}")]
-    Registry(#[from] RegistryError),
+    /// The outbound registry client failed while talking to a downstream.
+    #[error("replication client error: {0}")]
+    Client(#[from] registry_client::Error),
+    /// A replication-internal failure: namespace mapping, manifest parsing,
+    /// serialization, or downstream-configuration resolution.
+    #[error("replication error: {0}")]
+    Internal(String),
 }

@@ -18,10 +18,10 @@ use crate::{
     },
     oci::{Digest, Namespace, Reference, Tag},
     registry::{
-        Error as RegistryError,
         metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
+    registry_client::Error as ClientError,
     replication::{ReplicationDownstream, manifest_accept_types},
 };
 
@@ -191,7 +191,7 @@ async fn reconcile_push_step(
                     );
                     Probe::Converged
                 }
-                Ok(_) | Err(RegistryError::ManifestUnknown) => Probe::Push {
+                Ok(_) | Err(ClientError::ManifestUnknown) => Probe::Push {
                     tag,
                     digest: local,
                 },

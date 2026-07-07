@@ -8,7 +8,14 @@ use prometheus::{
 };
 use tracing::error;
 
-use crate::registry::Error;
+/// Errors raised while initializing or serving the metrics registry.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{0}")]
+    Initialization(String),
+    #[error("unable to encode metrics: {0}")]
+    Encode(String),
+}
 
 static METRICS: OnceLock<MetricsProvider> = OnceLock::new();
 
@@ -403,7 +410,7 @@ impl MetricsProvider {
         let metric_families = self.registry.gather();
         encoder
             .encode(&metric_families, &mut buffer)
-            .map_err(|error| Error::Internal(format!("Unable to encode metrics: {error}")))?;
+            .map_err(|error| Error::Encode(error.to_string()))?;
         Ok((encoder.format_type().to_string(), buffer))
     }
 }

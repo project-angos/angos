@@ -6,6 +6,7 @@ use angos_tx_engine::lock;
 use crate::{
     configuration, oci, policy,
     registry::{blob_store, cache, job_store, metadata_store},
+    registry_client,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -45,11 +46,9 @@ pub enum Error {
     RangeNotSatisfiable,
     #[error("resource not found")]
     NotFound,
-    #[error("{0}")]
-    Conflict(String),
     /// A replication write lost last-writer-wins: the local tag is strictly
-    /// newer than the incoming `source_ts`. Distinct from [`Error::Conflict`]
-    /// so the sender can treat it as convergence rather than retry.
+    /// newer than the incoming `source_ts`. Mapped to a distinct OCI code so
+    /// the sender can treat it as convergence rather than a conflict to retry.
     #[error("{0}")]
     ReplicationSuperseded(String),
     /// A `required`-policy webhook rejected or failed the event delivery.
@@ -125,6 +124,25 @@ impl From<blob_store::Error> for Error {
             }
             blob_store::Error::DigestAlgorithmUnavailable(_) => Error::DigestInvalid,
             _ => Error::Internal(format!("Data store error during operations: {error}")),
+        }
+    }
+}
+
+// The outbound client's remote outcomes map variant for variant, so the
+// pull-through path surfaces a remote miss as the matching local OCI code.
+impl From<registry_client::Error> for Error {
+    fn from(error: registry_client::Error) -> Self {
+        match error {
+            registry_client::Error::Initialization(msg) => Error::Initialization(msg),
+            registry_client::Error::Unauthorized(msg) => Error::Unauthorized(msg),
+            registry_client::Error::Denied(msg) => Error::Denied(msg),
+            registry_client::Error::BlobUnknown => Error::BlobUnknown,
+            registry_client::Error::ManifestUnknown => Error::ManifestUnknown,
+            registry_client::Error::ManifestBodyTooLarge { limit } => {
+                Error::ManifestBodyTooLarge { limit }
+            }
+            registry_client::Error::Unsupported => Error::Unsupported,
+            registry_client::Error::Internal(msg) => Error::Internal(msg),
         }
     }
 }
