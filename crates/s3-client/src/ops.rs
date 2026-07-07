@@ -1,10 +1,10 @@
 //! High-level object, multipart, listing and presign operations on top of
 //! [`super::client::S3Client`].
 //!
-//! All methods on `Backend` go through three steps:
-//!   1. `check_circuit_breaker`: fail fast when the backend is unhealthy.
-//!   2. perform a signed request via the internal client.
-//!   3. `record_*_result`: feed success/failure back into the circuit breaker.
+//! Every network operation runs inside [`Backend::guarded_io`] or
+//! [`Backend::guarded_data`], which fail fast while the circuit breaker is
+//! open and feed each outcome back into it. Only `generate_presigned_url`
+//! stays outside the guard: it signs locally and never touches the wire.
 //!
 //! All bodies use [`bytes::Bytes`] (refcounted, zero-copy across clones and
 //! retries). Reads return a streaming [`AsyncRead`] by default; the few
@@ -86,29 +86,27 @@ impl Backend {
         &self,
         path: &str,
     ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), io::Error> {
-        self.check_circuit_breaker()?;
         let key = self.full_key(path);
-
-        let result = self
-            .s3_client
-            .send_empty(
-                Method::GET,
-                &key,
-                Vec::new(),
-                HeaderMap::new(),
-                SendOpts::default(),
-            )
-            .await
-            .map(|response| {
-                (
-                    response.body.to_vec(),
-                    header_string(&response.headers, "etag"),
-                    last_modified(&response.headers),
+        self.guarded_io(async {
+            self.s3_client
+                .send_empty(
+                    Method::GET,
+                    &key,
+                    Vec::new(),
+                    HeaderMap::new(),
+                    SendOpts::default(),
                 )
-            })
-            .map_err(|e| map_get_error(&e));
-        self.record_io_result(&result);
-        result
+                .await
+                .map(|response| {
+                    (
+                        response.body.to_vec(),
+                        header_string(&response.headers, "etag"),
+                        last_modified(&response.headers),
+                    )
+                })
+                .map_err(|e| map_get_error(&e))
+        })
+        .await
     }
 
     /// # Errors
@@ -129,30 +127,28 @@ impl Backend {
         &self,
         path: &str,
     ) -> Result<(u64, Option<String>, Option<DateTime<Utc>>), io::Error> {
-        self.check_circuit_breaker()?;
         let key = self.full_key(path);
-
-        let result = self
-            .s3_client
-            .send_empty(
-                Method::HEAD,
-                &key,
-                Vec::new(),
-                HeaderMap::new(),
-                SendOpts::default(),
-            )
-            .await
-            .map_err(|e| map_get_error(&e))
-            .and_then(|response| {
-                let size = parse_content_length(&response.headers).map_err(io::Error::other)?;
-                Ok((
-                    size,
-                    header_string(&response.headers, "etag"),
-                    last_modified(&response.headers),
-                ))
-            });
-        self.record_io_result(&result);
-        result
+        self.guarded_io(async {
+            self.s3_client
+                .send_empty(
+                    Method::HEAD,
+                    &key,
+                    Vec::new(),
+                    HeaderMap::new(),
+                    SendOpts::default(),
+                )
+                .await
+                .map_err(|e| map_get_error(&e))
+                .and_then(|response| {
+                    let size = parse_content_length(&response.headers).map_err(io::Error::other)?;
+                    Ok((
+                        size,
+                        header_string(&response.headers, "etag"),
+                        last_modified(&response.headers),
+                    ))
+                })
+        })
+        .await
     }
 
     /// # Errors
@@ -164,17 +160,17 @@ impl Backend {
         path: &str,
         offset: Option<u64>,
     ) -> Result<GetObjectResult, io::Error> {
-        self.check_circuit_breaker()?;
         let key = self.full_key(path);
         let headers = offset.map(range_header).unwrap_or_default();
 
-        let result = self
-            .s3_client
-            .send_streaming_response(Method::GET, &key, Vec::new(), headers)
-            .await
-            .map_err(|e| map_get_error(&e));
-        self.record_io_result(&result);
-        let response = result?;
+        let response = self
+            .guarded_io(async {
+                self.s3_client
+                    .send_streaming_response(Method::GET, &key, Vec::new(), headers)
+                    .await
+                    .map_err(|e| map_get_error(&e))
+            })
+            .await?;
 
         let content_length = response
             .headers()
@@ -212,24 +208,23 @@ impl Backend {
     /// Forwards [`io::Error`] from the underlying `PUT`: HTTP failures,
     /// S3 protocol errors, or a tripped circuit breaker.
     pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), io::Error> {
-        self.check_circuit_breaker()?;
         let key = self.full_key(path);
-
-        let result = self
-            .s3_client
-            .send(
-                Method::PUT,
-                &key,
-                Vec::new(),
-                HeaderMap::new(),
-                data.into(),
-                SendOpts::default(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| io_other(&e));
-        self.record_io_result(&result);
-        result
+        let data = data.into();
+        self.guarded_io(async {
+            self.s3_client
+                .send(
+                    Method::PUT,
+                    &key,
+                    Vec::new(),
+                    HeaderMap::new(),
+                    data,
+                    SendOpts::default(),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| io_other(&e))
+        })
+        .await
     }
 
     /// # Errors
@@ -237,23 +232,21 @@ impl Backend {
     /// S3 protocol errors, or a tripped circuit breaker. Missing objects
     /// are returned as `NotFound`.
     pub async fn delete_object(&self, path: &str) -> Result<(), io::Error> {
-        self.check_circuit_breaker()?;
         let key = self.full_key(path);
-
-        let result = self
-            .s3_client
-            .send_empty(
-                Method::DELETE,
-                &key,
-                Vec::new(),
-                HeaderMap::new(),
-                SendOpts::default(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| io_other(&e));
-        self.record_io_result(&result);
-        result
+        self.guarded_io(async {
+            self.s3_client
+                .send_empty(
+                    Method::DELETE,
+                    &key,
+                    Vec::new(),
+                    HeaderMap::new(),
+                    SendOpts::default(),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| io_other(&e))
+        })
+        .await
     }
 
     /// # Errors
@@ -288,28 +281,25 @@ impl Backend {
     /// `ETag` doesn't match `etag`; otherwise forwards HTTP / S3 protocol
     /// errors as [`Error::Io`].
     pub async fn delete_if_match(&self, path: &str, etag: &str) -> Result<(), Error> {
-        self.check_circuit_breaker()
-            .map_err(|e| Error::Io(e.to_string()))?;
         let key = self.full_key(path);
         let headers = single_header("if-match", etag).map_err(|e| Error::Io(e.to_string()))?;
-
-        let result = self
-            .s3_client
-            .send_empty(
-                Method::DELETE,
-                &key,
-                Vec::new(),
-                headers,
-                SendOpts {
-                    non_idempotent: true,
-                    ..SendOpts::default()
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| classify_conditional_error(&e));
-        self.record_data_result(&result);
-        result
+        self.guarded_data(async {
+            self.s3_client
+                .send_empty(
+                    Method::DELETE,
+                    &key,
+                    Vec::new(),
+                    headers,
+                    SendOpts {
+                        non_idempotent: true,
+                        ..SendOpts::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| classify_conditional_error(&e))
+        })
+        .await
     }
 
     async fn conditional_put(
@@ -319,30 +309,27 @@ impl Backend {
         precondition_value: &str,
         data: Bytes,
     ) -> Result<Option<String>, Error> {
-        self.check_circuit_breaker()
-            .map_err(|e| Error::Io(e.to_string()))?;
         let key = self.full_key(path);
         let headers = single_header(precondition_header, precondition_value)
             .map_err(|e| Error::Io(e.to_string()))?;
-
-        let result = self
-            .s3_client
-            .send(
-                Method::PUT,
-                &key,
-                Vec::new(),
-                headers,
-                data,
-                SendOpts {
-                    non_idempotent: true,
-                    ..SendOpts::default()
-                },
-            )
-            .await
-            .map(|response| header_string(&response.headers, "etag"))
-            .map_err(|e| classify_conditional_error(&e));
-        self.record_data_result(&result);
-        result
+        self.guarded_data(async {
+            self.s3_client
+                .send(
+                    Method::PUT,
+                    &key,
+                    Vec::new(),
+                    headers,
+                    data,
+                    SendOpts {
+                        non_idempotent: true,
+                        ..SendOpts::default()
+                    },
+                )
+                .await
+                .map(|response| header_string(&response.headers, "etag"))
+                .map_err(|e| classify_conditional_error(&e))
+        })
+        .await
     }
 
     /// # Errors
@@ -366,24 +353,23 @@ impl Backend {
             &copy_source(&self.encoded_bucket, &self.full_key(source)),
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let result = self
-            .s3_client
-            .send_empty(
-                Method::PUT,
-                &destination_key,
-                Vec::new(),
-                headers,
-                SendOpts {
-                    check_embedded_error: true,
-                    ..SendOpts::default()
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| io_other(&e));
-        self.record_io_result(&result);
-        result
+        self.guarded_io(async {
+            self.s3_client
+                .send_empty(
+                    Method::PUT,
+                    &destination_key,
+                    Vec::new(),
+                    headers,
+                    SendOpts {
+                        check_embedded_error: true,
+                        ..SendOpts::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| io_other(&e))
+        })
+        .await
     }
 
     async fn copy_object_multipart(
@@ -469,20 +455,23 @@ impl Backend {
         let headers = single_header("content-md5", &content_md5_base64(&body))
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let response = self
-            .s3_client
-            .send(
-                Method::POST,
-                "",
-                vec![QueryParam::marker("delete")],
-                headers,
-                body,
-                SendOpts::default(),
-            )
-            .await
-            .map_err(|e| io_other(&e))?;
-
-        let parsed = xml::parse_delete_objects(&response.body).map_err(io::Error::other)?;
+        let parsed = self
+            .guarded_io(async {
+                let response = self
+                    .s3_client
+                    .send(
+                        Method::POST,
+                        "",
+                        vec![QueryParam::marker("delete")],
+                        headers,
+                        body,
+                        SendOpts::default(),
+                    )
+                    .await
+                    .map_err(|e| io_other(&e))?;
+                xml::parse_delete_objects(&response.body).map_err(io::Error::other)
+            })
+            .await?;
         let errors: Vec<_> = parsed
             .errors
             .into_iter()
@@ -499,8 +488,8 @@ impl Backend {
 
 impl Backend {
     /// # Errors
-    /// Forwards [`io::Error`] from the underlying `ListObjectsV2` request
-    /// or XML body parse failures.
+    /// Forwards [`io::Error`] from the underlying `ListObjectsV2` request,
+    /// XML body parse failures, or a tripped circuit breaker.
     pub async fn list_objects_v2_raw(
         &self,
         full_prefix: &str,
@@ -524,18 +513,21 @@ impl Backend {
             query.push(QueryParam::new("start-after", start_after));
         }
 
-        let response = self
-            .s3_client
-            .send_empty(
-                Method::GET,
-                "",
-                query,
-                HeaderMap::new(),
-                SendOpts::default(),
-            )
-            .await
-            .map_err(|e| io_other(&e))?;
-        xml::parse_list_objects_v2(&response.body).map_err(io::Error::other)
+        self.guarded_io(async {
+            let response = self
+                .s3_client
+                .send_empty(
+                    Method::GET,
+                    "",
+                    query,
+                    HeaderMap::new(),
+                    SendOpts::default(),
+                )
+                .await
+                .map_err(|e| io_other(&e))?;
+            xml::parse_list_objects_v2(&response.body).map_err(io::Error::other)
+        })
+        .await
     }
 
     /// # Errors
@@ -549,11 +541,10 @@ impl Backend {
         continuation_token: Option<String>,
         start_after: Option<String>,
     ) -> Result<(Vec<String>, Vec<String>, Option<String>), io::Error> {
-        self.check_circuit_breaker()?;
         let full_prefix = ensure_trailing_slash(self.full_key(path));
         let full_start_after = start_after.map(|s| format!("{full_prefix}{s}{delimiter}"));
 
-        let result = self
+        let res = self
             .list_objects_v2_raw(
                 &full_prefix,
                 max_keys,
@@ -561,9 +552,7 @@ impl Backend {
                 Some(delimiter),
                 full_start_after,
             )
-            .await;
-        self.record_io_result(&result);
-        let res = result?;
+            .await?;
 
         let prefixes = res
             .common_prefixes
@@ -619,25 +608,29 @@ impl Backend {
 impl Backend {
     /// # Errors
     /// Forwards [`io::Error`] from the underlying `CreateMultipartUpload`
-    /// request or XML body parse failures.
+    /// request, XML body parse failures, or a tripped circuit breaker.
     pub async fn create_multipart_upload(&self, path: &str) -> Result<String, io::Error> {
         let key = self.full_key(path);
-        let response = self
-            .s3_client
-            .send_empty(
-                Method::POST,
-                &key,
-                vec![QueryParam::marker("uploads")],
-                HeaderMap::new(),
-                SendOpts::default(),
-            )
-            .await
-            .map_err(|e| io_other(&e))?;
-        xml::parse_create_multipart_upload(&response.body).map_err(io::Error::other)
+        self.guarded_io(async {
+            let response = self
+                .s3_client
+                .send_empty(
+                    Method::POST,
+                    &key,
+                    vec![QueryParam::marker("uploads")],
+                    HeaderMap::new(),
+                    SendOpts::default(),
+                )
+                .await
+                .map_err(|e| io_other(&e))?;
+            xml::parse_create_multipart_upload(&response.body).map_err(io::Error::other)
+        })
+        .await
     }
 
     /// # Errors
-    /// Forwards [`io::Error`] from the underlying `UploadPart` request.
+    /// Forwards [`io::Error`] from the underlying `UploadPart` request or a
+    /// tripped circuit breaker.
     pub async fn upload_part(
         &self,
         path: &str,
@@ -646,19 +639,21 @@ impl Backend {
         body: Bytes,
     ) -> Result<String, io::Error> {
         let key = self.full_key(path);
-        let response = self
-            .s3_client
-            .send(
-                Method::PUT,
-                &key,
-                part_query(upload_id, part_number),
-                HeaderMap::new(),
-                body,
-                SendOpts::default(),
-            )
-            .await
-            .map_err(|e| io_other(&e))?;
-        Ok(header_string(&response.headers, "etag").unwrap_or_default())
+        self.guarded_io(async {
+            self.s3_client
+                .send(
+                    Method::PUT,
+                    &key,
+                    part_query(upload_id, part_number),
+                    HeaderMap::new(),
+                    body,
+                    SendOpts::default(),
+                )
+                .await
+                .map(|response| header_string(&response.headers, "etag").unwrap_or_default())
+                .map_err(|e| io_other(&e))
+        })
+        .await
     }
 
     /// Streams a multipart part from a byte stream into reqwest's HTTP body.
@@ -668,7 +663,7 @@ impl Backend {
     ///
     /// # Errors
     /// Forwards [`io::Error`] from the underlying streaming `UploadPart`
-    /// request.
+    /// request or a tripped circuit breaker.
     pub async fn upload_part_streaming<S>(
         &self,
         path: &str,
@@ -681,24 +676,26 @@ impl Backend {
         S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static,
     {
         let key = self.full_key(path);
-        let response = self
-            .s3_client
-            .send_streaming_body(
-                Method::PUT,
-                &key,
-                part_query(upload_id, part_number),
-                HeaderMap::new(),
-                content_length,
-                body,
-            )
-            .await
-            .map_err(|e| io_other(&e))?;
-        Ok(header_string(&response.headers, "etag").unwrap_or_default())
+        self.guarded_io(async {
+            self.s3_client
+                .send_streaming_body(
+                    Method::PUT,
+                    &key,
+                    part_query(upload_id, part_number),
+                    HeaderMap::new(),
+                    content_length,
+                    body,
+                )
+                .await
+                .map(|response| header_string(&response.headers, "etag").unwrap_or_default())
+                .map_err(|e| io_other(&e))
+        })
+        .await
     }
 
     /// # Errors
-    /// Forwards [`io::Error`] from the underlying `UploadPartCopy` request
-    /// or XML body parse failures.
+    /// Forwards [`io::Error`] from the underlying `UploadPartCopy` request,
+    /// XML body parse failures, or a tripped circuit breaker.
     pub async fn upload_part_copy(
         &self,
         source: &str,
@@ -722,27 +719,30 @@ impl Backend {
             .map_err(|e| io::Error::other(e.to_string()))?;
         }
 
-        let response = self
-            .s3_client
-            .send_empty(
-                Method::PUT,
-                &destination_key,
-                part_query(upload_id, part_number),
-                headers,
-                SendOpts {
-                    check_embedded_error: true,
-                    ..SendOpts::default()
-                },
-            )
-            .await
-            .map_err(|e| io_other(&e))?;
-        xml::parse_upload_part_copy(&response.body).map_err(io::Error::other)
+        self.guarded_io(async {
+            let response = self
+                .s3_client
+                .send_empty(
+                    Method::PUT,
+                    &destination_key,
+                    part_query(upload_id, part_number),
+                    headers,
+                    SendOpts {
+                        check_embedded_error: true,
+                        ..SendOpts::default()
+                    },
+                )
+                .await
+                .map_err(|e| io_other(&e))?;
+            xml::parse_upload_part_copy(&response.body).map_err(io::Error::other)
+        })
+        .await
     }
 
     /// # Errors
     /// Forwards [`io::Error`] from the underlying
     /// `CompleteMultipartUpload` request, including S3-embedded `<Error>`
-    /// bodies (200-with-error responses).
+    /// bodies (200-with-error responses), or a tripped circuit breaker.
     pub async fn complete_multipart_upload(
         &self,
         path: &str,
@@ -751,48 +751,54 @@ impl Backend {
     ) -> Result<(), io::Error> {
         let key = self.full_key(path);
         let body = Bytes::from(xml::complete_multipart_upload_xml(parts));
-        self.s3_client
-            .send(
-                Method::POST,
-                &key,
-                vec![QueryParam::new("uploadId", upload_id)],
-                HeaderMap::new(),
-                body,
-                SendOpts {
-                    check_embedded_error: true,
-                    non_idempotent: true,
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| io_other(&e))
+        self.guarded_io(async {
+            self.s3_client
+                .send(
+                    Method::POST,
+                    &key,
+                    vec![QueryParam::new("uploadId", upload_id)],
+                    HeaderMap::new(),
+                    body,
+                    SendOpts {
+                        check_embedded_error: true,
+                        non_idempotent: true,
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| io_other(&e))
+        })
+        .await
     }
 
     /// # Errors
     /// Forwards [`io::Error`] from the underlying `AbortMultipartUpload`
-    /// request.
+    /// request or a tripped circuit breaker.
     pub async fn abort_multipart_upload(
         &self,
         path: &str,
         upload_id: &str,
     ) -> Result<(), io::Error> {
         let key = self.full_key(path);
-        self.s3_client
-            .send_empty(
-                Method::DELETE,
-                &key,
-                vec![QueryParam::new("uploadId", upload_id)],
-                HeaderMap::new(),
-                SendOpts::default(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| io_other(&e))
+        self.guarded_io(async {
+            self.s3_client
+                .send_empty(
+                    Method::DELETE,
+                    &key,
+                    vec![QueryParam::new("uploadId", upload_id)],
+                    HeaderMap::new(),
+                    SendOpts::default(),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| io_other(&e))
+        })
+        .await
     }
 
     /// # Errors
     /// Forwards [`io::Error`] from the underlying `ListMultipartUploads`
-    /// request or XML body parse failures.
+    /// request, XML body parse failures, or a tripped circuit breaker.
     pub async fn list_multipart_uploads(
         &self,
         prefix: Option<&str>,
@@ -810,18 +816,22 @@ impl Backend {
             query.push(QueryParam::new("upload-id-marker", m));
         }
 
-        let response = self
-            .s3_client
-            .send_empty(
-                Method::GET,
-                "",
-                query,
-                HeaderMap::new(),
-                SendOpts::default(),
-            )
-            .await
-            .map_err(|e| io_other(&e))?;
-        let parsed = xml::parse_list_multipart_uploads(&response.body).map_err(io::Error::other)?;
+        let parsed = self
+            .guarded_io(async {
+                let response = self
+                    .s3_client
+                    .send_empty(
+                        Method::GET,
+                        "",
+                        query,
+                        HeaderMap::new(),
+                        SendOpts::default(),
+                    )
+                    .await
+                    .map_err(|e| io_other(&e))?;
+                xml::parse_list_multipart_uploads(&response.body).map_err(io::Error::other)
+            })
+            .await?;
 
         let uploads = parsed
             .uploads
@@ -849,7 +859,7 @@ impl Backend {
 
     /// # Errors
     /// Forwards [`io::Error`] from any of the paginated `ListParts`
-    /// requests or XML body parse failures.
+    /// requests, XML body parse failures, or a tripped circuit breaker.
     pub async fn list_parts(
         &self,
         path: &str,
@@ -864,18 +874,22 @@ impl Backend {
             if let Some(marker) = part_number_marker {
                 query.push(QueryParam::new("part-number-marker", marker.to_string()));
             }
-            let response = self
-                .s3_client
-                .send_empty(
-                    Method::GET,
-                    &key,
-                    query,
-                    HeaderMap::new(),
-                    SendOpts::default(),
-                )
-                .await
-                .map_err(|e| io_other(&e))?;
-            let parsed = xml::parse_list_parts(&response.body).map_err(io::Error::other)?;
+            let parsed = self
+                .guarded_io(async {
+                    let response = self
+                        .s3_client
+                        .send_empty(
+                            Method::GET,
+                            &key,
+                            query,
+                            HeaderMap::new(),
+                            SendOpts::default(),
+                        )
+                        .await
+                        .map_err(|e| io_other(&e))?;
+                    xml::parse_list_parts(&response.body).map_err(io::Error::other)
+                })
+                .await?;
             parts.extend(parsed.parts);
             if parsed.is_truncated {
                 part_number_marker = parsed.next_part_number_marker;
@@ -1352,6 +1366,88 @@ mod tests {
             "CompleteMultipartUpload must make exactly one attempt on a transport error",
         )
         .await;
+    }
+
+    /// Opens the breaker by feeding it failures until `check()` rejects.
+    fn open_breaker(backend: &Backend) {
+        for _ in 0..100 {
+            if backend.circuit_breaker.check().is_err() {
+                return;
+            }
+            backend.circuit_breaker.record_failure();
+        }
+    }
+
+    #[tokio::test]
+    async fn open_breaker_rejects_multipart_and_list_ops_without_a_request() {
+        let server = MockServer::start().await;
+        let backend = mock_backend(&server);
+        open_breaker(&backend);
+
+        assert!(backend.create_multipart_upload("object").await.is_err());
+        assert!(
+            backend
+                .upload_part("object", "id", 1, Bytes::from_static(b"x"))
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .complete_multipart_upload("object", "id", &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .abort_multipart_upload("object", "id")
+                .await
+                .is_err()
+        );
+        assert!(backend.list_parts("object", "id").await.is_err());
+        assert!(
+            backend
+                .list_multipart_uploads(None, None, None)
+                .await
+                .is_err()
+        );
+        assert!(backend.list_objects("prefix", 10, None).await.is_err());
+        assert!(backend.delete_prefix("prefix").await.is_err());
+
+        assert_attempts(
+            &server,
+            0,
+            "an open breaker must reject multipart and list calls before any request is sent",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_upload_part_failures_open_the_breaker() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let config = BackendConfig {
+            max_attempts: 1,
+            ..test_config(server.uri())
+        };
+        let backend = Backend::new(&config).unwrap();
+
+        for _ in 0..100 {
+            if backend.circuit_breaker.check().is_err() {
+                break;
+            }
+            let _ = backend
+                .upload_part("object", "id", 1, Bytes::from_static(b"x"))
+                .await;
+        }
+
+        assert!(
+            backend.circuit_breaker.check().is_err(),
+            "repeated UploadPart failures must open the circuit breaker"
+        );
     }
 
     #[tokio::test]
