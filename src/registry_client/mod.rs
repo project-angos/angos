@@ -33,6 +33,16 @@ use crate::{
     secret::Secret,
 };
 
+/// Header carrying the originating event timestamp (RFC 3339) of a replication
+/// request; the receiver rejects with a 409 [`REPLICATION_SUPERSEDED_CODE`]
+/// when its local tag is strictly newer (last-writer-wins).
+pub const X_ANGOS_SOURCE_TIMESTAMP: &str = "X-Angos-Source-Timestamp";
+
+/// OCI error `code` returned when a replication write loses last-writer-wins.
+/// Shared by sender and receiver so the sender can treat this 409 as
+/// convergence (job completes) while any other 409 still retries/dead-letters.
+pub const REPLICATION_SUPERSEDED_CODE: &str = "REPLICATION_SUPERSEDED";
+
 /// Classifies a non-success read status: only a true 404 maps to `not_found`, so
 /// callers can tell a genuinely absent object from a transient probe failure.
 fn classify_read_failure(status: StatusCode, op: &str, not_found: Error) -> Error {

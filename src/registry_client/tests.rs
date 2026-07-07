@@ -12,10 +12,10 @@ use crate::{
     oci::{Digest, MediaType, Reference, Tag},
     registry::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES},
     registry_client::{
-        DeleteManifestOutcome, Error, RegistryClient, RegistryClientConfig,
+        DeleteManifestOutcome, Error, REPLICATION_SUPERSEDED_CODE, RegistryClient,
+        RegistryClientConfig, X_ANGOS_SOURCE_TIMESTAMP,
         auth::{token_cache_key, token_index_cache_key},
     },
-    replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     secret::Secret,
     test_fixtures::client::test_client_config,
 };

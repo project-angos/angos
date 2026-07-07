@@ -21,8 +21,9 @@ use tracing::{info, instrument, warn};
 use crate::{
     oci::{Digest, Tag},
     registry::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT},
-    registry_client::{Error, RegistryClient},
-    replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
+    registry_client::{
+        Error, REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP,
+    },
 };
 
 /// Body of an OCI `GET /v2/<ns>/tags/list` response.

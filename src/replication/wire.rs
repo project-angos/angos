@@ -1,4 +1,6 @@
-//! Wire constants for replication last-writer-wins and downstream manifest probes.
+//! Accept-header set for downstream manifest probes. The last-writer-wins
+//! wire constants live on the transport client (`crate::registry_client`),
+//! which speaks them on the wire for every consumer.
 
 use crate::oci::{
     DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, OCI_INDEX_MEDIA_TYPE,
@@ -19,13 +21,3 @@ pub fn manifest_accept_types() -> Vec<String> {
     .map(str::to_string)
     .to_vec()
 }
-
-/// Header carrying the originating event timestamp (RFC 3339) of a replication
-/// request; the receiver rejects with a 409 [`REPLICATION_SUPERSEDED_CODE`]
-/// when its local tag is strictly newer (last-writer-wins).
-pub const X_ANGOS_SOURCE_TIMESTAMP: &str = "X-Angos-Source-Timestamp";
-
-/// OCI error `code` returned when a replication write loses last-writer-wins.
-/// Shared by sender and receiver so the sender can treat this 409 as
-/// convergence (job completes) while any other 409 still retries/dead-letters.
-pub const REPLICATION_SUPERSEDED_CODE: &str = "REPLICATION_SUPERSEDED";

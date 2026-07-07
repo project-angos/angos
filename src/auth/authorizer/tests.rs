@@ -8,7 +8,7 @@ use super::*;
 use crate::{
     auth::Error as AuthError,
     cache,
-    command::{bootstrap, server::Error as ServerError},
+    command::bootstrap,
     configuration::Configuration,
     identity::{ClientCertificate, ManifestPutTarget, OidcClaims},
     oci::{Digest, Namespace, Reference, Tag},

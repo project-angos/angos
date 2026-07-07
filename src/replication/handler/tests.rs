@@ -24,10 +24,9 @@ use crate::{
             repository_with_replication, seed_manifest, single_repo_resolver,
         },
     },
-    registry_client::RegistryClient,
+    registry_client::{REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP},
     replication::{
-        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
-        REPLICATION_SUPERSEDED_CODE, ReplicationDownstream, X_ANGOS_SOURCE_TIMESTAMP,
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
         handler::{
             ReplicationJobHandler, ReplicationPushPayload, build_envelope,
             build_prune_delete_envelope, replication_lock_key,
