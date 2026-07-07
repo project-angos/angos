@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The `webhook_authorization_*` and `event_webhook_*` metrics are now exported on `/metrics`; they were previously registered against a registry the endpoint does not serve.
 - The repository and namespace listings of the web UI now include namespaces whose only content is in-progress uploads, so those uploads can be inspected and cancelled.
 - Upload-only namespaces are now discovered on the blob store, where upload sessions live, so the web UI listings and `scrub --orphan-namespaces` see them when the blob and metadata stores are separate backends.
 

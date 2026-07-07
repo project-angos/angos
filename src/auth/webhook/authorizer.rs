@@ -9,11 +9,11 @@ use crate::{
         cache::lookup_cached_decision,
         config::Config,
         headers::{build_cache_key, build_headers},
-        metrics::{WEBHOOK_DURATION, WEBHOOK_REQUESTS},
     },
     cache::Cache,
     command::server::Error,
     identity::{Action, ClientIdentity},
+    metrics_provider::metrics_provider,
 };
 
 pub struct WebhookAuthorizer {
@@ -59,7 +59,8 @@ impl WebhookAuthorizer {
     }
 
     fn record_outcome(&self, label: &str) {
-        WEBHOOK_REQUESTS
+        metrics_provider()
+            .webhook_auth_requests
             .with_label_values(&[self.name.as_str(), label])
             .inc();
     }
@@ -94,7 +95,8 @@ impl WebhookAuthorizer {
             return Ok(cached);
         }
 
-        let timer = WEBHOOK_DURATION
+        let timer = metrics_provider()
+            .webhook_auth_duration
             .with_label_values(&[&self.name])
             .start_timer();
         let headers = build_headers(&self.config.forward_headers, action, identity, parts)?;

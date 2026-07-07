@@ -2,7 +2,6 @@ mod authorizer;
 mod cache;
 mod config;
 mod headers;
-mod metrics;
 
 #[cfg(test)]
 mod tests;

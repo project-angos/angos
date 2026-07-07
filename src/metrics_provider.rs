@@ -104,6 +104,10 @@ pub struct MetricsProvider {
     pub metric_http_request_duration: HistogramVec,
     pub metric_http_request_in_flight: IntGauge,
     pub auth_attempts: IntCounterVec,
+    pub webhook_auth_requests: IntCounterVec,
+    pub webhook_auth_duration: HistogramVec,
+    pub event_webhook_deliveries: IntCounterVec,
+    pub event_webhook_delivery_duration: HistogramVec,
     pub lock_acquisition_duration: HistogramVec,
     pub lock_acquisitions: IntCounterVec,
     pub lock_retries: IntCounterVec,
@@ -135,6 +139,11 @@ impl MetricsProvider {
         let metric_http_request_duration = Self::build_http_request_duration(&registry)?;
         let metric_http_request_in_flight = Self::build_http_request_in_flight(&registry)?;
         let auth_attempts = Self::build_auth_attempts(&registry)?;
+        let webhook_auth_requests = Self::build_webhook_auth_requests(&registry)?;
+        let webhook_auth_duration = Self::build_webhook_auth_duration(&registry)?;
+        let event_webhook_deliveries = Self::build_event_webhook_deliveries(&registry)?;
+        let event_webhook_delivery_duration =
+            Self::build_event_webhook_delivery_duration(&registry)?;
         let lock_acquisition_duration = Self::build_lock_acquisition_duration(&registry)?;
         let lock_acquisitions = Self::build_lock_acquisitions(&registry)?;
         let lock_retries = Self::build_lock_retries(&registry)?;
@@ -156,6 +165,10 @@ impl MetricsProvider {
             metric_http_request_duration,
             metric_http_request_in_flight,
             auth_attempts,
+            webhook_auth_requests,
+            webhook_auth_duration,
+            event_webhook_deliveries,
+            event_webhook_delivery_duration,
             lock_acquisition_duration,
             lock_acquisitions,
             lock_retries,
@@ -208,6 +221,50 @@ impl MetricsProvider {
             registry
         )
         .map_err(register_err("auth_attempts_total"))
+    }
+
+    fn build_webhook_auth_requests(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "webhook_authorization_requests_total",
+            "Total webhook authorization requests",
+            &["webhook", "result"],
+            registry
+        )
+        .map_err(register_err("webhook_authorization_requests_total"))
+    }
+
+    fn build_webhook_auth_duration(registry: &PrometheusRegistry) -> Result<HistogramVec, Error> {
+        register_histogram_vec_with_registry!(
+            "webhook_authorization_duration_seconds",
+            "Webhook authorization request duration",
+            &["webhook"],
+            registry
+        )
+        .map_err(register_err("webhook_authorization_duration_seconds"))
+    }
+
+    fn build_event_webhook_deliveries(
+        registry: &PrometheusRegistry,
+    ) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "event_webhook_deliveries_total",
+            "Total event webhook deliveries",
+            &["webhook", "event", "result"],
+            registry
+        )
+        .map_err(register_err("event_webhook_deliveries_total"))
+    }
+
+    fn build_event_webhook_delivery_duration(
+        registry: &PrometheusRegistry,
+    ) -> Result<HistogramVec, Error> {
+        register_histogram_vec_with_registry!(
+            "event_webhook_delivery_duration_seconds",
+            "Event webhook delivery duration",
+            &["webhook", "event"],
+            registry
+        )
+        .map_err(register_err("event_webhook_delivery_duration_seconds"))
     }
 
     fn build_lock_acquisition_duration(

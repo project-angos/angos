@@ -1,12 +1,15 @@
 use tracing::warn;
 
-use crate::{auth::webhook::metrics::WEBHOOK_REQUESTS, cache::Cache};
+use crate::{cache::Cache, metrics_provider::metrics_provider};
 
 pub async fn lookup_cached_decision(cache: &Cache, name: &str, cache_key: &str) -> Option<bool> {
     match cache.retrieve::<bool>(cache_key).await {
         Ok(Some(value)) => {
             let label = if value { "cached_allow" } else { "cached_deny" };
-            WEBHOOK_REQUESTS.with_label_values(&[name, label]).inc();
+            metrics_provider()
+                .webhook_auth_requests
+                .with_label_values(&[name, label])
+                .inc();
             Some(value)
         }
         Ok(None) => None,
@@ -24,6 +27,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_cached_decision_unwraps_hit_to_some_value() {
+        crate::metrics_provider::init_for_tests();
         let cache = cache::Config::Memory.to_backend().unwrap();
         cache.store("allow-key", &true, 60).await.unwrap();
         cache.store("deny-key", &false, 60).await.unwrap();

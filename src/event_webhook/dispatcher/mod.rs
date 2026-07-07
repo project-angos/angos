@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -10,7 +10,6 @@ use std::{
 use angos_backoff::Backoff;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
-use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
 use reqwest::Client;
 use sha2::Sha256;
 use tokio::{sync::Mutex, task::JoinSet};
@@ -28,26 +27,9 @@ use crate::{
         event::{Event, EventKind},
     },
     http_client::HttpClientBuilder,
+    metrics_provider::metrics_provider,
     secret::Secret,
 };
-
-static DELIVERY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
-        "event_webhook_deliveries_total",
-        "Total event webhook deliveries",
-        &["webhook", "event", "result"]
-    )
-    .unwrap()
-});
-
-static DELIVERY_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
-        "event_webhook_delivery_duration_seconds",
-        "Event webhook delivery duration",
-        &["webhook", "event"]
-    )
-    .unwrap()
-});
 
 pub struct EventDispatcher {
     endpoints: HashMap<String, WebhookEndpoint>,
@@ -181,7 +163,8 @@ impl EventDispatcher {
     ) -> Result<(), String> {
         let result = Self::send_with_retries(req, max_retries, backoff).await;
         let result_label = if result.is_ok() { "success" } else { "error" };
-        DELIVERY_TOTAL
+        metrics_provider()
+            .event_webhook_deliveries
             .with_label_values(&[webhook_name, req.event_kind_header, result_label])
             .inc();
         result
@@ -344,7 +327,8 @@ impl EventDispatcher {
                 continue;
             }
 
-            let timer = DELIVERY_DURATION
+            let timer = metrics_provider()
+                .event_webhook_delivery_duration
                 .with_label_values(&[name.as_str(), event_kind_header])
                 .start_timer();
 
