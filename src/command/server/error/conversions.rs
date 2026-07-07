@@ -1,6 +1,7 @@
 use hyper::StatusCode;
 
 use crate::{
+    auth,
     command::{bootstrap, server::error::Error},
     configuration, event_webhook, registry,
     registry::{blob_store, job_store},
@@ -82,6 +83,20 @@ impl From<registry::Error> for Error {
                 "INTERNAL_ERROR",
                 Some(error.to_string()),
             ),
+        }
+    }
+}
+
+impl From<auth::Error> for Error {
+    fn from(e: auth::Error) -> Self {
+        match e {
+            auth::Error::Initialization(msg) => Error::Initialization(msg),
+            auth::Error::Execution(msg) => Error::Execution(msg),
+            auth::Error::Unauthorized(msg) => Error::Unauthorized(msg),
+            auth::Error::Conflict(msg) => Error::Conflict(msg),
+            auth::Error::ProviderUnavailable(msg) => Error::ProviderUnavailable(msg),
+            // A registry error the authorizer surfaced keeps its OCI mapping.
+            auth::Error::Registry(inner) => Error::from(*inner),
         }
     }
 }

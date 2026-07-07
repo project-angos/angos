@@ -6,8 +6,8 @@ use hyper::{
 };
 
 use crate::{
+    auth::Error,
     auth::sha256_hex,
-    command::server::Error,
     identity::{Action, ClientIdentity},
 };
 

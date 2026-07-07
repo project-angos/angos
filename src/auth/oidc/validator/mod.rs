@@ -7,12 +7,12 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::{
+    auth::Error,
     auth::{
         oidc::{Jwk, OidcProvider},
         sha256_hex,
     },
     cache::Cache,
-    command::server::Error,
     identity::OidcClaims,
 };
 

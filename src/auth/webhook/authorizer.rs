@@ -5,13 +5,13 @@ use reqwest::{Client, StatusCode};
 use tracing::warn;
 
 use crate::{
+    auth::Error,
     auth::webhook::{
         cache::lookup_cached_decision,
         config::Config,
         headers::{build_cache_key, build_headers},
     },
     cache::Cache,
-    command::server::Error,
     identity::{Action, ClientIdentity},
     metrics_provider::metrics_provider,
 };

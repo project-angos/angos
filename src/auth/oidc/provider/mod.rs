@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use jsonwebtoken::Algorithm;
 
-use crate::command::server::Error;
+use crate::auth::Error;
 
 pub struct BaseConfig {
     pub issuer: String,

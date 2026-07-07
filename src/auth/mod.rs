@@ -1,6 +1,7 @@
 pub mod authenticator;
 pub mod authorizer;
 pub mod basic_auth;
+mod error;
 pub mod mtls;
 pub mod oidc;
 pub mod webhook;
@@ -9,12 +10,13 @@ use async_trait::async_trait;
 pub use authenticator::Authenticator;
 pub use authorizer::Authorizer;
 pub use basic_auth::BasicAuthValidator;
+pub use error::Error;
 use hyper::http::request::Parts;
 pub use mtls::{MtlsValidator, PeerCertificate};
 pub use oidc::OidcValidator;
 use sha2::{Digest as Sha2Digest, Sha256};
 
-use crate::{command::server::Error, identity::ClientIdentity};
+use crate::identity::ClientIdentity;
 
 /// Lowercase-hex sha256 of `data`, for deriving stable, bounded-length cache
 /// keys from arbitrary key material.

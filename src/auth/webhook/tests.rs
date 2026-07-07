@@ -9,6 +9,7 @@ use wiremock::{
 };
 
 use crate::{
+    auth::Error,
     auth::webhook::{
         Config, WebhookAuthorizer,
         config::WebhookAuth,
@@ -23,7 +24,6 @@ use crate::{
         },
     },
     cache::{self, Cache},
-    command::server::Error,
     http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
     oci::{Digest, Namespace, Reference, Tag},

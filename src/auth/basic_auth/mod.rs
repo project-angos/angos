@@ -10,10 +10,7 @@ use serde::{Deserialize, de};
 use tracing::{debug, instrument};
 
 use super::{AuthMiddleware, AuthResult};
-use crate::{
-    command::server::{Error, RequestHeaders},
-    identity::ClientIdentity,
-};
+use crate::{auth::Error, command::server::RequestHeaders, identity::ClientIdentity};
 
 /// An Argon2 password hash string, validated at deserialize time.
 #[derive(Clone)]

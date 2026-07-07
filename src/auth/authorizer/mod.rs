@@ -5,9 +5,9 @@ use reqwest::Client;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
+    auth::Error,
     auth::webhook::{self, WebhookAuthorizer},
     cache::Cache,
-    command::server::Error,
     configuration::{Configuration, RegexPattern},
     http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},

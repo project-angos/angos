@@ -6,6 +6,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use super::*;
 use crate::{
+    auth::Error as AuthError,
     cache,
     command::{bootstrap, server::Error as ServerError},
     configuration::Configuration,
@@ -296,8 +297,8 @@ fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
 
     let result = authorizer.check_immutable_tag("myrepo", &action);
 
-    let Err(ServerError::Conflict(msg)) = result else {
-        panic!("expected Err(ServerError::Conflict(_)), got: {result:?}");
+    let Err(AuthError::Conflict(msg)) = result else {
+        panic!("expected Err(AuthError::Conflict(_)), got: {result:?}");
     };
     assert!(
         msg.contains("v1.0.0") && msg.contains("immutable"),
@@ -334,8 +335,8 @@ fn test_check_immutable_tag_returns_conflict_for_by_digest_tag_on_push() {
 
     let result = authorizer.check_immutable_tag("myrepo", &action);
 
-    let Err(ServerError::Conflict(msg)) = result else {
-        panic!("expected Err(ServerError::Conflict(_)), got: {result:?}");
+    let Err(AuthError::Conflict(msg)) = result else {
+        panic!("expected Err(AuthError::Conflict(_)), got: {result:?}");
     };
     assert!(
         msg.contains("v1.0.0") && msg.contains("immutable"),
@@ -612,7 +613,7 @@ async fn global_deny_policy_rejects_all_requests() {
         .await;
 
     assert!(
-        matches!(result, Err(ServerError::Unauthorized(_))),
+        matches!(result, Err(AuthError::Unauthorized(_))),
         "global deny policy must reject ApiVersion, got: {result:?}"
     );
 }
@@ -692,7 +693,7 @@ async fn global_webhook_path_deny_when_webhook_returns_403() {
         .await;
 
     assert!(
-        matches!(result, Err(ServerError::Unauthorized(_))),
+        matches!(result, Err(AuthError::Unauthorized(_))),
         "global webhook returning 403 must deny the request, got: {result:?}"
     );
 }
@@ -815,7 +816,7 @@ async fn indeterminate_global_policy_denies_request() {
         .await;
 
     assert!(
-        matches!(result, Err(ServerError::Unauthorized(_))),
+        matches!(result, Err(AuthError::Unauthorized(_))),
         "an indeterminate global policy must deny the request, got: {result:?}"
     );
 }

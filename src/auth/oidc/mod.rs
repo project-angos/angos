@@ -13,12 +13,13 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::{
+    auth::Error,
     auth::{
         AuthMiddleware, AuthResult,
         oidc::provider::{generic, github},
     },
     cache::Cache,
-    command::server::{Error, RequestHeaders},
+    command::server::RequestHeaders,
     identity::{ClientIdentity, OidcClaims},
 };
 
