@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Security
 
 - `X-Forwarded-For`/`X-Real-IP` are no longer trusted unconditionally: the client IP used by access policies and webhooks now comes from these headers only when the peer is listed in the new `global.trusted_proxies` option, otherwise from the socket address.
+- Basic-auth response timing no longer reveals whether a username exists: an unknown username now costs the same Argon2 verification as a known one.
+- Duplicate usernames across `[auth.identity]` entries are now rejected at startup instead of nondeterministically shadowing each other's identity id.
 
 ### Added
 

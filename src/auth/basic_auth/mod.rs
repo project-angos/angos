@@ -48,30 +48,62 @@ pub struct Config {
 
 pub struct BasicAuthValidator {
     users: HashMap<String, (String, PasswordHash)>,
+    /// Hash verified on the unknown-username path so a miss costs the same
+    /// Argon2 work as a hit and response timing cannot enumerate usernames.
+    timing_guard: PasswordHash,
 }
 
-fn build_users(identities: &HashMap<String, Config>) -> HashMap<String, (String, PasswordHash)> {
-    identities
-        .iter()
-        .map(|(id, config)| {
-            (
+/// A fixed hash carrying `Argon2::default()`'s cost parameters; the password
+/// it encodes never matches, only its verification cost matters.
+const TIMING_GUARD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$YW5nb3MtdGltaW5nLWd1YXJk$FCScuxFhlmRU1Dn23hjKGjIaNsd/kD4tKsHrHAQU5VQ";
+
+/// Maps identities to a username-keyed lookup table, rejecting duplicate
+/// usernames: two `[auth.identity.*]` entries sharing a username would
+/// otherwise collapse into whichever the map iterates last, making the
+/// winning identity id (used by CEL rules and webhooks) change across
+/// restarts.
+fn build_users(
+    identities: &HashMap<String, Config>,
+) -> Result<HashMap<String, (String, PasswordHash)>, Error> {
+    let mut users = HashMap::with_capacity(identities.len());
+    for (id, config) in identities {
+        if users
+            .insert(
                 config.username.clone(),
                 (id.clone(), config.password.clone()),
             )
-        })
-        .collect()
+            .is_some()
+        {
+            return Err(Error::Initialization(format!(
+                "duplicate basic-auth username '{}' across [auth.identity] entries",
+                config.username
+            )));
+        }
+    }
+    Ok(users)
 }
 
 impl BasicAuthValidator {
-    pub fn new(identities: &HashMap<String, Config>) -> Self {
-        Self {
-            users: build_users(identities),
-        }
+    /// # Errors
+    ///
+    /// Returns [`Error::Initialization`] when two identities share a username.
+    pub fn new(identities: &HashMap<String, Config>) -> Result<Self, Error> {
+        let timing_guard = PasswordHashString::new(TIMING_GUARD_HASH)
+            .map(PasswordHash)
+            .map_err(|e| Error::Initialization(format!("invalid timing-guard hash: {e}")))?;
+        Ok(Self {
+            users: build_users(identities)?,
+            timing_guard,
+        })
     }
 
     #[instrument(skip(self, password))]
     pub fn validate_credentials(&self, username: &str, password: &str) -> Option<String> {
         let Some((identity_id, identity_password)) = self.users.get(username) else {
+            // Burn the same Argon2 work as a real verification so response
+            // timing cannot reveal whether the username exists.
+            let _ = Argon2::default()
+                .verify_password(password.as_bytes(), &self.timing_guard.as_password_hash());
             debug!("Username not found in credentials");
             return None;
         };
