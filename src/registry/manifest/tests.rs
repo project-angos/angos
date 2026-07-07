@@ -16,8 +16,8 @@ use crate::{
         metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
         path_builder::blob_path,
         test_utils::{
-            FSRegistryTestCase, RegistryTestCase, for_each_backend, put_blob_direct, put_link_raw,
-            upload_blob,
+            FSRegistryTestCase, RegistryTestCase, for_each_backend, get_blob, put_blob_direct,
+            put_link_raw, upload_blob,
         },
     },
     replication::REPLICATION_SUPERSEDED_CODE,
@@ -612,8 +612,7 @@ async fn permissive_push_does_not_grant_read_of_unowned_referenced_blob() {
     );
 
     let repository = permissive.get_repository_for_namespace(&attacker).unwrap();
-    let outcome = permissive
-        .get_blob(repository, &[], &attacker, &layer_digest, None)
+    let outcome = get_blob(&permissive, repository, &[], &attacker, &layer_digest, None)
         .await
         .map(|_| ());
     assert!(
@@ -745,14 +744,26 @@ async fn permissive_push_of_owned_references_yields_a_pullable_manifest() {
         )
         .await
         .expect("the pushed manifest must be pullable by tag");
-    permissive
-        .get_blob(repository, &[], &namespace, &config_digest, None)
-        .await
-        .expect("the owned config blob must be pullable");
-    permissive
-        .get_blob(repository, &[], &namespace, &layer_digest, None)
-        .await
-        .expect("the owned layer blob must be pullable");
+    get_blob(
+        &permissive,
+        repository,
+        &[],
+        &namespace,
+        &config_digest,
+        None,
+    )
+    .await
+    .expect("the owned config blob must be pullable");
+    get_blob(
+        &permissive,
+        repository,
+        &[],
+        &namespace,
+        &layer_digest,
+        None,
+    )
+    .await
+    .expect("the owned layer blob must be pullable");
 }
 
 #[tokio::test]
@@ -986,7 +997,11 @@ async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
         let digest = header_digest(&response.headers);
 
         // Hold the lock, then start the delete: it must block, not reclaim.
-        let session = registry.acquire_blob_data_lock(&digest).await.unwrap();
+        let session = registry
+            .metadata_store
+            .acquire_blob_data_lock(&digest)
+            .await
+            .unwrap();
         let reference = Reference::Digest(digest.clone());
         let delete = registry.delete_manifest(None, None, first, &reference);
         tokio::pin!(delete);

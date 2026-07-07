@@ -65,7 +65,7 @@ use crate::{
         global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
     },
     event_webhook::{dispatcher::EventDispatcher, event::Event},
-    oci::{Digest, Namespace},
+    oci::Namespace,
     registry::{
         blob_store::BlobStore,
         cache_job_handler::CacheJobHandler,
@@ -76,7 +76,6 @@ use crate::{
     },
     replication::ReplicationJobHandler,
 };
-use angos_tx_engine::lock::LockSession;
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
@@ -341,23 +340,6 @@ impl Registry {
         self.get_repository_for_namespace(namespace)
             .map(|r| r.name.to_string())
             .unwrap_or_default()
-    }
-
-    /// Acquire the coarse `blob-data:{digest}` lock that serialises blob-data
-    /// creation (upload completion) against reclamation (unreferenced delete)
-    /// and against concurrent manifest pushes, which declare the same coarse
-    /// lock on their link transactions. Without it, a delete can reclaim a
-    /// content-addressed blob's bytes in the window between another repository
-    /// granting a reference and validating its manifest, surfacing as
-    /// `ManifestBlobUnknown`.
-    ///
-    /// Delegates to [`MetadataStore::acquire_blob_data_lock`], the canonical
-    /// home for the key string and the lock domain (the metadata executor).
-    pub async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockSession, Error> {
-        self.metadata_store
-            .acquire_blob_data_lock(digest)
-            .await
-            .map_err(|e| Error::Internal(format!("blob-data lock acquire failed: {e}")))
     }
 }
 

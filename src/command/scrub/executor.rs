@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -145,28 +145,6 @@ pub fn record_reconcile_outcome(outcome: &str) {
 }
 
 impl Executor {
-    /// Acquire the `blob-data:{digest}` coarse lock (the same one manifest
-    /// pushes and upload completions take), run `critical_section` while holding
-    /// it, then release the lock whatever the section's outcome.
-    ///
-    /// The lock spans a re-check plus a data mutation so a reference a
-    /// concurrent push is granting cannot be missed and have its bytes reclaimed
-    /// underneath it.
-    async fn with_blob_data_lock<F, Fut>(
-        &self,
-        digest: &Digest,
-        critical_section: F,
-    ) -> Result<(), Error>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(), Error>>,
-    {
-        let session = self.metadata_store.acquire_blob_data_lock(digest).await?;
-        let result = critical_section().await;
-        session.release().await;
-        result
-    }
-
     async fn migrate_blob_index(&self, digest: Digest) -> Result<(), Error> {
         self.metadata_store.migrate_blob_index(&digest).await?;
         Ok(())
@@ -179,24 +157,29 @@ impl Executor {
         Ok(())
     }
 
+    /// Deletes the orphan's bytes under the `blob-data:{digest}` coarse lock
+    /// (the same one manifest pushes and upload completions take), so a
+    /// reference a concurrent push is granting cannot be missed and have its
+    /// bytes reclaimed underneath it.
     async fn delete_orphan_blob(&self, digest: Digest) -> Result<(), Error> {
-        self.with_blob_data_lock(&digest, || async {
-            match self.metadata_store.has_blob_references(&digest).await {
-                Err(e) => Err(Error::from(e)),
-                Ok(true) => {
-                    info!("skipping orphan blob deletion: reference appeared for {digest}");
-                    Ok(())
-                }
-                Ok(false) => match self.blob_store.delete_blob(&digest).await {
-                    Ok(())
-                    | Err(
-                        blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
-                    ) => Ok(()),
+        self.metadata_store
+            .with_blob_data_lock(&digest, async {
+                match self.metadata_store.has_blob_references(&digest).await {
                     Err(e) => Err(Error::from(e)),
-                },
-            }
-        })
-        .await
+                    Ok(true) => {
+                        info!("skipping orphan blob deletion: reference appeared for {digest}");
+                        Ok(())
+                    }
+                    Ok(false) => match self.blob_store.delete_blob(&digest).await {
+                        Ok(())
+                        | Err(
+                            blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
+                        ) => Ok(()),
+                        Err(e) => Err(Error::from(e)),
+                    },
+                }
+            })
+            .await
     }
 
     async fn remove_blob_index_link(
@@ -226,23 +209,24 @@ impl Executor {
         blob: Digest,
         link: LinkKind,
     ) -> Result<(), Error> {
-        self.with_blob_data_lock(&blob, || async {
-            match self.blob_store.size(&blob).await {
-                Ok(_) => {}
-                Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                    info!(
-                        "skipping blob-index grant: bytes were reclaimed for '{namespace}/{blob}'"
-                    );
-                    return Ok(());
+        self.metadata_store
+            .with_blob_data_lock(&blob, async {
+                match self.blob_store.size(&blob).await {
+                    Ok(_) => {}
+                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                        info!(
+                            "skipping blob-index grant: bytes were reclaimed for '{namespace}/{blob}'"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => return Err(Error::from(e)),
                 }
-                Err(e) => return Err(Error::from(e)),
-            }
-            self.metadata_store
-                .update_blob_index(&namespace, &blob, BlobIndexOperation::Insert(link.clone()))
-                .await?;
-            Ok(())
-        })
-        .await
+                self.metadata_store
+                    .update_blob_index(&namespace, &blob, BlobIndexOperation::Insert(link.clone()))
+                    .await?;
+                Ok(())
+            })
+            .await
     }
 
     async fn remove_orphan_blob_grant(
@@ -250,38 +234,39 @@ impl Executor {
         namespace: Namespace,
         blob: Digest,
     ) -> Result<(), Error> {
-        self.with_blob_data_lock(&blob, || async {
-            // Re-check under the lock: a manifest reference may have appeared
-            // since the checker classified the grant as orphaned.
-            let links = match self
-                .metadata_store
-                .read_blob_index_namespace(&namespace, &blob)
-                .await
-            {
-                Ok(links) => links,
-                // The grant vanished since classification (a concurrent revoke
-                // or delete): nothing left to do.
-                Err(MetadataError::ReferenceNotFound) => return Ok(()),
-                Err(e) => return Err(Error::from(e)),
-            };
-            if links.iter().any(LinkKind::is_tracked) {
-                info!(
-                    "skipping orphan grant revoke: a manifest reference appeared for '{namespace}/{blob}'"
-                );
-                return Ok(());
-            }
-            // Revoke the grant, then reclaim the now-unreferenced manifest
-            // blob-data from the blob store under the same lock.
-            if self
-                .metadata_store
-                .revoke_blob_ownership(&namespace, &blob)
-                .await?
-            {
-                self.blob_store.delete_blob(&blob).await?;
-            }
-            Ok(())
-        })
-        .await
+        self.metadata_store
+            .with_blob_data_lock(&blob, async {
+                // Re-check under the lock: a manifest reference may have appeared
+                // since the checker classified the grant as orphaned.
+                let links = match self
+                    .metadata_store
+                    .read_blob_index_namespace(&namespace, &blob)
+                    .await
+                {
+                    Ok(links) => links,
+                    // The grant vanished since classification (a concurrent revoke
+                    // or delete): nothing left to do.
+                    Err(MetadataError::ReferenceNotFound) => return Ok(()),
+                    Err(e) => return Err(Error::from(e)),
+                };
+                if links.iter().any(LinkKind::is_tracked) {
+                    info!(
+                        "skipping orphan grant revoke: a manifest reference appeared for '{namespace}/{blob}'"
+                    );
+                    return Ok(());
+                }
+                // Revoke the grant, then reclaim the now-unreferenced manifest
+                // blob-data from the blob store under the same lock.
+                if self
+                    .metadata_store
+                    .revoke_blob_ownership(&namespace, &blob)
+                    .await?
+                {
+                    self.blob_store.delete_blob(&blob).await?;
+                }
+                Ok(())
+            })
+            .await
     }
 
     async fn recreate_link(

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use angos_tx_engine::{executor::TransactionExecutor, lock::LockSession, store::Store};
 
@@ -113,7 +113,10 @@ impl MetadataStore {
         self.store.executor().as_ref()
     }
 
-    /// Acquire the coarse [`blob_data_lock_key`] lock for `digest`.
+    /// Acquire the coarse [`blob_data_lock_key`] lock for `digest`, which
+    /// serialises blob-data creation (upload completion) against reclamation
+    /// (unreferenced delete) and against concurrent manifest pushes, which
+    /// declare the same coarse lock on their link transactions.
     ///
     /// Lives on the METADATA executor — the one domain every blob-data
     /// participant (manifest push, upload, scrub) agrees on — even though the
@@ -125,5 +128,22 @@ impl MetadataStore {
             .acquire(&keys)
             .await
             .map_err(|e| Error::Coordination(format!("blob-data lock acquire failed: {e}")))
+    }
+
+    /// Run `op` while holding the coarse blob-data lock for `digest`,
+    /// releasing the lock whatever the outcome. `op` is not polled before the
+    /// lock is acquired.
+    pub async fn with_blob_data_lock<T, E>(
+        &self,
+        digest: &Digest,
+        op: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, E>
+    where
+        E: From<Error>,
+    {
+        let session = self.acquire_blob_data_lock(digest).await?;
+        let result = op.await;
+        session.release().await;
+        result
     }
 }
