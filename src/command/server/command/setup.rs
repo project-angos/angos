@@ -45,7 +45,9 @@ pub async fn build_metadata_store(
         let cas = if let Some(cas) = cached {
             cas
         } else {
-            let probed = storage_config.probe().await.map_err(Error::from)?;
+            let probed = bootstrap::probe_storage(&storage_config)
+                .await
+                .map_err(Error::from)?;
             let resolved = probed.unwrap_or_default();
             *cached_conditional_operations
                 .lock()
@@ -107,7 +109,7 @@ pub async fn build_registry(
     // store the metadata/job paths use.
     let storage_config = config.resolve_registry_storage();
     let maintenance_handles = if engine_maintenance.is_some() || config.global.job_queue.is_some() {
-        Some(storage_config.build_store().await?)
+        Some(bootstrap::build_store(&storage_config).await?)
     } else {
         None
     };
