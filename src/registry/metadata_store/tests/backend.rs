@@ -50,6 +50,7 @@ async fn test_update_blob_index_legacy_applies_correctly() {
     // Verify the legacy file picked up the new link.
     let raw = backend
         .store()
+        .object_store()
         .get(&path_builder::blob_index_path(&digest))
         .await
         .unwrap();
@@ -69,6 +70,7 @@ async fn test_update_blob_index_legacy_applies_correctly() {
 
     backend
         .store()
+        .object_store()
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();

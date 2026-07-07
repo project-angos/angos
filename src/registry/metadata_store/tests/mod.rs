@@ -121,6 +121,7 @@ pub async fn put_legacy_index(backend: &MetadataStore, digest: &Digest, index: &
     let body = Bytes::from(serde_json::to_vec(index).unwrap());
     backend
         .store()
+        .object_store()
         .put(&path_builder::blob_index_path(digest), body)
         .await
         .unwrap();
@@ -240,6 +241,7 @@ pub async fn test_datastore_list_tag_names_includes_malformed(m: Arc<MetadataSto
     // A directory whose name fails the tag grammar (leading '-'), planted by
     // writing a raw `current/link` object so validation is bypassed.
     m.store()
+        .object_store()
         .put(
             &format!(
                 "{}/current/link",
@@ -280,6 +282,7 @@ pub async fn test_datastore_delete_tag_directory_guards_unsafe_names(m: Arc<Meta
     // Positive case: a safe but grammar-invalid name (leading '-') is the normal
     // invalid-tag scrub target and must be deleted, proving no over-rejection.
     m.store()
+        .object_store()
         .put(
             &format!(
                 "{}/current/link",

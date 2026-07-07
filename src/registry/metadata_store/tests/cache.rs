@@ -34,7 +34,12 @@ async fn test_read_link_cache_hit_skips_storage() {
 
     // Delete the storage object directly
     let link_path = path_builder::link_path(&tag, &namespace);
-    backend.store().delete(&link_path).await.unwrap();
+    backend
+        .store()
+        .object_store()
+        .delete(&link_path)
+        .await
+        .unwrap();
 
     // Second read should succeed from cache
     let meta = backend.read_link(&namespace, &tag).await.unwrap();
@@ -146,7 +151,12 @@ async fn test_update_links_populates_cache_on_overwrite() {
 
     // Delete the storage object to prove the read comes from cache
     let link_path = path_builder::link_path(&tag, &namespace);
-    backend.store().delete(&link_path).await.unwrap();
+    backend
+        .store()
+        .object_store()
+        .delete(&link_path)
+        .await
+        .unwrap();
 
     let meta = backend.read_link(&namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest_b);
@@ -173,7 +183,12 @@ async fn test_update_links_populates_cache_on_create() {
 
     // Delete the storage object to prove the read comes from cache
     let link_path = path_builder::link_path(&tag, &namespace);
-    backend.store().delete(&link_path).await.unwrap();
+    backend
+        .store()
+        .object_store()
+        .delete(&link_path)
+        .await
+        .unwrap();
 
     let meta = backend.read_link(&namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest);
@@ -275,7 +290,12 @@ async fn test_cache_disabled_when_ttl_zero() {
     assert_eq!(meta.target, digest);
 
     let link_path = path_builder::link_path(&tag, &namespace);
-    backend.store().delete(&link_path).await.unwrap();
+    backend
+        .store()
+        .object_store()
+        .delete(&link_path)
+        .await
+        .unwrap();
 
     let result = backend.read_link(&namespace, &tag).await;
     assert!(

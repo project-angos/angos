@@ -101,9 +101,9 @@ pub async fn append_shard_for_digest(
     let shard_path = path_builder::blob_index_shard_path(digest, namespace);
 
     // Check for legacy layout first with a cheap HEAD.
-    match store.head(&legacy_path).await {
+    match store.object_store().head(&legacy_path).await {
         Ok(_) => {
-            match store.get(&legacy_path).await {
+            match store.object_store().get(&legacy_path).await {
                 Ok(data) => {
                     let raw = Bytes::from(data.clone());
                     let mut legacy: BlobIndex = serde_json::from_slice(&data).unwrap_or_default();
@@ -139,7 +139,7 @@ pub async fn append_shard_for_digest(
     }
 
     // Sharded path.
-    match store.get(&shard_path).await {
+    match store.object_store().get(&shard_path).await {
         Ok(data) => {
             let raw = Bytes::from(data.clone());
             let mut links: HashSet<LinkKind> = serde_json::from_slice(&data).unwrap_or_default();
@@ -193,7 +193,7 @@ pub(crate) async fn shard_will_be_empty(
     legacy_path: &str,
 ) -> Result<bool, TxError> {
     // Try legacy path first.
-    match store.get(legacy_path).await {
+    match store.object_store().get(legacy_path).await {
         Ok(data) => {
             let mut legacy: BlobIndex = serde_json::from_slice(&data).unwrap_or_default();
             if let Some(entry) = legacy.namespace.get_mut(namespace) {
@@ -207,7 +207,7 @@ pub(crate) async fn shard_will_be_empty(
     }
 
     // Sharded path.
-    match store.get(shard_path).await {
+    match store.object_store().get(shard_path).await {
         Ok(data) => {
             let mut links: HashSet<LinkKind> = serde_json::from_slice(&data).unwrap_or_default();
             apply_blob_index_operations(&mut links, ops);
@@ -228,6 +228,7 @@ pub(crate) async fn any_other_namespace_references_blob(
     let mut continuation = None;
     loop {
         let page = store
+            .object_store()
             .list(refs_prefix, 100, continuation)
             .await
             .map_err(Error::from)?;

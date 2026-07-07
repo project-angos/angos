@@ -445,7 +445,12 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
 
     // Delete the storage object to prove the next read must come from cache.
     let link_path = path_builder::link_path(&tag, &namespace);
-    backend.store().delete(&link_path).await.unwrap();
+    backend
+        .store()
+        .object_store()
+        .delete(&link_path)
+        .await
+        .unwrap();
 
     let meta = backend
         .read_link_recording_access(&namespace, &tag)

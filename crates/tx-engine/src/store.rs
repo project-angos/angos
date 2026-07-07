@@ -16,35 +16,25 @@
 //!
 //! # Error surface
 //!
-//! Plain reads, non-transactional writes, and the upload primitives return
-//! [`StorageError`] so callers keep matching [`StorageError::NotFound`]
-//! directly. The coordinated helpers ([`Store::update`] and
-//! [`Store::update_with_payload`]) return the engine [`Error`] (carrying
-//! `Conflict`/`Precondition`).
+//! Raw object I/O (reads, non-transactional writes, the upload lifecycle)
+//! goes straight through [`Store::object_store`] and returns [`StorageError`],
+//! so callers keep matching [`StorageError::NotFound`] directly. The
+//! coordinated helpers ([`Store::update`] and [`Store::update_with_payload`])
+//! return the engine [`Error`] (carrying `Conflict`/`Precondition`).
 
-use std::{
-    fmt,
-    future::Future,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{fmt, future::Future, sync::Arc};
 
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info};
 
-use angos_storage::{
-    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error as StorageError,
-    MultipartUploadPage, ObjectMeta, ObjectStore, Page,
-};
+use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 
 #[cfg(feature = "redis")]
 use crate::lock::storage::redis::RedisLockStorage;
 use crate::{
     error::Error,
-    executor::{
-        Outcome, TransactionExecutor, cas::CasExecutor, execute_with_retry_payload,
-        locked::LockedExecutor,
-    },
+    executor::{Outcome, TransactionExecutor, cas::CasExecutor, locked::LockedExecutor},
     janitor::{BodyJanitor, LockJanitor},
     lock::{
         LockStrategy,
@@ -260,119 +250,13 @@ impl Store {
         &self.executor
     }
 
-    /// The composed object store. Escape hatch for code that must hand an
-    /// `Arc<dyn ObjectStore>` to a helper (e.g. concurrent buffered reads, the
-    /// upload-session lifecycle, or test wrappers that intercept the storage
-    /// seam).
+    /// The composed object store: the single surface for raw object I/O
+    /// (reads, non-transactional writes, the upload lifecycle). Only the
+    /// coordinated paths (`execute`, `update*`, `read_for_update`) live on
+    /// the façade itself.
     #[must_use]
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object
-    }
-
-    // Reads (passthrough; surface `StorageError::NotFound` directly)
-
-    /// Read the full object body into memory.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageError::NotFound`] when `key` is absent; otherwise the backend
-    /// [`StorageError`].
-    pub async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        self.object.get(key).await
-    }
-
-    /// Open a streaming reader over the object body. The returned `u64` is the
-    /// total object size, not the remaining length after `offset`.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageError::NotFound`] when `key` is absent; otherwise the backend
-    /// [`StorageError`].
-    pub async fn get_stream(
-        &self,
-        key: &str,
-        offset: Option<u64>,
-    ) -> Result<(BoxedReader, u64), StorageError> {
-        self.object.get_stream(key, offset).await
-    }
-
-    /// Return the object's size and (when available) `ETag`/last-modified.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageError::NotFound`] when `key` is absent; otherwise the backend
-    /// [`StorageError`].
-    pub async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-        self.object.head(key).await
-    }
-
-    /// Flat-recursive enumeration of up to `n` keys under `prefix`.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the backend [`StorageError`].
-    pub async fn list(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-    ) -> Result<Page<String>, StorageError> {
-        self.object.list(prefix, n, token).await
-    }
-
-    /// One-level enumeration of children under `prefix`.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the backend [`StorageError`].
-    pub async fn list_children(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-        start_after: Option<String>,
-    ) -> Result<ChildrenPage, StorageError> {
-        self.object
-            .list_children(prefix, n, token, start_after)
-            .await
-    }
-
-    // Non-transactional writes (session records, best-effort cleanup)
-
-    /// Write `data` to `key`, replacing any existing object.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the backend [`StorageError`].
-    pub async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
-        self.object.put(key, data).await
-    }
-
-    /// Delete `key`. Missing key counts as success.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the backend [`StorageError`].
-    pub async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        self.object.delete(key).await
-    }
-
-    /// Delete every object whose key starts with `prefix`.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the backend [`StorageError`].
-    pub async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
-        self.object.delete_prefix(prefix).await
-    }
-
-    /// Server-side copy from `source` to `destination`.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the backend [`StorageError`].
-    pub async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
-        self.object.copy(source, destination).await
     }
 
     // Transactions
@@ -470,19 +354,18 @@ impl Store {
     /// `T` out of the retry loop alongside the mutations. Used by callers that
     /// need the value they just wrote (e.g. the updated metadata record).
     ///
+    /// The retry loop is written out here rather than routed through
+    /// [`execute_with_retry_payload`]: that helper's build closure cannot
+    /// borrow `map` mutably across its returned future, which the `&mut self`
+    /// receiver of `FnMut` requires.
+    ///
     /// # Errors
     ///
     /// See [`Store::update`].
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the internal mutex guarding `map` is poisoned. The mutex
-    /// is created locally, never shared, and the guard is dropped before any
-    /// `.await`, so poisoning cannot occur in practice.
     pub async fn update_with_payload<F, Fut, T>(
         &self,
         keys: &[String],
-        map: F,
+        mut map: F,
         max_attempts: u32,
     ) -> Result<(Outcome, T), Error>
     where
@@ -490,17 +373,8 @@ impl Store {
         Fut: Future<Output = Result<(Vec<Mutation>, T), Error>> + Send,
         T: Send,
     {
-        // `execute_with_retry_payload` takes a `FnMut() -> Fut` whose `Fut`
-        // must not borrow the closure's captures. The caller's `map` needs
-        // `&mut`, which would make the build closure `FnMut` and let that
-        // mutable borrow escape into the returned future. Sharing `map` through
-        // a `Mutex` lets the closure capture it by shared reference (so it is
-        // `Fn`); `&Mutex<F>` is `Send + Sync` when `F: Send`, so the future
-        // still satisfies the helper's `Fut: Send` bound. The lock guard is
-        // dropped before the `.await`, so it is never held across a suspension
-        // point.
-        let map = Mutex::new(map);
-        let build = || async {
+        let mut attempts = 0u32;
+        loop {
             let snaps = self.read_many_for_update(keys).await?;
             let mut builder = Transaction::builder();
             for snap in &snaps {
@@ -512,17 +386,19 @@ impl Store {
                     builder = builder.read(snap.key.clone(), snap.body.clone());
                 }
             }
-            let map_fut = {
-                let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
-                map(snaps)
-            };
-            let (mutations, payload) = map_fut.await?;
+            let (mutations, payload) = map(snaps).await?;
             for mutation in mutations {
                 builder = builder.mutation(mutation);
             }
-            Ok((builder.build(), payload))
-        };
-        execute_with_retry_payload(self.executor.as_ref(), build, max_attempts).await
+            match self.executor.execute(builder.build()).await {
+                Ok(outcome) => return Ok((outcome, payload)),
+                Err(Error::Conflict | Error::Precondition) if attempts < max_attempts => {
+                    debug!(attempts, max_attempts, "Transaction conflict, retrying");
+                    attempts += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Single-shot advisory read-modify-write on one key, bypassing the
@@ -561,79 +437,6 @@ impl Store {
             }
         }
         Ok(payload)
-    }
-
-    // Upload lifecycle
-
-    /// Begin/clear a fresh upload at `key` (discards any leaked prior upload).
-    ///
-    /// # Errors
-    ///
-    /// Any backend failure starting the upload.
-    pub async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.object.create_upload(key).await
-    }
-
-    /// Append `body` to the upload at `key`, returning the new total uploaded
-    /// size. `Some(len)` declares an exact byte count (validated); `None`
-    /// streams the body to EOF (a chunked request with no `Content-Length`).
-    ///
-    /// # Errors
-    ///
-    /// Any backend failure writing the chunk.
-    pub async fn write_upload(
-        &self,
-        key: &str,
-        body: ByteStream,
-        len: Option<u64>,
-    ) -> Result<u64, StorageError> {
-        self.object.write_upload(key, body, len).await
-    }
-
-    /// Discard the upload at `key` and any backend state it owns without
-    /// producing an object. Idempotent.
-    ///
-    /// # Errors
-    ///
-    /// Any backend failure aborting the upload.
-    pub async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.object.abort_upload(key).await
-    }
-
-    /// List in-flight multipart uploads store-wide, one page at a time
-    /// (`key_marker`/`upload_id_marker` continue a prior page; `None` starts).
-    ///
-    /// A raw primitive: orphan detection (age thresholds, live-session checks)
-    /// is the caller's job. FS/memory backends return an empty page.
-    ///
-    /// # Errors
-    ///
-    /// Any backend listing failure.
-    pub async fn list_multipart_uploads(
-        &self,
-        key_marker: Option<&str>,
-        upload_id_marker: Option<&str>,
-    ) -> Result<MultipartUploadPage, StorageError> {
-        self.object
-            .list_multipart_uploads(key_marker, upload_id_marker)
-            .await
-    }
-
-    /// Run only the backend completion step (S3 multipart-complete; FS no-op)
-    /// so the assembled object lands at `key`.
-    ///
-    /// This is a primitive: promotion to the canonical path and deletion of
-    /// any session-record keys are left to the caller, which composes them
-    /// into an engine [`Transaction`] (via [`Store::execute`]) so the moves
-    /// and deletes commit atomically, often merged with other mutations
-    /// (e.g. a blob-index grant). The upload orchestration that drives this
-    /// lives in the registry, not the engine.
-    ///
-    /// # Errors
-    ///
-    /// Any backend completion failure.
-    pub async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
-        self.object.complete_upload(key).await
     }
 }
 
@@ -680,7 +483,7 @@ mod tests {
             .await
             .expect("update");
 
-        assert_eq!(store.get("k").await.expect("get"), b"v");
+        assert_eq!(store.object_store().get("k").await.expect("get"), b"v");
     }
 
     #[tokio::test]
@@ -688,6 +491,7 @@ mod tests {
         let backend = Arc::new(MemoryObjectStore::new());
         let store = store_over(backend);
         store
+            .object_store()
             .put("k", Bytes::from_static(b"v1"))
             .await
             .expect("seed");
@@ -710,7 +514,7 @@ mod tests {
             .await
             .expect("update");
 
-        assert_eq!(store.get("k").await.expect("get"), b"v2");
+        assert_eq!(store.object_store().get("k").await.expect("get"), b"v2");
     }
 
     #[tokio::test]
@@ -728,6 +532,7 @@ mod tests {
         let backend = Arc::new(MemoryObjectStore::new());
         let store = cas_store_over(backend);
         store
+            .object_store()
             .put("k", Bytes::from_static(b"v1"))
             .await
             .expect("seed");
@@ -741,7 +546,7 @@ mod tests {
             .expect("advisory update");
 
         assert_eq!(payload, "payload");
-        assert_eq!(store.get("k").await.expect("get"), b"v2");
+        assert_eq!(store.object_store().get("k").await.expect("get"), b"v2");
     }
 
     /// A write landing between the advisory read and its conditional write
@@ -751,6 +556,7 @@ mod tests {
         let backend = Arc::new(MemoryObjectStore::new());
         let store = cas_store_over(backend);
         store
+            .object_store()
             .put("k", Bytes::from_static(b"v1"))
             .await
             .expect("seed");
@@ -761,7 +567,7 @@ mod tests {
                 assert_eq!(&body[..], b"v1");
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(racer.put("k", Bytes::from_static(b"racer")))
+                        .block_on(racer.object_store().put("k", Bytes::from_static(b"racer")))
                 })
                 .expect("racing put");
                 Ok((Bytes::from_static(b"stamped"), ()))
@@ -770,7 +576,7 @@ mod tests {
 
         assert!(payload.is_ok(), "a lost race must not surface an error");
         assert_eq!(
-            store.get("k").await.expect("get"),
+            store.object_store().get("k").await.expect("get"),
             b"racer",
             "the concurrent write must win; the advisory write is dropped"
         );
@@ -793,6 +599,7 @@ mod tests {
         let backend = Arc::new(MemoryObjectStore::new());
         let store = store_over(backend);
         store
+            .object_store()
             .put("k", Bytes::from_static(b"v1"))
             .await
             .expect("seed");
@@ -828,7 +635,7 @@ mod tests {
             .expect("update");
 
         assert_eq!(payload, 42);
-        assert_eq!(store.get("k").await.expect("get"), b"v");
+        assert_eq!(store.object_store().get("k").await.expect("get"), b"v");
     }
 
     #[tokio::test]
@@ -837,8 +644,13 @@ mod tests {
         let store = store_over(backend);
 
         // Stand in for a session record + an assembled upload object.
-        store.create_upload("upload/u1").await.expect("create");
         store
+            .object_store()
+            .create_upload("upload/u1")
+            .await
+            .expect("create");
+        store
+            .object_store()
             .put("upload-sessions/u1.json", Bytes::from_static(b"{}"))
             .await
             .expect("session record");
@@ -846,7 +658,11 @@ mod tests {
         // Primitive: backend completion lands the assembled object at the
         // upload key. The caller (registry) then composes the promotion and
         // record cleanup into a single engine transaction.
-        store.complete_upload("upload/u1").await.expect("complete");
+        store
+            .object_store()
+            .complete_upload("upload/u1")
+            .await
+            .expect("complete");
         store
             .execute(
                 Transaction::builder()
@@ -864,14 +680,14 @@ mod tests {
             .expect("promote");
 
         // Assembled object promoted to the canonical key...
-        assert!(store.get("blob-data/abc").await.is_ok());
+        assert!(store.object_store().get("blob-data/abc").await.is_ok());
         // ...source upload key gone, and the session record deleted.
         assert!(matches!(
-            store.get("upload/u1").await,
+            store.object_store().get("upload/u1").await,
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
-            store.get("upload-sessions/u1.json").await,
+            store.object_store().get("upload-sessions/u1.json").await,
             Err(StorageError::NotFound)
         ));
     }
