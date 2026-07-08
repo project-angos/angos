@@ -14,4 +14,4 @@ pub use kind::LinkKind;
 pub use metadata::LinkMetadata;
 pub use operation::LinkOperation;
 pub use ops::LinksCommit;
-pub use ops::{LinksTx, tx_error_to_meta};
+pub use ops::LinksTx;

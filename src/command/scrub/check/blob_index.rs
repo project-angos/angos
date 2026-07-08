@@ -38,9 +38,9 @@ use crate::{
     },
     oci::{Digest, Namespace},
     registry::{
-        blob_store,
+        Error as RegistryError,
         blob_store::BlobStore,
-        metadata_store::{Error as MetadataError, LinkKind, MetadataStore},
+        metadata_store::{LinkKind, MetadataStore},
         parse_manifest_digests,
     },
 };
@@ -75,7 +75,7 @@ impl BlobIndexChecker {
     ) -> Result<(), Error> {
         let content = match self.blob_store.read(revision).await {
             Ok(content) => content,
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+            Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
@@ -117,13 +117,13 @@ impl BlobIndexChecker {
             .await
         {
             Ok(links) if links.contains(link) => return Ok(()),
-            Ok(_) | Err(MetadataError::ReferenceNotFound) => {}
+            Ok(_) | Err(RegistryError::NotFound) => {}
             Err(e) => return Err(e.into()),
         }
 
         match self.blob_store.size(blob).await {
             Ok(_) => {}
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+            Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 debug!("Skipping blob-index grant for missing blob '{namespace}/{blob}': '{link}'");
                 return Ok(());
             }

@@ -5,7 +5,10 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::*;
-use crate::oci::{Algorithm, Digest, Namespace};
+use crate::{
+    oci::{Algorithm, Digest, Namespace},
+    registry::Error,
+};
 
 pub async fn test_datastore_list_uploads(store: &BlobStore) {
     let namespace = &Namespace::new("test-repo").unwrap();
@@ -293,7 +296,7 @@ pub async fn test_complete_upload_fails_on_rerun(store: &BlobStore) {
 
     let rerun = store.complete_upload(&namespace, &uuid, &digest).await;
     assert!(
-        matches!(rerun, Err(Error::UploadNotFound)),
+        matches!(rerun, Err(Error::BlobUploadUnknown)),
         "re-run of a completed session must fail: {rerun:?}"
     );
     assert_eq!(

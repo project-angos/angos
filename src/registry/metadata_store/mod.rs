@@ -2,20 +2,18 @@ use std::{future::Future, sync::Arc};
 
 use angos_tx_engine::{executor::TransactionExecutor, lock::LockSession, store::Store};
 
-use crate::{cache::Cache, oci::Digest};
+use crate::{cache::Cache, oci::Digest, registry::Error};
 
 mod access_time;
 mod blob_index;
 mod catalog;
-mod error;
 mod link;
 
 #[cfg(test)]
 mod tests;
 
 pub use blob_index::{BlobIndex, BlobIndexOperation};
-pub use error::Error;
-pub use link::{LinkKind, LinkMetadata, LinkOperation, LinksCommit, LinksTx, tx_error_to_meta};
+pub use link::{LinkKind, LinkMetadata, LinkOperation, LinksCommit, LinksTx};
 
 use access_time::{AccessTimeWriter, FlushHandle};
 
@@ -127,7 +125,7 @@ impl MetadataStore {
         self.executor()
             .acquire(&keys)
             .await
-            .map_err(|e| Error::Coordination(format!("blob-data lock acquire failed: {e}")))
+            .map_err(|e| Error::Internal(format!("blob-data lock acquire failed: {e}")))
     }
 
     /// Run `op` while holding the coarse blob-data lock for `digest`,

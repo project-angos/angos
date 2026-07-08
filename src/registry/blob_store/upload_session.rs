@@ -46,8 +46,9 @@ use angos_tx_engine::StorageError;
 use crate::{
     oci::{Algorithm, Digest, Namespace},
     registry::{
+        Error,
         blob_store::{
-            BlobStore, Error, UploadSummary,
+            BlobStore, UploadSummary,
             hashing_reader::{HashingReader, hashing_stream},
             resumable_hasher::{HashState, Hasher},
         },
@@ -148,7 +149,7 @@ impl BlobStore {
         let key = path_builder::upload_start_date_path(namespace, uuid);
         let data = match self.object.get(&key).await {
             Ok(data) => data,
-            Err(StorageError::NotFound) => return Err(Error::UploadNotFound),
+            Err(StorageError::NotFound) => return Err(Error::BlobUploadUnknown),
             Err(e) => return Err(e.into()),
         };
         let text = String::from_utf8(data)?;
@@ -202,13 +203,13 @@ impl BlobStore {
         }
 
         let Some(offset) = highest else {
-            return Err(Error::UploadNotFound);
+            return Err(Error::BlobUploadUnknown);
         };
         let key =
             path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
         match self.object.get(&key).await {
             Ok(data) => Ok((data, offset)),
-            Err(StorageError::NotFound) => Err(Error::UploadNotFound),
+            Err(StorageError::NotFound) => Err(Error::BlobUploadUnknown),
             Err(e) => Err(e.into()),
         }
     }
@@ -393,7 +394,7 @@ impl BlobStore {
             stream
                 .read_buf(&mut peek)
                 .await
-                .map_err(|e| Error::StorageBackend(e.to_string()))?;
+                .map_err(|e| Error::Internal(e.to_string()))?;
             if peek.is_empty() {
                 return Ok((hasher, record.uploaded_size));
             }
@@ -410,9 +411,7 @@ impl BlobStore {
             .object
             .write_upload(&upload_path, body_stream, content_length)
             .await;
-        let hash_result = finish
-            .await
-            .map_err(|e| Error::StorageBackend(e.to_string()))?;
+        let hash_result = finish.await.map_err(|e| Error::Internal(e.to_string()))?;
         // Hash-task errors (typically UploadBodySize) win over the storage
         // error they triggered.
         let (hasher, new_size) = match (write_result, hash_result) {
@@ -446,7 +445,7 @@ impl BlobStore {
     /// path.
     ///
     /// The session's `startedat` liveness marker is deleted up front, consuming
-    /// the session so a re-run returns [`Error::UploadNotFound`] rather than
+    /// the session so a re-run returns [`Error::BlobUploadUnknown`] rather than
     /// re-finalizing an already-completed upload (on S3 a naive re-finalize
     /// overwrites the blob with an empty object). The caller holds the
     /// `blob-data:{digest}` lock and skips this when the blob already exists, so

@@ -17,25 +17,16 @@ use crate::{
     jobs::store::{self as job_store, JobStore},
     registry::{
         self, Registry, RegistryConfig, Repository,
-        blob_store::{self, BlobStore},
-        metadata_store::{self, MetadataStore},
+        blob_store::BlobStore,
+        metadata_store::MetadataStore,
         repository,
         repository_resolver::{OverlapError, RepositoryResolver},
     },
 };
 
 /// Errors produced by the shared CLI bootstrap helpers.
-///
-/// `blob_store::Error` does not implement `std::error::Error`, which is a
-/// prerequisite for `#[from]` in thiserror. A manual `From` impl is provided
-/// instead; `source()` cannot chain into `blob_store::Error` until that type
-/// is migrated.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("failed to initialize blob store: {0}")]
-    BlobStore(blob_store::Error),
-    #[error("failed to initialize metadata store: {0}")]
-    MetadataStore(#[from] metadata_store::Error),
     #[error("storage backend failed: {0}")]
     StorageBackend(String),
     #[error("storage coordination/configuration error: {0}")]
@@ -55,12 +46,6 @@ pub enum Error {
     EventWebhook(#[from] event_webhook::Error),
     #[error("failed to initialize registry: {0}")]
     Registry(#[from] registry::Error),
-}
-
-impl From<blob_store::Error> for Error {
-    fn from(e: blob_store::Error) -> Self {
-        Self::BlobStore(e)
-    }
 }
 
 impl From<angos_storage::Error> for Error {
@@ -321,7 +306,7 @@ mod tests {
         },
         policy::{AccessMode, AccessPolicyConfig},
         registry::{
-            blob_store, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository,
+            self, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository,
             test_utils::s3_test_connection,
         },
     };
@@ -393,10 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn error_blob_store_converts_from_blob_store_error() {
-        let inner = blob_store::Error::BlobNotFound;
-        let err: Error = inner.into();
-        assert!(matches!(err, Error::BlobStore(_)));
+    fn error_registry_converts_from_registry_error() {
+        let err: Error = registry::Error::BlobUnknown.into();
+        assert!(matches!(err, Error::Registry(_)));
     }
 
     #[test]
@@ -407,10 +391,10 @@ mod tests {
     }
 
     #[test]
-    fn error_into_scrub_error_blob_store_variant() {
-        let bootstrap_err: Error = blob_store::Error::BlobNotFound.into();
+    fn error_into_scrub_error_registry_variant() {
+        let bootstrap_err: Error = registry::Error::BlobUnknown.into();
         let scrub_err: ScrubError = bootstrap_err.into();
-        assert!(matches!(scrub_err, ScrubError::BlobStore(_)));
+        assert!(matches!(scrub_err, ScrubError::Registry(_)));
     }
 
     #[test]
@@ -421,11 +405,10 @@ mod tests {
     }
 
     #[test]
-    fn error_into_server_error_blob_store_variant() {
-        let bootstrap_err: Error = blob_store::Error::BlobNotFound.into();
+    fn error_into_server_error_registry_variant() {
+        let bootstrap_err: Error = registry::Error::BlobUnknown.into();
         let server_err: ServerError = bootstrap_err.into();
         assert!(matches!(server_err, ServerError::Initialization(_)));
-        assert_eq!(server_err.to_string(), "Failed to initialize blob store");
     }
 
     fn s3_config_with_lock_strategy(lock_strategy: Option<LockStrategy>) -> RegistryStorageConfig {

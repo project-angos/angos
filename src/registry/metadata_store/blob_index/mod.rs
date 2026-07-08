@@ -21,7 +21,8 @@ use angos_tx_engine::{
 use crate::{
     oci::{Digest, Namespace},
     registry::{
-        metadata_store::{Error, LinkKind, LinksTx, MetadataStore, tx_error_to_meta},
+        Error,
+        metadata_store::{LinkKind, LinksTx, MetadataStore},
         path_builder,
     },
 };
@@ -82,7 +83,7 @@ impl MetadataStore {
         )
         .await
         .map(|_| ())
-        .map_err(tx_error_to_meta)
+        .map_err(Error::from)
     }
 
     /// Revoke `namespace`'s ownership of `digest` in an atomic transaction and
@@ -165,7 +166,7 @@ impl MetadataStore {
         if !found_shards || index.namespace.is_empty() {
             return match self.read_legacy_blob_index(digest).await? {
                 Some(legacy) if !legacy.namespace.is_empty() => Ok(legacy),
-                _ => Err(Error::ReferenceNotFound),
+                _ => Err(Error::NotFound),
             };
         }
         Ok(index)
@@ -223,7 +224,7 @@ impl MetadataStore {
             }
             Err(StorageError::NotFound) => match self.read_legacy_blob_index(digest).await? {
                 Some(legacy) => namespace_links_from_index(&legacy, namespace),
-                None => Err(Error::ReferenceNotFound),
+                None => Err(Error::NotFound),
             },
             Err(e) => Err(e.into()),
         }
@@ -295,7 +296,7 @@ impl MetadataStore {
             DEFAULT_RETRY_BUDGET,
         )
         .await
-        .map_err(tx_error_to_meta)?;
+        .map_err(Error::from)?;
 
         info!("Migrated legacy blob index for '{digest}' ({namespace_count} namespaces)",);
         Ok(())

@@ -23,7 +23,8 @@ use crate::{
     metrics_provider,
     oci::{Algorithm, Descriptor, Digest, MediaType, Namespace, Tag},
     registry::{
-        metadata_store::{BlobIndex, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore},
+        Error,
+        metadata_store::{BlobIndex, LinkKind, LinkMetadata, LinkOperation, MetadataStore},
         path_builder,
         s3_connection::S3ConnectionConfig,
         test_utils::{for_each_backend, media_type, put_blob_direct, s3_test_connection},
@@ -47,7 +48,7 @@ impl TestS3Config {
     ) -> Result<MetadataStore, Error> {
         let http = Arc::new(
             S3HttpBackend::new(&self.connection.to_client_config())
-                .map_err(|e| Error::StorageBackend(e.to_string()))?,
+                .map_err(|e| Error::Internal(e.to_string()))?,
         );
         let raw_storage = Arc::new(StorageS3Backend::builder(http.clone()).build());
         let object_store: Arc<dyn ObjectStore> = raw_storage.clone();
@@ -57,7 +58,7 @@ impl TestS3Config {
         let s3_lock_store: Option<Arc<dyn ConditionalStore>> = match &self.lock_strategy {
             LockStrategy::S3(cfg) => {
                 let lock_http = S3HttpBackend::new(&self.connection.to_lock_client_config(cfg))
-                    .map_err(|e| Error::Coordination(e.to_string()))?;
+                    .map_err(|e| Error::Internal(e.to_string()))?;
                 let lock_backend = StorageS3Backend::builder(Arc::new(lock_http)).build();
                 Some(Arc::new(lock_backend))
             }
@@ -71,7 +72,7 @@ impl TestS3Config {
                 self.lock_strategy.clone(),
                 s3_lock_store,
             )
-            .map_err(|e| Error::Coordination(e.to_string()))?,
+            .map_err(|e| Error::Internal(e.to_string()))?,
         );
         let mut builder = MetadataStore::builder(facade)
             .link_cache_ttl(self.link_cache_ttl)
@@ -274,7 +275,7 @@ pub async fn test_datastore_delete_tag_directory_guards_unsafe_names(m: Arc<Meta
     assert!(
         matches!(
             m.delete_tag_directory(namespace, unsafe_name).await,
-            Err(Error::InvalidData(_))
+            Err(Error::Internal(_))
         ),
         "expected guard to reject {unsafe_name:?}"
     );
@@ -355,7 +356,7 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
         platform: None,
     }];
 
-    assert_eq!(Ok(expected), referrers);
+    assert_eq!(referrers.unwrap(), expected);
 
     let filtered_referrers = m
         .list_referrers(
@@ -1249,7 +1250,7 @@ pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) 
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::ReferenceNotFound),
+        matches!(err, Error::NotFound),
         "Tag v1 should not exist after deletion but got error: {err:?}"
     );
 
@@ -1277,7 +1278,7 @@ pub async fn test_datastore_parallel_mixed_create_delete(m: Arc<MetadataStore>) 
                 "Blob index for digest_a should not contain Tag(v1) after deletion"
             );
         }
-        Err(Error::ReferenceNotFound) => {}
+        Err(Error::NotFound) => {}
         Err(e) => panic!("Unexpected error reading blob index for digest_a: {e:?}"),
     }
 
@@ -1525,7 +1526,7 @@ pub async fn test_datastore_tracked_delete_removes_when_no_referrers(m: Arc<Meta
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::ReferenceNotFound),
+        matches!(err, Error::NotFound),
         "Link should not exist after all referrers removed, got: {err:?}"
     );
 
@@ -1538,7 +1539,7 @@ pub async fn test_datastore_tracked_delete_removes_when_no_referrers(m: Arc<Meta
                 "Blob index should not contain the Layer link after removal"
             );
         }
-        Err(Error::ReferenceNotFound) => {}
+        Err(Error::NotFound) => {}
         Err(e) => panic!("Unexpected error reading blob index: {e:?}"),
     }
 }
@@ -1748,7 +1749,7 @@ pub async fn test_datastore_batch_deletes_empty_blob_container(m: Arc<MetadataSt
                 "Blob index should have no entries for the namespace after deletion"
             );
         }
-        Err(Error::ReferenceNotFound) => {}
+        Err(Error::NotFound) => {}
         Err(e) => panic!("Unexpected error reading blob index: {e:?}"),
     }
 }

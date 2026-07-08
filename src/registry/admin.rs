@@ -1,5 +1,6 @@
 //! The `/_ext` admin surface: repository/namespace info for the web UI and
-//! the jobs list/retry/delete responses, assembled as [`JsonResponse`] values.
+//! the jobs list/retry/delete responses, returned as typed domain structs that
+//! the server handlers serialize.
 
 use std::collections::HashMap;
 
@@ -15,10 +16,7 @@ use crate::{
         DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType,
         Namespace, Platform as OciPlatform, Tag, namespace_belongs_to,
     },
-    registry::{
-        APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders,
-        metadata_store::LinkKind, pagination::collect_all_pages,
-    },
+    registry::{Error, Registry, metadata_store::LinkKind, pagination::collect_all_pages},
 };
 
 /// Default page size for the durable job-queue listing endpoints when the
@@ -26,14 +24,8 @@ use crate::{
 /// envelope bodies per request.
 const DEFAULT_JOBS_PAGE: u16 = 100;
 
-fn json_headers() -> HeaderMap {
-    ResponseHeaders::new()
-        .content_type(APPLICATION_JSON)
-        .into_inner()
-}
-
 #[derive(Serialize, Debug)]
-struct RepositoryInfo {
+pub struct RepositoryInfo {
     name: String,
     namespace_count: usize,
     pull_through_cache: bool,
@@ -41,19 +33,19 @@ struct RepositoryInfo {
 }
 
 #[derive(Serialize, Debug)]
-struct RepositoriesBody {
+pub struct RepositoriesBody {
     repositories: Vec<RepositoryInfo>,
 }
 
 #[derive(Serialize, Debug)]
-struct NamespaceInfo {
+pub struct NamespaceInfo {
     name: String,
     manifest_count: usize,
     upload_count: usize,
 }
 
 #[derive(Serialize, Debug)]
-struct NamespacesBody {
+pub struct NamespacesBody {
     repository: String,
     namespaces: Vec<NamespaceInfo>,
     pull_through_cache: bool,
@@ -63,7 +55,7 @@ struct NamespacesBody {
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
-struct ExtPlatform {
+pub struct ExtPlatform {
     os: String,
     architecture: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,7 +73,7 @@ impl From<OciPlatform> for ExtPlatform {
 }
 
 #[derive(Serialize, Debug, Clone)]
-struct ParentRef {
+pub struct ParentRef {
     digest: String,
     tags: Vec<Tag>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,7 +82,7 @@ struct ParentRef {
 
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-struct ReferrerInfo {
+pub struct ReferrerInfo {
     digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     artifact_type: Option<MediaType>,
@@ -109,7 +101,7 @@ impl From<Descriptor> for ReferrerInfo {
 }
 
 #[derive(Serialize, Debug)]
-struct ManifestEntry {
+pub struct ManifestEntry {
     digest: String,
     tags: Vec<Tag>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -123,20 +115,20 @@ struct ManifestEntry {
 }
 
 #[derive(Serialize, Debug)]
-struct RevisionsBody {
+pub struct RevisionsBody {
     name: String,
     manifests: Vec<ManifestEntry>,
 }
 
 #[derive(Serialize, Debug)]
-struct UploadEntry {
+pub struct UploadEntry {
     uuid: String,
     size: u64,
     started_at: DateTime<Utc>,
 }
 
 #[derive(Serialize, Debug)]
-struct UploadsBody {
+pub struct UploadsBody {
     name: String,
     uploads: Vec<UploadEntry>,
 }
@@ -145,7 +137,7 @@ struct UploadsBody {
 /// address used by the retry/delete mutations; `not_before` is decoded from the
 /// key's time prefix so the UI can label backed-off retries.
 #[derive(Serialize, Debug)]
-struct JobEntry {
+pub struct JobEntry {
     storage_key: String,
     id: String,
     kind: String,
@@ -157,7 +149,7 @@ struct JobEntry {
 }
 
 #[derive(Serialize, Debug)]
-struct JobsBody {
+pub struct JobsBody {
     jobs: Vec<JobEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next: Option<String>,
@@ -165,7 +157,7 @@ struct JobsBody {
 
 /// A dead-letter (exhausted-retry) job, carrying the failure reason and instant.
 #[derive(Serialize, Debug)]
-struct FailedJobEntry {
+pub struct FailedJobEntry {
     storage_key: String,
     id: String,
     kind: String,
@@ -178,7 +170,7 @@ struct FailedJobEntry {
 }
 
 #[derive(Serialize, Debug)]
-struct FailedJobsBody {
+pub struct FailedJobsBody {
     failed: Vec<FailedJobEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next: Option<String>,
@@ -303,7 +295,7 @@ fn parent_refs_for(
 
 impl Registry {
     #[instrument(skip(self))]
-    pub async fn get_repositories_info(&self) -> Result<JsonResponse, Error> {
+    pub async fn get_repositories_info(&self) -> Result<RepositoriesBody, Error> {
         let mut repositories = Vec::with_capacity(self.resolver.len());
 
         for name in self.resolver.keys() {
@@ -319,14 +311,11 @@ impl Registry {
 
         repositories.sort_by(|a, b| a.name.cmp(&b.name));
 
-        Ok(JsonResponse {
-            headers: json_headers(),
-            body: serde_json::to_vec(&RepositoriesBody { repositories })?,
-        })
+        Ok(RepositoriesBody { repositories })
     }
 
     #[instrument(skip(self))]
-    pub async fn get_namespaces_info(&self, repository: &str) -> Result<JsonResponse, Error> {
+    pub async fn get_namespaces_info(&self, repository: &str) -> Result<NamespacesBody, Error> {
         let namespace_names = self.list_repository_namespaces(repository).await?;
         let mut namespaces = Vec::with_capacity(namespace_names.len());
 
@@ -343,26 +332,22 @@ impl Registry {
 
         let config = self.get_repository_config(repository);
 
-        Ok(JsonResponse {
-            headers: json_headers(),
-            body: serde_json::to_vec(&NamespacesBody {
-                repository: repository.to_string(),
-                namespaces,
-                pull_through_cache: config.pull_through_cache,
-                upstream_urls: config.upstream_urls,
-                immutable_tags: config.immutable_tags,
-                immutable_tags_exclusions: config.immutable_tags_exclusions,
-            })?,
+        Ok(NamespacesBody {
+            repository: repository.to_string(),
+            namespaces,
+            pull_through_cache: config.pull_through_cache,
+            upstream_urls: config.upstream_urls,
+            immutable_tags: config.immutable_tags,
+            immutable_tags_exclusions: config.immutable_tags_exclusions,
         })
     }
 
     #[instrument(skip(self))]
-    pub async fn get_revisions_info(&self, namespace: &Namespace) -> Result<JsonResponse, Error> {
+    pub async fn get_revisions_info(&self, namespace: &Namespace) -> Result<RevisionsBody, Error> {
         let all_revisions = collect_all_pages(|token| async move {
             self.metadata_store
                 .list_revisions(namespace, 1000, token)
                 .await
-                .map_err(Error::from)
         })
         .await?;
         let digest_to_tags = self.build_digest_to_tags_map(namespace).await?;
@@ -378,22 +363,16 @@ impl Registry {
             )
             .await;
 
-        Ok(JsonResponse {
-            headers: json_headers(),
-            body: serde_json::to_vec(&RevisionsBody {
-                name: namespace.to_string(),
-                manifests,
-            })?,
+        Ok(RevisionsBody {
+            name: namespace.to_string(),
+            manifests,
         })
     }
 
     #[instrument(skip(self))]
-    pub async fn get_uploads_info(&self, namespace: &Namespace) -> Result<JsonResponse, Error> {
+    pub async fn get_uploads_info(&self, namespace: &Namespace) -> Result<UploadsBody, Error> {
         let uuids = collect_all_pages(|token| async move {
-            self.blob_store
-                .list_uploads(namespace, 1000, token)
-                .await
-                .map_err(Error::from)
+            self.blob_store.list_uploads(namespace, 1000, token).await
         })
         .await?;
 
@@ -408,12 +387,9 @@ impl Registry {
             }
         }
 
-        Ok(JsonResponse {
-            headers: json_headers(),
-            body: serde_json::to_vec(&UploadsBody {
-                name: namespace.to_string(),
-                uploads: all_uploads,
-            })?,
+        Ok(UploadsBody {
+            name: namespace.to_string(),
+            uploads: all_uploads,
         })
     }
 
@@ -426,7 +402,7 @@ impl Registry {
         queue: Queue,
         n: Option<u16>,
         after: Option<String>,
-    ) -> Result<JsonResponse, Error> {
+    ) -> Result<JobsBody, Error> {
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
         let (keys, next) = self
             .job_queue
@@ -455,10 +431,7 @@ impl Registry {
             }
         }
 
-        Ok(JsonResponse {
-            headers: json_headers(),
-            body: serde_json::to_vec(&JobsBody { jobs, next })?,
-        })
+        Ok(JobsBody { jobs, next })
     }
 
     /// One keyset page of dead-letter (exhausted-retry) jobs on `queue`. See
@@ -469,7 +442,7 @@ impl Registry {
         queue: Queue,
         n: Option<u16>,
         after: Option<String>,
-    ) -> Result<JsonResponse, Error> {
+    ) -> Result<FailedJobsBody, Error> {
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
         let (keys, next) = self
             .job_queue
@@ -495,10 +468,7 @@ impl Registry {
             }
         }
 
-        Ok(JsonResponse {
-            headers: json_headers(),
-            body: serde_json::to_vec(&FailedJobsBody { failed, next })?,
-        })
+        Ok(FailedJobsBody { failed, next })
     }
 
     /// Requeue a dead-letter job (attempts reset to zero) on `queue`. Delegates
@@ -656,10 +626,7 @@ impl Registry {
 
     async fn count_uploads(&self, namespace: &Namespace) -> Result<usize, Error> {
         let uploads = collect_all_pages(|token| async move {
-            self.blob_store
-                .list_uploads(namespace, 1000, token)
-                .await
-                .map_err(Error::from)
+            self.blob_store.list_uploads(namespace, 1000, token).await
         })
         .await?;
         Ok(uploads.len())
@@ -670,10 +637,7 @@ impl Registry {
         namespace: &Namespace,
     ) -> Result<HashMap<Digest, Vec<Tag>>, Error> {
         let all_tags = collect_all_pages(|last| async move {
-            self.metadata_store
-                .list_tags(namespace, 1000, last)
-                .await
-                .map_err(Error::from)
+            self.metadata_store.list_tags(namespace, 1000, last).await
         })
         .await?;
 
@@ -694,10 +658,7 @@ impl Registry {
         }
 
         let manifest_namespaces = collect_all_pages(|token| async move {
-            self.metadata_store
-                .list_namespaces(1000, token)
-                .await
-                .map_err(Error::from)
+            self.metadata_store.list_namespaces(1000, token).await
         })
         .await?;
 
@@ -705,10 +666,7 @@ impl Registry {
         // only in-progress uploads is absent from it; merge the blob store's
         // `_uploads`-keyed listing so its pending uploads still surface here.
         let upload_namespaces = collect_all_pages(|token| async move {
-            self.blob_store
-                .list_upload_namespaces(1000, token)
-                .await
-                .map_err(Error::from)
+            self.blob_store.list_upload_namespaces(1000, token).await
         })
         .await?;
 
@@ -1136,7 +1094,7 @@ mod tests {
                 .unwrap();
 
             let response = registry.get_namespaces_info("test-repo").await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            let body = serde_json::to_value(&response).unwrap();
             let namespaces = body["namespaces"].as_array().unwrap();
 
             let entries: Vec<(&str, u64, u64)> = namespaces
@@ -1163,7 +1121,7 @@ mod tests {
             );
 
             let response = registry.get_repositories_info().await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            let body = serde_json::to_value(&response).unwrap();
             let count = body["repositories"][0]["namespace_count"].as_u64().unwrap();
             assert_eq!(
                 count, 2,
@@ -1189,7 +1147,7 @@ mod tests {
             .unwrap();
 
         let response = registry.get_namespaces_info("test-repo").await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let body = serde_json::to_value(&response).unwrap();
         let namespaces = body["namespaces"].as_array().unwrap();
 
         assert_eq!(

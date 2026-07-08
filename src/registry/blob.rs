@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
 
@@ -11,7 +10,7 @@ use crate::{
     metrics_provider::metrics_provider,
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
-        Error, HeaderMap, Registry, Repository, ResponseHeaders,
+        Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::{BlobStore, BoxedReader},
         cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
@@ -25,30 +24,38 @@ pub enum BlobRange {
     Suffix(u64),
 }
 
+/// The facts a blob GET resolved to; the handler turns each variant into its
+/// wire response (redirect, full body, or partial content) and headers.
 pub enum GetBlobResponse {
     Redirect {
-        headers: HeaderMap,
+        redirect_url: String,
+        digest: Digest,
     },
     Reader {
-        headers: HeaderMap,
+        digest: Digest,
+        total_length: u64,
         body: BoxedReader,
     },
     RangedReader {
-        headers: HeaderMap,
+        digest: Digest,
+        range: ResolvedRange,
         body: BoxedReader,
     },
 }
 
 pub struct HeadBlobResponse {
-    pub headers: HeaderMap,
+    pub digest: Digest,
+    pub size: u64,
 }
 
+/// A byte range resolved against a known blob length: the served window plus
+/// the total length, so the handler can format `Content-Range`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ResolvedRange {
-    start: u64,
-    end: u64,
-    length: u64,
-    total_length: u64,
+pub struct ResolvedRange {
+    pub start: u64,
+    pub end: u64,
+    pub length: u64,
+    pub total_length: u64,
 }
 
 fn resolve_blob_range(
@@ -89,40 +96,6 @@ fn resolve_blob_range(
         length: end - start + 1,
         total_length,
     }))
-}
-
-fn head_blob_headers(digest: &Digest, size: u64) -> HeaderMap {
-    ResponseHeaders::new()
-        .docker_content_digest(digest)
-        .content_length(size)
-        .into_inner()
-}
-
-fn get_blob_headers(digest: &Digest, total_length: u64) -> HeaderMap {
-    ResponseHeaders::new()
-        .docker_content_digest(digest)
-        .with(ACCEPT_RANGES.as_str(), "bytes")
-        .content_length(total_length)
-        .into_inner()
-}
-
-fn get_blob_range_headers(digest: &Digest, range: ResolvedRange) -> HeaderMap {
-    ResponseHeaders::new()
-        .docker_content_digest(digest)
-        .with(ACCEPT_RANGES.as_str(), "bytes")
-        .content_length(range.length)
-        .with(
-            CONTENT_RANGE.as_str(),
-            format!("bytes {}-{}/{}", range.start, range.end, range.total_length),
-        )
-        .into_inner()
-}
-
-fn get_blob_redirect_headers(url: String, digest: &Digest) -> HeaderMap {
-    ResponseHeaders::new()
-        .location(url)
-        .docker_content_digest(digest)
-        .into_inner()
 }
 
 fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bool {
@@ -202,7 +175,8 @@ impl Registry {
             match self.blob_store.size(digest).await {
                 Ok(size) => {
                     return Ok(HeadBlobResponse {
-                        headers: head_blob_headers(digest, size),
+                        digest: digest.clone(),
+                        size,
                     });
                 }
                 Err(error) if !repository.is_pull_through() => {
@@ -217,9 +191,7 @@ impl Registry {
             let (digest, size) = repository
                 .head_blob(accepted_types, namespace, digest)
                 .await?;
-            Ok(HeadBlobResponse {
-                headers: head_blob_headers(&digest, size),
-            })
+            Ok(HeadBlobResponse { digest, size })
         } else {
             Err(Error::BlobUnknown)
         }
@@ -261,7 +233,8 @@ impl Registry {
         self.dispatch_cache_fill(namespace, digest).await;
 
         Ok(GetBlobResponse::Reader {
-            headers: get_blob_headers(digest, total_length),
+            digest: digest.clone(),
+            total_length,
             body: client_stream,
         })
     }
@@ -307,7 +280,8 @@ impl Registry {
         let Some(requested_range) = range else {
             let (reader, total_length) = self.blob_store.reader(digest, None).await?;
             return Ok(GetBlobResponse::Reader {
-                headers: get_blob_headers(digest, total_length),
+                digest: digest.clone(),
+                total_length,
                 body: reader,
             });
         };
@@ -316,7 +290,8 @@ impl Registry {
         let Some(range) = resolve_blob_range(requested_range, total_length)? else {
             let (reader, _) = self.blob_store.reader(digest, None).await?;
             return Ok(GetBlobResponse::Reader {
-                headers: get_blob_headers(digest, total_length),
+                digest: digest.clone(),
+                total_length,
                 body: reader,
             });
         };
@@ -324,7 +299,8 @@ impl Registry {
         let reader = Box::new(reader.take(range.length));
 
         Ok(GetBlobResponse::RangedReader {
-            headers: get_blob_range_headers(digest, range),
+            digest: digest.clone(),
+            range,
             body: reader,
         })
     }
@@ -394,7 +370,8 @@ impl Registry {
             && let Ok(Some(presigned_url)) = self.blob_store.presigned_url(digest, None).await
         {
             GetBlobResponse::Redirect {
-                headers: get_blob_redirect_headers(presigned_url, digest),
+                redirect_url: presigned_url,
+                digest: digest.clone(),
             }
         } else {
             self.get_blob_with_access(repository, mime_types, namespace, digest, range, has_access)
@@ -415,7 +392,6 @@ mod tests {
     use std::{io::Cursor, sync::Arc, time::Duration};
 
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
-    use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
     use tempfile::TempDir;
     use tokio::{io::AsyncReadExt, time::sleep};
 
@@ -423,7 +399,6 @@ mod tests {
     use crate::{
         oci::{Namespace, Tag},
         registry::{
-            DOCKER_CONTENT_DIGEST,
             blob_ownership::BlobOwnership,
             metadata_store::{BlobIndexOperation, LinkOperation},
             test_utils::{
@@ -493,11 +468,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(response.headers[DOCKER_CONTENT_DIGEST], digest.to_string());
-            assert_eq!(
-                response.headers[CONTENT_LENGTH.as_str()],
-                content.len().to_string()
-            );
+            assert_eq!(response.digest, digest);
+            assert_eq!(response.size, content.len() as u64);
         })
         .await;
     }
@@ -515,10 +487,13 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::Reader { headers, mut body } => {
-                    assert_eq!(headers[CONTENT_LENGTH.as_str()], content.len().to_string());
-                    assert_eq!(headers[ACCEPT_RANGES.as_str()], "bytes");
-                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+                GetBlobResponse::Reader {
+                    digest: served_digest,
+                    total_length,
+                    mut body,
+                } => {
+                    assert_eq!(total_length, content.len() as u64);
+                    assert_eq!(served_digest, digest);
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, content);
@@ -567,13 +542,16 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::RangedReader { headers, mut body } => {
-                    assert_eq!(
-                        headers[CONTENT_RANGE.as_str()],
-                        format!("bytes 5-10/{}", content.len())
-                    );
-                    assert_eq!(headers[CONTENT_LENGTH.as_str()], "6");
-                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+                GetBlobResponse::RangedReader {
+                    digest: served_digest,
+                    range,
+                    mut body,
+                } => {
+                    assert_eq!(range.start, 5);
+                    assert_eq!(range.end, 10);
+                    assert_eq!(range.total_length, content.len() as u64);
+                    assert_eq!(range.length, 6);
+                    assert_eq!(served_digest, digest);
 
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
@@ -875,8 +853,12 @@ mod tests {
 
             let response = registry.get_local_blob(&digest, None).await.unwrap();
             match response {
-                GetBlobResponse::Reader { headers, mut body } => {
-                    assert_eq!(headers[CONTENT_LENGTH.as_str()], content.len().to_string());
+                GetBlobResponse::Reader {
+                    total_length,
+                    mut body,
+                    ..
+                } => {
+                    assert_eq!(total_length, content.len() as u64);
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, content);
@@ -895,12 +877,13 @@ mod tests {
             });
             let response = registry.get_local_blob(&digest, range).await.unwrap();
             match response {
-                GetBlobResponse::RangedReader { headers, mut body } => {
-                    assert_eq!(
-                        headers[CONTENT_RANGE.as_str()],
-                        format!("bytes 5-15/{}", content.len())
-                    );
-                    assert_eq!(headers[CONTENT_LENGTH.as_str()], "11");
+                GetBlobResponse::RangedReader {
+                    range, mut body, ..
+                } => {
+                    assert_eq!(range.start, 5);
+                    assert_eq!(range.end, 15);
+                    assert_eq!(range.total_length, content.len() as u64);
+                    assert_eq!(range.length, 11);
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, &content[5..=15]);
@@ -936,12 +919,13 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::RangedReader { headers, mut body } => {
-                    assert_eq!(
-                        headers[CONTENT_RANGE.as_str()],
-                        format!("bytes 0-{}/{}", content.len() - 1, content.len())
-                    );
-                    assert_eq!(headers[CONTENT_LENGTH.as_str()], content.len().to_string());
+                GetBlobResponse::RangedReader {
+                    range, mut body, ..
+                } => {
+                    assert_eq!(range.start, 0);
+                    assert_eq!(range.end, content.len() as u64 - 1);
+                    assert_eq!(range.total_length, content.len() as u64);
+                    assert_eq!(range.length, content.len() as u64);
 
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
@@ -974,12 +958,13 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::RangedReader { headers, mut body } => {
-                    assert_eq!(
-                        headers[CONTENT_RANGE.as_str()],
-                        format!("bytes {}-{}/{}", start, content.len() - 1, content.len())
-                    );
-                    assert_eq!(headers[CONTENT_LENGTH.as_str()], suffix_length.to_string());
+                GetBlobResponse::RangedReader {
+                    range, mut body, ..
+                } => {
+                    assert_eq!(range.start, start as u64);
+                    assert_eq!(range.end, content.len() as u64 - 1);
+                    assert_eq!(range.total_length, content.len() as u64);
+                    assert_eq!(range.length, suffix_length as u64);
 
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
@@ -1010,12 +995,13 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::RangedReader { headers, mut body } => {
-                    assert_eq!(
-                        headers[CONTENT_RANGE.as_str()],
-                        format!("bytes 0-{}/{}", content.len() - 1, content.len())
-                    );
-                    assert_eq!(headers[CONTENT_LENGTH.as_str()], content.len().to_string());
+                GetBlobResponse::RangedReader {
+                    range, mut body, ..
+                } => {
+                    assert_eq!(range.start, 0);
+                    assert_eq!(range.end, content.len() as u64 - 1);
+                    assert_eq!(range.total_length, content.len() as u64);
+                    assert_eq!(range.length, content.len() as u64);
 
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
@@ -1052,15 +1038,13 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::RangedReader { headers, mut body } => {
-                    assert_eq!(
-                        headers[CONTENT_RANGE.as_str()],
-                        format!("bytes 8-{}/{}", content.len() - 1, content.len())
-                    );
-                    assert_eq!(
-                        headers[CONTENT_LENGTH.as_str()],
-                        (content.len() - 8).to_string()
-                    );
+                GetBlobResponse::RangedReader {
+                    range, mut body, ..
+                } => {
+                    assert_eq!(range.start, 8);
+                    assert_eq!(range.end, content.len() as u64 - 1);
+                    assert_eq!(range.total_length, content.len() as u64);
+                    assert_eq!(range.length, content.len() as u64 - 8);
 
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
@@ -1119,8 +1103,12 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::Reader { headers, mut body } => {
-                    assert_eq!(headers[CONTENT_LENGTH.as_str()], "0");
+                GetBlobResponse::Reader {
+                    total_length,
+                    mut body,
+                    ..
+                } => {
+                    assert_eq!(total_length, 0);
                     let mut buf = Vec::new();
                     body.read_to_end(&mut buf).await.unwrap();
                     assert!(buf.is_empty());
@@ -1149,70 +1137,21 @@ mod tests {
                 .head_blob(&repository, &[], namespace, &digest)
                 .await
                 .unwrap();
-            assert_eq!(
-                head_response.headers[DOCKER_CONTENT_DIGEST],
-                digest.to_string()
-            );
-            assert_eq!(
-                head_response.headers[CONTENT_LENGTH.as_str()],
-                content.len().to_string()
-            );
+            assert_eq!(head_response.digest, digest);
+            assert_eq!(head_response.size, content.len() as u64);
 
             let get_response = get_blob(registry, &repository, &[], namespace, &digest, None)
                 .await
                 .unwrap();
             match get_response {
-                GetBlobResponse::Reader { headers, .. } => {
-                    assert_eq!(
-                        headers[CONTENT_LENGTH.as_str()],
-                        head_response.headers[CONTENT_LENGTH.as_str()]
-                    );
+                GetBlobResponse::Reader { total_length, .. } => {
+                    assert_eq!(total_length, head_response.size);
                 }
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
         })
         .await;
-    }
-
-    #[test]
-    fn test_head_blob_headers_contains_required_fields() {
-        let digest: Digest =
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                .parse()
-                .unwrap();
-        let headers = head_blob_headers(&digest, 42);
-        assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
-        assert_eq!(headers[CONTENT_LENGTH.as_str()], "42");
-    }
-
-    #[test]
-    fn test_get_blob_headers_includes_accept_ranges() {
-        let digest: Digest =
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                .parse()
-                .unwrap();
-        let headers = get_blob_headers(&digest, 1024);
-        assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
-        assert_eq!(headers[ACCEPT_RANGES.as_str()], "bytes");
-        assert_eq!(headers[CONTENT_LENGTH.as_str()], "1024");
-    }
-
-    #[test]
-    fn test_get_blob_range_headers_computes_content_length() {
-        let digest: Digest =
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                .parse()
-                .unwrap();
-        let range = ResolvedRange {
-            start: 5,
-            end: 10,
-            length: 6,
-            total_length: 100,
-        };
-        let headers = get_blob_range_headers(&digest, range);
-        assert_eq!(headers[CONTENT_LENGTH.as_str()], "6");
-        assert_eq!(headers[CONTENT_RANGE.as_str()], "bytes 5-10/100");
     }
 
     #[test]
@@ -1357,16 +1296,5 @@ mod tests {
             ),
             Err(Error::RangeNotSatisfiable)
         ));
-    }
-
-    #[test]
-    fn test_get_blob_redirect_headers_carries_location_and_digest() {
-        let digest: Digest =
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                .parse()
-                .unwrap();
-        let headers = get_blob_redirect_headers("https://cdn/blob".to_string(), &digest);
-        assert_eq!(headers[LOCATION.as_str()], "https://cdn/blob");
-        assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
     }
 }

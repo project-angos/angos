@@ -13,11 +13,9 @@ use crate::{
     metrics_provider::metrics_provider,
     oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
-        Registry,
+        Error as RegistryError, Registry,
         blob_store::{self, BlobStore, MultipartCleanup},
-        metadata_store::{
-            BlobIndexOperation, Error as MetadataError, LinkKind, LinkOperation, MetadataStore,
-        },
+        metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
@@ -186,10 +184,9 @@ impl Executor {
                         Ok(())
                     }
                     Ok(false) => match self.blob_store.delete_blob(&digest).await {
-                        Ok(())
-                        | Err(
-                            blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
-                        ) => Ok(()),
+                        Ok(()) | Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
+                            Ok(())
+                        }
                         Err(e) => Err(Error::from(e)),
                     },
                 }
@@ -228,7 +225,7 @@ impl Executor {
             .with_blob_data_lock(&blob, async {
                 match self.blob_store.size(&blob).await {
                     Ok(_) => {}
-                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                    Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                         info!(
                             "skipping blob-index grant: bytes were reclaimed for '{namespace}/{blob}'"
                         );
@@ -261,7 +258,7 @@ impl Executor {
                     Ok(links) => links,
                     // The grant vanished since classification (a concurrent revoke
                     // or delete): nothing left to do.
-                    Err(MetadataError::ReferenceNotFound) => return Ok(()),
+                    Err(RegistryError::NotFound) => return Ok(()),
                     Err(e) => return Err(Error::from(e)),
                 };
                 if links.iter().any(LinkKind::is_tracked) {

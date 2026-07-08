@@ -14,7 +14,7 @@ use tokio::{
 
 use angos_tx_engine::ByteStream;
 
-use crate::registry::blob_store::{Error, resumable_hasher::Hasher};
+use crate::registry::{Error, blob_store::resumable_hasher::Hasher};
 
 const READ_FRAME_SIZE: usize = 1024 * 1024;
 
@@ -88,26 +88,21 @@ where
                                 format!("short upload body: expected {expected} bytes, got {sent}"),
                             )))
                             .await;
-                        return Err(Error::UploadBodySize {
-                            expected,
-                            actual: sent,
-                        });
+                        return Err(Error::RangeNotSatisfiable);
                     }
                     break;
                 }
                 Ok(n) => {
                     sent = sent
-                        .checked_add(
-                            u64::try_from(n).map_err(|e| Error::InvalidFormat(e.to_string()))?,
-                        )
-                        .ok_or_else(|| Error::StorageBackend("size overflow".into()))?;
+                        .checked_add(u64::try_from(n).map_err(|e| Error::Internal(e.to_string()))?)
+                        .ok_or_else(|| Error::Internal("size overflow".into()))?;
                     if tx.send(Ok(buf.split().freeze())).await.is_err() {
                         break;
                     }
                 }
                 Err(e) => {
                     let _ = tx.send(Err(io::Error::other(e.to_string()))).await;
-                    return Err(Error::UploadBodyRead(e.to_string()));
+                    return Err(Error::RangeNotSatisfiable);
                 }
             }
         }

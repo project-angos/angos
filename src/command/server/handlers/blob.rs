@@ -1,15 +1,57 @@
-use hyper::{Response, StatusCode, http::request::Parts};
+use hyper::{
+    Response, StatusCode,
+    header::{ACCEPT_RANGES, CONTENT_RANGE},
+    http::request::Parts,
+};
 
 use crate::{
     command::server::{
-        ServerContext, error::Error, handlers::build_response, request::RequestHeaders,
+        ServerContext,
+        error::Error,
+        handlers::build_response,
+        request::RequestHeaders,
+        response::{HeaderMap, ResponseHeaders},
         response_body::ResponseBody,
     },
     event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{Digest, Namespace},
-    registry::GetBlobResponse,
+    registry::{GetBlobResponse, blob::ResolvedRange},
 };
+
+fn head_blob_headers(digest: &Digest, size: u64) -> HeaderMap {
+    ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .content_length(size)
+        .into_inner()
+}
+
+fn get_blob_headers(digest: &Digest, total_length: u64) -> HeaderMap {
+    ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .with(ACCEPT_RANGES.as_str(), "bytes")
+        .content_length(total_length)
+        .into_inner()
+}
+
+fn get_blob_range_headers(digest: &Digest, range: ResolvedRange) -> HeaderMap {
+    ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .with(ACCEPT_RANGES.as_str(), "bytes")
+        .content_length(range.length)
+        .with(
+            CONTENT_RANGE.as_str(),
+            format!("bytes {}-{}/{}", range.start, range.end, range.total_length),
+        )
+        .into_inner()
+}
+
+fn get_blob_redirect_headers(url: String, digest: &Digest) -> HeaderMap {
+    ResponseHeaders::new()
+        .location(url)
+        .docker_content_digest(digest)
+        .into_inner()
+}
 
 pub async fn handle_head_blob(
     context: &ServerContext,
@@ -24,7 +66,11 @@ pub async fn handle_head_blob(
         .head_blob(repository, &mime_types, namespace, digest)
         .await?;
 
-    build_response(StatusCode::OK, response.headers, ResponseBody::empty())
+    build_response(
+        StatusCode::OK,
+        head_blob_headers(&response.digest, response.size),
+        ResponseBody::empty(),
+    )
 }
 
 pub async fn handle_delete_blob(
@@ -57,17 +103,30 @@ pub async fn handle_get_blob(
         .await?;
 
     match response {
-        GetBlobResponse::Redirect { headers } => build_response(
+        GetBlobResponse::Redirect {
+            redirect_url,
+            digest,
+        } => build_response(
             StatusCode::TEMPORARY_REDIRECT,
-            headers,
+            get_blob_redirect_headers(redirect_url, &digest),
             ResponseBody::empty(),
         ),
-        GetBlobResponse::Reader { headers, body } => {
-            build_response(StatusCode::OK, headers, ResponseBody::streaming(body))
-        }
-        GetBlobResponse::RangedReader { headers, body } => build_response(
+        GetBlobResponse::Reader {
+            digest,
+            total_length,
+            body,
+        } => build_response(
+            StatusCode::OK,
+            get_blob_headers(&digest, total_length),
+            ResponseBody::streaming(body),
+        ),
+        GetBlobResponse::RangedReader {
+            digest,
+            range,
+            body,
+        } => build_response(
             StatusCode::PARTIAL_CONTENT,
-            headers,
+            get_blob_range_headers(&digest, range),
             ResponseBody::streaming(body),
         ),
     }
@@ -75,15 +134,65 @@ pub async fn handle_get_blob(
 
 #[cfg(test)]
 mod tests {
-    use hyper::{Request, StatusCode};
+    use hyper::{
+        Request, StatusCode,
+        header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION},
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use crate::{
-        command::server::server_context::tests::create_test_repo_context, identity::ClientIdentity,
-        oci::Namespace, registry::test_utils::upload_blob,
+        command::server::server_context::tests::create_test_repo_context,
+        identity::ClientIdentity,
+        oci::{Digest, Namespace},
+        registry::DOCKER_CONTENT_DIGEST,
+        registry::test_utils::upload_blob,
     };
 
-    use super::handle_get_blob;
+    use super::{
+        ResolvedRange, get_blob_headers, get_blob_range_headers, get_blob_redirect_headers,
+        handle_get_blob, head_blob_headers,
+    };
+
+    fn sample_digest() -> Digest {
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn head_blob_headers_contains_required_fields() {
+        let headers = head_blob_headers(&sample_digest(), 42);
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "42");
+    }
+
+    #[test]
+    fn get_blob_headers_includes_accept_ranges() {
+        let headers = get_blob_headers(&sample_digest(), 1024);
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
+        assert_eq!(headers[ACCEPT_RANGES.as_str()], "bytes");
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "1024");
+    }
+
+    #[test]
+    fn get_blob_range_headers_computes_content_length() {
+        let range = ResolvedRange {
+            start: 5,
+            end: 10,
+            length: 6,
+            total_length: 100,
+        };
+        let headers = get_blob_range_headers(&sample_digest(), range);
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "6");
+        assert_eq!(headers[CONTENT_RANGE.as_str()], "bytes 5-10/100");
+    }
+
+    #[test]
+    fn get_blob_redirect_headers_carries_location_and_digest() {
+        let headers = get_blob_redirect_headers("https://cdn/blob".to_string(), &sample_digest());
+        assert_eq!(headers[LOCATION.as_str()], "https://cdn/blob");
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
+    }
 
     /// A blob GET emits one `blob.pull` event carrying the blob digest.
     #[tokio::test]

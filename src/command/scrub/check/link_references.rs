@@ -13,9 +13,9 @@ use crate::{
     },
     oci::{Digest, Namespace},
     registry::{
-        blob_store,
+        Error as RegistryError,
         blob_store::BlobStore,
-        metadata_store::{self, LinkKind, MetadataStore},
+        metadata_store::{LinkKind, MetadataStore},
         parse_manifest_digests,
     },
 };
@@ -41,7 +41,7 @@ impl LinkReferencesChecker {
     ) -> Result<(), Error> {
         let content = match self.blob_store.read(revision).await {
             Ok(content) => content,
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+            Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 warn!("Manifest blob missing for revision {revision}; removing revision link");
                 return sink
                     .apply(Action::DeleteOrphanManifest {
@@ -80,7 +80,7 @@ impl LinkReferencesChecker {
     ) -> Result<(), Error> {
         let metadata = match self.metadata_store.read_link(namespace, link).await {
             Ok(m) => m,
-            Err(metadata_store::Error::ReferenceNotFound) => return Ok(()),
+            Err(RegistryError::NotFound) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
 
@@ -104,7 +104,7 @@ impl LinkReferencesChecker {
                 .await
             {
                 Ok(_) => {}
-                Err(metadata_store::Error::ReferenceNotFound) => {
+                Err(RegistryError::NotFound) => {
                     sink.apply(Action::RemoveReferrer {
                         namespace: namespace.clone(),
                         link: link.clone(),
@@ -370,7 +370,7 @@ mod tests {
                 .read_link(namespace, &LinkKind::Config(config_digest))
                 .await;
             assert!(
-                matches!(config_result, Err(metadata_store::Error::ReferenceNotFound)),
+                matches!(config_result, Err(RegistryError::NotFound)),
                 "Config link should still not exist after check"
             );
         })
@@ -482,8 +482,8 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(Error::MetadataStore(_))),
-            "parse error must propagate as Error::MetadataStore, got: {result:?}"
+            matches!(result, Err(Error::Registry(_))),
+            "parse error must propagate as Error::Registry, got: {result:?}"
         );
     }
 

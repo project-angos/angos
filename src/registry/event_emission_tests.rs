@@ -230,12 +230,7 @@ async fn digest_push_suppresses_tag_create_event() {
         .expect("seed push");
     let seed_event_count = received_events(&server).await.len();
 
-    let digest_str = tag_response
-        .headers
-        .get("Docker-Content-Digest")
-        .cloned()
-        .expect("digest header");
-    let digest: Digest = digest_str.parse().expect("parse digest");
+    let digest = tag_response.digest.clone();
 
     // Push the same manifest addressed by its digest.
     fixture
@@ -343,12 +338,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
         .expect("put manifest");
     let push_event_count = received_events(&server).await.len();
 
-    let digest_str = push
-        .headers
-        .get("Docker-Content-Digest")
-        .cloned()
-        .expect("digest header");
-    let digest: Digest = digest_str.parse().expect("parse digest");
+    let digest = push.digest.clone();
 
     let reference = Reference::Digest(digest);
     fixture

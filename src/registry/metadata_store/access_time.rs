@@ -28,7 +28,8 @@ use angos_tx_engine::{
 use crate::{
     oci::Namespace,
     registry::{
-        metadata_store::{Error, LinkKind, LinkMetadata, MetadataStore, tx_error_to_meta},
+        Error,
+        metadata_store::{LinkKind, LinkMetadata, MetadataStore},
         path_builder,
     },
 };
@@ -192,7 +193,7 @@ impl MetadataStore {
                 Ok((serialized, link_data))
             })
             .await
-            .map_err(tx_error_to_meta)
+            .map_err(Error::from)
     }
 
     /// Mark the access time for `link` in `namespace` using a read-modify-write
@@ -236,7 +237,7 @@ impl MetadataStore {
                 DEFAULT_RETRY_BUDGET,
             )
             .await
-            .map_err(tx_error_to_meta)?;
+            .map_err(Error::from)?;
 
         Ok(link_data)
     }
@@ -281,6 +282,6 @@ impl MetadataStore {
             )
             .await
             .map(|_| ())
-            .map_err(tx_error_to_meta)
+            .map_err(Error::from)
     }
 }

@@ -13,7 +13,10 @@ use crate::{
         executor::ActionSink,
     },
     oci::Namespace,
-    registry::blob_store::{self, BlobStore, UploadSummary},
+    registry::{
+        Error as RegistryError,
+        blob_store::{BlobStore, UploadSummary},
+    },
 };
 
 enum UploadVerdict {
@@ -27,7 +30,7 @@ enum UploadVerdict {
 
 #[allow(clippy::match_same_arms)]
 fn classify_upload(
-    summary: Result<&UploadSummary, &blob_store::Error>,
+    summary: Result<&UploadSummary, &RegistryError>,
     timeout: Duration,
     now: DateTime<Utc>,
 ) -> UploadVerdict {
@@ -35,13 +38,11 @@ fn classify_upload(
         Ok(s) if now.signed_duration_since(s.started_at) > timeout => UploadVerdict::DeleteObsolete,
         Ok(_) => UploadVerdict::Keep,
         Err(
-            blob_store::Error::UploadNotFound
-            | blob_store::Error::ReferenceNotFound
-            | blob_store::Error::BlobNotFound
-            | blob_store::Error::InvalidFormat(_)
-            | blob_store::Error::HashSerialization(_)
-            | blob_store::Error::JSONSerialization(_),
+            RegistryError::BlobUploadUnknown | RegistryError::NotFound | RegistryError::BlobUnknown,
         ) => UploadVerdict::DeleteInconsistent,
+        // A corrupt session record and a transient backend read both collapse to
+        // `Internal` now, so this arm covers both; it errs on the safe side and
+        // keeps the upload rather than risk deleting one on a transient error.
         Err(_) => UploadVerdict::Keep,
     }
 }
@@ -114,13 +115,12 @@ impl NamespaceChecker for UploadChecker {
 
 #[cfg(test)]
 mod tests {
-    use angos_s3_client as s3_client;
     use chrono::TimeZone;
 
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        registry::{blob_store, test_utils::for_each_backend},
+        registry::test_utils::for_each_backend,
     };
 
     fn fixed_now() -> DateTime<Utc> {
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn classify_upload_deletes_inconsistent_on_upload_not_found() {
         let verdict = classify_upload(
-            Err(&blob_store::Error::UploadNotFound),
+            Err(&RegistryError::BlobUploadUnknown),
             Duration::hours(1),
             fixed_now(),
         );
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn classify_upload_deletes_inconsistent_on_reference_not_found() {
         let verdict = classify_upload(
-            Err(&blob_store::Error::ReferenceNotFound),
+            Err(&RegistryError::NotFound),
             Duration::hours(1),
             fixed_now(),
         );
@@ -182,33 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_upload_deletes_inconsistent_on_invalid_format() {
+    fn classify_upload_keeps_on_opaque_internal_error() {
+        // A corrupt session record and a transient backend read both surface as
+        // `Internal` after the error-chain collapse and can no longer be told
+        // apart, so the checker conservatively keeps the upload for both.
         let verdict = classify_upload(
-            Err(&blob_store::Error::InvalidFormat("bad data".to_string())),
-            Duration::hours(1),
-            fixed_now(),
-        );
-        assert!(matches!(verdict, UploadVerdict::DeleteInconsistent));
-    }
-
-    #[test]
-    fn classify_upload_keeps_on_storage_backend_error() {
-        let verdict = classify_upload(
-            Err(&blob_store::Error::StorageBackend(
-                "S3 throttle".to_string(),
-            )),
-            Duration::hours(1),
-            fixed_now(),
-        );
-        assert!(matches!(verdict, UploadVerdict::Keep));
-    }
-
-    #[test]
-    fn classify_upload_keeps_on_data_store_error() {
-        let verdict = classify_upload(
-            Err(&blob_store::Error::DataStore(s3_client::Error::Io(
-                "timeout".to_string(),
-            ))),
+            Err(&RegistryError::Internal("S3 throttle".to_string())),
             Duration::hours(1),
             fixed_now(),
         );

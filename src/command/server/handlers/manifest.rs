@@ -10,13 +10,76 @@ use crate::{
         error::Error,
         handlers::build_response,
         request::{RequestHeaders, incoming_into_async_read},
+        response::{HeaderMap, ResponseHeaders},
         response_body::ResponseBody,
     },
     event_webhook::event::EventActor,
     identity::ClientIdentity,
-    oci::{MediaType, Namespace, Reference, Tag},
-    registry::GetManifestResponse,
+    oci::{Digest, MediaType, Namespace, Reference, Tag},
+    registry::{GetManifestResponse, OCI_SUBJECT, OCI_TAG},
 };
+
+fn head_manifest_headers(media_type: Option<&str>, digest: &Digest, size: u64) -> HeaderMap {
+    let headers = ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .content_length(size);
+    match media_type {
+        Some(media_type) => headers.content_type(media_type).into_inner(),
+        None => headers.into_inner(),
+    }
+}
+
+fn get_manifest_body_headers(
+    media_type: Option<&str>,
+    digest: &Digest,
+    content_length: u64,
+) -> HeaderMap {
+    let headers = ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .content_length(content_length);
+    match media_type {
+        Some(media_type) => headers.content_type(media_type).into_inner(),
+        None => headers.into_inner(),
+    }
+}
+
+fn get_manifest_redirect_headers(
+    url: String,
+    digest: &Digest,
+    media_type: Option<MediaType>,
+) -> HeaderMap {
+    let headers = ResponseHeaders::new()
+        .location(url)
+        .docker_content_digest(digest);
+    match media_type {
+        Some(media_type) => headers.content_type(media_type.as_ref()).into_inner(),
+        None => headers.into_inner(),
+    }
+}
+
+fn put_manifest_headers(
+    namespace: &Namespace,
+    reference: &Reference,
+    digest: &Digest,
+    subject: Option<&Digest>,
+    created_tags: &[Tag],
+) -> HeaderMap {
+    let mut headers = ResponseHeaders::new()
+        .location(format!("/v2/{namespace}/manifests/{reference}"))
+        .docker_content_digest(digest);
+    if let Some(subject) = subject {
+        headers = headers.with(OCI_SUBJECT, subject.to_string());
+    }
+    if !created_tags.is_empty() {
+        let joined = created_tags
+            .iter()
+            .map(Tag::as_ref)
+            .collect::<Vec<&str>>()
+            .join(", ");
+        headers = headers.with(OCI_TAG, joined);
+    }
+    headers.into_inner()
+}
 
 pub async fn handle_head_manifest(
     context: &ServerContext,
@@ -38,7 +101,15 @@ pub async fn handle_head_manifest(
         )
         .await?;
 
-    build_response(StatusCode::OK, response.headers, ResponseBody::empty())
+    build_response(
+        StatusCode::OK,
+        head_manifest_headers(
+            response.media_type.as_deref(),
+            &response.digest,
+            response.size,
+        ),
+        ResponseBody::empty(),
+    )
 }
 
 pub async fn handle_get_manifest(
@@ -57,14 +128,24 @@ pub async fn handle_get_manifest(
         .await?;
 
     match response {
-        GetManifestResponse::Redirect { headers, .. } => build_response(
+        GetManifestResponse::Redirect {
+            redirect_url,
+            digest,
+            media_type,
+        } => build_response(
             StatusCode::TEMPORARY_REDIRECT,
-            headers,
+            get_manifest_redirect_headers(redirect_url, &digest, media_type),
             ResponseBody::empty(),
         ),
         GetManifestResponse::Body {
-            headers, content, ..
-        } => build_response(StatusCode::OK, headers, ResponseBody::fixed(content)),
+            media_type,
+            digest,
+            content,
+        } => build_response(
+            StatusCode::OK,
+            get_manifest_body_headers(media_type.as_deref(), &digest, content.len() as u64),
+            ResponseBody::fixed(content),
+        ),
     }
 }
 
@@ -98,7 +179,17 @@ where
         )
         .await?;
 
-    build_response(StatusCode::CREATED, response.headers, ResponseBody::empty())
+    build_response(
+        StatusCode::CREATED,
+        put_manifest_headers(
+            &response.namespace,
+            &response.reference,
+            &response.digest,
+            response.subject.as_ref(),
+            &response.created_tags,
+        ),
+        ResponseBody::empty(),
+    )
 }
 
 pub async fn handle_delete_manifest(
@@ -151,7 +242,10 @@ pub async fn handle_put_manifest(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
-    use hyper::{Request, StatusCode};
+    use hyper::{
+        Request, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use crate::{
@@ -160,13 +254,94 @@ mod tests {
             server_context::tests::create_test_repo_context,
         },
         identity::ClientIdentity,
-        oci::{MediaType, Namespace, Reference, Tag},
+        oci::{Digest, MediaType, Namespace, Reference, Tag},
+        registry::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, OCI_TAG},
         registry_client::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     };
 
-    use super::{handle_get_manifest, put_manifest};
+    use super::{
+        get_manifest_body_headers, get_manifest_redirect_headers, handle_get_manifest,
+        head_manifest_headers, put_manifest, put_manifest_headers,
+    };
 
     const MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+    fn sample_digest() -> Digest {
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn head_manifest_headers_carries_digest_length_and_media_type() {
+        let headers = head_manifest_headers(Some(MEDIA_TYPE), &sample_digest(), 42);
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "42");
+        assert_eq!(headers[CONTENT_TYPE.as_str()], MEDIA_TYPE);
+    }
+
+    #[test]
+    fn head_manifest_headers_omits_content_type_without_media_type() {
+        let headers = head_manifest_headers(None, &sample_digest(), 7);
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "7");
+        assert!(!headers.contains_key(CONTENT_TYPE.as_str()));
+    }
+
+    #[test]
+    fn get_manifest_body_headers_carries_digest_length_and_media_type() {
+        let headers = get_manifest_body_headers(Some(MEDIA_TYPE), &sample_digest(), 128);
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "128");
+        assert_eq!(headers[CONTENT_TYPE.as_str()], MEDIA_TYPE);
+    }
+
+    #[test]
+    fn get_manifest_redirect_headers_carries_location_and_digest() {
+        let headers = get_manifest_redirect_headers(
+            "https://cdn/manifest".to_string(),
+            &sample_digest(),
+            Some(MediaType::new(MEDIA_TYPE).unwrap()),
+        );
+        assert_eq!(headers[LOCATION.as_str()], "https://cdn/manifest");
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
+        assert_eq!(headers[CONTENT_TYPE.as_str()], MEDIA_TYPE);
+    }
+
+    #[test]
+    fn put_manifest_headers_formats_location() {
+        let namespace = Namespace::new("test/repo").unwrap();
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let headers = put_manifest_headers(&namespace, &reference, &sample_digest(), None, &[]);
+        assert_eq!(headers[LOCATION.as_str()], "/v2/test/repo/manifests/latest");
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
+        assert!(!headers.contains_key(OCI_SUBJECT));
+        assert!(!headers.contains_key(OCI_TAG));
+    }
+
+    #[test]
+    fn put_manifest_headers_carries_subject() {
+        let namespace = Namespace::new("test/repo").unwrap();
+        let reference = Reference::Digest(sample_digest());
+        let subject = sample_digest();
+        let headers = put_manifest_headers(
+            &namespace,
+            &reference,
+            &sample_digest(),
+            Some(&subject),
+            &[],
+        );
+        assert_eq!(headers[OCI_SUBJECT], subject.to_string());
+    }
+
+    #[test]
+    fn put_manifest_headers_joins_created_tags() {
+        let namespace = Namespace::new("test/repo").unwrap();
+        let reference = Reference::Digest(sample_digest());
+        let tags = vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()];
+        let headers = put_manifest_headers(&namespace, &reference, &sample_digest(), None, &tags);
+        assert_eq!(headers[OCI_TAG], "1.2.3, latest");
+    }
 
     // A context whose resolver matches "test/*", required for the read-back path
     // (the default test config declares no [repository.*] so it would resolve none).

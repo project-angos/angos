@@ -14,9 +14,9 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store,
+        Error as RegistryError,
         blob_store::BlobStore,
-        metadata_store::{Error as MetadataError, LinkKind, MetadataStore},
+        metadata_store::{LinkKind, MetadataStore},
     },
 };
 
@@ -61,7 +61,7 @@ impl OrphanGrantChecker {
         let last_modified = match self.blob_store.last_modified(blob).await {
             Ok(Some(ts)) => ts,
             Ok(None) => return Ok(()),
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+            Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
@@ -72,7 +72,7 @@ impl OrphanGrantChecker {
 
         let index = match self.metadata_store.read_blob_index(blob).await {
             Ok(index) => index,
-            Err(MetadataError::ReferenceNotFound) => return Ok(()),
+            Err(RegistryError::NotFound) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         let grant = LinkKind::Blob(blob.clone());

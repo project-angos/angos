@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     oci::{Descriptor, Digest, MediaType},
-    registry::metadata_store::Error,
+    registry::Error,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,9 +91,9 @@ impl LinkMetadata {
     /// `now()` would re-stamp fresher every read and block replication) and
     /// retention treats it as oldest.
     fn from_legacy_bytes(s: Vec<u8>) -> Result<Self, Error> {
-        let target = String::from_utf8(s).map_err(|e| Error::InvalidData(e.to_string()))?;
+        let target = String::from_utf8(s).map_err(|e| Error::Internal(e.to_string()))?;
         let target =
-            Digest::try_from(target.as_str()).map_err(|e| Error::InvalidData(e.to_string()))?;
+            Digest::try_from(target.as_str()).map_err(|e| Error::Internal(e.to_string()))?;
 
         Ok(LinkMetadata {
             target,
@@ -200,19 +200,19 @@ mod tests {
     #[test]
     fn from_bytes_rejects_malformed_input() {
         let result = LinkMetadata::from_bytes(b"this is not JSON or a digest".to_vec());
-        assert!(matches!(result, Err(Error::InvalidData(_))));
+        assert!(matches!(result, Err(Error::Internal(_))));
     }
 
     #[test]
     fn from_bytes_rejects_invalid_utf8() {
         let result = LinkMetadata::from_bytes(vec![0xff, 0xfe, 0xfd]);
-        assert!(matches!(result, Err(Error::InvalidData(_))));
+        assert!(matches!(result, Err(Error::Internal(_))));
     }
 
     #[test]
     fn from_bytes_rejects_empty_input() {
         let result = LinkMetadata::from_bytes(Vec::new());
-        assert!(matches!(result, Err(Error::InvalidData(_))));
+        assert!(matches!(result, Err(Error::Internal(_))));
     }
 
     #[test]

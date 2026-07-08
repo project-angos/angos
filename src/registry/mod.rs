@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt,
     num::NonZeroUsize,
     sync::{Arc, Weak},
@@ -19,7 +18,6 @@ pub mod content_discovery;
 mod error;
 #[cfg(test)]
 mod event_emission_tests;
-mod headers;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;
@@ -54,26 +52,16 @@ use crate::{
 };
 pub use blob::{BlobRange, GetBlobResponse};
 pub use error::Error;
-pub use headers::{HeaderMap, ResponseHeaders};
 pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
 pub use repository::Repository;
 pub use upload::{BlobMount, StartUploadResponse};
 
+/// OCI wire header names shared by the server responses and the transport
+/// client. Response-only header names live in `command::server::response`.
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
 pub const OCI_SUBJECT: &str = "OCI-Subject";
 pub const OCI_TAG: &str = "OCI-Tag";
-pub const APPLICATION_JSON: &str = "application/json";
-
-/// Response for endpoints whose body is a JSON (or JSON-flavoured) payload.
-///
-/// The registry is the sole authority on both the headers (Content-Type,
-/// Link, OCI-Filters-Applied, ...) and the serialized body bytes. Handlers
-/// attach the headers verbatim and pass the body through.
-pub struct JsonResponse {
-    pub headers: HashMap<&'static str, String>,
-    pub body: Vec<u8>,
-}
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {

@@ -4,7 +4,8 @@ use super::{test_backend_with_cache, test_config};
 use crate::{
     oci::{Digest, Namespace, Tag},
     registry::{
-        metadata_store::{Error, LinkKind, LinkMetadata, LinkOperation},
+        Error,
+        metadata_store::{LinkKind, LinkMetadata, LinkOperation},
         path_builder,
     },
 };
@@ -224,7 +225,7 @@ async fn test_update_links_invalidates_cache_on_delete() {
 
     let result = backend.read_link(&namespace, &tag).await;
     assert!(
-        matches!(result, Err(Error::ReferenceNotFound)),
+        matches!(result, Err(Error::NotFound)),
         "Should get ReferenceNotFound after deleting a tag via update_links"
     );
 }
@@ -299,7 +300,7 @@ async fn test_cache_disabled_when_ttl_zero() {
 
     let result = backend.read_link(&namespace, &tag).await;
     assert!(
-        matches!(result, Err(Error::ReferenceNotFound)),
+        matches!(result, Err(Error::NotFound)),
         "Should get ReferenceNotFound when cache is disabled and storage object is deleted"
     );
 }

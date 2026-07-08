@@ -24,8 +24,9 @@ use angos_tx_engine::{
 use crate::{
     oci::{Descriptor, Digest, MediaType, Namespace},
     registry::{
+        Error,
         metadata_store::{
-            BlobIndexOperation, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore,
+            BlobIndexOperation, LinkKind, LinkMetadata, LinkOperation, MetadataStore,
             blob_index::shard::{
                 any_other_namespace_references_blob, append_shard_for_digest, ops_for_digest,
                 shard_will_be_empty,
@@ -34,21 +35,6 @@ use crate::{
         path_builder,
     },
 };
-
-// Error mapping
-
-/// Map a tx-engine error to a metadata-store error.
-pub fn tx_error_to_meta(err: TxError) -> Error {
-    match err {
-        TxError::Storage(e) => Error::from(e),
-        TxError::Lock(e) => Error::from(e),
-        TxError::Serde(e) => Error::from(e),
-        TxError::Conflict | TxError::Precondition | TxError::PartialCommit => {
-            Error::Coordination("transaction conflict: retry budget exhausted".to_string())
-        }
-        TxError::Build(msg) => Error::Coordination(format!("engine build error: {msg}")),
-    }
-}
 
 // Consolidated transaction planner
 
@@ -388,7 +374,7 @@ impl MetadataStore {
             DEFAULT_RETRY_BUDGET,
         )
         .await
-        .map_err(tx_error_to_meta)?;
+        .map_err(Error::from)?;
 
         if let Some(message) = result.superseded {
             return Err(Error::ReplicationSuperseded(message));

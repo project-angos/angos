@@ -11,7 +11,8 @@ use angos_tx_engine::StorageError;
 use crate::{
     oci::Namespace,
     registry::{
-        metadata_store::{Error, LinkKind, LinkMetadata, MetadataStore},
+        Error,
+        metadata_store::{LinkKind, LinkMetadata, MetadataStore},
         path_builder,
     },
 };
@@ -26,7 +27,7 @@ impl MetadataStore {
         let link_path = path_builder::link_path(link, namespace);
         match self.store().object_store().get(&link_path).await {
             Ok(data) => LinkMetadata::from_bytes(data),
-            Err(StorageError::NotFound) => Err(Error::ReferenceNotFound),
+            Err(StorageError::NotFound) => Err(Error::NotFound),
             Err(e) => Err(e.into()),
         }
     }

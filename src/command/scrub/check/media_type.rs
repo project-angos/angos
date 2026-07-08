@@ -13,7 +13,7 @@ use crate::{
     },
     oci::{Manifest, Namespace},
     registry::{
-        blob_store,
+        Error as RegistryError,
         blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
     },
@@ -48,7 +48,7 @@ impl MediaTypeChecker {
 
         let content = match self.blob_store.read(&metadata.target).await {
             Ok(content) => content,
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+            Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 warn!(
                     "Manifest blob missing for {display_name} ({}); removing revision link",
                     metadata.target

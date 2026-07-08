@@ -17,10 +17,7 @@ use angos_storage::{
     ObjectStore, PresignedStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
 
-use crate::registry::{
-    blob_store::{BlobStore, Error},
-    s3_connection::S3ConnectionConfig,
-};
+use crate::registry::{Error, blob_store::BlobStore, s3_connection::S3ConnectionConfig};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct FsBackendConfig {
@@ -117,8 +114,8 @@ impl BlobStoreConfig {
                     max_attempts: config.transport.max_attempts,
                     ..config.connection.to_client_config()
                 };
-                let http = S3HttpBackend::new(&transport)
-                    .map_err(|e| Error::StorageBackend(e.to_string()))?;
+                let http =
+                    S3HttpBackend::new(&transport).map_err(|e| Error::Internal(e.to_string()))?;
                 let backend = Arc::new(
                     StorageS3Backend::builder(Arc::new(http))
                         .part_size(config.transport.multipart_part_size.as_u64())

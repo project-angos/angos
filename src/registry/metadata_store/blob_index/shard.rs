@@ -18,7 +18,8 @@ use angos_tx_engine::{
 use crate::{
     oci::{Digest, Namespace},
     registry::{
-        metadata_store::{BlobIndex, BlobIndexOperation, Error, LinkKind},
+        Error,
+        metadata_store::{BlobIndex, BlobIndexOperation, LinkKind},
         path_builder,
     },
 };
@@ -65,7 +66,7 @@ pub fn apply_blob_index_operations(
 
 pub fn non_empty_links_or_not_found(links: HashSet<LinkKind>) -> Result<HashSet<LinkKind>, Error> {
     if links.is_empty() {
-        Err(Error::ReferenceNotFound)
+        Err(Error::NotFound)
     } else {
         Ok(links)
     }
@@ -80,7 +81,7 @@ pub fn namespace_links_from_index(
         .get(namespace)
         .cloned()
         .filter(|links| !links.is_empty())
-        .ok_or(Error::ReferenceNotFound)
+        .ok_or(Error::NotFound)
 }
 
 // Store read-modify-write

@@ -1,72 +1,9 @@
-use std::sync::LazyLock;
-
-use serde::Serialize;
 use tracing::instrument;
 
-use hyper::header::LINK;
-
 use crate::{
-    oci::{
-        Descriptor, Digest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE,
-        OCI_MANIFEST_SCHEMA_VERSION, Tag,
-    },
-    registry::{APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders},
+    oci::{Descriptor, Digest, Namespace, Tag},
+    registry::{Error, Registry},
 };
-
-const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
-
-static OCI_INDEX_MEDIA_TYPE_VALUE: LazyLock<MediaType> =
-    LazyLock::new(|| MediaType::new(OCI_INDEX_MEDIA_TYPE).unwrap());
-
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct ReferrerList {
-    schema_version: i32,
-    media_type: MediaType,
-    manifests: Vec<Descriptor>,
-}
-
-impl Default for ReferrerList {
-    fn default() -> Self {
-        ReferrerList {
-            schema_version: OCI_MANIFEST_SCHEMA_VERSION,
-            media_type: OCI_INDEX_MEDIA_TYPE_VALUE.clone(),
-            manifests: Vec::new(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct CatalogBody {
-    repositories: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct TagsBody<'a> {
-    name: &'a str,
-    tags: Vec<Tag>,
-}
-
-fn referrers_headers(artifact_type_filtered: bool) -> HeaderMap {
-    let headers = ResponseHeaders::new().content_type(OCI_INDEX_MEDIA_TYPE);
-    if artifact_type_filtered {
-        headers
-            .with(OCI_FILTERS_APPLIED, "artifactType")
-            .into_inner()
-    } else {
-        headers.into_inner()
-    }
-}
-
-fn paginated_json_headers(link: Option<&str>) -> HeaderMap {
-    let headers = ResponseHeaders::new().content_type(APPLICATION_JSON);
-    match link {
-        Some(link) => headers
-            .with(LINK.as_str(), format!("<{link}>; rel=\"next\""))
-            .into_inner(),
-        None => headers.into_inner(),
-    }
-}
 
 impl Registry {
     pub async fn list_catalog_entries(
@@ -97,59 +34,23 @@ impl Registry {
         Ok((tags, link))
     }
 
+    /// Returns the referrer descriptors for a subject digest along with a flag
+    /// indicating whether an `artifactType` filter was applied. Presentation
+    /// (image-index body + headers) is the handler's responsibility.
     #[instrument]
     pub async fn get_referrers(
         &self,
         namespace: &Namespace,
         digest: &Digest,
         artifact_type: Option<String>,
-    ) -> Result<JsonResponse, Error> {
+    ) -> Result<(Vec<Descriptor>, bool), Error> {
         let filtered = artifact_type.is_some();
         let manifests = self
             .metadata_store
             .list_referrers(namespace, digest, artifact_type)
             .await?;
-        let referrer_list = ReferrerList {
-            manifests,
-            ..ReferrerList::default()
-        };
 
-        Ok(JsonResponse {
-            headers: referrers_headers(filtered),
-            body: serde_json::to_vec(&referrer_list)?,
-        })
-    }
-
-    #[instrument]
-    pub async fn list_catalog(
-        &self,
-        n: Option<u16>,
-        last: Option<String>,
-    ) -> Result<JsonResponse, Error> {
-        let (repositories, link) = self.list_catalog_entries(n, last).await?;
-
-        Ok(JsonResponse {
-            headers: paginated_json_headers(link.as_deref()),
-            body: serde_json::to_vec(&CatalogBody { repositories })?,
-        })
-    }
-
-    #[instrument]
-    pub async fn list_tags(
-        &self,
-        namespace: &Namespace,
-        n: Option<u16>,
-        last: Option<String>,
-    ) -> Result<JsonResponse, Error> {
-        let (tags, link) = self.list_tag_entries(namespace, n, last).await?;
-
-        Ok(JsonResponse {
-            headers: paginated_json_headers(link.as_deref()),
-            body: serde_json::to_vec(&TagsBody {
-                name: namespace.as_ref(),
-                tags,
-            })?,
-        })
+        Ok((manifests, filtered))
     }
 }
 

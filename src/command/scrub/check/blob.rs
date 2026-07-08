@@ -13,9 +13,9 @@ use crate::{
     },
     oci::{Digest, Namespace},
     registry::{
-        blob_store,
+        Error as RegistryError,
         blob_store::BlobStore,
-        metadata_store::{BlobIndex, Error as MetadataError, LinkKind, MetadataStore},
+        metadata_store::{BlobIndex, LinkKind, MetadataStore},
     },
 };
 
@@ -33,7 +33,7 @@ async fn classify_blob(
     match metadata_store.read_blob_index(blob).await {
         Ok(index) if index.namespace.is_empty() => Ok(BlobVerdict::Orphan),
         Ok(index) => Ok(BlobVerdict::Referenced(index)),
-        Err(MetadataError::ReferenceNotFound) => Ok(BlobVerdict::Orphan),
+        Err(RegistryError::NotFound) => Ok(BlobVerdict::Orphan),
         Err(e) => Err(e.into()),
     }
 }
@@ -70,7 +70,7 @@ impl BlobChecker {
                         }
                     }
                 }
-                Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                     warn!("Blob {blob} has no bytes but index has entries; purging stale index");
                     self.purge_blob_index(blob, blob_index, sink).await;
                 }
@@ -415,7 +415,7 @@ mod tests {
 
             let result = metadata_store.read_blob_index(&phantom_digest).await;
             match result {
-                Err(MetadataError::ReferenceNotFound) => {}
+                Err(RegistryError::NotFound) => {}
                 Ok(index) => {
                     assert!(
                         index.namespace.is_empty()
@@ -460,7 +460,7 @@ mod tests {
 
             let result = metadata_store.read_blob_index(&phantom_digest).await;
             match result {
-                Err(MetadataError::ReferenceNotFound) => {}
+                Err(RegistryError::NotFound) => {}
                 Ok(index) => {
                     assert!(
                         index.namespace.is_empty()
