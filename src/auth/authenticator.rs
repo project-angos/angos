@@ -44,11 +44,6 @@ fn select_auth_method(mtls: bool, oidc: bool, basic: bool) -> Option<&'static st
     None
 }
 
-struct AuthOutcome {
-    method: Option<&'static str>,
-    identity: ClientIdentity,
-}
-
 /// Coordinates all authentication methods and handles the authentication chain
 pub struct Authenticator {
     mtls_validator: MtlsValidator,
@@ -115,12 +110,9 @@ impl Authenticator {
             self.try_basic_authentication(parts, &mut identity).await?
         };
 
-        let outcome = AuthOutcome {
-            method: select_auth_method(mtls_ok, oidc_ok, basic_ok),
-            identity,
-        };
-        tracing::Span::current().record("auth_method", outcome.method.unwrap_or("anonymous"));
-        Ok(outcome.identity)
+        identity.auth_method = select_auth_method(mtls_ok, oidc_ok, basic_ok);
+        tracing::Span::current().record("auth_method", identity.auth_method.unwrap_or("anonymous"));
+        Ok(identity)
     }
 
     /// Attempts mTLS authentication. Returns `true` if a valid certificate was extracted.

@@ -59,7 +59,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::registry::blob_store::{self, OrphanMultipartUpload};
+    use crate::registry::{Error as RegistryError, blob_store::OrphanMultipartUpload};
 
     struct SpyCleanup {
         list_called_timeout_secs: AtomicI64,
@@ -82,7 +82,7 @@ mod tests {
         async fn list_orphan_multipart_uploads(
             &self,
             timeout: Duration,
-        ) -> Result<Vec<OrphanMultipartUpload>, blob_store::Error> {
+        ) -> Result<Vec<OrphanMultipartUpload>, RegistryError> {
             self.list_called_timeout_secs
                 .store(timeout.num_seconds(), Ordering::SeqCst);
             Ok(self
@@ -98,7 +98,7 @@ mod tests {
         async fn abort_orphan_multipart_upload(
             &self,
             _upload: &OrphanMultipartUpload,
-        ) -> Result<(), blob_store::Error> {
+        ) -> Result<(), RegistryError> {
             self.abort_call_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -138,16 +138,14 @@ mod tests {
             async fn list_orphan_multipart_uploads(
                 &self,
                 _timeout: Duration,
-            ) -> Result<Vec<OrphanMultipartUpload>, blob_store::Error> {
-                Err(blob_store::Error::StorageBackend(
-                    "backend failure".to_string(),
-                ))
+            ) -> Result<Vec<OrphanMultipartUpload>, RegistryError> {
+                Err(RegistryError::Internal("backend failure".to_string()))
             }
 
             async fn abort_orphan_multipart_upload(
                 &self,
                 _upload: &OrphanMultipartUpload,
-            ) -> Result<(), blob_store::Error> {
+            ) -> Result<(), RegistryError> {
                 Ok(())
             }
         }

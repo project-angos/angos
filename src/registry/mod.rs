@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt,
     num::NonZeroUsize,
     sync::{Arc, Weak},
@@ -10,6 +9,7 @@ use tokio::{select, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
+mod admin;
 pub mod blob;
 pub mod blob_ownership;
 pub mod blob_store;
@@ -18,10 +18,6 @@ pub mod content_discovery;
 mod error;
 #[cfg(test)]
 mod event_emission_tests;
-mod ext;
-mod headers;
-pub mod job_runner;
-pub mod job_store;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;
@@ -34,29 +30,6 @@ pub mod test_utils;
 pub mod upload;
 pub mod version;
 
-pub use blob::{BlobRange, GetBlobResponse};
-pub use error::Error;
-pub use headers::{HeaderMap, ResponseHeaders};
-pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
-pub use repository::Repository;
-pub use upload::{BlobMount, StartUploadResponse};
-
-pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
-pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
-pub const OCI_SUBJECT: &str = "OCI-Subject";
-pub const OCI_TAG: &str = "OCI-Tag";
-pub const APPLICATION_JSON: &str = "application/json";
-
-/// Response for endpoints whose body is a JSON (or JSON-flavoured) payload.
-///
-/// The registry is the sole authority on both the headers (Content-Type,
-/// Link, OCI-Filters-Applied, ...) and the serialized body bytes. Handlers
-/// attach the headers verbatim and pass the body through.
-pub struct JsonResponse {
-    pub headers: HashMap<&'static str, String>,
-    pub body: Vec<u8>,
-}
-
 pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
@@ -65,17 +38,30 @@ use crate::{
         global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
     },
     event_webhook::{dispatcher::EventDispatcher, event::Event},
+    jobs::Queue,
+    jobs::{
+        runner::execute_one,
+        store::{JobHandler, JobStore},
+    },
     oci::Namespace,
     registry::{
-        blob_store::BlobStore,
-        cache_job_handler::CacheJobHandler,
-        job_runner::execute_one,
-        job_store::{JobHandler, JobStore, Queue},
-        metadata_store::MetadataStore,
+        blob_store::BlobStore, cache_job_handler::CacheJobHandler, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationJobHandler,
 };
+pub use blob::{BlobRange, GetBlobResponse};
+pub use error::Error;
+pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
+pub use repository::Repository;
+pub use upload::{BlobMount, StartUploadResponse};
+
+/// OCI wire header names shared by the server responses and the transport
+/// client. Response-only header names live in `command::server::response`.
+pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
+pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
+pub const OCI_SUBJECT: &str = "OCI-Subject";
+pub const OCI_TAG: &str = "OCI-Tag";
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
@@ -131,68 +117,6 @@ impl Default for RegistryConfig {
             max_concurrent_replication_jobs: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
             event_dispatcher: None,
         }
-    }
-}
-
-impl RegistryConfig {
-    pub fn update_pull_time(mut self, enabled: bool) -> Self {
-        self.update_pull_time = enabled;
-        self
-    }
-
-    pub fn enable_blob_redirect(mut self, enabled: bool) -> Self {
-        self.enable_blob_redirect = enabled;
-        self
-    }
-
-    pub fn enable_manifest_redirect(mut self, enabled: bool) -> Self {
-        self.enable_manifest_redirect = enabled;
-        self
-    }
-
-    pub fn global_immutable_tags(mut self, enabled: bool) -> Self {
-        self.global_immutable_tags = enabled;
-        self
-    }
-
-    pub fn global_immutable_tags_exclusions(mut self, exclusions: Vec<RegexPattern>) -> Self {
-        self.global_immutable_tags_exclusions = exclusions;
-        self
-    }
-
-    pub fn max_manifest_size_bytes(mut self, limit: usize) -> Self {
-        self.max_manifest_size_bytes = limit;
-        self
-    }
-
-    pub fn max_blob_size_bytes(mut self, limit: u64) -> Self {
-        self.max_blob_size_bytes = limit;
-        self
-    }
-
-    pub fn validate_manifest_references(mut self, enabled: bool) -> Self {
-        self.validate_manifest_references = enabled;
-        self
-    }
-
-    pub fn job_queue(mut self, queue: Arc<JobStore>) -> Self {
-        self.job_queue = Some(queue);
-        self
-    }
-
-    pub fn max_concurrent_cache_jobs(mut self, value: NonZeroUsize) -> Self {
-        self.max_concurrent_cache_jobs = value;
-        self
-    }
-
-    pub fn max_concurrent_replication_jobs(mut self, value: NonZeroUsize) -> Self {
-        self.max_concurrent_replication_jobs = value;
-        self
-    }
-
-    pub fn event_dispatcher(mut self, dispatcher: Option<Arc<EventDispatcher>>) -> Self {
-        self.event_dispatcher = dispatcher;
-        self
     }
 }
 
@@ -470,11 +394,14 @@ mod in_process_replication_tests {
     };
 
     use crate::{
+        jobs::{
+            Queue,
+            store::{JobEnvelope, JobStore},
+        },
         oci::{Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
-            job_store::{JobEnvelope, JobStore, Queue},
             metadata_store::MetadataStore,
             test_utils::{
                 FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,

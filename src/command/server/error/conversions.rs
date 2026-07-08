@@ -3,8 +3,9 @@ use hyper::StatusCode;
 use crate::{
     auth,
     command::{bootstrap, server::error::Error},
-    configuration, event_webhook, metrics_provider, registry,
-    registry::{blob_store, job_store},
+    configuration, event_webhook,
+    jobs::store as job_store,
+    metrics_provider, registry,
     registry_client::REPLICATION_SUPERSEDED_CODE,
 };
 
@@ -64,6 +65,11 @@ impl From<registry::Error> for Error {
                 oci_error(StatusCode::RANGE_NOT_SATISFIABLE, "SIZE_INVALID", None)
             }
             registry::Error::NotFound => oci_error(StatusCode::NOT_FOUND, "NOT_FOUND", None),
+            // A concurrent-writer CAS conflict: HTTP 409 so the client retries.
+            // Previously this collapsed into a 500 (the bug this fix corrects).
+            registry::Error::Conflict(msg) => {
+                oci_error(StatusCode::CONFLICT, "CONFLICT", Some(msg))
+            }
             registry::Error::ReplicationSuperseded(msg) => {
                 oci_error(StatusCode::CONFLICT, REPLICATION_SUPERSEDED_CODE, Some(msg))
             }
@@ -75,7 +81,18 @@ impl From<registry::Error> for Error {
                 "INTERNAL_ERROR",
                 Some(msg),
             ),
-            _ => oci_error(
+            // Every remaining variant is an opaque server-side failure with no
+            // client-actionable OCI code. Matched exhaustively (no catch-all) so
+            // a newly added variant must be mapped deliberately here.
+            registry::Error::Configuration(_)
+            | registry::Error::Cache(_)
+            | registry::Error::Io(_)
+            | registry::Error::Http(_)
+            | registry::Error::Serde(_)
+            | registry::Error::PolicyExecution(_)
+            | registry::Error::InvalidHeader(_)
+            | registry::Error::InvalidUri(_)
+            | registry::Error::Serialization(_) => oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 Some(error.to_string()),
@@ -101,12 +118,6 @@ impl From<auth::Error> for Error {
 impl From<bootstrap::Error> for Error {
     fn from(e: bootstrap::Error) -> Self {
         match e {
-            bootstrap::Error::BlobStore(_) => {
-                Error::Initialization("Failed to initialize blob store".to_string())
-            }
-            bootstrap::Error::MetadataStore(inner) => {
-                Error::Initialization(format!("Failed to initialize metadata store: {inner}"))
-            }
             bootstrap::Error::StorageBackend(inner) | bootstrap::Error::Coordination(inner) => {
                 Error::Initialization(format!("Failed to initialize storage handles: {inner}"))
             }
@@ -127,12 +138,6 @@ impl From<bootstrap::Error> for Error {
                 Error::Initialization(format!("Failed to initialize registry: {inner}"))
             }
         }
-    }
-}
-
-impl From<blob_store::Error> for Error {
-    fn from(_: blob_store::Error) -> Self {
-        Error::Initialization("Failed to initialize blob store".to_string())
     }
 }
 

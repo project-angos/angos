@@ -41,14 +41,9 @@
 //!
 //! The known-length path streams bodies frame-by-frame via an mpsc channel
 //! handed to `upload_part_streaming`, so no whole part sits in process memory.
-//! The unknown-length (chunked) path dispatches three ways:
-//! - non-uniform with a `part_size` above the 5 MiB floor coalesces each
-//!   `part_size` part in a scratch multipart of 5 MiB sub-parts and grafts it
-//!   into the main upload via a server-side `UploadPartCopy`, holding at most
-//!   one 5 MiB sub-part in memory while honoring `part_size`;
-//! - uniform with a `part_size` above the floor streams `part_size` parts
-//!   directly, buffering up to `part_size` at a time;
-//! - a `part_size` at the floor streams 5 MiB parts directly.
+//! The unknown-length (chunked) path drains the body to EOF, flushing a
+//! `part_size` `UploadPart` each time `part_size` bytes accumulate and staging
+//! the sub-`part_size` remainder, buffering up to `part_size` at a time.
 
 use std::{collections::HashSet, io, sync::Arc, time::Duration};
 
@@ -218,156 +213,6 @@ impl Backend {
         }
         Ok(())
     }
-
-    /// Drain an unknown-length (chunked) body into the upload at `key` while
-    /// holding at most one [`MIN_PART_SIZE`] buffer in process memory, emitting
-    /// `part_size` main parts. Each main part is assembled in a scratch
-    /// multipart of 5 MiB sub-parts, completed to an object, then grafted into
-    /// the main upload via a server-side `UploadPartCopy`; a sub-floor trailing
-    /// tail is staged as the remainder. Each byte is moved twice server-side
-    /// (into the scratch, then copied into the main upload).
-    ///
-    /// Concurrent `write_upload` calls on a single session are unsupported: they
-    /// recover the same committed offset and would race the scratch and the
-    /// staged remainder alike (see [`Self::write_upload`]).
-    async fn write_upload_chunked_coalesced(
-        &self,
-        key: &str,
-        body: ByteStream,
-        mut upload_id: Option<String>,
-        mut parts: Vec<UploadedPart>,
-        committed_size: u64,
-    ) -> Result<u64, Error> {
-        // The prior remainder is bounded by `part_size` (sub-5-MiB only for an
-        // all-chunked session; a prior known-length non-uniform write can stage
-        // up to `part_size - 1`), so loading it back is cheap relative to
-        // `part_size`.
-        let read_key = staged_key(key, committed_size);
-        let staged_len = self.staged_size(key, committed_size).await?;
-        let staged_bytes = load_staged(&self.client, &read_key, staged_len).await?;
-        let combined = chain_staged_with_body(staged_bytes, body);
-        let mut reader = StreamReader::new(combined);
-
-        // The scratch is keyed by `key` alone (not by offset) to match the
-        // keyless recover-from-S3 model. Self-heal a scratch a crashed prior
-        // call may have left here.
-        let scratch = scratch_key(key);
-        self.abort_multiparts_at(&scratch).await?;
-        let _ = self.client.delete_object(&scratch).await;
-
-        let cap = usize::try_from(MIN_PART_SIZE).map_err(|e| Error::Backend(e.to_string()))?;
-        let mut scratch_id: Option<String> = None;
-        let mut scratch_parts: Vec<UploadedPart> = Vec::new();
-        let mut scratch_size: u64 = 0;
-        let mut first_read = true;
-
-        loop {
-            // Cap each sub-part so the scratch seals at exactly `part_size`
-            // instead of overshooting to the next 5 MiB multiple. The capped
-            // final sub-part (under the floor when `part_size` is not a 5 MiB
-            // multiple) is always the scratch's last part, which S3 permits.
-            let want = MIN_PART_SIZE.min(self.part_size - scratch_size);
-            let mut buf = Vec::with_capacity(usize::try_from(want).unwrap_or(cap));
-            (&mut reader).take(want).read_to_end(&mut buf).await?;
-            let n = buf.len() as u64;
-            // A read shorter than requested (including zero) is the body's end.
-            let eof = n < want;
-
-            if first_read && eof {
-                // The entire combined input (prior sub-5-MiB staged remainder +
-                // body) is below the floor, so it can only become the staged
-                // remainder. Skip the scratch multipart (CreateMPU + UploadPart
-                // + CompleteMPU + CopyObject + Delete) and put_object the bytes
-                // straight at the staged key. No main part has been produced, so
-                // the new committed offset equals the recovered one and the
-                // remainder key is unchanged; the stored result is byte-identical
-                // to the scratch path.
-                let write_key = staged_key(key, committed_size);
-                self.client.put_object(&write_key, Bytes::from(buf)).await?;
-                return committed_size
-                    .checked_add(n)
-                    .ok_or_else(|| Error::Backend("upload size overflow".to_string()));
-            }
-            first_read = false;
-
-            if n > 0 {
-                let sid = ensure_upload_id(&self.client, &mut scratch_id, &scratch).await?;
-                let sub_number = next_part_number(&scratch_parts)?;
-                let sub_body: ByteStream =
-                    Box::pin(stream::once(async move { Ok(Bytes::from(buf)) }));
-                let etag = self
-                    .client
-                    .upload_part_streaming(&scratch, &sid, sub_number, n, sub_body)
-                    .await?;
-                scratch_parts.push(UploadedPart {
-                    part_number: sub_number,
-                    e_tag: etag,
-                    size: n,
-                });
-                scratch_size += n;
-            }
-
-            if scratch_size == 0 {
-                // Clean EOF with nothing buffered: done.
-                break;
-            }
-            if !eof && scratch_size < self.part_size {
-                // Keep filling the current part.
-                continue;
-            }
-
-            // Seal the scratch into an object holding `scratch_size` bytes.
-            let sid = scratch_id
-                .take()
-                .ok_or_else(|| Error::Backend("scratch multipart missing".to_string()))?;
-            self.client
-                .complete_multipart_upload(&scratch, &sid, &scratch_parts)
-                .await?;
-            scratch_parts.clear();
-            let flushed = scratch_size;
-            scratch_size = 0;
-
-            if eof && flushed < MIN_PART_SIZE {
-                // A trailing sub-floor piece can only be the staged remainder.
-                let new_committed = parts.iter().map(|p| p.size).sum::<u64>();
-                let new_read_key = staged_key(key, new_committed);
-                self.client.copy_object(&scratch, &new_read_key).await?;
-                let _ = self.client.delete_object(&scratch).await;
-                if new_read_key != read_key {
-                    let _ = self.client.delete_object(&read_key).await;
-                }
-                return new_committed
-                    .checked_add(flushed)
-                    .ok_or_else(|| Error::Backend("upload size overflow".to_string()));
-            }
-
-            // Graft the sealed scratch object into the main upload as one part.
-            let id = ensure_upload_id(&self.client, &mut upload_id, key).await?;
-            let main_number = next_part_number(&parts)?;
-            let etag = self
-                .client
-                .upload_part_copy(&scratch, key, &id, main_number, None)
-                .await?;
-            parts.push(UploadedPart {
-                part_number: main_number,
-                e_tag: etag,
-                size: flushed,
-            });
-            let _ = self.client.delete_object(&scratch).await;
-
-            if eof {
-                break;
-            }
-        }
-
-        // Everything landed in main parts with no trailing remainder; drop the
-        // old staged remainder that was folded back in above.
-        let new_committed = parts.iter().map(|p| p.size).sum::<u64>();
-        if staged_len > 0 {
-            let _ = self.client.delete_object(&read_key).await;
-        }
-        Ok(new_committed)
-    }
 }
 
 /// In-flight multipart state recovered from S3 by [`Backend::recover_upload`].
@@ -470,8 +315,8 @@ impl ObjectStore for Backend {
     ) -> Result<u64, Error> {
         // Concurrent writes to a single upload session are unsupported: each call
         // recovers the same committed offset from S3 (the keyless model), so two
-        // in-flight writes would race the staged remainder, the scratch, and the
-        // caller's hash state alike.
+        // in-flight writes would race the staged remainder and the caller's hash
+        // state alike.
         //
         // Recover the in-flight state from S3: the upload id (if a multipart is
         // already open), the committed parts, and from them the committed byte
@@ -488,18 +333,6 @@ impl ObjectStore for Backend {
             return committed_size
                 .checked_add(staged_len)
                 .ok_or_else(|| Error::Backend("upload size overflow".to_string()));
-        }
-
-        // The coalescer is the non-uniform chunked path with a `part_size` above
-        // the floor: it streams 5 MiB scratch sub-parts grafted as `part_size`
-        // parts, honoring `part_size` with bounded memory. Uniform mode flushes
-        // `part_size` parts directly below (so non-final parts are uniform, which
-        // strict providers require, instead of the coalescer's variable sizes),
-        // and a floor `part_size` has nothing to coalesce.
-        if len.is_none() && self.part_size > MIN_PART_SIZE && !self.uniform_parts {
-            return self
-                .write_upload_chunked_coalesced(key, body, upload_id, parts, committed_size)
-                .await;
         }
 
         // The current remainder (if any) sits at `staged/<committed_size>`. HEAD
@@ -564,12 +397,11 @@ impl ObjectStore for Backend {
         } else {
             // Unknown length (a chunked request with no `Content-Length`): drain
             // `reader` to EOF, flushing a part each time `flush_size` bytes
-            // accumulate. This direct path runs for uniform mode (any
-            // `part_size`) and for the floor `part_size`, so it flushes
-            // `part_size` parts and buffers up to `part_size` at a time; uniform
-            // chunked thus emits the same `part_size` non-final parts as the
-            // known-length uniform path, keeping a mixed-mode session uniform.
-            // The trailing short read is the remainder.
+            // accumulate. This handles all unknown-length input (uniform and
+            // non-uniform), flushing `part_size` parts and buffering up to
+            // `part_size` at a time. Non-final parts are thus always `part_size`,
+            // matching the known-length uniform path so a mixed-mode session
+            // stays uniform. The trailing short read is the remainder.
             let flush_size = self.part_size;
             let cap = usize::try_from(flush_size).map_err(|e| Error::Backend(e.to_string()))?;
             loop {
@@ -616,14 +448,6 @@ impl ObjectStore for Backend {
     }
 
     async fn complete_upload(&self, key: &str) -> Result<(), Error> {
-        // Reap any chunked-coalesce scratch orphaned by a coalesced write that
-        // crashed mid-flight before the session was finished via a known-length
-        // path: an in-flight scratch multipart (aborted) and a sealed scratch
-        // object (deleted). `abort_multiparts_at` lists once and returns when
-        // empty, so this is cheap on the common (no scratch) path.
-        self.abort_multiparts_at(&scratch_key(key)).await?;
-        let _ = self.client.delete_object(&scratch_key(key)).await;
-
         let recovered = self.recover_upload(key).await?;
         let upload_id = recovered.upload_id;
         let mut parts = recovered.parts;
@@ -681,11 +505,9 @@ impl ObjectStore for Backend {
     }
 
     async fn abort_upload(&self, key: &str) -> Result<(), Error> {
-        // Abort the main multipart and any chunked-coalesce scratch multipart,
-        // then delete every staged object (remainder and sealed scratch) under
-        // the key's staging container.
+        // Abort the main multipart, then delete every staged object under the
+        // key's staging container.
         self.abort_multiparts_at(key).await?;
-        self.abort_multiparts_at(&scratch_key(key)).await?;
         let _ = self.client.delete_prefix(&staged_container(key)).await;
         Ok(())
     }
@@ -788,14 +610,6 @@ fn staged_container(key: &str) -> String {
 /// recovered parts list.
 fn staged_key(key: &str, offset: u64) -> String {
     format!("{}/{offset}", staged_container(key))
-}
-
-/// Scratch key under the staging container where a chunked, coalesced upload
-/// assembles one `part_size` part before grafting it into the main upload.
-/// Living under the staging container means `abort_upload`'s staged
-/// `delete_prefix` reclaims any sealed scratch object.
-fn scratch_key(key: &str) -> String {
-    format!("{}/coalesce", staged_container(key))
 }
 
 async fn load_staged(client: &S3Backend, staging: &str, expected: u64) -> Result<Vec<u8>, Error> {

@@ -1,3 +1,8 @@
+//! HTTP response presentation: the header builder and header-name constants the
+//! handlers use to turn the registry's domain facts into wire responses. The
+//! registry returns facts (digests, sizes, locations); header assembly lives
+//! here, next to the status-code choice.
+
 use std::collections::HashMap;
 
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE};
@@ -5,6 +10,14 @@ use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE};
 use crate::{oci::Digest, registry::DOCKER_CONTENT_DIGEST};
 
 pub type HeaderMap = HashMap<&'static str, String>;
+
+// Header names emitted only in server responses. The OCI wire vocabulary shared
+// with the transport client (`Docker-Content-Digest`, `Docker-Upload-UUID`,
+// `OCI-Subject`, `OCI-Tag`) lives in `registry`; handlers import those directly.
+pub const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
+pub const DOCKER_DISTRIBUTION_API_VERSION: &str = "Docker-Distribution-API-Version";
+pub const X_POWERED_BY: &str = "X-Powered-By";
+pub const APPLICATION_JSON: &str = "application/json";
 
 #[derive(Debug, Default)]
 pub struct ResponseHeaders {

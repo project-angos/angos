@@ -14,10 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::{
     oci::Namespace,
-    registry::{
-        blob_store::{BlobStore, Error},
-        path_builder,
-    },
+    registry::{Error, blob_store::BlobStore, path_builder},
 };
 
 /// A multipart upload with no live session, eligible to be aborted.

@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256, Sha512, digest::common::hazmat::SerializableState};
 
 use crate::{
     oci::{self, Algorithm},
-    registry::blob_store::Error,
+    registry::Error,
 };
 
 /// One supported algorithm's live hasher. The mid-stream state can be
@@ -25,7 +25,7 @@ impl AlgorithmHasher {
     }
 
     fn from_state(algorithm: Algorithm, state: &[u8]) -> Result<Self, Error> {
-        let invalid = || Error::HashSerialization("Unable to resume hash state".to_string());
+        let invalid = || Error::Internal("Unable to resume hash state".to_string());
         Ok(match algorithm {
             Algorithm::Sha256 => Self::Sha256(Sha256::deserialize(
                 state.try_into().map_err(|_| invalid())?,
@@ -115,7 +115,7 @@ impl Hasher {
             .iter()
             .find(|h| h.algorithm() == algorithm)
             .map(AlgorithmHasher::digest)
-            .ok_or(Error::DigestAlgorithmUnavailable(algorithm))
+            .ok_or(Error::DigestInvalid)
     }
 }
 
@@ -159,14 +159,12 @@ impl HashState {
             };
             let decoded = BASE64_STANDARD
                 .decode(&encoded)
-                .map_err(|e| Error::HashSerialization(e.to_string()))?;
+                .map_err(|e| Error::Internal(e.to_string()))?;
             states.insert(algorithm, decoded);
         }
 
         if states.is_empty() {
-            return Err(Error::HashSerialization(
-                "empty hash checkpoint".to_string(),
-            ));
+            return Err(Error::Internal("empty hash checkpoint".to_string()));
         }
         Ok(Self { states })
     }
@@ -274,7 +272,7 @@ mod tests {
         // rather than a generic hash-serialization failure.
         assert!(matches!(
             restored.digest(Algorithm::Sha512),
-            Err(Error::DigestAlgorithmUnavailable(Algorithm::Sha512))
+            Err(Error::DigestInvalid)
         ));
     }
 

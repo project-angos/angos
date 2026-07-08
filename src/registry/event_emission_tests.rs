@@ -25,11 +25,12 @@ use crate::{
         dispatcher::EventDispatcher,
         event::{EventActor, EventKind},
     },
+    jobs::Queue,
+    jobs::store::JobStore,
     oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
         BlobMount, Registry, RegistryConfig, Repository, StartUploadResponse,
         blob_ownership::BlobOwnership,
-        job_store::{JobStore, Queue},
         metadata_store::LinkKind,
         repository_resolver::RepositoryResolver,
         test_utils::{
@@ -80,10 +81,7 @@ impl FsRegistryFixture {
         };
         let mut webhooks = HashMap::new();
         webhooks.insert("test-hook".to_string(), webhook);
-        let dispatcher = EventDispatcher::builder()
-            .webhooks(webhooks)
-            .build()
-            .expect("dispatcher build");
+        let dispatcher = EventDispatcher::new(webhooks).expect("dispatcher build");
 
         let FsTestStack {
             dir,
@@ -95,7 +93,10 @@ impl FsRegistryFixture {
             RepositoryResolver::new(create_test_repositories())
                 .expect("test repositories must not have overlapping prefixes"),
         );
-        let config = RegistryConfig::default().event_dispatcher(Some(Arc::new(dispatcher)));
+        let config = RegistryConfig {
+            event_dispatcher: Some(Arc::new(dispatcher)),
+            ..RegistryConfig::default()
+        };
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         Self {
@@ -229,12 +230,7 @@ async fn digest_push_suppresses_tag_create_event() {
         .expect("seed push");
     let seed_event_count = received_events(&server).await.len();
 
-    let digest_str = tag_response
-        .headers
-        .get("Docker-Content-Digest")
-        .cloned()
-        .expect("digest header");
-    let digest: Digest = digest_str.parse().expect("parse digest");
+    let digest = tag_response.digest.clone();
 
     // Push the same manifest addressed by its digest.
     fixture
@@ -342,12 +338,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
         .expect("put manifest");
     let push_event_count = received_events(&server).await.len();
 
-    let digest_str = push
-        .headers
-        .get("Docker-Content-Digest")
-        .cloned()
-        .expect("digest header");
-    let digest: Digest = digest_str.parse().expect("parse digest");
+    let digest = push.digest.clone();
 
     let reference = Reference::Digest(digest);
     fixture
@@ -713,7 +704,10 @@ impl ReplicationFixture {
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let config = RegistryConfig {
+            job_queue: Some(job_store.clone()),
+            ..RegistryConfig::default()
+        };
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         Self {

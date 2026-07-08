@@ -4,7 +4,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         Error,
-        metadata_store::{BlobIndexOperation, Error as MetadataError, LinkKind, MetadataStore},
+        metadata_store::{BlobIndexOperation, LinkKind, MetadataStore},
     },
 };
 
@@ -30,7 +30,6 @@ impl<'a> BlobOwnership<'a> {
                 BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
             )
             .await
-            .map_err(Error::from)
     }
 
     pub async fn can_read(&self, namespace: &Namespace, digest: &Digest) -> Result<bool, Error> {
@@ -40,8 +39,8 @@ impl<'a> BlobOwnership<'a> {
             .await
         {
             Ok(_) => Ok(true),
-            Err(MetadataError::ReferenceNotFound) => Ok(false),
-            Err(error) => Err(error.into()),
+            Err(Error::NotFound) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
@@ -56,8 +55,8 @@ impl<'a> BlobOwnership<'a> {
             .await
         {
             Ok(links) => Ok(links),
-            Err(MetadataError::ReferenceNotFound) => Ok(HashSet::new()),
-            Err(error) => Err(error.into()),
+            Err(Error::NotFound) => Ok(HashSet::new()),
+            Err(error) => Err(error),
         }
     }
 
@@ -67,8 +66,8 @@ impl<'a> BlobOwnership<'a> {
     pub async fn referencing_namespaces(&self, digest: &Digest) -> Result<Vec<Namespace>, Error> {
         let index = match self.metadata_store.read_blob_index(digest).await {
             Ok(index) => index,
-            Err(MetadataError::ReferenceNotFound) => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
         };
 
         Ok(index.namespace.into_keys().collect())
@@ -84,8 +83,8 @@ impl<'a> BlobOwnership<'a> {
     ) -> Result<Option<Namespace>, Error> {
         let index = match self.metadata_store.read_blob_index(digest).await {
             Ok(index) => index,
-            Err(MetadataError::ReferenceNotFound) => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
         };
 
         Ok(index

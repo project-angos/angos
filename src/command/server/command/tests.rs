@@ -295,12 +295,14 @@ async fn test_build_registry_components_integration() {
     .await
     .unwrap();
 
-    let registry_config = RegistryConfig::default()
-        .update_pull_time(config.global.update_pull_time)
-        .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
-        .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
-        .global_immutable_tags(config.global.immutable_tags)
-        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
+    let registry_config = RegistryConfig {
+        update_pull_time: config.global.update_pull_time,
+        enable_blob_redirect: config.global.resolved_enable_blob_redirect(),
+        enable_manifest_redirect: config.global.resolved_enable_manifest_redirect(),
+        global_immutable_tags: config.global.immutable_tags,
+        global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
+        ..RegistryConfig::default()
+    };
 
     let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);
 

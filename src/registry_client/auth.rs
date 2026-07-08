@@ -9,16 +9,17 @@ use reqwest::{
     header::{AUTHORIZATION, WWW_AUTHENTICATE},
 };
 use serde::Deserialize;
+use url::Url;
 
 use crate::registry_client::{Error, RegistryClient, parse_header};
 
-fn authority_for_cache_key(url: &url::Url) -> Result<&str, Error> {
+fn authority_for_cache_key(url: &Url) -> Result<&str, Error> {
     url.host_str()
         .ok_or_else(|| Error::Internal("Response URL is missing host authority".to_string()))
 }
 
 pub fn token_cache_key(
-    url: &url::Url,
+    url: &Url,
     realm: &str,
     service: Option<&str>,
     scope: Option<&str>,
@@ -31,7 +32,7 @@ pub fn token_cache_key(
     ))
 }
 
-pub fn token_index_cache_key(url: &url::Url) -> Result<String, Error> {
+pub fn token_index_cache_key(url: &Url) -> Result<String, Error> {
     let authority = authority_for_cache_key(url)?;
     Ok(format!("auth-index:{authority}:{}", url.as_str()))
 }
@@ -73,7 +74,7 @@ impl BearerChallenge {
             .find_map(|(key, value)| (key == name).then_some(value.as_str()))
     }
 
-    fn cache_key(&self, response_url: &url::Url) -> Result<String, Error> {
+    fn cache_key(&self, response_url: &Url) -> Result<String, Error> {
         token_cache_key(
             response_url,
             &self.realm,
@@ -82,8 +83,8 @@ impl BearerChallenge {
         )
     }
 
-    fn token_url(&self) -> Result<url::Url, Error> {
-        let mut url = url::Url::parse(&self.realm)
+    fn token_url(&self) -> Result<Url, Error> {
+        let mut url = Url::parse(&self.realm)
             .map_err(|e| Error::Internal(format!("Invalid bearer token realm: {e}")))?;
         url.query_pairs_mut()
             .extend_pairs(self.other.iter().map(|(k, v)| (k.as_str(), v.as_str())));
@@ -156,7 +157,7 @@ impl RegistryClient {
     async fn exchange_bearer_token(
         &self,
         challenge: BearerChallenge,
-        response_url: &url::Url,
+        response_url: &Url,
         cache_key: &str,
     ) -> Result<String, Error> {
         let mut req = self.client.get(challenge.token_url()?);
@@ -205,6 +206,8 @@ impl RegistryClient {
 
 #[cfg(test)]
 mod tests {
+    use url::Url;
+
     use crate::registry_client::{
         Error,
         auth::{BearerToken, authority_for_cache_key, parse_bearer_challenge, token_cache_key},
@@ -258,7 +261,7 @@ mod tests {
 
     #[test]
     fn authority_for_cache_key_returns_host() {
-        let url = url::Url::parse("https://registry.example.com/v2/").unwrap();
+        let url = Url::parse("https://registry.example.com/v2/").unwrap();
         assert_eq!(
             authority_for_cache_key(&url).unwrap(),
             "registry.example.com"
@@ -267,14 +270,14 @@ mod tests {
 
     #[test]
     fn authority_for_cache_key_errors_when_host_missing() {
-        let url = url::Url::parse("data:text/plain,hello").unwrap();
+        let url = Url::parse("data:text/plain,hello").unwrap();
         let err = authority_for_cache_key(&url).expect_err("expected Err for hostless URL");
         assert!(matches!(err, Error::Internal(_)));
     }
 
     #[test]
     fn token_cache_key_includes_bearer_scope() {
-        let url = url::Url::parse("https://registry.example.com/v2/").unwrap();
+        let url = Url::parse("https://registry.example.com/v2/").unwrap();
         assert_eq!(
             token_cache_key(
                 &url,
@@ -289,7 +292,7 @@ mod tests {
 
     #[test]
     fn token_cache_key_separates_different_scopes() {
-        let url = url::Url::parse("https://registry.example.com/v2/").unwrap();
+        let url = Url::parse("https://registry.example.com/v2/").unwrap();
         let foo = token_cache_key(
             &url,
             "https://auth.example.com/token",

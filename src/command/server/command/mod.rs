@@ -18,7 +18,8 @@ use crate::{
         },
     },
     configuration::{Configuration, ServerConfig},
-    registry::job_store::{Queue, queue_depth_refresh_loop},
+    jobs::Queue,
+    jobs::store::queue_depth_refresh_loop,
 };
 
 mod notifier;

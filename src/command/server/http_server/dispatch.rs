@@ -73,16 +73,15 @@ async fn dispatch_route<'a>(
             handlers::upload::handle_get_upload(context, &namespace, uuid).await
         }
         Action::PatchUpload { namespace, uuid } => {
-            handlers::upload::dispatch_patch_upload(context, parts, incoming, &namespace, uuid)
-                .await
+            handlers::upload::handle_patch_upload(context, parts, incoming, &namespace, uuid).await
         }
         Action::PutUpload {
             namespace,
             uuid,
             digest,
         } => {
-            handlers::upload::dispatch_put_upload(
-                context, parts, incoming, &namespace, uuid, digest, identity,
+            handlers::upload::handle_put_upload(
+                context, parts, incoming, &namespace, uuid, &digest, identity,
             )
             .await
         }
@@ -90,10 +89,10 @@ async fn dispatch_route<'a>(
             handlers::upload::handle_delete_upload(context, &namespace, uuid).await
         }
         Action::GetBlob { namespace, digest } => {
-            handlers::blob::dispatch_get_blob(context, parts, &namespace, digest, identity).await
+            handlers::blob::handle_get_blob(context, parts, &namespace, &digest, identity).await
         }
         Action::HeadBlob { namespace, digest } => {
-            handlers::blob::dispatch_head_blob(context, parts, &namespace, digest).await
+            handlers::blob::handle_head_blob(context, parts, &namespace, &digest).await
         }
         Action::DeleteBlob { namespace, digest } => {
             handlers::blob::handle_delete_blob(context, &namespace, &digest).await
@@ -102,20 +101,16 @@ async fn dispatch_route<'a>(
             namespace,
             reference,
         } => {
-            handlers::manifest::dispatch_get_manifest(
-                context, parts, &namespace, reference, identity,
-            )
-            .await
+            handlers::manifest::handle_get_manifest(context, parts, &namespace, reference, identity)
+                .await
         }
         Action::HeadManifest {
             namespace,
             reference,
-        } => {
-            handlers::manifest::dispatch_head_manifest(context, parts, &namespace, reference).await
-        }
+        } => handlers::manifest::handle_head_manifest(context, parts, &namespace, reference).await,
         Action::PutManifest { namespace, target } => {
             let (reference, tags) = target.into_parts();
-            handlers::manifest::dispatch_put_manifest(
+            handlers::manifest::handle_put_manifest(
                 context, parts, incoming, &namespace, reference, tags, identity,
             )
             .await
@@ -124,7 +119,7 @@ async fn dispatch_route<'a>(
             namespace,
             reference,
         } => {
-            handlers::manifest::dispatch_delete_manifest(
+            handlers::manifest::handle_delete_manifest(
                 context, parts, &namespace, reference, identity,
             )
             .await

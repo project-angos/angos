@@ -10,10 +10,10 @@ use tracing::{info, warn};
 
 use crate::{
     command::scrub::{action::Action, check::StoreChecker, error::Error, executor::ActionSink},
+    jobs::store::{Error as JobStoreError, JobStore},
+    jobs::{JobState, Queue},
     registry::{
-        Repository,
-        cache_job_handler::CacheFetchBlobPayload,
-        job_store::{Error as JobStoreError, JobState, JobStore, Queue},
+        Repository, cache_job_handler::CacheFetchBlobPayload,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationPushPayload,
@@ -237,12 +237,15 @@ mod tests {
             },
             executor::{ActionSink, DryRunSink, Executor},
         },
+        jobs::{
+            JobState, Queue,
+            store::{FailOutcome, JobEnvelope, JobStore},
+        },
         oci::{Namespace, Tag},
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             Repository,
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
-            job_store::{FailOutcome, JobEnvelope, JobState, JobStore, Queue},
             metadata_store::MetadataStore,
             repository::Upstream,
             repository_resolver::RepositoryResolver,

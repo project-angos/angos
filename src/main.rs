@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    command::{argon, prune, replicate, scrub, server, worker},
+    command::{argon, bootstrap, prune, replicate, scrub, server, worker},
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
     metrics_provider::initialize_metrics,
 };
@@ -26,6 +26,7 @@ mod configuration;
 mod event_webhook;
 pub mod http_client;
 mod identity;
+mod jobs;
 mod metrics_provider;
 mod oci;
 mod policy;
@@ -53,7 +54,7 @@ fn set_tracing(
         let Ok(otlp_exporter) = SpanExporter::builder()
             .with_tonic()
             .with_endpoint(&tracing_config.endpoint)
-            .with_timeout(std::time::Duration::from_secs(10))
+            .with_timeout(Duration::from_secs(10))
             .build()
         else {
             let msg = "Failed to create OTLP exporter".to_string();
@@ -231,7 +232,7 @@ async fn run_worker(
     config_path: &str,
     worker_options: worker::Options,
     config: Configuration,
-) -> Result<(), worker::Error> {
+) -> Result<(), bootstrap::Error> {
     let worker = Arc::new(worker::Command::new(&worker_options, &config).await?);
 
     let Ok(_watcher) = ConfigWatcher::new(config_path, worker.clone()) else {

@@ -1,10 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io::Cursor,
-};
+use std::{collections::HashSet, io::Cursor};
 
 use futures_util::future::join_all;
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
 
 use super::{parse::manifest_meta_from_body, *};
@@ -12,8 +8,8 @@ use crate::{
     command::server::Error as ServerError,
     oci::{Algorithm, MediaType, Namespace, Tag},
     registry::{
-        DOCKER_CONTENT_DIGEST, Error, OCI_TAG, Registry,
-        metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
+        Error, Registry,
+        metadata_store::{LinkKind, LinkMetadata, LinkOperation},
         path_builder::blob_path,
         test_utils::{
             FSRegistryTestCase, RegistryTestCase, for_each_backend, get_blob, put_blob_direct,
@@ -22,10 +18,6 @@ use crate::{
     },
     registry_client::REPLICATION_SUPERSEDED_CODE,
 };
-
-fn header_digest(headers: &HashMap<&'static str, String>) -> Digest {
-    headers[DOCKER_CONTENT_DIGEST].parse().unwrap()
-}
 
 const IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
 const CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
@@ -224,9 +216,9 @@ async fn test_put_manifest() {
 
         assert_eq!(stored_manifest.content, content);
         assert_eq!(stored_manifest.media_type.unwrap(), media_type);
-        assert_eq!(stored_manifest.digest, header_digest(&response.headers));
+        assert_eq!(stored_manifest.digest, response.digest.clone());
 
-        let digest = header_digest(&response.headers);
+        let digest = response.digest.clone();
         let response = registry
             .put_manifest(
                 namespace,
@@ -237,7 +229,7 @@ async fn test_put_manifest() {
             .await
             .unwrap();
 
-        assert_eq!(header_digest(&response.headers), digest);
+        assert_eq!(response.digest.clone(), digest);
     })
     .await;
 }
@@ -268,16 +260,12 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
         .await
         .expect("by-digest push with tag params must succeed");
 
-    let oci_tag = response
-        .headers
-        .get(OCI_TAG)
-        .expect("OCI-Tag header must be present");
     assert_eq!(
-        oci_tag.as_str(),
-        "1.2.3, latest",
-        "OCI-Tag must list created tags comma and space separated in created order"
+        response.created_tags,
+        vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()],
+        "created_tags must list the tags in created order (OCI-Tag wire formatting is covered by the handler builder tests)"
     );
-    assert_eq!(header_digest(&response.headers), digest);
+    assert_eq!(response.digest, digest);
 
     // Event emission for `?tag=` pushes is covered by
     // `event_emission_tests::digest_push_with_tag_params_emits_tag_create_per_tag`.
@@ -294,8 +282,7 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
             .await
             .expect("each created tag must resolve");
         assert_eq!(
-            header_digest(&head.headers),
-            digest,
+            head.digest, digest,
             "tag '{tag}' must point at the sha512 digest"
         );
     }
@@ -329,8 +316,8 @@ async fn accept_put_manifest_by_tag_ignores_tag_params() {
         .expect("by-tag push must succeed");
 
     assert!(
-        !response.headers.contains_key(OCI_TAG),
-        "a by-tag push must not emit an OCI-Tag header"
+        response.created_tags.is_empty(),
+        "a by-tag push must not create any extra tags"
     );
 
     let repository = registry.get_repository_for_namespace(&namespace).unwrap();
@@ -491,7 +478,7 @@ async fn put_manifest_allows_missing_subject_reference() {
             .expect("missing subject should not reject manifest push");
 
         let subject = MISSING_SUBJECT_DIGEST.parse().unwrap();
-        let digest = header_digest(&response.headers);
+        let digest = response.digest.clone();
         let link = LinkKind::Referrer(subject, digest.clone());
         let metadata = registry
             .metadata_store
@@ -797,14 +784,14 @@ async fn test_get_manifest() {
 
         assert_eq!(manifest.content, content);
         assert_eq!(manifest.media_type.unwrap(), media_type);
-        assert_eq!(manifest.digest, header_digest(&response.headers));
+        assert_eq!(manifest.digest, response.digest.clone());
 
         let manifest = registry
             .get_manifest(
                 registry.get_repository_for_namespace(namespace).unwrap(),
                 &[media_type.to_string()],
                 namespace,
-                Reference::Digest(header_digest(&response.headers)),
+                Reference::Digest(response.digest.clone()),
                 false,
             )
             .await
@@ -812,7 +799,7 @@ async fn test_get_manifest() {
 
         assert_eq!(manifest.content, content);
         assert_eq!(manifest.media_type.unwrap(), media_type);
-        assert_eq!(manifest.digest, header_digest(&response.headers));
+        assert_eq!(manifest.digest, response.digest.clone());
     })
     .await;
 }
@@ -846,36 +833,24 @@ async fn test_head_manifest() {
             .await
             .unwrap();
 
-        assert_eq!(manifest.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&manifest.headers),
-            header_digest(&response.headers)
-        );
-        assert_eq!(
-            manifest.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
+        assert_eq!(manifest.media_type.as_ref().unwrap(), &media_type);
+        assert_eq!(manifest.digest, response.digest);
+        assert_eq!(manifest.size, content.len() as u64);
 
         let manifest = registry
             .head_manifest(
                 registry.get_repository_for_namespace(namespace).unwrap(),
                 &[media_type.to_string()],
                 namespace,
-                Reference::Digest(header_digest(&response.headers)),
+                Reference::Digest(response.digest.clone()),
                 false,
             )
             .await
             .unwrap();
 
-        assert_eq!(manifest.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&manifest.headers),
-            header_digest(&response.headers)
-        );
-        assert_eq!(
-            manifest.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
+        assert_eq!(manifest.media_type.as_ref().unwrap(), &media_type);
+        assert_eq!(manifest.digest, response.digest);
+        assert_eq!(manifest.size, content.len() as u64);
     })
     .await;
 }
@@ -926,7 +901,7 @@ async fn test_delete_manifest() {
                 None,
                 None,
                 namespace,
-                &Reference::Digest(header_digest(&response.headers)),
+                &Reference::Digest(response.digest.clone()),
             )
             .await
             .unwrap();
@@ -937,7 +912,7 @@ async fn test_delete_manifest() {
                     registry.get_repository_for_namespace(namespace).unwrap(),
                     &[media_type.to_string()],
                     namespace,
-                    Reference::Digest(header_digest(&response.headers)),
+                    Reference::Digest(response.digest.clone()),
                     false,
                 )
                 .await
@@ -994,7 +969,7 @@ async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
             )
             .await
             .unwrap();
-        let digest = header_digest(&response.headers);
+        let digest = response.digest.clone();
 
         // Hold the lock, then start the delete: it must block, not reclaim.
         let session = registry
@@ -1067,7 +1042,7 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
             )
             .await
             .unwrap();
-        let manifest_digest = header_digest(&response.headers);
+        let manifest_digest = response.digest.clone();
 
         let manifest_blob_result = registry.delete_blob(namespace, &manifest_digest).await;
         assert!(matches!(manifest_blob_result, Err(Error::BlobReferenced)));
@@ -1400,25 +1375,21 @@ async fn test_handle_get_manifest() {
             .unwrap();
 
         match response {
-            GetManifestResponse::Redirect { headers, digest } => {
-                assert_eq!(digest, header_digest(&put_response.headers));
-                assert_eq!(
-                    header_digest(&headers),
-                    header_digest(&put_response.headers)
-                );
-                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
+            GetManifestResponse::Redirect {
+                digest,
+                media_type: served_media_type,
+                ..
+            } => {
+                assert_eq!(digest, put_response.digest);
+                assert_eq!(served_media_type.as_ref().unwrap(), &media_type);
             }
             GetManifestResponse::Body {
-                headers,
-                content: body,
+                media_type: served_media_type,
                 digest,
+                content: body,
             } => {
-                assert_eq!(digest, header_digest(&put_response.headers));
-                assert_eq!(
-                    header_digest(&headers),
-                    header_digest(&put_response.headers)
-                );
-                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
+                assert_eq!(digest, put_response.digest);
+                assert_eq!(served_media_type.as_ref().unwrap(), &media_type);
                 assert_eq!(body, content);
             }
         }
@@ -1448,10 +1419,10 @@ async fn test_handle_put_manifest() {
             .await
             .expect("put manifest failed");
 
-        assert_eq!(
-            response.headers[LOCATION.as_str()],
-            format!("/v2/{namespace}/manifests/{tag}")
-        );
+        // The handler rebuilds the `Location` from these facts; that wire
+        // formatting is covered by the handler builder tests.
+        assert_eq!(response.namespace, *namespace);
+        assert_eq!(response.reference.to_string(), tag);
 
         let repository = registry
             .get_repository_for_namespace(namespace)
@@ -1469,7 +1440,7 @@ async fn test_handle_put_manifest() {
 
         assert_eq!(stored_manifest.content, content);
         assert_eq!(stored_manifest.media_type.unwrap(), media_type);
-        assert_eq!(stored_manifest.digest, header_digest(&response.headers));
+        assert_eq!(stored_manifest.digest, response.digest.clone());
     })
     .await;
 }
@@ -1506,7 +1477,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
                 None,
                 None,
                 namespace,
-                &Reference::Digest(header_digest(&response.headers)),
+                &Reference::Digest(response.digest.clone()),
             )
             .await
             .unwrap();
@@ -1545,7 +1516,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
                     repository,
                     &[media_type.to_string()],
                     namespace,
-                    Reference::Digest(header_digest(&response.headers)),
+                    Reference::Digest(response.digest.clone()),
                     false,
                 )
                 .await
@@ -1599,7 +1570,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
                 None,
                 None,
                 namespace,
-                &Reference::Digest(header_digest(&response_a.headers)),
+                &Reference::Digest(response_a.digest.clone()),
             )
             .await
             .unwrap();
@@ -1643,7 +1614,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
             .await
             .unwrap();
 
-        assert_eq!(manifest_b.digest, header_digest(&response_b.headers));
+        assert_eq!(manifest_b.digest, response_b.digest.clone());
     })
     .await;
 }
@@ -1696,7 +1667,7 @@ async fn test_delete_manifest_with_many_tags() {
                 None,
                 None,
                 namespace,
-                &Reference::Digest(header_digest(&response_a.headers)),
+                &Reference::Digest(response_a.digest.clone()),
             )
             .await
             .unwrap();
@@ -1763,7 +1734,7 @@ async fn test_put_manifest_stores_media_type() {
             .await
             .unwrap();
 
-        let digest_link = LinkKind::Digest(header_digest(&response.headers));
+        let digest_link = LinkKind::Digest(response.digest.clone());
         let link_meta = registry
             .metadata_store
             .read_link(namespace, &digest_link)
@@ -1838,15 +1809,12 @@ async fn test_head_manifest_fallback_without_media_type() {
             .unwrap();
 
         assert_eq!(
-            head.headers[CONTENT_TYPE.as_str()],
-            media_type,
+            head.media_type.as_ref().unwrap(),
+            &media_type,
             "HEAD should fall back to reading blob when media_type not in link"
         );
-        assert_eq!(header_digest(&head.headers), digest);
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
+        assert_eq!(head.digest, digest);
+        assert_eq!(head.size, content.len() as u64);
     })
     .await;
 }
@@ -1870,10 +1838,7 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
 
         let digest_link = registry
             .metadata_store
-            .read_link(
-                namespace,
-                &LinkKind::Digest(header_digest(&response.headers)),
-            )
+            .read_link(namespace, &LinkKind::Digest(response.digest.clone()))
             .await
             .unwrap();
 
@@ -1926,14 +1891,14 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
         // support presigned URLs (FS backend), we get a Body response, both are
         // valid; in the Body case the media_type comes from the manifest JSON.
         match response {
-            GetManifestResponse::Redirect { headers, .. } => {
+            GetManifestResponse::Redirect { media_type, .. } => {
                 assert!(
-                    headers.contains_key(CONTENT_TYPE.as_str()),
-                    "Redirect should still include Content-Type via fallback"
+                    media_type.is_some(),
+                    "Redirect should still carry a media_type via fallback"
                 );
             }
-            GetManifestResponse::Body { headers, .. } => {
-                assert!(headers.contains_key(CONTENT_TYPE.as_str()));
+            GetManifestResponse::Body { media_type, .. } => {
+                assert!(media_type.is_some());
             }
         }
     })
@@ -2047,7 +2012,7 @@ async fn store_manifest_writes_blob_and_links() {
         .await
         .unwrap();
 
-    let stored_digest = header_digest(&response.headers);
+    let stored_digest = response.digest.clone();
     assert_eq!(stored_digest, expected_digest);
 
     // The link should be readable via the metadata store.
@@ -2202,7 +2167,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
         .read_link(&namespace, &LinkKind::Digest(digest.clone()))
         .await;
     assert!(
-        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        matches!(result, Err(Error::NotFound)),
         "digest link should be gone after delete, got: {result:?}"
     );
 }
@@ -2643,10 +2608,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
         .await
         .err();
     assert!(
-        matches!(
-            result,
-            Some(metadata_store::Error::ReplicationSuperseded(_))
-        ),
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
         "an older replicated write must be rejected by the transaction itself, got: {result:?}"
     );
 
@@ -2690,10 +2652,7 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
         .await
         .err();
     assert!(
-        matches!(
-            result,
-            Some(metadata_store::Error::ReplicationSuperseded(_))
-        ),
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
         "an older replicated delete must be rejected by the transaction itself, got: {result:?}"
     );
 
@@ -2889,7 +2848,7 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
         .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
-        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        matches!(result, Err(Error::NotFound)),
         "tag must be gone after an accepted delete, got: {result:?}"
     );
 }
@@ -2937,7 +2896,7 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
         .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
-        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        matches!(result, Err(Error::NotFound)),
         "tag must be gone after the non-superseded delete, got: {result:?}"
     );
 }
@@ -3009,7 +2968,7 @@ async fn replicated_delete_not_superseded_by_a_legacy_link() {
 
     let result = registry.metadata_store.read_link(namespace, &link).await;
     assert!(
-        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        matches!(result, Err(Error::NotFound)),
         "the legacy tag must be gone after the non-superseded delete, got: {result:?}"
     );
 }
@@ -3075,7 +3034,7 @@ async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
         .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
-        matches!(tag_result, Err(metadata_store::Error::ReferenceNotFound)),
+        matches!(tag_result, Err(Error::NotFound)),
         "pointing tag must be removed by an accepted digest delete, got: {tag_result:?}"
     );
 }
@@ -3140,7 +3099,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
         .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
         .await;
     assert!(
-        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        matches!(result, Err(Error::NotFound)),
         "the downstream tag must be gone after an applied prune delete, got: {result:?}"
     );
 }
@@ -3183,10 +3142,10 @@ mod noop_suppression_tests {
     use angos_tx_engine::transaction::Transaction;
 
     use crate::{
+        jobs::{Queue, store::JobStore},
         oci::{Digest, MediaType, Namespace, Reference, Tag},
         registry::{
             Registry, RegistryConfig,
-            job_store::{JobStore, Queue},
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{
                 FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,
@@ -3218,7 +3177,10 @@ mod noop_suppression_tests {
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let config = RegistryConfig {
+            job_queue: Some(job_store.clone()),
+            ..RegistryConfig::default()
+        };
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
         (registry, job_store, dir)
     }
@@ -3795,10 +3757,10 @@ mod dispatch_replication_tests {
     use regex::Regex;
 
     use crate::{
+        jobs::{Queue, store::JobStore},
         oci::{Digest, Namespace, Tag},
         registry::{
             Registry, RegistryConfig, Repository,
-            job_store::{JobStore, Queue},
             test_utils::{
                 FsTestStack, downstream_client, fs_test_stack, repository_with_replication,
                 single_repo_resolver, sole_pending_payload,
@@ -3857,7 +3819,10 @@ mod dispatch_replication_tests {
         // No drain spawned: the bare JobStore only persists envelopes; these tests assert enqueue only.
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let config = RegistryConfig {
+            job_queue: Some(job_store.clone()),
+            ..RegistryConfig::default()
+        };
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         (registry, job_store, dir)

@@ -8,7 +8,8 @@ use tracing::{debug, instrument};
 use crate::{
     oci::{Algorithm, Descriptor, Digest, Namespace, Tag},
     registry::{
-        metadata_store::{Error, LinkKind, MetadataStore},
+        Error,
+        metadata_store::{LinkKind, MetadataStore},
         pagination,
         pagination::collect_all_pages,
         path_builder,
@@ -306,7 +307,7 @@ impl MetadataStore {
         tag_name: &str,
     ) -> Result<(), Error> {
         if tag_name.is_empty() || tag_name.contains('/') || tag_name == "." || tag_name == ".." {
-            return Err(Error::InvalidData(format!(
+            return Err(Error::Internal(format!(
                 "unsafe tag directory name: '{tag_name}'"
             )));
         }
@@ -321,9 +322,8 @@ impl MetadataStore {
     /// by scrub to reclaim a directory whose name fails `Namespace` validation
     /// and so cannot form typed links for a per-link delete.
     pub async fn delete_namespace_directory(&self, name: &str) -> Result<(), Error> {
-        let prefix = path_builder::namespace_dir(name).ok_or_else(|| {
-            Error::InvalidData(format!("unsafe namespace directory name: '{name}'"))
-        })?;
+        let prefix = path_builder::namespace_dir(name)
+            .ok_or_else(|| Error::Internal(format!("unsafe namespace directory name: '{name}'")))?;
         self.store()
             .object_store()
             .delete_prefix(&prefix)

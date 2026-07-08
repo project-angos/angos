@@ -177,14 +177,16 @@ pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
             .expect("test repositories must not have overlapping prefixes"),
     );
 
-    let registry_config = RegistryConfig::default()
-        .update_pull_time(config.global.update_pull_time)
-        .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
-        .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
-        .max_manifest_size_bytes(config.global.max_manifest_size_bytes())
-        .global_immutable_tags(config.global.immutable_tags)
-        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone())
-        .event_dispatcher(EventDispatcher::from_config(&config.event_webhook).unwrap());
+    let registry_config = RegistryConfig {
+        update_pull_time: config.global.update_pull_time,
+        enable_blob_redirect: config.global.resolved_enable_blob_redirect(),
+        enable_manifest_redirect: config.global.resolved_enable_manifest_redirect(),
+        max_manifest_size_bytes: config.global.max_manifest_size_bytes(),
+        global_immutable_tags: config.global.immutable_tags,
+        global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
+        event_dispatcher: EventDispatcher::from_config(&config.event_webhook).unwrap(),
+        ..RegistryConfig::default()
+    };
 
     Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
 }
@@ -628,12 +630,14 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
         blob_backend,
         metadata_store.clone(),
         Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap()),
-        RegistryConfig::default()
-            .update_pull_time(false)
-            .enable_blob_redirect(false)
-            .enable_manifest_redirect(false)
-            .global_immutable_tags(false)
-            .global_immutable_tags_exclusions(Vec::new()),
+        RegistryConfig {
+            update_pull_time: false,
+            enable_blob_redirect: false,
+            enable_manifest_redirect: false,
+            global_immutable_tags: false,
+            global_immutable_tags_exclusions: Vec::new(),
+            ..RegistryConfig::default()
+        },
     )
     .unwrap();
 

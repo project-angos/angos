@@ -10,7 +10,6 @@
 //! caller-facing trait.
 
 mod config;
-mod error;
 pub mod hashing_reader;
 mod multipart_cleanup;
 pub mod resumable_hasher;
@@ -35,12 +34,11 @@ pub use config::BlobStoreConfig;
 // backends through `BlobStoreConfig`. Re-export them for test builds only.
 #[cfg(test)]
 pub use config::{FsBackendConfig, S3BackendConfig, TransportFields};
-pub use error::Error;
 pub use multipart_cleanup::{MultipartCleanup, OrphanMultipartUpload};
 
 use crate::{
     oci::Digest,
-    registry::{pagination, path_builder},
+    registry::{Error, pagination, path_builder},
 };
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
@@ -130,7 +128,7 @@ impl BlobStore {
         let path = path_builder::blob_path(digest);
         match self.object.get(&path).await {
             Ok(data) => Ok(data),
-            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
+            Err(StorageError::NotFound) => Err(Error::BlobUnknown),
             Err(e) => Err(e.into()),
         }
     }
@@ -140,7 +138,7 @@ impl BlobStore {
         let path = path_builder::blob_path(digest);
         match self.object.head(&path).await {
             Ok(meta) => Ok(meta.size),
-            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
+            Err(StorageError::NotFound) => Err(Error::BlobUnknown),
             Err(e) => Err(e.into()),
         }
     }
@@ -153,7 +151,7 @@ impl BlobStore {
         let path = path_builder::blob_path(digest);
         match self.object.head(&path).await {
             Ok(meta) => Ok(meta.last_modified),
-            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
+            Err(StorageError::NotFound) => Err(Error::BlobUnknown),
             Err(e) => Err(e.into()),
         }
     }
@@ -167,7 +165,7 @@ impl BlobStore {
         let path = path_builder::blob_path(digest);
         match self.object.get_stream(&path, start_offset).await {
             Ok((reader, total)) => Ok((reader, total)),
-            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
+            Err(StorageError::NotFound) => Err(Error::BlobUnknown),
             Err(e) => Err(e.into()),
         }
     }
@@ -184,9 +182,8 @@ impl BlobStore {
     /// `Namespace` validation.
     #[instrument(skip(self))]
     pub async fn delete_namespace_directory(&self, name: &str) -> Result<(), Error> {
-        let prefix = path_builder::namespace_dir(name).ok_or_else(|| {
-            Error::InvalidFormat(format!("unsafe namespace directory name: '{name}'"))
-        })?;
+        let prefix = path_builder::namespace_dir(name)
+            .ok_or_else(|| Error::Internal(format!("unsafe namespace directory name: '{name}'")))?;
         self.object.delete_prefix(&prefix).await?;
         Ok(())
     }

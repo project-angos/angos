@@ -13,12 +13,14 @@ use tracing::debug;
 use angos_tx_engine::transaction::Transaction;
 
 use crate::{
+    jobs::Queue,
+    jobs::store::{Error, JobEnvelope, JobHandler},
     metrics_provider::metrics_provider,
     oci::{Digest, Namespace, Reference, Tag},
     registry::{
+        Error as MetadataStoreError,
         blob_store::BlobStore,
-        job_store::{Error, JobEnvelope, JobHandler, Queue},
-        metadata_store::{Error as MetadataStoreError, LinkKind, MetadataStore},
+        metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
     replication::{
@@ -253,7 +255,7 @@ impl ReplicationJobHandler {
                 .await
             {
                 Ok(link) => Ok(Some((link.target, link.created_at))),
-                Err(MetadataStoreError::ReferenceNotFound) => Ok(None),
+                Err(MetadataStoreError::NotFound) => Ok(None),
                 Err(e) => Err(Error::Storage(format!(
                     "failed to read tag '{tag}' in '{namespace}': {e}"
                 ))),
@@ -274,7 +276,7 @@ impl ReplicationJobHandler {
                 .await
             {
                 Ok(_) => Ok(Some((digest, None))),
-                Err(MetadataStoreError::ReferenceNotFound) => Ok(None),
+                Err(MetadataStoreError::NotFound) => Ok(None),
                 Err(e) => Err(Error::Storage(format!(
                     "failed to read revision '{digest}' in '{namespace}': {e}"
                 ))),

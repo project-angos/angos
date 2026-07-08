@@ -1,5 +1,6 @@
 use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use tokio::task;
 use tracing::{instrument, warn};
@@ -225,11 +226,7 @@ impl Repository {
         mut op: F,
     ) -> Result<T, Error>
     where
-        F: FnMut(
-            &'a Upstream,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<T, Error>> + Send + 'a>,
-        >,
+        F: FnMut(&'a Upstream) -> BoxFuture<'a, Result<T, Error>>,
     {
         for upstream in &self.upstreams {
             match op(upstream).await {

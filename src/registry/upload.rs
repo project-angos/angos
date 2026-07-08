@@ -5,9 +5,8 @@ use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
-        DOCKER_UPLOAD_UUID, Error, HeaderMap, Registry, ResponseHeaders,
+        Error, Registry,
         blob_ownership::BlobOwnership,
-        blob_store,
         blob_store::{hashing_reader::HashingReader, resumable_hasher::Hasher},
     },
 };
@@ -21,9 +20,17 @@ const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
 /// [`manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES`](crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES).
 pub const DEFAULT_MAX_BLOB_SIZE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
+/// The facts a blob-upload start resolved to; the handler turns each variant
+/// into its wire response and headers.
 pub enum StartUploadResponse {
-    ExistingBlob { headers: HeaderMap },
-    Session { headers: HeaderMap },
+    ExistingBlob {
+        namespace: Namespace,
+        digest: Digest,
+    },
+    Session {
+        namespace: Namespace,
+        session_uuid: String,
+    },
 }
 
 /// An OCI cross-repository blob mount request
@@ -37,49 +44,20 @@ pub struct BlobMount {
 }
 
 pub struct GetUploadResponse {
-    pub headers: HeaderMap,
+    pub namespace: Namespace,
+    pub session_id: String,
+    pub size: u64,
 }
 
 pub struct PatchUploadResponse {
-    pub headers: HeaderMap,
+    pub namespace: Namespace,
+    pub session_id: String,
+    pub size: u64,
 }
 
 pub struct CompleteUploadResponse {
-    pub headers: HeaderMap,
-}
-
-/// Headers for a completed-blob response (used by `StartUpload` when the digest
-/// already exists, and by `CompleteUpload` when the upload finishes).
-fn blob_location_headers(namespace: &Namespace, digest: &Digest) -> HeaderMap {
-    ResponseHeaders::new()
-        .location(format!("/v2/{namespace}/blobs/{digest}"))
-        .docker_content_digest(digest)
-        .into_inner()
-}
-
-fn upload_session_headers(namespace: &Namespace, session_uuid: &str) -> HeaderMap {
-    ResponseHeaders::new()
-        .location(format!("/v2/{namespace}/blobs/uploads/{session_uuid}"))
-        .range("0-0")
-        .with(DOCKER_UPLOAD_UUID, session_uuid)
-        .into_inner()
-}
-
-fn upload_status_headers(namespace: &Namespace, session_id: &str, range_max: u64) -> HeaderMap {
-    ResponseHeaders::new()
-        .location(format!("/v2/{namespace}/blobs/uploads/{session_id}"))
-        .range(format!("0-{range_max}"))
-        .with(DOCKER_UPLOAD_UUID, session_id)
-        .into_inner()
-}
-
-fn patch_upload_headers(namespace: &Namespace, session_id: &str, range_max: u64) -> HeaderMap {
-    ResponseHeaders::new()
-        .location(format!("/v2/{namespace}/blobs/uploads/{session_id}"))
-        .range(format!("0-{range_max}"))
-        .with(DOCKER_UPLOAD_UUID, session_id)
-        .content_length(0)
-        .into_inner()
+    pub namespace: Namespace,
+    pub digest: Digest,
 }
 
 impl Registry {
@@ -114,19 +92,15 @@ impl Registry {
                             &mut sink(),
                         )
                         .await
-                        .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
+                        .map_err(|_| Error::RangeNotSatisfiable)?;
                         if read != expected {
-                            return Err(blob_store::Error::UploadBodySize {
-                                expected,
-                                actual: read,
-                            }
-                            .into());
+                            return Err(Error::RangeNotSatisfiable);
                         }
                     }
                     None => {
                         copy(&mut reader, &mut sink())
                             .await
-                            .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
+                            .map_err(|_| Error::RangeNotSatisfiable)?;
                     }
                 }
 
@@ -156,7 +130,8 @@ impl Registry {
         }
 
         Ok(CompleteUploadResponse {
-            headers: blob_location_headers(namespace, digest),
+            namespace: namespace.clone(),
+            digest: digest.clone(),
         })
     }
 
@@ -170,7 +145,7 @@ impl Registry {
         namespace: &Namespace,
         mount: &BlobMount,
         source: &Namespace,
-    ) -> Result<Option<HeaderMap>, Error> {
+    ) -> Result<Option<Digest>, Error> {
         self.metadata_store
             .with_blob_data_lock(&mount.digest, async {
                 if self.blob_store.size(&mount.digest).await.is_err()
@@ -184,7 +159,7 @@ impl Registry {
                 BlobOwnership::new(self.metadata_store.as_ref())
                     .grant(namespace, &mount.digest)
                     .await?;
-                Ok(Some(blob_location_headers(namespace, &mount.digest)))
+                Ok(Some(mount.digest.clone()))
             })
             .await
     }
@@ -231,7 +206,8 @@ impl Registry {
             .await?;
 
         Ok(StartUploadResponse::Session {
-            headers: upload_session_headers(namespace, session_id.as_ref()),
+            namespace: namespace.clone(),
+            session_uuid: session_id.as_ref().to_string(),
         })
     }
 
@@ -250,7 +226,8 @@ impl Registry {
                 .await?
         {
             return Ok(StartUploadResponse::ExistingBlob {
-                headers: blob_location_headers(namespace, &digest),
+                namespace: namespace.clone(),
+                digest,
             });
         }
 
@@ -277,8 +254,11 @@ impl Registry {
             .actor(actor);
         self.dispatch_events(&[event]).await?;
 
-        if let Some(headers) = self.try_cross_repo_mount(namespace, mount, source).await? {
-            return Ok(StartUploadResponse::ExistingBlob { headers });
+        if let Some(digest) = self.try_cross_repo_mount(namespace, mount, source).await? {
+            return Ok(StartUploadResponse::ExistingBlob {
+                namespace: namespace.clone(),
+                digest,
+            });
         }
 
         self.open_upload_session(namespace).await
@@ -395,10 +375,10 @@ impl Registry {
         self.reject_if_oversized(namespace, &session_key, size)
             .await?;
 
-        let range_max = size.saturating_sub(1);
-
         Ok(PatchUploadResponse {
-            headers: patch_upload_headers(namespace, &session_key, range_max),
+            namespace: namespace.clone(),
+            session_id: session_key,
+            size,
         })
     }
 
@@ -434,8 +414,8 @@ impl Registry {
             .await
         {
             Ok(summary) => summary.size,
-            Err(blob_store::Error::UploadNotFound) => 0,
-            Err(e) => return Err(e.into()),
+            Err(Error::BlobUploadUnknown) => 0,
+            Err(e) => return Err(e),
         };
         let has_prior_writes = committed > 0;
 
@@ -501,12 +481,12 @@ impl Registry {
             .with_blob_data_lock(digest, async {
                 match self.blob_store.size(digest).await {
                     Ok(_) => {}
-                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                    Err(Error::BlobUnknown | Error::NotFound) => {
                         self.blob_store
                             .complete_upload(namespace, &session_key, digest)
                             .await?;
                     }
-                    Err(error) => return Err(Error::from(error)),
+                    Err(error) => return Err(error),
                 }
 
                 BlobOwnership::new(self.metadata_store.as_ref())
@@ -541,10 +521,10 @@ impl Registry {
         let uuid = session_id.as_ref();
         let summary = self.blob_store.upload_summary(namespace, uuid).await?;
 
-        let range_max = summary.size.saturating_sub(1);
-
         Ok(GetUploadResponse {
-            headers: upload_status_headers(namespace, uuid, range_max),
+            namespace: namespace.clone(),
+            session_id: uuid.to_string(),
+            size: summary.size,
         })
     }
 }
@@ -554,10 +534,7 @@ mod tests {
     use std::{io::Cursor, str::FromStr, sync::Arc};
 
     use async_trait::async_trait;
-    use hyper::{
-        Request,
-        header::{LOCATION, RANGE},
-    };
+    use hyper::Request;
 
     use crate::{
         auth::Authorizer,
@@ -565,8 +542,7 @@ mod tests {
         identity::ClientIdentity,
         oci::{Algorithm, Digest, Namespace, UploadSessionId},
         registry::{
-            BlobMount, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, RegistryConfig,
-            StartUploadResponse,
+            BlobMount, Error, Registry, RegistryConfig, StartUploadResponse,
             blob_ownership::BlobOwnership,
             blob_store::BlobStore,
             metadata_store::LinkKind,
@@ -630,12 +606,12 @@ mod tests {
 
             let response = registry.start_upload(namespace, None).await.unwrap();
             match response {
-                StartUploadResponse::Session { headers } => {
-                    assert!(
-                        headers[LOCATION.as_str()]
-                            .starts_with(&format!("/v2/{namespace}/blobs/uploads/"))
-                    );
-                    assert!(!headers[DOCKER_UPLOAD_UUID].is_empty());
+                StartUploadResponse::Session {
+                    namespace: session_namespace,
+                    session_uuid,
+                } => {
+                    assert_eq!(&session_namespace, namespace);
+                    assert!(!session_uuid.is_empty());
                 }
                 StartUploadResponse::ExistingBlob { .. } => panic!("Expected Session response"),
             }
@@ -646,12 +622,12 @@ mod tests {
                 .await
                 .unwrap();
             match response {
-                StartUploadResponse::Session { headers } => {
-                    assert!(
-                        headers[LOCATION.as_str()]
-                            .starts_with(&format!("/v2/{namespace}/blobs/uploads/"))
-                    );
-                    assert!(!headers[DOCKER_UPLOAD_UUID].is_empty());
+                StartUploadResponse::Session {
+                    namespace: session_namespace,
+                    session_uuid,
+                } => {
+                    assert_eq!(&session_namespace, namespace);
+                    assert!(!session_uuid.is_empty());
                 }
                 StartUploadResponse::ExistingBlob { .. } => {
                     panic!("Expected unowned blob to start a new session")
@@ -668,12 +644,12 @@ mod tests {
                 .await
                 .unwrap();
             match response {
-                StartUploadResponse::ExistingBlob { headers } => {
-                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
-                    assert_eq!(
-                        headers[LOCATION.as_str()],
-                        format!("/v2/{namespace}/blobs/{digest}")
-                    );
+                StartUploadResponse::ExistingBlob {
+                    namespace: blob_namespace,
+                    digest: blob_digest,
+                } => {
+                    assert_eq!(&blob_namespace, namespace);
+                    assert_eq!(blob_digest, digest);
                 }
                 StartUploadResponse::Session { .. } => panic!("Expected Existing response"),
             }
@@ -705,12 +681,12 @@ mod tests {
                 .unwrap();
 
             match response {
-                StartUploadResponse::ExistingBlob { headers } => {
-                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
-                    assert_eq!(
-                        headers[LOCATION.as_str()],
-                        format!("/v2/{target}/blobs/{digest}")
-                    );
+                StartUploadResponse::ExistingBlob {
+                    namespace: blob_namespace,
+                    digest: blob_digest,
+                } => {
+                    assert_eq!(blob_digest, digest);
+                    assert_eq!(&blob_namespace, target);
                 }
                 StartUploadResponse::Session { .. } => {
                     panic!("Expected a mounted existing-blob response")
@@ -752,11 +728,12 @@ mod tests {
                 .unwrap();
 
             match response {
-                StartUploadResponse::Session { headers } => {
-                    assert!(
-                        headers[LOCATION.as_str()]
-                            .starts_with(&format!("/v2/{target}/blobs/uploads/"))
-                    );
+                StartUploadResponse::Session {
+                    namespace: session_namespace,
+                    session_uuid,
+                } => {
+                    assert_eq!(&session_namespace, target);
+                    assert!(!session_uuid.is_empty());
                 }
                 StartUploadResponse::ExistingBlob { .. } => {
                     panic!("Expected a fall-back session when the source does not own the blob")
@@ -826,8 +803,11 @@ mod tests {
                 .unwrap();
 
             match response {
-                StartUploadResponse::ExistingBlob { headers } => {
-                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+                StartUploadResponse::ExistingBlob {
+                    digest: blob_digest,
+                    ..
+                } => {
+                    assert_eq!(blob_digest, digest);
                 }
                 StartUploadResponse::Session { .. } => {
                     panic!("automatic discovery must mount a referenced blob")
@@ -1056,10 +1036,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                response.headers[RANGE.as_str()],
-                format!("0-{}", content.len() - 1)
-            );
+            assert_eq!(response.size, content.len() as u64);
 
             let additional_content = b" additional";
             let stream = Cursor::new(additional_content);
@@ -1074,8 +1051,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                response.headers[RANGE.as_str()],
-                format!("0-{}", content.len() + additional_content.len() - 1)
+                response.size,
+                (content.len() + additional_content.len()) as u64
             );
 
             let summary = registry
@@ -1178,10 +1155,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                response.headers[DOCKER_CONTENT_DIGEST],
-                expected_digest.to_string()
-            );
+            assert_eq!(response.digest, expected_digest);
 
             let stored_content = registry.blob_store.read(&expected_digest).await.unwrap();
             assert_eq!(stored_content, content);
@@ -1229,10 +1203,7 @@ mod tests {
                     .await
                     .unwrap();
 
-                assert_eq!(
-                    response.headers[DOCKER_CONTENT_DIGEST],
-                    expected_digest.to_string()
-                );
+                assert_eq!(response.digest, expected_digest);
                 let stored = registry.blob_store.read(&expected_digest).await.unwrap();
                 assert_eq!(stored, content);
 
@@ -1292,10 +1263,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                response.headers[DOCKER_CONTENT_DIGEST],
-                expected_digest.to_string()
-            );
+            assert_eq!(response.digest, expected_digest);
             assert_eq!(expected_digest.algorithm(), Algorithm::Sha512);
             assert_eq!(
                 registry.blob_store.read(&expected_digest).await.unwrap(),
@@ -1393,10 +1361,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            response.headers[DOCKER_CONTENT_DIGEST],
-            expected_digest.to_string()
-        );
+        assert_eq!(response.digest, expected_digest);
         assert_eq!(
             registry.blob_store.read(&expected_digest).await.unwrap(),
             content
@@ -1583,7 +1548,7 @@ mod tests {
                 .get_upload_status(namespace, &session_id)
                 .await
                 .unwrap();
-            assert_eq!(response.headers[RANGE.as_str()], "0-0");
+            assert_eq!(response.size, 0);
 
             let stream = Cursor::new(content);
             registry
@@ -1601,10 +1566,7 @@ mod tests {
                 .get_upload_status(namespace, &session_id)
                 .await
                 .unwrap();
-            assert_eq!(
-                response.headers[RANGE.as_str()],
-                format!("0-{}", content.len() - 1)
-            );
+            assert_eq!(response.size, content.len() as u64);
         })
         .await;
     }
@@ -1895,7 +1857,10 @@ mod tests {
             RepositoryResolver::new(create_test_repositories())
                 .expect("test repositories must not have overlapping prefixes"),
         );
-        let config = RegistryConfig::default().max_blob_size_bytes(max_blob_size_bytes);
+        let config = RegistryConfig {
+            max_blob_size_bytes,
+            ..RegistryConfig::default()
+        };
         Registry::new(
             test_case.blob_store(),
             test_case.metadata_store(),

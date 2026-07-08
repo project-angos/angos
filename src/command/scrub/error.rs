@@ -1,32 +1,14 @@
 use angos_tx_engine::lock;
 
-use crate::{
-    cache,
-    command::bootstrap::Error as BootstrapError,
-    policy,
-    registry::{self, blob_store, metadata_store},
-};
+use crate::{cache, command::bootstrap::Error as BootstrapError, policy, registry};
 
-/// Errors that can occur during a scrub run.
+/// Errors that can occur during a scrub run. Each variant's `Display` carries
+/// a `scrub ...` prefix so log lines are unambiguously attributable.
 ///
-/// The `Initialization` string variant is retained for call sites where the
-/// source error type is not one of the typed variants below, or where the call
-/// site adds contextual information (e.g. a repository name) that is not
-/// present in the source error.
-///
-/// ## Display prefix choice
-///
-/// The original implementation emitted bare strings with no context prefix,
-/// making it impossible to distinguish a scrub error's origin in log output.
-/// The new `#[error("...")]` attributes add a minimal prefix so that log lines
-/// are unambiguously attributable.
-///
-/// ## `blob_store::Error` and `#[from]`
-///
-/// `blob_store::Error` does not implement `std::error::Error`, which is a
-/// prerequisite for `#[from]` / `#[source]` in thiserror.  A manual `From`
-/// impl is therefore provided instead; `source()` cannot chain into
-/// `blob_store::Error` until that type is migrated.
+/// The `Initialization` string variant covers call sites where the source
+/// error type is not one of the typed variants below, or where the call site
+/// adds contextual information (e.g. a repository name) that is not present
+/// in the source error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("scrub initialization failed: {0}")]
@@ -42,26 +24,14 @@ pub enum Error {
     #[error("scrub job queue error: {0}")]
     JobQueue(String),
 
-    /// Wraps a `metadata_store::Error` with source preserved.
-    #[error("scrub metadata store error: {0}")]
-    MetadataStore(#[from] metadata_store::Error),
-
-    /// Wraps a `blob_store::Error`.
-    ///
-    /// `blob_store::Error` does not implement `std::error::Error`, so `source()`
-    /// cannot chain into it; a manual `From` impl is used instead of `#[from]`.
-    #[error("scrub blob store error: {0}")]
-    BlobStore(blob_store::Error),
+    /// Wraps a `registry::Error` (the single blob-store / metadata-store domain
+    /// error) with source preserved.
+    #[error("scrub registry error: {0}")]
+    Registry(#[from] registry::Error),
 
     /// Wraps a `cache::Error` with source preserved.
     #[error("scrub cache error: {0}")]
     Cache(#[from] cache::Error),
-}
-
-impl From<blob_store::Error> for Error {
-    fn from(e: blob_store::Error) -> Self {
-        Error::BlobStore(e)
-    }
 }
 
 impl From<policy::Error> for Error {
@@ -72,24 +42,13 @@ impl From<policy::Error> for Error {
 
 impl From<lock::Error> for Error {
     fn from(e: lock::Error) -> Self {
-        Error::MetadataStore(e.into())
-    }
-}
-
-impl From<registry::Error> for Error {
-    fn from(e: registry::Error) -> Self {
-        match e {
-            registry::Error::MetadataStore(inner) => Error::MetadataStore(inner),
-            other => Error::Initialization(other.to_string()),
-        }
+        Error::Registry(e.into())
     }
 }
 
 impl From<BootstrapError> for Error {
     fn from(e: BootstrapError) -> Self {
         match e {
-            BootstrapError::BlobStore(inner) => Error::BlobStore(inner),
-            BootstrapError::MetadataStore(inner) => Error::MetadataStore(inner),
             BootstrapError::Cache(inner) => Error::Cache(inner),
             BootstrapError::Repository { name, source } => Error::Initialization(format!(
                 "Failed to initialize repository '{name}': {source}"
@@ -139,10 +98,11 @@ mod tests {
     }
 
     #[test]
-    fn blob_store_from_conversion() {
-        let inner = blob_store::Error::BlobNotFound;
+    fn registry_from_conversion() {
+        let inner = registry::Error::BlobUnknown;
         let error: Error = inner.into();
-        assert!(matches!(error, Error::BlobStore(_)));
+        assert!(matches!(error, Error::Registry(_)));
+        assert!(error.source().is_some());
     }
 
     #[test]

@@ -12,7 +12,10 @@ use crate::{
         executor::ActionSink,
     },
     oci::{Digest, Namespace},
-    registry::metadata_store::{self, LinkKind, MetadataStore},
+    registry::{
+        Error as RegistryError,
+        metadata_store::{LinkKind, MetadataStore},
+    },
 };
 
 pub struct ReferrerChecker {
@@ -45,7 +48,7 @@ impl ReferrerChecker {
                 .await
             {
                 Ok(_) => {}
-                Err(metadata_store::Error::ReferenceNotFound) => {
+                Err(RegistryError::NotFound) => {
                     sink.apply(Action::DeleteOrphanReferrer {
                         namespace: namespace.clone(),
                         subject: subject.clone(),

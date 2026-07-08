@@ -12,7 +12,7 @@ use crate::{
     },
     oci::{Namespace, Tag},
     registry::{
-        blob_store,
+        Error as RegistryError,
         blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
     },
@@ -61,7 +61,7 @@ impl TagChecker for DigestLinkChecker {
                 )
                 .await
             }
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+            Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 warn!(
                     "Tag '{namespace}:{tag}' targets missing blob '{}'; removing",
                     tag_metadata.target

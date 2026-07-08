@@ -3,7 +3,6 @@ use std::sync::Arc;
 use argh::FromArgs;
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 use crate::{
     command::{
@@ -13,13 +12,13 @@ use crate::{
             action::Action,
             check::{LayoutChecker, NamespaceChecker, StoreChecker, TagChecker, list_all},
             error::Error,
-            executor::{ActionSink, DryRunSink, Executor},
+            executor::{ActionSink, DryRunSink, Executor, run_job_store},
             setup::{self, LabeledStoreCheckers},
         },
     },
     configuration::Configuration,
     oci::{Namespace, Tag},
-    registry::{Registry, job_store::JobStore, metadata_store::MetadataStore},
+    registry::{Registry, metadata_store::MetadataStore},
 };
 
 #[derive(FromArgs, PartialEq, Debug, Default)]
@@ -112,16 +111,11 @@ pub struct Command {
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let auth_cache = bootstrap::auth_cache(&config.cache)?;
-        let blob_backend = Arc::new(config.blob_store.build_backend()?);
-        let metadata_store =
-            bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
-        let repositories = bootstrap::repositories(
-            &config.repository,
-            &auth_cache,
-            config.global.max_manifest_size_bytes(),
-        )
-        .await?;
+        let bootstrap::MaintenanceContext {
+            blob_store: blob_backend,
+            metadata_store,
+            repositories,
+        } = bootstrap::maintenance_context(config).await?;
 
         let namespace_checkers = setup::namespace_checkers(
             options,
@@ -145,10 +139,7 @@ impl Command {
             info!("Dry-run mode: no changes will be made to the storage");
             Box::new(DryRunSink)
         } else {
-            let job_store = Arc::new(JobStore::new(
-                metadata_store.store_arc(),
-                format!("scrub-{}", Uuid::new_v4()),
-            ));
+            let job_store = run_job_store(&metadata_store, "scrub");
             let mut executor = Executor::new(
                 blob_backend.clone(),
                 metadata_store.clone(),

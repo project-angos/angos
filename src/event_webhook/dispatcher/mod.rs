@@ -115,8 +115,50 @@ fn compute_signature(secret: &str, body: &[u8]) -> String {
 }
 
 impl EventDispatcher {
-    pub fn builder() -> EventDispatcherBuilder {
-        EventDispatcherBuilder::default()
+    /// Build a dispatcher over the full webhook map (name → config); each
+    /// config is resolved into its endpoint's individual fields here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Initialization`] when a webhook's HTTP client cannot
+    /// be constructed.
+    pub fn new(webhooks: HashMap<String, EventWebhookConfig>) -> Result<Self, Error> {
+        let mut endpoints = HashMap::with_capacity(webhooks.len());
+
+        for (name, config) in webhooks {
+            let client = HttpClientBuilder::new()
+                .rustls_tls()
+                .timeout(Duration::from_millis(config.timeout_ms))
+                .build()
+                .map_err(|e| {
+                    Error::Initialization(format!(
+                        "Failed to create HTTP client for webhook '{name}': {e}"
+                    ))
+                })?;
+
+            endpoints.insert(
+                name,
+                WebhookEndpoint {
+                    client,
+                    url: config.url,
+                    policy: config.policy,
+                    token: config.token,
+                    max_retries: config.max_retries,
+                    events: config.events,
+                    repository_filter: config.repository_filter,
+                },
+            );
+        }
+
+        Ok(Self {
+            endpoints,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(Mutex::new(JoinSet::new())),
+            delivery_backoff: Backoff::exponential(
+                Duration::from_millis(100),
+                Duration::from_secs(10),
+            ),
+        })
     }
 
     /// Build the dispatcher from the configured webhook map, `None` when no
@@ -128,7 +170,7 @@ impl EventDispatcher {
         if webhooks.is_empty() {
             return Ok(None);
         }
-        let dispatcher = Self::builder().webhooks(webhooks.clone()).build()?;
+        let dispatcher = Self::new(webhooks.clone())?;
         Ok(Some(Arc::new(dispatcher)))
     }
 
@@ -343,59 +385,5 @@ impl EventDispatcher {
         }
 
         Ok(())
-    }
-}
-
-#[derive(Default)]
-pub struct EventDispatcherBuilder {
-    webhooks: HashMap<String, EventWebhookConfig>,
-}
-
-impl EventDispatcherBuilder {
-    /// Set the full webhook map (name → config). Each config is resolved into
-    /// the endpoint's individual fields at [`build`](Self::build) time.
-    #[must_use]
-    pub fn webhooks(mut self, webhooks: HashMap<String, EventWebhookConfig>) -> Self {
-        self.webhooks = webhooks;
-        self
-    }
-
-    pub fn build(self) -> Result<EventDispatcher, Error> {
-        let mut endpoints = HashMap::with_capacity(self.webhooks.len());
-
-        for (name, config) in self.webhooks {
-            let client = HttpClientBuilder::new()
-                .rustls_tls()
-                .timeout(Duration::from_millis(config.timeout_ms))
-                .build()
-                .map_err(|e| {
-                    Error::Initialization(format!(
-                        "Failed to create HTTP client for webhook '{name}': {e}"
-                    ))
-                })?;
-
-            endpoints.insert(
-                name,
-                WebhookEndpoint {
-                    client,
-                    url: config.url,
-                    policy: config.policy,
-                    token: config.token,
-                    max_retries: config.max_retries,
-                    events: config.events,
-                    repository_filter: config.repository_filter,
-                },
-            );
-        }
-
-        Ok(EventDispatcher {
-            endpoints,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            in_flight: Arc::new(Mutex::new(JoinSet::new())),
-            delivery_backoff: Backoff::exponential(
-                Duration::from_millis(100),
-                Duration::from_secs(10),
-            ),
-        })
     }
 }

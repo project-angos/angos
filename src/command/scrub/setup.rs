@@ -19,8 +19,9 @@ use crate::{
         },
     },
     configuration::Configuration,
+    jobs::store::JobStore,
     registry::{
-        blob_store::BlobStore, job_store::JobStore, metadata_store::MetadataStore,
+        blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
 };

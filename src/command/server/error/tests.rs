@@ -278,10 +278,8 @@ fn test_typed_registry_variants_route_to_internal_server_error() {
             "I/O error during operations",
         ),
         (
-            registry::Error::MetadataStore(crate::registry::metadata_store::Error::Coordination(
-                "redis unreachable".to_string(),
-            )),
-            "metadata store error during operations",
+            registry::Error::Serde(serde_json::from_str::<serde_json::Value>("{bad}").unwrap_err()),
+            "(de)serialization error during operations",
         ),
     ];
 

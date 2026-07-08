@@ -35,14 +35,14 @@ fn event_dispatcher_builder_constructs_from_configs() {
     hook2.events = vec![EventKind::TagCreate];
     webhooks.insert("hook2".to_string(), hook2);
 
-    let dispatcher = EventDispatcher::builder().webhooks(webhooks).build();
+    let dispatcher = EventDispatcher::new(webhooks);
     assert!(dispatcher.is_ok());
 }
 
 #[test]
 fn event_dispatcher_builder_empty_configs() {
     let webhooks = HashMap::new();
-    let dispatcher = EventDispatcher::builder().webhooks(webhooks).build();
+    let dispatcher = EventDispatcher::new(webhooks);
     assert!(dispatcher.is_ok());
 }
 

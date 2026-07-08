@@ -16,8 +16,7 @@ use crate::{
     },
     oci::{Digest, Namespace},
     registry::{
-        blob_store::BlobStore,
-        metadata_store::{Error as MetadataError, MetadataStore},
+        Error as RegistryError, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
 };
@@ -115,7 +114,7 @@ impl OrphanNamespaceChecker {
     ) -> Result<(), Error> {
         let index = match self.metadata_store.read_blob_index(blob).await {
             Ok(index) => index,
-            Err(MetadataError::ReferenceNotFound) => return Ok(()),
+            Err(RegistryError::NotFound) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         for namespace in index.namespace.into_keys() {

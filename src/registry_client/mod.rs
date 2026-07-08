@@ -5,7 +5,7 @@ mod auth;
 mod error;
 mod write;
 
-use std::{future::Future, io, path::Path, sync::Arc, time::Duration};
+use std::{future::Future, io, path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use auth::token_index_cache_key;
 use futures_util::TryStreamExt;
@@ -17,6 +17,7 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
+use url::Url;
 
 pub use crate::registry_client::{
     error::Error,
@@ -53,7 +54,7 @@ fn classify_read_failure(status: StatusCode, op: &str, not_found: Error) -> Erro
     }
 }
 
-fn parse_header<T: std::str::FromStr>(
+fn parse_header<T: FromStr>(
     response: &Response,
     header: impl reqwest::header::AsHeaderName,
 ) -> Result<T, Error> {
@@ -294,7 +295,7 @@ impl RegistryClient {
     }
 
     async fn cached_auth_header(&self, location: &str) -> Option<String> {
-        let url = match url::Url::parse(location) {
+        let url = match Url::parse(location) {
             Ok(url) => url,
             Err(e) => {
                 warn!("Unable to parse upstream URL for auth cache lookup: {e}");
@@ -321,7 +322,7 @@ impl RegistryClient {
         self.authenticate_with_cache(response, attempted_auth).await
     }
 
-    async fn cached_auth_header_for_url(&self, url: &url::Url) -> Option<String> {
+    async fn cached_auth_header_for_url(&self, url: &Url) -> Option<String> {
         let index_key = match token_index_cache_key(url) {
             Ok(key) => key,
             Err(e) => {

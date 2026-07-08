@@ -45,141 +45,6 @@ pub fn build_header_value(value: &str) -> Result<HeaderValue, Error> {
     }
 }
 
-pub fn set_forwarded_method_header(parts: &Parts, headers: &mut HeaderMap) -> Result<(), Error> {
-    let value = build_header_value(parts.method.as_str())?;
-    headers.insert(X_FORWARDED_METHOD, value);
-    Ok(())
-}
-
-pub fn set_forwarded_proto_header(parts: &Parts, headers: &mut HeaderMap) -> Result<(), Error> {
-    let proto = if parts.uri.scheme_str() == Some("https") {
-        build_header_value("https")?
-    } else {
-        build_header_value("http")?
-    };
-
-    headers.insert(X_FORWARDED_PROTO, proto);
-    Ok(())
-}
-
-pub fn set_forwarded_host_header(parts: &Parts, headers: &mut HeaderMap) {
-    if let Some(host) = parts.headers.get("Host") {
-        headers.insert(X_FORWARDED_HOST, host.clone());
-    }
-}
-
-pub fn set_forwarded_uri_header(parts: &Parts, headers: &mut HeaderMap) -> Result<(), Error> {
-    let uri = parts.uri.to_string();
-    let value = build_header_value(&uri)?;
-    headers.insert(X_FORWARDED_URI, value);
-    Ok(())
-}
-
-pub fn set_forwarded_for_header(
-    identity: &ClientIdentity,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
-    if let Some(ip) = &identity.client_ip {
-        let value = build_header_value(ip)?;
-        headers.insert(X_FORWARDED_FOR, value);
-    }
-    Ok(())
-}
-
-pub fn set_registry_action_header(action: &Action, headers: &mut HeaderMap) -> Result<(), Error> {
-    let value = build_header_value(action.action_name())?;
-    headers.insert(X_REGISTRY_ACTION, value);
-    Ok(())
-}
-
-pub fn set_registry_namespace_header(
-    action: &Action,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
-    if let Some(namespace) = action.get_namespace() {
-        let value = build_header_value(namespace)?;
-        headers.insert(X_REGISTRY_NAMESPACE, value);
-    }
-    Ok(())
-}
-
-pub fn set_registry_reference_header(
-    action: &Action,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
-    if let Some(reference) = action.get_reference() {
-        let value = build_header_value(&reference.to_string())?;
-        headers.insert(X_REGISTRY_REFERENCE, value);
-    }
-    Ok(())
-}
-
-pub fn set_registry_digest_header(action: &Action, headers: &mut HeaderMap) -> Result<(), Error> {
-    if let Some(digest) = action.get_digest() {
-        let value = build_header_value(&digest.to_string())?;
-        headers.insert(X_REGISTRY_DIGEST, value);
-    }
-    Ok(())
-}
-
-pub fn set_registry_username_header(
-    identity: &ClientIdentity,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
-    if let Some(username) = &identity.username {
-        let value = build_header_value(username)?;
-        headers.insert(X_REGISTRY_USERNAME, value);
-    }
-    Ok(())
-}
-
-pub fn set_registry_identity_id_header(
-    identity: &ClientIdentity,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
-    if let Some(id) = &identity.id {
-        let value = build_header_value(id)?;
-        headers.insert(X_REGISTRY_IDENTITY_ID, value);
-    }
-    Ok(())
-}
-
-pub fn set_registry_certificate_cn_header(
-    identity: &ClientIdentity,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
-    for cn in &identity.certificate.common_names {
-        let value = build_header_value(cn)?;
-        headers.append(X_REGISTRY_CERTIFICATE_CN, value);
-    }
-    Ok(())
-}
-
-pub fn set_registry_certificate_o_header(
-    identity: &ClientIdentity,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
-    for org in &identity.certificate.organizations {
-        let value = build_header_value(org)?;
-        headers.append(X_REGISTRY_CERTIFICATE_O, value);
-    }
-    Ok(())
-}
-
-pub fn set_forwarded_headers(
-    forward_headers: &[String],
-    parts: &Parts,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
-    for name in forward_headers {
-        if let Some(value) = parts.headers.get(name) {
-            let name = build_header_name(name)?;
-            headers.insert(name, value.clone());
-        }
-    }
-    Ok(())
-}
-
 pub fn build_headers(
     forward_headers: &[String],
     action: &Action,
@@ -188,24 +53,61 @@ pub fn build_headers(
 ) -> Result<HeaderMap, Error> {
     let mut headers = HeaderMap::new();
 
-    set_forwarded_method_header(parts, &mut headers)?;
-    set_forwarded_proto_header(parts, &mut headers)?;
-    set_forwarded_host_header(parts, &mut headers);
-    set_forwarded_uri_header(parts, &mut headers)?;
-    set_forwarded_for_header(identity, &mut headers)?;
+    // Forwarded request context.
+    headers.insert(
+        X_FORWARDED_METHOD,
+        build_header_value(parts.method.as_str())?,
+    );
+    let proto = if parts.uri.scheme_str() == Some("https") {
+        "https"
+    } else {
+        "http"
+    };
+    headers.insert(X_FORWARDED_PROTO, build_header_value(proto)?);
+    if let Some(host) = parts.headers.get("Host") {
+        headers.insert(X_FORWARDED_HOST, host.clone());
+    }
+    headers.insert(X_FORWARDED_URI, build_header_value(&parts.uri.to_string())?);
+    if let Some(ip) = &identity.client_ip {
+        headers.insert(X_FORWARDED_FOR, build_header_value(ip)?);
+    }
 
-    set_registry_action_header(action, &mut headers)?;
-    set_registry_namespace_header(action, &mut headers)?;
-    set_registry_reference_header(action, &mut headers)?;
-    set_registry_digest_header(action, &mut headers)?;
+    // The registry action under authorization.
+    headers.insert(X_REGISTRY_ACTION, build_header_value(action.action_name())?);
+    if let Some(namespace) = action.get_namespace() {
+        headers.insert(X_REGISTRY_NAMESPACE, build_header_value(namespace)?);
+    }
+    if let Some(reference) = action.get_reference() {
+        headers.insert(
+            X_REGISTRY_REFERENCE,
+            build_header_value(&reference.to_string())?,
+        );
+    }
+    if let Some(digest) = action.get_digest() {
+        headers.insert(X_REGISTRY_DIGEST, build_header_value(&digest.to_string())?);
+    }
 
-    set_registry_username_header(identity, &mut headers)?;
-    set_registry_identity_id_header(identity, &mut headers)?;
+    // The caller's identity.
+    if let Some(username) = &identity.username {
+        headers.insert(X_REGISTRY_USERNAME, build_header_value(username)?);
+    }
+    if let Some(id) = &identity.id {
+        headers.insert(X_REGISTRY_IDENTITY_ID, build_header_value(id)?);
+    }
+    for cn in &identity.certificate.common_names {
+        headers.append(X_REGISTRY_CERTIFICATE_CN, build_header_value(cn)?);
+    }
+    for org in &identity.certificate.organizations {
+        headers.append(X_REGISTRY_CERTIFICATE_O, build_header_value(org)?);
+    }
 
-    set_registry_certificate_cn_header(identity, &mut headers)?;
-    set_registry_certificate_o_header(identity, &mut headers)?;
+    // Operator-selected client headers, forwarded verbatim.
+    for name in forward_headers {
+        if let Some(value) = parts.headers.get(name) {
+            headers.insert(build_header_name(name)?, value.clone());
+        }
+    }
 
-    set_forwarded_headers(forward_headers, parts, &mut headers)?;
     Ok(headers)
 }
 

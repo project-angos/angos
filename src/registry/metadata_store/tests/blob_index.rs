@@ -5,7 +5,10 @@ use angos_tx_engine::lock::{LockStrategy, S3LockConfig};
 use super::test_config;
 use crate::{
     oci::{Digest, Namespace, Tag},
-    registry::metadata_store::{BlobIndexOperation, Error, LinkKind, LinkOperation},
+    registry::{
+        Error,
+        metadata_store::{BlobIndexOperation, LinkKind, LinkOperation},
+    },
 };
 
 #[tokio::test]
@@ -170,13 +173,13 @@ async fn test_tracked_link_deletes_with_referrers() {
         let link = LinkKind::Layer(d.clone());
         let result = backend.read_link_reference(&namespace, &link).await;
         assert!(
-            matches!(result, Err(Error::ReferenceNotFound)),
+            matches!(result, Err(Error::NotFound)),
             "Tracked link {link} should be deleted"
         );
 
         let result = backend.read_blob_index(d).await;
         assert!(
-            matches!(result, Err(Error::ReferenceNotFound)),
+            matches!(result, Err(Error::NotFound)),
             "Blob index for {d} should be removed after all links deleted"
         );
     }
@@ -246,7 +249,7 @@ async fn test_mixed_creates_and_deletes_across_digests() {
                 "remove-tag should not be in blob index after delete"
             );
         }
-        Err(Error::ReferenceNotFound) => {}
+        Err(Error::NotFound) => {}
         Err(e) => panic!("Unexpected error reading blob index: {e}"),
     }
 
@@ -257,7 +260,7 @@ async fn test_mixed_creates_and_deletes_across_digests() {
     let result = backend
         .read_link_reference(&namespace, &LinkKind::Tag(Tag::new("remove-tag").unwrap()))
         .await;
-    assert!(matches!(result, Err(Error::ReferenceNotFound)));
+    assert!(matches!(result, Err(Error::NotFound)));
 
     let new_meta = backend
         .read_link_reference(&namespace, &LinkKind::Tag(Tag::new("new-tag").unwrap()))

@@ -1,6 +1,7 @@
 //! Recovery loop: periodically scans `.tx-log/` and replays or rolls back
 //! intents whose owner's heartbeat has gone stale.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +51,7 @@ pub struct RecoveryLoop {
 }
 
 impl std::fmt::Debug for RecoveryLoop {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecoveryLoop")
             .field("interval", &self.interval)
             .field("has_lock", &self.lock.is_some())

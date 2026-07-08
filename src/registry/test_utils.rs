@@ -9,6 +9,8 @@ use uuid::Uuid;
 use crate::{
     cache,
     configuration::GlobalConfig,
+    jobs::Queue,
+    jobs::store::JobStore,
     metrics_provider,
     oci::{Digest, MediaType, Namespace, Tag, UploadSessionId},
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
@@ -18,7 +20,6 @@ use crate::{
         blob_ownership::BlobOwnership,
         blob_store,
         blob_store::{BlobStore, BlobStoreConfig},
-        job_store::{JobStore, Queue},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         path_builder,
@@ -166,15 +167,17 @@ pub fn create_test_registry_with(
     );
     let global = GlobalConfig::default();
 
-    let config = RegistryConfig::default()
-        .update_pull_time(global.update_pull_time)
-        .enable_blob_redirect(global.resolved_enable_blob_redirect())
-        .enable_manifest_redirect(global.resolved_enable_manifest_redirect())
-        .max_manifest_size_bytes(global.max_manifest_size_bytes())
-        .max_blob_size_bytes(global.max_blob_size_bytes())
-        .validate_manifest_references(validate_manifest_references)
-        .global_immutable_tags(global.immutable_tags)
-        .global_immutable_tags_exclusions(global.immutable_tags_exclusions.clone());
+    let config = RegistryConfig {
+        update_pull_time: global.update_pull_time,
+        enable_blob_redirect: global.resolved_enable_blob_redirect(),
+        enable_manifest_redirect: global.resolved_enable_manifest_redirect(),
+        max_manifest_size_bytes: global.max_manifest_size_bytes(),
+        max_blob_size_bytes: global.max_blob_size_bytes(),
+        validate_manifest_references,
+        global_immutable_tags: global.immutable_tags,
+        global_immutable_tags_exclusions: global.immutable_tags_exclusions.clone(),
+        ..RegistryConfig::default()
+    };
 
     Registry::new(blob_store, metadata_store, resolver, config).unwrap()
 }

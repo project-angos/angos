@@ -310,11 +310,10 @@ mod tests {
             check::NamespaceChecker,
             executor::{ActionSink, Executor},
         },
+        jobs::{Queue, runner::execute_one, store::JobStore},
         oci::{Digest, Namespace, Tag},
         registry::{
             DOCKER_CONTENT_DIGEST, Repository,
-            job_runner::execute_one,
-            job_store::{JobStore, Queue},
             metadata_store::{LinkKind, LinkOperation},
             repository_resolver::RepositoryResolver,
             test_utils::{

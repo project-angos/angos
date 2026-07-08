@@ -3,8 +3,8 @@ use std::slice;
 use serde::{Serialize, Serializer, ser::SerializeMap};
 
 use crate::{
+    jobs::{JobState, Queue},
     oci::{Digest, Namespace, Reference, Tag, UploadSessionId},
-    registry::job_store::{JobState, Queue},
 };
 
 /// Action represents a parsed HTTP request: both the domain operation (for CEL policies)

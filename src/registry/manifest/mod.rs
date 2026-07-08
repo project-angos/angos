@@ -8,24 +8,20 @@ use futures_util::future::join_all;
 pub use parse::{ParsedManifestDigests, parse_manifest_digests};
 use parse::{manifest_meta_from_body, parse_and_validate_manifest};
 pub use response::{GetManifestResponse, HeadManifestResponse, PutManifestResponse};
-use response::{
-    ManifestBody, ManifestMeta, get_manifest_body_headers, get_manifest_redirect_headers,
-    head_manifest_headers, put_manifest_headers,
-};
+use response::{ManifestBody, ManifestMeta};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, instrument, warn};
 
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
+    jobs::Queue,
     metrics_provider::metrics_provider,
     oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
     registry::{
         Error, Registry, Repository,
         blob_ownership::BlobOwnership,
-        blob_store::Error as BlobStoreError,
         cache_job_handler::CACHE_ACTOR,
-        job_store::Queue,
-        metadata_store::{Error as MetadataStoreError, LinkKind, LinkMetadata, LinkOperation},
+        metadata_store::{LinkKind, LinkMetadata, LinkOperation, LinksCommit},
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
@@ -112,6 +108,71 @@ fn delete_events(
     events
 }
 
+/// The `ManifestPush` event a put emits, a `TagCreate` when the reference is a
+/// tag, and one `TagCreate` per tag created via a `?tag=` query parameter.
+fn put_manifest_events(
+    namespace: &Namespace,
+    repository: &str,
+    digest: Option<&str>,
+    reference: &Reference,
+    created_tags: &[Tag],
+    actor: Option<&EventActor>,
+) -> Vec<Event> {
+    let mut events = vec![manifest_event(
+        EventKind::ManifestPush,
+        namespace,
+        repository.to_string(),
+        digest.map(str::to_string),
+        reference,
+        actor.cloned(),
+    )];
+    if let Some(tag) = reference.as_tag() {
+        events.push(tag_event(
+            EventKind::TagCreate,
+            namespace,
+            repository.to_string(),
+            digest.map(str::to_string),
+            reference,
+            tag,
+            actor.cloned(),
+        ));
+    }
+    for tag in created_tags {
+        events.push(tag_event(
+            EventKind::TagCreate,
+            namespace,
+            repository.to_string(),
+            digest.map(str::to_string),
+            reference,
+            tag,
+            actor.cloned(),
+        ));
+    }
+    events
+}
+
+/// Buffers the manifest body from `body_stream`, rejecting a stream longer than
+/// `limit` bytes. Reads one byte past the limit so an at-limit body is kept and
+/// an over-limit one is refused.
+async fn read_limited_manifest_body<S>(body_stream: S, limit: usize) -> Result<Vec<u8>, Error>
+where
+    S: AsyncRead + Unpin + Send,
+{
+    let mut request_body = Vec::new();
+    let mut limited_body = body_stream.take(limit as u64 + 1);
+    limited_body
+        .read_to_end(&mut request_body)
+        .await
+        .map_err(|_| {
+            Error::ManifestInvalid("Unable to retrieve manifest from client query".to_string())
+        })?;
+
+    if request_body.len() > limit {
+        return Err(Error::ManifestBodyTooLarge { limit });
+    }
+    Ok(request_body)
+}
+
 impl Registry {
     #[instrument(skip(repository))]
     pub async fn head_manifest(
@@ -127,7 +188,9 @@ impl Registry {
         if !repository.is_pull_through() {
             return local
                 .map(|meta| HeadManifestResponse {
-                    headers: head_manifest_headers(&meta),
+                    media_type: meta.media_type,
+                    digest: meta.digest,
+                    size: meta.size,
                 })
                 .map_err(|_| {
                     error!("Failed to head local manifest: {namespace}:{reference}");
@@ -149,7 +212,9 @@ impl Registry {
 
             if use_local {
                 return Ok(HeadManifestResponse {
-                    headers: head_manifest_headers(&meta),
+                    media_type: meta.media_type,
+                    digest: meta.digest,
+                    size: meta.size,
                 });
             }
         }
@@ -165,11 +230,9 @@ impl Registry {
             .await?;
 
         Ok(HeadManifestResponse {
-            headers: head_manifest_headers(&ManifestMeta {
-                media_type: body.media_type,
-                digest: body.digest,
-                size: body.content.len() as u64,
-            }),
+            media_type: body.media_type,
+            digest: body.digest,
+            size: body.content.len() as u64,
         })
     }
 
@@ -179,7 +242,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         link: &LinkKind,
-    ) -> Result<LinkMetadata, MetadataStoreError> {
+    ) -> Result<LinkMetadata, Error> {
         if self.update_pull_time {
             self.metadata_store
                 .read_link_recording_access(namespace, link)
@@ -423,7 +486,7 @@ impl Registry {
         // blob-data lock across both so a concurrent delete cannot reclaim the
         // blob between the write and the link. A crash or LWW-supersession in
         // between leaves at most an orphan blob, which scrub reclaims.
-        let commit = self
+        let commit: LinksCommit = self
             .metadata_store
             .with_blob_data_lock(&computed_digest, async {
                 self.blob_store
@@ -432,12 +495,6 @@ impl Registry {
                 self.metadata_store
                     .store_manifest(namespace, &ops, created_at)
                     .await
-                    .map_err(|e| match e {
-                        MetadataStoreError::ReplicationSuperseded(message) => {
-                            Error::ReplicationSuperseded(message)
-                        }
-                        e => Error::from(e),
-                    })
             })
             .await?;
 
@@ -453,14 +510,11 @@ impl Registry {
         let subject = manifest.subject.map(|s| s.digest);
 
         Ok(PutManifestResponse {
-            headers: put_manifest_headers(
-                namespace,
-                reference,
-                &computed_digest,
-                subject.as_ref(),
-                created_tags,
-            ),
+            namespace: namespace.clone(),
+            reference: reference.clone(),
             digest: computed_digest,
+            subject,
+            created_tags: created_tags.to_vec(),
             changed,
         })
     }
@@ -502,10 +556,8 @@ impl Registry {
 
         match self.blob_store.size(digest).await {
             Ok(_) => Ok(()),
-            Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
-                Err(Error::ManifestBlobUnknown)
-            }
-            Err(error) => Err(error.into()),
+            Err(Error::BlobUnknown | Error::NotFound) => Err(Error::ManifestBlobUnknown),
+            Err(error) => Err(error),
         }
     }
 
@@ -575,67 +627,21 @@ impl Registry {
             Vec::new()
         };
 
-        // No-op suppression: the ref counts as absent only when the prior link
-        // is gone AND no tag still points at it; a transient read error counts
-        // as "existed" so a real delete is never suppressed. Unlike the put
-        // gate's commit-validated `LinksCommit::changed` this is a pre-commit
-        // read a racing write can flip, which is safe: over-dispatch is
-        // idempotent, and the one suppression race coincides with a concurrent
-        // re-put whose own dispatch converges the mesh.
-        let existed_before = match self
-            .prior_link_if_replicated(resolved_repository, namespace, reference)
-            .await
-        {
-            None => false,
-            Some(Err(MetadataStoreError::ReferenceNotFound)) => !pointing_tags.is_empty(),
-            Some(_) => true,
-        };
+        let existed_before = self
+            .manifest_delete_existed_before(
+                resolved_repository,
+                namespace,
+                reference,
+                &pointing_tags,
+            )
+            .await;
 
-        let ops = if let Reference::Digest(digest) = reference {
-            // A tag re-pointed locally after the delete was authored must not
-            // be dropped by the older replicated delete.
-            if let Some(source_ts) = source_ts {
-                self.check_digest_delete_not_superseded(namespace, &pointing_tags, source_ts)
-                    .await?;
-            }
+        let ops = self
+            .plan_manifest_delete_ops(namespace, reference, &pointing_tags, source_ts)
+            .await?;
 
-            let manifest = self
-                .blob_store
-                .read(digest)
-                .await
-                .ok()
-                .and_then(|content| Manifest::from_slice(&content).ok());
-            link_plan::delete(reference, manifest.as_ref(), &pointing_tags)
-        } else {
-            link_plan::delete(reference, None, &[])
-        };
-
-        // The pre-commit guards above fail fast; threading `source_ts` into the
-        // transaction makes the deleted tag links part of its validated read
-        // set, so a concurrent newer re-put aborts the delete rather than being
-        // clobbered by an older replicated delete.
-        if let Reference::Digest(digest) = reference {
-            // The manifest blob-data is content in the blob store. Hold the
-            // blob-data lock across the unreferenced-check + reclaim so a
-            // concurrent reference grant isn't missed, then reclaim the bytes
-            // when the delete left the blob unreferenced.
-            self.metadata_store
-                .with_blob_data_lock(digest, async {
-                    if self
-                        .metadata_store
-                        .delete_manifest(namespace, digest, &ops, source_ts)
-                        .await?
-                    {
-                        self.blob_store.delete_blob(digest).await?;
-                    }
-                    Ok::<_, Error>(())
-                })
-                .await?;
-        } else {
-            self.metadata_store
-                .delete_links(namespace, &ops, source_ts)
-                .await?;
-        }
+        self.commit_manifest_delete(namespace, reference, &ops, source_ts)
+            .await?;
 
         // For a tag delete the receiver keys off `payload.tag`, so no digest
         // is carried.
@@ -669,6 +675,99 @@ impl Registry {
         Ok(())
     }
 
+    /// Whether the reference counted as present before the delete, gating the
+    /// replication dispatch. Absent only when the prior link is gone AND no tag
+    /// still points at it; a transient read error counts as "existed" so a real
+    /// delete is never suppressed. This is a pre-commit read a racing write can
+    /// flip, which is safe: over-dispatch is idempotent and the one suppression
+    /// race coincides with a concurrent re-put whose own dispatch converges the
+    /// mesh.
+    async fn manifest_delete_existed_before(
+        &self,
+        resolved_repository: Option<&Repository>,
+        namespace: &Namespace,
+        reference: &Reference,
+        pointing_tags: &[LinkKind],
+    ) -> bool {
+        match self
+            .prior_link_if_replicated(resolved_repository, namespace, reference)
+            .await
+        {
+            None => false,
+            Some(Err(Error::NotFound)) => !pointing_tags.is_empty(),
+            Some(_) => true,
+        }
+    }
+
+    /// Builds the link plan for a delete. A digest delete first guards against a
+    /// newer local re-point of a pointing tag (LWW) and reads the manifest to
+    /// cascade its child links; a tag delete drops only the tag link.
+    async fn plan_manifest_delete_ops(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+        pointing_tags: &[LinkKind],
+        source_ts: Option<DateTime<Utc>>,
+    ) -> Result<Vec<LinkOperation>, Error> {
+        let Reference::Digest(digest) = reference else {
+            return Ok(link_plan::delete(reference, None, &[]));
+        };
+
+        // A tag re-pointed locally after the delete was authored must not be
+        // dropped by the older replicated delete.
+        if let Some(source_ts) = source_ts {
+            self.check_digest_delete_not_superseded(namespace, pointing_tags, source_ts)
+                .await?;
+        }
+
+        let manifest = self
+            .blob_store
+            .read(digest)
+            .await
+            .ok()
+            .and_then(|content| Manifest::from_slice(&content).ok());
+        Ok(link_plan::delete(
+            reference,
+            manifest.as_ref(),
+            pointing_tags,
+        ))
+    }
+
+    /// Commits the delete transaction. A digest delete runs under the blob-data
+    /// lock so the unreferenced-check and byte reclaim cannot miss a concurrent
+    /// reference grant; a tag delete drops its links directly. Threading
+    /// `source_ts` into the transaction makes the deleted links part of its
+    /// validated read set, so a concurrent newer re-put aborts the delete rather
+    /// than being clobbered by an older replicated delete.
+    async fn commit_manifest_delete(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+        ops: &[LinkOperation],
+        source_ts: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let Reference::Digest(digest) = reference else {
+            self.metadata_store
+                .delete_links(namespace, ops, source_ts)
+                .await?;
+            return Ok(());
+        };
+
+        self.metadata_store
+            .with_blob_data_lock(digest, async {
+                if self
+                    .metadata_store
+                    .delete_manifest(namespace, digest, ops, source_ts)
+                    .await?
+                {
+                    self.blob_store.delete_blob(digest).await?;
+                }
+                Ok::<_, Error>(())
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Attempts to short-circuit a manifest GET into a presigned redirect using
     /// only the link metadata (without reading the manifest blob). Returns
     /// `Some(Redirect)` when the link records a `media_type` AND the configured
@@ -689,8 +788,9 @@ impl Registry {
             .ok()??;
 
         Some(GetManifestResponse::Redirect {
-            headers: get_manifest_redirect_headers(presigned_url, &link.target, Some(media_type)),
+            redirect_url: presigned_url,
             digest: link.target,
+            media_type: Some(media_type),
         })
     }
 
@@ -773,24 +873,16 @@ impl Registry {
                 .await
         {
             return Ok(GetManifestResponse::Redirect {
-                headers: get_manifest_redirect_headers(
-                    presigned_url,
-                    &manifest.digest,
-                    manifest.media_type,
-                ),
+                redirect_url: presigned_url,
                 digest: manifest.digest,
+                media_type: manifest.media_type,
             });
         }
 
-        let content_length = manifest.content.len() as u64;
         Ok(GetManifestResponse::Body {
-            headers: get_manifest_body_headers(
-                manifest.media_type.as_deref(),
-                &manifest.digest,
-                content_length,
-            ),
-            content: manifest.content,
+            media_type: manifest.media_type,
             digest: manifest.digest,
+            content: manifest.content,
         })
     }
 
@@ -850,8 +942,8 @@ impl Registry {
             .await
         {
             Ok(metadata) => metadata,
-            Err(MetadataStoreError::ReferenceNotFound) => return Ok(None),
-            Err(err) => return Err(Error::from(err)),
+            Err(Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
         };
         Ok(metadata.supersedes(source_ts, incoming_digest))
     }
@@ -892,7 +984,7 @@ impl Registry {
         repository: Option<&Repository>,
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Option<Result<LinkMetadata, MetadataStoreError>> {
+    ) -> Option<Result<LinkMetadata, Error>> {
         let repository = repository?;
 
         for downstream in &repository.replication {
@@ -934,20 +1026,8 @@ impl Registry {
             Reference::Tag(_) => Vec::new(),
         };
 
-        let limit = self.max_manifest_size_bytes;
-        let mut request_body = Vec::new();
-        let mut limited_body = body_stream.take(limit as u64 + 1);
-
-        limited_body
-            .read_to_end(&mut request_body)
-            .await
-            .map_err(|_| {
-                Error::ManifestInvalid("Unable to retrieve manifest from client query".to_string())
-            })?;
-
-        if request_body.len() > limit {
-            return Err(Error::ManifestBodyTooLarge { limit });
-        }
+        let request_body =
+            read_limited_manifest_body(body_stream, self.max_manifest_size_bytes).await?;
 
         // Hashed up front: the intent events fired before the store carry the
         // content digest, and the LWW tie-break compares it on equal timestamps.
@@ -956,46 +1036,19 @@ impl Registry {
         let repository = resolved_repository
             .map(|r| r.name.to_string())
             .unwrap_or_default();
-        let digest_str = Some(digest.to_string());
-
-        let mut events = vec![manifest_event(
-            EventKind::ManifestPush,
-            namespace,
-            repository.clone(),
-            digest_str.clone(),
-            &reference,
-            actor.clone(),
-        )];
-
-        if let Some(tag) = reference.as_tag() {
-            events.push(tag_event(
-                EventKind::TagCreate,
-                namespace,
-                repository.clone(),
-                digest_str.clone(),
-                &reference,
-                tag,
-                actor.clone(),
-            ));
-        }
-
-        // Each tag created by a `?tag=` query parameter gets its own TagCreate
-        // event, mirroring the by-tag push above.
-        for tag in &created_tags {
-            events.push(tag_event(
-                EventKind::TagCreate,
-                namespace,
-                repository.clone(),
-                digest_str.clone(),
-                &reference,
-                tag,
-                actor.clone(),
-            ));
-        }
 
         // Intent-first emission: the events fire before the write, so a
         // performed write can never go unnotified; a write that fails past
         // this point leaves a false-positive notification instead.
+        let digest_str = digest.to_string();
+        let events = put_manifest_events(
+            namespace,
+            &repository,
+            Some(&digest_str),
+            &reference,
+            &created_tags,
+            actor.as_ref(),
+        );
         self.dispatch_events(&events).await?;
 
         self.check_lww_not_superseded(namespace, &reference, source_ts, Some(&digest))

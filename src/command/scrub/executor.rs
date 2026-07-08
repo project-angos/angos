@@ -3,19 +3,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use crate::{
     command::scrub::{action::Action, error::Error},
     event_webhook::event::EventActor,
+    jobs::store::{Error as JobStoreError, JobEnvelope, JobStore},
+    jobs::{JobState, Queue},
     metrics_provider::metrics_provider,
     oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
-        Registry,
+        Error as RegistryError, Registry,
         blob_store::{self, BlobStore, MultipartCleanup},
-        job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore, Queue},
-        metadata_store::{
-            BlobIndexOperation, Error as MetadataError, LinkKind, LinkOperation, MetadataStore,
-        },
+        metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
@@ -30,6 +30,16 @@ use crate::registry::{
 
 /// Internal-process name stamped on the events retention deletions emit.
 pub const RETENTION_ACTOR: &str = "prune";
+
+/// A fresh uniquely-named job store for one maintenance run: the executor's
+/// replication-enqueue target and, when a drain is wired, its consumer.
+#[must_use]
+pub fn run_job_store(metadata_store: &MetadataStore, prefix: &str) -> Arc<JobStore> {
+    Arc::new(JobStore::new(
+        metadata_store.store_arc(),
+        format!("{prefix}-{}", Uuid::new_v4()),
+    ))
+}
 
 /// A sink that receives `Action` values produced by scrub checkers.
 #[async_trait]
@@ -108,7 +118,10 @@ impl Executor {
             blob_store.clone(),
             metadata_store.clone(),
             resolver,
-            RegistryConfig::default().job_queue(job_store.clone()),
+            RegistryConfig {
+                job_queue: Some(job_store.clone()),
+                ..RegistryConfig::default()
+            },
         )
         .expect("test registry");
         Self::new(blob_store, metadata_store, job_store).with_registry(registry)
@@ -171,10 +184,9 @@ impl Executor {
                         Ok(())
                     }
                     Ok(false) => match self.blob_store.delete_blob(&digest).await {
-                        Ok(())
-                        | Err(
-                            blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
-                        ) => Ok(()),
+                        Ok(()) | Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
+                            Ok(())
+                        }
                         Err(e) => Err(Error::from(e)),
                     },
                 }
@@ -213,7 +225,7 @@ impl Executor {
             .with_blob_data_lock(&blob, async {
                 match self.blob_store.size(&blob).await {
                     Ok(_) => {}
-                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                    Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                         info!(
                             "skipping blob-index grant: bytes were reclaimed for '{namespace}/{blob}'"
                         );
@@ -246,7 +258,7 @@ impl Executor {
                     Ok(links) => links,
                     // The grant vanished since classification (a concurrent revoke
                     // or delete): nothing left to do.
-                    Err(MetadataError::ReferenceNotFound) => return Ok(()),
+                    Err(RegistryError::NotFound) => return Ok(()),
                     Err(e) => return Err(Error::from(e)),
                 };
                 if links.iter().any(LinkKind::is_tracked) {
@@ -607,10 +619,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        jobs::store::FailOutcome,
         oci::Digest,
         registry::{
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
-            job_store::{FailOutcome, JobState, Queue},
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{build_store, for_each_backend, put_blob_direct},
         },

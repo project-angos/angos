@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 
 use crate::{
     configuration::{RegexPattern, TrustedProxy},
+    jobs::store::JobQueueConfig,
     policy::{AccessPolicyConfig, RetentionPolicyConfig},
-    registry::job_store::JobQueueConfig,
 };
 
 /// Default cap on concurrent in-process cache-fill jobs. Evaluated at

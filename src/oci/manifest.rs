@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, mem};
 
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +64,7 @@ impl Manifest {
             .or_else(|| self.config.as_ref().map(|c| c.media_type.clone()));
         Some(Descriptor {
             media_type,
-            annotations: std::mem::take(&mut self.annotations),
+            annotations: mem::take(&mut self.annotations),
             artifact_type,
             platform: None,
             digest,

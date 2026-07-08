@@ -21,17 +21,18 @@ use angos_tx_engine::{
 use crate::{
     oci::{Digest, Namespace},
     registry::{
-        metadata_store::{Error, LinkKind, LinksTx, MetadataStore, tx_error_to_meta},
+        Error,
+        metadata_store::{LinkKind, LinksTx, MetadataStore},
         path_builder,
     },
 };
 
-pub(crate) mod shard;
+pub mod shard;
 
 use self::shard::{
-    SHARD_READ_CONCURRENCY, append_shard_for_digest, apply_blob_index_operations,
-    collect_blob_index_shards, decode_blob_index_shard_namespace, namespace_links_from_index,
-    non_empty_links_or_not_found,
+    SHARD_READ_CONCURRENCY, append_shard_for_digest, append_shard_ops, collect_blob_index_shards,
+    decode_blob_index_shard_namespace, namespace_links_from_index, non_empty_links_or_not_found,
+    read_shard,
 };
 
 // Domain types
@@ -82,7 +83,7 @@ impl MetadataStore {
         )
         .await
         .map(|_| ())
-        .map_err(tx_error_to_meta)
+        .map_err(Error::from)
     }
 
     /// Revoke `namespace`'s ownership of `digest` in an atomic transaction and
@@ -165,7 +166,7 @@ impl MetadataStore {
         if !found_shards || index.namespace.is_empty() {
             return match self.read_legacy_blob_index(digest).await? {
                 Some(legacy) if !legacy.namespace.is_empty() => Ok(legacy),
-                _ => Err(Error::ReferenceNotFound),
+                _ => Err(Error::NotFound),
             };
         }
         Ok(index)
@@ -223,7 +224,7 @@ impl MetadataStore {
             }
             Err(StorageError::NotFound) => match self.read_legacy_blob_index(digest).await? {
                 Some(legacy) => namespace_links_from_index(&legacy, namespace),
-                None => Err(Error::ReferenceNotFound),
+                None => Err(Error::NotFound),
             },
             Err(e) => Err(e.into()),
         }
@@ -278,43 +279,11 @@ impl MetadataStore {
 
                     // Re-read each shard inside the closure so the
                     // fingerprint is fresh on every retry attempt.
-                    match self.store().object_store().get(&shard_path).await {
-                        Ok(shard_data) => {
-                            let mut existing: HashSet<LinkKind> =
-                                serde_json::from_slice(&shard_data).unwrap_or_default();
-                            apply_blob_index_operations(&mut existing, &operations);
-                            builder = builder.read(shard_path.clone(), Bytes::from(shard_data));
-                            if existing.is_empty() {
-                                builder = builder.mutation(Mutation::Delete {
-                                    key: shard_path,
-                                    expected: None,
-                                });
-                            } else {
-                                let body = Bytes::from(
-                                    serde_json::to_vec(&existing).map_err(TxError::Serde)?,
-                                );
-                                builder = builder.mutation(Mutation::Put {
-                                    key: shard_path,
-                                    body,
-                                    expected: None,
-                                });
-                            }
-                        }
-                        Err(StorageError::NotFound) => {
-                            let mut new_links = HashSet::new();
-                            apply_blob_index_operations(&mut new_links, &operations);
-                            if !new_links.is_empty() {
-                                let body = Bytes::from(
-                                    serde_json::to_vec(&new_links).map_err(TxError::Serde)?,
-                                );
-                                builder = builder.mutation(Mutation::PutIfAbsent {
-                                    key: shard_path,
-                                    body,
-                                });
-                            }
-                        }
-                        Err(e) => return Err(TxError::Storage(e)),
-                    }
+                    let existing = read_shard(self.store(), &shard_path)
+                        .await
+                        .map_err(TxError::Storage)?;
+                    builder = append_shard_ops(shard_path, existing, &operations, builder)
+                        .map_err(TxError::Serde)?;
                 }
 
                 builder = builder.mutation(Mutation::Delete {
@@ -327,7 +296,7 @@ impl MetadataStore {
             DEFAULT_RETRY_BUDGET,
         )
         .await
-        .map_err(tx_error_to_meta)?;
+        .map_err(Error::from)?;
 
         info!("Migrated legacy blob index for '{digest}' ({namespace_count} namespaces)",);
         Ok(())
