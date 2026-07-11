@@ -123,10 +123,10 @@ impl From<LockError> for Error {
 /// Precondition for `[global.job_queue]`: the durable queue is drained by
 /// separate processes, so the engine lock that serializes job claims must
 /// coordinate across processes. Config validation rejects strategies that are
-/// statically `memory`; this catches an unset S3 lock strategy that fell back
-/// to `memory` because the probe found no conditional-write support.
+/// statically in-process; this catches an unset S3 lock strategy that fell back
+/// to the in-process lock because the probe found no conditional-write support.
 pub fn ensure_shared_lock(store: &Store) -> Result<(), Error> {
-    if store.lock_backend() == "memory" {
+    if !store.lock_is_process_shared() {
         return Err(Error::Initialization(
             "[global.job_queue] needs a shared lock strategy so workers serialize on the \
              same jobs across processes, but the metadata store's lock resolved to the \

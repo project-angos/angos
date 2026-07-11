@@ -34,7 +34,10 @@ use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 use crate::lock::storage::redis::RedisLockStorage;
 use crate::{
     error::Error,
-    executor::{Outcome, TransactionExecutor, cas::CasExecutor, locked::LockedExecutor},
+    executor::{
+        DEFAULT_RETRY_BUDGET, Outcome, TransactionExecutor, cas::CasExecutor,
+        locked::LockedExecutor,
+    },
     janitor::{BodyJanitor, LockJanitor},
     lock::{
         LockStrategy,
@@ -194,11 +197,20 @@ impl Store {
     }
 
     /// `true` when writes coordinate through storage-level conditional
-    /// operations (the CAS executor), making [`Store::update_advisory`]
-    /// available.
+    /// operations (the CAS executor).
     #[must_use]
     pub fn cas_enabled(&self) -> bool {
         self.conditional.is_some()
+    }
+
+    /// `true` when the coordination lock serializes across processes (Redis or
+    /// S3), so separate `angos` processes claim the same work safely; `false`
+    /// for the in-process `memory` lock. Callers that need cross-process
+    /// coordination (the durable job queue) gate on this rather than inspecting
+    /// the backend label.
+    #[must_use]
+    pub fn lock_is_process_shared(&self) -> bool {
+        self.lock_backend() != "memory"
     }
 
     /// The engine maintenance loops (recovery, body janitor, lock janitor)
@@ -401,29 +413,30 @@ impl Store {
         }
     }
 
-    /// Single-shot advisory read-modify-write on one key, bypassing the
-    /// transaction pipeline: one read with its etag plus one conditional
-    /// write. Only available on CAS deployments (see [`Store::cas_enabled`]).
+    /// Advisory read-modify-write on one key, picking the cheapest strategy the
+    /// backend allows: a CAS store does one read-with-etag plus one conditional
+    /// write; a lock-coordinated store falls back to a read-modify-write
+    /// transaction. The choice lives here so callers never inspect the executor.
     ///
-    /// Advisory state tolerates lost updates, so a concurrent writer winning
-    /// the race (etag mismatch) drops this write as a successful no-op, and a
-    /// backend that surfaces no etag skips the write entirely rather than
-    /// clobbering unconditionally. `map`'s payload is returned either way.
+    /// Advisory state tolerates lost updates: on the CAS path a concurrent
+    /// writer winning the race (etag mismatch) drops this write as a successful
+    /// no-op, and a backend that surfaces no etag skips the write rather than
+    /// clobbering unconditionally; the lock path retries on conflict up to the
+    /// default budget. `map` may be invoked once per attempt, so it must be
+    /// re-runnable.
     ///
     /// # Errors
     ///
-    /// [`Error::Build`] when the store has no conditional backend, `map`'s
-    /// error, or a storage error from the read or write, including
-    /// `NotFound` when `key` is absent.
+    /// `map`'s error, a storage error from the read or write (including
+    /// `NotFound` when `key` is absent), or `Conflict` if the lock path
+    /// exhausts its retry budget.
     pub async fn update_advisory<F, T>(&self, key: &str, map: F) -> Result<T, Error>
     where
-        F: FnOnce(Bytes) -> Result<(Bytes, T), Error> + Send,
+        F: Fn(Bytes) -> Result<(Bytes, T), Error> + Send,
         T: Send,
     {
         let Some(conditional) = &self.conditional else {
-            return Err(Error::Build(
-                "advisory update requires the CAS executor".to_string(),
-            ));
+            return self.update_advisory_locked(key, map).await;
         };
         let (body, etag) = conditional
             .get_with_etag(key)
@@ -437,6 +450,40 @@ impl Store {
             }
         }
         Ok(payload)
+    }
+
+    /// The lock-coordinated fallback for [`Store::update_advisory`]: a
+    /// read-modify-write transaction retried on conflict up to
+    /// [`DEFAULT_RETRY_BUDGET`] extra attempts. An absent `key` errors with
+    /// `NotFound`, matching the CAS path.
+    async fn update_advisory_locked<F, T>(&self, key: &str, map: F) -> Result<T, Error>
+    where
+        F: Fn(Bytes) -> Result<(Bytes, T), Error> + Send,
+        T: Send,
+    {
+        let mut attempts = 0u32;
+        loop {
+            let snap = self.read_for_update(key).await.map_err(Error::Storage)?;
+            if !snap.present {
+                return Err(Error::Storage(StorageError::NotFound));
+            }
+            let (mapped, payload) = map(snap.body.clone())?;
+            let tx = Transaction::builder()
+                .read(key.to_string(), snap.body)
+                .mutation(Mutation::Put {
+                    key: key.to_string(),
+                    body: mapped,
+                    expected: None,
+                })
+                .build();
+            match self.executor.execute(tx).await {
+                Ok(_) => return Ok(payload),
+                Err(Error::Conflict | Error::Precondition) if attempts < DEFAULT_RETRY_BUDGET => {
+                    attempts += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -594,8 +641,11 @@ mod tests {
         assert!(matches!(err, Error::Storage(StorageError::NotFound)));
     }
 
+    /// On a lock-coordinated store the advisory update falls back to a
+    /// read-modify-write transaction, writing the mapped body and returning the
+    /// payload.
     #[tokio::test]
-    async fn update_advisory_requires_cas() {
+    async fn update_advisory_locked_writes_and_returns_payload() {
         let backend = Arc::new(MemoryObjectStore::new());
         let store = store_over(backend);
         store
@@ -604,11 +654,28 @@ mod tests {
             .await
             .expect("seed");
 
-        let err = store
-            .update_advisory("k", |body| Ok((body, ())))
+        let payload = store
+            .update_advisory("k", |body| {
+                assert_eq!(&body[..], b"v1");
+                Ok((Bytes::from_static(b"v2"), "payload"))
+            })
             .await
-            .expect_err("non-CAS store must reject advisory updates");
-        assert!(matches!(err, Error::Build(_)));
+            .expect("advisory update on locked store");
+
+        assert_eq!(payload, "payload");
+        assert_eq!(store.object_store().get("k").await.expect("get"), b"v2");
+    }
+
+    #[tokio::test]
+    async fn update_advisory_locked_missing_key_propagates_not_found() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        let store = store_over(backend);
+
+        let err = store
+            .update_advisory("missing", |body| Ok((body, ())))
+            .await
+            .expect_err("missing key must error");
+        assert!(matches!(err, Error::Storage(StorageError::NotFound)));
     }
 
     #[tokio::test]

@@ -1,10 +1,10 @@
 //! Access-time recording: every path that stamps a link's `accessed_at`
 //! lives here.
 //!
-//! CAS deployments stamp inline with a single conditional write whose lost
-//! races are no-ops. Lock-coordinated deployments either buffer stamps in
-//! [`AccessTimeWriter`] and flush them periodically (debounce configured) or
-//! stamp inline with a read-modify-write transaction (debounce disabled).
+//! With a debounce configured, stamps are buffered in [`AccessTimeWriter`] and
+//! flushed periodically; otherwise each read stamps inline through the store's
+//! advisory update, which picks a conditional write or a read-modify-write
+//! transaction below the storage API.
 
 use std::{
     collections::HashMap,
@@ -18,11 +18,10 @@ use std::{
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use tokio::{spawn, sync::Mutex, time::sleep};
-use tracing::{info, instrument, warn};
+use tracing::{instrument, warn};
 
 use angos_tx_engine::{
-    StorageError, error::Error as TxError, executor::DEFAULT_RETRY_BUDGET, store::Store,
-    transaction::Mutation,
+    error::Error as TxError, executor::DEFAULT_RETRY_BUDGET, store::Store, transaction::Mutation,
 };
 
 use crate::{
@@ -36,21 +35,14 @@ use crate::{
 
 // Build-time wiring
 
-/// Access-time wiring decided at build time. CAS deployments stamp inline,
-/// so no writer is spun up and a configured debounce is ignored;
-/// lock-coordinated deployments with a debounce get the writer plus its
-/// background flush task.
+/// Access-time wiring decided at build time. A configured debounce gets the
+/// buffering writer plus its background flush task; otherwise stamps are
+/// applied inline and no writer is spun up.
 pub fn build_writer(
     store: &Arc<Store>,
     link_cache_ttl: u64,
     debounce_secs: u64,
 ) -> (Option<AccessTimeWriter>, Option<Arc<FlushHandle>>) {
-    if store.cas_enabled() {
-        if debounce_secs > 0 {
-            info!("Access-time debounce ignored: CAS deployments stamp access times inline");
-        }
-        return (None, None);
-    }
     if debounce_secs == 0 {
         return (None, None);
     }
@@ -143,23 +135,17 @@ impl Drop for FlushHandle {
 
 impl MetadataStore {
     /// Like [`MetadataStore::read_link`] but records the link's access time.
-    /// On CAS deployments the stamp is a single conditional write on the etag
-    /// just read; otherwise it is deferred via the debounce writer when
-    /// configured, else stamped inline with a read-modify-write transaction.
-    /// The manifest pull path uses this when pull-time tracking is enabled.
+    /// A configured debounce defers the stamp via the writer; otherwise the
+    /// stamp is applied inline through the store's advisory update. The manifest
+    /// pull path uses this when pull-time tracking is enabled.
     #[instrument(skip(self))]
     pub async fn read_link_recording_access(
         &self,
         namespace: &Namespace,
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
-        if self.store().cas_enabled() {
-            let link_data = self.stamp_link_access_time(namespace, link).await?;
-            self.cache_put(namespace, link, &link_data).await;
-            return Ok(link_data);
-        }
         let Some(writer) = &self.access_time_writer else {
-            let link_data = self.update_link_access_time(namespace, link).await?;
+            let link_data = self.stamp_link_access_time(namespace, link).await?;
             self.cache_put(namespace, link, &link_data).await;
             return Ok(link_data);
         };
@@ -174,9 +160,9 @@ impl MetadataStore {
         }
     }
 
-    /// Stamp the access time with one conditional write on the etag just
-    /// read. Access times are advisory, so a concurrent writer winning the
-    /// race drops this stamp as a no-op; there is nothing to retry.
+    /// Stamp the access time inline through the store's advisory update, which
+    /// picks a conditional write or a read-modify-write transaction. Access
+    /// times are advisory, so a lost race is dropped as a no-op.
     async fn stamp_link_access_time(
         &self,
         namespace: &Namespace,
@@ -194,52 +180,6 @@ impl MetadataStore {
             })
             .await
             .map_err(Error::from)
-    }
-
-    /// Mark the access time for `link` in `namespace` using a read-modify-write
-    /// transaction, returning the updated [`LinkMetadata`]. Concurrent updaters
-    /// resolve via content-hash conflict detection (last writer wins), which is
-    /// fine for advisory access-time stamps.
-    async fn update_link_access_time(
-        &self,
-        namespace: &Namespace,
-        link: &LinkKind,
-    ) -> Result<LinkMetadata, Error> {
-        let link_path = path_builder::link_path(link, namespace);
-        let keys = [link_path.clone()];
-
-        let (_, link_data) = self
-            .store()
-            .update_with_payload(
-                &keys,
-                |snaps| {
-                    let link_path = link_path.clone();
-                    async move {
-                        let snap = &snaps[0];
-                        if !snap.present {
-                            return Err(TxError::Storage(StorageError::NotFound));
-                        }
-                        let link_data = LinkMetadata::from_bytes(snap.body.to_vec())
-                            .map_err(|e| TxError::Build(e.to_string()))?
-                            .accessed();
-                        let serialized =
-                            Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
-                        Ok((
-                            vec![Mutation::Put {
-                                key: link_path,
-                                body: serialized,
-                                expected: None,
-                            }],
-                            link_data,
-                        ))
-                    }
-                },
-                DEFAULT_RETRY_BUDGET,
-            )
-            .await
-            .map_err(Error::from)?;
-
-        Ok(link_data)
     }
 
     /// Flush a single access-time update via a read-modify-write transaction.

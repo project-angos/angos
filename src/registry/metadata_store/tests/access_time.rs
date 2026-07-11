@@ -467,13 +467,13 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
     );
 }
 
-/// CAS deployments stamp inline with a conditional write, so the configured
-/// debounce is ignored and the stamp is visible in storage immediately.
+/// With no debounce, a CAS deployment stamps inline via a conditional write:
+/// no writer is spun up and the stamp is visible in storage immediately.
 #[tokio::test]
-async fn test_cas_ignores_debounce_and_stamps_inline() {
+async fn test_cas_inline_stamp_writes_immediately() {
     let config = test_config();
     let mut cfg = config.clone();
-    cfg.access_time_debounce_secs = 60;
+    cfg.access_time_debounce_secs = 0;
     let backend = cfg.to_backend(true, None).unwrap();
     let namespace = Namespace::new("cas-inline-stamp").unwrap();
     let digest =
@@ -492,7 +492,7 @@ async fn test_cas_ignores_debounce_and_stamps_inline() {
 
     assert!(
         backend.access_time_writer.is_none(),
-        "CAS deployments must not spin up the debounce writer"
+        "no debounce means no writer is spun up"
     );
 
     let meta = backend
@@ -509,6 +509,53 @@ async fn test_cas_ignores_debounce_and_stamps_inline() {
     assert!(
         raw.accessed_at.is_some(),
         "the stamp must be visible in storage immediately, without any flush"
+    );
+}
+
+/// A configured debounce is honored uniformly: a CAS deployment spins up the
+/// buffering writer and defers the stamp too. The write strategy lives below
+/// the storage API, so the registry no longer special-cases CAS.
+#[tokio::test]
+async fn test_cas_debounce_defers_stamp() {
+    let config = test_config();
+    let mut cfg = config.clone();
+    cfg.access_time_debounce_secs = 60;
+    let backend = cfg.to_backend(true, None).unwrap();
+    let namespace = Namespace::new("cas-debounce").unwrap();
+    let digest =
+        Digest::from_str("sha256:ca03c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+            .unwrap();
+    let tag = LinkKind::Tag(Tag::new("cas-debounced").unwrap());
+
+    let ops = vec![LinkOperation::Create {
+        link: tag.clone(),
+        target: digest.clone(),
+        referrer: None,
+        media_type: None,
+        descriptor: None,
+    }];
+    backend.update_links(&namespace, &ops).await.unwrap();
+
+    assert!(
+        backend.access_time_writer.is_some(),
+        "a configured debounce spins up the writer regardless of backend"
+    );
+
+    backend
+        .read_link_recording_access(&namespace, &tag)
+        .await
+        .unwrap();
+    let raw = backend.read_link_reference(&namespace, &tag).await.unwrap();
+    assert!(
+        raw.accessed_at.is_none(),
+        "the stamp is buffered, not yet flushed to storage"
+    );
+
+    backend.flush_access_times().await;
+    let raw = backend.read_link_reference(&namespace, &tag).await.unwrap();
+    assert!(
+        raw.accessed_at.is_some(),
+        "an explicit flush persists the buffered stamp"
     );
 }
 
