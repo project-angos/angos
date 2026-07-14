@@ -16,7 +16,10 @@ async fn dispatch_sends_hmac_signature_header() {
     let server = MockServer::start().await;
     let event = create_test_event();
     let body = serde_json::to_vec(&event).unwrap();
-    let expected_sig = format!("sha256={}", compute_signature("hmac-secret", &body));
+    let expected_sig = format!(
+        "sha256={}",
+        compute_signature("hmac-secret", &body).unwrap()
+    );
 
     Mock::given(method("POST"))
         .and(header("X-Registry-Signature-256", expected_sig.as_str()))

@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use hyper::{Response, StatusCode, header::LINK};
 use serde::Serialize;
 
@@ -11,20 +9,16 @@ use crate::{
         response::{APPLICATION_JSON, HeaderMap, OCI_FILTERS_APPLIED, ResponseHeaders},
         response_body::ResponseBody,
     },
-    oci::{
-        Descriptor, Digest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE,
-        OCI_MANIFEST_SCHEMA_VERSION, Tag,
-    },
+    oci::{Descriptor, Digest, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_SCHEMA_VERSION, Tag},
 };
-
-static OCI_INDEX_MEDIA_TYPE_VALUE: LazyLock<MediaType> =
-    LazyLock::new(|| MediaType::new(OCI_INDEX_MEDIA_TYPE).unwrap());
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct ReferrerList {
     schema_version: i32,
-    media_type: MediaType,
+    // The OCI index media type serializes as its string, so the constant is
+    // carried directly rather than re-parsed through the fallible `MediaType`.
+    media_type: &'static str,
     manifests: Vec<Descriptor>,
 }
 
@@ -32,7 +26,7 @@ impl Default for ReferrerList {
     fn default() -> Self {
         ReferrerList {
             schema_version: OCI_MANIFEST_SCHEMA_VERSION,
-            media_type: OCI_INDEX_MEDIA_TYPE_VALUE.clone(),
+            media_type: OCI_INDEX_MEDIA_TYPE,
             manifests: Vec::new(),
         }
     }

@@ -30,11 +30,11 @@ pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response
 }
 
 pub fn fallback_500() -> Response<ResponseBody> {
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header(CONTENT_TYPE, "text/plain")
-        .body(ResponseBody::Fixed(Full::new(Bytes::from(
-            "Internal Server Error",
-        ))))
-        .expect("static fallback response must be valid")
+    let body = ResponseBody::Fixed(Full::new(Bytes::from("Internal Server Error")));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    response
 }

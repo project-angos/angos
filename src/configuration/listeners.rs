@@ -97,12 +97,23 @@ impl ListenerBaseConfig {
         8000
     }
 
+    // Non-zero literals validated at compile time: the `None` arm can never be
+    // reached, so there is no runtime unwrap.
+    const DEFAULT_QUERY_TIMEOUT: NonZeroU64 = match NonZeroU64::new(3600) {
+        Some(value) => value,
+        None => panic!("default query timeout must be non-zero"),
+    };
+    const DEFAULT_QUERY_TIMEOUT_GRACE_PERIOD: NonZeroU64 = match NonZeroU64::new(60) {
+        Some(value) => value,
+        None => panic!("default query timeout grace period must be non-zero"),
+    };
+
     fn default_query_timeout() -> NonZeroU64 {
-        NonZeroU64::new(3600).expect("default query timeout must be non-zero")
+        Self::DEFAULT_QUERY_TIMEOUT
     }
 
     fn default_query_timeout_grace_period() -> NonZeroU64 {
-        NonZeroU64::new(60).expect("default query timeout grace period must be non-zero")
+        Self::DEFAULT_QUERY_TIMEOUT_GRACE_PERIOD
     }
 }
 

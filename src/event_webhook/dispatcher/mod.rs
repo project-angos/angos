@@ -107,11 +107,11 @@ fn serialize_event(event: &Event) -> Result<(Bytes, &'static str), Error> {
     Ok((Bytes::from(body), event.kind.as_str()))
 }
 
-fn compute_signature(secret: &str, body: &[u8]) -> String {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+fn compute_signature(secret: &str, body: &[u8]) -> Result<String, String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("failed to initialize HMAC for the webhook signature: {e}"))?;
     mac.update(body);
-    hex::encode(mac.finalize().into_bytes())
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 impl EventDispatcher {
@@ -220,7 +220,7 @@ impl EventDispatcher {
             .header("X-Registry-Event", req.event_kind_header);
 
         if let Some(token) = req.token {
-            let signature = compute_signature(token, &req.body);
+            let signature = compute_signature(token, &req.body)?;
             request = request
                 .header("Authorization", format!("Bearer {token}"))
                 .header("X-Registry-Signature-256", format!("sha256={signature}"));
@@ -244,35 +244,32 @@ impl EventDispatcher {
         max_retries: u32,
         backoff: Backoff,
     ) -> Result<(), String> {
+        // A `loop` (not a bounded `for`) so the exhaustion path carries the last
+        // error in hand and returns from inside, with no post-loop `Option` to
+        // unwrap: the final attempt is the only exit besides an early success.
         let mut first_err: Option<String> = None;
-        let mut last_err: Option<String> = None;
+        let mut attempt = 0;
 
-        for attempt in 0..=max_retries {
+        loop {
             if attempt > 0 {
                 tokio::time::sleep(backoff.delay(attempt - 1)).await;
             }
 
-            match Self::send_request(req).await {
+            let last_err = match Self::send_request(req).await {
                 Ok(()) => return Ok(()),
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e.clone());
-                    }
-                    last_err = Some(e);
-                }
+                Err(e) => e,
+            };
+
+            if attempt == max_retries {
+                let first_err = first_err.as_deref().unwrap_or(&last_err);
+                return Err(Self::format_retry_failure(
+                    max_retries + 1,
+                    (first_err, &last_err),
+                ));
             }
+            first_err.get_or_insert(last_err);
+            attempt += 1;
         }
-
-        let errors = (
-            first_err
-                .as_deref()
-                .expect("retry loop records first error before failing"),
-            last_err
-                .as_deref()
-                .expect("retry loop records last error before failing"),
-        );
-
-        Err(Self::format_retry_failure(max_retries + 1, errors))
     }
 
     fn format_retry_failure(attempts: u32, errors: (&str, &str)) -> String {
