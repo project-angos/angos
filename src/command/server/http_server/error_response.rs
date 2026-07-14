@@ -7,7 +7,7 @@ use hyper::{
 
 use crate::command::server::{error::Error, response_body::ResponseBody};
 
-const BASIC_AUTH_CHALLENGE: &str = r#"Basic realm="Simple Registry", charset="UTF-8""#;
+const BASIC_AUTH_CHALLENGE: &str = r#"Basic realm="Angos", charset="UTF-8""#;
 
 pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response<ResponseBody> {
     let body = Bytes::from(error.as_json(request_id).to_string());

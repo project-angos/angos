@@ -52,7 +52,7 @@ fn test_error_to_response_unauthorized_with_request_id() {
     );
     assert_eq!(
         response.headers().get(WWW_AUTHENTICATE).unwrap(),
-        r#"Basic realm="Simple Registry", charset="UTF-8""#
+        r#"Basic realm="Angos", charset="UTF-8""#
     );
 }
 
@@ -307,7 +307,7 @@ async fn bad_basic_auth_returns_http_401() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         response.headers().get(WWW_AUTHENTICATE).unwrap(),
-        r#"Basic realm="Simple Registry", charset="UTF-8""#
+        r#"Basic realm="Angos", charset="UTF-8""#
     );
 }
 
