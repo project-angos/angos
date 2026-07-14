@@ -1,4 +1,4 @@
-use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{fs, net::SocketAddr, path::Path, sync::Arc};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ use tracing::debug;
 use crate::command::server::{
     ServerContext,
     error::Error,
-    listeners::{Connector, HandshakeResult, accept_loop},
+    listeners::{Connector, HandshakeResult, Listener},
 };
 pub use crate::configuration::listeners::{ClientAuth, ServerTlsConfig, TlsListenerConfig};
 
@@ -68,12 +68,61 @@ fn build_client_verifier(
     Ok(verifier)
 }
 
-struct TlsConnector<'a> {
-    tls_acceptor: &'a ArcSwap<TlsAcceptor>,
+/// Builds a [`TlsAcceptor`] from the server certificate/key and optional client
+/// CA bundle. Shared by the connector's initial construction and every reload.
+pub fn build_tls_acceptor(tls_config: &ServerTlsConfig) -> Result<TlsAcceptor, Error> {
+    debug!("Detected TLS configuration");
+    let server_certs = load_certificate_bundle(
+        &tls_config.server_certificate_bundle,
+        "server certificates bundle",
+    )?;
+    let server_key = load_private_key(&tls_config.server_private_key, "server private key")?;
+
+    let server_config = if let Some(ca_bundle) = tls_config.client_ca_bundle.as_ref() {
+        debug!(
+            "Client CA bundle detected (client_auth = {:?})",
+            tls_config.client_auth
+        );
+        let client_cert_verifier = build_client_verifier(ca_bundle, tls_config.client_auth)?;
+        ServerConfig::builder()
+            .with_client_cert_verifier(client_cert_verifier)
+            .with_single_cert(server_certs, server_key)
+    } else {
+        debug!("No client CA bundle detected; client_auth setting is ignored");
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(server_certs, server_key)
+    };
+
+    let server_config = server_config
+        .map_err(|e| Error::Initialization(format!("Failed to create TLS server config: {e}")))?;
+
+    Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
+/// The mTLS handshake: it owns the hot-swappable [`TlsAcceptor`] so a config
+/// reload re-terminates TLS without rebuilding the listener.
+pub struct TlsConnector {
+    tls_acceptor: ArcSwap<TlsAcceptor>,
+}
+
+impl TlsConnector {
+    pub fn new(tls_config: &ServerTlsConfig) -> Result<Self, Error> {
+        Ok(Self {
+            tls_acceptor: ArcSwap::from_pointee(build_tls_acceptor(tls_config)?),
+        })
+    }
+
+    /// Swap in an acceptor built from `tls_config`.
+    pub fn reload(&self, tls_config: &ServerTlsConfig) -> Result<(), Error> {
+        self.tls_acceptor
+            .store(Arc::new(build_tls_acceptor(tls_config)?));
+        Ok(())
+    }
 }
 
 #[async_trait]
-impl Connector for TlsConnector<'_> {
+impl Connector for TlsConnector {
     type Stream = tokio_rustls::server::TlsStream<TcpStream>;
 
     async fn handshake(
@@ -109,102 +158,31 @@ impl Connector for TlsConnector<'_> {
     }
 }
 
-pub struct TlsListener {
-    binding_address: SocketAddr,
-    tls_acceptor: ArcSwap<TlsAcceptor>,
-    context: ArcSwap<ServerContext>,
-    timeouts: ArcSwap<[Duration; 2]>,
-}
+/// A TLS/mTLS listener: the shared shell over the [`TlsConnector`].
+pub type TlsListener = Listener<TlsConnector>;
 
 impl TlsListener {
     pub fn new(config: &TlsListenerConfig, context: ServerContext) -> Result<Self, Error> {
-        let binding_address = SocketAddr::new(config.base.bind_address, config.base.port);
-        let tls_acceptor = ArcSwap::from_pointee(Self::build_tls_acceptor(&config.tls)?);
-        let timeouts = [
-            Duration::from_secs(config.base.query_timeout.get()),
-            Duration::from_secs(config.base.query_timeout_grace_period.get()),
-        ];
-
-        Ok(Self {
-            binding_address,
-            tls_acceptor,
-            context: ArcSwap::from_pointee(context),
-            timeouts: ArcSwap::from_pointee(timeouts),
-        })
+        let connector = TlsConnector::new(&config.tls)?;
+        Ok(Self::build(&config.base, connector, context))
     }
 
-    pub async fn shutdown(&self) {
-        self.context.load().shutdown().await;
-    }
-
+    /// Apply a full listener config reload: rebuild the acceptor, then swap in
+    /// the new timeouts and context.
     pub fn notify_config_change(
         &self,
         config: &TlsListenerConfig,
         context: ServerContext,
     ) -> Result<(), Error> {
-        let acceptor = Arc::new(Self::build_tls_acceptor(&config.tls)?);
-        self.tls_acceptor.store(acceptor);
-
-        let timeouts = [
-            Duration::from_secs(config.base.query_timeout.get()),
-            Duration::from_secs(config.base.query_timeout_grace_period.get()),
-        ];
-
-        self.timeouts.store(Arc::new(timeouts));
-        self.context.store(Arc::new(context));
-
+        self.connector().reload(&config.tls)?;
+        self.store_timeouts(&config.base);
+        self.store_context(context);
         Ok(())
     }
 
+    /// Apply a TLS-only reload (certificate rotation): rebuild the acceptor.
     pub fn notify_tls_config_change(&self, config: &ServerTlsConfig) -> Result<(), Error> {
-        let acceptor = Arc::new(Self::build_tls_acceptor(config)?);
-        self.tls_acceptor.store(acceptor);
-
-        Ok(())
-    }
-
-    pub fn build_tls_acceptor(tls_config: &ServerTlsConfig) -> Result<TlsAcceptor, Error> {
-        debug!("Detected TLS configuration");
-        let server_certs = load_certificate_bundle(
-            &tls_config.server_certificate_bundle,
-            "server certificates bundle",
-        )?;
-        let server_key = load_private_key(&tls_config.server_private_key, "server private key")?;
-
-        let server_config = if let Some(ca_bundle) = tls_config.client_ca_bundle.as_ref() {
-            debug!(
-                "Client CA bundle detected (client_auth = {:?})",
-                tls_config.client_auth
-            );
-            let client_cert_verifier = build_client_verifier(ca_bundle, tls_config.client_auth)?;
-            ServerConfig::builder()
-                .with_client_cert_verifier(client_cert_verifier)
-                .with_single_cert(server_certs, server_key)
-        } else {
-            debug!("No client CA bundle detected; client_auth setting is ignored");
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(server_certs, server_key)
-        };
-
-        let server_config = server_config.map_err(|e| {
-            Error::Initialization(format!("Failed to create TLS server config: {e}"))
-        })?;
-
-        Ok(TlsAcceptor::from(Arc::new(server_config)))
-    }
-
-    pub async fn serve(&self) -> Result<(), Error> {
-        let connector = TlsConnector {
-            tls_acceptor: &self.tls_acceptor,
-        };
-        accept_loop(
-            self.binding_address,
-            &connector,
-            &self.context,
-            &self.timeouts,
-        )
-        .await
+        self.connector().reload(config)
     }
 }
 

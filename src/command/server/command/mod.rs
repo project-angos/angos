@@ -30,6 +30,22 @@ pub enum ServiceListener {
     Secure(TlsListener),
 }
 
+impl ServiceListener {
+    async fn serve(&self) -> Result<(), Error> {
+        match self {
+            Self::Insecure(listener) => listener.serve().await,
+            Self::Secure(listener) => listener.serve().await,
+        }
+    }
+
+    async fn shutdown(&self) {
+        match self {
+            Self::Insecure(listener) => listener.shutdown().await,
+            Self::Secure(listener) => listener.shutdown().await,
+        }
+    }
+}
+
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
     subcommand,
@@ -159,10 +175,7 @@ impl Command {
     }
 
     pub async fn shutdown_with_timeout(&self, grace: Duration) {
-        match &self.listener {
-            ServiceListener::Insecure(listener) => listener.shutdown().await,
-            ServiceListener::Secure(listener) => listener.shutdown().await,
-        }
+        self.listener.shutdown().await;
 
         if let Some(refresh) = &self.pending_refresh {
             refresh.shutdown.cancel();
@@ -179,12 +192,7 @@ impl Command {
     }
 
     pub async fn run(&self) -> Result<(), Error> {
-        match &self.listener {
-            ServiceListener::Insecure(listener) => listener.serve().await?,
-            ServiceListener::Secure(listener) => listener.serve().await?,
-        }
-
-        Ok(())
+        self.listener.serve().await
     }
 }
 

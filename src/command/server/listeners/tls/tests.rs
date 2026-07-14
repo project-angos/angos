@@ -138,7 +138,7 @@ fn test_config_ipv6_address() {
 fn test_build_tls_acceptor_success() {
     init_crypto_provider();
     let (tls_config, _tmp_files) = build_config(false);
-    let result = TlsListener::build_tls_acceptor(&tls_config);
+    let result = build_tls_acceptor(&tls_config);
 
     assert!(result.is_ok());
 }
@@ -148,7 +148,7 @@ fn test_build_tls_acceptor_with_client_ca() {
     init_crypto_provider();
     let (tls_config, _tmp_files) = build_config(true);
 
-    let result = TlsListener::build_tls_acceptor(&tls_config);
+    let result = build_tls_acceptor(&tls_config);
 
     assert!(result.is_ok());
 }
@@ -158,7 +158,7 @@ fn test_build_tls_acceptor_missing_cert_file() {
     let (mut tls_config, _tmp_files) = build_config(true);
     tls_config.server_certificate_bundle = PathBuf::from("/invalid/path.pem");
 
-    let result = TlsListener::build_tls_acceptor(&tls_config);
+    let result = build_tls_acceptor(&tls_config);
 
     assert!(result.is_err());
     if let Err(Error::Initialization(msg)) = result {
@@ -173,7 +173,7 @@ fn test_build_tls_acceptor_missing_key_file() {
     let (mut tls_config, _tmp_files) = build_config(true);
     tls_config.server_private_key = PathBuf::from("/invalid/path.pem");
 
-    let result = TlsListener::build_tls_acceptor(&tls_config);
+    let result = build_tls_acceptor(&tls_config);
 
     assert!(result.is_err());
     if let Err(Error::Initialization(msg)) = result {
@@ -191,7 +191,7 @@ fn test_build_tls_acceptor_invalid_cert_format() {
     let (mut tls_config, _tmp_files) = build_config(true);
     tls_config.server_certificate_bundle = cert_file.path().to_path_buf();
 
-    let result = TlsListener::build_tls_acceptor(&tls_config);
+    let result = build_tls_acceptor(&tls_config);
 
     assert!(result.is_err());
 }
@@ -204,7 +204,7 @@ fn test_build_tls_acceptor_invalid_key_format() {
     let (mut tls_config, _tmp_files) = build_config(true);
     tls_config.server_private_key = key_file.path().to_path_buf();
 
-    let result = TlsListener::build_tls_acceptor(&tls_config);
+    let result = build_tls_acceptor(&tls_config);
 
     assert!(result.is_err());
 }
@@ -214,7 +214,7 @@ fn test_build_tls_acceptor_missing_client_ca_file() {
     let (mut tls_config, _tmp_files) = build_config(false);
     tls_config.client_ca_bundle = Some(PathBuf::from("/nonexistent/ca.pem"));
 
-    let result = TlsListener::build_tls_acceptor(&tls_config);
+    let result = build_tls_acceptor(&tls_config);
 
     assert!(result.is_err());
     if let Err(Error::Initialization(msg)) = result {
@@ -471,6 +471,6 @@ fn test_build_tls_acceptor_with_client_auth_required() {
     let (mut tls_config, _tmp_files) = build_config(true);
     tls_config.client_auth = ClientAuth::Required;
 
-    let result = TlsListener::build_tls_acceptor(&tls_config);
+    let result = build_tls_acceptor(&tls_config);
     assert!(result.is_ok(), "build failed: {:?}", result.err());
 }

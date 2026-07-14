@@ -1,23 +1,18 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::net::SocketAddr;
 
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tokio::net::TcpStream;
 
 use crate::command::server::{
     ServerContext,
-    error::Error,
-    listeners::{Connector, HandshakeResult, accept_loop},
+    listeners::{Connector, HandshakeResult, Listener},
 };
 pub use crate::configuration::listeners::InsecureListenerConfig;
 
-pub struct InsecureListener {
-    binding_address: SocketAddr,
-    context: ArcSwap<ServerContext>,
-    timeouts: ArcSwap<[Duration; 2]>,
-}
+/// A non-TLS listener: the shared shell over the pass-through connector.
+pub type InsecureListener = Listener<InsecureConnector>;
 
-struct InsecureConnector;
+pub struct InsecureConnector;
 
 #[async_trait]
 impl Connector for InsecureConnector {
@@ -40,43 +35,14 @@ impl Connector for InsecureConnector {
 }
 
 impl InsecureListener {
-    pub fn new(server_config: &InsecureListenerConfig, context: ServerContext) -> Self {
-        let binding_address =
-            SocketAddr::new(server_config.base.bind_address, server_config.base.port);
-
-        let timeouts = [
-            Duration::from_secs(server_config.base.query_timeout.get()),
-            Duration::from_secs(server_config.base.query_timeout_grace_period.get()),
-        ];
-
-        Self {
-            binding_address,
-            context: ArcSwap::from_pointee(context),
-            timeouts: ArcSwap::from_pointee(timeouts),
-        }
+    pub fn new(config: &InsecureListenerConfig, context: ServerContext) -> Self {
+        Self::build(&config.base, InsecureConnector, context)
     }
 
+    /// Apply a non-listener config reload: the insecure listener has no
+    /// scheme-specific state, so only the server context is swapped.
     pub fn notify_config_change(&self, context: ServerContext) {
-        self.context.store(Arc::new(context));
-    }
-
-    pub async fn shutdown(&self) {
-        self.context.load().shutdown().await;
-    }
-
-    #[cfg(test)]
-    pub fn current_context(&self) -> arc_swap::Guard<Arc<ServerContext>> {
-        self.context.load()
-    }
-
-    pub async fn serve(&self) -> Result<(), Error> {
-        accept_loop(
-            self.binding_address,
-            &InsecureConnector,
-            &self.context,
-            &self.timeouts,
-        )
-        .await
+        self.store_context(context);
     }
 }
 
