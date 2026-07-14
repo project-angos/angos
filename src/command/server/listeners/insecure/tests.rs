@@ -165,8 +165,8 @@ async fn test_insecure_listener_timeouts_initialization() {
     let listener = InsecureListener::new(&config, context);
 
     let timeouts = listener.timeouts.load();
-    assert_eq!(timeouts[0], Duration::from_secs(5000));
-    assert_eq!(timeouts[1], Duration::from_secs(100));
+    assert_eq!(timeouts.query, Duration::from_secs(5000));
+    assert_eq!(timeouts.grace, Duration::from_secs(100));
 }
 
 async fn create_context_with_webhook(webhook_url: &str) -> ServerContext {

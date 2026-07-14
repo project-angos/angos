@@ -1,11 +1,6 @@
 use std::{
-    convert::Infallible,
-    fmt::Debug,
-    future::Future,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    time::{Duration, Instant},
+    convert::Infallible, fmt::Debug, future::Future, net::SocketAddr, pin::Pin, sync::Arc,
+    time::Instant,
 };
 
 use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
@@ -24,6 +19,7 @@ use crate::{
         ServerContext,
         error::Error as ServerError,
         http_server::{dispatch::dispatch_request, error_to_response},
+        listeners::RequestTimeouts,
         response_body::ResponseBody,
         router,
     },
@@ -39,7 +35,7 @@ pub async fn serve_request<S>(
     stream: TokioIo<S>,
     context: Arc<ServerContext>,
     peer_certificate: Option<Vec<u8>>,
-    timeouts: Arc<[Duration; 2]>,
+    timeouts: Arc<RequestTimeouts>,
     remote_address: SocketAddr,
 ) where
     S: Unpin + AsyncWrite + AsyncRead + Send + Debug + 'static,
@@ -56,7 +52,8 @@ pub async fn serve_request<S>(
 
     let _in_flight_guard = InFlightGuard::new();
 
-    let [query_timeout, grace_period] = *timeouts;
+    let query_timeout = timeouts.query;
+    let grace_period = timeouts.grace;
 
     // Phase 1: serve until the connection finishes or its query timeout (a wall-clock
     // deadline from connection start, not an activity-reset watchdog) fires. On

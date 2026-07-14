@@ -9,7 +9,10 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::command::server::{ServerContext, error::Error, serve_request};
+use crate::{
+    command::server::{ServerContext, error::Error, serve_request},
+    configuration::listeners::ListenerBaseConfig,
+};
 
 pub mod insecure;
 pub mod tls;
@@ -17,6 +20,24 @@ pub mod tls;
 pub struct HandshakeResult<S> {
     pub stream: S,
     pub peer_certificate: Option<Vec<u8>>,
+}
+
+/// The two per-connection deadlines: the wall-clock request-processing timeout
+/// and the grace period allowed for the in-flight request to drain after it
+/// fires.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestTimeouts {
+    pub query: Duration,
+    pub grace: Duration,
+}
+
+impl RequestTimeouts {
+    pub fn from_config(base: &ListenerBaseConfig) -> Self {
+        Self {
+            query: Duration::from_secs(base.query_timeout.get()),
+            grace: Duration::from_secs(base.query_timeout_grace_period.get()),
+        }
+    }
 }
 
 #[async_trait]
@@ -32,11 +53,70 @@ pub trait Connector: Send + Sync {
     fn label(&self) -> &'static str;
 }
 
+/// The shared listener shell: a bound address plus a hot-swappable context and
+/// timeouts, driving connections through a [`Connector`] that supplies the
+/// per-scheme handshake. TLS and non-TLS listeners are the same shell over a
+/// different connector, so the shape lives here once.
+pub struct Listener<C: Connector> {
+    binding_address: SocketAddr,
+    connector: C,
+    context: ArcSwap<ServerContext>,
+    timeouts: ArcSwap<RequestTimeouts>,
+}
+
+impl<C: Connector> Listener<C> {
+    /// Assemble the shell around `connector`, deriving the bind address and
+    /// timeouts from `base`.
+    pub fn build(base: &ListenerBaseConfig, connector: C, context: ServerContext) -> Self {
+        Self {
+            binding_address: SocketAddr::new(base.bind_address, base.port),
+            connector,
+            context: ArcSwap::from_pointee(context),
+            timeouts: ArcSwap::from_pointee(RequestTimeouts::from_config(base)),
+        }
+    }
+
+    /// The connector, so scheme-specific reloads (the TLS acceptor) reach it.
+    pub fn connector(&self) -> &C {
+        &self.connector
+    }
+
+    /// Swap in a freshly-built server context on a non-listener config reload.
+    pub fn store_context(&self, context: ServerContext) {
+        self.context.store(Arc::new(context));
+    }
+
+    /// Swap in the per-connection timeouts from an updated base config.
+    pub fn store_timeouts(&self, base: &ListenerBaseConfig) {
+        self.timeouts
+            .store(Arc::new(RequestTimeouts::from_config(base)));
+    }
+
+    pub async fn shutdown(&self) {
+        self.context.load().shutdown().await;
+    }
+
+    pub async fn serve(&self) -> Result<(), Error> {
+        accept_loop(
+            self.binding_address,
+            &self.connector,
+            &self.context,
+            &self.timeouts,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub fn current_context(&self) -> arc_swap::Guard<Arc<ServerContext>> {
+        self.context.load()
+    }
+}
+
 pub async fn accept_loop<C: Connector>(
     binding_address: SocketAddr,
     connector: &C,
     context: &ArcSwap<ServerContext>,
-    timeouts: &ArcSwap<[Duration; 2]>,
+    timeouts: &ArcSwap<RequestTimeouts>,
 ) -> Result<(), Error> {
     info!("Listening on {} ({})", binding_address, connector.label());
     let listener = build_listener(binding_address).await?;
