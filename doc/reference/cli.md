@@ -84,7 +84,6 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--retention`             | `-r`   | Deprecated: use [`angos prune`](#prune)                                                            |
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--reconcile-blob-index`  |        | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band (storage corruption, manual tampering). Reads every manifest, so it is expensive |
-| `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 | `--replicate`             |        | Deprecated: use [`angos replicate`](#replicate)                                                    |
 | `--replication-orphans`   |        | Delete replication jobs (pending and dead-lettered) whose downstream or repository is no longer configured                                       |

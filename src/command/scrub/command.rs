@@ -58,9 +58,6 @@ pub struct Options {
     /// reference each blob (repairs an index corrupted out-of-band, e.g. storage
     /// corruption or manual tampering); reads every manifest, so it is expensive
     pub reconcile_blob_index: bool,
-    #[argh(switch, short = 'M')]
-    /// backfill missing `media_type` on manifest links
-    pub media_types: bool,
     #[argh(switch, short = 'R')]
     /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
     pub referrers: bool,

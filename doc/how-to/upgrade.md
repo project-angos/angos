@@ -323,6 +323,24 @@ angos migrate
 
 Run it before serving the affected repositories. The command is idempotent, so it is safe to re-run and leaves already-JSON links untouched; pass `--dry-run` to report what it would rewrite without changing anything. A migrated link is written without a `created_at`, so it never wins replication last-writer-wins and retention treats it as oldest.
 
+### Manifest Media Type Backfill (Breaking Change)
+
+#### What Changed
+
+A manifest link records the manifest's `media_type`. The serving paths no longer read the manifest blob to recover a link that lacks one, and the `scrub --media-types` backfill that populated missing values is removed. A HEAD or GET of a manifest whose link has no stored `media_type` is now served without a `Content-Type`.
+
+**Who is affected:** Deployments with manifest links written before `media_type` was stored that were never re-pushed or backfilled. Every push since then stores the `media_type`, so a registry that has run the backfill once is unaffected.
+
+#### Migration (run before upgrading)
+
+On your **current version**, run the backfill once to populate every missing `media_type` from the manifest body:
+
+```text
+angos scrub --media-types
+```
+
+Then upgrade. If you have already run it, no action is required; the backfill is idempotent.
+
 ### Removed Configuration Keys (Breaking Change)
 
 #### What Changed

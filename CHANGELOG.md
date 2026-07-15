@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The deprecated `global.enable_redirect` boolean is removed; use `global.enable_blob_redirect` and `global.enable_manifest_redirect`.
 - The legacy single-file blob index (`index.json`) runtime fallback and its scrub migration are removed; run `angos scrub` on the prior version before upgrading, or references held only in an un-migrated `index.json` are lost.
 - The pre-JSON bare-digest link-metadata runtime fallback is removed; such links no longer resolve until `angos migrate` rewrites them as JSON.
+- The manifest `media_type` runtime fallback and its `scrub --media-types` backfill are removed; run `scrub --media-types` on the prior version before upgrading, or a manifest whose link lacks a `media_type` is served without a `Content-Type`.
 
 ## 1.3.2
 

@@ -11,7 +11,7 @@ use crate::{
     jobs::store::{Error as JobStoreError, JobEnvelope, JobStore},
     jobs::{JobState, Queue},
     metrics_provider::metrics_provider,
-    oci::{Digest, MediaType, Namespace, Reference, Tag},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{
         Error as RegistryError, Registry,
         blob_store::{self, BlobStore, MultipartCleanup},
@@ -304,26 +304,6 @@ impl Executor {
         Ok(())
     }
 
-    async fn set_media_type(
-        &self,
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-        media_type: MediaType,
-    ) -> Result<(), Error> {
-        self.metadata_store
-            .update_links(
-                &namespace,
-                &[LinkOperation::create_with_media_type(
-                    link,
-                    target,
-                    Some(media_type),
-                )],
-            )
-            .await?;
-        Ok(())
-    }
-
     /// Retention tag deletion through the registry's standard delete path,
     /// so it emits `tag.delete`/`manifest.delete` events and, per its
     /// internal actor, mirrors only to `prune = true` downstreams.
@@ -524,16 +504,6 @@ impl ActionSink for Executor {
                 target,
                 referrer,
             } => self.add_referrer(namespace, link, target, referrer).await,
-            Action::SetMediaType {
-                namespace,
-                link,
-                target,
-                media_type,
-                ..
-            } => {
-                self.set_media_type(namespace, link, target, media_type)
-                    .await
-            }
             Action::DeleteTag { namespace, tag } => self.delete_tag(namespace, tag).await,
             Action::DeleteInvalidTag { namespace, tag } => {
                 self.delete_invalid_tag(namespace, tag).await

@@ -3,7 +3,7 @@ use std::{collections::HashSet, io::Cursor};
 use futures_util::future::join_all;
 use serde_json::json;
 
-use super::{parse::manifest_meta_from_body, *};
+use super::*;
 use crate::{
     command::server::Error as ServerError,
     oci::{Algorithm, MediaType, Namespace, Tag},
@@ -12,8 +12,8 @@ use crate::{
         metadata_store::{LinkKind, LinkMetadata, LinkOperation},
         path_builder::blob_path,
         test_utils::{
-            FSRegistryTestCase, RegistryTestCase, for_each_backend, get_blob, put_blob_direct,
-            put_link_raw, upload_blob,
+            FSRegistryTestCase, RegistryTestCase, for_each_backend, get_blob, put_link_raw,
+            upload_blob,
         },
     },
     registry_client::REPLICATION_SUPERSEDED_CODE,
@@ -1762,64 +1762,6 @@ async fn test_put_manifest_stores_media_type() {
 }
 
 #[tokio::test]
-async fn test_head_manifest_fallback_without_media_type() {
-    for_each_backend(async |test_case| {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/head-fallback").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let digest = put_blob_direct(registry.metadata_store.store(), &content).await;
-
-        registry
-            .metadata_store
-            .update_links(
-                namespace,
-                &[
-                    LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
-                    LinkOperation::create(
-                        LinkKind::Tag(Tag::new("latest").unwrap()),
-                        digest.clone(),
-                    ),
-                ],
-            )
-            .await
-            .unwrap();
-
-        let link_meta = registry
-            .metadata_store
-            .read_link(namespace, &LinkKind::Digest(digest.clone()))
-            .await
-            .unwrap();
-        assert_eq!(
-            link_meta.media_type, None,
-            "Link created without media_type should have None"
-        );
-
-        let repository = registry.get_repository_for_namespace(namespace).unwrap();
-
-        let head = registry
-            .head_manifest(
-                repository,
-                &[media_type.to_string()],
-                namespace,
-                Reference::Tag(Tag::new("latest").unwrap()),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            head.media_type.as_ref().unwrap(),
-            &media_type,
-            "HEAD should fall back to reading blob when media_type not in link"
-        );
-        assert_eq!(head.digest, digest);
-        assert_eq!(head.size, content.len() as u64);
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
     for_each_backend(async |test_case| {
         let registry = test_case.registry();
@@ -1851,144 +1793,10 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
     .await;
 }
 
-#[tokio::test]
-async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
-    for_each_backend(async |test_case| {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/redirect-fallback").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let digest = put_blob_direct(registry.metadata_store.store(), &content).await;
-
-        registry
-            .metadata_store
-            .update_links(
-                namespace,
-                &[
-                    LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
-                    LinkOperation::create(
-                        LinkKind::Tag(Tag::new("latest").unwrap()),
-                        digest.clone(),
-                    ),
-                ],
-            )
-            .await
-            .unwrap();
-
-        let response = registry
-            .resolve_get_manifest(
-                None,
-                namespace,
-                Reference::Tag(Tag::new("latest").unwrap()),
-                &[media_type.to_string()],
-                false,
-            )
-            .await
-            .unwrap();
-
-        // When the redirect path fires, the media_type must still be present
-        // (via fallback reading the blob body). When the blob backend does not
-        // support presigned URLs (FS backend), we get a Body response, both are
-        // valid; in the Body case the media_type comes from the manifest JSON.
-        match response {
-            GetManifestResponse::Redirect { media_type, .. } => {
-                assert!(
-                    media_type.is_some(),
-                    "Redirect should still carry a media_type via fallback"
-                );
-            }
-            GetManifestResponse::Body { media_type, .. } => {
-                assert!(media_type.is_some());
-            }
-        }
-    })
-    .await;
-}
-
 fn fixed_digest() -> Digest {
     "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         .parse()
         .unwrap()
-}
-
-#[test]
-fn manifest_meta_from_body_returns_meta_for_valid_image_manifest_with_media_type() {
-    let body = serde_json::to_vec(&json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {
-            "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            "size": 256
-        },
-        "layers": []
-    }))
-    .unwrap();
-
-    let target = fixed_digest();
-    let meta = manifest_meta_from_body(&target, &body).unwrap();
-
-    assert_eq!(
-        meta.media_type.as_deref(),
-        Some("application/vnd.oci.image.manifest.v1+json")
-    );
-    assert_eq!(meta.digest, target);
-    assert_eq!(meta.size, body.len() as u64);
-}
-
-#[test]
-fn manifest_meta_from_body_returns_meta_for_image_manifest_without_media_type() {
-    let body = serde_json::to_vec(&json!({
-        "schemaVersion": 2,
-        "config": {
-            "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            "size": 256
-        },
-        "layers": []
-    }))
-    .unwrap();
-
-    let target = fixed_digest();
-    let meta = manifest_meta_from_body(&target, &body).unwrap();
-
-    assert_eq!(meta.media_type, None);
-    assert_eq!(meta.digest, target);
-    assert_eq!(meta.size, body.len() as u64);
-}
-
-#[test]
-fn manifest_meta_from_body_returns_meta_for_oci_index() {
-    let body = serde_json::to_vec(&json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.index.v1+json",
-        "manifests": [
-            {
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                "size": 512,
-                "platform": { "architecture": "amd64", "os": "linux" }
-            }
-        ]
-    }))
-    .unwrap();
-
-    let target = fixed_digest();
-    let meta = manifest_meta_from_body(&target, &body).unwrap();
-
-    assert_eq!(
-        meta.media_type.as_deref(),
-        Some("application/vnd.oci.image.index.v1+json")
-    );
-    assert_eq!(meta.digest, target);
-    assert_eq!(meta.size, body.len() as u64);
-}
-
-#[test]
-fn manifest_meta_from_body_errors_on_malformed_json() {
-    let target = fixed_digest();
-    let result = manifest_meta_from_body(&target, b"not json");
-    assert!(result.is_err());
 }
 
 // Manifest write/delete path tests

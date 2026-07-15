@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     jobs::{JobState, Queue},
-    oci::{Digest, MediaType, Namespace, Tag},
+    oci::{Digest, Namespace, Tag},
     registry::metadata_store::LinkKind,
 };
 
@@ -50,13 +50,6 @@ pub enum Action {
         namespace: Namespace,
         link: LinkKind,
         referrer: Digest,
-    },
-    SetMediaType {
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-        media_type: MediaType,
-        display_name: String,
     },
     DeleteTag {
         namespace: Namespace,
@@ -189,17 +182,6 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "remove referrer {referrer} from link {link} in namespace '{namespace}'"
-                )
-            }
-            Action::SetMediaType {
-                namespace,
-                media_type,
-                display_name,
-                ..
-            } => {
-                write!(
-                    f,
-                    "set media_type '{media_type}' on {display_name} in namespace '{namespace}'"
                 )
             }
             Action::DeleteTag { namespace, tag } => {

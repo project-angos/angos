@@ -2,7 +2,7 @@ use tracing::warn;
 
 use crate::{
     oci::{Digest, Manifest, MediaType},
-    registry::{Error, manifest::response::ManifestMeta, metadata_store::LinkKind},
+    registry::{Error, metadata_store::LinkKind},
 };
 
 pub struct ParsedManifestDigests {
@@ -69,18 +69,6 @@ fn validate_media_type_match(
         ));
     }
     Ok(())
-}
-
-/// Constructs a `ManifestMeta` from raw manifest body bytes for a known target
-/// digest. Centralises the deserialize-and-project step so the I/O fallback in
-/// `head_local_manifest` and any future caller share one implementation.
-pub fn manifest_meta_from_body(target: &Digest, bytes: &[u8]) -> Result<ManifestMeta, Error> {
-    let manifest = serde_json::from_slice::<Manifest>(bytes)?;
-    Ok(ManifestMeta {
-        media_type: manifest.media_type,
-        digest: target.clone(),
-        size: bytes.len() as u64,
-    })
 }
 
 /// Deserialize a manifest body and verify its declared media type matches the
