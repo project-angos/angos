@@ -117,7 +117,7 @@ setup guide including `angos worker` invocation and KEDA autoscaling.
 
 | Option          | Type     | Default | Description                        |
 |-----------------|----------|---------|------------------------------------|
-| `default`       | string   | `"deny"` | Default action when no rules match (`"allow"` or `"deny"`). The legacy `default_allow` boolean is still accepted but emits a deprecation warning. |
+| `default`       | string   | `"deny"` | Default action when no rules match (`"allow"` or `"deny"`). |
 | `rules`         | [string] | `[]`    | CEL expressions for access control |
 
 ### Global Retention Policy (`global.retention_policy`)
