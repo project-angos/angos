@@ -2936,22 +2936,23 @@ async fn same_digest_re_push_preserves_created_at() {
 }
 
 #[tokio::test]
-async fn replicated_delete_not_superseded_by_a_legacy_link() {
-    // A pre-JSON distribution-era link (bare digest string) parses to
-    // created_at=None, so it must never win LWW; a synthesised now() would
-    // re-stamp fresher on every read and block every replicated write to a
-    // migrated tag forever.
+async fn replicated_delete_not_superseded_by_a_link_without_created_at() {
+    // A link with no `created_at` (e.g. a pre-JSON distribution link rewritten
+    // as JSON without a timestamp) must never win LWW; a synthesised now() would
+    // re-stamp fresher on every read and block every replicated write to the
+    // tag forever.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("legacy-repo").unwrap();
     let link = LinkKind::Tag(Tag::new("latest").unwrap());
 
     let legacy_digest = Digest::sha256_of_bytes(b"legacy-manifest");
+    let link_without_created_at = format!(r#"{{"target":"{legacy_digest}","created_at":null}}"#);
     put_link_raw(
         registry.metadata_store.store(),
         namespace,
         &link,
-        legacy_digest.to_string().as_bytes(),
+        link_without_created_at.as_bytes(),
     )
     .await;
 

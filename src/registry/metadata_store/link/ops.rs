@@ -479,7 +479,7 @@ impl MetadataStore {
         match self.store().object_store().get(link_path).await {
             Ok(data) => {
                 let bytes = Bytes::from(data.clone());
-                let metadata = LinkMetadata::from_bytes(data)
+                let metadata: LinkMetadata = serde_json::from_slice(&data)
                     .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
                 Ok(Some((bytes, metadata)))
             }

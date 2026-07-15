@@ -2001,6 +2001,6 @@ fn test_link_metadata_backward_compat_no_media_type() {
         r#"{{"target":"sha256:{}","created_at":"2024-01-01T00:00:00Z"}}"#,
         "a".repeat(64)
     );
-    let metadata = LinkMetadata::from_bytes(json.into_bytes()).unwrap();
+    let metadata: LinkMetadata = serde_json::from_slice(json.as_bytes()).unwrap();
     assert_eq!(metadata.media_type, None);
 }
