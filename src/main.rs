@@ -125,10 +125,7 @@ fn main() {
     let config = match Configuration::load(&cli_args.config) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!(
-                "Failed to load configuration from {}: {e}",
-                &cli_args.config
-            );
+            eprintln!("Failed to load configuration from {}: {e}", cli_args.config);
             exit(1);
         }
     };
