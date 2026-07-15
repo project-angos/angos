@@ -331,23 +331,6 @@ S3 multipart uploads that were started but never completed can accumulate and co
 
 This is S3-specific and has no effect on filesystem storage backends.
 
-### Blob Index Migration
-
-Legacy single-file blob indexes (`index.json`) keep working at runtime against both the S3 and filesystem backends. Reads consult the sharded layout first and fall back to the legacy file when no sharded entry exists, and writes are applied in place to a legacy file when one is present so the layout never splits mid-blob. Operators are **not** forced to run scrub just to keep serving traffic.
-
-`scrub` is the only way to convert the on-disk blob-index layout from legacy to sharded:
-
-- `scrub --blobs` iterates every blob, rewrites each legacy `index.json` into per-namespace shards under `refs/{namespace}.json`, and deletes the legacy file once the shards are written.
-
-Running scrub benefits operators who want the per-namespace shard layout's lock granularity and concurrency characteristics for old blobs; the runtime fallback is correct but does not gain those properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
-
-```bash
-# Migrate legacy blob indexes
-./angos -c config.toml scrub --blobs
-```
-
-This migration is **idempotent**: re-running scrub is safe and will simply skip data that is already in the sharded layout.
-
 ### Fix Links Format
 
 The `--links` flag repairs link format inconsistencies. Use this when:
