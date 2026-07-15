@@ -20,6 +20,23 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Bounds how long establishing the connection (TCP + TLS handshake) may
+    /// take. Unlike [`Self::timeout`], it does not cap the transfer itself.
+    #[must_use]
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.builder = self.builder.connect_timeout(timeout);
+        self
+    }
+
+    /// Bounds inactivity between successful reads (it resets on each read), so
+    /// a long but steadily-progressing transfer is not capped while a stalled
+    /// connection still fails.
+    #[must_use]
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.builder = self.builder.read_timeout(timeout);
+        self
+    }
+
     #[must_use]
     pub fn redirect(mut self, policy: Policy) -> Self {
         self.builder = self.builder.redirect(policy);

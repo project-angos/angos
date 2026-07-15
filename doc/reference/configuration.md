@@ -436,6 +436,8 @@ Array of upstream registries for pull-through cache.
 |----------------------|--------|----------|-----------------------------------|
 | `url`                | string | required | Upstream registry URL. A bare host pulls from the registry root after stripping the repository name (`<repo>/x` → upstream `x`); a path (`https://host/team`) becomes the upstream namespace prefix instead (`<repo>/x` → upstream `team/x`). Pulling the repository root `<repo>` itself maps to `<repo>` for a bare host and to `<path>` for a path URL. Angos talks to the OCI `/v2/` root, so the path is mapped into the namespace, not the HTTP path. |
 | `max_redirect`       | u8     | `5`      | Maximum redirects to follow       |
+| `connect_timeout_secs` | u64  | `30`     | Timeout for establishing the connection (TCP + TLS handshake) |
+| `read_timeout_secs`  | u64    | `300`    | Per-read inactivity timeout during a transfer; not a whole-transfer cap, so a large blob is never limited by total time |
 | `server_ca_bundle`   | string | -        | CA bundle for server verification |
 | `client_certificate` | string | -        | Client certificate for mTLS       |
 | `client_private_key` | string | -        | Client key for mTLS               |
@@ -455,6 +457,8 @@ Array of downstream registries to which this repository's mutations are replicat
 | `max_concurrent_pushes` | usize    | `4`                | Concurrent blob pushes per manifest for this downstream (positive integer, >= 1) |
 | `prune`                 | bool     | `false`            | When `true`, reconciliation also deletes downstream-only tags (authoritative one-way mirror; unsafe for active-active peers) |
 | `max_redirect`          | u8       | `5`                | Maximum redirects to follow                                              |
+| `connect_timeout_secs`  | u64      | `30`               | Timeout for establishing the connection (TCP + TLS handshake)            |
+| `read_timeout_secs`     | u64      | `300`              | Per-read inactivity timeout during a transfer; not a whole-transfer cap, so a large blob push is never limited by total time |
 | `username`              | string   | -                  | Basic auth username                                                      |
 | `password`              | string   | -                  | Basic auth password                                                      |
 | `server_ca_bundle`      | string   | -                  | CA bundle for downstream TLS verification                               |

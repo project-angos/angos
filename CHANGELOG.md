@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - With CAS coordination, access times are now stamped inline as a single conditional write whose lost races are no-ops; `access_time_debounce_secs` only applies to lock-coordinated deployments.
 - Retention deletions (`angos prune`) now run through the registry's standard delete path: blob bytes are reclaimed immediately once unreferenced, and the deletion replicates to downstreams marked `prune = true` only.
 - Graceful shutdown now drains in-flight async webhook deliveries to completion instead of abandoning them after a fixed timeout; each delivery stays bounded by its own request timeout, retry cap, and backoff ceiling.
+- Replication and pull-through no longer cap a whole transfer at 5 minutes: the registry client uses a connection timeout plus a per-read stall timeout (new `connect_timeout_secs`/`read_timeout_secs`), so a large blob that keeps progressing is not dead-lettered.
 - `required`-policy webhooks now default to `max_retries = 3` (with the existing exponential backoff), so a transient endpoint failure no longer immediately fails the client operation; an explicit `max_retries` still wins.
 - Webhook events now fire before the operation is performed instead of after it commits: delivery is at-least-once, so a performed operation can no longer go unnotified, while a rejected or failed operation may leave a false-positive intent event.
 
