@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The deprecated `access_policy.default_allow` boolean is removed; set the typed `default = "allow"` or `default = "deny"` instead.
 - The deprecated `cache_store` config section is removed; use `cache`.
+- The deprecated `storage` config section is removed; use `blob_store`.
 
 ## 1.3.2
 

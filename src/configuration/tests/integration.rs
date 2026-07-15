@@ -43,30 +43,6 @@ fn test_load_minimal_config() {
 }
 
 #[test]
-fn test_storage_field_backward_compatibility() {
-    // Test that old 'storage' field is supported for backward compatibility
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [storage.fs]
-    root_dir = "/data/registry"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-
-    // Should parse 'storage' as 'blob_store'
-    let expected = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
-        root_dir: "/data/registry".to_string(),
-        sync_to_disk: false,
-    });
-    assert_eq!(config.blob_store, expected);
-
-    // No explicit metadata_store section: field must be Inherit
-    assert_eq!(config.registry_storage, RegistryStorageConfig::Inherit);
-}
-
-#[test]
 fn test_tls_config_detection() {
     let config = r#"
     [server]

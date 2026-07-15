@@ -36,8 +36,7 @@ use crate::{
 };
 
 /// Cross-section validation runs in the `TryFrom` conversion, so a parsed
-/// `Configuration` is always a validated one. The `storage` alias is the pre-1.0
-/// section name for `blob_store`.
+/// `Configuration` is always a validated one.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(try_from = "ConfigurationFields")]
 pub struct Configuration {
@@ -62,7 +61,7 @@ struct ConfigurationFields {
     ui: UiConfig,
     #[serde(default)]
     cache: cache::Config,
-    #[serde(default, alias = "storage")]
+    #[serde(default)]
     blob_store: blob_store::BlobStoreConfig,
     #[serde(default, rename = "metadata_store")]
     registry_storage: RegistryStorageConfig,
