@@ -1,17 +1,8 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use futures_util::StreamExt;
-use tracing::{debug, error};
+use tracing::debug;
 
-use crate::{
-    command::scrub::{
-        action::Action,
-        check::{StoreChecker, list_all},
-        error::Error,
-        executor::ActionSink,
-    },
-    registry::blob_store::BlobStore,
+use crate::command::scrub::{
+    action::Action, check::StoreChecker, error::Error, executor::ActionSink,
 };
 
 /// Migrates metadata layout documents that scrub can discover safely.
@@ -19,13 +10,12 @@ use crate::{
 /// Backend-specific migration details live behind `MetadataStore`; this checker
 /// only enumerates registry-wide subjects and emits ordinary scrub actions so
 /// dry-run and real runs keep the same control flow as consistency repairs.
-pub struct LayoutChecker {
-    blob_store: Arc<BlobStore>,
-}
+#[derive(Default)]
+pub struct LayoutChecker;
 
 impl LayoutChecker {
-    pub fn new(blob_store: Arc<BlobStore>) -> Self {
-        Self { blob_store }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -36,14 +26,6 @@ impl StoreChecker for LayoutChecker {
 
         sink.apply(Action::PruneLegacyNamespaceRegistry).await?;
 
-        let mut blobs = list_all::blobs(&self.blob_store);
-        while let Some(blob) = blobs.next().await {
-            let blob = blob?;
-            if let Err(error) = sink.apply(Action::MigrateBlobIndex(blob.clone())).await {
-                error!("Failed to migrate blob index layout for {blob}: {error}");
-            }
-        }
-
         Ok(())
     }
 }
@@ -51,30 +33,10 @@ impl StoreChecker for LayoutChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{oci::Digest, registry::blob_store};
-    use bytes::Bytes;
-    use tempfile::TempDir;
 
     #[tokio::test]
-    async fn layout_checker_emits_blob_migration_actions() {
-        let temp_dir = TempDir::new().unwrap();
-        let root_dir = temp_dir.path().to_string_lossy().into_owned();
-        let blob_store = Arc::new(
-            blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
-                root_dir,
-                sync_to_disk: false,
-            })
-            .build_backend()
-            .unwrap(),
-        );
-        let content = b"layout migration";
-        let digest = Digest::sha256_of_bytes(content);
-        blob_store
-            .put_blob(&digest, Bytes::from_static(content))
-            .await
-            .unwrap();
-
-        let checker = LayoutChecker::new(blob_store);
+    async fn layout_checker_emits_prune_legacy_namespace_registry() {
+        let checker = LayoutChecker::new();
         let mut actions = Vec::new();
         checker.check_all(&mut actions).await.unwrap();
 
@@ -82,11 +44,6 @@ mod tests {
             actions
                 .iter()
                 .any(|action| matches!(action, Action::PruneLegacyNamespaceRegistry))
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::MigrateBlobIndex(blob) if blob == &digest))
         );
     }
 }

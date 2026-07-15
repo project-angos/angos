@@ -1,8 +1,6 @@
 mod access_time;
-mod backend;
 mod blob_index;
 mod cache;
-mod legacy_fallback;
 mod list_namespaces;
 
 use std::{
@@ -24,7 +22,7 @@ use crate::{
     oci::{Algorithm, Descriptor, Digest, MediaType, Namespace, Tag},
     registry::{
         Error,
-        metadata_store::{BlobIndex, LinkKind, LinkMetadata, LinkOperation, MetadataStore},
+        metadata_store::{LinkKind, LinkMetadata, LinkOperation, MetadataStore},
         path_builder,
         s3_connection::S3ConnectionConfig,
         test_utils::{for_each_backend, media_type, put_blob_direct, s3_test_connection},
@@ -108,24 +106,6 @@ pub fn test_backend_with_debounce(config: &TestS3Config, debounce_secs: u64) -> 
     let mut cfg = config.clone();
     cfg.access_time_debounce_secs = debounce_secs;
     cfg.to_backend(false, None).unwrap()
-}
-
-pub fn legacy_blob_index_with(entries: Vec<(&str, Vec<LinkKind>)>) -> BlobIndex {
-    let mut namespace: HashMap<Namespace, HashSet<LinkKind>> = HashMap::new();
-    for (ns, links) in entries {
-        namespace.insert(Namespace::new(ns).unwrap(), links.into_iter().collect());
-    }
-    BlobIndex { namespace }
-}
-
-pub async fn put_legacy_index(backend: &MetadataStore, digest: &Digest, index: &BlobIndex) {
-    let body = Bytes::from(serde_json::to_vec(index).unwrap());
-    backend
-        .store()
-        .object_store()
-        .put(&path_builder::blob_index_path(digest), body)
-        .await
-        .unwrap();
 }
 
 // Integration tests

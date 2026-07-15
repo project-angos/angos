@@ -158,11 +158,6 @@ pub fn record_reconcile_outcome(outcome: &str) {
 }
 
 impl Executor {
-    async fn migrate_blob_index(&self, digest: Digest) -> Result<(), Error> {
-        self.metadata_store.migrate_blob_index(&digest).await?;
-        Ok(())
-    }
-
     async fn prune_legacy_namespace_registry(&self) -> Result<(), Error> {
         self.metadata_store
             .delete_legacy_namespace_registry()
@@ -503,7 +498,6 @@ impl ActionSink for Executor {
         info!("{action}");
 
         match action {
-            Action::MigrateBlobIndex(digest) => self.migrate_blob_index(digest).await,
             Action::PruneLegacyNamespaceRegistry => self.prune_legacy_namespace_registry().await,
             Action::DeleteOrphanBlob(digest) => self.delete_orphan_blob(digest).await,
             Action::RemoveBlobIndexLink {

@@ -125,7 +125,7 @@ impl Command {
             &repositories,
         )?;
         let tag_checkers = setup::tag_checkers(options, &blob_backend, &metadata_store);
-        let layout_checker = setup::layout_checker(&blob_backend);
+        let layout_checker = LayoutChecker::new();
         let store_checkers =
             setup::store_checkers(options, &blob_backend, &metadata_store, &repositories)?;
 

@@ -72,49 +72,7 @@ pub fn non_empty_links_or_not_found(links: HashSet<LinkKind>) -> Result<HashSet<
     }
 }
 
-pub fn namespace_links_from_index(
-    index: &BlobIndex,
-    namespace: &Namespace,
-) -> Result<HashSet<LinkKind>, Error> {
-    index
-        .namespace
-        .get(namespace)
-        .cloned()
-        .filter(|links| !links.is_empty())
-        .ok_or(Error::NotFound)
-}
-
 // Store read-modify-write
-
-/// The write target the legacy-vs-shard routing resolved: a whole-index
-/// legacy `index.json` when one exists, else the per-namespace shard.
-pub enum ShardTarget {
-    /// Legacy whole-index file: raw bytes for the transaction read set plus
-    /// the parsed index.
-    Legacy { raw: Bytes, index: BlobIndex },
-    /// Per-namespace shard state; `None` when the shard is absent.
-    Shard(Option<(Bytes, HashSet<LinkKind>)>),
-}
-
-/// Resolve the legacy-vs-shard routing with a single GET per layer. The one
-/// home of the routing rule shared by the transaction planner and the
-/// emptiness probe.
-pub async fn read_shard_target(
-    store: &Store,
-    legacy_path: &str,
-    shard_path: &str,
-) -> Result<ShardTarget, StorageError> {
-    match store.object_store().get(legacy_path).await {
-        Ok(data) => {
-            let raw = Bytes::from(data.clone());
-            let index: BlobIndex = serde_json::from_slice(&data).unwrap_or_default();
-            return Ok(ShardTarget::Legacy { raw, index });
-        }
-        Err(StorageError::NotFound) => {}
-        Err(e) => return Err(e),
-    }
-    Ok(ShardTarget::Shard(read_shard(store, shard_path).await?))
-}
 
 /// Read one per-namespace shard: its raw bytes plus parsed links, or `None`
 /// when absent.
@@ -174,46 +132,16 @@ pub fn append_shard_ops(
 
 /// Read the current shard state for `digest`/`namespace`, apply `ops`, and
 /// append the resulting read + mutation to `builder`.
-///
-/// Routing: if a legacy `index.json` exists it is the write target; otherwise
-/// the per-namespace shard is used.
 pub async fn append_shard_for_digest(
     store: &Store,
     namespace: &Namespace,
     digest: &Digest,
     ops: &[BlobIndexOperation],
-    mut builder: TransactionBuilder,
+    builder: TransactionBuilder,
 ) -> Result<TransactionBuilder, Error> {
-    let legacy_path = path_builder::blob_index_path(digest);
     let shard_path = path_builder::blob_index_shard_path(digest, namespace);
-
-    match read_shard_target(store, &legacy_path, &shard_path).await? {
-        ShardTarget::Legacy { raw, mut index } => {
-            {
-                let entry = index.namespace.entry(namespace.clone()).or_default();
-                apply_blob_index_operations(entry, ops);
-                if entry.is_empty() {
-                    index.namespace.remove(namespace);
-                }
-            }
-            builder = builder.read(legacy_path.clone(), raw);
-            if index.namespace.is_empty() {
-                return Ok(builder.mutation(Mutation::Delete {
-                    key: legacy_path,
-                    expected: None,
-                }));
-            }
-            let body = Bytes::from(serde_json::to_vec(&index)?);
-            Ok(builder.mutation(Mutation::Put {
-                key: legacy_path,
-                body,
-                expected: None,
-            }))
-        }
-        ShardTarget::Shard(existing) => {
-            append_shard_ops(shard_path, existing, ops, builder).map_err(Error::from)
-        }
-    }
+    let existing = read_shard(store, &shard_path).await?;
+    append_shard_ops(shard_path, existing, ops, builder).map_err(Error::from)
 }
 
 /// Return the ops slice for `digest` from the map, or an empty slice.
@@ -224,30 +152,21 @@ pub fn ops_for_digest<'a>(
     map.get(digest).map_or(&[] as &[_], Vec::as_slice)
 }
 
-/// Check whether the shard for `namespace` will be empty after applying `ops`.
+/// Check whether the shard at `shard_path` will be empty after applying `ops`.
 pub async fn shard_will_be_empty(
     store: &Store,
-    namespace: &Namespace,
     ops: &[BlobIndexOperation],
     shard_path: &str,
-    legacy_path: &str,
 ) -> Result<bool, TxError> {
-    match read_shard_target(store, legacy_path, shard_path)
+    match read_shard(store, shard_path)
         .await
         .map_err(TxError::Storage)?
     {
-        ShardTarget::Legacy { mut index, .. } => match index.namespace.get_mut(namespace) {
-            Some(entry) => {
-                apply_blob_index_operations(entry, ops);
-                Ok(entry.is_empty())
-            }
-            None => Ok(false),
-        },
-        ShardTarget::Shard(Some((_, mut links))) => {
+        Some((_, mut links)) => {
             apply_blob_index_operations(&mut links, ops);
             Ok(links.is_empty())
         }
-        ShardTarget::Shard(None) => Ok(true),
+        None => Ok(true),
     }
 }
 

@@ -9,10 +9,10 @@ use crate::{
         replicate::ReplicationChecker,
         scrub::{
             check::{
-                BlobChecker, BlobIndexChecker, DigestLinkChecker, LayoutChecker,
-                LinkReferencesChecker, ManifestChecker, MediaTypeChecker, MultipartChecker,
-                NamespaceChecker, OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker,
-                OrphanQueue, ReferrerChecker, StoreChecker, TagChecker, UploadChecker,
+                BlobChecker, BlobIndexChecker, DigestLinkChecker, LinkReferencesChecker,
+                ManifestChecker, MediaTypeChecker, MultipartChecker, NamespaceChecker,
+                OrphanGrantChecker, OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue,
+                ReferrerChecker, StoreChecker, TagChecker, UploadChecker,
             },
             command::Options,
             error::Error,
@@ -117,10 +117,6 @@ pub fn tag_checkers(
             metadata_store.clone(),
         )) as Box<dyn TagChecker>]
     })
-}
-
-pub fn layout_checker(blob_store: &Arc<BlobStore>) -> LayoutChecker {
-    LayoutChecker::new(blob_store.clone())
 }
 
 pub fn blob_checker(

@@ -153,7 +153,7 @@ Update any clients of the old `/v2/_ext/...` endpoints to the new `/_ext/...` pa
 
 ---
 
-## 1.2.x → Next
+## 1.2.x → 1.3.0
 
 ### Durable Queue Shared Lock (Breaking Change)
 
@@ -282,3 +282,42 @@ The blob store is now pure storage with no transaction engine. The in-process jo
 **Who is affected:** Only deployments that run the in-process queue **and** place the blob store and metadata store on separate backends. When both share one backend (the default), the `_jobs/` location is physically unchanged and no action is required.
 
 On a split-backend deployment, drain the in-process queue before upgrading: `_jobs/` records still pending on the blob backend become invisible to the new queue after the upgrade. Cache-fill jobs re-enqueue on the next pull, but an in-flight `event-only` replication push is not re-driven by `angos replicate`, so re-push affected tags if the queue was not drained. Leftover `_jobs/`, `.tx-log/`, `.tx-bodies/`, and `.tx-locks/` objects on the blob backend are inert and can be deleted manually.
+
+---
+
+## 1.3.x → 1.4.0
+
+### Blob-Index Layout Migration (Breaking Change, Data Loss Risk)
+
+#### What Changed
+
+The legacy single-file blob index (`.../<digest>/index.json`) is no longer read, written, or migrated at runtime. Blob references now live only in the sharded `refs/<namespace>.json` layout introduced in 1.2.0. The scrub action that migrated `index.json` files into shards is also removed.
+
+**Who is affected:** Deployments upgraded from a pre-1.2.0 layout that never completed the migration. Any blob whose references still live only in an `index.json` file becomes unreferenced after upgrade, so the blob can be reclaimed by a later scrub and pulls of it fail.
+
+#### Migration (run before upgrading)
+
+On your **current version**, run a scrub once to migrate every legacy `index.json` into the sharded layout (the layout migration runs on any `angos scrub` invocation):
+
+```text
+angos scrub
+```
+
+Then upgrade. If you have already run `angos scrub` on 1.2.0 or later, no action is required; the migration is idempotent and your indexes are already sharded.
+
+### Removed Configuration Keys (Breaking Change)
+
+#### What Changed
+
+Several long-deprecated configuration keys are no longer read. A configuration still using them now silently falls back to the default instead of the intended value.
+
+| Removed key | Replacement |
+| --- | --- |
+| `global.enable_redirect` | `global.enable_blob_redirect` + `global.enable_manifest_redirect` (both default `true`) |
+| `access_policy.default_allow` | `access_policy.default = "allow"` or `"deny"` |
+| `cache_store` section | `cache` |
+| `storage` section | `blob_store` |
+
+#### Migration
+
+Rename each key in your configuration. Every replacement was accepted alongside the old key in earlier releases, so the rename is safe to apply on your current version before upgrading.

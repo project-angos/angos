@@ -11,7 +11,6 @@ use crate::{
 /// Checkers produce `Action` values via their `ActionSink`; the `Executor`
 /// applies them (or skips them in dry-run mode) in one place.
 pub enum Action {
-    MigrateBlobIndex(Digest),
     /// Delete the dead namespace-registry objects (`_registry/`) left by the
     /// pre-1.3 maintained catalog index; the catalog is now derived from content.
     PruneLegacyNamespaceRegistry,
@@ -126,9 +125,6 @@ impl fmt::Display for Action {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Action::MigrateBlobIndex(digest) => {
-                write!(f, "migrate blob index layout for '{digest}'")
-            }
             Action::PruneLegacyNamespaceRegistry => {
                 write!(
                     f,

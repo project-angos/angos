@@ -714,13 +714,10 @@ async fn blob_will_be_unreferenced(
     }
 
     let shard_path_ns = path_builder::blob_index_shard_path(digest, namespace);
-    let legacy_path = path_builder::blob_index_path(digest);
     let our_shard_will_be_empty = shard_will_be_empty(
         store,
-        namespace,
         ops_for_digest(pending_blob_ops, digest),
         &shard_path_ns,
-        &legacy_path,
     )
     .await?;
     if !our_shard_will_be_empty {

@@ -42,10 +42,6 @@ pub fn blob_path(digest: &Digest) -> String {
     format!("{}/data", blob_dir(digest))
 }
 
-pub fn blob_index_path(digest: &Digest) -> String {
-    format!("{}/index.json", blob_dir(digest))
-}
-
 pub fn blob_index_refs_dir(digest: &Digest) -> String {
     format!("{}/refs", blob_dir(digest))
 }
@@ -198,10 +194,6 @@ mod tests {
             format!("v2/blobs/sha256/aa/{HASH_A}/data")
         );
         assert_eq!(
-            blob_index_path(&digest),
-            format!("v2/blobs/sha256/aa/{HASH_A}/index.json")
-        );
-        assert_eq!(
             blob_container_dir(&digest),
             format!("v2/blobs/sha256/aa/{HASH_A}")
         );
@@ -213,10 +205,6 @@ mod tests {
         assert_eq!(
             blob_path(&digest),
             format!("v2/blobs/sha512/cc/{HASH_512}/data")
-        );
-        assert_eq!(
-            blob_index_path(&digest),
-            format!("v2/blobs/sha512/cc/{HASH_512}/index.json")
         );
     }
 
