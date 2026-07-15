@@ -71,6 +71,11 @@ fn parse_header<T: FromStr>(
 pub struct RegistryClientConfig {
     pub url: String,
     pub max_redirect: u8,
+    /// Bounds establishing the connection (TCP + TLS handshake).
+    pub connect_timeout_secs: u64,
+    /// Bounds inactivity between reads during a transfer; a long but
+    /// progressing blob transfer is never capped by a total deadline.
+    pub read_timeout_secs: u64,
     pub server_ca_bundle: Option<String>,
     /// Note: named `client_certificate` (without `_bundle`) to match the existing config key;
     /// renaming would break operator configs.
@@ -85,6 +90,10 @@ struct RegistryClientConfigFields {
     url: String,
     #[serde(default = "RegistryClientConfig::default_max_redirect")]
     max_redirect: u8,
+    #[serde(default = "RegistryClientConfig::default_connect_timeout_secs")]
+    connect_timeout_secs: u64,
+    #[serde(default = "RegistryClientConfig::default_read_timeout_secs")]
+    read_timeout_secs: u64,
     server_ca_bundle: Option<String>,
     client_certificate: Option<String>,
     client_private_key: Option<String>,
@@ -104,6 +113,8 @@ impl TryFrom<RegistryClientConfigFields> for RegistryClientConfig {
         Ok(Self {
             url: fields.url,
             max_redirect: fields.max_redirect,
+            connect_timeout_secs: fields.connect_timeout_secs,
+            read_timeout_secs: fields.read_timeout_secs,
             server_ca_bundle: fields.server_ca_bundle,
             client_certificate: fields.client_certificate,
             client_private_key: fields.client_private_key,
@@ -116,6 +127,14 @@ impl TryFrom<RegistryClientConfigFields> for RegistryClientConfig {
 impl RegistryClientConfig {
     fn default_max_redirect() -> u8 {
         5
+    }
+
+    fn default_connect_timeout_secs() -> u64 {
+        30
+    }
+
+    fn default_read_timeout_secs() -> u64 {
+        300
     }
 }
 
@@ -161,7 +180,10 @@ impl RegistryClient {
             .redirect(reqwest::redirect::Policy::limited(
                 config.max_redirect as usize,
             ))
-            .timeout(Duration::from_mins(5))
+            // No whole-transfer deadline: a connect bound plus a per-read stall
+            // bound so replicating a large blob is not capped by total time.
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .read_timeout(Duration::from_secs(config.read_timeout_secs))
             .tls_files(
                 config.server_ca_bundle.as_deref().map(Path::new),
                 config.client_certificate.as_deref().map(Path::new),
