@@ -305,17 +305,23 @@ angos scrub
 
 Then upgrade. If you have already run `angos scrub` on 1.2.0 or later, no action is required; the migration is idempotent and your indexes are already sharded.
 
-### Legacy Link Metadata (Breaking Change, Data Loss Risk)
+### Legacy Link Metadata (Breaking Change)
 
 #### What Changed
 
-Link files stored in the pre-JSON bare-digest format (a single digest string, as written by the upstream Docker `distribution` implementation) are no longer read. Angos writes link metadata as JSON with a `created_at` timestamp, and only that format is parsed now.
+Link files stored in the pre-JSON bare-digest format (a single digest string, as written by the upstream Docker `distribution` implementation) are no longer read at runtime. Angos writes link metadata as JSON with a `created_at` timestamp, and only that format is parsed by the serving paths now. A bare-digest link no longer resolves, and because a read precedes every write and delete, it cannot be re-pushed or removed through the API until it is rewritten.
 
 **Who is affected:** Deployments seeded from a raw `distribution` on-disk layout whose links were never rewritten by angos (for example a tag that has not been pushed, retagged, or otherwise touched since the import). Native angos deployments write JSON links from the start and are unaffected.
 
 #### Migration
 
-Rewrite the affected links as JSON before upgrading by re-pushing the affected tags or manifests through angos; any link write converts the file to JSON. A bare-digest link carries no `created_at`, so it never wins replication last-writer-wins and retention treats it as oldest.
+After upgrading, run `angos migrate` to rewrite every bare-digest link as JSON:
+
+```text
+angos migrate
+```
+
+Run it before serving the affected repositories. The command is idempotent, so it is safe to re-run and leaves already-JSON links untouched; pass `--dry-run` to report what it would rewrite without changing anything. A migrated link is written without a `created_at`, so it never wins replication last-writer-wins and retention treats it as oldest.
 
 ### Removed Configuration Keys (Breaking Change)
 

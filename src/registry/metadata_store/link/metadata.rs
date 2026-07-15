@@ -39,6 +39,22 @@ impl LinkMetadata {
         }
     }
 
+    /// Build a link carrying no creation timestamp. Used by `angos migrate`
+    /// to rebuild a pre-JSON `distribution` link (a bare digest file) as JSON.
+    /// A missing `created_at` never wins last-writer-wins (a synthesised
+    /// `now()` would re-stamp fresher on every read and block replication to
+    /// the tag), so a migrated legacy link stays subordinate to any real write.
+    pub fn without_timestamp(target: Digest) -> Self {
+        Self {
+            target,
+            created_at: None,
+            accessed_at: None,
+            referenced_by: HashSet::new(),
+            media_type: None,
+            descriptor: None,
+        }
+    }
+
     pub fn add_referrer(&mut self, digest: Digest) {
         self.referenced_by.insert(digest);
     }

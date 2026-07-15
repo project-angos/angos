@@ -21,7 +21,7 @@ mod event_emission_tests;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;
-mod path_builder;
+pub mod path_builder;
 pub mod repository;
 pub mod repository_resolver;
 pub mod s3_connection;

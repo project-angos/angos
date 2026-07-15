@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.4.0 - Unreleased
 
+### Added
+
+- New `angos migrate` command rewrites pre-JSON bare-digest link files as JSON, converting registries seeded from a raw Docker `distribution` on-disk layout.
+
 ### Removed
 
 - The deprecated `access_policy.default_allow` boolean is removed; set the typed `default = "allow"` or `default = "deny"` instead.
@@ -13,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The deprecated `storage` config section is removed; use `blob_store`.
 - The deprecated `global.enable_redirect` boolean is removed; use `global.enable_blob_redirect` and `global.enable_manifest_redirect`.
 - The legacy single-file blob index (`index.json`) runtime fallback and its scrub migration are removed; run `angos scrub` on the prior version before upgrading, or references held only in an un-migrated `index.json` are lost.
-- The pre-JSON bare-digest link-metadata fallback (from data seeded off a raw Docker `distribution` on-disk layout) is removed; such links must be rewritten as JSON before upgrading, otherwise they no longer resolve.
+- The pre-JSON bare-digest link-metadata runtime fallback is removed; such links no longer resolve until `angos migrate` rewrites them as JSON.
 
 ## 1.3.2
 

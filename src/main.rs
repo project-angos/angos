@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    command::{argon, bootstrap, prune, replicate, scrub, server, worker},
+    command::{argon, bootstrap, migrate, prune, replicate, scrub, server, worker},
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
     metrics_provider::initialize_metrics,
 };
@@ -108,6 +108,7 @@ struct GlobalArguments {
 #[argh(subcommand)]
 enum SubCommand {
     Argon(argon::Options),
+    Migrate(migrate::Options),
     Prune(prune::Options),
     Replicate(replicate::Options),
     Scrub(scrub::Options),
@@ -160,6 +161,15 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
                 1
             }
         },
+        SubCommand::Migrate(migrate_options) => {
+            match migrate::run(&migrate_options, &config).await {
+                Ok(()) => 0,
+                Err(err) => {
+                    error!("Migrate error: {err}");
+                    1
+                }
+            }
+        }
         SubCommand::Prune(prune_options) => match prune::run(&prune_options, &config).await {
             Ok(()) => 0,
             Err(err) => {
