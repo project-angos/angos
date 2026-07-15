@@ -115,7 +115,7 @@ See [Conditional Operations](../reference/configuration.md#conditional-operation
 - `global.enable_blob_redirect`: controls HTTP 307 redirects for blob (layer/config) downloads.
 - `global.enable_manifest_redirect`: controls HTTP 307 redirects for manifest downloads.
 
-Both default to `true`, preserving historical behavior. The old `enable_redirect` field is still accepted as a fallback for both new flags and will emit a deprecation warning at startup.
+Both default to `true`, preserving historical behavior. The old `enable_redirect` field was accepted as a fallback for both new flags in 1.2.0 through 1.3.x and is **removed in 1.4.0**; migrate to the two new flags.
 
 Additionally, presigned manifest URLs now include a `response-content-type` query parameter so that S3 serves the correct OCI/Docker media type after a redirect, rather than `binary/octet-stream`. This fixes `podman pull` and `skopeo copy` failures against Angos deployments with S3-backed storage and redirects enabled.
 
@@ -139,7 +139,7 @@ enable_blob_redirect = false
 enable_manifest_redirect = false
 ```
 
-**If you want to keep using `enable_redirect`**, no immediate action is required. The field continues to work as a fallback but will print a warning at startup. Update to the new fields at your convenience.
+**If you still set `enable_redirect`**, it is ignored as of 1.4.0 (the key is no longer read); set `enable_blob_redirect` and `enable_manifest_redirect` instead.
 
 ### Extension API Path Change (Breaking Change)
 

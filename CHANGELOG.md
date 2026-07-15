@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The deprecated `access_policy.default_allow` boolean is removed; set the typed `default = "allow"` or `default = "deny"` instead.
 - The deprecated `cache_store` config section is removed; use `cache`.
 - The deprecated `storage` config section is removed; use `blob_store`.
+- The deprecated `global.enable_redirect` boolean is removed; use `global.enable_blob_redirect` and `global.enable_manifest_redirect`.
 
 ## 1.3.2
 

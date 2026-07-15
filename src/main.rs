@@ -152,8 +152,6 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
         }
     };
 
-    config.log_deprecations();
-
     let exit_code = match cli_args.subcommand {
         SubCommand::Argon(_) => match argon::run() {
             Ok(()) => 0,
