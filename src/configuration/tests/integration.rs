@@ -296,26 +296,6 @@ fn test_cache_config_redis() {
 }
 
 #[test]
-fn test_cache_store_backward_compatibility() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [cache_store.redis]
-    url = "redis://localhost:6379"
-    key_prefix = "angos:"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    match config.cache {
-        cache::Config::Redis(redis_config) => {
-            assert_eq!(redis_config.url, "redis://localhost:6379");
-        }
-        cache::Config::Memory => panic!("Expected Redis cache config"),
-    }
-}
-
-#[test]
 fn test_invalid_toml_format() {
     let config = r#"
     [server
