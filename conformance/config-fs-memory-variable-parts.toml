@@ -6,6 +6,6 @@ port = 8000
 root_dir = "./conformance/fs-data"
 
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 [repository."conformance"]

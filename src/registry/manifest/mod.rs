@@ -5,8 +5,8 @@ mod response;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
+use parse::parse_and_validate_manifest;
 pub use parse::{ParsedManifestDigests, parse_manifest_digests};
-use parse::{manifest_meta_from_body, parse_and_validate_manifest};
 pub use response::{GetManifestResponse, HeadManifestResponse, PutManifestResponse};
 use response::{ManifestBody, ManifestMeta};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -260,34 +260,16 @@ impl Registry {
         let blob_link = LinkKind::from_reference(reference);
         let link = self.read_manifest_link(namespace, &blob_link).await?;
 
-        if let Some(media_type) = link.media_type {
-            let size = self.blob_store.size(&link.target).await.map_err(|error| {
-                error!("Failed to get blob size: {error}");
-                Error::ManifestUnknown
-            })?;
+        let size = self.blob_store.size(&link.target).await.map_err(|error| {
+            error!("Failed to get blob size: {error}");
+            Error::ManifestUnknown
+        })?;
 
-            return Ok(ManifestMeta {
-                media_type: Some(media_type),
-                digest: link.target,
-                size,
-            });
-        }
-
-        // Backward compatibility: links created before media_type was stored require
-        // a full blob read. Remove this fallback once all links have been re-pushed.
-        let (mut reader, _) =
-            self.blob_store
-                .reader(&link.target, None)
-                .await
-                .map_err(|error| {
-                    error!("Failed to build blob reader: {error}");
-                    Error::ManifestUnknown
-                })?;
-
-        let mut manifest_content = Vec::new();
-        reader.read_to_end(&mut manifest_content).await?;
-
-        manifest_meta_from_body(&link.target, &manifest_content)
+        Ok(ManifestMeta {
+            media_type: link.media_type,
+            digest: link.target,
+            size,
+        })
     }
 
     #[instrument(skip(repository))]
@@ -392,13 +374,9 @@ impl Registry {
         let link = self.read_manifest_link(namespace, &blob_link).await?;
 
         let content = self.blob_store.read(&link.target).await?;
-        let manifest: Manifest = serde_json::from_slice(&content).map_err(|error| {
-            warn!("Failed to deserialize manifest: {error}");
-            Error::ManifestInvalid("Failed to deserialize manifest".to_string())
-        })?;
 
         Ok(ManifestBody {
-            media_type: link.media_type.or(manifest.media_type),
+            media_type: link.media_type,
             digest: link.target,
             content,
         })
@@ -862,22 +840,6 @@ impl Registry {
                 is_tag_immutable,
             )
             .await?;
-
-        // Backward compatibility: when the optimized redirect path above fails (link
-        // lacks media_type), fall back to redirecting after reading the full blob.
-        // Remove this block once all links have been re-pushed.
-        if self.enable_manifest_redirect
-            && let Ok(Some(presigned_url)) = self
-                .blob_store
-                .presigned_url(&manifest.digest, manifest.media_type.as_deref())
-                .await
-        {
-            return Ok(GetManifestResponse::Redirect {
-                redirect_url: presigned_url,
-                digest: manifest.digest,
-                media_type: manifest.media_type,
-            });
-        }
 
         Ok(GetManifestResponse::Body {
             media_type: manifest.media_type,

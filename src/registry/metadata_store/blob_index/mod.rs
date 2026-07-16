@@ -6,16 +6,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument};
+use tracing::instrument;
 
 use angos_tx_engine::{
     StorageError,
     error::Error as TxError,
     executor::{DEFAULT_RETRY_BUDGET, execute_with_retry},
-    transaction::{Mutation, Transaction},
+    transaction::Transaction,
 };
 
 use crate::{
@@ -30,9 +29,8 @@ use crate::{
 pub mod shard;
 
 use self::shard::{
-    SHARD_READ_CONCURRENCY, append_shard_for_digest, append_shard_ops, collect_blob_index_shards,
-    decode_blob_index_shard_namespace, namespace_links_from_index, non_empty_links_or_not_found,
-    read_shard,
+    SHARD_READ_CONCURRENCY, append_shard_for_digest, collect_blob_index_shards,
+    decode_blob_index_shard_namespace, non_empty_links_or_not_found,
 };
 
 // Domain types
@@ -164,10 +162,7 @@ impl MetadataStore {
         }
 
         if !found_shards || index.namespace.is_empty() {
-            return match self.read_legacy_blob_index(digest).await? {
-                Some(legacy) if !legacy.namespace.is_empty() => Ok(legacy),
-                _ => Err(Error::NotFound),
-            };
+            return Err(Error::NotFound);
         }
         Ok(index)
     }
@@ -204,10 +199,7 @@ impl MetadataStore {
             }
         }
 
-        Ok(self
-            .read_legacy_blob_index(digest)
-            .await?
-            .is_some_and(|legacy| legacy.namespace.values().any(|links| !links.is_empty())))
+        Ok(false)
     }
 
     #[instrument(skip(self))]
@@ -222,83 +214,8 @@ impl MetadataStore {
                 let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
                 non_empty_links_or_not_found(links)
             }
-            Err(StorageError::NotFound) => match self.read_legacy_blob_index(digest).await? {
-                Some(legacy) => namespace_links_from_index(&legacy, namespace),
-                None => Err(Error::NotFound),
-            },
+            Err(StorageError::NotFound) => Err(Error::NotFound),
             Err(e) => Err(e.into()),
         }
-    }
-
-    /// Read the legacy single-file blob index for `digest`, or `None` when no
-    /// legacy object exists. A malformed body deserializes to an empty
-    /// [`BlobIndex`] (`unwrap_or_default`); callers apply their own non-empty /
-    /// not-found projection over the result.
-    async fn read_legacy_blob_index(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
-        match self
-            .store()
-            .object_store()
-            .get(&path_builder::blob_index_path(digest))
-            .await
-        {
-            Ok(data) => Ok(Some(serde_json::from_slice(&data).unwrap_or_default())),
-            Err(StorageError::NotFound) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    #[instrument(skip(self))]
-    pub async fn migrate_blob_index(&self, digest: &Digest) -> Result<(), Error> {
-        let legacy_path = path_builder::blob_index_path(digest);
-
-        // Read the legacy file once outside the retry loop; if absent, nothing
-        // to migrate. On conflict the engine re-reads under the lock, so a
-        // concurrent migrator wins and we bail cleanly.
-        let data = match self.store().object_store().get(&legacy_path).await {
-            Ok(d) => d,
-            Err(StorageError::NotFound) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-
-        let blob_index: BlobIndex = serde_json::from_slice(&data).map_err(Error::from)?;
-        let namespace_count = blob_index.namespace.len();
-        let raw_legacy = Bytes::from(data);
-
-        execute_with_retry(
-            self.executor(),
-            || async {
-                let mut builder =
-                    Transaction::builder().read(legacy_path.clone(), raw_legacy.clone());
-
-                for (namespace, links) in &blob_index.namespace {
-                    let shard_path = path_builder::blob_index_shard_path(digest, namespace);
-                    let operations: Vec<BlobIndexOperation> = links
-                        .iter()
-                        .map(|l| BlobIndexOperation::Insert(l.clone()))
-                        .collect();
-
-                    // Re-read each shard inside the closure so the
-                    // fingerprint is fresh on every retry attempt.
-                    let existing = read_shard(self.store(), &shard_path)
-                        .await
-                        .map_err(TxError::Storage)?;
-                    builder = append_shard_ops(shard_path, existing, &operations, builder)
-                        .map_err(TxError::Serde)?;
-                }
-
-                builder = builder.mutation(Mutation::Delete {
-                    key: legacy_path.clone(),
-                    expected: None,
-                });
-
-                Ok(builder.build())
-            },
-            DEFAULT_RETRY_BUDGET,
-        )
-        .await
-        .map_err(Error::from)?;
-
-        info!("Migrated legacy blob index for '{digest}' ({namespace_count} namespaces)",);
-        Ok(())
     }
 }

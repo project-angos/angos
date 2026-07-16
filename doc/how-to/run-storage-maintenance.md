@@ -38,7 +38,6 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
 | `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--reconcile-blob-index`      | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band. Reads every manifest, so it is expensive |
-| `-M, --media-types`           | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `-R, --referrers`             | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 | `-n, --orphan-namespaces`     | Delete all content for namespaces not owned by any configured repository (destructive; see below)  |
 | `-d, --dry-run`               | Preview changes without applying them                                                              |
@@ -331,37 +330,6 @@ S3 multipart uploads that were started but never completed can accumulate and co
 - Have no corresponding upload container in the registry metadata
 
 This is S3-specific and has no effect on filesystem storage backends.
-
-### Backfill Media Types
-
-The `--media-types` flag reads each manifest blob and writes its `media_type` into the link metadata. This enables optimizations that avoid full blob reads on HEAD requests and redirect paths. Run this once after upgrading to populate existing links:
-
-```bash
-# Preview what would be backfilled
-./angos -c config.toml scrub --media-types --dry-run
-
-# Backfill media types on all manifest links
-./angos -c config.toml scrub --media-types
-```
-
-This is idempotent and safe to run multiple times.
-
-### Blob Index Migration
-
-Legacy single-file blob indexes (`index.json`) keep working at runtime against both the S3 and filesystem backends. Reads consult the sharded layout first and fall back to the legacy file when no sharded entry exists, and writes are applied in place to a legacy file when one is present so the layout never splits mid-blob. Operators are **not** forced to run scrub just to keep serving traffic.
-
-`scrub` is the only way to convert the on-disk blob-index layout from legacy to sharded:
-
-- `scrub --blobs` iterates every blob, rewrites each legacy `index.json` into per-namespace shards under `refs/{namespace}.json`, and deletes the legacy file once the shards are written.
-
-Running scrub benefits operators who want the per-namespace shard layout's lock granularity and concurrency characteristics for old blobs; the runtime fallback is correct but does not gain those properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
-
-```bash
-# Migrate legacy blob indexes
-./angos -c config.toml scrub --blobs
-```
-
-This migration is **idempotent**: re-running scrub is safe and will simply skip data that is already in the sharded layout.
 
 ### Fix Links Format
 

@@ -11,7 +11,7 @@ use crate::{
     jobs::store::{Error as JobStoreError, JobEnvelope, JobStore},
     jobs::{JobState, Queue},
     metrics_provider::metrics_provider,
-    oci::{Digest, MediaType, Namespace, Reference, Tag},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{
         Error as RegistryError, Registry,
         blob_store::{self, BlobStore, MultipartCleanup},
@@ -158,18 +158,6 @@ pub fn record_reconcile_outcome(outcome: &str) {
 }
 
 impl Executor {
-    async fn migrate_blob_index(&self, digest: Digest) -> Result<(), Error> {
-        self.metadata_store.migrate_blob_index(&digest).await?;
-        Ok(())
-    }
-
-    async fn prune_legacy_namespace_registry(&self) -> Result<(), Error> {
-        self.metadata_store
-            .delete_legacy_namespace_registry()
-            .await?;
-        Ok(())
-    }
-
     /// Deletes the orphan's bytes under the `blob-data:{digest}` coarse lock
     /// (the same one manifest pushes and upload completions take), so a
     /// reference a concurrent push is granting cannot be missed and have its
@@ -304,26 +292,6 @@ impl Executor {
             .update_links(
                 &namespace,
                 &[LinkOperation::create_with_referrer(link, target, referrer)],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn set_media_type(
-        &self,
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-        media_type: MediaType,
-    ) -> Result<(), Error> {
-        self.metadata_store
-            .update_links(
-                &namespace,
-                &[LinkOperation::create_with_media_type(
-                    link,
-                    target,
-                    Some(media_type),
-                )],
             )
             .await?;
         Ok(())
@@ -503,8 +471,6 @@ impl ActionSink for Executor {
         info!("{action}");
 
         match action {
-            Action::MigrateBlobIndex(digest) => self.migrate_blob_index(digest).await,
-            Action::PruneLegacyNamespaceRegistry => self.prune_legacy_namespace_registry().await,
             Action::DeleteOrphanBlob(digest) => self.delete_orphan_blob(digest).await,
             Action::RemoveBlobIndexLink {
                 namespace,
@@ -530,16 +496,6 @@ impl ActionSink for Executor {
                 target,
                 referrer,
             } => self.add_referrer(namespace, link, target, referrer).await,
-            Action::SetMediaType {
-                namespace,
-                link,
-                target,
-                media_type,
-                ..
-            } => {
-                self.set_media_type(namespace, link, target, media_type)
-                    .await
-            }
             Action::DeleteTag { namespace, tag } => self.delete_tag(namespace, tag).await,
             Action::DeleteInvalidTag { namespace, tag } => {
                 self.delete_invalid_tag(namespace, tag).await

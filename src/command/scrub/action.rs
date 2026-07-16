@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     jobs::{JobState, Queue},
-    oci::{Digest, MediaType, Namespace, Tag},
+    oci::{Digest, Namespace, Tag},
     registry::metadata_store::LinkKind,
 };
 
@@ -11,10 +11,6 @@ use crate::{
 /// Checkers produce `Action` values via their `ActionSink`; the `Executor`
 /// applies them (or skips them in dry-run mode) in one place.
 pub enum Action {
-    MigrateBlobIndex(Digest),
-    /// Delete the dead namespace-registry objects (`_registry/`) left by the
-    /// pre-1.3 maintained catalog index; the catalog is now derived from content.
-    PruneLegacyNamespaceRegistry,
     DeleteOrphanBlob(Digest),
     RemoveBlobIndexLink {
         namespace: Namespace,
@@ -51,13 +47,6 @@ pub enum Action {
         namespace: Namespace,
         link: LinkKind,
         referrer: Digest,
-    },
-    SetMediaType {
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-        media_type: MediaType,
-        display_name: String,
     },
     DeleteTag {
         namespace: Namespace,
@@ -126,15 +115,6 @@ impl fmt::Display for Action {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Action::MigrateBlobIndex(digest) => {
-                write!(f, "migrate blob index layout for '{digest}'")
-            }
-            Action::PruneLegacyNamespaceRegistry => {
-                write!(
-                    f,
-                    "prune the legacy namespace-registry index ('_registry/')"
-                )
-            }
             Action::DeleteOrphanBlob(digest) => {
                 write!(f, "delete orphan blob '{digest}'")
             }
@@ -193,17 +173,6 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "remove referrer {referrer} from link {link} in namespace '{namespace}'"
-                )
-            }
-            Action::SetMediaType {
-                namespace,
-                media_type,
-                display_name,
-                ..
-            } => {
-                write!(
-                    f,
-                    "set media_type '{media_type}' on {display_name} in namespace '{namespace}'"
                 )
             }
             Action::DeleteTag { namespace, tag } => {

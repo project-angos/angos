@@ -15,13 +15,8 @@
 //! - `identity`: Client identity information (id, username, certificate details)
 //! - `request`: Request details (action, namespace, digest, reference)
 
-use std::fmt;
-
 use cel_interpreter::Context;
-use serde::{
-    Deserialize, Deserializer,
-    de::{self, MapAccess, Visitor},
-};
+use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::identity::{Action, ClientIdentity};
@@ -39,78 +34,14 @@ pub enum AccessMode {
 }
 
 /// Configuration for access control policies.
-#[derive(Clone, Debug, Default)]
+///
+/// A missing `default` denies by default; an unknown key is ignored and a
+/// duplicate key is rejected (both serde defaults).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct AccessPolicyConfig {
     pub default: AccessMode,
     pub rules: Vec<CelRule>,
-}
-
-impl<'de> Deserialize<'de> for AccessPolicyConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct AccessPolicyVisitor;
-
-        impl<'de> Visitor<'de> for AccessPolicyVisitor {
-            type Value = AccessPolicyConfig;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("access policy configuration")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut default = None;
-                let mut default_allow = None;
-                let mut rules = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "default" => assign_once(&mut default, "default", map.next_value()?)?,
-                        "default_allow" => {
-                            assign_once(&mut default_allow, "default_allow", map.next_value()?)?;
-                        }
-                        "rules" => assign_once(&mut rules, "rules", map.next_value()?)?,
-                        _ => {
-                            let _ = map.next_value::<de::IgnoredAny>()?;
-                        }
-                    }
-                }
-
-                if default_allow.is_some() {
-                    warn!("'access_policy.default_allow' is deprecated; use 'default' instead");
-                }
-
-                Ok(AccessPolicyConfig {
-                    default: default
-                        .or_else(|| default_allow.map(AccessMode::from_default_allow))
-                        .unwrap_or_default(),
-                    rules: rules.unwrap_or_default(),
-                })
-            }
-        }
-
-        deserializer.deserialize_map(AccessPolicyVisitor)
-    }
-}
-
-fn assign_once<T, E>(slot: &mut Option<T>, field: &'static str, value: T) -> Result<(), E>
-where
-    E: de::Error,
-{
-    if slot.replace(value).is_some() {
-        return Err(de::Error::duplicate_field(field));
-    }
-    Ok(())
-}
-
-impl AccessMode {
-    fn from_default_allow(allow: bool) -> Self {
-        if allow { Self::Allow } else { Self::Deny }
-    }
 }
 
 impl From<AccessMode> for PolicyDecision {
@@ -459,28 +390,6 @@ mod tests {
     fn test_access_policy_default_toml_unknown_value_fails() {
         let result: Result<AccessPolicyConfig, _> = toml::from_str("default = \"maybe\"");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_deprecated_default_allow_true_maps_to_allow() {
-        let config: AccessPolicyConfig = toml::from_str("default_allow = true").unwrap();
-        assert_eq!(config.default, AccessMode::Allow);
-    }
-
-    #[test]
-    fn test_deprecated_default_allow_false_maps_to_deny() {
-        let config: AccessPolicyConfig = toml::from_str("default_allow = false").unwrap();
-        assert_eq!(config.default, AccessMode::Deny);
-    }
-
-    #[test]
-    fn test_default_wins_over_deprecated_default_allow() {
-        let toml = r#"
-            default = "deny"
-            default_allow = true
-        "#;
-        let config: AccessPolicyConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.default, AccessMode::Deny);
     }
 
     // --- Non-boolean and error rule behaviour ---

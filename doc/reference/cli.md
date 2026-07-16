@@ -84,7 +84,6 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--retention`             | `-r`   | Deprecated: use [`angos prune`](#prune)                                                            |
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--reconcile-blob-index`  |        | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band (storage corruption, manual tampering). Reads every manifest, so it is expensive |
-| `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 | `--replicate`             |        | Deprecated: use [`angos replicate`](#replicate)                                                    |
 | `--replication-orphans`   |        | Delete replication jobs (pending and dead-lettered) whose downstream or repository is no longer configured                                       |
@@ -198,6 +197,34 @@ angos replicate --dry-run
 
 # Reconcile every replicated repository with its downstreams
 angos replicate
+```
+
+---
+
+### migrate
+
+Convert pre-JSON bare-digest link files to the current JSON format. Needed only for registries seeded from a raw Docker `distribution` on-disk layout, whose links the serving paths no longer read.
+
+```bash
+angos migrate [options]
+```
+
+Walks every link object once and rewrites each bare-digest file as JSON, leaving already-JSON links and unrecognizable files untouched. It is idempotent, so an interrupted run can be re-run. See [Upgrade Guide](../how-to/upgrade.md#legacy-link-metadata-breaking-change).
+
+**Options:**
+
+| Option      | Short | Description                                    |
+|-------------|-------|------------------------------------------------|
+| `--dry-run` | `-d`  | Report what would be rewritten without changes |
+
+**Examples:**
+
+```bash
+# Preview which links would be rewritten
+angos migrate --dry-run
+
+# Rewrite bare-digest links as JSON
+angos migrate
 ```
 
 ---

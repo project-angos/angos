@@ -109,7 +109,7 @@ impl Hasher {
     }
 
     /// The digest for `algorithm`, or an error if this hasher carries no state
-    /// for it (a legacy checkpoint resumed without that algorithm).
+    /// for it (a checkpoint written before that algorithm was supported).
     pub fn digest(&self, algorithm: Algorithm) -> Result<oci::Digest, Error> {
         self.hashers
             .iter()
@@ -142,15 +142,11 @@ impl HashState {
         Ok(serde_json::to_vec(&map)?)
     }
 
-    /// Decode from checkpoint bytes; unknown algorithms are ignored so a newer
-    /// build's checkpoint still resumes. A legacy pre-JSON payload (a bare
-    /// sha256 state) is not valid JSON, so it is read as a sha256-only checkpoint.
+    /// Decode from the JSON checkpoint bytes; unknown algorithms are ignored so
+    /// a newer build's checkpoint still resumes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let Ok(map) = serde_json::from_slice::<BTreeMap<String, String>>(bytes) else {
-            return Ok(Self {
-                states: BTreeMap::from([(Algorithm::Sha256, bytes.to_vec())]),
-            });
-        };
+        let map: BTreeMap<String, String> = serde_json::from_slice(bytes)
+            .map_err(|e| Error::Internal(format!("invalid hash checkpoint: {e}")))?;
 
         let mut states = BTreeMap::new();
         for (name, encoded) in map {
@@ -170,7 +166,7 @@ impl HashState {
     }
 
     /// Rebuild a live [`Hasher`] from the checkpointed states. A missing
-    /// algorithm (e.g. sha512 absent from a legacy checkpoint) is left out
+    /// algorithm (e.g. one added after the checkpoint was written) is left out
     /// rather than started fresh, which would hash from the wrong offset and
     /// silently corrupt the result; [`Hasher::digest`] then errors if it is
     /// requested.
@@ -256,33 +252,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sha256_only_checkpoint_resumes_sha256_and_rejects_sha512() {
-        // A pre-JSON checkpoint is a bare sha256 state.
-        let mut sha256 = AlgorithmHasher::new(Algorithm::Sha256);
-        sha256.update(b"legacy bytes");
-        let legacy = sha256.serialized_state();
-
-        let restored = HashState::from_bytes(&legacy)
-            .unwrap()
-            .into_hasher()
-            .unwrap();
-        assert_eq!(restored.digest(Algorithm::Sha256).unwrap(), sha256.digest());
-        // sha512 was never hashed for the legacy bytes: it must NOT be fabricated,
-        // and the error names the unavailable algorithm (mapped to a 4xx upstream)
-        // rather than a generic hash-serialization failure.
-        assert!(matches!(
-            restored.digest(Algorithm::Sha512),
-            Err(Error::DigestInvalid)
-        ));
-    }
-
-    #[test]
-    fn from_state_rejects_garbage() {
-        assert!(
-            HashState::from_bytes(&[0xAB, 0xCD, 0xEF])
-                .unwrap()
-                .into_hasher()
-                .is_err()
-        );
+    fn from_bytes_rejects_non_json_checkpoint() {
+        // A non-JSON payload (corrupt, or a pre-JSON bare state) is rejected
+        // rather than resumed.
+        assert!(HashState::from_bytes(&[0xAB, 0xCD, 0xEF]).is_err());
     }
 }

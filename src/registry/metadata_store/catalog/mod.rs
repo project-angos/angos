@@ -1,6 +1,5 @@
 //! The namespace / tag / revision / referrer catalog: the content-derived
-//! enumeration endpoints, the namespace tree-walk they build on, and the prune
-//! of the dead pre-1.3 `_registry/` namespace index.
+//! enumeration endpoints and the namespace tree-walk they build on.
 
 use futures_util::stream::{self, StreamExt};
 use tracing::{debug, instrument};
@@ -17,10 +16,6 @@ use crate::{
 };
 
 mod referrer_resolver;
-
-/// Prefix of the pre-1.3 maintained namespace-registry index. The catalog is now
-/// derived from content, so these objects are dead and are pruned by scrub.
-const LEGACY_NAMESPACE_REGISTRY_PREFIX: &str = "_registry";
 
 impl MetadataStore {
     /// Lists the namespaces holding manifest content (a `_manifests` child);
@@ -283,16 +278,6 @@ impl MetadataStore {
         }
 
         Ok(count)
-    }
-
-    /// Delete the dead pre-1.3 namespace-registry objects (`_registry/`).
-    /// Idempotent: a no-op once the prefix is gone.
-    pub async fn delete_legacy_namespace_registry(&self) -> Result<(), Error> {
-        self.store()
-            .object_store()
-            .delete_prefix(LEGACY_NAMESPACE_REGISTRY_PREFIX)
-            .await
-            .map_err(Error::from)
     }
 
     /// Delete an entire tag directory by prefix. Used by scrub for an invalid

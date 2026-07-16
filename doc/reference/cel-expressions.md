@@ -76,8 +76,9 @@ Information about the current request. Fields are present based on the action ty
 |-------------------------|---------|--------------------------------------------|
 | `request.action`        | string  | Action being requested (see Actions table) |
 | `request.namespace`     | string? | Repository namespace                       |
-| `request.digest`        | string? | Blob/manifest digest                       |
-| `request.reference`     | string? | Tag or digest reference                    |
+| `request.digest`        | string? | Blob or manifest digest (blob actions; by-digest `put-manifest`) |
+| `request.reference`     | string? | Manifest tag or digest reference (`get`/`head`/`delete-manifest`) |
+| `request.tags`          | list<string> | Tags a `put-manifest` creates, empty when none (the target tag, or `?tag=` params on a by-digest push) |
 | `request.uuid`          | string? | Upload session UUID                        |
 | `request.from`          | string? | Cross-repository mount source repository (`mount-blob` only) |
 | `request.n`             | int?    | Pagination limit                           |

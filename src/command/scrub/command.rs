@@ -10,7 +10,7 @@ use crate::{
         replicate::ReplicationDrain,
         scrub::{
             action::Action,
-            check::{LayoutChecker, NamespaceChecker, StoreChecker, TagChecker, list_all},
+            check::{NamespaceChecker, TagChecker, list_all},
             error::Error,
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
             setup::{self, LabeledStoreCheckers},
@@ -58,9 +58,6 @@ pub struct Options {
     /// reference each blob (repairs an index corrupted out-of-band, e.g. storage
     /// corruption or manual tampering); reads every manifest, so it is expensive
     pub reconcile_blob_index: bool,
-    #[argh(switch, short = 'M')]
-    /// backfill missing `media_type` on manifest links
-    pub media_types: bool,
     #[argh(switch, short = 'R')]
     /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
     pub referrers: bool,
@@ -95,7 +92,6 @@ pub struct Command {
     /// the namespace checkers so the invalid-tag gate and per-tag checks precede
     /// the aggregate tag checks. `None` when `--tags` is absent.
     tag_checkers: Option<Vec<Box<dyn TagChecker>>>,
-    layout_checker: LayoutChecker,
     /// Store-wide checkers (blobs, orphan grants/namespaces/jobs, multipart),
     /// each paired with a stable label for failure attribution, pre-ordered by
     /// [`setup::store_checkers`] and applied in one pass.
@@ -125,7 +121,6 @@ impl Command {
             &repositories,
         )?;
         let tag_checkers = setup::tag_checkers(options, &blob_backend, &metadata_store);
-        let layout_checker = setup::layout_checker(&blob_backend);
         let store_checkers =
             setup::store_checkers(options, &blob_backend, &metadata_store, &repositories)?;
 
@@ -174,7 +169,6 @@ impl Command {
             metadata_store,
             namespace_checkers,
             tag_checkers,
-            layout_checker,
             store_checkers,
             sink,
             replication_drain,
@@ -183,7 +177,6 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
-        self.migrate_storage_layout().await?;
         self.scrub_metadata().await?;
         // Store-wide checkers run in the order `setup::store_checkers` built
         // them: orphan-namespace clearing frees manifest bytes for the blob
@@ -196,13 +189,6 @@ impl Command {
         self.metadata_store.flush_access_times().await;
         if let Some(registry) = &self.retention_registry {
             registry.shutdown().await;
-        }
-        Ok(())
-    }
-
-    async fn migrate_storage_layout(&mut self) -> Result<(), Error> {
-        if let Err(e) = self.layout_checker.check_all(self.sink.as_mut()).await {
-            warn!("Storage layout migration checker failed: {e}");
         }
         Ok(())
     }
