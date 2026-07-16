@@ -57,9 +57,9 @@ use crate::{
 };
 
 /// Fixed path segment under which the hasher-state checkpoint is stored
-/// (`hashstates/<CHECKPOINT_DIR_SEGMENT>/<offset>`). Kept as `sha256` (its
-/// historical algorithm-name origin) though the checkpoint now holds every
-/// algorithm's state, so a pre-multi-algorithm checkpoint still resumes.
+/// (`hashstates/<CHECKPOINT_DIR_SEGMENT>/<offset>`). Kept as `sha256`, its
+/// historical algorithm-name origin, though the checkpoint now holds every
+/// algorithm's state as a JSON map.
 const CHECKPOINT_DIR_SEGMENT: &str = "sha256";
 
 /// Bytes peeked from a chunked (`None`) body to tell an empty finalize from one
