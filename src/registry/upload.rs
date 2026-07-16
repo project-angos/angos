@@ -1798,7 +1798,7 @@ mod tests {
 
         assert_eq!(summary.size, content.len() as u64);
 
-        // Corrupt every `hashstates/sha256/<offset>` checkpoint so that
+        // Corrupt every `hashstates/<offset>` checkpoint so that
         // `complete_upload` cannot reconstruct the final digest from the
         // persisted hasher state.
         let hashstates_dir =
@@ -1808,7 +1808,6 @@ mod tests {
                 .join(path_builder::upload_hash_context_dir(
                     namespace,
                     session_id.as_ref(),
-                    "sha256",
                 ));
         for entry in std::fs::read_dir(&hashstates_dir).unwrap() {
             let checkpoint = entry.unwrap().path();

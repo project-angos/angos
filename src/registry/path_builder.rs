@@ -71,22 +71,17 @@ pub fn upload_path(namespace: &Namespace, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/data")
 }
 
-/// Directory holding an upload's hasher-state checkpoints under `algorithm`, one
-/// file per offset. Used to enumerate checkpoints and pick the most recent.
-pub fn upload_hash_context_dir(namespace: &Namespace, uuid: &str, algorithm: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}")
+/// Directory holding an upload's hasher-state checkpoints, one file per offset.
+/// Used to enumerate checkpoints and pick the most recent.
+pub fn upload_hash_context_dir(namespace: &Namespace, uuid: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates")
 }
 
-/// An upload's serialised hasher-state checkpoint under `algorithm` after
-/// consuming its bytes up to `offset`. One file per offset, allowing hash
-/// resumption after a crash without re-reading the uploaded bytes.
-pub fn upload_hash_context_path(
-    namespace: &Namespace,
-    uuid: &str,
-    algorithm: &str,
-    offset: u64,
-) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}/{offset}")
+/// An upload's serialised hasher-state checkpoint after consuming its bytes up
+/// to `offset`. One file per offset, allowing hash resumption after a crash
+/// without re-reading the uploaded bytes.
+pub fn upload_hash_context_path(namespace: &Namespace, uuid: &str, offset: u64) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{offset}")
 }
 
 /// RFC3339 timestamp marking when the upload session was created. Used for
@@ -221,8 +216,8 @@ mod tests {
         );
         assert_eq!(uploads_root_dir(&ns), "v2/repositories/ns/_uploads");
         assert_eq!(
-            upload_hash_context_path(&ns, "uuid", "sha256", 42),
-            "v2/repositories/ns/_uploads/uuid/hashstates/sha256/42"
+            upload_hash_context_path(&ns, "uuid", 42),
+            "v2/repositories/ns/_uploads/uuid/hashstates/42"
         );
         assert_eq!(
             upload_start_date_path(&ns, "uuid"),
