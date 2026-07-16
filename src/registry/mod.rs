@@ -290,7 +290,7 @@ fn build_in_process_queue(
     // Drain replication only when a downstream is configured: with none, the
     // queue stays empty forever, so its loops would just storm the object store
     // with `LIST`s. (Replication jobs left from a removed downstream are reaped
-    // by `scrub --replication-orphans`, not drained here.) Build the fallible
+    // by `angos prune`'s orphan-job sweep, not drained here.) Build the fallible
     // handler before spawning any loop so an error cannot leak a cache loop.
     let any_downstream = resolver
         .keys()

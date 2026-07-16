@@ -1,38 +1,18 @@
-mod blob;
-mod blob_index;
-mod link_references;
-mod link_repair;
+//! The namespace-checker seam shared by `prune` (retention) and `replicate`
+//! (reconciliation), plus the paginated enumeration streams in [`list_all`].
+//! Scrub itself validates per key through `validate`, not through checkers.
+
 pub mod list_all;
-mod manifest;
-mod multipart;
-mod orphan_grants;
-mod orphan_jobs;
-mod orphan_namespaces;
-mod referrer;
-mod tag;
-mod upload;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-pub use blob::BlobChecker;
-pub use blob_index::BlobIndexChecker;
 use futures_util::StreamExt;
-pub use link_references::LinkReferencesChecker;
-pub use link_repair::ensure_link;
-pub use manifest::ManifestChecker;
-pub use multipart::MultipartChecker;
-pub use orphan_grants::OrphanGrantChecker;
-pub use orphan_jobs::{OrphanJobChecker, OrphanQueue};
-pub use orphan_namespaces::OrphanNamespaceChecker;
-pub use referrer::ReferrerChecker;
-pub use tag::DigestLinkChecker;
 use tracing::warn;
-pub use upload::UploadChecker;
 
 use crate::{
     command::scrub::{error::Error, executor::ActionSink},
-    oci::{Namespace, Tag},
+    oci::Namespace,
     registry::metadata_store::MetadataStore,
 };
 
@@ -43,11 +23,7 @@ use crate::{
 /// each one.
 #[async_trait]
 pub trait NamespaceChecker: Send + Sync {
-    async fn check(
-        &self,
-        namespace: &Namespace,
-        sink: &mut (dyn ActionSink + Send),
-    ) -> Result<(), Error>;
+    async fn check(&self, namespace: &Namespace, sink: &dyn ActionSink) -> Result<(), Error>;
 }
 
 /// Walks every namespace and applies `checker` to each, skipping (with a
@@ -56,7 +32,7 @@ pub trait NamespaceChecker: Send + Sync {
 pub async fn check_namespaces(
     metadata_store: &Arc<MetadataStore>,
     checker: &dyn NamespaceChecker,
-    sink: &mut (dyn ActionSink + Send),
+    sink: &dyn ActionSink,
 ) -> Result<(), Error> {
     let mut namespaces = list_all::namespaces(metadata_store);
     while let Some(namespace) = namespaces.next().await {
@@ -73,26 +49,4 @@ pub async fn check_namespaces(
         }
     }
     Ok(())
-}
-
-/// A checker that operates across the entire store (not namespace-scoped).
-///
-/// `BlobChecker` and `MultipartChecker` implement this trait because their
-/// work spans the whole store, not a single namespace.
-#[async_trait]
-pub trait StoreChecker: Send + Sync {
-    async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error>;
-}
-
-/// A checker that inspects a single already-validated tag. The tag walk is
-/// driven once by `Command::scrub_metadata`, which dispatches every valid tag
-/// to each enabled `TagChecker`.
-#[async_trait]
-pub trait TagChecker: Send + Sync {
-    async fn check_tag(
-        &self,
-        namespace: &Namespace,
-        tag: &Tag,
-        sink: &mut (dyn ActionSink + Send),
-    ) -> Result<(), Error>;
 }

@@ -41,6 +41,8 @@ sequenceDiagram
 - Child manifests of multi-platform indexes
 - Manifests with referrers (signatures, SBOMs)
 
+**Retention subjects** are tagged manifests, untagged (orphan) manifests, and grant-only blobs. A grant-only blob is one a namespace uploaded whose manifest never landed (a lost replication race, a dead-lettered push, or an abandoned client); it is evaluated like any untagged content, with no tag and `pushed_at` set to the upload time, once it is past prune's `-u` in-flight window. A time-based rule such as `image.pushed_at > now() - days(7)` therefore also bounds how long stranded uploads linger. With no policies configured, untagged manifests and grant-only blobs are both retained.
+
 ---
 
 ## Basic Configuration
@@ -198,10 +200,10 @@ Result: Production images kept for 365 days, others for 7 days.
 
 ## Enforcing Retention Policies
 
-Retention policies are enforced by the `prune` command. Retention deletions take the registry's standard delete path:
+Retention policies are enforced by the `prune` command, which also reclaims aged upload-lifecycle leftovers within its `-u` window (default `1h`; see [Storage Maintenance](run-storage-maintenance.md#what-prune-does)). Retention deletions take the registry's standard delete path:
 
 - They emit `manifest.delete` / `tag.delete` webhook events whose actor carries `internal = "prune"`, so subscribers can tell retention apart from client deletes.
-- The manifest's blob bytes are reclaimed immediately once unreferenced (no separate `scrub --blobs` pass needed for pruned content).
+- The manifest's blob bytes are reclaimed immediately once unreferenced (no separate scrub pass needed for pruned content).
 - On repositories with replication, the deletion is mirrored **only to downstreams marked `prune = true`** (authoritative one-way mirrors); additive downstreams keep their copies. Mirror deletions are enqueued on the durable job queue and drained by the running server or `angos worker`, so they complete asynchronously after the prune run exits.
 
 ```bash

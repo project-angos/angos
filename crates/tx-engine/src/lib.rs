@@ -36,3 +36,9 @@ pub use angos_storage::{
     BoxedReader, ByteStream, ChildrenPage, Error as StorageError, Etag, MultipartUploadPage,
     ObjectMeta, Page, PendingMultipartUpload,
 };
+
+// Engine-owned storage prefixes, exported so external maintenance (scrub) can
+// recognize them and leave them alone.
+pub use intent::{INTENT_BODIES_PREFIX, INTENT_LOG_PREFIX};
+pub use lock::storage::LOCK_OBJECTS_PREFIX;
+pub use probe::PROBE_KEY_PREFIX;

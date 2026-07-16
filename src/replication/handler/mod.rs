@@ -190,7 +190,7 @@ impl ReplicationJobHandler {
         // Failing loudly on an unknown downstream is intentional: it surfaces
         // stale config (a removed or renamed downstream) and the orphaned jobs
         // dead-letter after max attempts instead of vanishing silently;
-        // `scrub --replication-orphans` clears them.
+        // `angos prune`'s orphan-job sweep clears them.
         repository
             .replication
             .iter()

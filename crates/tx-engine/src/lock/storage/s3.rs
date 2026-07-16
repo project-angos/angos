@@ -34,7 +34,10 @@ use angos_storage::{ConditionalStore, Error as StorageError, Etag};
 
 use crate::lock::{
     Error,
-    storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
+    storage::{
+        DeleteIfMatchOutcome, LOCK_OBJECTS_PREFIX, LockStorage, PutIfAbsentOutcome,
+        PutIfMatchOutcome,
+    },
 };
 
 fn shard_prefix(key: &str) -> String {
@@ -46,7 +49,7 @@ fn shard_prefix(key: &str) -> String {
 #[must_use]
 pub fn lock_path(key: &str) -> String {
     let shard = shard_prefix(key);
-    format!(".tx-locks/{shard}/{key}")
+    format!("{LOCK_OBJECTS_PREFIX}/{shard}/{key}")
 }
 
 /// Maximum number of attempts (the initial write plus reconciling retries)

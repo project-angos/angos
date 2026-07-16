@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 
-use crate::lock::storage::LockBody;
+use crate::intent::INTENT_BODIES_PREFIX;
+use crate::lock::storage::{LOCK_OBJECTS_PREFIX, LockBody};
 use crate::periodic::run_periodic;
 
 /// Default age after which an orphan body prefix is eligible for deletion.
@@ -120,7 +121,12 @@ impl BodyJanitor {
         loop {
             match self
                 .store
-                .list_children(".tx-bodies/", 100, token.clone(), None)
+                .list_children(
+                    &format!("{INTENT_BODIES_PREFIX}/"),
+                    100,
+                    token.clone(),
+                    None,
+                )
                 .await
             {
                 Ok(page) => {
@@ -145,7 +151,7 @@ impl BodyJanitor {
     async fn process_prefix(&self, sub_prefix: &str) {
         // sub_prefix is like ".tx-bodies/<tx-id>/"; extract the UUID.
         let tx_id_str = sub_prefix
-            .trim_start_matches(".tx-bodies/")
+            .trim_start_matches(&format!("{INTENT_BODIES_PREFIX}/") as &str)
             .trim_end_matches('/');
 
         let Ok(tx_id) = tx_id_str.parse::<Uuid>() else {
@@ -343,7 +349,11 @@ impl LockJanitor {
         loop {
             match self
                 .store
-                .list(".tx-locks/", LOCK_LIST_PAGE_SIZE, token.clone())
+                .list(
+                    &format!("{LOCK_OBJECTS_PREFIX}/"),
+                    LOCK_LIST_PAGE_SIZE,
+                    token.clone(),
+                )
                 .await
             {
                 Ok(page) => {

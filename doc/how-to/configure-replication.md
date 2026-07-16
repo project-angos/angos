@@ -54,11 +54,11 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (pos
 | `reconcile-only` | No | Yes |
 
 :::note Removing or renaming a downstream
-Pending jobs for a removed or renamed downstream fail loudly and dead-letter after their retry budget. Clear them with `angos scrub --replication-orphans` (use `--dry-run` to preview), or inspect them via the jobs admin UI or the [`_jobs` API](../reference/api-endpoints.md#list-failed-jobs) (`?queue=replication`).
+Pending jobs for a removed or renamed downstream fail loudly and dead-letter after their retry budget. They are cleared by `angos prune` (use `--dry-run` to preview), or inspect them via the jobs admin UI or the [`_jobs` API](../reference/api-endpoints.md#list-failed-jobs) (`?queue=replication`).
 :::
 
 :::note Reclaiming stranded blobs on a receiver
-When a replicated manifest push uploads a blob but its manifest then loses last-writer-wins or dead-letters, the receiver keeps the blob's per-namespace ownership grant with no manifest referencing it, pinning the bytes. `angos scrub --orphan-grants <age>` (e.g. `24h`) revokes such grants once the blob is older than the given age and reclaims the bytes; the age gate avoids racing an in-flight push.
+When a replicated manifest push uploads a blob but its manifest then loses last-writer-wins or dead-letters, the receiver keeps the blob's per-namespace ownership grant with no manifest referencing it, pinning the bytes. `angos prune` treats such grants as retention subjects (untagged, `pushed_at` = upload time): once the blob is past the `-u` in-flight window, a grant no retention rule keeps is revoked and the bytes reclaimed. Configure a time-based rule (e.g. `image.pushed_at > now() - days(7)`) to bound how long stranded grants linger.
 :::
 
 ## Fan out into sibling repositories

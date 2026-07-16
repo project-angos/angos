@@ -186,8 +186,10 @@ impl ObjectStore for MemoryObjectStore {
         // Normalise the separator: if the prefix does not end with '/', strip the
         // leading '/' from each suffix so callers get a clean relative name
         // (matching the FS backend, which returns paths relative to the
-        // prefix-directory without a leading separator).
-        let sep_len = usize::from(!prefix.ends_with('/'));
+        // prefix-directory without a leading separator). An empty prefix lists
+        // the whole store and every key is already relative to the root.
+        let at_boundary = prefix.is_empty() || prefix.ends_with('/');
+        let sep_len = usize::from(!at_boundary);
 
         // Collect and sort all keys matching the prefix, then paginate.
         let mut keys: Vec<String> = guard
@@ -196,7 +198,7 @@ impl ObjectStore for MemoryObjectStore {
             .filter(|k| {
                 k.starts_with(prefix)
                     && k.len() > prefix.len()
-                    && (prefix.ends_with('/') || k.as_bytes().get(prefix.len()) == Some(&b'/'))
+                    && (at_boundary || k.as_bytes().get(prefix.len()) == Some(&b'/'))
             })
             // Strip the prefix (and separator) so the result contains only the
             // suffix (filename), matching the FS backend's convention.

@@ -63,55 +63,44 @@ angos -c production.toml server
 
 ### scrub
 
-Check storage for inconsistencies and perform maintenance tasks.
+Walk the store, repair inconsistencies, and quarantine unrecognized objects.
 
 ```bash
 angos scrub [options]
 ```
 
-The scrub command performs storage maintenance and integrity checks. You must specify which checks to run using the flags below. Note that garbage collection happens online during normal server operation.
+Scrub streams every object key in both stores (blob and metadata), categorizes it by shape, and validates it concurrently, in three ordered passes: links and job records first, then blob-index shards, then blob data. It always runs the full set of checks:
+
+- Repairs every link a manifest implies (config, layer, sub-manifest, digest revision), the `referenced_by` back-links, and missing blob-index grants.
+- Removes tags whose target manifest blob is missing, revisions whose manifest blob is missing, orphan referrer entries, stale blob-index entries, and tag or namespace directories whose names violate the OCI grammar.
+- Deletes objects whose content is unreadable (a link, job record, or index shard that does not parse).
+- Reclaims blobs with no references (re-checked under the blob-data lock, so it is safe alongside a live server).
+- Moves any key that matches no known angos layout to `_lost_and_found/` in the same store, preserving its bytes for inspection. Emptying that prefix is the operator's job.
+
+Scrub is purely structural: it takes no age thresholds and no configuration-relative decisions. Time-based reclamation and orphan-namespace clearing belong to [`angos prune`](#prune).
+
+Because a repair can create new derivable state, a heavily damaged store may need more than one run to fully converge; run scrub until it reports zero changes.
+
+**Warning:** scrub quarantines keys it does not recognize, so it must be run from the same angos version as the server fleet. After an upgrade, run `scrub -d` first and review the report.
 
 **Options:**
 
-| Option                    | Short  | Description                                                                                        |
-|---------------------------|--------|----------------------------------------------------------------------------------------------------|
-| `--dry-run`               | `-d`   | Preview what would be removed without making changes                                               |
-| `--uploads <duration>`    | `-u`   | Check upload sessions: remove broken or partial state and uploads older than the given duration (e.g., `1h`, `30m`, `2d`) |
-| `--multipart <duration>`  | `-p`   | Cleanup orphan S3 multipart uploads older than duration (S3 only)                                  |
-| `--tags`                  | `-t`   | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
-| `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |
-| `--blobs`                 | `-b`   | Check for blob inconsistencies, corruption, and stale blob-index entries                           |
-| `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
-| `--reconcile-blob-index`  |        | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band (storage corruption, manual tampering). Reads every manifest, so it is expensive |
-| `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
-| `--replication-orphans`   |        | Delete replication jobs (pending and dead-lettered) whose downstream or repository is no longer configured                                       |
-| `--cache-orphans`         |        | Delete cache jobs (pending and dead-lettered) whose repository is no longer configured for pull-through                                          |
-| `--orphan-grants <duration>` |     | Revoke blob-ownership grants older than the duration (e.g. `24h`) that no manifest references, reclaiming the bytes; cleans up blobs a replication push uploaded before its manifest lost last-writer-wins or dead-lettered |
-| `--orphan-namespaces`     | `-n`   | Remove revisions, tags, and in-flight uploads for namespaces not owned by any configured repository, and reclaim their layer/config blob bytes by revoking those blobs' ownership grants when no still-configured namespace shares them. Manifest blob bytes are not reclaimed here; run with `--blobs` in the same pass to reclaim them once the links are gone. Destructive: run with `--dry-run` first. Ignored (deletes nothing) when no repositories are configured, so an emptied config can never wipe the whole registry. |
+| Option                | Short  | Description                                                                 |
+|-----------------------|--------|------------------------------------------------------------------------------|
+| `--dry-run`           | `-d`   | Preview what would be changed without applying anything                     |
+| `--concurrency <N>`   |        | Number of keys validated concurrently per pass (default 8)                  |
 
 **Examples:**
 
 ```bash
-# Preview all maintenance operations
-angos scrub -d -t -m -b
+# Preview everything scrub would do
+angos scrub --dry-run
 
-# Run full storage integrity check
-angos scrub -t -m -b
+# Full structural check and repair
+angos scrub
 
-# Check blob storage integrity
-angos scrub --blobs
-
-# Remove incomplete uploads older than 1 hour
-angos scrub --uploads 1h
-
-# Cleanup orphan S3 multipart uploads older than 24 hours
-angos scrub --multipart 24h
-
-# Preview clearing namespaces no longer owned by any configured repository
-angos scrub --orphan-namespaces --dry-run
-
-# Run with verbose logging
-RUST_LOG=info angos scrub -t -m -b
+# Faster walk on a large store
+angos scrub --concurrency 32
 ```
 
 **Scheduling:**
@@ -133,7 +122,7 @@ spec:
           containers:
           - name: scrub
             image: ghcr.io/project-angos/angos:latest
-            args: ["-c", "/config/config.toml", "scrub", "-t", "-m", "-b"]
+            args: ["-c", "/config/config.toml", "scrub"]
           restartPolicy: OnFailure
 ```
 
@@ -143,28 +132,45 @@ On a host install, use a systemd timer instead; see [Run Storage Maintenance](..
 
 ### prune
 
-Enforce retention policies, deleting the tags they no longer retain.
+Enforce retention policies and reclaim aged upload-lifecycle leftovers.
 
 ```bash
 angos prune [options]
 ```
 
-Applies the global and per-repository retention policies to every namespace. See [Configure Retention Policies](../how-to/configure-retention-policies.md) for the policy syntax and what is protected from deletion.
+Applies the global and per-repository retention policies to every namespace (see [Configure Retention Policies](../how-to/configure-retention-policies.md) for the policy syntax and what is protected from deletion), then reclaims everything gated on the `-u` age window:
+
+- Upload sessions older than the window, or with broken session state.
+- Orphan S3 multipart uploads older than the window whose session marker is gone (a crash between opening the multipart and writing the marker).
+- Byteless blob-index entries: a grant written by an upload whose bytes never landed.
+
+Grant-only blob ownership (a blob uploaded whose manifest never landed) is decided by the **retention policies** like any other untagged content: the subject carries no tag and `pushed_at` is the upload time, the `-u` window only shields in-flight pushes from consideration, and with no policies configured the grant is retained.
+
+It also performs the configuration-relative cleanup, always on:
+
+- **Orphan namespaces**: every namespace not owned by any configured `[repository]` loses its revisions, tags, in-flight uploads, and blob-ownership grants. The blast radius is every namespace whose owning repository is no longer in your config, so run `--dry-run` after config changes. Refused when no repositories are configured, so an emptied config can never wipe the registry.
+- **Orphan jobs**: queued replication and cache jobs whose downstream or repository is no longer configured.
+
+Prune is the config-and-time command: run it against the same configuration file the servers use.
 
 **Options:**
 
-| Option      | Short | Description                                    |
-|-------------|-------|------------------------------------------------|
-| `--dry-run` | `-d`  | Preview what would be deleted without changes  |
+| Option              | Short | Description                                                              |
+|---------------------|-------|---------------------------------------------------------------------------|
+| `--dry-run`         | `-d`  | Preview what would be deleted without changes                            |
+| `--uploads <dur>`   | `-u`  | Age window for upload-lifecycle reclamation (default `1h`)               |
 
 **Examples:**
 
 ```bash
-# Preview retention policy enforcement
+# Preview retention enforcement and upload reclamation
 angos prune --dry-run
 
-# Enforce retention policies
+# Enforce retention policies; reap upload leftovers older than 1 hour
 angos prune
+
+# Keep in-flight uploads alive for up to a day
+angos prune --uploads 24h
 ```
 
 Schedule `prune` like `scrub`, with a Kubernetes CronJob or a systemd timer; see [Configure Retention Policies](../how-to/configure-retention-policies.md#scheduled-enforcement) for complete examples.

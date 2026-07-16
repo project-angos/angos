@@ -12,7 +12,7 @@ mod link;
 #[cfg(test)]
 mod tests;
 
-pub use blob_index::{BlobIndex, BlobIndexOperation};
+pub use blob_index::{BlobIndex, BlobIndexOperation, shard::decode_blob_index_shard_namespace};
 pub use link::{LinkKind, LinkMetadata, LinkOperation, LinksCommit, LinksTx};
 
 use access_time::{AccessTimeWriter, FlushHandle};
