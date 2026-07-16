@@ -248,16 +248,15 @@ impl ManifestPutTarget {
 }
 
 impl Serialize for ManifestPutTarget {
+    /// Project the push target onto the CEL policy input: `tags` always lists
+    /// every tag the push creates (empty for a bare by-digest push), and
+    /// `digest` is added for a by-digest push.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Flatten to the legacy `{reference, tags}` shape so CEL policies keep
-        // seeing `reference` exactly as the other manifest actions emit it.
         let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("reference", &self.reference())?;
-        if let Self::Digest { tags, .. } = self
-            && !tags.is_empty()
-        {
-            map.serialize_entry("tags", tags)?;
+        if let Self::Digest { digest, .. } = self {
+            map.serialize_entry("digest", digest)?;
         }
+        map.serialize_entry("tags", self.created_tags())?;
         map.end()
     }
 }

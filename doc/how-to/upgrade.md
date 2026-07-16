@@ -341,6 +341,18 @@ angos scrub --media-types
 
 Then upgrade. If you have already run it, no action is required; the backfill is idempotent.
 
+### Manifest Push Policy Input (Breaking Change)
+
+#### What Changed
+
+A `put-manifest` action now exposes `request.digest` and `request.tags` to CEL access policies instead of `request.reference`. A by-digest push carries `request.digest`; the tags the push creates (the target tag of a by-tag push, or the `?tag=` parameters of a by-digest push) are carried in `request.tags`. The read and delete manifest actions still expose `request.reference`.
+
+**Who is affected:** Deployments whose `access_policy` rules gate a manifest push on `request.reference`. The webhook authorization headers (`X-Registry-Reference`) are unchanged.
+
+#### Migration
+
+Rewrite any rule that matched a push on `request.reference` to use `request.digest` and/or `request.tags`, for example `has(request.digest)` for a by-digest push or `'latest' in request.tags` to match a created tag.
+
 ### Removed Configuration Keys (Breaking Change)
 
 #### What Changed

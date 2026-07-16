@@ -309,8 +309,9 @@ fn test_get_reference() {
     );
 }
 
-// The by-tag and by-digest targets must serialize `reference` exactly as the
-// Every manifest action must expose `reference` to CEL policies.
+// The read/delete manifest actions address a single reference, so they expose
+// `reference` to CEL policies. A put addresses a digest and/or tags instead
+// (see `test_put_manifest_target_serializes_digest_and_tags`).
 #[test]
 fn test_manifest_actions_serialize_reference_for_cel() {
     let r = reference();
@@ -327,10 +328,6 @@ fn test_manifest_actions_serialize_reference_for_cel() {
             namespace: ns(),
             reference: r.clone(),
         },
-        Action::PutManifest {
-            namespace: ns(),
-            target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap()),
-        },
     ];
     for action in actions {
         let value = serde_json::to_value(&action).unwrap();
@@ -341,9 +338,10 @@ fn test_manifest_actions_serialize_reference_for_cel() {
     }
 }
 
-// other manifest actions do so existing CEL policies keep working.
+// A put-manifest exposes `digest` (by-digest push) and `tags` (every tag the
+// push creates) to CEL, each omitted when it does not apply.
 #[test]
-fn test_put_manifest_target_serializes_with_flat_reference() {
+fn test_put_manifest_target_serializes_digest_and_tags() {
     let by_tag = Action::PutManifest {
         namespace: ns(),
         target: ManifestPutTarget::Tag(Tag::new("latest").unwrap()),
@@ -353,7 +351,7 @@ fn test_put_manifest_target_serializes_with_flat_reference() {
         serde_json::json!({
             "action": "put-manifest",
             "namespace": "test",
-            "reference": {"Tag": "latest"},
+            "tags": ["latest"],
         })
     );
 
@@ -369,24 +367,26 @@ fn test_put_manifest_target_serializes_with_flat_reference() {
         serde_json::json!({
             "action": "put-manifest",
             "namespace": "test",
-            "reference": {"Digest": SHA256_EMPTY},
+            "digest": SHA256_EMPTY,
             "tags": ["v1", "v2"],
         })
     );
 
-    let no_tags = Action::PutManifest {
+    let by_digest_no_tags = Action::PutManifest {
         namespace: ns(),
         target: ManifestPutTarget::Digest {
             digest: digest(),
             tags: Vec::new(),
         },
     };
-    assert!(
-        serde_json::to_value(&no_tags)
-            .unwrap()
-            .get("tags")
-            .is_none(),
-        "empty tags must be omitted from the serialized action"
+    assert_eq!(
+        serde_json::to_value(&by_digest_no_tags).unwrap(),
+        serde_json::json!({
+            "action": "put-manifest",
+            "namespace": "test",
+            "digest": SHA256_EMPTY,
+            "tags": [],
+        })
     );
 }
 

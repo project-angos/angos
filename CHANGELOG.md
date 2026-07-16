@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - New `angos migrate` command rewrites pre-JSON bare-digest link files as JSON, converting registries seeded from a raw Docker `distribution` on-disk layout.
 
+### Changed
+
+- A `put-manifest` CEL policy input now exposes `request.digest` (by-digest push) and `request.tags` (the tags the push creates) instead of `request.reference`; update any access policy that gated a manifest push on `request.reference`.
+
 ### Removed
 
 - The deprecated `access_policy.default_allow` boolean is removed; set the typed `default = "allow"` or `default = "deny"` instead.
