@@ -254,7 +254,7 @@ See [Set Up Access Control](set-up-access-control.md) for the full `mount-blob` 
 
 The `_catalog` listing is now derived directly from stored content rather than from a maintained namespace-registry index. A namespace is listed exactly when it holds at least one revision or tag, so the catalog is deterministic and strongly consistent.
 
-**Who is affected:** No one needs to act. Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written, and `scrub` prunes them automatically (its layout-migration step runs on every scrub).
+**Who is affected:** No one needs to act. Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written. They are inert; run `scrub` on your current version before upgrading to have them removed automatically, or leave them in place and delete them manually later.
 
 ### Manifest-Reference Validation Now Permissive by Default
 

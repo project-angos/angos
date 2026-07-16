@@ -158,13 +158,6 @@ pub fn record_reconcile_outcome(outcome: &str) {
 }
 
 impl Executor {
-    async fn prune_legacy_namespace_registry(&self) -> Result<(), Error> {
-        self.metadata_store
-            .delete_legacy_namespace_registry()
-            .await?;
-        Ok(())
-    }
-
     /// Deletes the orphan's bytes under the `blob-data:{digest}` coarse lock
     /// (the same one manifest pushes and upload completions take), so a
     /// reference a concurrent push is granting cannot be missed and have its
@@ -478,7 +471,6 @@ impl ActionSink for Executor {
         info!("{action}");
 
         match action {
-            Action::PruneLegacyNamespaceRegistry => self.prune_legacy_namespace_registry().await,
             Action::DeleteOrphanBlob(digest) => self.delete_orphan_blob(digest).await,
             Action::RemoveBlobIndexLink {
                 namespace,

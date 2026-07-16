@@ -11,9 +11,6 @@ use crate::{
 /// Checkers produce `Action` values via their `ActionSink`; the `Executor`
 /// applies them (or skips them in dry-run mode) in one place.
 pub enum Action {
-    /// Delete the dead namespace-registry objects (`_registry/`) left by the
-    /// pre-1.3 maintained catalog index; the catalog is now derived from content.
-    PruneLegacyNamespaceRegistry,
     DeleteOrphanBlob(Digest),
     RemoveBlobIndexLink {
         namespace: Namespace,
@@ -118,12 +115,6 @@ impl fmt::Display for Action {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Action::PruneLegacyNamespaceRegistry => {
-                write!(
-                    f,
-                    "prune the legacy namespace-registry index ('_registry/')"
-                )
-            }
             Action::DeleteOrphanBlob(digest) => {
                 write!(f, "delete orphan blob '{digest}'")
             }
