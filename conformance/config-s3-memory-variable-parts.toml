@@ -18,6 +18,6 @@ multipart_copy_chunk_size = "100MiB"
 multipart_copy_jobs = 10
 
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 [repository."conformance"]

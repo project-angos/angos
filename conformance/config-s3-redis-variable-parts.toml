@@ -35,6 +35,6 @@ ttl = 30
 key_prefix = "angos-s3-redis-lock-"
 
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 [repository."conformance"]

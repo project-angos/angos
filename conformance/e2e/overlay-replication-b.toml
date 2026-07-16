@@ -2,6 +2,6 @@
 # instance A and serves them locally. Instance B runs on port 8001 with an
 # isolated backend (see the workflow's backend-B transform).
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 [repository."repl"]

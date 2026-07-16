@@ -19,6 +19,6 @@ multipart_copy_jobs = 10
 multipart_uniform_parts = true
 
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 [repository."conformance"]
