@@ -15,7 +15,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub is rewritten as a single concurrent walk that categorizes and validates every object key: all checks always run, unreadable objects are deleted, and unrecognized keys are quarantined under `_lost_and_found/`; run scrub from the same version as the server fleet.
 - Prune now owns configuration-relative and age-gated reclamation: orphan namespaces and orphan jobs are always cleared, and a single `-u/--uploads` window (default 1h) gates upload sessions, orphan S3 multiparts, and byteless blob-index entries.
 - Grant-only blob ownership (a blob uploaded whose manifest never landed) is now decided by the retention policies like any other untagged content, with the `-u` window shielding in-flight pushes.
+- The transaction engine's garbage janitors (orphaned staging bodies, expired lock objects) no longer run as background loops in the server and worker; `angos scrub` sweeps them instead, while the recovery loop stays in serving processes.
 - A `put-manifest` CEL policy input now exposes `request.digest` (by-digest push) and `request.tags` (the tags the push creates) instead of `request.reference`; update any access policy that gated a manifest push on `request.reference`.
+
+### Fixed
+
+- The transaction engine's body janitor never actually reclaimed orphaned `.tx-bodies/` staging: it mishandled the listing's relative names and always concluded there was nothing to delete.
 
 ### Removed
 

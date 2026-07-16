@@ -50,6 +50,7 @@ pub struct Command {
     validator: Arc<Validator>,
     stats: Arc<WalkStats>,
     concurrency: usize,
+    dry_run: bool,
     /// Held so the end of the run can drain in-flight async webhook
     /// deliveries the delete actions triggered.
     registry: Option<Arc<Registry>>,
@@ -100,6 +101,7 @@ impl Command {
             validator,
             stats,
             concurrency: options.concurrency,
+            dry_run: options.dry_run,
             registry,
         })
     }
@@ -110,6 +112,17 @@ impl Command {
     /// listing failure aborts the run, since the later passes' deletions rely
     /// on the earlier repairs.
     pub async fn run(&mut self) -> Result<(), Error> {
+        // Engine housekeeping first: reclaim orphaned transaction staging
+        // bodies and expired lock objects through the engine's own janitors
+        // (age-gated by engine thresholds; serving processes no longer run
+        // periodic janitor loops). The sweep mutates directly, so dry-run
+        // skips it.
+        if self.dry_run {
+            info!("Dry-run mode: skipping the engine janitor sweep");
+        } else {
+            self.metadata_store.store().janitor_sweep().await;
+        }
+
         self.walk_pass(Pass::MetadataLinks, "").await?;
         self.walk_pass(Pass::MetadataShards, path_builder::blobs_root_dir())
             .await?;

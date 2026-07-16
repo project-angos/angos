@@ -76,6 +76,7 @@ Scrub streams every object key in both stores (blob and metadata), categorizes i
 - Deletes objects whose content is unreadable (a link, job record, or index shard that does not parse).
 - Reclaims blobs with no references (re-checked under the blob-data lock, so it is safe alongside a live server).
 - Moves any key that matches no known angos layout to `_lost_and_found/` in the same store, preserving its bytes for inspection. Emptying that prefix is the operator's job.
+- Runs the transaction engine's janitor sweeps (orphaned staging bodies, expired lock objects); serving processes no longer run periodic janitor loops.
 
 Scrub is purely structural: it takes no age thresholds and no configuration-relative decisions. Time-based reclamation and orphan-namespace clearing belong to [`angos prune`](#prune).
 

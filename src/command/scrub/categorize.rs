@@ -48,8 +48,8 @@ pub enum KeyCategory {
     /// A `lock_key` dedup index entry (metadata store).
     JobIndex { queue: Queue },
     /// Transaction-engine state (`.tx-log/`, `.tx-bodies/`, `.tx-locks/`).
-    /// The engine's recovery loop and janitors own these; scrub must never
-    /// touch them.
+    /// Engine-owned: the walk never touches these keys directly; scrub
+    /// reclaims their garbage only through the engine's own janitor sweep.
     EngineInternal,
     /// Already quarantined; never re-processed.
     LostAndFound,

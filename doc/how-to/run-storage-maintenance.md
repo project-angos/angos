@@ -35,6 +35,7 @@ Scrub streams every key in both stores (blob and metadata), categorizes it by sh
 | Corrupt content | Deletes links, job records, and index shards whose content does not parse |
 | Orphan blobs | Reclaims blobs with no index references, re-checked under the blob-data lock at apply time |
 | Unrecognized keys | Moves them to `_lost_and_found/` in the same store, preserving their bytes |
+| Engine housekeeping | Runs the transaction engine's own janitor sweeps: orphaned `.tx-bodies/` staging and expired `.tx-locks/` objects (age-gated by engine thresholds; skipped in dry-run) |
 
 | Option | Short | Description |
 |---|---|---|
