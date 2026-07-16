@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The manifest `media_type` runtime fallback and its `scrub --media-types` backfill are removed; run `scrub --media-types` on the prior version before upgrading, or a manifest whose link lacks a `media_type` is served without a `Content-Type`.
 - Scrub no longer prunes the dead pre-1.3 namespace-registry objects (`_registry/`); run `scrub` on the prior version before upgrading to have them removed automatically, otherwise the inert objects can be deleted manually.
 - The deprecated `scrub --retention` and `scrub --replicate` flags are removed; use `angos prune` and `angos replicate`.
+- The deprecated `[metadata_store.s3.capabilities]` table is removed; set `conditional_operations` (a config still carrying `capabilities` now ignores it and probes at startup).
 - The pre-JSON resumable-hash checkpoint fallback is removed; a chunked upload checkpointed by a pre-1.3 build restarts on resume across the upgrade instead of continuing.
 
 ## 1.3.2

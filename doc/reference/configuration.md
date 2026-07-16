@@ -247,7 +247,6 @@ When using S3 as the metadata store, you can declare whether your S3-compatible 
 - When `lock_strategy` is unset, the resolved value also selects the default lock backend: the shared S3 lock when `true`, the in-process `memory` lock when `false`.
 - With `lock_strategy = "memory"` or `"redis"`, `conditional_operations = true` is used only for blob-index shard updates. Link updates still use the configured lock backend.
 - To avoid S3 CAS entirely, set `conditional_operations = false`; combine with `lock_strategy = "redis"` for multi-replica deployments.
-- The `[metadata_store.s3.capabilities]` table (booleans `put_if_none_match`, `put_if_match`, `delete_if_match`) is deprecated but still accepted; it maps to `conditional_operations = true` only when all three flags are `true`. Setting both keys is rejected.
 
 **Example with explicit declaration (AWS S3, Exoscale SOS):**
 ```toml

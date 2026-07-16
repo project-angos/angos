@@ -365,7 +365,8 @@ Several long-deprecated configuration keys are no longer read. A configuration s
 | `access_policy.default_allow` | `access_policy.default = "allow"` or `"deny"` |
 | `cache_store` section | `cache` |
 | `storage` section | `blob_store` |
+| `[metadata_store.s3.capabilities]` table | `metadata_store.s3.conditional_operations` |
 
 #### Migration
 
-Rename each key in your configuration. Every replacement was accepted alongside the old key in earlier releases, so the rename is safe to apply on your current version before upgrading.
+Rename each key in your configuration. Every replacement was accepted alongside the old key in earlier releases, so the rename is safe to apply on your current version before upgrading. Replace the `capabilities` table with `conditional_operations = true` only when all three of its booleans were `true`, otherwise `conditional_operations = false`; a leftover `capabilities` table is ignored and the registry probes the provider at startup.
