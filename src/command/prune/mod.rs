@@ -45,8 +45,7 @@ pub fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Ret
 }
 
 /// Applies the global and per-repository retention policies to every
-/// namespace, deleting the tags the policies no longer retain. Supersedes the
-/// deprecated `scrub --retention`.
+/// namespace, deleting the tags the policies no longer retain.
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
     let bootstrap::MaintenanceContext {
         blob_store: blob_backend,

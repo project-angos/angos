@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // End-to-end (`angos scrub --replicate`)
+    // End-to-end (`angos replicate`)
     // ------------------------------------------------------------------
 
     /// Mounts a downstream missing tag `v1` and both blobs, expecting the full
@@ -1220,7 +1220,7 @@ mod tests {
             .await;
     }
 
-    /// Full `angos scrub --replicate` push chain against a wiremock downstream,
+    /// Full `angos replicate` push chain against a wiremock downstream,
     /// including `lock_key` coalescing of a duplicate enqueue.
     #[tokio::test]
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
@@ -1326,7 +1326,7 @@ mod tests {
         drop(mock_server);
     }
 
-    /// Full `angos scrub --replicate` delete chain: a downstream-only tag is
+    /// Full `angos replicate` delete chain: a downstream-only tag is
     /// enqueued for delete and the drain issues exactly one downstream DELETE.
     #[tokio::test]
     async fn scrub_replicate_deletes_downstream_only_tag() {

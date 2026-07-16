@@ -223,12 +223,6 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
 }
 
 async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
-    if options.retention {
-        warn!("'scrub --retention' is deprecated; use 'angos prune' instead");
-    }
-    if options.replicate {
-        warn!("'scrub --replicate' is deprecated; use 'angos replicate' instead");
-    }
     let mut scrub = scrub::Command::new(&options, &config).await?;
     scrub.run().await
 }

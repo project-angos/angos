@@ -4,21 +4,16 @@ use chrono::Duration;
 use tracing::{info, warn};
 
 use crate::{
-    command::{
-        prune::{RetentionChecker, global_retention_policy},
-        replicate::ReplicationChecker,
-        scrub::{
-            check::{
-                BlobChecker, BlobIndexChecker, DigestLinkChecker, LinkReferencesChecker,
-                ManifestChecker, MultipartChecker, NamespaceChecker, OrphanGrantChecker,
-                OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue, ReferrerChecker,
-                StoreChecker, TagChecker, UploadChecker,
-            },
-            command::Options,
-            error::Error,
+    command::scrub::{
+        check::{
+            BlobChecker, BlobIndexChecker, DigestLinkChecker, LinkReferencesChecker,
+            ManifestChecker, MultipartChecker, NamespaceChecker, OrphanGrantChecker,
+            OrphanJobChecker, OrphanNamespaceChecker, OrphanQueue, ReferrerChecker, StoreChecker,
+            TagChecker, UploadChecker,
         },
+        command::Options,
+        error::Error,
     },
-    configuration::Configuration,
     jobs::store::JobStore,
     registry::{
         blob_store::BlobStore, metadata_store::MetadataStore,
@@ -32,21 +27,10 @@ pub type LabeledStoreCheckers = Vec<(&'static str, Box<dyn StoreChecker>)>;
 
 pub fn namespace_checkers(
     options: &Options,
-    config: &Configuration,
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
-    resolver: &Arc<RepositoryResolver>,
 ) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
     let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
-
-    if options.retention {
-        let policy = global_retention_policy(&config.global.retention_policy);
-        checkers.push(Box::new(RetentionChecker::new(
-            metadata_store.clone(),
-            resolver.clone(),
-            policy,
-        )));
-    }
 
     if let Some(upload_timeout) = options.uploads {
         let upload_timeout = Duration::from_std(upload_timeout.into())
@@ -84,13 +68,6 @@ pub fn namespace_checkers(
 
     if options.referrers {
         checkers.push(Box::new(ReferrerChecker::new(metadata_store.clone())));
-    }
-
-    if options.replicate {
-        checkers.push(Box::new(ReplicationChecker::new(
-            metadata_store.clone(),
-            resolver.clone(),
-        )));
     }
 
     Ok(checkers)
