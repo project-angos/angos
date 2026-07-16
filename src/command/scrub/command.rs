@@ -7,7 +7,6 @@ use tracing::{error, info, warn};
 use crate::{
     command::{
         bootstrap,
-        replicate::ReplicationDrain,
         scrub::{
             action::Action,
             check::{NamespaceChecker, TagChecker, list_all},
@@ -47,9 +46,6 @@ pub struct Options {
     #[argh(switch, short = 'b')]
     /// check for blob inconsistencies
     pub blobs: bool,
-    #[argh(switch, short = 'r')]
-    /// deprecated, use 'angos prune': enforce retention policies
-    pub retention: bool,
     #[argh(switch, short = 'l')]
     /// fix links format inconsistencies
     pub links: bool,
@@ -61,10 +57,6 @@ pub struct Options {
     #[argh(switch, short = 'R')]
     /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
     pub referrers: bool,
-    #[argh(switch)]
-    /// deprecated, use 'angos replicate': reconcile replicated namespaces with
-    /// their downstreams
-    pub replicate: bool,
     #[argh(switch)]
     /// delete replication jobs (pending and dead-lettered) whose downstream or
     /// repository is no longer configured
@@ -97,12 +89,9 @@ pub struct Command {
     /// [`setup::store_checkers`] and applied in one pass.
     store_checkers: LabeledStoreCheckers,
     sink: Box<dyn ActionSink + Send>,
-    /// Drains reconcile-enqueued replication jobs in-process at the end of the
-    /// run. `None` when dry-run or `--replicate` is absent.
-    replication_drain: Option<ReplicationDrain>,
-    /// Registry the deprecated `--retention` deletions run through; held so the
+    /// Registry the `--orphan-namespaces` tag deletions run through; held so the
     /// end of the run can drain in-flight async webhook deliveries.
-    retention_registry: Option<Arc<Registry>>,
+    registry: Option<Arc<Registry>>,
 }
 
 impl Command {
@@ -113,23 +102,13 @@ impl Command {
             repositories,
         } = bootstrap::maintenance_context(config).await?;
 
-        let namespace_checkers = setup::namespace_checkers(
-            options,
-            config,
-            &blob_backend,
-            &metadata_store,
-            &repositories,
-        )?;
+        let namespace_checkers =
+            setup::namespace_checkers(options, &blob_backend, &metadata_store)?;
         let tag_checkers = setup::tag_checkers(options, &blob_backend, &metadata_store);
         let store_checkers =
             setup::store_checkers(options, &blob_backend, &metadata_store, &repositories)?;
 
-        // One `Arc<JobStore>` serves as both producer (Executor enqueue) and
-        // consumer (end-of-run drain). Building the queue is cheap, so every
-        // non-dry-run `Executor` owns one; the drain is wired only with
-        // `--replicate`.
-        let mut replication_drain: Option<ReplicationDrain> = None;
-        let mut retention_registry: Option<Arc<Registry>> = None;
+        let mut registry: Option<Arc<Registry>> = None;
         let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
             Box::new(DryRunSink)
@@ -140,27 +119,18 @@ impl Command {
                 metadata_store.clone(),
                 job_store.clone(),
             );
-            // The deprecated `--retention` deletes through the registry, like
-            // `angos prune`.
-            if options.retention {
-                let registry = bootstrap::registry(
+            // `--orphan-namespaces` deletes dangling tags through the registry,
+            // like `angos prune`, so wire one when that checker is enabled.
+            if options.orphan_namespaces {
+                let orphan_registry = bootstrap::registry(
                     config,
                     blob_backend.clone(),
                     metadata_store.clone(),
                     repositories.clone(),
-                    job_store.clone(),
-                )?;
-                retention_registry = Some(registry.clone());
-                executor = executor.with_registry(registry);
-            }
-            if options.replicate {
-                replication_drain = Some(ReplicationDrain::new(
                     job_store,
-                    &blob_backend,
-                    &metadata_store,
-                    &repositories,
-                    config.global.max_concurrent_replication_jobs,
-                ));
+                )?;
+                registry = Some(orphan_registry.clone());
+                executor = executor.with_registry(orphan_registry);
             }
             Box::new(executor)
         };
@@ -171,23 +141,18 @@ impl Command {
             tag_checkers,
             store_checkers,
             sink,
-            replication_drain,
-            retention_registry,
+            registry,
         })
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
         self.scrub_metadata().await?;
         // Store-wide checkers run in the order `setup::store_checkers` built
-        // them: orphan-namespace clearing frees manifest bytes for the blob
-        // reclaim, and the orphan-job sweep precedes the replication drain so
-        // the drain does not churn orphaned jobs through retries first.
+        // them: orphan-namespace clearing frees manifest bytes the blob reclaim
+        // then reclaims.
         self.scrub_store().await;
-        if let Some(drain) = &self.replication_drain {
-            drain.drain().await;
-        }
         self.metadata_store.flush_access_times().await;
-        if let Some(registry) = &self.retention_registry {
+        if let Some(registry) = &self.registry {
             registry.shutdown().await;
         }
         Ok(())
@@ -318,7 +283,6 @@ mod tests {
             tags: true,
             manifests: true,
             blobs: true,
-            retention: true,
             ..Options::default()
         };
 
@@ -326,9 +290,9 @@ mod tests {
 
         assert!(command.is_ok());
         let cmd = command.unwrap();
-        // retention, uploads, manifests = 3 namespace checkers (the tag walk is
-        // a free function driven by `tag_checkers`, not a namespace checker)
-        assert_eq!(cmd.namespace_checkers.len(), 3);
+        // uploads, manifests = 2 namespace checkers (the tag walk is a free
+        // function driven by `tag_checkers`, not a namespace checker)
+        assert_eq!(cmd.namespace_checkers.len(), 2);
         // `tags` is enabled, so the per-tag checkers are present.
         assert!(cmd.tag_checkers.is_some());
         // `blobs` is the only store-wide checker enabled by these options.

@@ -33,7 +33,6 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
 | `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
 | `-b, --blobs`                 | Check for orphaned or corrupted blobs; prune stale blob-index entries for deleted namespaces       |
-| `-r, --retention`             | Deprecated: use `angos prune`                                                                      |
 | `-u, --uploads <duration>`    | Check upload sessions: remove broken or partial state and uploads older than the given duration    |
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
 | `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |

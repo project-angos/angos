@@ -81,11 +81,9 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--tags`                  | `-t`   | Check and fix tag references; remove tags whose target manifest blob is missing; delete tag directories whose names violate the OCI tag grammar |
 | `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |
 | `--blobs`                 | `-b`   | Check for blob inconsistencies, corruption, and stale blob-index entries                           |
-| `--retention`             | `-r`   | Deprecated: use [`angos prune`](#prune)                                                            |
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--reconcile-blob-index`  |        | Rebuild blob-index entries missing relative to the manifests that reference each blob; repairs an index corrupted out-of-band (storage corruption, manual tampering). Reads every manifest, so it is expensive |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
-| `--replicate`             |        | Deprecated: use [`angos replicate`](#replicate)                                                    |
 | `--replication-orphans`   |        | Delete replication jobs (pending and dead-lettered) whose downstream or repository is no longer configured                                       |
 | `--cache-orphans`         |        | Delete cache jobs (pending and dead-lettered) whose repository is no longer configured for pull-through                                          |
 | `--orphan-grants <duration>` |     | Revoke blob-ownership grants older than the duration (e.g. `24h`) that no manifest references, reclaiming the bytes; cleans up blobs a replication push uploaded before its manifest lost last-writer-wins or dead-lettered |
@@ -145,7 +143,7 @@ On a host install, use a systemd timer instead; see [Run Storage Maintenance](..
 
 ### prune
 
-Enforce retention policies, deleting the tags they no longer retain. Replaces the deprecated `scrub --retention`.
+Enforce retention policies, deleting the tags they no longer retain.
 
 ```bash
 angos prune [options]
@@ -175,7 +173,7 @@ Schedule `prune` like `scrub`, with a Kubernetes CronJob or a systemd timer; see
 
 ### replicate
 
-Reconcile every replicated namespace against all its configured downstreams. Replaces the deprecated `scrub --replicate`.
+Reconcile every replicated namespace against all its configured downstreams.
 
 ```bash
 angos replicate [options]

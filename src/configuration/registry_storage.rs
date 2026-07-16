@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer};
 use tracing::info;
 
 use angos_tx_engine::lock::{
@@ -79,9 +79,6 @@ pub struct S3BackendConfig {
     ///
     /// Set explicitly to avoid startup latency from probing, or for
     /// S3-compatible providers where probe results may be inaccurate.
-    ///
-    /// The legacy `capabilities` table (three per-operation booleans) is
-    /// still accepted and maps to `true` only when all three flags are set.
     pub conditional_operations: Option<bool>,
 }
 
@@ -135,43 +132,19 @@ impl<'de> Deserialize<'de> for S3BackendConfig {
             access_time_debounce_secs: u64,
             #[serde(default)]
             conditional_operations: Option<bool>,
-            #[serde(default)]
-            capabilities: Option<LegacyCapabilities>,
-        }
-
-        /// Legacy `[metadata_store.s3.capabilities]` table. Folded into
-        /// `conditional_operations`: CAS requires all three operations.
-        #[derive(Deserialize)]
-        struct LegacyCapabilities {
-            put_if_none_match: bool,
-            put_if_match: bool,
-            delete_if_match: bool,
         }
 
         let raw = Raw::deserialize(deserializer)?;
         // `None` (nothing configured) survives here: the effective default
         // depends on CAS support, resolved at build time.
         let lock_strategy = resolve_lock_strategy(raw.lock_strategy, raw.redis, true)?;
-        let conditional_operations = match (raw.conditional_operations, raw.capabilities) {
-            (Some(_), Some(_)) => {
-                return Err(D::Error::custom(
-                    "cannot set both 'conditional_operations' and the legacy 'capabilities' \
-                     table; use conditional_operations",
-                ));
-            }
-            (Some(declared), None) => Some(declared),
-            (None, Some(caps)) => {
-                Some(caps.put_if_none_match && caps.put_if_match && caps.delete_if_match)
-            }
-            (None, None) => None,
-        };
 
         Ok(S3BackendConfig {
             connection: raw.connection,
             lock_strategy,
             link_cache_ttl: raw.link_cache_ttl,
             access_time_debounce_secs: raw.access_time_debounce_secs,
-            conditional_operations,
+            conditional_operations: raw.conditional_operations,
         })
     }
 }
@@ -340,55 +313,6 @@ mod tests {
             {extra}
         "#
         )
-    }
-
-    #[test]
-    fn legacy_capabilities_full_set_maps_to_conditional_operations_true() {
-        let toml = s3_toml_with(
-            r"
-            [capabilities]
-            put_if_none_match = true
-            put_if_match      = true
-            delete_if_match   = true
-        ",
-        );
-        let cfg: S3BackendConfig = toml::from_str(&toml).expect("deserialize");
-        assert_eq!(cfg.conditional_operations, Some(true));
-    }
-
-    #[test]
-    fn legacy_capabilities_partial_set_maps_to_conditional_operations_false() {
-        // Conditional deletes are part of the required set, so a legacy config
-        // that lacks them declares a provider that cannot run CAS.
-        let toml = s3_toml_with(
-            r"
-            [capabilities]
-            put_if_none_match = true
-            put_if_match      = true
-            delete_if_match   = false
-        ",
-        );
-        let cfg: S3BackendConfig = toml::from_str(&toml).expect("deserialize");
-        assert_eq!(cfg.conditional_operations, Some(false));
-    }
-
-    #[test]
-    fn conditional_operations_and_legacy_capabilities_conflict_is_rejected() {
-        let toml = s3_toml_with(
-            r"
-            conditional_operations = true
-
-            [capabilities]
-            put_if_none_match = true
-            put_if_match      = true
-            delete_if_match   = true
-        ",
-        );
-        let err = toml::from_str::<S3BackendConfig>(&toml).expect_err("conflict must be rejected");
-        assert!(
-            err.to_string().contains("conditional_operations"),
-            "error should point at the conflicting keys, got: {err}"
-        );
     }
 
     #[test]

@@ -88,8 +88,8 @@ impl Executor {
         }
     }
 
-    /// Wire the registry the retention actions delete through. Required for
-    /// runs that enforce retention (`prune`, `scrub --retention`).
+    /// Wire the registry that tag deletions run through. Required by `prune`
+    /// (retention deletes) and `scrub --orphan-namespaces` (dangling-tag deletes).
     #[must_use]
     pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
         self.registry = Some(registry);

@@ -101,8 +101,7 @@ impl ReplicationDrain {
 }
 
 /// Reconciles every replicated namespace against all its configured
-/// downstreams, then drains the enqueued jobs in-process. Supersedes the
-/// deprecated `scrub --replicate`.
+/// downstreams, then drains the enqueued jobs in-process.
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
     let bootstrap::MaintenanceContext {
         blob_store: blob_backend,

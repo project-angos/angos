@@ -198,7 +198,7 @@ Result: Production images kept for 365 days, others for 7 days.
 
 ## Enforcing Retention Policies
 
-Retention policies are enforced by the `prune` command (`scrub --retention` is a deprecated alias). Retention deletions take the registry's standard delete path:
+Retention policies are enforced by the `prune` command. Retention deletions take the registry's standard delete path:
 
 - They emit `manifest.delete` / `tag.delete` webhook events whose actor carries `internal = "prune"`, so subscribers can tell retention apart from client deletes.
 - The manifest's blob bytes are reclaimed immediately once unreferenced (no separate `scrub --blobs` pass needed for pruned content).
