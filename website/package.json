@@ -15,9 +15,9 @@
     "write-heading-ids": "docusaurus write-heading-ids"
   },
   "dependencies": {
-    "@docusaurus/core": "^3.10.1",
-    "@docusaurus/preset-classic": "^3.10.1",
-    "@docusaurus/theme-mermaid": "^3.10.1",
+    "@docusaurus/core": "^3.10.2",
+    "@docusaurus/preset-classic": "^3.10.2",
+    "@docusaurus/theme-mermaid": "^3.10.2",
     "@fontsource/inter": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",
     "@mdx-js/react": "^3.1.1",
@@ -27,23 +27,23 @@
     "unist-util-visit": "^5.1.0"
   },
   "devDependencies": {
-    "@docusaurus/module-type-aliases": "^3.10.1",
-    "@docusaurus/types": "^3.10.1"
+    "@docusaurus/module-type-aliases": "^3.10.2",
+    "@docusaurus/types": "^3.10.2"
   },
   "overrides": {
-    "serialize-javascript": "^7.0.5",
-    "shell-quote": "^1.8.4",
-    "ws": "^8.21.0",
-    "qs": "^6.15.2",
-    "uuid": "^11.1.1",
-    "dompurify": "^3.4.11",
-    "http-proxy-middleware": "^2.0.10",
-    "joi": "^17.13.4",
+    "serialize-javascript": "^7.0.7",
+    "shell-quote": "^1.10.0",
+    "ws": "^8.21.1",
+    "qs": "^6.15.3",
+    "uuid": "^14.0.1",
+    "dompurify": "^3.4.12",
+    "http-proxy-middleware": "^4.2.0",
+    "joi": "^18.2.3",
     "launch-editor": "^2.14.1",
-    "@babel/core": "^7.29.6",
-    "webpack-dev-server": "^5.2.5",
+    "@babel/core": "^8.0.1",
+    "webpack-dev-server": "^6.0.0",
     "gray-matter": {
-      "js-yaml": "^3.15.0"
+      "js-yaml": "^5.2.1"
     }
   },
   "browserslist": {
@@ -59,6 +59,6 @@
     ]
   },
   "engines": {
-    "node": ">=18.0"
+    "node": ">=24.18.0"
   }
 }
