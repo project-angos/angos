@@ -80,7 +80,7 @@ parking_lot = { workspace = true }
 # Stays on 0.5 in lockstep with argon2: this dep exists to enable the
 # `getrandom` feature on the password-hash instance argon2 re-exports, which
 # requires both to resolve to the same crate version.
-password-hash = { version = "0.6.1", features = ["getrandom"] }
+password-hash = { version = "0.5", features = ["getrandom"] }
 prometheus = "0.14"
 quick-xml = { workspace = true }
 redis = { workspace = true }
@@ -113,6 +113,6 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 angos-s3-client = { workspace = true, features = ["test-util"] }
 angos-storage = { workspace = true, features = ["test-util"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
-p256 = { version = "0.14.0", features = ["ecdsa", "pem", "jwk"] }
+p256 = { version = "0.14.0", features = ["ecdsa", "pem"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
 wiremock = { workspace = true }

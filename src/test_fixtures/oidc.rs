@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::{
     PublicKey,
-    elliptic_curve::{pkcs8::DecodePublicKey, sec1::ToEncodedPoint},
+    elliptic_curve::{pkcs8::DecodePublicKey, sec1::ToSec1Point},
 };
 use rcgen::KeyPair;
 
@@ -26,7 +26,7 @@ fn generate_key() -> OidcKey {
     // the 32-byte X and Y coordinates for the JWK.
     let public_key =
         PublicKey::from_public_key_pem(&kp.public_key_pem()).expect("valid P-256 SPKI public key");
-    let point = public_key.to_encoded_point(false); // uncompressed: 0x04 || X || Y
+    let point = public_key.to_sec1_point(false); // uncompressed: 0x04 || X || Y
     let x = point.x().expect("uncompressed point has x coordinate");
     let y = point.y().expect("uncompressed point has y coordinate");
 
