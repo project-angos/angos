@@ -19,6 +19,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -154,7 +155,10 @@ impl CasExecutor {
     ///
     /// Returns `Ok(())` after all mutations are applied. On `Precondition`
     /// failure before any mutation has been applied, rolls back and returns
-    /// `Err(Error::Precondition)`. On `Precondition` failure mid-Apply (at
+    /// `Err(Error::Precondition)`. A merge that exhausts its attempt budget
+    /// before any mutation has been applied likewise rolls back, returning
+    /// `Err(Error::Conflict)` so the caller's retry loop re-runs the whole
+    /// transaction. On `Precondition` failure mid-Apply (at
     /// least one mutation already stamped `Applied`), uses the stale-stamp
     /// recovery heuristic:
     ///
@@ -211,6 +215,12 @@ impl CasExecutor {
                         rollback(self.store.as_ref(), intent).await;
                         return Err(Error::Precondition);
                     }
+                }
+                Err(Error::PartialCommit) if !intent.any_applied() => {
+                    // Merge attempt budget exhausted with nothing applied yet:
+                    // roll back and signal a retriable conflict instead.
+                    rollback(self.store.as_ref(), intent).await;
+                    return Err(Error::Conflict);
                 }
                 Err(e) => return Err(e),
             }
@@ -393,7 +403,64 @@ pub async fn apply_cas(
                 .await
                 .map_err(Error::Storage),
         },
+        // Mode-independent: the merge re-reads and recomputes against live state,
+        // so it is idempotent on both the healthy apply and recovery replay.
+        MutationRecord::MergeSet { key, add, remove } => {
+            apply_merge_set_cas(store, key, add, remove).await
+        }
     }
+}
+
+/// Upper bound on CAS re-reads for a single [`MutationRecord::MergeSet`] apply.
+/// On exhaustion the mutation is left `Pending` and `Error::PartialCommit` is
+/// returned, deferring to the recovery loop, which retries and converges once
+/// contention subsides.
+const MERGE_SET_MAX_ATTEMPTS: u32 = 16;
+
+/// Apply a [`MutationRecord::MergeSet`] with conditional operations: read the
+/// current set with its etag, merge, and commit with `put_if_match` /
+/// `delete_if_match` / `put_if_absent`, re-reading on a precondition miss.
+///
+/// A backend that surfaces no etag for a present object falls back to an
+/// unconditional write (matching how a read-keyed `Put` degrades when no etag is
+/// captured).
+///
+/// # Errors
+///
+/// Returns [`Error::Serde`] on a malformed set body, [`Error::Storage`] on a hard
+/// storage error, or [`Error::PartialCommit`] when the attempt budget is
+/// exhausted under sustained contention.
+async fn apply_merge_set_cas(
+    store: &dyn ConditionalStore,
+    key: &str,
+    add: &[Value],
+    remove: &[Value],
+) -> Result<(), Error> {
+    for _ in 0..MERGE_SET_MAX_ATTEMPTS {
+        let outcome = match store.get_with_etag(key).await {
+            Ok((current, Some(etag))) => match common::merge_json_set(&current, add, remove)? {
+                Some(body) => store.put_if_match(key, &etag, body).await.map(|_| ()),
+                None => store.delete_if_match(key, &etag).await,
+            },
+            // Present but no etag: no CAS is possible, so write unconditionally.
+            Ok((current, None)) => match common::merge_json_set(&current, add, remove)? {
+                Some(body) => store.put(key, body).await,
+                None => store.delete(key).await,
+            },
+            Err(StorageError::NotFound) => match common::merge_json_set(&[], add, remove)? {
+                Some(body) => store.put_if_absent(key, body).await.map(|_| ()),
+                None => return Ok(()),
+            },
+            Err(e) => return Err(Error::Storage(e)),
+        };
+        match outcome {
+            Ok(()) => return Ok(()),
+            // Lost the CAS race: re-read and recompute on the next iteration.
+            Err(StorageError::PreconditionFailed) => {}
+            Err(e) => return Err(Error::Storage(e)),
+        }
+    }
+    Err(Error::PartialCommit)
 }
 
 /// Fetch the staged body for a `Put`/`PutIfAbsent`.
@@ -497,9 +564,9 @@ impl TransactionExecutor for CasExecutor {
 
         // Reap only when the transaction either fully committed or applied
         // nothing (see `common::finish`). This subsumes the `PartialCommit`
-        // case (which always implies `any_applied`); on the `Precondition` +
-        // nothing-applied path `apply_all` already rolled back, so reaping
-        // here is a harmless no-op.
+        // case (which always implies `any_applied`); on the nothing-applied
+        // `Precondition`/`Conflict` paths `apply_all` already rolled back, so
+        // reaping here is a harmless no-op.
         finish(self.store.as_ref(), &apply_result, &intent).await;
 
         if let Some(session) = coarse_session {

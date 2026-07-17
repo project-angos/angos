@@ -64,14 +64,12 @@ impl MetadataStore {
         execute_with_retry(
             self.executor(),
             || async {
-                let store = self.store_arc();
-                let builder = Transaction::builder();
                 let builder = append_shard_for_digest(
-                    store.as_ref(),
+                    self.store_arc().as_ref(),
                     namespace,
                     digest,
                     &operations,
-                    builder,
+                    Transaction::builder(),
                 )
                 .await
                 .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;

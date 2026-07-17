@@ -14,11 +14,20 @@ mod shard;
 mod tests;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    future::Future,
     sync::{Arc, Mutex, atomic::Ordering},
+    time::{Duration, Instant},
 };
 
+use chrono::{DateTime, TimeDelta, Utc};
+use tokio::time::sleep;
 use tracing::warn;
+
+use angos_tx_engine::{
+    INTENT_LOG_PREFIX, StorageError,
+    intent::{IntentRecord, MutationRecord},
+};
 
 use crate::{
     command::scrub::{
@@ -29,8 +38,19 @@ use crate::{
         walk::WalkStats,
     },
     oci::Digest,
-    registry::{blob_store::BlobStore, metadata_store::MetadataStore},
+    registry::{Error as RegistryError, blob_store::BlobStore, metadata_store::MetadataStore},
 };
+
+/// Intent records fetched per `.tx-log/` listing page while confirming a
+/// candidate repair.
+const INTENT_PAGE: u16 = 100;
+
+/// How long a candidate repair waits for in-flight transactions on its
+/// evidence keys to settle, and the pause between observations. Transactions
+/// settle in milliseconds; a candidate still covered at the deadline is left
+/// for the next run.
+const INTENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const INTENT_SETTLE_BACKOFF: Duration = Duration::from_millis(20);
 
 /// One of the three walk passes. Later passes rely on earlier repairs:
 /// links are healed and grants reconciled (M1) before shard entries are
@@ -61,6 +81,10 @@ pub struct Validator {
     /// namespaces, orphan upload sessions), so the per-key walk does not
     /// repeat their prefix-level actions.
     handled: Mutex<HashSet<String>>,
+    /// Intent records already fetched this run, keyed by log file name. An
+    /// intent's expiry and mutation keys never change once written, so a
+    /// cached entry stays valid for the whole run.
+    intent_cache: Mutex<HashMap<String, CachedIntent>>,
 }
 
 impl Validator {
@@ -78,6 +102,7 @@ impl Validator {
             stats,
             delete_unknown,
             handled: Mutex::new(HashSet::new()),
+            intent_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -142,6 +167,107 @@ impl Validator {
         Ok(())
     }
 
+    /// Confirm a cross-key inconsistency before repairing it, so a
+    /// transaction caught mid-apply is never mistaken for settled damage.
+    ///
+    /// A live intent listing any of `evidence_keys` marks the state as still
+    /// moving (a server write, or one of this run's own repairs on a
+    /// neighbouring key), so the check backs off and retries until it settles.
+    /// Once settled, the repair proceeds only when `reverify` still observes
+    /// the inconsistency; checking intents again after the re-read closes the
+    /// race with a transaction that started in between. A candidate that never
+    /// settles is left for the next run.
+    pub async fn confirm_repair<F, Fut>(
+        &self,
+        evidence_keys: &[String],
+        reverify: F,
+    ) -> Result<bool, Error>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<bool, Error>>,
+    {
+        let deadline = Instant::now() + INTENT_SETTLE_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.live_intent_touches(evidence_keys).await? {
+                sleep(INTENT_SETTLE_BACKOFF).await;
+                continue;
+            }
+            if !reverify().await? {
+                return Ok(false);
+            }
+            if !self.live_intent_touches(evidence_keys).await? {
+                return Ok(true);
+            }
+            sleep(INTENT_SETTLE_BACKOFF).await;
+        }
+        warn!("scrub: repair candidate on {evidence_keys:?} never settled; leaving to a later run");
+        Ok(false)
+    }
+
+    /// Whether a live (non-expired) transaction intent lists any of `keys`
+    /// among its mutation targets. An unreadable intent record suppresses the
+    /// repair too: its transaction is recovery's to settle first.
+    ///
+    /// The listing is always fresh (reaping must be observed), but records
+    /// already fetched this run are answered from the intent cache.
+    async fn live_intent_touches(&self, keys: &[String]) -> Result<bool, Error> {
+        let store = self.metadata_store.store().object_store();
+        let mut token = None;
+        loop {
+            let page = store
+                .list(INTENT_LOG_PREFIX, INTENT_PAGE, token)
+                .await
+                .map_err(RegistryError::from)?;
+            for name in &page.items {
+                if let Some(touches) = self.cached_intent_touches(name, keys) {
+                    if touches {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                let raw = match store.get(&format!("{INTENT_LOG_PREFIX}/{name}")).await {
+                    Ok(raw) => raw,
+                    // Reaped between the listing and the read: not in flight.
+                    Err(StorageError::NotFound) => continue,
+                    Err(e) => return Err(RegistryError::from(e).into()),
+                };
+                // An unreadable record is never cached, so it keeps
+                // suppressing repairs until it becomes readable or is reaped.
+                let Ok(intent) = serde_json::from_slice::<IntentRecord>(&raw) else {
+                    return Ok(true);
+                };
+                let cached = CachedIntent::from(&intent);
+                let touches = cached.touches(keys);
+                self.cache_intent(name.clone(), cached);
+                if touches {
+                    return Ok(true);
+                }
+            }
+            token = page.next_token;
+            if token.is_none() {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// The cached intent's verdict against `keys`, or `None` when the record
+    /// has not been fetched this run.
+    fn cached_intent_touches(&self, name: &str, keys: &[String]) -> Option<bool> {
+        let cache = match self.intent_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        cache.get(name).map(|cached| cached.touches(keys))
+    }
+
+    /// Remember a fetched intent record for the rest of the run.
+    fn cache_intent(&self, name: String, cached: CachedIntent) {
+        match self.intent_cache.lock() {
+            Ok(mut cache) => cache.insert(name, cached),
+            Err(poisoned) => poisoned.into_inner().insert(name, cached),
+        };
+    }
+
     /// Handle a key that matches no known layout: quarantined by default,
     /// deleted outright under `--delete-unknown`. Either way it counts in
     /// the run's unknown-key tally.
@@ -198,6 +324,43 @@ impl Validator {
         match self.handled.lock() {
             Ok(handled) => handled.contains(&token),
             Err(poisoned) => poisoned.into_inner().contains(&token),
+        }
+    }
+}
+
+/// The immutable facts of one intent record: when it expires and which keys
+/// its mutations touch. Only an intent's progress slots change after it is
+/// written, so these never go stale.
+struct CachedIntent {
+    expires_at: DateTime<Utc>,
+    touched_keys: HashSet<String>,
+}
+
+impl CachedIntent {
+    /// Whether the intent is still live and lists any of `keys`. An expired
+    /// intent's leftovers are scrub's to repair rather than recovery's to
+    /// replay, so it suppresses nothing.
+    fn touches(&self, keys: &[String]) -> bool {
+        Utc::now() < self.expires_at && keys.iter().any(|key| self.touched_keys.contains(key))
+    }
+}
+
+impl From<&IntentRecord> for CachedIntent {
+    fn from(intent: &IntentRecord) -> Self {
+        let ttl = i64::try_from(intent.ttl_secs).unwrap_or(i64::MAX);
+        let expires_at = intent
+            .created_at
+            .checked_add_signed(TimeDelta::seconds(ttl))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let touched_keys = intent
+            .mutations
+            .iter()
+            .flat_map(MutationRecord::all_keys)
+            .map(str::to_string)
+            .collect();
+        Self {
+            expires_at,
+            touched_keys,
         }
     }
 }

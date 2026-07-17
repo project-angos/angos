@@ -41,6 +41,13 @@ use crate::{
 ///    - If every entry in `progress` is `Pending`, the transaction is rolled
 ///      back: delete bodies and intent.
 ///
+/// Default grace, used by the serving processes, after which a committed intent
+/// the recovery loop still cannot reconcile is abandoned: its intent is reaped
+/// so a permanently unsatisfiable mutation stops re-logging every sweep. The
+/// blob-index state a reaped shard mutation would have written is reconciled by
+/// `angos scrub`.
+pub const DEFAULT_ABANDON_AFTER_SECS: u64 = 3600;
+
 /// Constructed via [`RecoveryLoop::builder`].
 pub struct RecoveryLoop {
     store: Arc<dyn ObjectStore>,
@@ -48,6 +55,7 @@ pub struct RecoveryLoop {
     lock: Option<Arc<Lock>>,
     interval: Duration,
     cancellation: CancellationToken,
+    abandon_after_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for RecoveryLoop {
@@ -67,6 +75,7 @@ pub struct RecoveryLoopBuilder {
     lock: Option<Arc<Lock>>,
     interval: Option<Duration>,
     cancellation: Option<CancellationToken>,
+    abandon_after_secs: Option<u64>,
 }
 
 impl RecoveryLoopBuilder {
@@ -106,6 +115,16 @@ impl RecoveryLoopBuilder {
         self
     }
 
+    /// Abandon a committed intent that still fails to reconcile once it is older
+    /// than `secs`, reaping it instead of replaying it forever. Omitting this
+    /// (the default) never abandons, which is the right choice for one-shot test
+    /// sweeps; serving processes wire [`DEFAULT_ABANDON_AFTER_SECS`].
+    #[must_use]
+    pub fn abandon_after_secs(mut self, secs: u64) -> Self {
+        self.abandon_after_secs = Some(secs);
+        self
+    }
+
     /// Consume the builder and produce a [`RecoveryLoop`].
     #[must_use]
     pub fn build(self) -> RecoveryLoop {
@@ -115,6 +134,7 @@ impl RecoveryLoopBuilder {
             lock: self.lock,
             interval: self.interval.unwrap_or(Duration::from_secs(30)),
             cancellation: self.cancellation.unwrap_or_default(),
+            abandon_after_secs: self.abandon_after_secs,
         }
     }
 }
@@ -151,6 +171,7 @@ impl RecoveryLoop {
             lock: None,
             interval: None,
             cancellation: None,
+            abandon_after_secs: None,
         }
     }
 
@@ -252,7 +273,7 @@ impl RecoveryLoop {
         if intent.any_applied() {
             self.replay_forward(&mut intent).await;
         } else {
-            self.rollback(&intent).await;
+            common::rollback(self.store.as_ref(), &intent).await;
         }
 
         if let Some(session) = session {
@@ -266,6 +287,19 @@ impl RecoveryLoop {
         let len = intent.mutations.len();
         for idx in 0..len {
             if let Err(e) = self.apply_mutation(intent, idx).await {
+                if matches!(e, StorageError::PreconditionFailed)
+                    && self.abandon_deadline_passed(intent)
+                {
+                    warn!(
+                        tx_id = %intent.id,
+                        idx,
+                        "RecoveryLoop: abandoning committed transaction whose mutation stayed \
+                         unreconcilable past the grace period; reaping intent so it stops \
+                         replaying (blob-index state is reconciled by scrub)"
+                    );
+                    common::reap(self.store.as_ref(), intent).await;
+                    return;
+                }
                 warn!(
                     tx_id = %intent.id,
                     idx,
@@ -275,24 +309,17 @@ impl RecoveryLoop {
                 return;
             }
         }
-        self.reap(intent).await;
-    }
-
-    /// Roll back a transaction that has no applied mutations.
-    ///
-    /// Delegates to the shared [`common::rollback`] so the recovery and
-    /// healthy-path cleanup stay in lock-step.
-    async fn rollback(&self, intent: &IntentRecord) {
-        common::rollback(self.store.as_ref(), intent).await;
-    }
-
-    /// Reap a fully-applied transaction.
-    ///
-    /// Delegates to the shared [`common::reap`]: deletes the body staging
-    /// prefix first, leaving the intent log intact for a later sweep if that
-    /// delete fails.
-    async fn reap(&self, intent: &IntentRecord) {
         common::reap(self.store.as_ref(), intent).await;
+    }
+
+    /// Whether `intent` has stayed unreconcilable long enough to abandon, per
+    /// the configured grace. Always `false` when no grace is set.
+    fn abandon_deadline_passed(&self, intent: &IntentRecord) -> bool {
+        let Some(grace_secs) = self.abandon_after_secs else {
+            return false;
+        };
+        let grace = chrono::Duration::seconds(grace_secs.cast_signed());
+        Utc::now() > intent.created_at + grace
     }
 
     /// Apply a single mutation during recovery.

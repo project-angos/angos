@@ -26,6 +26,8 @@ The `scrub` and `prune` commands run as **separate periodic processes** that ope
 
 Scrub streams every key in both stores (blob and metadata), categorizes it by shape, and validates it concurrently, in three ordered passes: links and job records, then blob-index shards, then blob data. Every check always runs; there are no per-check flags.
 
+Before applying a cross-key repair, scrub confirms the inconsistency is settled damage rather than a transaction caught mid-apply: while a live transaction intent covers the involved keys, the candidate waits briefly and re-checks, and one that never settles is left for the next run. This is what makes scrub safe to run against a live server.
+
 | Concern | Behavior |
 |---|---|
 | Manifest-derived links | Recreates every link a manifest implies (config, layer, sub-manifest, digest revision) and the `referenced_by` back-links |

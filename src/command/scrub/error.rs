@@ -2,8 +2,9 @@ use angos_tx_engine::lock;
 
 use crate::{cache, command::bootstrap::Error as BootstrapError, policy, registry};
 
-/// Errors that can occur during a scrub run. Each variant's `Display` carries
-/// a `scrub ...` prefix so log lines are unambiguously attributable.
+/// Errors raised by the maintenance machinery shared between `scrub` and
+/// `prune`. `Display` stays command-neutral: the logging call sites and the
+/// top-level command handlers add the attribution.
 ///
 /// The `Initialization` string variant covers call sites where the source
 /// error type is not one of the typed variants below, or where the call site
@@ -11,26 +12,26 @@ use crate::{cache, command::bootstrap::Error as BootstrapError, policy, registry
 /// in the source error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("scrub initialization failed: {0}")]
+    #[error("initialization failed: {0}")]
     Initialization(String),
 
     /// A replication-reconcile failure (envelope build or durable-queue enqueue)
     /// raised mid-run, so it must not borrow the `Initialization` prefix.
-    #[error("scrub replication error: {0}")]
+    #[error("replication error: {0}")]
     Replication(String),
 
     /// A durable-queue failure (list, read, or delete) raised while scrubbing
     /// orphan jobs on the replication or cache queue.
-    #[error("scrub job queue error: {0}")]
+    #[error("job queue error: {0}")]
     JobQueue(String),
 
     /// Wraps a `registry::Error` (the single blob-store / metadata-store domain
     /// error) with source preserved.
-    #[error("scrub registry error: {0}")]
+    #[error("registry error: {0}")]
     Registry(#[from] registry::Error),
 
     /// Wraps a `cache::Error` with source preserved.
-    #[error("scrub cache error: {0}")]
+    #[error("cache error: {0}")]
     Cache(#[from] cache::Error),
 }
 
@@ -73,10 +74,7 @@ mod tests {
     #[test]
     fn initialization_display_includes_prefix() {
         let error = Error::Initialization("Some init error".to_string());
-        assert_eq!(
-            format!("{error}"),
-            "scrub initialization failed: Some init error"
-        );
+        assert_eq!(format!("{error}"), "initialization failed: Some init error");
     }
 
     #[test]
@@ -84,7 +82,7 @@ mod tests {
         let error = Error::Replication("failed to enqueue replication job".to_string());
         assert_eq!(
             format!("{error}"),
-            "scrub replication error: failed to enqueue replication job"
+            "replication error: failed to enqueue replication job"
         );
     }
 
@@ -93,7 +91,7 @@ mod tests {
         let error = Error::JobQueue("failed to list cache jobs".to_string());
         assert_eq!(
             format!("{error}"),
-            "scrub job queue error: failed to list cache jobs"
+            "job queue error: failed to list cache jobs"
         );
     }
 

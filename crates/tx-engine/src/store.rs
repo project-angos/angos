@@ -44,7 +44,7 @@ use crate::{
         primitive::Lock,
         storage::{LockStorage, memory::MemoryLockStorage, s3::S3LockStorage},
     },
-    recovery::RecoveryLoop,
+    recovery::{DEFAULT_ABANDON_AFTER_SECS, RecoveryLoop},
     transaction::{Mutation, Transaction},
 };
 
@@ -229,6 +229,7 @@ impl Store {
     ) -> impl Future<Output = ()> + Send + 'static {
         let mut recovery = RecoveryLoop::builder(self.object.clone())
             .lock(self.lock.clone())
+            .abandon_after_secs(DEFAULT_ABANDON_AFTER_SECS)
             .cancellation(cancellation);
         if let Some(cs) = &self.conditional {
             recovery = recovery.conditional_store(cs.clone());

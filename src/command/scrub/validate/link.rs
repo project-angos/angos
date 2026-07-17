@@ -18,7 +18,7 @@ use crate::{
     registry::{
         Error as RegistryError,
         metadata_store::{LinkKind, LinkMetadata},
-        parse_manifest_digests,
+        parse_manifest_digests, path_builder,
     },
 };
 
@@ -179,22 +179,25 @@ impl Validator {
         if self.read_link_body(key).await?.is_none() {
             return Ok(());
         }
-        match self
-            .metadata_store
-            .read_link(namespace, &LinkKind::Digest(referrer.clone()))
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(RegistryError::NotFound) => {
-                self.emit(Action::DeleteOrphanReferrer {
-                    namespace: namespace.clone(),
-                    subject: subject.clone(),
-                    referrer: referrer.clone(),
-                })
-                .await
-            }
-            Err(e) => Err(e.into()),
+        let revision_key = path_builder::link_path(&LinkKind::Digest(referrer.clone()), namespace);
+        if self.read_link_body(&revision_key).await?.is_some() {
+            return Ok(());
         }
+        let evidence = [key.to_string(), revision_key.clone()];
+        let revision_key = &revision_key;
+        let reverify = move || async move {
+            Ok(self.read_link_body(key).await?.is_some()
+                && self.read_link_body(revision_key).await?.is_none())
+        };
+        if !self.confirm_repair(&evidence, reverify).await? {
+            return Ok(());
+        }
+        self.emit(Action::DeleteOrphanReferrer {
+            namespace: namespace.clone(),
+            subject: subject.clone(),
+            referrer: referrer.clone(),
+        })
+        .await
     }
 
     /// A blob/layer/config/index-child link: prune `referenced_by` entries
@@ -210,22 +213,29 @@ impl Validator {
             return Ok(());
         };
         for referrer in &metadata.referenced_by {
-            match self
-                .metadata_store
-                .read_link(namespace, &LinkKind::Digest(referrer.clone()))
-                .await
-            {
-                Ok(_) => {}
-                Err(RegistryError::NotFound) => {
-                    self.emit(Action::RemoveReferrer {
-                        namespace: namespace.clone(),
-                        link: link.clone(),
-                        referrer: referrer.clone(),
-                    })
-                    .await?;
-                }
-                Err(e) => return Err(e.into()),
+            let revision_key =
+                path_builder::link_path(&LinkKind::Digest(referrer.clone()), namespace);
+            if self.read_link_body(&revision_key).await?.is_some() {
+                continue;
             }
+            let evidence = [key.to_string(), revision_key.clone()];
+            let revision_key = &revision_key;
+            let reverify = move || async move {
+                let Some(current) = self.read_link_body(key).await? else {
+                    return Ok(false);
+                };
+                Ok(current.referenced_by.contains(referrer)
+                    && self.read_link_body(revision_key).await?.is_none())
+            };
+            if !self.confirm_repair(&evidence, reverify).await? {
+                continue;
+            }
+            self.emit(Action::RemoveReferrer {
+                namespace: namespace.clone(),
+                link: link.clone(),
+                referrer: referrer.clone(),
+            })
+            .await?;
         }
         Ok(())
     }
@@ -259,10 +269,22 @@ impl Validator {
         link: &LinkKind,
         expected: &Digest,
     ) -> Result<(), Error> {
-        match self.metadata_store.read_link(namespace, link).await {
-            Ok(metadata) if &metadata.target == expected => return Ok(()),
-            Ok(_) | Err(RegistryError::NotFound) => {}
-            Err(e) => return Err(e.into()),
+        let link_key = path_builder::link_path(link, namespace);
+        if let Some(metadata) = self.read_link_body(&link_key).await?
+            && &metadata.target == expected
+        {
+            return Ok(());
+        }
+        let evidence = [link_key.clone()];
+        let link_key = &link_key;
+        let reverify = move || async move {
+            Ok(self
+                .read_link_body(link_key)
+                .await?
+                .is_none_or(|current| &current.target != expected))
+        };
+        if !self.confirm_repair(&evidence, reverify).await? {
+            return Ok(());
         }
         self.emit(Action::RecreateLink {
             namespace: namespace.clone(),
@@ -282,12 +304,23 @@ impl Validator {
         target: &Digest,
         referrer: &Digest,
     ) -> Result<(), Error> {
-        let metadata = match self.metadata_store.read_link(namespace, link).await {
-            Ok(metadata) => metadata,
-            Err(RegistryError::NotFound) => return Ok(()),
-            Err(e) => return Err(e.into()),
+        let link_key = path_builder::link_path(link, namespace);
+        // An absent link is a candidate too: the repair recreates it with the
+        // back-link, so a concurrent removal cascade cannot strand the child.
+        if let Some(metadata) = self.read_link_body(&link_key).await?
+            && metadata.referenced_by.contains(referrer)
+        {
+            return Ok(());
+        }
+        let evidence = [link_key.clone()];
+        let link_key = &link_key;
+        let reverify = move || async move {
+            Ok(self
+                .read_link_body(link_key)
+                .await?
+                .is_none_or(|current| !current.referenced_by.contains(referrer)))
         };
-        if metadata.referenced_by.contains(referrer) {
+        if !self.confirm_repair(&evidence, reverify).await? {
             return Ok(());
         }
         self.emit(Action::AddReferrer {
@@ -325,6 +358,21 @@ impl Validator {
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
+        }
+        let evidence = [path_builder::blob_index_shard_path(blob, namespace)];
+        let reverify = move || async move {
+            match self
+                .metadata_store
+                .read_blob_index_namespace(namespace, blob)
+                .await
+            {
+                Ok(links) => Ok(!links.contains(link)),
+                Err(RegistryError::NotFound) => Ok(true),
+                Err(e) => Err(e.into()),
+            }
+        };
+        if !self.confirm_repair(&evidence, reverify).await? {
+            return Ok(());
         }
         self.emit(Action::GrantBlobIndexLink {
             namespace: namespace.clone(),
