@@ -14,6 +14,20 @@ pub fn repository_dir() -> &'static str {
     REPOS_ROOT
 }
 
+/// Root directory and namespace-name prefix for a namespace tree walk. `None`
+/// walks the whole repositories tree; `Some(repository)` restricts the walk to
+/// that repository's subtree while keeping the repository segment in the
+/// returned namespace names.
+pub fn namespace_walk_root(scope: Option<&str>) -> (String, String) {
+    match scope {
+        Some(repository) => (
+            format!("{REPOS_ROOT}/{repository}"),
+            format!("{repository}/"),
+        ),
+        None => (REPOS_ROOT.to_string(), String::new()),
+    }
+}
+
 /// Storage prefix for a namespace's repository subtree addressed by its raw
 /// on-disk name, so scrub can reclaim a directory whose name fails `Namespace`
 /// validation (out-of-band corruption). Returns `None` when a path segment is
@@ -40,10 +54,6 @@ fn blob_dir(digest: &Digest) -> String {
 
 pub fn blob_path(digest: &Digest) -> String {
     format!("{}/data", blob_dir(digest))
-}
-
-pub fn blob_index_path(digest: &Digest) -> String {
-    format!("{}/index.json", blob_dir(digest))
 }
 
 pub fn blob_index_refs_dir(digest: &Digest) -> String {
@@ -75,22 +85,17 @@ pub fn upload_path(namespace: &Namespace, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/data")
 }
 
-/// Directory holding an upload's hasher-state checkpoints under `algorithm`, one
-/// file per offset. Used to enumerate checkpoints and pick the most recent.
-pub fn upload_hash_context_dir(namespace: &Namespace, uuid: &str, algorithm: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}")
+/// Directory holding an upload's hasher-state checkpoints, one file per offset.
+/// Used to enumerate checkpoints and pick the most recent.
+pub fn upload_hash_context_dir(namespace: &Namespace, uuid: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates")
 }
 
-/// An upload's serialised hasher-state checkpoint under `algorithm` after
-/// consuming its bytes up to `offset`. One file per offset, allowing hash
-/// resumption after a crash without re-reading the uploaded bytes.
-pub fn upload_hash_context_path(
-    namespace: &Namespace,
-    uuid: &str,
-    algorithm: &str,
-    offset: u64,
-) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}/{offset}")
+/// An upload's serialised hasher-state checkpoint after consuming its bytes up
+/// to `offset`. One file per offset, allowing hash resumption after a crash
+/// without re-reading the uploaded bytes.
+pub fn upload_hash_context_path(namespace: &Namespace, uuid: &str, offset: u64) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{offset}")
 }
 
 /// RFC3339 timestamp marking when the upload session was created. Used for
@@ -198,10 +203,6 @@ mod tests {
             format!("v2/blobs/sha256/aa/{HASH_A}/data")
         );
         assert_eq!(
-            blob_index_path(&digest),
-            format!("v2/blobs/sha256/aa/{HASH_A}/index.json")
-        );
-        assert_eq!(
             blob_container_dir(&digest),
             format!("v2/blobs/sha256/aa/{HASH_A}")
         );
@@ -213,10 +214,6 @@ mod tests {
         assert_eq!(
             blob_path(&digest),
             format!("v2/blobs/sha512/cc/{HASH_512}/data")
-        );
-        assert_eq!(
-            blob_index_path(&digest),
-            format!("v2/blobs/sha512/cc/{HASH_512}/index.json")
         );
     }
 
@@ -233,8 +230,8 @@ mod tests {
         );
         assert_eq!(uploads_root_dir(&ns), "v2/repositories/ns/_uploads");
         assert_eq!(
-            upload_hash_context_path(&ns, "uuid", "sha256", 42),
-            "v2/repositories/ns/_uploads/uuid/hashstates/sha256/42"
+            upload_hash_context_path(&ns, "uuid", 42),
+            "v2/repositories/ns/_uploads/uuid/hashstates/42"
         );
         assert_eq!(
             upload_start_date_path(&ns, "uuid"),

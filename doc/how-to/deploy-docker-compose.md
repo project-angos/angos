@@ -293,7 +293,7 @@ At startup, Angos probes the S3 provider to verify conditional write and delete 
 Run maintenance manually with Docker Compose:
 
 ```bash
-docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs
+docker compose run --rm registry /angos -c /config/config.toml scrub
 docker compose run --rm registry /angos -c /config/config.toml prune
 ```
 
@@ -308,7 +308,7 @@ After=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/path/to/registry
-ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs
+ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml scrub
 ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml prune
 ```
 

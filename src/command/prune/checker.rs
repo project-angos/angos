@@ -2,8 +2,10 @@ use std::{cmp::Reverse, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, future::join_all};
+use futures_util::{StreamExt, TryStreamExt, future::join_all};
 use tracing::{debug, error};
+
+use chrono::Duration;
 
 use crate::{
     command::scrub::{
@@ -15,7 +17,8 @@ use crate::{
     oci::{Digest, Namespace, Tag},
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
-        Repository,
+        Error as RegistryError, Repository,
+        blob_store::BlobStore,
         metadata_store::{BlobIndex, LinkKind, LinkMetadata, MetadataStore},
         pagination::collect_all_pages,
         repository_resolver::RepositoryResolver,
@@ -151,6 +154,114 @@ fn decide_orphan_fate(
     })
 }
 
+/// Revoke per-namespace blob-ownership grants with no manifest reference,
+/// letting the retention policies decide their fate like any other untagged
+/// content: the subject carries no tag and `pushed_at` is the bytes' mtime,
+/// so time-based keep rules apply uniformly. With no policies configured the
+/// grant is retained, matching the orphan-manifest default.
+///
+/// `in_flight_window` guards the push race, not the decision: a push grants
+/// ownership before it links the manifest, so bytes younger than the window
+/// are never considered. The executor still re-checks under the blob-data
+/// lock before revoking.
+pub async fn sweep_orphan_grants(
+    blob_store: &Arc<BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
+    resolver: &Arc<RepositoryResolver>,
+    global_policy: Option<&RetentionPolicy>,
+    in_flight_window: Duration,
+    sink: &dyn ActionSink,
+    concurrency: usize,
+) -> Result<(), Error> {
+    let now = Utc::now();
+    list_all::blobs(blob_store)
+        .try_for_each_concurrent(concurrency, |blob| async move {
+            if let Err(e) = sweep_grants_for_blob(
+                blob_store,
+                metadata_store,
+                resolver,
+                global_policy,
+                &blob,
+                in_flight_window,
+                now,
+                sink,
+            )
+            .await
+            {
+                error!("prune: failed to check grants for blob {blob}: {e}");
+            }
+            Ok(())
+        })
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sweep_grants_for_blob(
+    blob_store: &Arc<BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
+    resolver: &Arc<RepositoryResolver>,
+    global_policy: Option<&RetentionPolicy>,
+    blob: &Digest,
+    in_flight_window: Duration,
+    now: DateTime<Utc>,
+    sink: &dyn ActionSink,
+) -> Result<(), Error> {
+    // In-flight guard on the bytes' mtime; without one (or with the bytes
+    // absent) leave the blob to scrub's orphan GC.
+    let last_modified = match blob_store.last_modified(blob).await {
+        Ok(Some(ts)) => ts,
+        Ok(None) | Err(RegistryError::BlobUnknown | RegistryError::NotFound) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if now.signed_duration_since(last_modified) < in_flight_window {
+        return Ok(());
+    }
+
+    let index = match metadata_store.read_blob_index(blob).await {
+        Ok(index) => index,
+        Err(RegistryError::NotFound) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let subject = ManifestImage {
+        tag: None,
+        pushed_at: EpochSeconds::from_seconds(last_modified.timestamp()),
+        last_pulled_at: EpochSeconds::from_seconds(0),
+    };
+    let grant = LinkKind::Blob(blob.clone());
+    for (namespace, links) in index.namespace {
+        // A namespace that no longer resolves to any configured repository is
+        // being cleared by the orphan-namespace sweep; revoke its grants
+        // outright (the executor's under-lock re-check still spares a blob a
+        // not-yet-cascaded manifest references).
+        let repository = resolver.resolve(&namespace);
+        if repository.is_none() && resolver.len() > 0 {
+            sink.apply(Action::RemoveOrphanBlobGrant {
+                namespace,
+                blob: blob.clone(),
+            })
+            .await?;
+            continue;
+        }
+        // A tracked link (Layer/Config/Manifest) means a manifest references
+        // the blob, so the grant is live; only a grant-only namespace is a
+        // retention subject.
+        if !links.contains(&grant) || links.iter().any(LinkKind::is_tracked) {
+            continue;
+        }
+        let global = check_global_policy(global_policy, &subject, &[], &[])?;
+        let repo = check_repo_policy(repository, &subject, &[], &[])?;
+        if policies_retain(&global, &repo) {
+            continue;
+        }
+        sink.apply(Action::RemoveOrphanBlobGrant {
+            namespace,
+            blob: blob.clone(),
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 impl RetentionChecker {
     pub fn new(
         metadata_store: Arc<MetadataStore>,
@@ -167,11 +278,7 @@ impl RetentionChecker {
 
 #[async_trait]
 impl NamespaceChecker for RetentionChecker {
-    async fn check(
-        &self,
-        namespace: &Namespace,
-        sink: &mut (dyn ActionSink + Send),
-    ) -> Result<(), Error> {
+    async fn check(&self, namespace: &Namespace, sink: &dyn ActionSink) -> Result<(), Error> {
         debug!("Checking retention policies on '{namespace}'");
 
         let tag_names = collect_all_pages(|marker| async move {
@@ -272,7 +379,7 @@ impl RetentionChecker {
         &self,
         namespace: &Namespace,
         tags_to_delete: &[&Tag],
-        sink: &mut (dyn ActionSink + Send),
+        sink: &dyn ActionSink,
     ) -> Result<(), Error> {
         for tag in tags_to_delete {
             let action = Action::DeleteTag {
@@ -337,7 +444,7 @@ impl RetentionChecker {
         namespace: &Namespace,
         last_pushed: &[String],
         last_pulled: &[String],
-        sink: &mut (dyn ActionSink + Send),
+        sink: &dyn ActionSink,
     ) -> Result<(), Error> {
         let mut revisions = list_all::revisions(&self.metadata_store, namespace);
         while let Some(digest) = revisions.next().await {
@@ -359,7 +466,7 @@ impl RetentionChecker {
         digest: &Digest,
         last_pushed: &[String],
         last_pulled: &[String],
-        sink: &mut (dyn ActionSink + Send),
+        sink: &dyn ActionSink,
     ) -> Result<(), Error> {
         let is_protected = self.is_protected(namespace, digest).await?;
         if is_protected {
@@ -395,7 +502,7 @@ impl RetentionChecker {
         namespace: &Namespace,
         digest: &Digest,
         fate: Fate,
-        sink: &mut (dyn ActionSink + Send),
+        sink: &dyn ActionSink,
     ) -> Result<(), Error> {
         match fate {
             Fate::Skip | Fate::Retain => Ok(()),
@@ -465,7 +572,7 @@ mod tests {
         registry::{
             Registry, RegistryConfig,
             blob_store::BlobStore,
-            metadata_store::LinkOperation,
+            metadata_store::{BlobIndexOperation, LinkOperation},
             repository_resolver::RepositoryResolver,
             test_utils::{
                 self, FSRegistryTestCase, RegistryTestCase, for_each_backend, put_blob_direct,
@@ -674,8 +781,8 @@ mod tests {
             let scrubber =
                 RetentionChecker::new(metadata_store.clone(), resolver, Some(retention_policy));
 
-            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
-            scrubber.check(namespace, &mut executor).await.unwrap();
+            let executor = make_executor(test_case.blob_store(), test_case.metadata_store());
+            scrubber.check(namespace, &executor).await.unwrap();
 
             let tag_link = metadata_store
                 .read_link(namespace, &LinkKind::Tag(Tag::new("v1.0.0").unwrap()))
@@ -713,8 +820,8 @@ mod tests {
             );
             let scrubber = RetentionChecker::new(metadata_store.clone(), resolver, None);
 
-            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
-            scrubber.check(namespace, &mut executor).await.unwrap();
+            let executor = make_executor(test_case.blob_store(), test_case.metadata_store());
+            scrubber.check(namespace, &executor).await.unwrap();
 
             let tag_link = metadata_store
                 .read_link(namespace, &LinkKind::Tag(Tag::new("any-tag").unwrap()))
@@ -751,13 +858,13 @@ mod tests {
                 Arc::new(SystemClock),
             ));
 
-            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
+            let executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
-                .check(&namespace, &mut executor)
+                .check(&namespace, &executor)
                 .await
                 .unwrap();
 
@@ -790,13 +897,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
+            let executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver, None)
-                .check(&namespace, &mut executor)
+                .check(&namespace, &executor)
                 .await
                 .unwrap();
 
@@ -828,13 +935,13 @@ mod tests {
                 Arc::new(SystemClock),
             ));
 
-            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
+            let executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver, Some(policy.clone()))
-                .check(&namespace, &mut executor)
+                .check(&namespace, &executor)
                 .await
                 .unwrap();
 
@@ -847,13 +954,13 @@ mod tests {
 
             teardown_index_scenario(&metadata_store, &namespace, index_digest, &child_digest).await;
 
-            let mut executor2 = make_executor(test_case.blob_store(), test_case.metadata_store());
+            let executor2 = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver2 = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver2, Some(policy))
-                .check(&namespace, &mut executor2)
+                .check(&namespace, &executor2)
                 .await
                 .unwrap();
 
@@ -901,11 +1008,14 @@ mod tests {
         );
         let scrubber = RetentionChecker::new(metadata_store.clone(), resolver, Some(policy));
 
-        let mut sink: Vec<Action> = Vec::new();
-        scrubber.check(namespace, &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        scrubber.check(namespace, &sink).await.unwrap();
 
         assert!(
-            sink.iter().any(|a| matches!(a, Action::DeleteTag { .. })),
+            sink.lock()
+                .unwrap()
+                .iter()
+                .any(|a| matches!(a, Action::DeleteTag { .. })),
             "Vec sink must capture a DeleteTag action"
         );
 
@@ -976,7 +1086,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut executor = Executor::new(test_case.blob_store(), metadata_store.clone(), job_store)
+        let executor = Executor::new(test_case.blob_store(), metadata_store.clone(), job_store)
             .with_registry(registry);
 
         let policy = Arc::new(RetentionPolicy::new(
@@ -986,7 +1096,7 @@ mod tests {
             Arc::new(SystemClock),
         ));
         RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
-            .check(namespace, &mut executor)
+            .check(namespace, &executor)
             .await
             .unwrap();
 
@@ -1061,13 +1171,13 @@ mod tests {
                 Arc::new(SystemClock),
             ));
 
-            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
+            let executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
             );
             RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
-                .check(&namespace, &mut executor)
+                .check(&namespace, &executor)
                 .await
                 .unwrap();
 
@@ -1236,5 +1346,165 @@ mod tests {
         let fate = decide_orphan_fate(false, false, Some(&metadata), None, Some(&policy), &[], &[])
             .unwrap();
         assert_eq!(fate, Fate::Delete);
+    }
+
+    fn keep_nothing_policy() -> RetentionPolicy {
+        RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.tag == 'keep-me'").unwrap()],
+            },
+            Arc::new(SystemClock),
+        )
+    }
+
+    fn keep_recent_policy() -> RetentionPolicy {
+        RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.pushed_at > now() - days(1)").unwrap()],
+            },
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// Seed a blob whose only index entry is its self-ownership grant.
+    async fn seed_grant_only_blob(
+        test_case: &dyn RegistryTestCase,
+        namespace: &Namespace,
+    ) -> Digest {
+        let metadata_store = test_case.metadata_store();
+        let blob = put_blob_direct(metadata_store.store(), b"granted-but-unreferenced").await;
+        metadata_store
+            .update_blob_index(
+                namespace,
+                &blob,
+                BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
+            )
+            .await
+            .unwrap();
+        blob
+    }
+
+    fn grant_resolver() -> Arc<RepositoryResolver> {
+        Arc::new(
+            RepositoryResolver::new(test_utils::create_test_repositories())
+                .expect("test repositories must not overlap"),
+        )
+    }
+
+    #[tokio::test]
+    async fn orphan_grant_is_retained_without_policies() {
+        for_each_backend(async |test_case| {
+            let namespace = Namespace::new("test-repo/no-rules").unwrap();
+            let blob = seed_grant_only_blob(test_case, &namespace).await;
+            let metadata_store = test_case.metadata_store();
+            let executor = Executor::new_for_test(test_case.blob_store(), metadata_store.clone());
+
+            sweep_orphan_grants(
+                &test_case.blob_store(),
+                &metadata_store,
+                &grant_resolver(),
+                None,
+                chrono::Duration::zero(),
+                &executor,
+                4,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &blob)
+                    .await
+                    .is_ok(),
+                "with no retention policies a grant must be retained, like any untagged content"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn orphan_grant_is_revoked_when_no_rule_retains_it() {
+        for_each_backend(async |test_case| {
+            let namespace = Namespace::new("test-repo/dropped").unwrap();
+            let blob = seed_grant_only_blob(test_case, &namespace).await;
+            let metadata_store = test_case.metadata_store();
+            let executor = Executor::new_for_test(test_case.blob_store(), metadata_store.clone());
+            let policy = keep_nothing_policy();
+
+            // Within the in-flight window: never considered, whatever policy says.
+            sweep_orphan_grants(
+                &test_case.blob_store(),
+                &metadata_store,
+                &grant_resolver(),
+                Some(&policy),
+                chrono::Duration::days(1),
+                &executor,
+                4,
+            )
+            .await
+            .unwrap();
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &blob)
+                    .await
+                    .is_ok(),
+                "a grant within the in-flight window must never be considered"
+            );
+
+            // Past the window: the policy decides, and nothing retains it.
+            sweep_orphan_grants(
+                &test_case.blob_store(),
+                &metadata_store,
+                &grant_resolver(),
+                Some(&policy),
+                chrono::Duration::zero(),
+                &executor,
+                4,
+            )
+            .await
+            .unwrap();
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &blob)
+                    .await
+                    .is_err(),
+                "a grant no rule retains must be revoked past the window"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn orphan_grant_is_retained_by_a_matching_time_rule() {
+        for_each_backend(async |test_case| {
+            let namespace = Namespace::new("test-repo/kept").unwrap();
+            let blob = seed_grant_only_blob(test_case, &namespace).await;
+            let metadata_store = test_case.metadata_store();
+            let executor = Executor::new_for_test(test_case.blob_store(), metadata_store.clone());
+            let policy = keep_recent_policy();
+
+            // The bytes were just written, so `pushed_at > now() - days(1)`
+            // retains them even though the in-flight window is zero.
+            sweep_orphan_grants(
+                &test_case.blob_store(),
+                &metadata_store,
+                &grant_resolver(),
+                Some(&policy),
+                chrono::Duration::zero(),
+                &executor,
+                4,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &blob)
+                    .await
+                    .is_ok(),
+                "a rule matching the subject must retain the grant"
+            );
+        })
+        .await;
     }
 }

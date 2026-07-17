@@ -21,7 +21,7 @@ mod event_emission_tests;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;
-mod path_builder;
+pub mod path_builder;
 pub mod repository;
 pub mod repository_resolver;
 pub mod s3_connection;
@@ -290,7 +290,7 @@ fn build_in_process_queue(
     // Drain replication only when a downstream is configured: with none, the
     // queue stays empty forever, so its loops would just storm the object store
     // with `LIST`s. (Replication jobs left from a removed downstream are reaped
-    // by `scrub --replication-orphans`, not drained here.) Build the fallible
+    // by `angos prune`'s orphan-job sweep, not drained here.) Build the fallible
     // handler before spawning any loop so an error cannot leak a cache loop.
     let any_downstream = resolver
         .keys()

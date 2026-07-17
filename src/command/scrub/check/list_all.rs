@@ -38,18 +38,6 @@ pub fn tags<'a>(
     }))
 }
 
-pub fn unparsed_tags<'a>(
-    metadata_store: &'a Arc<MetadataStore>,
-    namespace: &'a Namespace,
-) -> ResultStream<'a, String> {
-    Box::pin(paginated(move |marker| async move {
-        metadata_store
-            .list_tag_names(namespace, PAGE_SIZE, marker)
-            .await
-            .map_err(Error::from)
-    }))
-}
-
 pub fn uploads<'a>(
     blob_store: &'a Arc<BlobStore>,
     namespace: &'a Namespace,
@@ -91,7 +79,7 @@ pub fn upload_namespaces(blob_store: &Arc<BlobStore>) -> ResultStream<'_, String
 
 /// Drives a paginated source as a stream. Each yielded item is one entry from
 /// the underlying source; pages are fetched lazily, one at a time.
-fn paginated<T, F, Fut>(fetch: F) -> impl Stream<Item = Result<T, Error>>
+pub fn paginated<T, F, Fut>(fetch: F) -> impl Stream<Item = Result<T, Error>>
 where
     T: Send,
     F: FnMut(Option<String>) -> Fut + Send,

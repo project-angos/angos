@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 
-use crate::lock::storage::LockBody;
+use crate::intent::{INTENT_BODIES_PREFIX, INTENT_LOG_PREFIX};
+use crate::lock::storage::{LOCK_OBJECTS_PREFIX, LockBody};
 use crate::periodic::run_periodic;
 
 /// Default age after which an orphan body prefix is eligible for deletion.
@@ -120,7 +121,12 @@ impl BodyJanitor {
         loop {
             match self
                 .store
-                .list_children(".tx-bodies/", 100, token.clone(), None)
+                .list_children(
+                    &format!("{INTENT_BODIES_PREFIX}/"),
+                    100,
+                    token.clone(),
+                    None,
+                )
                 .await
             {
                 Ok(page) => {
@@ -142,13 +148,9 @@ impl BodyJanitor {
 
     /// Examine one `.tx-bodies/<tx-id>/` prefix. Delete it if the tx-id
     /// corresponds to a v4 UUID that is old enough and has no live intent.
+    /// `sub_prefix` is the bare child name from `list_children` (the tx-id).
     async fn process_prefix(&self, sub_prefix: &str) {
-        // sub_prefix is like ".tx-bodies/<tx-id>/"; extract the UUID.
-        let tx_id_str = sub_prefix
-            .trim_start_matches(".tx-bodies/")
-            .trim_end_matches('/');
-
-        let Ok(tx_id) = tx_id_str.parse::<Uuid>() else {
+        let Ok(tx_id) = sub_prefix.parse::<Uuid>() else {
             // Not a UUID-shaped prefix; skip.
             return;
         };
@@ -156,7 +158,7 @@ impl BodyJanitor {
         // Age estimation: v4 UUIDs are random but we can use object head for
         // last-modified. Fall back to skipping if head is unavailable.
         // Simpler: check whether the intent exists first.
-        let intent_key = format!(".tx-log/{tx_id}.json");
+        let intent_key = format!("{INTENT_LOG_PREFIX}/{tx_id}.json");
         match self.store.head(&intent_key).await {
             Ok(_) => {
                 // Intent exists, not an orphan; the owner or recovery will reap.
@@ -179,7 +181,7 @@ impl BodyJanitor {
         // staged body, which can be misleading. Listing one child gives us a
         // real staged-body key whose `last_modified` reflects when staging
         // began.
-        let prefix_key = sub_prefix.to_owned();
+        let prefix_key = format!("{INTENT_BODIES_PREFIX}/{tx_id}/");
         let first_child_suffix = match self.store.list(&prefix_key, 1, None).await {
             Ok(page) => page.items.into_iter().next(),
             Err(e) => {
@@ -343,7 +345,11 @@ impl LockJanitor {
         loop {
             match self
                 .store
-                .list(".tx-locks/", LOCK_LIST_PAGE_SIZE, token.clone())
+                .list(
+                    &format!("{LOCK_OBJECTS_PREFIX}/"),
+                    LOCK_LIST_PAGE_SIZE,
+                    token.clone(),
+                )
                 .await
             {
                 Ok(page) => {
@@ -447,8 +453,103 @@ mod tests {
         test_util::{HookedStore, StoreHook, StoreOp},
     };
 
-    use crate::janitor::LockJanitor;
+    use crate::intent::{INTENT_BODIES_PREFIX, INTENT_LOG_PREFIX};
+    use crate::janitor::{BodyJanitor, LockJanitor};
     use crate::lock::storage::LockBody;
+
+    fn body_janitor(store: Arc<dyn ObjectStore>) -> BodyJanitor {
+        BodyJanitor::builder(store)
+            .orphan_age(Duration::ZERO)
+            .build()
+    }
+
+    async fn write_body(store: &MemoryObjectStore, tx_id: Uuid, idx: u32) {
+        store
+            .put(
+                &format!("{INTENT_BODIES_PREFIX}/{tx_id}/{idx}"),
+                Bytes::from_static(b"staged"),
+            )
+            .await
+            .expect("put body");
+    }
+
+    #[tokio::test]
+    async fn orphan_body_prefix_is_reclaimed() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let tx_id = Uuid::new_v4();
+        write_body(&store, tx_id, 0).await;
+        write_body(&store, tx_id, 1).await;
+
+        body_janitor(store.clone()).sweep().await;
+
+        for idx in 0..2 {
+            let after = store
+                .head(&format!("{INTENT_BODIES_PREFIX}/{tx_id}/{idx}"))
+                .await;
+            assert!(
+                matches!(after, Err(StorageError::NotFound)),
+                "orphan staged body {idx} must be reclaimed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn body_prefix_with_live_intent_is_preserved() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let tx_id = Uuid::new_v4();
+        write_body(&store, tx_id, 0).await;
+        store
+            .put(
+                &format!("{INTENT_LOG_PREFIX}/{tx_id}.json"),
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .expect("put intent");
+
+        body_janitor(store.clone()).sweep().await;
+
+        store
+            .head(&format!("{INTENT_BODIES_PREFIX}/{tx_id}/0"))
+            .await
+            .expect("a body with a live intent must survive");
+    }
+
+    #[tokio::test]
+    async fn young_orphan_body_is_preserved() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let tx_id = Uuid::new_v4();
+        write_body(&store, tx_id, 0).await;
+
+        BodyJanitor::builder(store.clone() as Arc<dyn ObjectStore>)
+            .orphan_age(Duration::from_secs(3600))
+            .build()
+            .sweep()
+            .await;
+
+        store
+            .head(&format!("{INTENT_BODIES_PREFIX}/{tx_id}/0"))
+            .await
+            .expect("a body younger than the orphan age must survive");
+    }
+
+    #[tokio::test]
+    async fn non_uuid_prefix_is_skipped() {
+        let store = Arc::new(MemoryObjectStore::new());
+        store
+            .put(
+                &format!("{INTENT_BODIES_PREFIX}/not-a-uuid/0"),
+                Bytes::from_static(b"?"),
+            )
+            .await
+            .expect("put");
+
+        body_janitor(store.clone()).sweep().await;
+
+        store
+            .head(&format!("{INTENT_BODIES_PREFIX}/not-a-uuid/0"))
+            .await
+            .expect("a non-UUID prefix is not the janitor's to reclaim");
+    }
 
     fn lock_key(suffix: &str) -> String {
         format!(".tx-locks/{suffix}")
@@ -457,6 +558,12 @@ mod tests {
     async fn write_lock(store: &MemoryObjectStore, suffix: &str, body: &LockBody) {
         let bytes = Bytes::from(serde_json::to_vec(body).expect("serialise"));
         store.put(&lock_key(suffix), bytes).await.expect("put");
+        // The janitor ages a lock by its object mtime (heartbeat rewrites
+        // bump it); align the fixture's mtime with the body's declared
+        // refresh time.
+        store
+            .backdate(&lock_key(suffix), body.refreshed_at)
+            .expect("backdate");
     }
 
     fn expired_body() -> LockBody {

@@ -5,13 +5,18 @@ use chrono::Utc;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use angos_storage::ObjectStore;
+
 use crate::{
-    command::scrub::{action::Action, error::Error},
+    command::scrub::{
+        action::{Action, LOST_AND_FOUND_PREFIX, WalkedStore},
+        error::Error,
+    },
     event_webhook::event::EventActor,
     jobs::store::{Error as JobStoreError, JobEnvelope, JobStore},
     jobs::{JobState, Queue},
     metrics_provider::metrics_provider,
-    oci::{Digest, MediaType, Namespace, Reference, Tag},
+    oci::{Digest, Namespace, Reference, Tag},
     registry::{
         Error as RegistryError, Registry,
         blob_store::{self, BlobStore, MultipartCleanup},
@@ -41,10 +46,11 @@ pub fn run_job_store(metadata_store: &MetadataStore, prefix: &str) -> Arc<JobSto
     ))
 }
 
-/// A sink that receives `Action` values produced by scrub checkers.
+/// A sink that receives `Action` values produced by maintenance checks.
+/// `apply` takes `&self` so one sink can serve many concurrent producers.
 #[async_trait]
-pub trait ActionSink: Send {
-    async fn apply(&mut self, action: Action) -> Result<(), Error>;
+pub trait ActionSink: Send + Sync {
+    async fn apply(&self, action: Action) -> Result<(), Error>;
 }
 
 /// Logs actions as dry-run without applying any mutations to storage.
@@ -52,7 +58,7 @@ pub struct DryRunSink;
 
 #[async_trait]
 impl ActionSink for DryRunSink {
-    async fn apply(&mut self, action: Action) -> Result<(), Error> {
+    async fn apply(&self, action: Action) -> Result<(), Error> {
         info!("DRY RUN: would {action}");
         Ok(())
     }
@@ -88,8 +94,9 @@ impl Executor {
         }
     }
 
-    /// Wire the registry the retention actions delete through. Required for
-    /// runs that enforce retention (`prune`, `scrub --retention`).
+    /// Wire the registry that tag and manifest deletions run through, so they
+    /// take the standard delete path (locking, blob reclaim, events,
+    /// replication). Both scrub and prune construct their executors with one.
     #[must_use]
     pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
         self.registry = Some(registry);
@@ -158,18 +165,6 @@ pub fn record_reconcile_outcome(outcome: &str) {
 }
 
 impl Executor {
-    async fn migrate_blob_index(&self, digest: Digest) -> Result<(), Error> {
-        self.metadata_store.migrate_blob_index(&digest).await?;
-        Ok(())
-    }
-
-    async fn prune_legacy_namespace_registry(&self) -> Result<(), Error> {
-        self.metadata_store
-            .delete_legacy_namespace_registry()
-            .await?;
-        Ok(())
-    }
-
     /// Deletes the orphan's bytes under the `blob-data:{digest}` coarse lock
     /// (the same one manifest pushes and upload completions take), so a
     /// reference a concurrent push is granting cannot be missed and have its
@@ -304,26 +299,6 @@ impl Executor {
             .update_links(
                 &namespace,
                 &[LinkOperation::create_with_referrer(link, target, referrer)],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn set_media_type(
-        &self,
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-        media_type: MediaType,
-    ) -> Result<(), Error> {
-        self.metadata_store
-            .update_links(
-                &namespace,
-                &[LinkOperation::create_with_media_type(
-                    link,
-                    target,
-                    Some(media_type),
-                )],
             )
             .await?;
         Ok(())
@@ -495,16 +470,52 @@ impl Executor {
             ))),
         }
     }
+
+    /// The raw object store behind `store`, for exact-key actions produced by
+    /// the walk (quarantine, corrupt-object deletion).
+    fn walked_object_store(&self, store: WalkedStore) -> &Arc<dyn ObjectStore> {
+        match store {
+            WalkedStore::Blob => self.blob_store.object_store(),
+            WalkedStore::Metadata => self.metadata_store.store().object_store(),
+        }
+    }
+
+    /// Move an unrecognized key under the lost-and-found prefix, preserving
+    /// its original path so an operator can inspect or restore it. A missing
+    /// source counts as success: on a shared physical root both store walks
+    /// see the same alien key, and the second quarantine finds it moved.
+    async fn quarantine_key(&self, store: WalkedStore, key: String) -> Result<(), Error> {
+        let destination = format!("{LOST_AND_FOUND_PREFIX}/{key}");
+        if let Err(e) = self
+            .walked_object_store(store)
+            .move_object(&key, &destination)
+            .await
+        {
+            match RegistryError::from(e) {
+                RegistryError::NotFound => {}
+                other => return Err(other.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete an exact walked key: an expected-shape object with unreadable
+    /// content, or an unrecognized key under `--delete-unknown`.
+    async fn delete_walked_key(&self, store: WalkedStore, key: String) -> Result<(), Error> {
+        self.walked_object_store(store)
+            .delete(&key)
+            .await
+            .map_err(RegistryError::from)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ActionSink for Executor {
-    async fn apply(&mut self, action: Action) -> Result<(), Error> {
+    async fn apply(&self, action: Action) -> Result<(), Error> {
         info!("{action}");
 
         match action {
-            Action::MigrateBlobIndex(digest) => self.migrate_blob_index(digest).await,
-            Action::PruneLegacyNamespaceRegistry => self.prune_legacy_namespace_registry().await,
             Action::DeleteOrphanBlob(digest) => self.delete_orphan_blob(digest).await,
             Action::RemoveBlobIndexLink {
                 namespace,
@@ -530,16 +541,6 @@ impl ActionSink for Executor {
                 target,
                 referrer,
             } => self.add_referrer(namespace, link, target, referrer).await,
-            Action::SetMediaType {
-                namespace,
-                link,
-                target,
-                media_type,
-                ..
-            } => {
-                self.set_media_type(namespace, link, target, media_type)
-                    .await
-            }
             Action::DeleteTag { namespace, tag } => self.delete_tag(namespace, tag).await,
             Action::DeleteInvalidTag { namespace, tag } => {
                 self.delete_invalid_tag(namespace, tag).await
@@ -593,18 +594,24 @@ impl ActionSink for Executor {
                 storage_key,
                 ..
             } => self.delete_orphan_job(queue, state, storage_key).await,
+            Action::QuarantineKey { store, key } => self.quarantine_key(store, key).await,
+            Action::DeleteCorruptObject { store, key }
+            | Action::DeleteUnknownKey { store, key } => self.delete_walked_key(store, key).await,
         }
     }
 }
 
-/// Captures actions into a `Vec` without performing any I/O.
+/// Captures actions into a locked `Vec` without performing any I/O.
 ///
-/// Used in tests to assert which actions a checker would produce without
-/// touching any real storage backend.
+/// Used in tests to assert which actions a check would produce without
+/// touching any real storage backend; the lock lets one capture serve
+/// concurrent producers, matching the `&self` sink contract.
 #[async_trait]
-impl ActionSink for Vec<Action> {
-    async fn apply(&mut self, action: Action) -> Result<(), Error> {
-        self.push(action);
+impl ActionSink for std::sync::Mutex<Vec<Action>> {
+    async fn apply(&self, action: Action) -> Result<(), Error> {
+        self.lock()
+            .map_err(|e| Error::Initialization(format!("capture sink poisoned: {e}")))?
+            .push(action);
         Ok(())
     }
 }
@@ -646,7 +653,7 @@ mod tests {
             let orphan_content = b"executor dry-run test";
             let orphan_digest = put_blob_direct(metadata_store.store(), orphan_content).await;
 
-            let mut sink = DryRunSink;
+            let sink = DryRunSink;
             sink.apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
                 .await
                 .unwrap();
@@ -668,7 +675,7 @@ mod tests {
             let orphan_content = b"executor real-run test";
             let orphan_digest = put_blob_direct(metadata_store.store(), orphan_content).await;
 
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store);
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
@@ -706,7 +713,7 @@ mod tests {
                 .unwrap();
             blob_store.delete_blob(&digest).await.unwrap();
 
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanManifest {
@@ -752,7 +759,7 @@ mod tests {
                 .unwrap();
             blob_store.delete_blob(&digest).await.unwrap();
 
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanManifest {
@@ -792,7 +799,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store);
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(digest.clone()))
@@ -816,7 +823,7 @@ mod tests {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let digest = put_blob_direct(metadata_store.store(), b"granted layer").await;
 
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
             executor
                 .apply(Action::GrantBlobIndexLink {
                     namespace: namespace.clone(),
@@ -853,7 +860,7 @@ mod tests {
             )
             .unwrap();
 
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
             executor
                 .apply(Action::GrantBlobIndexLink {
                     namespace: namespace.clone(),
@@ -915,7 +922,7 @@ mod tests {
                 "Referrer link must exist before applying the action"
             );
 
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanReferrer {
@@ -979,7 +986,7 @@ mod tests {
                 "phantom referrer must be present before the action"
             );
 
-            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::RemoveReferrer {
@@ -1010,7 +1017,7 @@ mod tests {
 
             let job_store = standalone_job_store("scrub-source-ts");
 
-            let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
+            let executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             executor
                 .apply(Action::EnqueueReplicationDelete {
@@ -1053,7 +1060,7 @@ mod tests {
 
             let job_store = standalone_job_store("scrub-prune-coalesce");
 
-            let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
+            let executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             for _ in 0..2 {
                 executor
@@ -1124,7 +1131,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
 
-            let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
+            let executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             for (queue, envelope) in [
                 (Queue::Replication, orphan_push_envelope()),
@@ -1160,7 +1167,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
 
-            let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
+            let executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             for (queue, mut envelope) in [
                 (Queue::Replication, orphan_push_envelope()),
@@ -1208,7 +1215,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
 
-            let mut executor = Executor::new(blob_store, metadata_store, job_store);
+            let executor = Executor::new(blob_store, metadata_store, job_store);
 
             for queue in [Queue::Replication, Queue::Cache] {
                 for state in [JobState::Pending, JobState::Failed] {
@@ -1233,7 +1240,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         sink.apply(Action::DeleteOrphanBlob(digest.clone()))
             .await
             .unwrap();
@@ -1244,8 +1251,112 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(sink.len(), 2);
-        assert!(matches!(sink[0], Action::DeleteOrphanBlob(_)));
-        assert!(matches!(sink[1], Action::DeleteExpiredUpload { .. }));
+        assert_eq!(sink.lock().unwrap().len(), 2);
+        assert!(matches!(
+            sink.lock().unwrap()[0],
+            Action::DeleteOrphanBlob(_)
+        ));
+        assert!(matches!(
+            sink.lock().unwrap()[1],
+            Action::DeleteExpiredUpload { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn quarantine_key_moves_object_under_lost_and_found() {
+        for_each_backend(async |test_case| {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+
+            let key = "junk/unexpected-object";
+            metadata_store
+                .store()
+                .object_store()
+                .put(key, bytes::Bytes::from_static(b"alien"))
+                .await
+                .unwrap();
+
+            executor
+                .apply(Action::QuarantineKey {
+                    store: WalkedStore::Metadata,
+                    key: key.to_string(),
+                })
+                .await
+                .unwrap();
+
+            let objects = metadata_store.store().object_store();
+            assert!(objects.get(key).await.is_err(), "original key must be gone");
+            assert_eq!(
+                objects
+                    .get(&format!("{LOST_AND_FOUND_PREFIX}/{key}"))
+                    .await
+                    .unwrap(),
+                b"alien",
+                "bytes must be preserved under the lost-and-found prefix"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_corrupt_object_removes_key_in_named_store() {
+        for_each_backend(async |test_case| {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+
+            let key = "v2/repositories/junk-ns/_manifests/tags/x/current/link";
+            blob_store
+                .object_store()
+                .put(key, bytes::Bytes::from_static(b"not json"))
+                .await
+                .unwrap();
+
+            executor
+                .apply(Action::DeleteCorruptObject {
+                    store: WalkedStore::Blob,
+                    key: key.to_string(),
+                })
+                .await
+                .unwrap();
+
+            assert!(blob_store.object_store().get(key).await.is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_key_removes_key_without_quarantining() {
+        for_each_backend(async |test_case| {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+
+            let key = "junk/unexpected-object";
+            let objects = metadata_store.store().object_store();
+            objects
+                .put(key, bytes::Bytes::from_static(b"alien"))
+                .await
+                .unwrap();
+
+            executor
+                .apply(Action::DeleteUnknownKey {
+                    store: WalkedStore::Metadata,
+                    key: key.to_string(),
+                })
+                .await
+                .unwrap();
+
+            assert!(objects.get(key).await.is_err(), "the key must be gone");
+            assert!(
+                objects
+                    .get(&format!("{LOST_AND_FOUND_PREFIX}/{key}"))
+                    .await
+                    .is_err(),
+                "a deleted unknown key must leave no quarantined copy"
+            );
+        })
+        .await;
     }
 }

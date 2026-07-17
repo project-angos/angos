@@ -479,7 +479,7 @@ impl MetadataStore {
         match self.store().object_store().get(link_path).await {
             Ok(data) => {
                 let bytes = Bytes::from(data.clone());
-                let metadata = LinkMetadata::from_bytes(data)
+                let metadata: LinkMetadata = serde_json::from_slice(&data)
                     .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
                 Ok(Some((bytes, metadata)))
             }
@@ -714,13 +714,10 @@ async fn blob_will_be_unreferenced(
     }
 
     let shard_path_ns = path_builder::blob_index_shard_path(digest, namespace);
-    let legacy_path = path_builder::blob_index_path(digest);
     let our_shard_will_be_empty = shard_will_be_empty(
         store,
-        namespace,
         ops_for_digest(pending_blob_ops, digest),
         &shard_path_ns,
-        &legacy_path,
     )
     .await?;
     if !our_shard_will_be_empty {

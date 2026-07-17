@@ -67,8 +67,8 @@ pub struct Command {
     cached_conditional_operations: Arc<Mutex<Option<bool>>>,
     /// `None` when `[global.job_queue]` is not configured.
     pending_refresh: Option<PendingRefreshTask>,
-    /// Cancellation token tied to the transactional-engine recovery loop and
-    /// body janitor. Fired on shutdown to stop both background tasks.
+    /// Cancellation token tied to the transactional-engine recovery loop.
+    /// Fired on shutdown to stop it.
     engine_maintenance: CancellationToken,
 }
 

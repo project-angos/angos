@@ -52,8 +52,8 @@ pub struct Command {
     poll_interval: Duration,
     shutdown: CancellationToken,
     workers: TaskTracker,
-    /// Cancellation token tied to the transactional-engine recovery loop and
-    /// body janitor. Fired on shutdown to stop both background tasks.
+    /// Cancellation token tied to the transactional-engine recovery loop.
+    /// Fired on shutdown to stop it.
     engine_maintenance: CancellationToken,
 }
 
@@ -258,12 +258,12 @@ impl WorkerContext {
             Arc::new(JobStore::new(storage.clone(), "worker")),
         )?;
 
-        // Spawn the engine maintenance loops once per worker process so any
-        // crashed-mid-Apply transactions are recovered and orphan body
-        // staging is reaped. The recovery loop is backend-wide, so one
-        // instance covers every drained queue.
+        // Spawn the engine recovery loop once per worker process so any
+        // crashed-mid-Apply transactions are recovered. It is backend-wide,
+        // so one instance covers every drained queue; the garbage-only
+        // janitors are driven by `angos scrub` instead.
         if let Some(token) = engine_maintenance {
-            tokio::spawn(storage.maintenance(token));
+            tokio::spawn(storage.recovery(token));
         }
 
         Ok(Self {

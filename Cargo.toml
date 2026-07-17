@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/backoff", "crates/s3-client", "crates/storage", "crates/tx-engine"]
+members = [
+    "crates/backoff",
+    "crates/conformance-gates",
+    "crates/s3-client",
+    "crates/storage",
+    "crates/tx-engine",
+]
 
 # Policy: every dependency used by two or more workspace members is declared
 # here (version plus the features every user shares); members reference it
@@ -10,6 +16,7 @@ angos-backoff = { path = "crates/backoff" }
 angos-s3-client = { path = "crates/s3-client" }
 angos-storage = { path = "crates/storage" }
 angos-tx-engine = { path = "crates/tx-engine" }
+argh = "0.1.19"
 async-trait = "0.1.89"
 base64 = "0.22.1"
 bytes = "1.12.1"
@@ -53,7 +60,7 @@ angos-s3-client = { workspace = true }
 angos-storage = { workspace = true }
 angos-tx-engine = { workspace = true, features = ["redis"] }
 arc-swap = "1.9.2"
-argh = "0.1.19"
+argh = { workspace = true }
 argon2 = "0.5.3"
 async-trait = { workspace = true }
 base64 = { workspace = true }

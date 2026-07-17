@@ -2,19 +2,38 @@ use std::fmt;
 
 use crate::{
     jobs::{JobState, Queue},
-    oci::{Digest, MediaType, Namespace, Tag},
+    oci::{Digest, Namespace, Tag},
     registry::metadata_store::LinkKind,
 };
+
+/// Root prefix that quarantined keys are moved under, preserving their
+/// original path below it. A known category to the walk, so quarantined
+/// objects are never re-processed; emptying it is the operator's job.
+pub const LOST_AND_FOUND_PREFIX: &str = "_lost_and_found";
+
+/// Which physical object store a walked key was found in. The blob and
+/// metadata stores may be distinct buckets/roots, so a raw-key action must
+/// name the store it targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkedStore {
+    Blob,
+    Metadata,
+}
+
+impl fmt::Display for WalkedStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WalkedStore::Blob => write!(f, "blob store"),
+            WalkedStore::Metadata => write!(f, "metadata store"),
+        }
+    }
+}
 
 /// A single mutation that a scrub checker has decided to perform.
 ///
 /// Checkers produce `Action` values via their `ActionSink`; the `Executor`
 /// applies them (or skips them in dry-run mode) in one place.
 pub enum Action {
-    MigrateBlobIndex(Digest),
-    /// Delete the dead namespace-registry objects (`_registry/`) left by the
-    /// pre-1.3 maintained catalog index; the catalog is now derived from content.
-    PruneLegacyNamespaceRegistry,
     DeleteOrphanBlob(Digest),
     RemoveBlobIndexLink {
         namespace: Namespace,
@@ -51,13 +70,6 @@ pub enum Action {
         namespace: Namespace,
         link: LinkKind,
         referrer: Digest,
-    },
-    SetMediaType {
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-        media_type: MediaType,
-        display_name: String,
     },
     DeleteTag {
         namespace: Namespace,
@@ -120,21 +132,31 @@ pub enum Action {
         storage_key: String,
         reason: String,
     },
+    /// Move a key matching no known angos layout to the lost-and-found prefix
+    /// of the store it was found in, preserving its bytes for inspection.
+    QuarantineKey {
+        store: WalkedStore,
+        key: String,
+    },
+    /// Delete a key matching no known angos layout outright, discarding its
+    /// bytes. Emitted instead of [`Action::QuarantineKey`] under
+    /// `scrub --delete-unknown`.
+    DeleteUnknownKey {
+        store: WalkedStore,
+        key: String,
+    },
+    /// Delete an expected-shape object whose content is invalid (unparseable),
+    /// so it can never be read successfully again.
+    DeleteCorruptObject {
+        store: WalkedStore,
+        key: String,
+    },
 }
 
 impl fmt::Display for Action {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Action::MigrateBlobIndex(digest) => {
-                write!(f, "migrate blob index layout for '{digest}'")
-            }
-            Action::PruneLegacyNamespaceRegistry => {
-                write!(
-                    f,
-                    "prune the legacy namespace-registry index ('_registry/')"
-                )
-            }
             Action::DeleteOrphanBlob(digest) => {
                 write!(f, "delete orphan blob '{digest}'")
             }
@@ -193,17 +215,6 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "remove referrer {referrer} from link {link} in namespace '{namespace}'"
-                )
-            }
-            Action::SetMediaType {
-                namespace,
-                media_type,
-                display_name,
-                ..
-            } => {
-                write!(
-                    f,
-                    "set media_type '{media_type}' on {display_name} in namespace '{namespace}'"
                 )
             }
             Action::DeleteTag { namespace, tag } => {
@@ -272,6 +283,15 @@ impl fmt::Display for Action {
                     f,
                     "delete the {partition} {queue} job '{storage_key}' because {reason}"
                 )
+            }
+            Action::QuarantineKey { store, key } => {
+                write!(f, "quarantine unrecognized {store} key '{key}'")
+            }
+            Action::DeleteUnknownKey { store, key } => {
+                write!(f, "delete unrecognized {store} key '{key}'")
+            }
+            Action::DeleteCorruptObject { store, key } => {
+                write!(f, "delete corrupt {store} object '{key}'")
             }
         }
     }

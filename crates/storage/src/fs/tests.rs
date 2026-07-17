@@ -33,6 +33,60 @@ async fn delete_prefix_prunes_empty_ancestors_up_to_root() {
     assert!(dir.path().exists(), "the store root is never removed");
 }
 
+/// Single-key `delete` must collapse now-empty ancestors exactly like
+/// `delete_prefix`, matching S3 where a prefix vanishes with its last object.
+/// Regression guard for hollow tag directories surviving a link delete and
+/// being read back as live tags by directory-based listings.
+#[tokio::test]
+async fn delete_prunes_empty_ancestors_up_to_root() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("tags/garbled/current/link", Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+    store
+        .put("tags/live/current/link", Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+
+    store.delete("tags/garbled/current/link").await.unwrap();
+
+    // The deleted tag's chain collapses up to the still-populated `tags/`.
+    assert!(
+        !dir.path().join("tags/garbled").exists(),
+        "empty ancestors must be pruned after a single-key delete"
+    );
+    assert!(dir.path().join("tags/live/current").exists());
+}
+
+/// `move_object`'s rename fast path must sweep the source's now-empty parent
+/// chain like `delete` does, or a quarantine-style move leaves a hollow
+/// directory that directory-based listings surface as a live container.
+#[tokio::test]
+async fn move_object_prunes_empty_source_ancestors() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("zz-alien/at-root", Bytes::from_static(b"alien"))
+        .await
+        .unwrap();
+
+    store
+        .move_object("zz-alien/at-root", "_lost_and_found/zz-alien/at-root")
+        .await
+        .unwrap();
+
+    assert!(
+        !dir.path().join("zz-alien").exists(),
+        "the emptied source directory must be pruned after a move"
+    );
+    assert_eq!(
+        store.get("_lost_and_found/zz-alien/at-root").await.unwrap(),
+        b"alien"
+    );
+}
+
 #[tokio::test]
 async fn delete_prefix_stops_pruning_at_first_non_empty_ancestor() {
     let dir = TempDir::new().unwrap();

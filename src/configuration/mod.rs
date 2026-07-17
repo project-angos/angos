@@ -1,7 +1,6 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use serde::Deserialize;
-use tracing::warn;
 
 use angos_tx_engine::lock::LockStrategy;
 
@@ -36,8 +35,7 @@ use crate::{
 };
 
 /// Cross-section validation runs in the `TryFrom` conversion, so a parsed
-/// `Configuration` is always a validated one. The `cache_store` and `storage`
-/// aliases are the pre-1.0 section names.
+/// `Configuration` is always a validated one.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(try_from = "ConfigurationFields")]
 pub struct Configuration {
@@ -60,9 +58,9 @@ struct ConfigurationFields {
     global: GlobalConfig,
     #[serde(default)]
     ui: UiConfig,
-    #[serde(default, alias = "cache_store")]
+    #[serde(default)]
     cache: cache::Config,
-    #[serde(default, alias = "storage")]
+    #[serde(default)]
     blob_store: blob_store::BlobStoreConfig,
     #[serde(default, rename = "metadata_store")]
     registry_storage: RegistryStorageConfig,
@@ -124,26 +122,6 @@ impl Configuration {
         validate_repositories(&self.repository, &self.auth.webhook, &self.event_webhook)?;
         validate_durable_queue_lock(&self)?;
         Ok(self)
-    }
-
-    pub fn log_deprecations(&self) {
-        for field in self.deprecated_fields() {
-            warn!(
-                "'{field}' is deprecated; use \
-                 'global.enable_blob_redirect' and 'global.enable_manifest_redirect' instead"
-            );
-        }
-    }
-
-    /// Returns the names of deprecated configuration fields that are set.
-    ///
-    /// Exposed for testing without requiring log capture infrastructure.
-    pub fn deprecated_fields(&self) -> Vec<&'static str> {
-        let mut fields = Vec::new();
-        if self.global.enable_redirect.is_some() {
-            fields.push("global.enable_redirect");
-        }
-        fields
     }
 }
 

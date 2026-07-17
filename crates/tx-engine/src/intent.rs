@@ -84,11 +84,19 @@ pub enum MutationProgress {
 
 /// Staging key for the body of mutation `idx` in transaction `id`.
 ///
+/// Prefix of the intent log: one `<tx-id>.json` record per in-flight
+/// transaction. Engine-owned; external maintenance must never touch it.
+pub const INTENT_LOG_PREFIX: &str = ".tx-log";
+
+/// Prefix of the staged mutation bodies, one `<tx-id>/<idx>` object per
+/// mutation. Engine-owned; the `BodyJanitor` reclaims orphans.
+pub const INTENT_BODIES_PREFIX: &str = ".tx-bodies";
+
 /// Single source of truth for the `.tx-bodies/<tx-id>/<idx>` shape, shared by
 /// [`IntentRecord::body_ref`] and the body-staging path in the executors.
 #[must_use]
 pub fn body_ref_key(id: Uuid, idx: usize) -> String {
-    format!(".tx-bodies/{id}/{idx}")
+    format!("{INTENT_BODIES_PREFIX}/{id}/{idx}")
 }
 
 /// A read dependency recorded in an intent.
@@ -130,13 +138,13 @@ impl IntentRecord {
     /// Return the object key under which this intent is stored.
     #[must_use]
     pub fn log_key(&self) -> String {
-        format!(".tx-log/{}.json", self.id)
+        format!("{INTENT_LOG_PREFIX}/{}.json", self.id)
     }
 
     /// Return the `.tx-bodies` prefix for mutation body staging.
     #[must_use]
     pub fn bodies_prefix(&self) -> String {
-        format!(".tx-bodies/{}/", self.id)
+        format!("{INTENT_BODIES_PREFIX}/{}/", self.id)
     }
 
     /// Return the staging key for mutation body at index `idx`.

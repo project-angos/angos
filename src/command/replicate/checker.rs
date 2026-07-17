@@ -75,7 +75,7 @@ impl ReplicationChecker {
         downstream: &ReplicationDownstream,
         namespace: &Namespace,
         local_tags: &[(Tag, Option<Digest>)],
-        sink: &mut (dyn ActionSink + Send),
+        sink: &dyn ActionSink,
     ) {
         reconcile_push_step(downstream, namespace, local_tags, sink).await;
 
@@ -139,14 +139,14 @@ impl ReplicationChecker {
 
 /// Push step of a reconcile: HEAD every local tag against the downstream
 /// (concurrently, bounded by `max_concurrent_pushes`) and enqueue a push for
-/// each diverging or absent one. The probe phase fans out; the enqueue is
-/// applied serially because the sink is `&mut`. A tag whose local read failed
-/// (`None`) is skipped here but still counts as local for the prune step.
+/// each diverging or absent one. The probe phase fans out; the enqueues are
+/// applied serially in probe order. A tag whose local read failed (`None`) is
+/// skipped here but still counts as local for the prune step.
 async fn reconcile_push_step(
     downstream: &ReplicationDownstream,
     namespace: &Namespace,
     local_tags: &[(Tag, Option<Digest>)],
-    sink: &mut (dyn ActionSink + Send),
+    sink: &dyn ActionSink,
 ) {
     enum Probe {
         Push { tag: Tag, digest: Digest },
@@ -253,11 +253,7 @@ async fn reconcile_push_step(
 
 #[async_trait]
 impl NamespaceChecker for ReplicationChecker {
-    async fn check(
-        &self,
-        namespace: &Namespace,
-        sink: &mut (dyn ActionSink + Send),
-    ) -> Result<(), Error> {
+    async fn check(&self, namespace: &Namespace, sink: &dyn ActionSink) -> Result<(), Error> {
         let Some(repository) = self.resolver.resolve(namespace) else {
             return Ok(());
         };
@@ -411,12 +407,12 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
-        assert_eq!(sink.len(), 1);
+        assert_eq!(sink.lock().unwrap().len(), 1);
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::EnqueueReplicationPush { downstream, tag, digest, .. }
                 if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
         ));
@@ -462,12 +458,12 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&content, &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&content, &sink).await.unwrap();
 
-        assert_eq!(sink.len(), 1);
+        assert_eq!(sink.lock().unwrap().len(), 1);
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::EnqueueReplicationPush { downstream, namespace, tag, digest }
                 if downstream == DOWNSTREAM
                     && namespace == "nginx/app"
@@ -539,7 +535,7 @@ mod tests {
 
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
-        let mut executor: Box<dyn ActionSink + Send> = Box::new(Executor::new(
+        let mut executor: Box<dyn ActionSink> = Box::new(Executor::new(
             blob_store.clone(),
             metadata_store.clone(),
             job_store.clone(),
@@ -617,13 +613,13 @@ mod tests {
             .with_label_values(&["skipped"])
             .get();
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
         assert!(
-            sink.is_empty(),
+            sink.lock().unwrap().is_empty(),
             "a transient downstream HEAD failure must not enqueue a push, got {} action(s)",
-            sink.len()
+            sink.lock().unwrap().len()
         );
         let skipped_after = crate::metrics_provider::metrics_provider()
             .replication_reconcile_total
@@ -640,15 +636,16 @@ mod tests {
     /// An `ActionSink` that fails the first `fail_first` applies, simulating
     /// transient enqueue errors.
     struct FlakySink {
-        attempted: Vec<Action>,
+        attempted: std::sync::Mutex<Vec<Action>>,
         fail_first: usize,
     }
 
     #[async_trait]
     impl ActionSink for FlakySink {
-        async fn apply(&mut self, action: Action) -> Result<(), Error> {
-            self.attempted.push(action);
-            if self.attempted.len() <= self.fail_first {
+        async fn apply(&self, action: Action) -> Result<(), Error> {
+            let mut attempted = self.attempted.lock().unwrap();
+            attempted.push(action);
+            if attempted.len() <= self.fail_first {
                 return Err(Error::Initialization("simulated enqueue failure".into()));
             }
             Ok(())
@@ -692,14 +689,14 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink = FlakySink {
-            attempted: Vec::new(),
+        let sink = FlakySink {
+            attempted: std::sync::Mutex::new(Vec::new()),
             fail_first: 1,
         };
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        checker.check(&namespace(), &sink).await.unwrap();
 
-        let attempted: Vec<&str> = sink
-            .attempted
+        let attempted = sink.attempted.lock().unwrap();
+        let attempted: Vec<&str> = attempted
             .iter()
             .filter_map(|a| match a {
                 Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_ref()),
@@ -737,14 +734,14 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink = FlakySink {
-            attempted: Vec::new(),
+        let sink = FlakySink {
+            attempted: std::sync::Mutex::new(Vec::new()),
             fail_first: 1,
         };
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        checker.check(&namespace(), &sink).await.unwrap();
 
-        let deleted: Vec<&str> = sink
-            .attempted
+        let deleted = sink.attempted.lock().unwrap();
+        let deleted: Vec<&str> = deleted
             .iter()
             .filter_map(|a| match a {
                 Action::EnqueueReplicationDelete { tag, .. } => Some(tag.as_ref()),
@@ -796,10 +793,13 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
-        assert!(sink.is_empty(), "converged tag must not enqueue a push");
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "converged tag must not enqueue a push"
+        );
     }
 
     #[tokio::test]
@@ -844,10 +844,14 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
-        assert_eq!(sink.len(), 1, "diverging tag must enqueue a push");
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            1,
+            "diverging tag must enqueue a push"
+        );
     }
 
     #[tokio::test]
@@ -891,9 +895,10 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
+        let sink = sink.into_inner().unwrap();
         let mut tags: Vec<&str> = sink
             .iter()
             .filter_map(|action| match action {
@@ -955,16 +960,16 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
         assert_eq!(
-            sink.len(),
+            sink.lock().unwrap().len(),
             1,
             "only the downstream-only tag should produce an action"
         );
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::EnqueueReplicationDelete { downstream, namespace, tag }
                 if downstream == DOWNSTREAM && namespace == NAMESPACE && tag == "stray"
         ));
@@ -1019,11 +1024,11 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
         assert!(
-            sink.is_empty(),
+            sink.lock().unwrap().is_empty(),
             "prune disabled: a downstream-only tag must not be deleted"
         );
         drop(mock_server);
@@ -1062,13 +1067,13 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
         assert!(
-            sink.is_empty(),
+            sink.lock().unwrap().is_empty(),
             "an unreadable local tag must be skipped for push AND protected from prune, got {} action(s)",
-            sink.len()
+            sink.lock().unwrap().len()
         );
         drop(mock_server);
     }
@@ -1102,10 +1107,13 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
-        assert!(sink.is_empty(), "event-only downstream must be skipped");
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "event-only downstream must be skipped"
+        );
     }
 
     #[tokio::test]
@@ -1143,23 +1151,23 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let mut sink: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut sink).await.unwrap();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &sink).await.unwrap();
 
         assert_eq!(
-            sink.len(),
+            sink.lock().unwrap().len(),
             1,
             "reconcile-only downstream must reconcile a missing tag"
         );
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::EnqueueReplicationPush { downstream, tag, digest, .. }
                 if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
         ));
     }
 
     // ------------------------------------------------------------------
-    // End-to-end (`angos scrub --replicate`)
+    // End-to-end (`angos replicate`)
     // ------------------------------------------------------------------
 
     /// Mounts a downstream missing tag `v1` and both blobs, expecting the full
@@ -1220,7 +1228,7 @@ mod tests {
             .await;
     }
 
-    /// Full `angos scrub --replicate` push chain against a wiremock downstream,
+    /// Full `angos replicate` push chain against a wiremock downstream,
     /// including `lock_key` coalescing of a duplicate enqueue.
     #[tokio::test]
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
@@ -1253,8 +1261,9 @@ mod tests {
 
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
-        let mut captured: Vec<Action> = Vec::new();
-        checker.check(&namespace(), &mut captured).await.unwrap();
+        let captured: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker.check(&namespace(), &captured).await.unwrap();
+        let captured = captured.into_inner().unwrap();
         assert_eq!(captured.len(), 1, "out-of-sync tag must emit one action");
         assert!(matches!(
             &captured[0],
@@ -1265,7 +1274,7 @@ mod tests {
                     && *digest == manifest_digest
         ));
 
-        let mut executor: Box<dyn ActionSink + Send> = Box::new(Executor::new(
+        let mut executor: Box<dyn ActionSink> = Box::new(Executor::new(
             blob_store.clone(),
             metadata_store.clone(),
             job_store.clone(),
@@ -1326,7 +1335,7 @@ mod tests {
         drop(mock_server);
     }
 
-    /// Full `angos scrub --replicate` delete chain: a downstream-only tag is
+    /// Full `angos replicate` delete chain: a downstream-only tag is
     /// enqueued for delete and the drain issues exactly one downstream DELETE.
     #[tokio::test]
     async fn scrub_replicate_deletes_downstream_only_tag() {
@@ -1372,7 +1381,7 @@ mod tests {
 
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
-        let mut executor: Box<dyn ActionSink + Send> = Box::new(Executor::new(
+        let mut executor: Box<dyn ActionSink> = Box::new(Executor::new(
             blob_store.clone(),
             metadata_store.clone(),
             job_store.clone(),

@@ -4,7 +4,45 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 1.3.2 - Unreleased
+## 1.4.0 - Unreleased
+
+### Added
+
+- New `angos migrate` command rewrites pre-JSON bare-digest link files as JSON, converting registries seeded from a raw Docker `distribution` on-disk layout.
+- New `scrub --delete-unknown` flag deletes unrecognized keys outright instead of quarantining them under `_lost_and_found/`.
+- New `prune --concurrency` option (default 25) checks namespaces, uploads, blobs, and shards concurrently within each sweep, like the scrub walk.
+
+### Changed
+
+- Scrub is rewritten as a single concurrent walk that categorizes and validates every object key: all checks always run, unreadable objects are deleted, and unrecognized keys are quarantined under `_lost_and_found/`; run scrub from the same version as the server fleet.
+- Prune now owns configuration-relative and age-gated reclamation: orphan namespaces and orphan jobs are always cleared, and a single `-u/--uploads` window (default 1h) gates upload sessions, orphan S3 multiparts, and byteless blob-index entries.
+- Grant-only blob ownership (a blob uploaded whose manifest never landed) is now decided by the retention policies like any other untagged content, with the `-u` window shielding in-flight pushes.
+- The transaction engine's garbage janitors (orphaned staging bodies, expired lock objects) no longer run as background loops in the server and worker; `angos scrub` sweeps them instead, while the recovery loop stays in serving processes.
+- A `put-manifest` CEL policy input now exposes `request.digest` (by-digest push) and `request.tags` (the tags the push creates) instead of `request.reference`; update any access policy that gated a manifest push on `request.reference`.
+- The `_ext` namespace walk now lists a directory's siblings concurrently, and a single-repository listing walks only that repository's subtree, so the repository and namespace listings are no longer bottlenecked by sequential whole-store scans on S3.
+
+### Fixed
+
+- The web UI could not display a manifest or download a blob when redirects were enabled, because a browser cannot follow the cross-origin redirect to a pre-signed S3 URL; GET requests carrying the `X-Angos-No-Redirect` header are now served inline.
+- The transaction engine's body janitor never actually reclaimed orphaned `.tx-bodies/` staging: it mishandled the listing's relative names and always concluded there was nothing to delete.
+- On the filesystem backend, deleting a single object sometimes left its now-empty parent directories behind, and directory-based listings served them back (a deleted tag kept appearing in the tag list).
+
+### Removed
+
+- The deprecated `access_policy.default_allow` boolean is removed; set the typed `default = "allow"` or `default = "deny"` instead.
+- The deprecated `cache_store` config section is removed; use `cache`.
+- The deprecated `storage` config section is removed; use `blob_store`.
+- The deprecated `global.enable_redirect` boolean is removed; use `global.enable_blob_redirect` and `global.enable_manifest_redirect`.
+- The legacy single-file blob index (`index.json`) runtime fallback and its scrub migration are removed; run `angos scrub` on the prior version before upgrading, or references held only in an un-migrated `index.json` are lost.
+- The pre-JSON bare-digest link-metadata runtime fallback is removed; such links no longer resolve until `angos migrate` rewrites them as JSON.
+- The manifest `media_type` runtime fallback and its `scrub --media-types` backfill are removed; run `scrub --media-types` on the prior version before upgrading, or a manifest whose link lacks a `media_type` is served without a `Content-Type`.
+- Scrub no longer prunes the dead pre-1.3 namespace-registry objects (`_registry/`); run `scrub` on the prior version before upgrading to have them removed automatically, otherwise the inert objects can be deleted manually.
+- The deprecated `scrub --retention` and `scrub --replicate` flags are removed; use `angos prune` and `angos replicate`.
+- All scrub selection flags (`--tags`, `--manifests`, `--blobs`, `--links`, `--reconcile-blob-index`, `--referrers`, `--replication-orphans`, `--cache-orphans`, `--uploads`, `--multipart`, `--orphan-grants`, `--orphan-namespaces`) are removed; every structural check always runs and the rest moved to `angos prune`.
+- The deprecated `[metadata_store.s3.capabilities]` table is removed; set `conditional_operations` (a config still carrying `capabilities` now ignores it and probes at startup).
+- The pre-JSON resumable-hash checkpoint fallback is removed; a chunked upload checkpointed by a pre-1.3 build restarts on resume across the upgrade instead of continuing.
+
+## 1.3.2
 
 ### Security
 

@@ -6,12 +6,11 @@
 //!
 //! - `startedat`: RFC3339 timestamp of the last activity, used by `scrub` for
 //!   age-based orphan detection.
-//! - `hashstates/sha256/<offset>`: serialised hasher state for every supported
+//! - `hashstates/<offset>`: serialised hasher state for every supported
 //!   digest algorithm, checkpointed together after consuming the upload's bytes
-//!   up to `<offset>`, so hashing resumes after a crash without re-reading them
-//!   (`sha256` is a fixed legacy path segment, not the only algorithm). The
-//!   highest checkpoint offset also records how many bytes were consumed, so the
-//!   upload's size is recovered from it on resume.
+//!   up to `<offset>`, so hashing resumes after a crash without re-reading them.
+//!   The highest checkpoint offset also records how many bytes were consumed, so
+//!   the upload's size is recovered from it on resume.
 //! - `data`: the assembled upload bytes (FS append target / S3 multipart key).
 //! - `staged/<offset>`: S3-only multipart sub-part remainder, one file per
 //!   offset, superseded as the upload advances.
@@ -56,12 +55,6 @@ use crate::{
     },
 };
 
-/// Fixed path segment under which the hasher-state checkpoint is stored
-/// (`hashstates/<CHECKPOINT_DIR_SEGMENT>/<offset>`). Kept as `sha256` (its
-/// historical algorithm-name origin) though the checkpoint now holds every
-/// algorithm's state, so a pre-multi-algorithm checkpoint still resumes.
-const CHECKPOINT_DIR_SEGMENT: &str = "sha256";
-
 /// Bytes peeked from a chunked (`None`) body to tell an empty finalize from one
 /// carrying data, before deciding whether to short-circuit or stream.
 const PEEK_FRAME_SIZE: usize = 8 * 1024;
@@ -92,7 +85,7 @@ pub struct UploadSessionRecord {
     /// latest activity time rather than creation time alone).
     pub started_at: DateTime<Utc>,
     /// Serialised hasher-state checkpoint for every supported digest algorithm,
-    /// read from the highest-offset `hashstates/sha256/<offset>` file. Resumes
+    /// read from the highest-offset `hashstates/<offset>` file. Resumes
     /// the hash computation after a crash without re-reading the uploaded bytes.
     pub hash_context: Vec<u8>,
     /// Number of bytes consumed so far, recovered from the highest hasher-state
@@ -169,7 +162,7 @@ impl BlobStore {
         Ok(())
     }
 
-    /// Read the highest-offset `hashstates/sha256/<offset>` checkpoint. The
+    /// Read the highest-offset `hashstates/<offset>` checkpoint. The
     /// offset is the cumulative number of bytes hashed, so the maximum offset
     /// is both the most recent hasher state and the bytes consumed so far.
     async fn read_hash_context(
@@ -179,7 +172,7 @@ impl BlobStore {
     ) -> Result<(Vec<u8>, u64), Error> {
         let dir = format!(
             "{}/",
-            path_builder::upload_hash_context_dir(namespace, uuid, CHECKPOINT_DIR_SEGMENT)
+            path_builder::upload_hash_context_dir(namespace, uuid)
         );
         let mut highest: Option<u64> = None;
         let mut token = None;
@@ -205,8 +198,7 @@ impl BlobStore {
         let Some(offset) = highest else {
             return Err(Error::BlobUploadUnknown);
         };
-        let key =
-            path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
+        let key = path_builder::upload_hash_context_path(namespace, uuid, offset);
         match self.object.get(&key).await {
             Ok(data) => Ok((data, offset)),
             Err(StorageError::NotFound) => Err(Error::BlobUploadUnknown),
@@ -214,7 +206,7 @@ impl BlobStore {
         }
     }
 
-    /// Write the serialised hasher `state` as the `hashstates/sha256/<offset>`
+    /// Write the serialised hasher `state` as the `hashstates/<offset>`
     /// checkpoint, where `offset` is the cumulative number of bytes hashed.
     async fn write_hash_context(
         &self,
@@ -223,8 +215,7 @@ impl BlobStore {
         offset: u64,
         state: &[u8],
     ) -> Result<(), Error> {
-        let key =
-            path_builder::upload_hash_context_path(namespace, uuid, CHECKPOINT_DIR_SEGMENT, offset);
+        let key = path_builder::upload_hash_context_path(namespace, uuid, offset);
         self.object.put(&key, Bytes::copy_from_slice(state)).await?;
         Ok(())
     }
@@ -268,9 +259,28 @@ impl BlobStore {
         n: u16,
         last: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        let namespaces = pagination::collect_namespaces_with_marker(
-            path_builder::repository_dir(),
+        let mut namespaces = self.collect_upload_namespaces(None).await?;
+        namespaces.sort_unstable();
+
+        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+    }
+
+    /// Walks the `_uploads`-keyed tree in a single concurrent walk and returns
+    /// every namespace with an upload session, unpaginated and unsorted. `scope`
+    /// restricts the walk to one repository's subtree; `None` walks the whole
+    /// store.
+    #[instrument(skip(self))]
+    pub async fn collect_upload_namespaces(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        let (root, prefix) = path_builder::namespace_walk_root(scope);
+
+        pagination::collect_namespaces_with_marker(
+            &root,
+            &prefix,
             "_uploads",
+            pagination::NAMESPACE_WALK_CONCURRENCY,
             |path, token| async move {
                 self.object
                     .list_children(&path, 1000, token, None)
@@ -278,9 +288,7 @@ impl BlobStore {
                     .map_err(Error::from)
             },
         )
-        .await?;
-
-        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+        .await
     }
 
     #[instrument(skip(self))]

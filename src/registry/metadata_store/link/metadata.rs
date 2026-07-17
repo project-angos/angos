@@ -3,10 +3,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    oci::{Descriptor, Digest, MediaType},
-    registry::Error,
-};
+use crate::oci::{Descriptor, Digest, MediaType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkMetadata {
@@ -35,6 +32,22 @@ impl LinkMetadata {
         Self {
             target,
             created_at: Some(created_at),
+            accessed_at: None,
+            referenced_by: HashSet::new(),
+            media_type: None,
+            descriptor: None,
+        }
+    }
+
+    /// Build a link carrying no creation timestamp. Used by `angos migrate`
+    /// to rebuild a pre-JSON `distribution` link (a bare digest file) as JSON.
+    /// A missing `created_at` never wins last-writer-wins (a synthesised
+    /// `now()` would re-stamp fresher on every read and block replication to
+    /// the tag), so a migrated legacy link stays subordinate to any real write.
+    pub fn without_timestamp(target: Digest) -> Self {
+        Self {
+            target,
+            created_at: None,
             accessed_at: None,
             referenced_by: HashSet::new(),
             media_type: None,
@@ -76,33 +89,6 @@ impl LinkMetadata {
             return Some(created_at);
         }
         None
-    }
-
-    pub fn from_bytes(s: Vec<u8>) -> Result<Self, Error> {
-        if let Ok(metadata) = serde_json::from_slice(&s) {
-            return Ok(metadata);
-        }
-        Self::from_legacy_bytes(s)
-    }
-
-    /// Parses pre-JSON link data from the upstream `distribution` implementation,
-    /// where each link file held only the bare digest string. `created_at` is
-    /// `None`, so the legacy tag never wins last-writer-wins (a synthesised
-    /// `now()` would re-stamp fresher every read and block replication) and
-    /// retention treats it as oldest.
-    fn from_legacy_bytes(s: Vec<u8>) -> Result<Self, Error> {
-        let target = String::from_utf8(s).map_err(|e| Error::Internal(e.to_string()))?;
-        let target =
-            Digest::try_from(target.as_str()).map_err(|e| Error::Internal(e.to_string()))?;
-
-        Ok(LinkMetadata {
-            target,
-            created_at: None,
-            accessed_at: None,
-            referenced_by: HashSet::new(),
-            media_type: None,
-            descriptor: None,
-        })
     }
 
     pub fn with_media_type(mut self, media_type: Option<MediaType>) -> Self {
@@ -163,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_parses_json_serialised_form() {
+    fn link_metadata_survives_json_round_trip() {
         let mut meta = LinkMetadata::from_digest(digest());
         meta.add_referrer(other_digest());
         let meta = meta
@@ -173,46 +159,12 @@ mod tests {
             .with_descriptor(Some(minimal_descriptor()));
 
         let bytes = serde_json::to_vec(&meta).unwrap();
-        let parsed = LinkMetadata::from_bytes(bytes).unwrap();
+        let parsed: LinkMetadata = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(parsed.target, meta.target);
         assert_eq!(parsed.referenced_by, meta.referenced_by);
         assert_eq!(parsed.media_type, meta.media_type);
         assert_eq!(parsed.descriptor, meta.descriptor);
-    }
-
-    #[test]
-    fn from_bytes_falls_back_to_legacy_digest_string() {
-        let raw = format!("sha256:{VALID_HASH}");
-        let parsed = LinkMetadata::from_bytes(raw.into_bytes()).unwrap();
-        assert_eq!(parsed.target, digest());
-    }
-
-    #[test]
-    fn from_bytes_legacy_has_no_created_at() {
-        // A synthesised timestamp would re-stamp fresher on every read and let a
-        // legacy tag win last-writer-wins forever, blocking replication.
-        let raw = format!("sha256:{VALID_HASH}");
-        let parsed = LinkMetadata::from_bytes(raw.into_bytes()).unwrap();
-        assert!(parsed.created_at.is_none());
-    }
-
-    #[test]
-    fn from_bytes_rejects_malformed_input() {
-        let result = LinkMetadata::from_bytes(b"this is not JSON or a digest".to_vec());
-        assert!(matches!(result, Err(Error::Internal(_))));
-    }
-
-    #[test]
-    fn from_bytes_rejects_invalid_utf8() {
-        let result = LinkMetadata::from_bytes(vec![0xff, 0xfe, 0xfd]);
-        assert!(matches!(result, Err(Error::Internal(_))));
-    }
-
-    #[test]
-    fn from_bytes_rejects_empty_input() {
-        let result = LinkMetadata::from_bytes(Vec::new());
-        assert!(matches!(result, Err(Error::Internal(_))));
     }
 
     #[test]

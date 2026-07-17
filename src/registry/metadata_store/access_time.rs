@@ -171,7 +171,7 @@ impl MetadataStore {
         let link_path = path_builder::link_path(link, namespace);
         self.store()
             .update_advisory(&link_path, |body| {
-                let link_data = LinkMetadata::from_bytes(body.to_vec())
+                let link_data = serde_json::from_slice::<LinkMetadata>(&body)
                     .map_err(|e| TxError::Build(e.to_string()))?
                     .accessed();
                 let serialized =
@@ -206,7 +206,7 @@ impl MetadataStore {
                         if !snap.present {
                             return Ok(Vec::new());
                         }
-                        let link_data = LinkMetadata::from_bytes(snap.body.to_vec())
+                        let link_data = serde_json::from_slice::<LinkMetadata>(&snap.body)
                             .map_err(|e| TxError::Build(e.to_string()))?
                             .accessed();
                         let serialized =

@@ -179,8 +179,8 @@ pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
 
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
-        enable_blob_redirect: config.global.resolved_enable_blob_redirect(),
-        enable_manifest_redirect: config.global.resolved_enable_manifest_redirect(),
+        enable_blob_redirect: config.global.enable_blob_redirect,
+        enable_manifest_redirect: config.global.enable_manifest_redirect,
         max_manifest_size_bytes: config.global.max_manifest_size_bytes(),
         global_immutable_tags: config.global.immutable_tags,
         global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),

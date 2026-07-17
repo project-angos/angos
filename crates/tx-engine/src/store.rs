@@ -7,8 +7,8 @@
 //! primitive and selects the executor from operator-level inputs, so
 //! subsystems (`metadata_store`, `job_store`) hold a single `Arc<Store>` and
 //! never instantiate locks or executors directly. [`Store::maintenance`]
-//! returns the engine's background loops (recovery, body janitor, lock
-//! janitor) wired over the same primitives; the caller spawns it.
+//! returns the engine's recovery loop wired over the same primitives (the
+//! caller spawns it) and a one-shot janitor sweep for external maintenance.
 //!
 //! The façade stays domain-agnostic: it speaks only `String` keys and `Bytes`
 //! bodies. Registry domain types (`Digest`, `LinkKind`, OCI hashing, serde)
@@ -213,45 +213,41 @@ impl Store {
         self.lock_backend() != "memory"
     }
 
-    /// The engine maintenance loops (recovery, body janitor, lock janitor)
-    /// joined into a single future that runs until `cancellation` fires. The
-    /// caller decides where it runs (typically `tokio::spawn`); spawn it once
-    /// per process per shared [`ObjectStore`].
+    /// The engine recovery loop as a future that runs until `cancellation`
+    /// fires. The caller decides where it runs (typically `tokio::spawn`);
+    /// spawn it once per serving process per shared [`ObjectStore`].
     ///
-    /// The loops use the engine's default intervals and coordinate through
-    /// the executor's own primitives: recovery takes ownership of stale
-    /// intents via the engine lock and, on CAS deployments, replays with the
-    /// same conditional store the healthy path uses. The lock janitor runs
-    /// only on CAS deployments: lock objects exist solely on CAS-capable
-    /// backends, and it reclaims them with conditional deletes.
-    pub fn maintenance(
+    /// Recovery is correctness-critical (it replays or rolls back stale
+    /// intents), so it stays a background loop; the garbage-only janitors are
+    /// driven as one-shot sweeps by external maintenance via
+    /// [`Store::janitor_sweep`]. Recovery takes ownership of stale intents
+    /// via the engine lock and, on CAS deployments, replays with the same
+    /// conditional store the healthy path uses.
+    pub fn recovery(
         &self,
         cancellation: CancellationToken,
     ) -> impl Future<Output = ()> + Send + 'static {
         let mut recovery = RecoveryLoop::builder(self.object.clone())
             .lock(self.lock.clone())
-            .cancellation(cancellation.clone());
+            .cancellation(cancellation);
         if let Some(cs) = &self.conditional {
             recovery = recovery.conditional_store(cs.clone());
         }
-        let recovery = recovery.build();
+        recovery.build().run()
+    }
 
-        let body_janitor = BodyJanitor::builder(self.object.clone())
-            .cancellation(cancellation.clone())
-            .build();
-
-        let lock_janitor = self
-            .conditional
-            .clone()
-            .map(|cs| LockJanitor::builder(cs).cancellation(cancellation).build());
-
-        async move {
-            let lock_janitor = async move {
-                if let Some(janitor) = lock_janitor {
-                    janitor.run().await;
-                }
-            };
-            tokio::join!(recovery.run(), body_janitor.run(), lock_janitor);
+    /// One-shot engine housekeeping: reclaim orphaned `.tx-bodies/` staging
+    /// bodies and, on CAS deployments, expired `.tx-locks/` objects. Both are
+    /// garbage-only (never correctness), age-gated by the engine's own
+    /// thresholds, and safe alongside live traffic; `angos scrub` drives this
+    /// instead of each serving process running periodic janitor loops.
+    pub async fn janitor_sweep(&self) {
+        BodyJanitor::builder(self.object.clone())
+            .build()
+            .sweep()
+            .await;
+        if let Some(cs) = &self.conditional {
+            LockJanitor::builder(cs.clone()).build().sweep().await;
         }
     }
 

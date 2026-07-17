@@ -56,7 +56,6 @@ When omitted, the server runs without TLS (insecure).
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `max_blob_size`             | string   | `"100GiB"` | Maximum total size of a single blob upload; a larger upload is rejected with `BLOB_UPLOAD_INVALID` (HTTP 413) |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
-| `enable_redirect`           | bool     | -        | **Deprecated.** Fallback for both fields below when unset. |
 | `enable_blob_redirect`      | bool     | `true`   | Allow HTTP 307 redirects for blob downloads. |
 | `enable_manifest_redirect`  | bool     | `true`   | Allow HTTP 307 redirects for manifest downloads. Manifest bodies served via `response-content-type` to preserve the media type across redirects. |
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
@@ -117,7 +116,7 @@ setup guide including `angos worker` invocation and KEDA autoscaling.
 
 | Option          | Type     | Default | Description                        |
 |-----------------|----------|---------|------------------------------------|
-| `default`       | string   | `"deny"` | Default action when no rules match (`"allow"` or `"deny"`). The legacy `default_allow` boolean is still accepted but emits a deprecation warning. |
+| `default`       | string   | `"deny"` | Default action when no rules match (`"allow"` or `"deny"`). |
 | `rules`         | [string] | `[]`    | CEL expressions for access control |
 
 ### Global Retention Policy (`global.retention_policy`)
@@ -248,7 +247,6 @@ When using S3 as the metadata store, you can declare whether your S3-compatible 
 - When `lock_strategy` is unset, the resolved value also selects the default lock backend: the shared S3 lock when `true`, the in-process `memory` lock when `false`.
 - With `lock_strategy = "memory"` or `"redis"`, `conditional_operations = true` is used only for blob-index shard updates. Link updates still use the configured lock backend.
 - To avoid S3 CAS entirely, set `conditional_operations = false`; combine with `lock_strategy = "redis"` for multi-replica deployments.
-- The `[metadata_store.s3.capabilities]` table (booleans `put_if_none_match`, `put_if_match`, `delete_if_match`) is deprecated but still accepted; it maps to `conditional_operations = true` only when all three flags are `true`. Setting both keys is rejected.
 
 **Example with explicit declaration (AWS S3, Exoscale SOS):**
 ```toml

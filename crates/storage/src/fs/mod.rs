@@ -141,8 +141,8 @@ impl Backend {
     ///
     /// Private: empty-directory pruning is an FS implementation detail with no
     /// meaning on S3, so it never crosses the [`ObjectStore`] trait surface.
-    /// [`Backend::delete_prefix`] invokes it for callers; nothing outside this
-    /// module triggers it directly.
+    /// [`Backend::delete`] and [`Backend::delete_prefix`] invoke it for
+    /// callers; nothing outside this module triggers it directly.
     async fn prune_empty_ancestors(&self, key: &str) {
         // Lexically resolve `.`/`..` BEFORE touching the filesystem. `full_path`
         // does a bare `root.join(key)`, and `Path::starts_with` is purely
@@ -284,26 +284,43 @@ fn backend_error(op: &str, path: &Path, error: &io::Error) -> Error {
 }
 
 async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Error> {
-    ensure_parent(target).await?;
-    let parent = target.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-    let final_path = target.to_owned();
-    let label = target.to_owned();
-    spawn_blocking(move || -> io::Result<()> {
-        let mut temp = TempFileBuilder::new()
-            .prefix(ATOMIC_WRITE_TMP_PREFIX)
-            .tempfile_in(&parent)?;
-        temp.write_all(&data)?;
-        if sync {
-            temp.flush()?;
-            temp.as_file().sync_all()?;
+    // A concurrent `delete` can prune the parent directory between
+    // `ensure_parent` and temp-file creation (see `prune_empty_ancestors`).
+    // Once the temp file exists the directory is non-empty and safe from the
+    // sweep, so only creation races: retry the racy error kinds with the same
+    // bound as `ensure_parent`.
+    let mut attempt = 0;
+    loop {
+        ensure_parent(target).await?;
+        let parent = target.parent().unwrap_or_else(|| Path::new(".")).to_owned();
+        let final_path = target.to_owned();
+        let body = data.clone();
+        let result = spawn_blocking(move || -> io::Result<()> {
+            let mut temp = TempFileBuilder::new()
+                .prefix(ATOMIC_WRITE_TMP_PREFIX)
+                .tempfile_in(&parent)?;
+            temp.write_all(&body)?;
+            if sync {
+                temp.flush()?;
+                temp.as_file().sync_all()?;
+            }
+            temp.persist(final_path).map_err(|e| e.error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("temp-write task panicked: {e}")))?;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let racy = matches!(e.kind(), ErrorKind::InvalidInput | ErrorKind::NotFound);
+                attempt += 1;
+                if !racy || attempt >= ENSURE_PARENT_RETRIES {
+                    return Err(backend_error("atomic_write", target, &e));
+                }
+                yield_now().await;
+            }
         }
-        temp.persist(final_path).map_err(|e| e.error)?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("temp-write task panicked: {e}")))?
-    .map_err(|e| backend_error("atomic_write", &label, &e))?;
-    Ok(())
+    }
 }
 
 /// Sorted list of immediate entries; missing dir yields an empty vector.
@@ -379,10 +396,15 @@ impl ObjectStore for Backend {
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
         match fs::remove_file(self.full_path(key)).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
         }
+        // On S3 a prefix vanishes with its last object; mirror that here so
+        // directory-based listings never surface hollow scaffolding (e.g. a
+        // deleted tag's empty directory read back as a live tag).
+        self.prune_empty_ancestors(key).await;
+        Ok(())
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
@@ -525,6 +547,9 @@ impl ObjectStore for Backend {
         // upload and its canonical blob-data location live under the same root,
         // so this is the common path and avoids copying the bytes at all.
         if fs::rename(&src, &dst).await.is_ok() {
+            // The rename may have emptied the source's parent chain; sweep it
+            // like `delete` does so no hollow directories survive the move.
+            self.prune_empty_ancestors(source).await;
             return Ok(());
         }
         // Rename can fail across filesystems (`EXDEV`) or transiently; fall back

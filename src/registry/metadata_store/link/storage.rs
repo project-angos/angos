@@ -26,7 +26,7 @@ impl MetadataStore {
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
         match self.store().object_store().get(&link_path).await {
-            Ok(data) => LinkMetadata::from_bytes(data),
+            Ok(data) => serde_json::from_slice(&data).map_err(|e| Error::Internal(e.to_string())),
             Err(StorageError::NotFound) => Err(Error::NotFound),
             Err(e) => Err(e.into()),
         }

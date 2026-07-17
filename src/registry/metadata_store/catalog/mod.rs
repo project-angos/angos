@@ -1,6 +1,5 @@
 //! The namespace / tag / revision / referrer catalog: the content-derived
-//! enumeration endpoints, the namespace tree-walk they build on, and the prune
-//! of the dead pre-1.3 `_registry/` namespace index.
+//! enumeration endpoints and the namespace tree-walk they build on.
 
 use futures_util::stream::{self, StreamExt};
 use tracing::{debug, instrument};
@@ -18,10 +17,6 @@ use crate::{
 
 mod referrer_resolver;
 
-/// Prefix of the pre-1.3 maintained namespace-registry index. The catalog is now
-/// derived from content, so these objects are dead and are pruned by scrub.
-const LEGACY_NAMESPACE_REGISTRY_PREFIX: &str = "_registry";
-
 impl MetadataStore {
     /// Lists the namespaces holding manifest content (a `_manifests` child);
     /// an `_uploads`-only namespace is not a catalog entry and is discovered
@@ -34,9 +29,24 @@ impl MetadataStore {
     ) -> Result<(Vec<String>, Option<String>), Error> {
         debug!("Fetching {n} namespace(s) with continuation token: {last:?}");
 
-        let namespaces = pagination::collect_namespaces_with_marker(
-            path_builder::repository_dir(),
+        let mut namespaces = self.collect_namespaces(None).await?;
+        namespaces.sort_unstable();
+
+        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+    }
+
+    /// Walks the manifest catalog in a single concurrent tree walk and returns
+    /// every namespace, unpaginated and unsorted. `scope` restricts the walk to
+    /// one repository's subtree; `None` walks the whole store.
+    #[instrument(skip(self))]
+    pub async fn collect_namespaces(&self, scope: Option<&str>) -> Result<Vec<String>, Error> {
+        let (root, prefix) = path_builder::namespace_walk_root(scope);
+
+        pagination::collect_namespaces_with_marker(
+            &root,
+            &prefix,
             "_manifests",
+            pagination::NAMESPACE_WALK_CONCURRENCY,
             |path, token| async move {
                 self.store()
                     .object_store()
@@ -45,9 +55,7 @@ impl MetadataStore {
                     .map_err(Error::from)
             },
         )
-        .await?;
-
-        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+        .await
     }
 
     #[instrument(skip(self))]
@@ -74,10 +82,10 @@ impl MetadataStore {
     }
 
     /// Lists the RAW tag directory names in `namespace` with NO `Tag`
-    /// validation. Scrub enumerates these so it can detect (and delete)
-    /// directories whose names do not satisfy the `oci::Tag` grammar, which
-    /// [`Self::list_tags`] silently drops.
-    #[instrument(skip(self))]
+    /// validation, so tests can observe directories whose names do not
+    /// satisfy the `oci::Tag` grammar, which [`Self::list_tags`] silently
+    /// drops (production code walks raw keys through scrub's categorizer).
+    #[cfg(test)]
     pub async fn list_tag_names(
         &self,
         namespace: &Namespace,
@@ -283,16 +291,6 @@ impl MetadataStore {
         }
 
         Ok(count)
-    }
-
-    /// Delete the dead pre-1.3 namespace-registry objects (`_registry/`).
-    /// Idempotent: a no-op once the prefix is gone.
-    pub async fn delete_legacy_namespace_registry(&self) -> Result<(), Error> {
-        self.store()
-            .object_store()
-            .delete_prefix(LEGACY_NAMESPACE_REGISTRY_PREFIX)
-            .await
-            .map_err(Error::from)
     }
 
     /// Delete an entire tag directory by prefix. Used by scrub for an invalid

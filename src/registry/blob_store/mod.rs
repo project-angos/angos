@@ -74,9 +74,9 @@ impl BlobStore {
         BlobStore { object, presign }
     }
 
-    /// The underlying object store. Test escape hatch for raw prefix access
-    /// (fixture cleanup, storage-seam fault injection) outside the blob API.
-    #[cfg(test)]
+    /// The underlying object store, for raw key access outside the blob API:
+    /// the scrub walk (quarantine/corrupt-object deletion on exact listed
+    /// keys) and test fixtures.
     #[must_use]
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object

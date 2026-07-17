@@ -2,6 +2,6 @@
 # Appended to a backend fragment derived from a conformance config so the
 # scenario runs against every backend in the matrix.
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 [repository."test"]

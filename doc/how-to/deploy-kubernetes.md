@@ -287,7 +287,7 @@ spec:
           containers:
             - name: scrub
               image: ghcr.io/project-angos/angos:latest
-              args: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs"]
+              args: ["-c", "/config/config.toml", "scrub"]
               volumeMounts:
                 - name: config
                   mountPath: /config

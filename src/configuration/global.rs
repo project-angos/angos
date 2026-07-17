@@ -17,6 +17,8 @@ pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4)
 /// Default replication-worker concurrency; the `unwrap` is const-evaluated.
 pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
+// A config struct is naturally flag-heavy; the bool count is not an API smell.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
@@ -27,7 +29,7 @@ pub struct GlobalConfig {
     )]
     pub max_concurrent_cache_jobs: NonZeroUsize,
     /// Worker concurrency for the replication queue, used by the server,
-    /// `angos worker`, and `scrub --replicate` drains.
+    /// `angos worker`, and `angos replicate` drains.
     #[serde(
         default = "default_max_concurrent_replication_jobs",
         deserialize_with = "deserialize_max_concurrent_replication_jobs"
@@ -39,12 +41,10 @@ pub struct GlobalConfig {
     pub max_blob_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
     pub update_pull_time: bool,
-    #[serde(default)]
-    pub enable_redirect: Option<bool>,
-    #[serde(default)]
-    pub enable_blob_redirect: Option<bool>,
-    #[serde(default)]
-    pub enable_manifest_redirect: Option<bool>,
+    #[serde(default = "default_redirect_enabled")]
+    pub enable_blob_redirect: bool,
+    #[serde(default = "default_redirect_enabled")]
+    pub enable_manifest_redirect: bool,
     #[serde(default)]
     pub access_policy: AccessPolicyConfig,
     #[serde(default)]
@@ -132,6 +132,10 @@ fn default_update_pull_time() -> bool {
     false
 }
 
+fn default_redirect_enabled() -> bool {
+    true
+}
+
 fn default_allow_missing_manifest_references() -> bool {
     true
 }
@@ -145,9 +149,8 @@ impl Default for GlobalConfig {
             max_manifest_size: default_max_manifest_size(),
             max_blob_size: default_max_blob_size(),
             update_pull_time: default_update_pull_time(),
-            enable_redirect: None,
-            enable_blob_redirect: None,
-            enable_manifest_redirect: None,
+            enable_blob_redirect: true,
+            enable_manifest_redirect: true,
             access_policy: AccessPolicyConfig::default(),
             retention_policy: RetentionPolicyConfig::default(),
             immutable_tags: false,
@@ -162,18 +165,6 @@ impl Default for GlobalConfig {
 }
 
 impl GlobalConfig {
-    pub fn resolved_enable_blob_redirect(&self) -> bool {
-        self.enable_blob_redirect
-            .or(self.enable_redirect)
-            .unwrap_or(true)
-    }
-
-    pub fn resolved_enable_manifest_redirect(&self) -> bool {
-        self.enable_manifest_redirect
-            .or(self.enable_redirect)
-            .unwrap_or(true)
-    }
-
     pub fn max_manifest_size_bytes(&self) -> usize {
         usize::try_from(self.max_manifest_size.as_u64()).unwrap_or(usize::MAX)
     }

@@ -11,6 +11,10 @@ use angos_storage::{ConditionalStore, Error as StorageError, Etag};
 
 use crate::error::Error;
 
+/// Root-level prefix of the transient probe objects. A probe writes then
+/// deletes its key in one call; a crash can leak one.
+pub const PROBE_KEY_PREFIX: &str = "_angos_probe_";
+
 /// Probe whether the store supports every conditional operation CAS
 /// coordination requires.
 ///
@@ -26,7 +30,7 @@ use crate::error::Error;
 /// Returns [`Error::Storage`] when the initial probe object cannot be
 /// written (e.g. the bucket does not exist or credentials are invalid).
 pub async fn probe_cas_support(store: &impl ConditionalStore) -> Result<bool, Error> {
-    let probe_key = format!("_angos_probe_{}", uuid::Uuid::new_v4());
+    let probe_key = format!("{PROBE_KEY_PREFIX}{}", uuid::Uuid::new_v4());
     probe_cas_support_with_key(store, &probe_key).await
 }
 

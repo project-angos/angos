@@ -1,15 +1,15 @@
 //! [`OrphanJobChecker`]: emits a delete action for every job (pending or
 //! dead-lettered) on one durable queue whose payload no longer resolves to
 //! configured state, so stale config stops churning the queue through retries.
+//! Runs on every `angos prune`: prune is the config-trusting command.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::{
-    command::scrub::{action::Action, check::StoreChecker, error::Error, executor::ActionSink},
+    command::scrub::{Error, action::Action, executor::ActionSink},
     jobs::store::{Error as JobStoreError, JobStore},
     jobs::{JobState, Queue},
     registry::{
@@ -149,11 +149,7 @@ impl OrphanJobChecker {
 
     /// Scans one queue partition to exhaustion, emitting a delete action per
     /// orphan; returns how many orphans were emitted.
-    async fn scan_partition(
-        &self,
-        state: JobState,
-        sink: &mut (dyn ActionSink + Send),
-    ) -> Result<u64, Error> {
+    async fn scan_partition(&self, state: JobState, sink: &dyn ActionSink) -> Result<u64, Error> {
         let queue = self.queue.as_queue();
         let mut orphans: u64 = 0;
         let mut after: Option<String> = None;
@@ -209,17 +205,32 @@ impl OrphanJobChecker {
     }
 }
 
-#[async_trait]
-impl StoreChecker for OrphanJobChecker {
-    async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error> {
+impl OrphanJobChecker {
+    /// Scan both partitions of this checker's queue.
+    pub async fn check_all(&self, sink: &dyn ActionSink) -> Result<(), Error> {
         let pending = self.scan_partition(JobState::Pending, sink).await?;
         let failed = self.scan_partition(JobState::Failed, sink).await?;
         info!(
-            "Found {pending} orphan pending and {failed} orphan dead-lettered {} job(s)",
+            "prune: found {pending} orphan pending and {failed} orphan dead-lettered {} job(s)",
             self.queue.as_queue()
         );
         Ok(())
     }
+}
+
+/// Delete queued jobs on both durable queues whose downstream or repository
+/// is no longer configured. Always runs with `angos prune`.
+pub async fn sweep_orphan_jobs(
+    job_store: &Arc<JobStore>,
+    resolver: &Arc<RepositoryResolver>,
+    sink: &dyn ActionSink,
+) -> Result<(), Error> {
+    for queue in [OrphanQueue::Replication, OrphanQueue::Cache] {
+        OrphanJobChecker::new(job_store.clone(), resolver.clone(), queue)
+            .check_all(sink)
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -229,13 +240,12 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        command::scrub::{
-            action::Action,
-            check::{
-                StoreChecker,
-                orphan_jobs::{OrphanJobChecker, OrphanQueue},
+        command::{
+            prune::orphan_jobs::{OrphanJobChecker, OrphanQueue},
+            scrub::{
+                action::Action,
+                executor::{ActionSink, DryRunSink, Executor},
             },
-            executor::{ActionSink, DryRunSink, Executor},
         },
         jobs::{
             JobState, Queue,
@@ -396,15 +406,19 @@ mod tests {
             .unwrap();
         assert_eq!(keys.len(), 1);
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store, OrphanQueue::Replication)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
-        assert_eq!(sink.len(), 1, "the orphan job must emit one action");
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            1,
+            "the orphan job must emit one action"
+        );
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::DeleteOrphanJob { queue, state, storage_key, reason }
                 if *queue == Queue::Replication
                     && *state == JobState::Pending
@@ -424,16 +438,16 @@ mod tests {
 
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store, OrphanQueue::Replication)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
         assert!(
-            sink.is_empty(),
+            sink.lock().unwrap().is_empty(),
             "a job for a configured downstream must not emit an action, got {} action(s)",
-            sink.len()
+            sink.lock().unwrap().len()
         );
     }
 
@@ -450,15 +464,19 @@ mod tests {
         // namespace resolves to no repository at all.
         enqueue_push(&job_store, DOWNSTREAM, GHOST_NAMESPACE).await;
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store, OrphanQueue::Replication)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
-        assert_eq!(sink.len(), 1, "an unresolvable namespace is an orphan");
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            1,
+            "an unresolvable namespace is an orphan"
+        );
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::DeleteOrphanJob { queue, state, reason, .. }
                 if *queue == Queue::Replication
                     && *state == JobState::Pending
@@ -478,19 +496,19 @@ mod tests {
         let envelope = build_envelope(&push_payload(REMOVED_DOWNSTREAM, NAMESPACE)).unwrap();
         dead_letter(&job_store, Queue::Replication, envelope).await;
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store, OrphanQueue::Replication)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
         assert_eq!(
-            sink.len(),
+            sink.lock().unwrap().len(),
             1,
             "the dead-lettered orphan must emit one action"
         );
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::DeleteOrphanJob { state, reason, .. }
                 if *state == JobState::Failed && reason.contains(REMOVED_DOWNSTREAM)
         ));
@@ -514,16 +532,16 @@ mod tests {
         .unwrap();
         job_store.enqueue(envelope).await.unwrap();
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store.clone(), OrphanQueue::Replication)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
         assert!(
-            sink.is_empty(),
+            sink.lock().unwrap().is_empty(),
             "a payload scrub cannot attribute must be skipped, got {} action(s)",
-            sink.len()
+            sink.lock().unwrap().len()
         );
         assert_eq!(
             job_store
@@ -557,7 +575,7 @@ mod tests {
             2
         );
 
-        let mut executor: Box<dyn ActionSink + Send> =
+        let mut executor: Box<dyn ActionSink> =
             Box::new(Executor::new(blob_store, metadata_store, job_store.clone()));
         checker(job_store.clone(), OrphanQueue::Replication)
             .check_all(executor.as_mut())
@@ -594,9 +612,9 @@ mod tests {
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
         enqueue_push(&job_store, REMOVED_DOWNSTREAM, NAMESPACE).await;
 
-        let mut sink = DryRunSink;
+        let sink = DryRunSink;
         checker(job_store.clone(), OrphanQueue::Replication)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
@@ -623,15 +641,19 @@ mod tests {
         let keys = job_store.list_pending(Queue::Cache, 10).await.unwrap();
         assert_eq!(keys.len(), 1);
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store, OrphanQueue::Cache)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
-        assert_eq!(sink.len(), 1, "an unresolvable namespace is an orphan");
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            1,
+            "an unresolvable namespace is an orphan"
+        );
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::DeleteOrphanJob { queue, state, storage_key, reason }
                 if *queue == Queue::Cache
                     && *state == JobState::Pending
@@ -651,16 +673,16 @@ mod tests {
 
         enqueue_cache_fill(&job_store, NAMESPACE).await;
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store, OrphanQueue::Cache)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
         assert!(
-            sink.is_empty(),
+            sink.lock().unwrap().is_empty(),
             "a job for a configured pull-through repository must not emit an action, got {} action(s)",
-            sink.len()
+            sink.lock().unwrap().len()
         );
     }
 
@@ -677,15 +699,19 @@ mod tests {
         // upstreams: a fill job for it can never fetch anything.
         enqueue_cache_fill(&job_store, LOCAL_REPO).await;
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store, OrphanQueue::Cache)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
-        assert_eq!(sink.len(), 1, "a non-pull-through repository is an orphan");
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            1,
+            "a non-pull-through repository is an orphan"
+        );
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::DeleteOrphanJob { queue, state, reason, .. }
                 if *queue == Queue::Cache
                     && *state == JobState::Pending
@@ -704,19 +730,19 @@ mod tests {
 
         dead_letter(&job_store, Queue::Cache, cache_envelope(GHOST_NAMESPACE)).await;
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store, OrphanQueue::Cache)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
         assert_eq!(
-            sink.len(),
+            sink.lock().unwrap().len(),
             1,
             "the dead-lettered orphan must emit one action"
         );
         assert!(matches!(
-            &sink[0],
+            &sink.lock().unwrap()[0],
             Action::DeleteOrphanJob { queue, state, reason, .. }
                 if *queue == Queue::Cache
                     && *state == JobState::Failed
@@ -742,16 +768,16 @@ mod tests {
         .unwrap();
         job_store.enqueue(envelope).await.unwrap();
 
-        let mut sink: Vec<Action> = Vec::new();
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker(job_store.clone(), OrphanQueue::Cache)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
         assert!(
-            sink.is_empty(),
+            sink.lock().unwrap().is_empty(),
             "a payload scrub cannot attribute must be skipped, got {} action(s)",
-            sink.len()
+            sink.lock().unwrap().len()
         );
         assert_eq!(
             job_store.count_pending(Queue::Cache, 0).await.unwrap(),
@@ -776,7 +802,7 @@ mod tests {
         enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
         assert_eq!(job_store.count_pending(Queue::Cache, 0).await.unwrap(), 2);
 
-        let mut executor: Box<dyn ActionSink + Send> =
+        let mut executor: Box<dyn ActionSink> =
             Box::new(Executor::new(blob_store, metadata_store, job_store.clone()));
         checker(job_store.clone(), OrphanQueue::Cache)
             .check_all(executor.as_mut())
@@ -810,9 +836,9 @@ mod tests {
         enqueue_cache_fill(&job_store, NAMESPACE).await;
         enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
 
-        let mut sink = DryRunSink;
+        let sink = DryRunSink;
         checker(job_store.clone(), OrphanQueue::Cache)
-            .check_all(&mut sink)
+            .check_all(&sink)
             .await
             .unwrap();
 
