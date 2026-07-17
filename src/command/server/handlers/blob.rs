@@ -95,11 +95,12 @@ pub async fn handle_get_blob(
     let headers = RequestHeaders::new(&parts.headers);
     let mime_types = headers.accepted_content_types();
     let range = headers.blob_range()?;
+    let allow_redirect = !headers.redirect_suppressed();
 
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .resolve_get_blob(actor, namespace, digest, &mime_types, range)
+        .resolve_get_blob(actor, namespace, digest, &mime_types, range, allow_redirect)
         .await?;
 
     match response {

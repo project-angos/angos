@@ -238,7 +238,7 @@ Base path: `/_ext/`
 GET /_ext/_repositories
 ```
 
-List all configured repositories with namespace counts.
+List all configured repositories with their namespace counts.
 
 **Response:**
 ```json
@@ -246,8 +246,8 @@ List all configured repositories with namespace counts.
   "repositories": [
     {
       "name": "library",
-      "namespaces": 15,
-      "is_pull_through": true,
+      "namespace_count": 15,
+      "pull_through_cache": true,
       "immutable_tags": true
     }
   ]

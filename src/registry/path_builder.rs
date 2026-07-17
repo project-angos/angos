@@ -14,6 +14,20 @@ pub fn repository_dir() -> &'static str {
     REPOS_ROOT
 }
 
+/// Root directory and namespace-name prefix for a namespace tree walk. `None`
+/// walks the whole repositories tree; `Some(repository)` restricts the walk to
+/// that repository's subtree while keeping the repository segment in the
+/// returned namespace names.
+pub fn namespace_walk_root(scope: Option<&str>) -> (String, String) {
+    match scope {
+        Some(repository) => (
+            format!("{REPOS_ROOT}/{repository}"),
+            format!("{repository}/"),
+        ),
+        None => (REPOS_ROOT.to_string(), String::new()),
+    }
+}
+
 /// Storage prefix for a namespace's repository subtree addressed by its raw
 /// on-disk name, so scrub can reclaim a directory whose name fails `Namespace`
 /// validation (out-of-band corruption). Returns `None` when a path segment is

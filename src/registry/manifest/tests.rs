@@ -1370,6 +1370,7 @@ async fn test_handle_get_manifest() {
                 Reference::Tag(Tag::new(tag).unwrap()),
                 &[],
                 false,
+                true,
             )
             .await
             .unwrap();

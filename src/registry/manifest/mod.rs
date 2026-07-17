@@ -786,6 +786,7 @@ impl Registry {
         reference: Reference,
         mime_types: &[String],
         is_tag_immutable: bool,
+        allow_redirect: bool,
     ) -> Result<GetManifestResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
         let repository_name = repository.name.to_string();
@@ -799,6 +800,7 @@ impl Registry {
                 reference,
                 mime_types,
                 is_tag_immutable,
+                allow_redirect,
             )
             .await?;
 
@@ -819,12 +821,14 @@ impl Registry {
         reference: Reference,
         mime_types: &[String],
         is_tag_immutable: bool,
+        allow_redirect: bool,
     ) -> Result<GetManifestResponse, Error> {
         let redirect_is_authoritative = !repository.is_pull_through()
             || matches!(reference, Reference::Digest(_))
             || is_tag_immutable;
 
-        if self.enable_manifest_redirect
+        if allow_redirect
+            && self.enable_manifest_redirect
             && redirect_is_authoritative
             && let Some(resp) = self.try_redirect_via_link(namespace, &reference).await
         {

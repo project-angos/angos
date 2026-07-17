@@ -19,9 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Grant-only blob ownership (a blob uploaded whose manifest never landed) is now decided by the retention policies like any other untagged content, with the `-u` window shielding in-flight pushes.
 - The transaction engine's garbage janitors (orphaned staging bodies, expired lock objects) no longer run as background loops in the server and worker; `angos scrub` sweeps them instead, while the recovery loop stays in serving processes.
 - A `put-manifest` CEL policy input now exposes `request.digest` (by-digest push) and `request.tags` (the tags the push creates) instead of `request.reference`; update any access policy that gated a manifest push on `request.reference`.
+- The `_ext` namespace walk now lists a directory's siblings concurrently, and a single-repository listing walks only that repository's subtree, so the repository and namespace listings are no longer bottlenecked by sequential whole-store scans on S3.
 
 ### Fixed
 
+- The web UI could not display a manifest or download a blob when redirects were enabled, because a browser cannot follow the cross-origin redirect to a pre-signed S3 URL; GET requests carrying the `X-Angos-No-Redirect` header are now served inline.
 - The transaction engine's body janitor never actually reclaimed orphaned `.tx-bodies/` staging: it mishandled the listing's relative names and always concluded there was nothing to delete.
 - On the filesystem backend, deleting a single object sometimes left its now-empty parent directories behind, and directory-based listings served them back (a deleted tag kept appearing in the tag list).
 
