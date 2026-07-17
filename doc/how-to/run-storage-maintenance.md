@@ -40,7 +40,7 @@ Scrub streams every key in both stores (blob and metadata), categorizes it by sh
 | Option | Short | Description |
 |---|---|---|
 | `--dry-run` | `-d` | Preview changes without applying them |
-| `--concurrency <N>` | | Keys validated concurrently per pass (default 8) |
+| `--concurrency <N>` | | Keys validated concurrently per pass (default 25) |
 | `--delete-unknown` | | Delete unrecognized keys outright instead of quarantining them |
 
 ### The lost-and-found prefix
@@ -74,7 +74,7 @@ These need an age threshold because a structural check cannot distinguish an in-
 |---|---|---|
 | `--dry-run` | `-d` | Preview what would be deleted without changes |
 | `--uploads <dur>` | `-u` | Age window for upload-lifecycle reclamation (default `1h`) |
-| `--concurrency <N>` | | Namespaces, uploads, blobs, or shards checked concurrently per sweep (default 8) |
+| `--concurrency <N>` | | Namespaces, uploads, blobs, or shards checked concurrently per sweep (default 25) |
 
 ---
 

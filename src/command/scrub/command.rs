@@ -29,7 +29,7 @@ use crate::{
 /// Default per-pass concurrency, shared by the scrub walk and the prune
 /// sweeps.
 pub fn default_concurrency() -> usize {
-    8
+    25
 }
 
 #[derive(FromArgs, PartialEq, Debug)]

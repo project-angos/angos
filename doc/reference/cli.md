@@ -89,7 +89,7 @@ Because a repair can create new derivable state, a heavily damaged store may nee
 | Option                | Short  | Description                                                                 |
 |-----------------------|--------|------------------------------------------------------------------------------|
 | `--dry-run`           | `-d`   | Preview what would be changed without applying anything                     |
-| `--concurrency <N>`   |        | Number of keys validated concurrently per pass (default 8)                  |
+| `--concurrency <N>`   |        | Number of keys validated concurrently per pass (default 25)                  |
 | `--delete-unknown`    |        | Delete unrecognized keys outright instead of quarantining them              |
 
 **Examples:**
@@ -164,7 +164,7 @@ Prune is the config-and-time command: run it against the same configuration file
 |---------------------|-------|---------------------------------------------------------------------------|
 | `--dry-run`         | `-d`  | Preview what would be deleted without changes                            |
 | `--uploads <dur>`   | `-u`  | Age window for upload-lifecycle reclamation (default `1h`)               |
-| `--concurrency <N>` |       | Namespaces, uploads, blobs, or shards checked concurrently per sweep (default 8) |
+| `--concurrency <N>` |       | Namespaces, uploads, blobs, or shards checked concurrently per sweep (default 25) |
 
 **Examples:**
 
