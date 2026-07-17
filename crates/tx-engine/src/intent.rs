@@ -17,6 +17,7 @@ pub const DEFAULT_INTENT_TTL_SECS: u64 = 300;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -49,6 +50,16 @@ pub enum MutationRecord {
     /// Server-side move from `src` to `dst`: copy then delete-src, both
     /// idempotent under replay.
     Move { src: String, dst: String },
+    /// Idempotently merge `add`/`remove` into the JSON-array set at `key`.
+    ///
+    /// Carries no `body_ref` (the small deltas live inline) and no etag: each
+    /// apply and replay re-reads live state and recomputes, so it always
+    /// converges instead of leaving a permanent partial commit.
+    MergeSet {
+        key: String,
+        add: Vec<Value>,
+        remove: Vec<Value>,
+    },
 }
 
 impl MutationRecord {
@@ -60,7 +71,8 @@ impl MutationRecord {
         match self {
             MutationRecord::Put { key, .. }
             | MutationRecord::PutIfAbsent { key, .. }
-            | MutationRecord::Delete { key, .. } => vec![key.as_str()].into_iter(),
+            | MutationRecord::Delete { key, .. }
+            | MutationRecord::MergeSet { key, .. } => vec![key.as_str()].into_iter(),
             MutationRecord::Copy { src, dst } | MutationRecord::Move { src, dst } => {
                 vec![src.as_str(), dst.as_str()].into_iter()
             }

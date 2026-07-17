@@ -133,7 +133,9 @@ pub async fn sweep_orphan_multiparts(
 
 /// Remove blob-index entries that reference byteless blobs once the shard is
 /// older than the window: a grant written by an upload whose bytes never
-/// landed (or whose bytes were reclaimed out-of-band).
+/// landed (or whose bytes were reclaimed out-of-band). A pull-through grant
+/// whose lazy fill never completed is purged too; the next pull re-fills the
+/// bytes and re-grants.
 pub async fn sweep_byteless_shards(
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,

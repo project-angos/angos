@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
+use serde_json::Value;
 
 use angos_tx_engine::{
     StorageError,
@@ -91,47 +92,73 @@ pub async fn read_shard(
     }
 }
 
-/// Apply `ops` over the shard's current `existing` state and append the
-/// fingerprint read plus the resulting mutation to `builder`: `Put`/`Delete`
-/// over a present shard, create-only `PutIfAbsent` over an absent one.
-pub fn append_shard_ops(
-    shard_path: String,
-    existing: Option<(Bytes, HashSet<LinkKind>)>,
+/// Fold `ops` into the disjoint `(add, remove)` link sets a [`Mutation::MergeSet`]
+/// carries, applying last-op-wins per link so the result matches an ordered
+/// [`apply_blob_index_operations`] over the same ops.
+fn ops_to_merge_delta(
     ops: &[BlobIndexOperation],
-    mut builder: TransactionBuilder,
-) -> Result<TransactionBuilder, serde_json::Error> {
-    let Some((raw, mut links)) = existing else {
-        let mut links = HashSet::new();
-        apply_blob_index_operations(&mut links, ops);
-        if links.is_empty() {
-            return Ok(builder);
+) -> Result<(Vec<Value>, Vec<Value>), serde_json::Error> {
+    let mut add: Vec<LinkKind> = Vec::new();
+    let mut remove: Vec<LinkKind> = Vec::new();
+    for op in ops {
+        match op {
+            BlobIndexOperation::Insert(link) => {
+                remove.retain(|existing| existing != link);
+                if !add.contains(link) {
+                    add.push(link.clone());
+                }
+            }
+            BlobIndexOperation::Remove(link) => {
+                add.retain(|existing| existing != link);
+                if !remove.contains(link) {
+                    remove.push(link.clone());
+                }
+            }
         }
-        let body = Bytes::from(serde_json::to_vec(&links)?);
-        return Ok(builder.mutation(Mutation::PutIfAbsent {
-            key: shard_path,
-            body,
-        }));
-    };
-
-    apply_blob_index_operations(&mut links, ops);
-    builder = builder.read(shard_path.clone(), raw);
-    if links.is_empty() {
-        Ok(builder.mutation(Mutation::Delete {
-            key: shard_path,
-            expected: None,
-        }))
-    } else {
-        let body = Bytes::from(serde_json::to_vec(&links)?);
-        Ok(builder.mutation(Mutation::Put {
-            key: shard_path,
-            body,
-            expected: None,
-        }))
     }
+    let add = add
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    let remove = remove
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    Ok((add, remove))
 }
 
-/// Read the current shard state for `digest`/`namespace`, apply `ops`, and
-/// append the resulting read + mutation to `builder`.
+/// Append the shard mutation for `ops` to `builder` as an idempotent
+/// [`Mutation::MergeSet`], or leave `builder` untouched when `ops` net to
+/// nothing.
+///
+/// A present shard is joined to the read set: its fingerprint lets the executor
+/// catch a concurrent shard write at prepare and retry the whole transaction
+/// cleanly, so the healthy path settles fast. If a write still slips in after
+/// the commit point, the carried delta lets the merge reconcile against live
+/// state on replay rather than stranding a partial commit.
+pub fn append_shard_ops(
+    shard_path: String,
+    existing: Option<Bytes>,
+    ops: &[BlobIndexOperation],
+    builder: TransactionBuilder,
+) -> Result<TransactionBuilder, serde_json::Error> {
+    let (add, remove) = ops_to_merge_delta(ops)?;
+    if add.is_empty() && remove.is_empty() {
+        return Ok(builder);
+    }
+    let builder = match existing {
+        Some(raw) => builder.read(shard_path.clone(), raw),
+        None => builder,
+    };
+    Ok(builder.mutation(Mutation::MergeSet {
+        key: shard_path,
+        add,
+        remove,
+    }))
+}
+
+/// Read the current shard for `digest`/`namespace` and append its merge mutation
+/// to `builder`.
 pub async fn append_shard_for_digest(
     store: &Store,
     namespace: &Namespace,
@@ -140,7 +167,11 @@ pub async fn append_shard_for_digest(
     builder: TransactionBuilder,
 ) -> Result<TransactionBuilder, Error> {
     let shard_path = path_builder::blob_index_shard_path(digest, namespace);
-    let existing = read_shard(store, &shard_path).await?;
+    let existing = match store.object_store().get(&shard_path).await {
+        Ok(data) => Some(Bytes::from(data)),
+        Err(StorageError::NotFound) => None,
+        Err(e) => return Err(Error::from(e)),
+    };
     append_shard_ops(shard_path, existing, ops, builder).map_err(Error::from)
 }
 

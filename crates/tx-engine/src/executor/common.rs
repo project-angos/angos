@@ -6,6 +6,7 @@
 
 use bytes::Bytes;
 use chrono::Utc;
+use serde_json::Value;
 use tracing::warn;
 
 use angos_storage::{Error as StorageError, Etag, ObjectStore};
@@ -113,6 +114,11 @@ pub async fn stage_bodies(
                 src: src.clone(),
                 dst: dst.clone(),
             },
+            Mutation::MergeSet { key, add, remove } => MutationRecord::MergeSet {
+                key: key.clone(),
+                add: add.clone(),
+                remove: remove.clone(),
+            },
         };
         records.push(record);
     }
@@ -172,6 +178,68 @@ pub async fn move_idempotent(
     match store.delete(src).await {
         Ok(()) | Err(StorageError::NotFound) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// Merge `add`/`remove` into the JSON-array set held in `current` (an empty
+/// slice for an absent key), returning the re-serialised body or `None` when the
+/// set becomes empty and the key should be deleted.
+///
+/// Members compare by structural JSON equality. `add` and `remove` are assumed
+/// disjoint, so apply order does not matter. Shared by both appliers so the
+/// CAS retry loop and the locked read-modify-write stay in lock-step.
+///
+/// # Errors
+///
+/// Returns [`serde_json::Error`] when `current` is not a JSON array or the
+/// merged set fails to serialise.
+pub fn merge_json_set(
+    current: &[u8],
+    add: &[Value],
+    remove: &[Value],
+) -> Result<Option<Bytes>, serde_json::Error> {
+    let mut members: Vec<Value> = if current.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_slice(current)?
+    };
+    members.retain(|member| !remove.contains(member));
+    for member in add {
+        if !members.contains(member) {
+            members.push(member.clone());
+        }
+    }
+    if members.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Bytes::from(serde_json::to_vec(&members)?)))
+}
+
+/// Apply a [`MutationRecord::MergeSet`] against a plain [`ObjectStore`] under the
+/// caller's lock: read the current set, merge, then write or delete. Idempotent
+/// in both modes, so recovery replays it unchanged.
+///
+/// # Errors
+///
+/// Returns [`Error::Serde`] when the stored body is not a JSON array, or
+/// [`Error::Storage`] on a hard storage error.
+async fn apply_merge_set_object(
+    store: &dyn ObjectStore,
+    key: &str,
+    add: &[Value],
+    remove: &[Value],
+) -> Result<(), Error> {
+    let current = match store.get(key).await {
+        Ok(body) => body,
+        Err(StorageError::NotFound) => Vec::new(),
+        Err(e) => return Err(Error::Storage(e)),
+    };
+    match merge_json_set(&current, add, remove)? {
+        Some(body) => store.put(key, body).await.map_err(Error::Storage),
+        None => match store.delete(key).await {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(e) => Err(Error::Storage(e)),
+        },
     }
 }
 
@@ -268,6 +336,9 @@ pub async fn apply_object_store(
                 .await
                 .map_err(Error::Storage),
         },
+        MutationRecord::MergeSet { key, add, remove } => {
+            apply_merge_set_object(store, key, add, remove).await
+        }
     }
 }
 

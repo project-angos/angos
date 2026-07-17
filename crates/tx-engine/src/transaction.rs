@@ -2,6 +2,7 @@
 //! that the engine either commits atomically or leaves entirely unapplied.
 
 use bytes::Bytes;
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use angos_storage::Etag;
@@ -87,6 +88,22 @@ pub enum Mutation {
     /// Both steps are individually idempotent under replay: a `delete` of a
     /// missing `src` is treated as success, and `copy` is overwrite-anywhere.
     Move { src: String, dst: String },
+
+    /// Idempotently merge `add`/`remove` into the JSON-array set stored at
+    /// `key`.
+    ///
+    /// The object is a JSON array treated as a set whose members compare by
+    /// structural JSON equality. Apply removes every member of `remove`, inserts
+    /// every member of `add` not already present, and deletes `key` when the set
+    /// becomes empty. Unlike a `Put`, it carries no build-time etag: each apply
+    /// (and every recovery replay) re-reads and recomputes against live state,
+    /// so a lost race is retried rather than left as a permanent partial commit.
+    /// `add` and `remove` must be disjoint, which makes the merge commutative.
+    MergeSet {
+        key: String,
+        add: Vec<Value>,
+        remove: Vec<Value>,
+    },
 }
 
 impl Mutation {
@@ -97,7 +114,8 @@ impl Mutation {
         match self {
             Mutation::Put { key, .. }
             | Mutation::PutIfAbsent { key, .. }
-            | Mutation::Delete { key, .. } => key,
+            | Mutation::Delete { key, .. }
+            | Mutation::MergeSet { key, .. } => key,
             Mutation::Copy { dst, .. } | Mutation::Move { dst, .. } => dst,
         }
     }

@@ -291,7 +291,7 @@ impl MetadataStore {
     /// / blob-index side effects the [`LinksTx`] kind carries), commit it, and
     /// perform post-apply cleanup. Every public entry point shares this body,
     /// differing only in the `tx` kind; the per-attempt planning is split into
-    /// the named phases below.
+    /// the named steps below.
     pub async fn execute_links_tx(
         &self,
         namespace: &Namespace,
@@ -301,10 +301,10 @@ impl MetadataStore {
         let (_, result) = execute_with_retry_payload(
             self.executor(),
             || async {
-                // Phase 1: one read pass over every operation's link. The
-                // observed bytes join the transaction read set in phase 3, so
-                // a racing write to any touched link aborts this attempt at
-                // prepare and the retry re-plans against fresh state.
+                // Snapshot: one read pass over every operation's link. The
+                // observed bytes join the transaction read set when mutations
+                // are built, so a racing write to any touched link aborts this
+                // attempt at prepare and the retry re-plans against fresh state.
                 let snapshot = self.snapshot_links(namespace, operations).await?;
 
                 // Empty no-op short-circuit: no creates, every delete target
@@ -313,7 +313,7 @@ impl MetadataStore {
                     return Ok((Transaction::builder().build(), LinksTxCaptured::default()));
                 }
 
-                // Phase 2: last-writer-wins gate for replicated writes/deletes.
+                // LWW gate: reject replicated writes/deletes superseded locally.
                 if let Some(message) = lww_superseded(&snapshot, &tx) {
                     return Ok((
                         Transaction::builder().build(),
@@ -330,7 +330,7 @@ impl MetadataStore {
                     reads,
                 } = snapshot;
 
-                // Phase 3: build the link mutations over the snapshot state.
+                // Plan: build the link mutations over the snapshot state.
                 let LinkMutations {
                     mut builder,
                     pending_blob_ops,
@@ -338,16 +338,16 @@ impl MetadataStore {
                     deleted_links,
                 } = build_link_mutations(namespace, &ops, &mut link_cache, &tx, reads)?;
 
-                // Phase 4: decide whether this transaction leaves the manifest
-                // blob unreferenced (its shard becomes empty AND no other
-                // namespace references it). The blob-data itself lives in the
-                // blob store; the caller reclaims it under the blob-data lock.
+                // Reclaim check: decide whether this transaction leaves the
+                // manifest blob unreferenced (its shard becomes empty AND no
+                // other namespace references it). The blob-data itself lives in
+                // the blob store; the caller reclaims it under the blob-data lock.
                 let store = self.store_arc();
                 let reclaim_blob =
                     blob_will_be_unreferenced(store.as_ref(), namespace, &tx, &pending_blob_ops)
                         .await?;
 
-                // Phase 5: append blob-index shard mutations and finalize.
+                // Shard merges: append blob-index shard mutations and finalize.
                 for (digest, shard_ops) in &pending_blob_ops {
                     builder = append_shard_for_digest(
                         store.as_ref(),
@@ -404,10 +404,10 @@ impl MetadataStore {
         })
     }
 
-    /// Phase 1: read each operation's link once, in parallel, capturing the
-    /// raw bytes (for the transaction read set) and the parsed metadata (for
-    /// planning) together. A non-`NotFound` read error fails the attempt
-    /// rather than being planned around as an absent link.
+    /// The snapshot pass: read each operation's link once, in parallel,
+    /// capturing the raw bytes (for the transaction read set) and the parsed
+    /// metadata (for planning) together. A non-`NotFound` read error fails the
+    /// attempt rather than being planned around as an absent link.
     async fn snapshot_links<'a>(
         &self,
         namespace: &Namespace,
@@ -489,10 +489,10 @@ impl MetadataStore {
     }
 }
 
-/// Phase 2: the last-writer-wins gate for replicated writes and deletes.
-/// Returns `Some(message)` when a local tag is newer than the replicated
-/// source, so the attempt commits an empty transaction and the caller maps it
-/// to [`Error::ReplicationSuperseded`]. The comparison runs against the same
+/// The last-writer-wins gate for replicated writes and deletes: returns
+/// `Some(message)` when a local tag is newer than the replicated source, so
+/// the attempt commits an empty transaction and the caller maps it to
+/// [`Error::ReplicationSuperseded`]. The comparison runs against the same
 /// snapshot the read set validates, so a racing tag write aborts the commit
 /// rather than gating LWW on stale state.
 fn lww_superseded(snapshot: &LinksSnapshot<'_>, tx: &LinksTx<'_>) -> Option<String> {
@@ -546,10 +546,11 @@ fn is_empty_noop(ops: &[OpSnapshot<'_>], tx: &LinksTx<'_>) -> bool {
     !had_creates && !tx.has_blob_side_effects() && all_deletes_absent
 }
 
-/// Phase 3: turn the snapshot's creates and deletes into transaction mutations,
-/// accumulating the blob-index ops and the written / deleted link sets. Seeds the
-/// builder with the snapshot reads and direct blob-index ops, then threads a
-/// [`LinkMutations`] accumulator through the create/delete processors.
+/// The planning step: turn the snapshot's creates and deletes into transaction
+/// mutations, accumulating the blob-index ops and the written / deleted link
+/// sets. Seeds the builder with the snapshot reads and direct blob-index ops,
+/// then threads a [`LinkMutations`] accumulator through the create/delete
+/// processors.
 fn build_link_mutations(
     namespace: &Namespace,
     ops: &[OpSnapshot<'_>],
@@ -584,8 +585,9 @@ fn build_link_mutations(
     Ok(acc)
 }
 
-/// Phase 3 (creates): append a link `Put` per `Create` op, recording the
-/// inserted / moved blob-index entries and the written link metadata.
+/// The create half of mutation planning: append a link `Put` per `Create` op,
+/// recording the inserted / moved blob-index entries and the written link
+/// metadata.
 fn build_create_mutations(
     namespace: &Namespace,
     ops: &[OpSnapshot<'_>],
@@ -657,9 +659,10 @@ fn build_create_mutations(
     Ok(acc)
 }
 
-/// Phase 3 (deletes): for each `Delete` op whose link exists, either prune one
-/// referrer (a tracked link with references left becomes a `Put`) or remove
-/// the link outright (a `Delete` plus the blob-index `Remove`).
+/// The delete half of mutation planning: for each `Delete` op whose link
+/// exists, either prune one referrer (a tracked link with references left
+/// becomes a `Put`) or remove the link outright (a `Delete` plus the
+/// blob-index `Remove`).
 fn build_delete_mutations(
     namespace: &Namespace,
     ops: &[OpSnapshot<'_>],
@@ -695,7 +698,7 @@ fn build_delete_mutations(
     Ok(acc)
 }
 
-/// Phase 6: decide whether this transaction leaves the manifest blob
+/// The reclaim check: decide whether this transaction leaves the manifest blob
 /// unreferenced (its namespace shard becomes empty and no other namespace
 /// references it). The caller reclaims the blob-data from the blob store; the
 /// blob's existence is not probed here (the reclaim is an idempotent

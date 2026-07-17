@@ -2,6 +2,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use chrono::Utc;
+use uuid::Uuid;
+
+use angos_tx_engine::intent::{IntentRecord, MutationProgress, MutationRecord};
 
 use crate::{
     command::scrub::{
@@ -706,6 +710,168 @@ async fn convergence_second_run_emits_zero_actions() {
             actions.is_empty(),
             "the second run must find nothing left to do, got: {:?}",
             actions.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    })
+    .await;
+}
+
+/// Write a transaction intent whose only mutation touches `key`, with the
+/// given TTL. Returns the intent's log key so tests can reap it.
+async fn put_intent_touching(
+    metadata_store: &Arc<MetadataStore>,
+    key: &str,
+    ttl_secs: u64,
+) -> String {
+    let intent = IntentRecord {
+        id: Uuid::new_v4(),
+        created_at: Utc::now(),
+        ttl_secs,
+        reads: Vec::new(),
+        mutations: vec![MutationRecord::Delete {
+            key: key.to_string(),
+            expected: None,
+        }],
+        coarse_lock_keys: Vec::new(),
+        progress: vec![MutationProgress::Pending],
+    };
+    let log_key = intent.log_key();
+    metadata_store
+        .store()
+        .object_store()
+        .put(&log_key, Bytes::from(serde_json::to_vec(&intent).unwrap()))
+        .await
+        .unwrap();
+    log_key
+}
+
+#[tokio::test]
+async fn live_intent_suppresses_shard_entry_removal() {
+    for_each_backend(async |test_case| {
+        let namespace = &Namespace::new("test-repo/inflight-entry").unwrap();
+        let (_, _, layer_digest) = push_healthy_image(test_case, namespace).await;
+        let metadata_store = test_case.metadata_store();
+
+        let phantom = LinkKind::Layer(Digest::sha256_of_bytes(b"inflight-layer"));
+        metadata_store
+            .update_blob_index(
+                namespace,
+                &layer_digest,
+                BlobIndexOperation::Insert(phantom.clone()),
+            )
+            .await
+            .unwrap();
+        let log_key = put_intent_touching(
+            &metadata_store,
+            &path_builder::link_path(&phantom, namespace),
+            300,
+        )
+        .await;
+
+        scrub_apply(test_case).await;
+        let links = metadata_store
+            .read_blob_index_namespace(namespace, &layer_digest)
+            .await
+            .unwrap();
+        assert!(
+            links.contains(&phantom),
+            "an entry a live transaction is still writing must not be removed"
+        );
+
+        // Once the intent is reaped the same state is settled damage.
+        metadata_store
+            .store()
+            .object_store()
+            .delete(&log_key)
+            .await
+            .unwrap();
+        scrub_apply(test_case).await;
+        let links = metadata_store
+            .read_blob_index_namespace(namespace, &layer_digest)
+            .await
+            .unwrap();
+        assert!(
+            !links.contains(&phantom),
+            "the entry must be removed after the intent is gone"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn expired_intent_does_not_suppress_repairs() {
+    for_each_backend(async |test_case| {
+        let namespace = &Namespace::new("test-repo/expired-intent").unwrap();
+        let (_, _, layer_digest) = push_healthy_image(test_case, namespace).await;
+        let metadata_store = test_case.metadata_store();
+
+        let phantom = LinkKind::Layer(Digest::sha256_of_bytes(b"expired-layer"));
+        metadata_store
+            .update_blob_index(
+                namespace,
+                &layer_digest,
+                BlobIndexOperation::Insert(phantom.clone()),
+            )
+            .await
+            .unwrap();
+        put_intent_touching(
+            &metadata_store,
+            &path_builder::link_path(&phantom, namespace),
+            0,
+        )
+        .await;
+
+        scrub_apply(test_case).await;
+
+        let links = metadata_store
+            .read_blob_index_namespace(namespace, &layer_digest)
+            .await
+            .unwrap();
+        assert!(
+            !links.contains(&phantom),
+            "an expired intent is recovery's leftovers, not an in-flight transaction"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn live_intent_suppresses_referrer_removal() {
+    for_each_backend(async |test_case| {
+        let namespace = &Namespace::new("test-repo/inflight-referrer").unwrap();
+        let (_, config_digest, _) = push_healthy_image(test_case, namespace).await;
+        let metadata_store = test_case.metadata_store();
+
+        // A referrer whose revision link is mid-write: referenced but absent.
+        let inflight_revision = Digest::sha256_of_bytes(b"inflight-revision");
+        let config_link = LinkKind::Config(config_digest.clone());
+        let mut current = metadata_store
+            .read_link(namespace, &config_link)
+            .await
+            .unwrap();
+        current.add_referrer(inflight_revision.clone());
+        put_link_raw(
+            metadata_store.store(),
+            namespace,
+            &config_link,
+            &serde_json::to_vec(&current).unwrap(),
+        )
+        .await;
+        put_intent_touching(
+            &metadata_store,
+            &path_builder::link_path(&LinkKind::Digest(inflight_revision.clone()), namespace),
+            300,
+        )
+        .await;
+
+        scrub_apply(test_case).await;
+
+        let repaired = metadata_store
+            .read_link(namespace, &config_link)
+            .await
+            .unwrap();
+        assert!(
+            repaired.referenced_by.contains(&inflight_revision),
+            "a back-link to a revision still being written must not be pruned"
         );
     })
     .await;
