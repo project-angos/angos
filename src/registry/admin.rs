@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
 use tracing::instrument;
 
@@ -23,6 +24,10 @@ use crate::{
 /// client supplies no `?n=`. Bounded so an admin scan reads at most this many
 /// envelope bodies per request.
 const DEFAULT_JOBS_PAGE: u16 = 100;
+
+/// Fan-out for per-namespace manifest/upload counting in the namespace listing;
+/// each namespace costs two backend listings, run concurrently to hide latency.
+const NAMESPACE_STAT_CONCURRENCY: usize = 32;
 
 #[derive(Serialize, Debug)]
 pub struct RepositoryInfo {
@@ -296,14 +301,21 @@ fn parent_refs_for(
 impl Registry {
     #[instrument(skip(self))]
     pub async fn get_repositories_info(&self) -> Result<RepositoriesBody, Error> {
-        let mut repositories = Vec::with_capacity(self.resolver.len());
+        // Walk each store once and bucket namespaces per repository in memory.
+        // Both walks are concurrent internally; listing per repository would
+        // instead re-scan the whole store once per configured repository.
+        let all_namespaces = self.collect_namespaces(None).await?;
 
+        let mut repositories = Vec::with_capacity(self.resolver.len());
         for name in self.resolver.keys() {
-            let namespaces = self.list_repository_namespaces(name).await?;
+            let namespace_count = all_namespaces
+                .iter()
+                .filter(|ns| namespace_belongs_to(ns, name))
+                .count();
             let config = self.get_repository_config(name);
             repositories.push(RepositoryInfo {
                 name: name.to_string(),
-                namespace_count: namespaces.len(),
+                namespace_count,
                 pull_through_cache: config.pull_through_cache,
                 immutable_tags: config.immutable_tags,
             });
@@ -317,18 +329,25 @@ impl Registry {
     #[instrument(skip(self))]
     pub async fn get_namespaces_info(&self, repository: &str) -> Result<NamespacesBody, Error> {
         let namespace_names = self.list_repository_namespaces(repository).await?;
-        let mut namespaces = Vec::with_capacity(namespace_names.len());
 
-        for name_str in namespace_names {
-            let name = Namespace::new(&name_str).map_err(|_| Error::NameInvalid)?;
-            let manifest_count = self.metadata_store.count_manifests(&name).await?;
-            let upload_count = self.count_uploads(&name).await?;
-            namespaces.push(NamespaceInfo {
-                name: name_str,
-                manifest_count,
-                upload_count,
-            });
-        }
+        // Each namespace's counts are two independent backend listings; fan them
+        // out rather than walking the namespaces one at a time.
+        let mut namespaces: Vec<NamespaceInfo> = stream::iter(namespace_names)
+            .map(|name_str| async move {
+                let name = Namespace::new(&name_str).map_err(|_| Error::NameInvalid)?;
+                let manifest_count = self.metadata_store.count_manifests(&name).await?;
+                let upload_count = self.count_uploads(&name).await?;
+                Ok::<_, Error>(NamespaceInfo {
+                    name: name_str,
+                    manifest_count,
+                    upload_count,
+                })
+            })
+            .buffer_unordered(NAMESPACE_STAT_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        namespaces.sort_by(|a, b| a.name.cmp(&b.name));
 
         let config = self.get_repository_config(repository);
 
@@ -657,28 +676,21 @@ impl Registry {
             return Err(Error::NameUnknown);
         }
 
-        let manifest_namespaces = collect_all_pages(|token| async move {
-            self.metadata_store.list_namespaces(1000, token).await
-        })
-        .await?;
+        self.collect_namespaces(Some(repository)).await
+    }
 
-        // The catalog keys namespaces off `_manifests`, so a namespace holding
-        // only in-progress uploads is absent from it; merge the blob store's
-        // `_uploads`-keyed listing so its pending uploads still surface here.
-        let upload_namespaces = collect_all_pages(|token| async move {
-            self.blob_store.list_upload_namespaces(1000, token).await
-        })
-        .await?;
+    /// Every namespace across both stores, sorted and deduplicated. `scope`
+    /// restricts the walk to one repository's subtree; `None` walks the whole
+    /// store. The manifest catalog keys namespaces off `_manifests`, so a
+    /// namespace holding only in-progress uploads is absent from it; the blob
+    /// store's `_uploads`-keyed listing is merged so pending uploads surface.
+    async fn collect_namespaces(&self, scope: Option<&str>) -> Result<Vec<String>, Error> {
+        let mut namespaces = self.metadata_store.collect_namespaces(scope).await?;
+        namespaces.extend(self.blob_store.collect_upload_namespaces(scope).await?);
 
-        let mut matching_namespaces: Vec<String> = manifest_namespaces
-            .into_iter()
-            .chain(upload_namespaces)
-            .filter(|ns| namespace_belongs_to(ns, repository))
-            .collect();
-
-        matching_namespaces.sort_unstable();
-        matching_namespaces.dedup();
-        Ok(matching_namespaces)
+        namespaces.sort_unstable();
+        namespaces.dedup();
+        Ok(namespaces)
     }
 
     async fn read_manifest(&self, digest: &Digest) -> Option<Manifest> {
@@ -1158,5 +1170,34 @@ mod tests {
         assert_eq!(namespaces[0]["name"], "test-repo/upload-only");
         assert_eq!(namespaces[0]["manifest_count"], 0);
         assert_eq!(namespaces[0]["upload_count"], 1);
+    }
+
+    /// A single-repository listing walks only that repository's subtree, so
+    /// content under a different top-level prefix must not leak into it.
+    #[tokio::test]
+    async fn namespaces_info_is_scoped_to_the_requested_repository() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+
+            let kept = Namespace::new("test-repo/kept").unwrap();
+            create_test_blob(registry, &kept, b"kept content").await;
+
+            let other = Namespace::new("other-repo/hidden").unwrap();
+            create_test_blob(registry, &other, b"hidden content").await;
+
+            let response = registry.get_namespaces_info("test-repo").await.unwrap();
+            let names: Vec<&str> = response
+                .namespaces
+                .iter()
+                .map(|ns| ns.name.as_str())
+                .collect();
+
+            assert_eq!(
+                names,
+                ["test-repo/kept"],
+                "only the requested repository's namespaces must be listed; got: {names:?}"
+            );
+        })
+        .await;
     }
 }

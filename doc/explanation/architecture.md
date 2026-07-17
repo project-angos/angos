@@ -137,6 +137,8 @@ This can be disabled per object kind with `enable_blob_redirect = false` and/or 
 - Pre-signed URLs expire, so very slow downloads may fail
 - S3 bucket policies must allow access from client IP ranges
 
+A client that sends the `X-Angos-No-Redirect` request header is served the body inline regardless of the flags. The web UI sets it because a browser `fetch` cannot follow the cross-origin redirect to a pre-signed URL.
+
 ---
 
 ## Data Model

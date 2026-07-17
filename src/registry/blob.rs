@@ -351,6 +351,7 @@ impl Registry {
         digest: &Digest,
         mime_types: &[String],
         range: Option<BlobRange>,
+        allow_redirect: bool,
     ) -> Result<GetBlobResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
@@ -364,6 +365,7 @@ impl Registry {
 
         let repository_name = repository.name.to_string();
         let response = if range.is_none()
+            && allow_redirect
             && self.enable_blob_redirect
             && has_access
             && self.blob_store.size(digest).await.is_ok()

@@ -119,12 +119,21 @@ pub async fn handle_get_manifest(
     reference: Reference,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = RequestHeaders::new(&parts.headers).accepted_content_types();
+    let headers = RequestHeaders::new(&parts.headers);
+    let mime_types = headers.accepted_content_types();
+    let allow_redirect = !headers.redirect_suppressed();
     let is_tag_immutable = context.is_reference_immutable(namespace, &reference);
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .resolve_get_manifest(actor, namespace, reference, &mime_types, is_tag_immutable)
+        .resolve_get_manifest(
+            actor,
+            namespace,
+            reference,
+            &mime_types,
+            is_tag_immutable,
+            allow_redirect,
+        )
         .await?;
 
     match response {

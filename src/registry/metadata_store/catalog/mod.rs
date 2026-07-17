@@ -29,9 +29,24 @@ impl MetadataStore {
     ) -> Result<(Vec<String>, Option<String>), Error> {
         debug!("Fetching {n} namespace(s) with continuation token: {last:?}");
 
-        let namespaces = pagination::collect_namespaces_with_marker(
-            path_builder::repository_dir(),
+        let mut namespaces = self.collect_namespaces(None).await?;
+        namespaces.sort_unstable();
+
+        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+    }
+
+    /// Walks the manifest catalog in a single concurrent tree walk and returns
+    /// every namespace, unpaginated and unsorted. `scope` restricts the walk to
+    /// one repository's subtree; `None` walks the whole store.
+    #[instrument(skip(self))]
+    pub async fn collect_namespaces(&self, scope: Option<&str>) -> Result<Vec<String>, Error> {
+        let (root, prefix) = path_builder::namespace_walk_root(scope);
+
+        pagination::collect_namespaces_with_marker(
+            &root,
+            &prefix,
             "_manifests",
+            pagination::NAMESPACE_WALK_CONCURRENCY,
             |path, token| async move {
                 self.store()
                     .object_store()
@@ -40,9 +55,7 @@ impl MetadataStore {
                     .map_err(Error::from)
             },
         )
-        .await?;
-
-        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+        .await
     }
 
     #[instrument(skip(self))]

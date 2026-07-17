@@ -9,7 +9,11 @@ use hyper::{
 };
 
 use crate::{
-    command::server::{error::Error, request::RequestHeaders, response_body::ResponseBody},
+    command::server::{
+        error::Error,
+        request::{RequestHeaders, X_ANGOS_NO_REDIRECT},
+        response_body::ResponseBody,
+    },
     oci::MediaType,
     registry::BlobRange,
     registry_client::X_ANGOS_SOURCE_TIMESTAMP,
@@ -744,4 +748,47 @@ fn test_source_timestamp_future_is_clamped_to_now() {
         source_ts >= before && source_ts <= after,
         "a future source timestamp is clamped to ~now (got {source_ts}), not the future value"
     );
+}
+
+#[test]
+fn test_redirect_not_suppressed_without_header() {
+    let request = Request::builder().body(()).unwrap();
+    let (parts, ()) = request.into_parts();
+
+    assert!(
+        !RequestHeaders::new(&parts.headers).redirect_suppressed(),
+        "a request without the header keeps the redirect fast path (OCI clients)"
+    );
+}
+
+#[test]
+fn test_redirect_suppressed_for_truthy_values() {
+    for value in ["1", "true", "TRUE", "yes"] {
+        let request = Request::builder()
+            .header(X_ANGOS_NO_REDIRECT, value)
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+
+        assert!(
+            RequestHeaders::new(&parts.headers).redirect_suppressed(),
+            "'{value}' must suppress the redirect so the browser UI gets an inline body"
+        );
+    }
+}
+
+#[test]
+fn test_redirect_not_suppressed_for_falsey_values() {
+    for value in ["0", "false", "FALSE", ""] {
+        let request = Request::builder()
+            .header(X_ANGOS_NO_REDIRECT, value)
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+
+        assert!(
+            !RequestHeaders::new(&parts.headers).redirect_suppressed(),
+            "'{value}' must not suppress the redirect"
+        );
+    }
 }

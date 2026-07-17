@@ -28,6 +28,12 @@ static BEARER_SCHEME: &str = "Bearer";
 static BASIC_SCHEME: &str = "Basic";
 static QUALITY_PARAM: &str = "q";
 
+/// Set by the web UI to force an inline body instead of a presigned S3
+/// redirect: a browser `fetch` cannot follow the cross-origin redirect (the
+/// presigned URL carries no CORS headers) and loses `Docker-Content-Digest`.
+/// OCI clients never send it, so their redirect fast path is unaffected.
+pub const X_ANGOS_NO_REDIRECT: &str = "X-Angos-No-Redirect";
+
 #[derive(Clone, Debug)]
 pub struct RequestHeaders<'a> {
     headers: &'a HeaderMap,
@@ -101,6 +107,19 @@ impl<'a> RequestHeaders<'a> {
         }
 
         Ok(Some(content_length))
+    }
+
+    /// Whether the client asked to be served the body inline rather than a
+    /// presigned S3 redirect (see [`X_ANGOS_NO_REDIRECT`]). Any non-empty value
+    /// other than `0`/`false` disables the redirect.
+    pub fn redirect_suppressed(&self) -> bool {
+        let Some(value) = self.headers.get(X_ANGOS_NO_REDIRECT) else {
+            return false;
+        };
+        let value = value.to_str().unwrap_or("").trim();
+        !value.is_empty()
+            && !value.eq_ignore_ascii_case("0")
+            && !value.eq_ignore_ascii_case("false")
     }
 
     pub fn content_type(&self) -> Result<Option<MediaType>, Error> {

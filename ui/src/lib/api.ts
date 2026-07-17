@@ -232,7 +232,7 @@ export interface ManifestResult {
 export async function fetchManifest(namespace: string, reference: string): Promise<ManifestResult> {
 	try {
 		const response = await fetch(`/v2/${namespace}/manifests/${reference}`, {
-			headers: { 'Accept': MANIFEST_ACCEPT_HEADER }
+			headers: { 'Accept': MANIFEST_ACCEPT_HEADER, 'X-Angos-No-Redirect': '1' }
 		});
 		if (!response.ok) {
 			return { manifest: null, digest: null, error: `HTTP ${response.status}` };
@@ -255,7 +255,9 @@ export async function cancelUpload(namespace: string, uuid: string): Promise<str
 
 export async function downloadBlob(namespace: string, digest: string, filename: string | null): Promise<string | null> {
 	try {
-		const response = await fetch(`/v2/${namespace}/blobs/${digest}`);
+		const response = await fetch(`/v2/${namespace}/blobs/${digest}`, {
+			headers: { 'X-Angos-No-Redirect': '1' }
+		});
 		if (!response.ok) {
 			return `HTTP ${response.status}`;
 		}

@@ -259,9 +259,28 @@ impl BlobStore {
         n: u16,
         last: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        let namespaces = pagination::collect_namespaces_with_marker(
-            path_builder::repository_dir(),
+        let mut namespaces = self.collect_upload_namespaces(None).await?;
+        namespaces.sort_unstable();
+
+        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+    }
+
+    /// Walks the `_uploads`-keyed tree in a single concurrent walk and returns
+    /// every namespace with an upload session, unpaginated and unsorted. `scope`
+    /// restricts the walk to one repository's subtree; `None` walks the whole
+    /// store.
+    #[instrument(skip(self))]
+    pub async fn collect_upload_namespaces(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        let (root, prefix) = path_builder::namespace_walk_root(scope);
+
+        pagination::collect_namespaces_with_marker(
+            &root,
+            &prefix,
             "_uploads",
+            pagination::NAMESPACE_WALK_CONCURRENCY,
             |path, token| async move {
                 self.object
                     .list_children(&path, 1000, token, None)
@@ -269,9 +288,7 @@ impl BlobStore {
                     .map_err(Error::from)
             },
         )
-        .await?;
-
-        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+        .await
     }
 
     #[instrument(skip(self))]
