@@ -3,8 +3,9 @@
 //! Every object key is streamed, categorized by shape, and validated
 //! concurrently: derivable state is repaired, unreadable content is deleted,
 //! and keys matching no known angos layout are quarantined under the
-//! lost-and-found prefix. Scrub is purely structural; age-gated reclamation
-//! (upload sessions, orphan grants) belongs to `angos prune`.
+//! lost-and-found prefix (or deleted outright with `--delete-unknown`).
+//! Scrub is purely structural; age-gated reclamation (upload sessions,
+//! orphan grants) belongs to `angos prune`.
 
 use std::sync::Arc;
 
@@ -42,6 +43,10 @@ pub struct Options {
     #[argh(option, default = "default_concurrency()")]
     /// number of keys validated concurrently per walk pass
     pub concurrency: usize,
+    #[argh(switch)]
+    /// delete unrecognized keys outright instead of quarantining them under
+    /// the lost-and-found prefix
+    pub delete_unknown: bool,
 }
 
 pub struct Command {
@@ -51,6 +56,7 @@ pub struct Command {
     stats: Arc<WalkStats>,
     concurrency: usize,
     dry_run: bool,
+    delete_unknown: bool,
     /// Held so the end of the run can drain in-flight async webhook
     /// deliveries the delete actions triggered.
     registry: Option<Arc<Registry>>,
@@ -93,6 +99,7 @@ impl Command {
             metadata_store.clone(),
             sink,
             stats.clone(),
+            options.delete_unknown,
         ));
 
         Ok(Self {
@@ -102,6 +109,7 @@ impl Command {
             stats,
             concurrency: options.concurrency,
             dry_run: options.dry_run,
+            delete_unknown: options.delete_unknown,
             registry,
         })
     }
@@ -132,7 +140,10 @@ impl Command {
         if let Some(registry) = &self.registry {
             registry.shutdown().await;
         }
-        info!("scrub complete: {}", self.stats.summary());
+        info!(
+            "scrub complete: {}",
+            self.stats.summary(self.delete_unknown)
+        );
         Ok(())
     }
 
@@ -196,6 +207,7 @@ mod tests {
         Options {
             dry_run,
             concurrency,
+            delete_unknown: false,
         }
     }
 

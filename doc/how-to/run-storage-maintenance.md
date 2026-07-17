@@ -41,12 +41,15 @@ Scrub streams every key in both stores (blob and metadata), categorizes it by sh
 |---|---|---|
 | `--dry-run` | `-d` | Preview changes without applying them |
 | `--concurrency <N>` | | Keys validated concurrently per pass (default 8) |
+| `--delete-unknown` | | Delete unrecognized keys outright instead of quarantining them |
 
 ### The lost-and-found prefix
 
 A key that matches no known angos layout is **moved, not deleted**, to `_lost_and_found/<original key>` in the store it was found in. Inspect that prefix after a run; restore a key by moving it back, or delete the prefix once satisfied. Scrub never re-processes quarantined objects.
 
-Because scrub quarantines what it does not recognize, **run it from the same angos version as the server fleet**. After an upgrade, run `scrub -d` first and review the report.
+When the bytes are not worth keeping (a store polluted by a foreign writer, or a quarantine already reviewed), `scrub --delete-unknown` deletes unrecognized keys outright instead. The deletion is unrecoverable, so prefer a `scrub -d` preview first.
+
+Because scrub quarantines (or with `--delete-unknown`, deletes) what it does not recognize, **run it from the same angos version as the server fleet**. After an upgrade, run `scrub -d` first and review the report.
 
 ### Convergence
 

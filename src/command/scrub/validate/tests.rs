@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -28,12 +29,23 @@ async fn run_passes(
     metadata_store: &Arc<MetadataStore>,
     sink: Arc<dyn ActionSink>,
 ) -> Arc<WalkStats> {
+    run_passes_with(blob_store, metadata_store, sink, false).await
+}
+
+/// `run_passes` with the `--delete-unknown` disposition made explicit.
+async fn run_passes_with(
+    blob_store: &Arc<BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
+    sink: Arc<dyn ActionSink>,
+    delete_unknown: bool,
+) -> Arc<WalkStats> {
     let stats = Arc::new(WalkStats::default());
     let validator = Arc::new(Validator::new(
         blob_store.clone(),
         metadata_store.clone(),
         sink,
         stats.clone(),
+        delete_unknown,
     ));
 
     let meta_objects = metadata_store.store().object_store();
@@ -529,6 +541,59 @@ async fn unknown_keys_are_quarantined_in_both_stores() {
             actions.is_empty(),
             "quarantined keys must not be re-processed, got: {:?}",
             actions.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn delete_unknown_removes_aliens_without_quarantining() {
+    for_each_backend(async |test_case| {
+        let metadata_store = test_case.metadata_store();
+        let blob_store = test_case.blob_store();
+
+        let alien = "totally/alien/key";
+        metadata_store
+            .store()
+            .object_store()
+            .put(alien, Bytes::from_static(b"metadata alien"))
+            .await
+            .unwrap();
+        let blob_alien = "v2/blobs/sha256/aa/not-a-digest/data";
+        blob_store
+            .object_store()
+            .put(blob_alien, Bytes::from_static(b"blob alien"))
+            .await
+            .unwrap();
+
+        let sink: Arc<dyn ActionSink> = Arc::new(Executor::new_for_test(
+            blob_store.clone(),
+            metadata_store.clone(),
+        ));
+        let stats = run_passes_with(&blob_store, &metadata_store, sink, true).await;
+
+        // Both aliens are gone, counted, and nothing landed in quarantine.
+        let meta_objects = metadata_store.store().object_store();
+        assert!(meta_objects.get(alien).await.is_err());
+        assert!(
+            meta_objects
+                .get(&format!("{LOST_AND_FOUND_PREFIX}/{alien}"))
+                .await
+                .is_err(),
+            "a deleted unknown key must not be quarantined"
+        );
+        assert!(blob_store.object_store().get(blob_alien).await.is_err());
+        assert!(
+            blob_store
+                .object_store()
+                .get(&format!("{LOST_AND_FOUND_PREFIX}/{blob_alien}"))
+                .await
+                .is_err(),
+        );
+        assert_eq!(
+            stats.quarantined.load(Ordering::Relaxed),
+            2,
+            "deleted unknowns still count in the unknown-key tally"
         );
     })
     .await;

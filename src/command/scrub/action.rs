@@ -138,6 +138,13 @@ pub enum Action {
         store: WalkedStore,
         key: String,
     },
+    /// Delete a key matching no known angos layout outright, discarding its
+    /// bytes. Emitted instead of [`Action::QuarantineKey`] under
+    /// `scrub --delete-unknown`.
+    DeleteUnknownKey {
+        store: WalkedStore,
+        key: String,
+    },
     /// Delete an expected-shape object whose content is invalid (unparseable),
     /// so it can never be read successfully again.
     DeleteCorruptObject {
@@ -279,6 +286,9 @@ impl fmt::Display for Action {
             }
             Action::QuarantineKey { store, key } => {
                 write!(f, "quarantine unrecognized {store} key '{key}'")
+            }
+            Action::DeleteUnknownKey { store, key } => {
+                write!(f, "delete unrecognized {store} key '{key}'")
             }
             Action::DeleteCorruptObject { store, key } => {
                 write!(f, "delete corrupt {store} object '{key}'")

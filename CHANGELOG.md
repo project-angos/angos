@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - New `angos migrate` command rewrites pre-JSON bare-digest link files as JSON, converting registries seeded from a raw Docker `distribution` on-disk layout.
+- New `scrub --delete-unknown` flag deletes unrecognized keys outright instead of quarantining them under `_lost_and_found/`.
 
 ### Changed
 

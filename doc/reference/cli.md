@@ -75,7 +75,7 @@ Scrub streams every object key in both stores (blob and metadata), categorizes i
 - Removes tags whose target manifest blob is missing, revisions whose manifest blob is missing, orphan referrer entries, stale blob-index entries, and tag or namespace directories whose names violate the OCI grammar.
 - Deletes objects whose content is unreadable (a link, job record, or index shard that does not parse).
 - Reclaims blobs with no references (re-checked under the blob-data lock, so it is safe alongside a live server).
-- Moves any key that matches no known angos layout to `_lost_and_found/` in the same store, preserving its bytes for inspection. Emptying that prefix is the operator's job.
+- Moves any key that matches no known angos layout to `_lost_and_found/` in the same store, preserving its bytes for inspection. Emptying that prefix is the operator's job. With `--delete-unknown` such keys are deleted outright instead.
 - Runs the transaction engine's janitor sweeps (orphaned staging bodies, expired lock objects); serving processes no longer run periodic janitor loops.
 
 Scrub is purely structural: it takes no age thresholds and no configuration-relative decisions. Time-based reclamation and orphan-namespace clearing belong to [`angos prune`](#prune).
@@ -90,6 +90,7 @@ Because a repair can create new derivable state, a heavily damaged store may nee
 |-----------------------|--------|------------------------------------------------------------------------------|
 | `--dry-run`           | `-d`   | Preview what would be changed without applying anything                     |
 | `--concurrency <N>`   |        | Number of keys validated concurrently per pass (default 8)                  |
+| `--delete-unknown`    |        | Delete unrecognized keys outright instead of quarantining them              |
 
 **Examples:**
 
@@ -102,6 +103,9 @@ angos scrub
 
 # Faster walk on a large store
 angos scrub --concurrency 32
+
+# Discard unrecognized keys instead of keeping them under _lost_and_found/
+angos scrub --delete-unknown
 ```
 
 **Scheduling:**

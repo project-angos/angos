@@ -499,8 +499,9 @@ impl Executor {
         Ok(())
     }
 
-    /// Delete an expected-shape object whose content is unreadable garbage.
-    async fn delete_corrupt_object(&self, store: WalkedStore, key: String) -> Result<(), Error> {
+    /// Delete an exact walked key: an expected-shape object with unreadable
+    /// content, or an unrecognized key under `--delete-unknown`.
+    async fn delete_walked_key(&self, store: WalkedStore, key: String) -> Result<(), Error> {
         self.walked_object_store(store)
             .delete(&key)
             .await
@@ -594,9 +595,8 @@ impl ActionSink for Executor {
                 ..
             } => self.delete_orphan_job(queue, state, storage_key).await,
             Action::QuarantineKey { store, key } => self.quarantine_key(store, key).await,
-            Action::DeleteCorruptObject { store, key } => {
-                self.delete_corrupt_object(store, key).await
-            }
+            Action::DeleteCorruptObject { store, key }
+            | Action::DeleteUnknownKey { store, key } => self.delete_walked_key(store, key).await,
         }
     }
 }
@@ -1322,6 +1322,40 @@ mod tests {
                 .unwrap();
 
             assert!(blob_store.object_store().get(key).await.is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_key_removes_key_without_quarantining() {
+        for_each_backend(async |test_case| {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+
+            let key = "junk/unexpected-object";
+            let objects = metadata_store.store().object_store();
+            objects
+                .put(key, bytes::Bytes::from_static(b"alien"))
+                .await
+                .unwrap();
+
+            executor
+                .apply(Action::DeleteUnknownKey {
+                    store: WalkedStore::Metadata,
+                    key: key.to_string(),
+                })
+                .await
+                .unwrap();
+
+            assert!(objects.get(key).await.is_err(), "the key must be gone");
+            assert!(
+                objects
+                    .get(&format!("{LOST_AND_FOUND_PREFIX}/{key}"))
+                    .await
+                    .is_err(),
+                "a deleted unknown key must leave no quarantined copy"
+            );
         })
         .await;
     }

@@ -76,7 +76,8 @@ pub struct WalkStats {
     /// Repair or reclaim actions emitted (excluding quarantines and
     /// corrupt-object deletions, counted separately).
     pub repairs: AtomicU64,
-    /// Unknown keys quarantined under the lost-and-found prefix.
+    /// Unknown keys handled: quarantined under the lost-and-found prefix,
+    /// or deleted outright under `--delete-unknown`.
     pub quarantined: AtomicU64,
     /// Expected-shape objects deleted because their content was unreadable.
     pub corrupt: AtomicU64,
@@ -86,10 +87,16 @@ pub struct WalkStats {
 }
 
 impl WalkStats {
-    /// One-line run summary for the final log.
-    pub fn summary(&self) -> String {
+    /// One-line run summary for the final log. `unknown_deleted` picks the
+    /// unknown-key wording, matching what the run actually did with them.
+    pub fn summary(&self, unknown_deleted: bool) -> String {
+        let unknown_word = if unknown_deleted {
+            "unknown deleted"
+        } else {
+            "quarantined"
+        };
         format!(
-            "walked {} key(s): {} repair(s), {} quarantined, {} corrupt deleted, {} failure(s)",
+            "walked {} key(s): {} repair(s), {} {unknown_word}, {} corrupt deleted, {} failure(s)",
             self.keys.load(Ordering::Relaxed),
             self.repairs.load(Ordering::Relaxed),
             self.quarantined.load(Ordering::Relaxed),

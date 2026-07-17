@@ -54,6 +54,9 @@ pub struct Validator {
     pub metadata_store: Arc<MetadataStore>,
     pub sink: Arc<dyn ActionSink>,
     pub stats: Arc<WalkStats>,
+    /// Delete unrecognized keys outright instead of quarantining them
+    /// (`--delete-unknown`).
+    delete_unknown: bool,
     /// Names already handled by a once-per-container emission (invalid
     /// namespaces, orphan upload sessions), so the per-key walk does not
     /// repeat their prefix-level actions.
@@ -66,12 +69,14 @@ impl Validator {
         metadata_store: Arc<MetadataStore>,
         sink: Arc<dyn ActionSink>,
         stats: Arc<WalkStats>,
+        delete_unknown: bool,
     ) -> Self {
         Self {
             blob_store,
             metadata_store,
             sink,
             stats,
+            delete_unknown,
             handled: Mutex::new(HashSet::new()),
         }
     }
@@ -137,14 +142,22 @@ impl Validator {
         Ok(())
     }
 
-    /// Quarantine a key that matches no known layout.
+    /// Handle a key that matches no known layout: quarantined by default,
+    /// deleted outright under `--delete-unknown`. Either way it counts in
+    /// the run's unknown-key tally.
     async fn quarantine(&self, store: WalkedStore, key: &str) -> Result<(), Error> {
-        self.sink
-            .apply(Action::QuarantineKey {
+        let action = if self.delete_unknown {
+            Action::DeleteUnknownKey {
                 store,
                 key: key.to_string(),
-            })
-            .await?;
+            }
+        } else {
+            Action::QuarantineKey {
+                store,
+                key: key.to_string(),
+            }
+        };
+        self.sink.apply(action).await?;
         self.stats.quarantined.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
