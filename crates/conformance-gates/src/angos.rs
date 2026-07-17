@@ -28,6 +28,7 @@ enum RunnerMode {
     Docker {
         image: String,
         conformance_dir: PathBuf,
+        user: Option<String>,
     },
 }
 
@@ -44,6 +45,7 @@ impl AngosRunner {
             RunnerMode::Docker {
                 image,
                 conformance_dir,
+                user: env::var("GATE_DOCKER_USER").ok().filter(|u| !u.is_empty()),
             }
         } else if let Ok(bin) = env::var("GATE_ANGOS_BIN") {
             RunnerMode::Binary(bin)
@@ -116,10 +118,12 @@ impl AngosRunner {
             RunnerMode::Docker {
                 image,
                 conformance_dir,
+                user,
             } => {
                 let name = format!("gate-chaos-{round}");
                 let start = docker_run(
                     &["-d", "--name", &name],
+                    user.as_deref(),
                     &self.config,
                     conformance_dir,
                     image,
@@ -151,15 +155,25 @@ impl AngosRunner {
             RunnerMode::Docker {
                 image,
                 conformance_dir,
-            } => docker_run(&["--rm"], config, conformance_dir, image, args),
+                user,
+            } => docker_run(
+                &["--rm"],
+                user.as_deref(),
+                config,
+                conformance_dir,
+                image,
+                args,
+            ),
         }
     }
 }
 
-/// Build a `docker run` command: `head` flags (detached or `--rm`), then the
-/// config and conformance mounts, host networking, the image, and its args.
+/// Build a `docker run` command: `head` flags (detached or `--rm`), an
+/// optional `--user`, then the config and conformance mounts, host
+/// networking, the image, and its args.
 fn docker_run(
     head: &[&str],
+    user: Option<&str>,
     config: &str,
     conformance_dir: &Path,
     image: &str,
@@ -167,6 +181,9 @@ fn docker_run(
 ) -> Command {
     let mut cmd = docker_command(&["run"]);
     cmd.args(head);
+    if let Some(user) = user {
+        cmd.args(["--user", user]);
+    }
     cmd.args(["-e", "RUST_LOG=info"]);
     cmd.arg("-v").arg(format!("{config}:/config.toml"));
     cmd.arg("-v")

@@ -246,11 +246,13 @@ jobs:
 
           # Split-backend push scenario: put the blob and metadata stores on
           # distinct key spaces so a manifest stored in the wrong store (the
-          # cross-store isolation bug) is unreadable on pull-back. For S3 both
-          # stores move to fresh buckets, because the blob bucket must NOT be one
-          # a prior step seeded with the test image, or the content-addressed
-          # manifest blob would already be present and mask the bug. For FS each
-          # container's roots are ephemeral, so only the metadata root is moved.
+          # cross-store isolation bug) is unreadable on pull-back. BOTH stores
+          # move to fresh spaces (S3 buckets / FS roots): the blob space must
+          # NOT be one a prior step seeded, or the content-addressed manifest
+          # blob would already be present and mask the bug, and its pre-existing
+          # blobs would read as orphans under the fresh metadata store. The
+          # conformance backend's fs root is host-mounted and shared, so the fs
+          # blob root must move just like the S3 bucket does.
           # Only meaningful when the variant configures an explicit metadata
           # store; the "memory" variants inherit the blob store (single store).
           if grep -q '^\[metadata_store\.' /tmp/backend.toml; then
@@ -259,8 +261,9 @@ jobs:
                   -e '/^\[metadata_store\.s3\]$/,/^\[/ s/^bucket = .*/bucket = "registry-split-meta"/' \
                   /tmp/backend.toml > /tmp/backend-split.toml
             else
-              sed '/^\[metadata_store\.fs\]$/,/^\[/ s#^root_dir = .*#root_dir = "./conformance/metadata-split-data"#' \
-                /tmp/backend.toml > /tmp/backend-split.toml
+              sed -e '/^\[blob_store\.fs\]$/,/^\[/ s#^root_dir = .*#root_dir = "./conformance/blob-split-data"#' \
+                  -e '/^\[metadata_store\.fs\]$/,/^\[/ s#^root_dir = .*#root_dir = "./conformance/metadata-split-data"#' \
+                  /tmp/backend.toml > /tmp/backend-split.toml
             fi
             cat /tmp/backend-split.toml conformance/e2e/overlay-push.toml > /tmp/e2e-push-split.toml
 
@@ -282,7 +285,12 @@ jobs:
 
       - name: Start angos backend (${{ matrix.description }})
         run: |
-          docker run --rm -d \
+          # On an fs store, the host-side scrub-gates binary reads what this
+          # container writes, so both must run as the same uid or the reads
+          # hit EACCES. s3 stores go over HTTP and need no --user.
+          docker_user=""
+          if [[ "${{ matrix.s3 }}" != "true" ]]; then docker_user="--user $(id -u):$(id -g)"; fi
+          docker run --rm -d $docker_user \
             -v ./conformance/${{ matrix.config }}:/config.toml \
             -v "$PWD/conformance:/conformance" \
             --network host \
@@ -320,8 +328,13 @@ jobs:
 
           # Scrub races the live benchmark traffic: the classify-then-recheck
           # lock discipline must never reclaim or repair in-flight state, so
-          # even under load the walk must report all zeros.
-          docker run --rm \
+          # even under load the walk must report all zeros. Run as the store's
+          # owning uid on fs (see the backend step) so this run's tx-engine
+          # writes stay readable by the later host-side gate binary.
+          docker_user=""
+          if [[ "${{ matrix.s3 }}" != "true" ]]; then docker_user="--user $(id -u):$(id -g)"; fi
+          docker run --rm $docker_user \
+            -e RUST_LOG=info \
             -v ./conformance/${{ matrix.config }}:/config.toml \
             -v "$PWD/conformance:/conformance" \
             --network host \
@@ -343,10 +356,16 @@ jobs:
             export GATE_MODE=fs
             GATE_DATA_ROOT=$(grep -m1 'root_dir' "conformance/${{ matrix.config }}" | cut -d'"' -f2 | sed 's|^\./||')
             export GATE_DATA_ROOT
+            # The dockerized scrub/prune runs must write as the host binary's
+            # uid so their output stays readable by this same-store gate.
+            export GATE_DOCKER_USER="$(id -u):$(id -g)"
           fi
           export STATE_DIR="$RUNNER_TEMP/gate-state-${{ matrix.variant }}"
           mkdir -p "$STATE_DIR"
 
+          # Push synthetic images so the store clears the gate floors
+          # independently of how many manifests the conformance suite left.
+          ./scrub-gates populate
           ./scrub-gates healthy
           ./scrub-gates corruption
           ./scrub-gates chaos
@@ -394,7 +413,11 @@ jobs:
           # live on different backends (distinct bucket / on-disk root). A
           # manifest must be stored as a blob in the blob store, or the manifest
           # GET and pull-back below 404.
-          docker run -d --network host --name angos-push-split \
+          # On fs, this step plants aliens into and reads _lost_and_found from
+          # the store on the host, so the container must own it as this uid.
+          docker_user=""
+          if [[ "${{ matrix.s3 }}" != "true" ]]; then docker_user="--user $(id -u):$(id -g)"; fi
+          docker run -d $docker_user --network host --name angos-push-split \
             -v "/tmp/e2e-push-split.toml:/config.toml" \
             -v "$PWD/conformance:/conformance" \
             ${CONFORMANCE_IMAGE_NAME} server
@@ -423,7 +446,8 @@ jobs:
 
           # A split deployment is where a cross-store misclassification would
           # quarantine live data; the walk must find nothing to change.
-          docker run --rm \
+          docker run --rm $docker_user \
+            -e RUST_LOG=info \
             -v "/tmp/e2e-push-split.toml:/config.toml" \
             -v "$PWD/conformance:/conformance" \
             --network host \
@@ -448,7 +472,8 @@ jobs:
             printf 'meta alien' > "$meta_root/zz-split-alien/meta-side"
           fi
 
-          docker run --rm \
+          docker run --rm $docker_user \
+            -e RUST_LOG=info \
             -v "/tmp/e2e-push-split.toml:/config.toml" \
             -v "$PWD/conformance:/conformance" \
             --network host \

@@ -450,9 +450,9 @@ pub async fn chaos(ctx: &GateContext) -> GateResult<()> {
     Ok(())
 }
 
-/// Local bring-up helper: push enough synthetic images through the API to
-/// clear the healthy gate's walk and audit floors on a fresh store. CI
-/// populates through the conformance suite instead.
+/// Push enough synthetic images through the API to clear the gate walk and
+/// audit floors, independently of how many manifests the conformance suite
+/// happens to leave. Run before the gates locally and in CI.
 pub async fn populate(ctx: &GateContext, images: usize) -> GateResult<()> {
     for index in 0..images {
         let namespace = format!("conformance/pop-{index:02}");
