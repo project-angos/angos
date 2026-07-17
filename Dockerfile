@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.24
+# syntax=docker/dockerfile:1.25
 ARG LLVM_VERSION=20
 ARG RELEASE_MODE=""
 

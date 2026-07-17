@@ -20,7 +20,7 @@ jobs:
     steps:
     - name: Get app token
       id: app-token
-      uses: actions/create-github-app-token@v2
+      uses: actions/create-github-app-token@v3
       with:
         app-id: ${{ secrets.RENOVATE_APP_ID }}
         private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
@@ -28,7 +28,7 @@ jobs:
         repositories: angos
     - uses: actions/checkout@v7
     - name: Run Renovate
-      uses: renovatebot/github-action@v46.1.17
+      uses: renovatebot/github-action@v46.1.19
       with:
         configurationFile: .github/renovate-global.json5
         token: ${{ steps.app-token.outputs.token }}
