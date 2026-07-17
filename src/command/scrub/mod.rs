@@ -7,5 +7,5 @@ pub mod executor;
 pub mod validate;
 pub mod walk;
 
-pub use command::{Command, Options};
+pub use command::{Command, Options, default_concurrency};
 pub use error::Error;

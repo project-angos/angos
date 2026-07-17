@@ -133,7 +133,9 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         ))
     };
 
-    check::check_namespaces(&metadata_store, &checker, sink.as_ref()).await?;
+    // Sequential on purpose: reconciliation enqueues downstream work in
+    // listing order and has no per-namespace concurrency knob.
+    check::check_namespaces(&metadata_store, &checker, sink.as_ref(), 1).await?;
     if let Some(drain) = &drain {
         drain.drain().await;
     }

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tracing::{debug, error, info, warn};
 
 use angos_tx_engine::StorageError;
@@ -59,10 +59,12 @@ fn classify_upload(
 }
 
 /// Delete every upload session older than the window or with broken state.
+/// Sessions of one namespace are checked up to `concurrency` at a time.
 pub async fn sweep_upload_sessions(
     blob_store: &Arc<BlobStore>,
     window: Duration,
     sink: &dyn ActionSink,
+    concurrency: usize,
 ) -> Result<(), Error> {
     let mut namespaces = list_all::upload_namespaces(blob_store);
     while let Some(namespace) = namespaces.next().await {
@@ -71,13 +73,15 @@ pub async fn sweep_upload_sessions(
             // Invalid upload namespaces are scrub's concern.
             continue;
         };
-        let mut uploads = list_all::uploads(blob_store, &namespace);
-        while let Some(uuid) = uploads.next().await {
-            let uuid = uuid?;
-            if let Err(e) = sweep_one_upload(blob_store, &namespace, &uuid, window, sink).await {
-                error!("prune: failed to check upload '{namespace}/{uuid}': {e}");
-            }
-        }
+        let namespace = &namespace;
+        list_all::uploads(blob_store, namespace)
+            .try_for_each_concurrent(concurrency, |uuid| async move {
+                if let Err(e) = sweep_one_upload(blob_store, namespace, &uuid, window, sink).await {
+                    error!("prune: failed to check upload '{namespace}/{uuid}': {e}");
+                }
+                Ok(())
+            })
+            .await?;
     }
     Ok(())
 }
@@ -135,13 +139,14 @@ pub async fn sweep_byteless_shards(
     metadata_store: &Arc<MetadataStore>,
     window: Duration,
     sink: &dyn ActionSink,
+    concurrency: usize,
 ) -> Result<(), Error> {
     let now = Utc::now();
     let objects = metadata_store.store().object_store();
     walk::for_each_key(
         objects,
         path_builder::blobs_root_dir(),
-        1,
+        concurrency,
         |key| async move {
             let KeyCategory::BlobIndexShard { digest, namespace } = categorize(&key) else {
                 return;
@@ -309,7 +314,7 @@ mod tests {
             let executor = Executor::new_for_test(blob_store.clone(), test_case.metadata_store());
 
             // Zero window: the just-created upload is already past it.
-            sweep_upload_sessions(&blob_store, Duration::zero(), &executor)
+            sweep_upload_sessions(&blob_store, Duration::zero(), &executor, 4)
                 .await
                 .unwrap();
             assert!(
@@ -325,7 +330,7 @@ mod tests {
                 .create_upload(&namespace, &fresh_uuid)
                 .await
                 .unwrap();
-            sweep_upload_sessions(&blob_store, Duration::days(1), &executor)
+            sweep_upload_sessions(&blob_store, Duration::days(1), &executor, 4)
                 .await
                 .unwrap();
             assert!(
@@ -349,7 +354,7 @@ mod tests {
             blob_store.create_upload(&namespace, &uuid).await.unwrap();
 
             let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-            sweep_upload_sessions(&blob_store, Duration::zero(), &sink)
+            sweep_upload_sessions(&blob_store, Duration::zero(), &sink, 4)
                 .await
                 .unwrap();
 
@@ -458,9 +463,15 @@ mod tests {
 
             let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
-            sweep_byteless_shards(&blob_store, &metadata_store, Duration::days(1), &executor)
-                .await
-                .unwrap();
+            sweep_byteless_shards(
+                &blob_store,
+                &metadata_store,
+                Duration::days(1),
+                &executor,
+                4,
+            )
+            .await
+            .unwrap();
             assert!(
                 metadata_store
                     .read_blob_index_namespace(&namespace, &ghost)
@@ -469,7 +480,7 @@ mod tests {
                 "a byteless entry within the window must be kept"
             );
 
-            sweep_byteless_shards(&blob_store, &metadata_store, Duration::zero(), &executor)
+            sweep_byteless_shards(&blob_store, &metadata_store, Duration::zero(), &executor, 4)
                 .await
                 .unwrap();
             assert!(

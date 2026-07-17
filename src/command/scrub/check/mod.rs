@@ -7,7 +7,7 @@ pub mod list_all;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 use tracing::warn;
 
 use crate::{
@@ -26,27 +26,29 @@ pub trait NamespaceChecker: Send + Sync {
     async fn check(&self, namespace: &Namespace, sink: &dyn ActionSink) -> Result<(), Error>;
 }
 
-/// Walks every namespace and applies `checker` to each, skipping (with a
-/// warning) an enumerated name that fails validation and continuing past a
-/// failed check, since maintenance is best-effort.
+/// Walks every namespace and applies `checker` to up to `concurrency` of
+/// them at a time, skipping (with a warning) an enumerated name that fails
+/// validation and continuing past a failed check, since maintenance is
+/// best-effort. Only a listing failure aborts the walk.
 pub async fn check_namespaces(
     metadata_store: &Arc<MetadataStore>,
     checker: &dyn NamespaceChecker,
     sink: &dyn ActionSink,
+    concurrency: usize,
 ) -> Result<(), Error> {
-    let mut namespaces = list_all::namespaces(metadata_store);
-    while let Some(namespace) = namespaces.next().await {
-        let namespace = namespace?;
-        let namespace = match Namespace::new(&namespace) {
-            Ok(namespace) => namespace,
-            Err(e) => {
-                warn!("Skipping invalid enumerated namespace '{namespace}': {e}");
-                continue;
+    list_all::namespaces(metadata_store)
+        .try_for_each_concurrent(concurrency, |namespace| async move {
+            let namespace = match Namespace::new(&namespace) {
+                Ok(namespace) => namespace,
+                Err(e) => {
+                    warn!("Skipping invalid enumerated namespace '{namespace}': {e}");
+                    return Ok(());
+                }
+            };
+            if let Err(e) = checker.check(&namespace, sink).await {
+                warn!("Check failed for namespace '{namespace}': {e}");
             }
-        };
-        if let Err(e) = checker.check(&namespace, sink).await {
-            warn!("Check failed for namespace '{namespace}': {e}");
-        }
-    }
-    Ok(())
+            Ok(())
+        })
+        .await
 }

@@ -2,7 +2,7 @@ use std::{cmp::Reverse, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, future::join_all};
+use futures_util::{StreamExt, TryStreamExt, future::join_all};
 use tracing::{debug, error};
 
 use chrono::Duration;
@@ -171,27 +171,28 @@ pub async fn sweep_orphan_grants(
     global_policy: Option<&RetentionPolicy>,
     in_flight_window: Duration,
     sink: &dyn ActionSink,
+    concurrency: usize,
 ) -> Result<(), Error> {
     let now = Utc::now();
-    let mut blobs = list_all::blobs(blob_store);
-    while let Some(blob) = blobs.next().await {
-        let blob = blob?;
-        if let Err(e) = sweep_grants_for_blob(
-            blob_store,
-            metadata_store,
-            resolver,
-            global_policy,
-            &blob,
-            in_flight_window,
-            now,
-            sink,
-        )
+    list_all::blobs(blob_store)
+        .try_for_each_concurrent(concurrency, |blob| async move {
+            if let Err(e) = sweep_grants_for_blob(
+                blob_store,
+                metadata_store,
+                resolver,
+                global_policy,
+                &blob,
+                in_flight_window,
+                now,
+                sink,
+            )
+            .await
+            {
+                error!("prune: failed to check grants for blob {blob}: {e}");
+            }
+            Ok(())
+        })
         .await
-        {
-            error!("prune: failed to check grants for blob {blob}: {e}");
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1405,6 +1406,7 @@ mod tests {
                 None,
                 chrono::Duration::zero(),
                 &executor,
+                4,
             )
             .await
             .unwrap();
@@ -1437,6 +1439,7 @@ mod tests {
                 Some(&policy),
                 chrono::Duration::days(1),
                 &executor,
+                4,
             )
             .await
             .unwrap();
@@ -1456,6 +1459,7 @@ mod tests {
                 Some(&policy),
                 chrono::Duration::zero(),
                 &executor,
+                4,
             )
             .await
             .unwrap();
@@ -1488,6 +1492,7 @@ mod tests {
                 Some(&policy),
                 chrono::Duration::zero(),
                 &executor,
+                4,
             )
             .await
             .unwrap();

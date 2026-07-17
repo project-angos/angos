@@ -17,7 +17,7 @@ use crate::{
     command::{
         bootstrap,
         scrub::{
-            Error, check,
+            Error, check, default_concurrency,
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
         },
     },
@@ -45,6 +45,10 @@ pub struct Options {
     /// multiparts, grant-only blob ownership, and byteless blob-index entries
     /// older than this are removed (default 1h)
     pub uploads: HumanDuration,
+    #[argh(option, default = "default_concurrency()")]
+    /// number of namespaces, uploads, blobs, or shards checked concurrently
+    /// per sweep
+    pub concurrency: usize,
 }
 
 /// The registry-wide retention policy, or `None` when no global rules are
@@ -99,7 +103,13 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         )
     };
 
-    check::check_namespaces(&metadata_store, &checker, sink.as_ref()).await?;
+    check::check_namespaces(
+        &metadata_store,
+        &checker,
+        sink.as_ref(),
+        options.concurrency,
+    )
+    .await?;
 
     // Config-relative and window-gated reclamation. Ordering matters for the
     // first two: orphan-namespace clearing cascades the manifest links whose
@@ -113,7 +123,8 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             sink.as_ref(),
         )
         .await,
-        uploads::sweep_upload_sessions(&blob_backend, window, sink.as_ref()).await,
+        uploads::sweep_upload_sessions(&blob_backend, window, sink.as_ref(), options.concurrency)
+            .await,
         uploads::sweep_orphan_multiparts(blob_backend.as_ref(), window, sink.as_ref()).await,
         checker::sweep_orphan_grants(
             &blob_backend,
@@ -122,9 +133,17 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             global_policy.as_deref(),
             window,
             sink.as_ref(),
+            options.concurrency,
         )
         .await,
-        uploads::sweep_byteless_shards(&blob_backend, &metadata_store, window, sink.as_ref()).await,
+        uploads::sweep_byteless_shards(
+            &blob_backend,
+            &metadata_store,
+            window,
+            sink.as_ref(),
+            options.concurrency,
+        )
+        .await,
         orphan_jobs::sweep_orphan_jobs(
             &Arc::new(JobStore::new(metadata_store.store_arc(), "prune-orphans")),
             &repositories,
