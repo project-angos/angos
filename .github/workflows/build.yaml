@@ -104,6 +104,11 @@ jobs:
           curl -L -o zb https://github.com/project-zot/zot/releases/download/v2.1.15/zb-linux-amd64
           chmod +x zb
 
+      - name: Build scrub gates
+        run: |
+          cargo build -p conformance-gates
+          cp target/debug/scrub-gates .
+
       - name: Build the container
         run: |
           docker build -t ${CONFORMANCE_IMAGE_NAME} -f Dockerfile --build-arg RELEASE_MODE=release .
@@ -116,6 +121,7 @@ jobs:
           path: |
             oci-conformance
             zb
+            scrub-gates
             conformance-image.tar
           if-no-files-found: error
           retention-days: 1
@@ -179,7 +185,7 @@ jobs:
       - name: Load container image
         run: |
           docker load -i conformance-image.tar
-          chmod +x oci-conformance zb
+          chmod +x oci-conformance zb scrub-gates
 
       - name: Start backend services
         run: |
@@ -278,6 +284,7 @@ jobs:
         run: |
           docker run --rm -d \
             -v ./conformance/${{ matrix.config }}:/config.toml \
+            -v "$PWD/conformance:/conformance" \
             --network host \
             --name conformance-${{ matrix.variant }}-backend \
             ${CONFORMANCE_IMAGE_NAME} \
@@ -304,13 +311,56 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Run zot benchmark (${{ matrix.description }})
+      - name: Run zot benchmark with scrub under live load (${{ matrix.description }})
         run: |
           zb_workdir="$(mktemp -d "${RUNNER_TEMP}/zb-conformance-${{ matrix.variant }}.XXXXXX")"
-          time ./zb --working-dir "$zb_workdir" -c 5 -r conformance -n 100 http://localhost:8000
+          ./zb --working-dir "$zb_workdir" -c 5 -r conformance -n 100 http://localhost:8000 &
+          zb_pid=$!
+          sleep 2
+
+          # Scrub races the live benchmark traffic: the classify-then-recheck
+          # lock discipline must never reclaim or repair in-flight state, so
+          # even under load the walk must report all zeros.
+          docker run --rm \
+            -v ./conformance/${{ matrix.config }}:/config.toml \
+            -v "$PWD/conformance:/conformance" \
+            --network host \
+            ${CONFORMANCE_IMAGE_NAME} \
+            scrub 2>&1 | tee scrub-under-load.log
+          grep -E "scrub complete: walked [0-9]+ key\(s\): 0 repair\(s\), 0 quarantined, 0 corrupt deleted, 0 failure\(s\)" scrub-under-load.log
+          walked=$(grep -oE "walked [0-9]+" scrub-under-load.log | grep -oE "[0-9]+")
+          [ "$walked" -ge 50 ] || { echo "under-load walk saw only $walked keys; the listing is broken"; exit 1; }
+
+          wait "$zb_pid"
+
+      - name: Scrub gates (${{ matrix.description }})
+        run: |
+          export GATE_ANGOS_DOCKER_IMAGE=${CONFORMANCE_IMAGE_NAME}
+          export GATE_CONFIG="$PWD/conformance/${{ matrix.config }}"
+          if [[ "${{ matrix.s3 }}" == "true" ]]; then
+            export GATE_MODE=s3 GATE_ENDPOINT=http://127.0.0.1:9000 GATE_BUCKET=registry
+          else
+            export GATE_MODE=fs
+            GATE_DATA_ROOT=$(grep -m1 'root_dir' "conformance/${{ matrix.config }}" | cut -d'"' -f2 | sed 's|^\./||')
+            export GATE_DATA_ROOT
+          fi
+          export STATE_DIR="$RUNNER_TEMP/gate-state-${{ matrix.variant }}"
+          mkdir -p "$STATE_DIR"
+
+          ./scrub-gates healthy
+          ./scrub-gates corruption
+          ./scrub-gates chaos
 
           # Release port 8000 so the e2e scenarios can reuse the same backend.
           docker rm -f conformance-${{ matrix.variant }}-backend
+
+      - name: Upload scrub gate state (${{ matrix.description }})
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scrub-gate-state-${{ matrix.variant }}
+          path: ${{ runner.temp }}/gate-state-${{ matrix.variant }}
+          retention-days: 7
 
       - name: E2E - push and pull a Hub image
         run: |
@@ -346,6 +396,7 @@ jobs:
           # GET and pull-back below 404.
           docker run -d --network host --name angos-push-split \
             -v "/tmp/e2e-push-split.toml:/config.toml" \
+            -v "$PWD/conformance:/conformance" \
             ${CONFORMANCE_IMAGE_NAME} server
 
           for i in $(seq 1 30); do
@@ -369,6 +420,53 @@ jobs:
           docker pull -q localhost:8000/test/alpine:split
           docker run --rm localhost:8000/test/alpine:split /bin/true
           echo "split-backend push/pull round-trip OK"
+
+          # A split deployment is where a cross-store misclassification would
+          # quarantine live data; the walk must find nothing to change.
+          docker run --rm \
+            -v "/tmp/e2e-push-split.toml:/config.toml" \
+            -v "$PWD/conformance:/conformance" \
+            --network host \
+            ${CONFORMANCE_IMAGE_NAME} \
+            scrub --dry-run 2>&1 | tee scrub-split.log
+          grep -E "scrub complete: walked [0-9]+ key\(s\): 0 repair\(s\), 0 quarantined, 0 corrupt deleted, 0 failure\(s\)" scrub-split.log
+          walked=$(grep -oE "walked [0-9]+" scrub-split.log | grep -oE "[0-9]+")
+          [ "$walked" -ge 10 ] || { echo "split walk saw only $walked keys; the listing is broken"; exit 1; }
+
+          # Plant an alien key in EACH store and require the quarantine to land
+          # in the same store: the sharpest cross-store correctness proof.
+          if [[ "${{ matrix.s3 }}" == "true" ]]; then
+            s3() { AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=roottoor AWS_DEFAULT_REGION=us-east-1 \
+              aws --endpoint-url http://127.0.0.1:9000 "$@"; }
+            printf 'blob alien' | s3 s3 cp - s3://registry-split-blob/zz-split-alien/blob-side >/dev/null
+            printf 'meta alien' | s3 s3 cp - s3://registry-split-meta/zz-split-alien/meta-side >/dev/null
+          else
+            blob_root=$(grep -m1 'root_dir' /tmp/e2e-push-split.toml | cut -d'"' -f2 | sed 's|^\./||')
+            meta_root=$(grep -A2 'metadata_store' /tmp/e2e-push-split.toml | grep -m1 'root_dir' | cut -d'"' -f2 | sed 's|^\./||')
+            mkdir -p "$blob_root/zz-split-alien" "$meta_root/zz-split-alien"
+            printf 'blob alien' > "$blob_root/zz-split-alien/blob-side"
+            printf 'meta alien' > "$meta_root/zz-split-alien/meta-side"
+          fi
+
+          docker run --rm \
+            -v "/tmp/e2e-push-split.toml:/config.toml" \
+            -v "$PWD/conformance:/conformance" \
+            --network host \
+            ${CONFORMANCE_IMAGE_NAME} \
+            scrub
+
+          if [[ "${{ matrix.s3 }}" == "true" ]]; then
+            [ "$(s3 s3 cp s3://registry-split-blob/_lost_and_found/zz-split-alien/blob-side - 2>/dev/null)" = "blob alien" ] \
+              || { echo "blob-store alien not quarantined in the blob store"; exit 1; }
+            [ "$(s3 s3 cp s3://registry-split-meta/_lost_and_found/zz-split-alien/meta-side - 2>/dev/null)" = "meta alien" ] \
+              || { echo "metadata-store alien not quarantined in the metadata store"; exit 1; }
+          else
+            [ "$(cat "$blob_root/_lost_and_found/zz-split-alien/blob-side" 2>/dev/null)" = "blob alien" ] \
+              || { echo "blob-store alien not quarantined in the blob store"; exit 1; }
+            [ "$(cat "$meta_root/_lost_and_found/zz-split-alien/meta-side" 2>/dev/null)" = "meta alien" ] \
+              || { echo "metadata-store alien not quarantined in the metadata store"; exit 1; }
+          fi
+          echo "cross-store quarantine landed in the correct stores"
 
           docker rm -f angos-push-split
 

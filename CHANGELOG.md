@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - The transaction engine's body janitor never actually reclaimed orphaned `.tx-bodies/` staging: it mishandled the listing's relative names and always concluded there was nothing to delete.
+- On the filesystem backend, deleting a single object sometimes left its now-empty parent directories behind, and directory-based listings served them back (a deleted tag kept appearing in the tag list).
 
 ### Removed
 
