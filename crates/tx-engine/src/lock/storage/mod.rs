@@ -28,6 +28,10 @@ use uuid::Uuid;
 
 use crate::lock::Error;
 
+/// Prefix of the shared lock objects (`<shard>/<key>` below it).
+/// Engine-owned; the `LockJanitor` reclaims expired ones.
+pub const LOCK_OBJECTS_PREFIX: &str = ".tx-locks";
+
 /// Serialized body of a lock object stored at `.tx-locks/<shard>/<key>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockBody {

@@ -6,6 +6,29 @@ use crate::{
     registry::metadata_store::LinkKind,
 };
 
+/// Root prefix that quarantined keys are moved under, preserving their
+/// original path below it. A known category to the walk, so quarantined
+/// objects are never re-processed; emptying it is the operator's job.
+pub const LOST_AND_FOUND_PREFIX: &str = "_lost_and_found";
+
+/// Which physical object store a walked key was found in. The blob and
+/// metadata stores may be distinct buckets/roots, so a raw-key action must
+/// name the store it targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkedStore {
+    Blob,
+    Metadata,
+}
+
+impl fmt::Display for WalkedStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WalkedStore::Blob => write!(f, "blob store"),
+            WalkedStore::Metadata => write!(f, "metadata store"),
+        }
+    }
+}
+
 /// A single mutation that a scrub checker has decided to perform.
 ///
 /// Checkers produce `Action` values via their `ActionSink`; the `Executor`
@@ -108,6 +131,25 @@ pub enum Action {
         state: JobState,
         storage_key: String,
         reason: String,
+    },
+    /// Move a key matching no known angos layout to the lost-and-found prefix
+    /// of the store it was found in, preserving its bytes for inspection.
+    QuarantineKey {
+        store: WalkedStore,
+        key: String,
+    },
+    /// Delete a key matching no known angos layout outright, discarding its
+    /// bytes. Emitted instead of [`Action::QuarantineKey`] under
+    /// `scrub --delete-unknown`.
+    DeleteUnknownKey {
+        store: WalkedStore,
+        key: String,
+    },
+    /// Delete an expected-shape object whose content is invalid (unparseable),
+    /// so it can never be read successfully again.
+    DeleteCorruptObject {
+        store: WalkedStore,
+        key: String,
     },
 }
 
@@ -241,6 +283,15 @@ impl fmt::Display for Action {
                     f,
                     "delete the {partition} {queue} job '{storage_key}' because {reason}"
                 )
+            }
+            Action::QuarantineKey { store, key } => {
+                write!(f, "quarantine unrecognized {store} key '{key}'")
+            }
+            Action::DeleteUnknownKey { store, key } => {
+                write!(f, "delete unrecognized {store} key '{key}'")
+            }
+            Action::DeleteCorruptObject { store, key } => {
+                write!(f, "delete corrupt {store} object '{key}'")
             }
         }
     }

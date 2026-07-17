@@ -535,17 +535,9 @@ Listing all namespaces (`_catalog` / `list_namespaces`) is derived directly from
 
 This makes the catalog **deterministic and strongly consistent**: a namespace appears the instant its first revision or tag is written and disappears the instant the last one is deleted. There is no namespace "registration" concept, no eventually-consistent index to converge, and no scrub step involved.
 
-#### Legacy Blob Index Migration
+#### Legacy Layouts
 
-The per-blob `index.json` file written by Angos prior to v1.1.0 can be encountered after upgrade. It continues to work at runtime without any migration step.
-
-Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present for a digest the runtime updates it in place (the legacy file stays the source of truth for that blob until scrub moves it), and only when no legacy file is present does a write create or update a sharded entry under `refs/{namespace}.json`. This is decided per blob, so different blobs in the same deployment can sit in different states.
-
-`angos scrub` is the only thing that actively rewrites legacy data into the sharded layout:
-
-- `angos scrub --blobs` rewrites each legacy `v2/blobs/{algorithm}/{hash_prefix}/{hash}/index.json` into per-namespace shards under `refs/{namespace}.json` and deletes the legacy file once the shards are written.
-
-The migration is idempotent: re-running scrub is safe and is a no-op for data that is already in the sharded layout.
+Blob references live only in the sharded `refs/{namespace}.json` layout; the pre-1.2.0 single-file `index.json` is no longer read (see the [upgrade guide](../how-to/upgrade.md) for the required pre-upgrade migration).
 
 Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written; the catalog is now derived directly from stored content. These objects become unused after upgrade and can be left in place or deleted manually; no migration step is required.
 
@@ -559,11 +551,10 @@ The write path adds entries on push and removes them on successful delete.
 Mid-flight failures or out-of-band edits can leave stale entries pointing to
 namespaces that no longer exist.
 
-Periodic `angos scrub -b` reconciles every blob-index entry against
+Periodic `angos scrub` reconciles every blob-index entry against
 `MetadataStore::read_link`. Entries that fail the probe are removed, and a
-shard whose entries all disappear is itself deleted. The empty `refs/`
-directory is pruned too. This convergence only runs when `-b` is part of the
-invocation; omitting it means stale shards accumulate indefinitely.
+shard whose entries all disappear is itself deleted. This convergence is part
+of every scrub run.
 
 Blob ownership markers (`LinkKind::Blob`) are intentionally retained until the
 client issues an explicit `DELETE /v2/<name>/blobs/<digest>`. They are not

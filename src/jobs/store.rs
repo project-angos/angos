@@ -48,7 +48,7 @@ use crate::{
 
 // Storage layout of the durable queues.
 
-const JOBS_ROOT: &str = "_jobs";
+pub const JOBS_ROOT: &str = "_jobs";
 
 fn job_pending_dir(queue: &str) -> String {
     format!("{JOBS_ROOT}/pending/{queue}")

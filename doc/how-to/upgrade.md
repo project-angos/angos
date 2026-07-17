@@ -353,6 +353,36 @@ A `put-manifest` action now exposes `request.digest` and `request.tags` to CEL a
 
 Rewrite any rule that matched a push on `request.reference` to use `request.digest` and/or `request.tags`, for example `has(request.digest)` for a by-digest push or `'latest' in request.tags` to match a created tag.
 
+### Scrub and Prune Rework (Breaking Change)
+
+#### What Changed
+
+The maintenance commands were redesigned around a structure-vs-config split:
+
+- `angos scrub` is now a single concurrent walk that always runs every structural check. **All selection flags are removed** (`--tags`, `--manifests`, `--blobs`, `--links`, `--reconcile-blob-index`, `--referrers`, `--uploads`, `--multipart`, `--orphan-grants`, `--orphan-namespaces`, `--replication-orphans`, `--cache-orphans`, and the deprecated `--retention`/`--replicate`); an invocation still passing one **fails to start**. Scrub deletes objects with unreadable content, moves keys matching no known angos layout to a `_lost_and_found/` prefix, and runs the transaction engine's janitor sweeps, which no longer run as background loops in the server and worker.
+- `angos prune` now owns configuration-relative and time-based reclamation. **Orphan-namespace clearing and the orphan-job sweep always run**, and a single `-u/--uploads` window (default `1h`) gates upload sessions, orphan S3 multiparts, and byteless blob-index entries. Grant-only blob ownership is decided by the retention policies.
+
+**Who is affected:** Every deployment with scheduled maintenance: cron jobs, systemd timers, Kubernetes CronJobs, and Compose profiles invoking scrub or prune with flags. Also any deployment that edits `[repository]` config: prune now clears namespaces no configured repository owns, without a flag.
+
+#### Migration
+
+Update every scheduled invocation before upgrading the maintenance schedule:
+
+| Old invocation | Replacement |
+| --- | --- |
+| `scrub --tags --manifests --blobs` (any combination of check flags) | `scrub` |
+| `scrub --uploads 1h` / `scrub --multipart 24h` | `prune` (default window `1h`) or `prune -u <dur>` |
+| `scrub --orphan-grants 24h` | add a time-based retention rule, e.g. `image.pushed_at > now() - days(1)` |
+| `scrub --orphan-namespaces` | `prune` (always on) |
+| `scrub --replication-orphans` / `scrub --cache-orphans` | `prune` (always on) |
+| `scrub --retention` / `scrub --replicate` | `angos prune` / `angos replicate` |
+
+Then, on the upgraded version:
+
+1. Run `angos scrub --dry-run` first and review the report, especially what would be quarantined; run scrub from the same angos version as the server fleet.
+2. Run `angos prune --dry-run` and confirm the orphan-namespace deletions only cover namespaces you intend to drop; every namespace whose owning `[repository]` is no longer configured is now cleared by a plain `prune`.
+3. Schedule both commands periodically: scrub also reclaims the transaction engine's garbage (orphaned staging bodies, expired lock objects), which serving processes no longer sweep on their own.
+
 ### Removed Configuration Keys (Breaking Change)
 
 #### What Changed

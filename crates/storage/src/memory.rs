@@ -1,6 +1,7 @@
 //! In-process memory-backed [`ObjectStore`] and [`ConditionalStore`].
 //!
-//! Stores objects in a `HashMap<String, (Bytes, Etag)>` guarded by a `Mutex`.
+//! Stores objects in a `HashMap<String, (Bytes, Etag, DateTime<Utc>)>` (body,
+//! fingerprint, write time) guarded by a `Mutex`.
 //! Every write generates a fresh monotonic etag so the store can also serve
 //! as a [`ConditionalStore`] for CAS-based testing.
 //!
@@ -25,6 +26,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 
 use crate::{
@@ -34,7 +36,7 @@ use crate::{
 
 /// Inner shared state.
 struct Inner {
-    data: HashMap<String, (Bytes, Etag)>,
+    data: HashMap<String, (Bytes, Etag, DateTime<Utc>)>,
 }
 
 impl Inner {
@@ -97,6 +99,22 @@ impl MemoryObjectStore {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         Etag::new(format!("\"{n}\""))
     }
+
+    /// Rewrite `key`'s stored write time, so age-gated logic (janitors,
+    /// reclamation windows) can be exercised without waiting. Test fixture
+    /// only, like the store itself.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] when `key` holds no object.
+    pub fn backdate(&self, key: &str, last_modified: DateTime<Utc>) -> Result<(), Error> {
+        match self.lock().data.get_mut(key) {
+            Some(entry) => {
+                entry.2 = last_modified;
+                Ok(())
+            }
+            None => Err(Error::NotFound),
+        }
+    }
 }
 
 impl Default for MemoryObjectStore {
@@ -111,7 +129,7 @@ impl ObjectStore for MemoryObjectStore {
         self.lock()
             .data
             .get(key)
-            .map(|(b, _)| b.to_vec())
+            .map(|(b, _, _)| b.to_vec())
             .ok_or(Error::NotFound)
     }
 
@@ -124,7 +142,7 @@ impl ObjectStore for MemoryObjectStore {
             .lock()
             .data
             .get(key)
-            .map(|(b, _)| b.clone())
+            .map(|(b, _, _)| b.clone())
             .ok_or(Error::NotFound)?;
 
         let total = bytes.len() as u64;
@@ -136,7 +154,9 @@ impl ObjectStore for MemoryObjectStore {
 
     async fn put(&self, key: &str, data: Bytes) -> Result<(), Error> {
         let etag = self.next_etag();
-        self.lock().data.insert(key.to_string(), (data, etag));
+        self.lock()
+            .data
+            .insert(key.to_string(), (data, etag, Utc::now()));
         Ok(())
     }
 
@@ -166,10 +186,10 @@ impl ObjectStore for MemoryObjectStore {
         self.lock()
             .data
             .get(key)
-            .map(|(b, e)| ObjectMeta {
+            .map(|(b, e, t)| ObjectMeta {
                 size: b.len() as u64,
                 etag: Some(e.clone()),
-                last_modified: None,
+                last_modified: Some(*t),
             })
             .ok_or(Error::NotFound)
     }
@@ -186,8 +206,10 @@ impl ObjectStore for MemoryObjectStore {
         // Normalise the separator: if the prefix does not end with '/', strip the
         // leading '/' from each suffix so callers get a clean relative name
         // (matching the FS backend, which returns paths relative to the
-        // prefix-directory without a leading separator).
-        let sep_len = usize::from(!prefix.ends_with('/'));
+        // prefix-directory without a leading separator). An empty prefix lists
+        // the whole store and every key is already relative to the root.
+        let at_boundary = prefix.is_empty() || prefix.ends_with('/');
+        let sep_len = usize::from(!at_boundary);
 
         // Collect and sort all keys matching the prefix, then paginate.
         let mut keys: Vec<String> = guard
@@ -196,7 +218,7 @@ impl ObjectStore for MemoryObjectStore {
             .filter(|k| {
                 k.starts_with(prefix)
                     && k.len() > prefix.len()
-                    && (prefix.ends_with('/') || k.as_bytes().get(prefix.len()) == Some(&b'/'))
+                    && (at_boundary || k.as_bytes().get(prefix.len()) == Some(&b'/'))
             })
             // Strip the prefix (and separator) so the result contains only the
             // suffix (filename), matching the FS backend's convention.
@@ -313,12 +335,12 @@ impl ObjectStore for MemoryObjectStore {
             .lock()
             .data
             .get(source)
-            .map(|(b, _)| b.clone())
+            .map(|(b, _, _)| b.clone())
             .ok_or(Error::NotFound)?;
         let etag = self.next_etag();
         self.lock()
             .data
-            .insert(destination.to_string(), (bytes, etag));
+            .insert(destination.to_string(), (bytes, etag, Utc::now()));
         Ok(())
     }
 
@@ -384,7 +406,7 @@ impl ConditionalStore for MemoryObjectStore {
         self.lock()
             .data
             .get(key)
-            .map(|(b, e)| (b.to_vec(), Some(e.clone())))
+            .map(|(b, e, _)| (b.to_vec(), Some(e.clone())))
             .ok_or(Error::NotFound)
     }
 
@@ -394,7 +416,9 @@ impl ConditionalStore for MemoryObjectStore {
         if guard.data.contains_key(key) {
             return Err(Error::PreconditionFailed);
         }
-        guard.data.insert(key.to_string(), (data, etag.clone()));
+        guard
+            .data
+            .insert(key.to_string(), (data, etag.clone(), Utc::now()));
         Ok(Some(etag))
     }
 
@@ -407,8 +431,10 @@ impl ConditionalStore for MemoryObjectStore {
         let new_etag = self.next_etag();
         let mut guard = self.lock();
         match guard.data.get(key) {
-            Some((_, current)) if current == etag => {
-                guard.data.insert(key.to_string(), (data, new_etag.clone()));
+            Some((_, current, _)) if current == etag => {
+                guard
+                    .data
+                    .insert(key.to_string(), (data, new_etag.clone(), Utc::now()));
                 Ok(Some(new_etag))
             }
             Some(_) | None => Err(Error::PreconditionFailed),
@@ -418,7 +444,7 @@ impl ConditionalStore for MemoryObjectStore {
     async fn delete_if_match(&self, key: &str, etag: &Etag) -> Result<(), Error> {
         let mut guard = self.lock();
         match guard.data.get(key) {
-            Some((_, current)) if current == etag => {
+            Some((_, current, _)) if current == etag => {
                 guard.data.remove(key);
                 Ok(())
             }

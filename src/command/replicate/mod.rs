@@ -112,7 +112,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
     let checker = ReplicationChecker::new(metadata_store.clone(), repositories.clone());
 
     let mut drain = None;
-    let mut sink: Box<dyn ActionSink + Send> = if options.dry_run {
+    let sink: Box<dyn ActionSink> = if options.dry_run {
         info!("Dry-run mode: no changes will be made to the storage");
         Box::new(DryRunSink)
     } else {
@@ -133,7 +133,9 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         ))
     };
 
-    check::check_namespaces(&metadata_store, &checker, sink.as_mut()).await?;
+    // Sequential on purpose: reconciliation enqueues downstream work in
+    // listing order and has no per-namespace concurrency knob.
+    check::check_namespaces(&metadata_store, &checker, sink.as_ref(), 1).await?;
     if let Some(drain) = &drain {
         drain.drain().await;
     }

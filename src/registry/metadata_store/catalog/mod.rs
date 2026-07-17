@@ -69,10 +69,10 @@ impl MetadataStore {
     }
 
     /// Lists the RAW tag directory names in `namespace` with NO `Tag`
-    /// validation. Scrub enumerates these so it can detect (and delete)
-    /// directories whose names do not satisfy the `oci::Tag` grammar, which
-    /// [`Self::list_tags`] silently drops.
-    #[instrument(skip(self))]
+    /// validation, so tests can observe directories whose names do not
+    /// satisfy the `oci::Tag` grammar, which [`Self::list_tags`] silently
+    /// drops (production code walks raw keys through scrub's categorizer).
+    #[cfg(test)]
     pub async fn list_tag_names(
         &self,
         namespace: &Namespace,

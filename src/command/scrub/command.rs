@@ -1,249 +1,183 @@
+//! The `scrub` command: a single categorizing walk over both stores.
+//!
+//! Every object key is streamed, categorized by shape, and validated
+//! concurrently: derivable state is repaired, unreadable content is deleted,
+//! and keys matching no known angos layout are quarantined under the
+//! lost-and-found prefix (or deleted outright with `--delete-unknown`).
+//! Scrub is purely structural; age-gated reclamation (upload sessions,
+//! orphan grants) belongs to `angos prune`.
+
 use std::sync::Arc;
 
 use argh::FromArgs;
-use futures_util::StreamExt;
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::{
     command::{
         bootstrap,
         scrub::{
-            action::Action,
-            check::{NamespaceChecker, TagChecker, list_all},
             error::Error,
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
-            setup::{self, LabeledStoreCheckers},
+            validate::{Pass, Validator},
+            walk::{self, WalkStats},
         },
     },
     configuration::Configuration,
-    oci::{Namespace, Tag},
-    registry::{Registry, metadata_store::MetadataStore},
+    registry::{Registry, blob_store::BlobStore, metadata_store::MetadataStore, path_builder},
 };
 
-#[derive(FromArgs, PartialEq, Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
+/// Default per-pass concurrency, shared by the scrub walk and the prune
+/// sweeps.
+pub fn default_concurrency() -> usize {
+    25
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
 #[argh(
     subcommand,
     name = "scrub",
-    description = "Check the storage backend for inconsistencies"
+    description = "Walk the store, repair inconsistencies, and quarantine unrecognized objects"
 )]
 pub struct Options {
     #[argh(switch, short = 'd')]
     /// display only, no actual changes applied
     pub dry_run: bool,
-    #[argh(option, short = 'u')]
-    /// check for obsolete uploads with specified timeout
-    pub uploads: Option<humantime::Duration>,
-    #[argh(option, short = 'p')]
-    /// abort orphan S3 multipart uploads older than the specified timeout
-    pub multipart: Option<humantime::Duration>,
-    #[argh(switch, short = 't')]
-    /// check for invalid tag digests
-    pub tags: bool,
-    #[argh(switch, short = 'm')]
-    /// check for manifests inconsistencies
-    pub manifests: bool,
-    #[argh(switch, short = 'b')]
-    /// check for blob inconsistencies
-    pub blobs: bool,
-    #[argh(switch, short = 'l')]
-    /// fix links format inconsistencies
-    pub links: bool,
+    #[argh(option, default = "default_concurrency()")]
+    /// number of keys validated concurrently per walk pass
+    pub concurrency: usize,
     #[argh(switch)]
-    /// rebuild blob-index entries missing relative to the manifests that
-    /// reference each blob (repairs an index corrupted out-of-band, e.g. storage
-    /// corruption or manual tampering); reads every manifest, so it is expensive
-    pub reconcile_blob_index: bool,
-    #[argh(switch, short = 'R')]
-    /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
-    pub referrers: bool,
-    #[argh(switch)]
-    /// delete replication jobs (pending and dead-lettered) whose downstream or
-    /// repository is no longer configured
-    pub replication_orphans: bool,
-    #[argh(switch)]
-    /// delete cache jobs (pending and dead-lettered) whose repository is no
-    /// longer configured for pull-through
-    pub cache_orphans: bool,
-    #[argh(switch, short = 'n')]
-    /// delete all content for namespaces not owned by any configured repository;
-    /// destructive (run --dry-run first); ignored when no repositories configured
-    pub orphan_namespaces: bool,
-    #[argh(option)]
-    /// revoke orphaned blob-ownership grants older than the specified age: a
-    /// blob a namespace owns but no manifest references (e.g. a replication push
-    /// that lost last-writer-wins), reclaiming the bytes when it was the last
-    /// reference
-    pub orphan_grants: Option<humantime::Duration>,
+    /// delete unrecognized keys outright instead of quarantining them under
+    /// the lost-and-found prefix
+    pub delete_unknown: bool,
 }
 
 pub struct Command {
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
-    namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
-    /// Per-tag checkers driven by the tag walk in `scrub_metadata`, run before
-    /// the namespace checkers so the invalid-tag gate and per-tag checks precede
-    /// the aggregate tag checks. `None` when `--tags` is absent.
-    tag_checkers: Option<Vec<Box<dyn TagChecker>>>,
-    /// Store-wide checkers (blobs, orphan grants/namespaces/jobs, multipart),
-    /// each paired with a stable label for failure attribution, pre-ordered by
-    /// [`setup::store_checkers`] and applied in one pass.
-    store_checkers: LabeledStoreCheckers,
-    sink: Box<dyn ActionSink + Send>,
-    /// Registry the `--orphan-namespaces` tag deletions run through; held so the
-    /// end of the run can drain in-flight async webhook deliveries.
+    validator: Arc<Validator>,
+    stats: Arc<WalkStats>,
+    concurrency: usize,
+    dry_run: bool,
+    delete_unknown: bool,
+    /// Held so the end of the run can drain in-flight async webhook
+    /// deliveries the delete actions triggered.
     registry: Option<Arc<Registry>>,
 }
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let bootstrap::MaintenanceContext {
-            blob_store: blob_backend,
+            blob_store,
             metadata_store,
             repositories,
         } = bootstrap::maintenance_context(config).await?;
 
-        let namespace_checkers =
-            setup::namespace_checkers(options, &blob_backend, &metadata_store)?;
-        let tag_checkers = setup::tag_checkers(options, &blob_backend, &metadata_store);
-        let store_checkers =
-            setup::store_checkers(options, &blob_backend, &metadata_store, &repositories)?;
-
-        let mut registry: Option<Arc<Registry>> = None;
-        let sink: Box<dyn ActionSink + Send> = if options.dry_run {
+        let mut registry = None;
+        let sink: Arc<dyn ActionSink> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
-            Box::new(DryRunSink)
+            Arc::new(DryRunSink)
         } else {
             let job_store = run_job_store(&metadata_store, "scrub");
-            let mut executor = Executor::new(
-                blob_backend.clone(),
+            // Tag and manifest deletions go through the registry's standard
+            // delete path (locking, blob reclaim, events, replication), so
+            // scrub always wires one.
+            let scrub_registry = bootstrap::registry(
+                config,
+                blob_store.clone(),
                 metadata_store.clone(),
+                repositories.clone(),
                 job_store.clone(),
-            );
-            // `--orphan-namespaces` deletes dangling tags through the registry,
-            // like `angos prune`, so wire one when that checker is enabled.
-            if options.orphan_namespaces {
-                let orphan_registry = bootstrap::registry(
-                    config,
-                    blob_backend.clone(),
-                    metadata_store.clone(),
-                    repositories.clone(),
-                    job_store,
-                )?;
-                registry = Some(orphan_registry.clone());
-                executor = executor.with_registry(orphan_registry);
-            }
-            Box::new(executor)
+            )?;
+            registry = Some(scrub_registry.clone());
+            Arc::new(
+                Executor::new(blob_store.clone(), metadata_store.clone(), job_store)
+                    .with_registry(scrub_registry),
+            )
         };
 
-        Ok(Self {
-            metadata_store,
-            namespace_checkers,
-            tag_checkers,
-            store_checkers,
+        let stats = Arc::new(WalkStats::default());
+        let validator = Arc::new(Validator::new(
+            blob_store.clone(),
+            metadata_store.clone(),
             sink,
+            stats.clone(),
+            options.delete_unknown,
+        ));
+
+        Ok(Self {
+            blob_store,
+            metadata_store,
+            validator,
+            stats,
+            concurrency: options.concurrency,
+            dry_run: options.dry_run,
+            delete_unknown: options.delete_unknown,
             registry,
         })
     }
 
+    /// The three passes, each internally concurrent. Ordering matters: links
+    /// are healed and grants reconciled before shard entries are pruned
+    /// against them, and the index is healed before blob GC reads it. A
+    /// listing failure aborts the run, since the later passes' deletions rely
+    /// on the earlier repairs.
     pub async fn run(&mut self) -> Result<(), Error> {
-        self.scrub_metadata().await?;
-        // Store-wide checkers run in the order `setup::store_checkers` built
-        // them: orphan-namespace clearing frees manifest bytes the blob reclaim
-        // then reclaims.
-        self.scrub_store().await;
+        // Engine housekeeping first: reclaim orphaned transaction staging
+        // bodies and expired lock objects through the engine's own janitors
+        // (age-gated by engine thresholds; serving processes no longer run
+        // periodic janitor loops). The sweep mutates directly, so dry-run
+        // skips it.
+        if self.dry_run {
+            info!("Dry-run mode: skipping the engine janitor sweep");
+        } else {
+            self.metadata_store.store().janitor_sweep().await;
+        }
+
+        self.walk_pass(Pass::MetadataLinks, "").await?;
+        self.walk_pass(Pass::MetadataShards, path_builder::blobs_root_dir())
+            .await?;
+        self.walk_pass(Pass::Blob, "").await?;
+
         self.metadata_store.flush_access_times().await;
         if let Some(registry) = &self.registry {
             registry.shutdown().await;
         }
+        info!(
+            "scrub complete: {}",
+            self.stats.summary(self.delete_unknown)
+        );
         Ok(())
     }
 
-    async fn scrub_metadata(&mut self) -> Result<(), Error> {
-        // Clone the Arc so the namespace stream borrows a local, leaving `self`
-        // free for the `&mut self` per-namespace methods called in the loop.
-        let metadata_store = self.metadata_store.clone();
-        let mut namespaces = list_all::namespaces(&metadata_store);
-        while let Some(namespace) = namespaces.next().await {
-            let namespace = namespace?;
-            let namespace = match Namespace::new(&namespace) {
-                Ok(namespace) => namespace,
-                Err(e) => {
-                    warn!("Skipping invalid enumerated namespace '{namespace}': {e}");
-                    continue;
-                }
-            };
-            if let Err(e) = self.scrub_tags(&namespace).await {
-                warn!("Tag scrub failed for namespace '{namespace}': {e}");
+    async fn walk_pass(&self, pass: Pass, prefix: &str) -> Result<(), Error> {
+        let objects = match pass {
+            Pass::MetadataLinks | Pass::MetadataShards => {
+                self.metadata_store.store().object_store()
             }
-            for i in 0..self.namespace_checkers.len() {
-                if let Err(e) = self.namespace_checkers[i]
-                    .check(&namespace, self.sink.as_mut())
-                    .await
-                {
-                    warn!("Scrub checker failed for namespace '{namespace}': {e}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Walks a namespace's tags once: an invalid name is deleted and skipped, a
-    /// valid tag is dispatched to each enabled per-tag checker. Runs before the
-    /// aggregate namespace checkers.
-    async fn scrub_tags(&mut self, namespace: &Namespace) -> Result<(), Error> {
-        let Some(tag_checkers) = &self.tag_checkers else {
-            return Ok(());
+            Pass::Blob => self.blob_store.object_store(),
         };
-        let mut names = list_all::unparsed_tags(&self.metadata_store, namespace);
-        while let Some(name) = names.next().await {
-            let name = name?;
-            let tag = match Tag::try_from(name.as_str()) {
-                Ok(tag) => tag,
-                Err(reason) => {
-                    warn!("Deleting invalid tag directory '{namespace}:{name}': {reason}");
-                    if let Err(e) = self
-                        .sink
-                        .apply(Action::DeleteInvalidTag {
-                            namespace: namespace.clone(),
-                            tag: name,
-                        })
-                        .await
-                    {
-                        error!("Failed to delete invalid tag directory in '{namespace}': {e}");
-                    }
-                    continue;
-                }
-            };
-            for checker in tag_checkers {
-                if let Err(e) = checker.check_tag(namespace, &tag, self.sink.as_mut()).await {
-                    error!("Tag check failed for '{namespace}:{tag}': {e}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Apply every enabled store-wide checker in order, logging and continuing
-    /// past a failed checker (scrub is best-effort).
-    async fn scrub_store(&mut self) {
-        for i in 0..self.store_checkers.len() {
-            let (name, checker) = &self.store_checkers[i];
-            if let Err(e) = checker.check_all(self.sink.as_mut()).await {
-                warn!("Store scrub checker '{name}' failed: {e}");
-            }
-        }
+        let validator = &self.validator;
+        walk::for_each_key(objects, prefix, self.concurrency, |key| async move {
+            validator.process(pass, &key).await;
+        })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::{
+        command::scrub::action::LOST_AND_FOUND_PREFIX,
+        oci::{Digest, Namespace},
+        registry::{
+            metadata_store::LinkMetadata, path_builder as paths, test_utils::seed_manifest,
+        },
+    };
 
-    // Scrub tests point both stores at one temporary root whose contents the
-    // assertions inspect, which the shared configuration fixture cannot
-    // express with its fixed store paths.
     fn scrub_config(root: &str) -> Configuration {
         let toml = format!(
             r#"
@@ -264,71 +198,146 @@ mod tests {
 
             [global.retention_policy]
             rules = []
+
+            [repository."test-repo"]
             "#
         );
         Configuration::load_from_str(&toml).unwrap()
     }
 
-    #[tokio::test]
-    async fn test_command_new_with_valid_config() {
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().to_string_lossy().to_string();
-        let config = scrub_config(&path);
-
-        let options = Options {
-            dry_run: true,
-            uploads: Some(humantime::Duration::from(std::time::Duration::from_hours(
-                1,
-            ))),
-            tags: true,
-            manifests: true,
-            blobs: true,
-            ..Options::default()
-        };
-
-        let command = Command::new(&options, &config).await;
-
-        assert!(command.is_ok());
-        let cmd = command.unwrap();
-        // uploads, manifests = 2 namespace checkers (the tag walk is a free
-        // function driven by `tag_checkers`, not a namespace checker)
-        assert_eq!(cmd.namespace_checkers.len(), 2);
-        // `tags` is enabled, so the per-tag checkers are present.
-        assert!(cmd.tag_checkers.is_some());
-        // `blobs` is the only store-wide checker enabled by these options.
-        assert_eq!(cmd.store_checkers.len(), 1);
+    fn options(dry_run: bool, concurrency: usize) -> Options {
+        Options {
+            dry_run,
+            concurrency,
+            delete_unknown: false,
+        }
     }
 
+    /// Full-command run over an FS root: junk is quarantined, an invalid tag
+    /// directory is removed, and a dry-run touches nothing.
     #[tokio::test]
-    async fn scrub_metadata_deletes_invalid_tag_directory() {
+    async fn command_run_quarantines_junk_and_removes_invalid_tags() {
         let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().to_string_lossy().to_string();
+        let root = temp_dir.path().to_string_lossy().to_string();
+        let config = scrub_config(&root);
+        let namespace = Namespace::new("test-repo/app").unwrap();
 
-        // Plant an invalid tag directory on disk before building the command.
-        // A leading '-' is a legal key segment but fails the tag grammar, and
-        // the `_manifests` ancestor makes `test-repo/app` an enumerable
-        // namespace.
-        let tag_dir = format!("{path}/v2/repositories/test-repo/app/_manifests/tags/-bad");
-        std::fs::create_dir_all(format!("{tag_dir}/current")).unwrap();
-        std::fs::write(
-            format!("{tag_dir}/current/link"),
-            b"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        // Seed content plus two defects through a throwaway command's stores.
+        let seed = Command::new(&options(true, 2), &config).await.unwrap();
+        seed_manifest(
+            seed.metadata_store.store(),
+            &seed.metadata_store,
+            &namespace,
         )
-        .unwrap();
+        .await;
+        let objects = seed.metadata_store.store().object_store();
+        objects
+            .put("stray/junk-object", Bytes::from_static(b"junk"))
+            .await
+            .unwrap();
+        let bad_tag_key = format!(
+            "{}/current/link",
+            paths::manifest_tag_dir(&namespace, "-bad")
+        );
+        let bad_body =
+            serde_json::to_vec(&LinkMetadata::from_digest(Digest::sha256_of_bytes(b"x"))).unwrap();
+        objects
+            .put(&bad_tag_key, Bytes::from(bad_body))
+            .await
+            .unwrap();
 
-        let config = scrub_config(&path);
+        // Dry-run first: nothing changes.
+        let mut dry = Command::new(&options(true, 2), &config).await.unwrap();
+        dry.run().await.unwrap();
+        assert!(objects.get("stray/junk-object").await.is_ok());
+        assert!(objects.get(&bad_tag_key).await.is_ok());
 
-        let options = Options {
-            tags: true,
-            ..Options::default()
-        };
+        // Real run: junk quarantined, invalid tag directory removed.
+        let mut real = Command::new(&options(false, 4), &config).await.unwrap();
+        real.run().await.unwrap();
+        assert!(objects.get("stray/junk-object").await.is_err());
+        assert_eq!(
+            objects
+                .get(&format!("{LOST_AND_FOUND_PREFIX}/stray/junk-object"))
+                .await
+                .unwrap(),
+            b"junk"
+        );
+        assert!(objects.get(&bad_tag_key).await.is_err());
 
-        let mut cmd = Command::new(&options, &config).await.unwrap();
-        cmd.scrub_metadata().await.unwrap();
+        // Convergence: a repair can create new derivable state (the recreated
+        // revision link derives back-links on the next pass), so run to the
+        // fixpoint and assert it is reached quickly.
+        let mut runs = 0;
+        loop {
+            let mut again = Command::new(&options(false, 4), &config).await.unwrap();
+            again.run().await.unwrap();
+            let stats = &again.stats;
+            let emitted = stats.repairs.load(std::sync::atomic::Ordering::Relaxed)
+                + stats.quarantined.load(std::sync::atomic::Ordering::Relaxed)
+                + stats.corrupt.load(std::sync::atomic::Ordering::Relaxed);
+            if emitted == 0 {
+                break;
+            }
+            runs += 1;
+            assert!(
+                runs < 4,
+                "the store must converge within a few runs (still emitting {emitted})"
+            );
+        }
+    }
 
-        assert!(
-            !std::path::Path::new(&tag_dir).exists(),
-            "scrub must delete the invalid tag directory"
+    /// The same seeded defects converge to the same state regardless of the
+    /// concurrency level.
+    #[tokio::test]
+    async fn concurrency_level_does_not_change_the_outcome() {
+        let mut roots = Vec::new();
+        for concurrency in [1, 8] {
+            let temp_dir = TempDir::new().unwrap();
+            let root = temp_dir.path().to_string_lossy().to_string();
+            let config = scrub_config(&root);
+            let namespace = Namespace::new("test-repo/app").unwrap();
+
+            let seed = Command::new(&options(true, 1), &config).await.unwrap();
+            seed_manifest(
+                seed.metadata_store.store(),
+                &seed.metadata_store,
+                &namespace,
+            )
+            .await;
+            seed.metadata_store
+                .store()
+                .object_store()
+                .put("stray/junk", Bytes::from_static(b"junk"))
+                .await
+                .unwrap();
+
+            let mut command = Command::new(&options(false, concurrency), &config)
+                .await
+                .unwrap();
+            command.run().await.unwrap();
+
+            // Collect the final key set (sorted by the walker).
+            let keys = std::sync::Mutex::new(Vec::new());
+            walk::for_each_key(
+                command.metadata_store.store().object_store(),
+                "",
+                1,
+                |key| {
+                    keys.lock().unwrap().push(key);
+                    async {}
+                },
+            )
+            .await
+            .unwrap();
+            roots.push((concurrency, keys.into_inner().unwrap(), temp_dir));
+        }
+
+        let (_, keys_serial, _dir_a) = &roots[0];
+        let (_, keys_concurrent, _dir_b) = &roots[1];
+        assert_eq!(
+            keys_serial, keys_concurrent,
+            "concurrency 1 and 8 must converge to the same key set"
         );
     }
 }

@@ -18,7 +18,7 @@ use crate::{
         cas::{CasApplyMode, apply_cas},
         common,
     },
-    intent::{IntentRecord, MutationProgress},
+    intent::{INTENT_LOG_PREFIX, IntentRecord, MutationProgress},
     lock::primitive::Lock,
     periodic::run_periodic,
     transaction::lock_key_set,
@@ -166,7 +166,11 @@ impl RecoveryLoop {
     pub async fn sweep(&self) {
         let mut token: Option<String> = None;
         loop {
-            match self.store.list(".tx-log/", 100, token.clone()).await {
+            match self
+                .store
+                .list(&format!("{INTENT_LOG_PREFIX}/"), 100, token.clone())
+                .await
+            {
                 Ok(page) => {
                     for suffix in page.items {
                         // `list` returns keys relative to the prefix; reconstruct

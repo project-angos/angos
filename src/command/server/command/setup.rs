@@ -66,10 +66,9 @@ pub async fn build_metadata_store(
 /// pending-gauge refresh interval; the server spawns its own ticker from it.
 /// The server never drains the queue itself: that is `angos worker`'s job.
 ///
-/// When `engine_maintenance` is `Some`, the transactional-engine recovery loop
-/// and body janitor are spawned tied to that token. Pass `None` on
-/// hot-reload paths where the maintenance tasks were already started by the
-/// initial bootstrap.
+/// When `engine_maintenance` is `Some`, the transactional-engine recovery
+/// loop is spawned tied to that token. Pass `None` on hot-reload paths where
+/// it was already started by the initial bootstrap.
 pub async fn build_registry(
     config: &Configuration,
     cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
@@ -131,7 +130,7 @@ pub async fn build_registry(
     };
 
     if let (Some(token), Some(handles)) = (engine_maintenance, maintenance_handles) {
-        tokio::spawn(handles.maintenance(token));
+        tokio::spawn(handles.recovery(token));
     }
 
     let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config)

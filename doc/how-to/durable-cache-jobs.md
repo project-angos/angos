@@ -135,7 +135,7 @@ API and UI list, retry, and delete failed jobs per queue, selected with
 
 **Orphan jobs after a configuration change:** Removing a repository (or its
 upstreams) from the configuration leaves its pending cache jobs to fail and
-dead-letter. `angos scrub --cache-orphans` deletes those orphans from both the
+dead-letter. `angos prune` deletes those orphans from both the
 pending and dead-letter partitions; combine with `--dry-run` to preview.
 
 To requeue manually, move the file back into `_jobs/pending/<queue>/`. The
