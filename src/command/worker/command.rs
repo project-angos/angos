@@ -249,7 +249,9 @@ impl WorkerContext {
             ));
         }
 
-        let storage = bootstrap::build_store(&config.resolve_registry_storage()).await?;
+        // Share the metadata store's engine façade instead of wiring (and
+        // probing) a second store over the same backend.
+        let storage = metadata_store.store_arc();
         job_store::ensure_shared_lock(&storage)?;
         let registry = bootstrap::registry(
             config,

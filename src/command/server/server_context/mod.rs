@@ -8,6 +8,7 @@ use tracing::instrument;
 
 use crate::{
     auth::{Authenticator, Authorizer},
+    cache::Cache,
     command::server::error::Error,
     configuration::{Configuration, TrustedProxy},
     identity::{Action, ClientIdentity},
@@ -25,15 +26,15 @@ pub struct ServerContext {
 }
 
 impl ServerContext {
-    pub fn new(config: &Configuration, registry: Arc<Registry>) -> Result<Self, Error> {
-        let Ok(cache) = config.cache.to_backend() else {
-            return Err(Error::Initialization(
-                "Failed to initialize cache backend".to_string(),
-            ));
-        };
-
-        let authenticator = Arc::new(Authenticator::new(config, &cache)?);
-        let authorizer = Arc::new(Authorizer::new(config, &cache)?);
+    /// Build the per-request context over the already-built `registry` and the
+    /// shared `cache` the bootstrap constructed from the same configuration.
+    pub fn new(
+        config: &Configuration,
+        cache: &Arc<Cache>,
+        registry: Arc<Registry>,
+    ) -> Result<Self, Error> {
+        let authenticator = Arc::new(Authenticator::new(config, cache)?);
+        let authorizer = Arc::new(Authorizer::new(config, cache)?);
 
         Ok(Self {
             authenticator,

@@ -14,6 +14,7 @@ use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ObjectStore, s3::Backend as StorageS3Backend};
 
 use crate::{
+    cache::{self, Cache},
     command::server::server_context::{ServerContext, resolve_forwarded_ip},
     configuration::{Configuration, TrustedProxy},
     event_webhook::{
@@ -87,9 +88,15 @@ pub async fn create_test_server_context_with(options: TestConfigOptions<'_>) -> 
     create_test_server_context_from_config(&config).await
 }
 
+/// The in-memory cache every test context shares with its authenticator and
+/// authorizer, mirroring the bootstrap's single shared backend.
+fn test_cache() -> Arc<Cache> {
+    cache::Config::Memory.to_backend().expect("memory cache")
+}
+
 pub async fn create_test_server_context_from_config(config: &Configuration) -> ServerContext {
     let registry = create_test_registry(config).await;
-    ServerContext::new(config, registry).unwrap()
+    ServerContext::new(config, &test_cache(), registry).unwrap()
 }
 
 /// Context over a fresh FS root with a `test` repository matching `test/*`
@@ -211,7 +218,7 @@ async fn test_server_context_new_with_basic_auth() {
     ));
     let registry = create_test_registry(&config).await;
 
-    let context = ServerContext::new(&config, registry);
+    let context = ServerContext::new(&config, &test_cache(), registry);
 
     assert!(context.is_ok());
 }
@@ -220,7 +227,7 @@ async fn test_server_context_new_with_basic_auth() {
 async fn test_authenticate_request_no_credentials() {
     let config = minimal_config();
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let request = Request::builder().body(()).unwrap();
     let (parts, ()) = request.into_parts();
@@ -247,7 +254,7 @@ async fn test_authenticate_request_with_basic_auth() {
     "#
     ));
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let auth_header = format!(
         "Basic {}",
@@ -271,7 +278,7 @@ async fn test_authenticate_request_with_basic_auth() {
 async fn test_authenticate_request_ignores_x_forwarded_for_from_untrusted_peer() {
     let config = minimal_config();
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let request = Request::builder()
         .header("X-Forwarded-For", "192.168.1.100, 10.0.0.1")
@@ -297,7 +304,7 @@ async fn test_authenticate_request_ignores_x_forwarded_for_from_untrusted_peer()
 async fn test_authenticate_request_with_remote_address() {
     let config = minimal_config();
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let request = Request::builder().body(()).unwrap();
     let (parts, ()) = request.into_parts();
@@ -316,7 +323,7 @@ async fn test_authenticate_request_with_remote_address() {
 async fn test_authenticate_request_x_forwarded_for_from_trusted_proxy_overrides_remote_address() {
     let config = load_config(r#"trusted_proxies = ["127.0.0.1"]"#);
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let request = Request::builder()
         .header("X-Forwarded-For", "192.168.1.100")
@@ -351,7 +358,7 @@ async fn test_authorize_request_with_global_policy() {
     "#,
     );
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let route = Action::GetManifest {
         namespace: Namespace::new("test/repo").unwrap(),
@@ -377,7 +384,7 @@ async fn test_server_context_new_with_event_webhooks() {
     "#,
     );
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     assert!(context.has_event_dispatcher());
 }
@@ -386,7 +393,7 @@ async fn test_server_context_new_with_event_webhooks() {
 async fn test_server_context_new_without_event_webhooks() {
     let config = minimal_config();
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     assert!(!context.has_event_dispatcher());
 }
@@ -395,7 +402,7 @@ async fn test_server_context_new_without_event_webhooks() {
 async fn test_dispatch_event_with_no_dispatcher() {
     let config = minimal_config();
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let event = Event {
         id: Uuid::new_v4(),
@@ -435,7 +442,7 @@ async fn test_dispatch_event_delivers_to_webhook() {
         mock_server.uri()
     ));
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let event = Event {
         id: Uuid::new_v4(),
@@ -474,7 +481,7 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         mock_server.uri()
     ));
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let event = Event {
         id: Uuid::new_v4(),
@@ -496,7 +503,7 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
 async fn test_server_context_shutdown_with_no_dispatcher() {
     let config = minimal_config();
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     assert!(!context.has_event_dispatcher());
     context.shutdown().await;
@@ -524,7 +531,7 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         mock_server.uri()
     ));
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let event = Event {
         id: Uuid::new_v4(),
@@ -570,7 +577,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
         mock_server.uri()
     ));
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     context.shutdown().await;
 
@@ -686,7 +693,7 @@ async fn test_shutdown_flushes_pending_access_times() {
     // The config only drives ServerContext auth and webhook wiring here; the
     // registry under test was already built by the harness above.
     let config = minimal_config();
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
     context.shutdown().await;
 
     let after = metadata_store.read_link(&namespace, &tag).await.unwrap();
@@ -814,7 +821,7 @@ async fn dispatch_events_first_failure_does_not_abort_batch() {
         mock_server.uri()
     ));
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let events = vec![
         make_event(Uuid::new_v4()),
@@ -852,7 +859,7 @@ async fn dispatch_events_all_success_returns_ok() {
         mock_server.uri()
     ));
     let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
     let events = vec![make_event(Uuid::new_v4()), make_event(Uuid::new_v4())];
     let result = context.registry.dispatch_events(&events).await;
