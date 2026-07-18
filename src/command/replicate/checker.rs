@@ -6,14 +6,14 @@
 use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, warn};
 
 use crate::{
     command::scrub::{
         Error,
         action::Action,
-        check::{NamespaceChecker, list_all},
+        check::NamespaceChecker,
         executor::{ActionSink, record_reconcile_outcome},
     },
     oci::{Digest, Namespace, Reference, Tag},
@@ -24,6 +24,10 @@ use crate::{
     registry_client::Error as ClientError,
     replication::{ReplicationDownstream, manifest_accept_types},
 };
+
+/// Fan-out for the local tag-digest link reads collected before reconciling a
+/// namespace's downstreams.
+const TAG_RESOLVE_CONCURRENCY: usize = 16;
 
 /// Enqueues a replication push for each diverging or downstream-missing tag, and
 /// for a `prune = true` downstream (one-way mirror) a replication delete for each
@@ -269,15 +273,20 @@ impl NamespaceChecker for ReplicationChecker {
         }
 
         // Collect and digest-resolve the tag set once to avoid O(downstreams x
-        // tags) metadata reads. A failed link read resolves to `None`: skipped
-        // for push but still counted as local so prune never deletes a live tag.
-        let mut local_tags: Vec<(Tag, Option<Digest>)> = Vec::new();
-        let mut stream = list_all::tags(&self.metadata_store, namespace);
-        while let Some(tag) = stream.next().await {
-            let tag = tag?;
-            let digest = self.local_digest(namespace, &tag).await;
-            local_tags.push((tag, digest));
-        }
+        // tags) metadata reads; the link reads fan out. A failed link read
+        // resolves to `None`: skipped for push but still counted as local so
+        // prune never deletes a live tag.
+        let local_tags: Vec<(Tag, Option<Digest>)> = self
+            .metadata_store
+            .stream_tags(namespace)
+            .err_into::<Error>()
+            .map_ok(|tag| async move {
+                let digest = self.local_digest(namespace, &tag).await;
+                Ok((tag, digest))
+            })
+            .try_buffered(TAG_RESOLVE_CONCURRENCY)
+            .try_collect()
+            .await?;
 
         for downstream in downstreams {
             self.reconcile_downstream(downstream, namespace, &local_tags, sink)

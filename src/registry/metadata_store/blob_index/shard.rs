@@ -20,7 +20,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         Error,
-        metadata_store::{BlobIndex, BlobIndexOperation, LinkKind},
+        metadata_store::{BlobIndexOperation, LinkKind},
         path_builder,
     },
 };
@@ -35,18 +35,6 @@ pub fn decode_blob_index_shard_namespace(file_name: &str) -> String {
         .unwrap_or(file_name)
         .replace("%2F", "/")
         .replace("%25", "%")
-}
-
-pub fn collect_blob_index_shards(
-    shards: impl IntoIterator<Item = (Namespace, HashSet<LinkKind>)>,
-) -> BlobIndex {
-    let mut index = BlobIndex::default();
-    for (namespace, links) in shards {
-        if !links.is_empty() {
-            index.namespace.insert(namespace, links);
-        }
-    }
-    index
 }
 
 pub fn apply_blob_index_operations(

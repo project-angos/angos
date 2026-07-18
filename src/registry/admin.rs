@@ -17,7 +17,7 @@ use crate::{
         DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType,
         Namespace, Platform as OciPlatform, Tag, namespace_belongs_to,
     },
-    registry::{Error, Registry, metadata_store::LinkKind, pagination::collect_all_pages},
+    registry::{Error, Registry, metadata_store::LinkKind},
 };
 
 /// Default page size for the durable job-queue listing endpoints when the
@@ -28,6 +28,11 @@ const DEFAULT_JOBS_PAGE: u16 = 100;
 /// Fan-out for per-namespace manifest/upload counting in the namespace listing;
 /// each namespace costs two backend listings, run concurrently to hide latency.
 const NAMESPACE_STAT_CONCURRENCY: usize = 32;
+
+/// Fan-out for the per-item reads behind the info endpoints (upload summaries,
+/// job envelopes, manifest and link reads): each listed item costs one or two
+/// independent backend reads, run concurrently to hide latency.
+const ADMIN_READ_CONCURRENCY: usize = 16;
 
 #[derive(Serialize, Debug)]
 pub struct RepositoryInfo {
@@ -363,12 +368,13 @@ impl Registry {
 
     #[instrument(skip(self))]
     pub async fn get_revisions_info(&self, namespace: &Namespace) -> Result<RevisionsBody, Error> {
-        let all_revisions = collect_all_pages(|token| async move {
-            self.metadata_store
-                .list_revisions(namespace, 1000, token)
-                .await
-        })
-        .await?;
+        // Materialized once: the tag map, the parent/referrer maps, and the
+        // entry builder below all need the full revision set.
+        let all_revisions: Vec<Digest> = self
+            .metadata_store
+            .stream_revisions(namespace)
+            .try_collect()
+            .await?;
         let digest_to_tags = self.build_digest_to_tags_map(namespace).await?;
         let (child_to_parents, docker_referrers) =
             self.build_parent_and_referrer_maps(&all_revisions).await;
@@ -390,21 +396,32 @@ impl Registry {
 
     #[instrument(skip(self))]
     pub async fn get_uploads_info(&self, namespace: &Namespace) -> Result<UploadsBody, Error> {
-        let uuids = collect_all_pages(|token| async move {
-            self.blob_store.list_uploads(namespace, 1000, token).await
-        })
-        .await?;
+        let mut uuids: Vec<String> = self
+            .blob_store
+            .stream_uploads(namespace)
+            .try_collect()
+            .await?;
+        uuids.sort();
 
-        let mut all_uploads = Vec::new();
-        for uuid in uuids {
-            if let Ok(summary) = self.blob_store.upload_summary(namespace, &uuid).await {
-                all_uploads.push(UploadEntry {
+        // Summary reads fan out; `buffered` keeps the sorted uuid order. An
+        // upload whose summary read fails (e.g. reaped mid-listing) is skipped.
+        let all_uploads: Vec<UploadEntry> = stream::iter(uuids)
+            .map(|uuid| async move {
+                let summary = self
+                    .blob_store
+                    .upload_summary(namespace, &uuid)
+                    .await
+                    .ok()?;
+                Some(UploadEntry {
                     uuid,
                     size: summary.size,
                     started_at: summary.started_at,
-                });
-            }
-        }
+                })
+            })
+            .buffered(ADMIN_READ_CONCURRENCY)
+            .filter_map(|entry| async move { entry })
+            .collect()
+            .await;
 
         Ok(UploadsBody {
             name: namespace.to_string(),
@@ -428,27 +445,32 @@ impl Registry {
             .list_pending_page(queue, n, after.as_deref())
             .await?;
 
-        let mut jobs = Vec::with_capacity(keys.len());
-        for storage_key in keys {
-            match self.job_queue.read_pending(queue, &storage_key).await {
-                Ok(envelope) => {
-                    let not_before =
-                        job_store::parse_not_before(&storage_key).unwrap_or(envelope.created_at);
-                    jobs.push(JobEntry {
-                        storage_key,
-                        id: envelope.id,
-                        kind: envelope.kind,
-                        lock_key: envelope.lock_key,
-                        attempts: envelope.attempts,
-                        max_attempts: envelope.max_attempts,
-                        created_at: envelope.created_at,
-                        not_before,
-                    });
+        // Envelope reads fan out; `buffered` keeps the keyset (time) order.
+        let jobs: Vec<JobEntry> = stream::iter(keys)
+            .map(|storage_key| async move {
+                match self.job_queue.read_pending(queue, &storage_key).await {
+                    Ok(envelope) => {
+                        let not_before = job_store::parse_not_before(&storage_key)
+                            .unwrap_or(envelope.created_at);
+                        Ok(Some(JobEntry {
+                            storage_key,
+                            id: envelope.id,
+                            kind: envelope.kind,
+                            lock_key: envelope.lock_key,
+                            attempts: envelope.attempts,
+                            max_attempts: envelope.max_attempts,
+                            created_at: envelope.created_at,
+                            not_before,
+                        }))
+                    }
+                    Err(job_store::Error::NotFound) => Ok(None),
+                    Err(e) => Err(Error::from(e)),
                 }
-                Err(job_store::Error::NotFound) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
+            })
+            .buffered(ADMIN_READ_CONCURRENCY)
+            .try_filter_map(|entry| async move { Ok(entry) })
+            .try_collect()
+            .await?;
 
         Ok(JobsBody { jobs, next })
     }
@@ -468,24 +490,29 @@ impl Registry {
             .list_failed_page(queue, n, after.as_deref())
             .await?;
 
-        let mut failed = Vec::with_capacity(keys.len());
-        for storage_key in keys {
-            match self.job_queue.read_failed(queue, &storage_key).await {
-                Ok(record) => failed.push(FailedJobEntry {
-                    storage_key,
-                    id: record.envelope.id,
-                    kind: record.envelope.kind,
-                    lock_key: record.envelope.lock_key,
-                    attempts: record.envelope.attempts,
-                    max_attempts: record.envelope.max_attempts,
-                    created_at: record.envelope.created_at,
-                    failed_at: record.failed_at,
-                    last_error: record.last_error,
-                }),
-                Err(job_store::Error::NotFound) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
+        // Record reads fan out; `buffered` keeps the keyset (time) order.
+        let failed: Vec<FailedJobEntry> = stream::iter(keys)
+            .map(|storage_key| async move {
+                match self.job_queue.read_failed(queue, &storage_key).await {
+                    Ok(record) => Ok(Some(FailedJobEntry {
+                        storage_key,
+                        id: record.envelope.id,
+                        kind: record.envelope.kind,
+                        lock_key: record.envelope.lock_key,
+                        attempts: record.envelope.attempts,
+                        max_attempts: record.envelope.max_attempts,
+                        created_at: record.envelope.created_at,
+                        failed_at: record.failed_at,
+                        last_error: record.last_error,
+                    })),
+                    Err(job_store::Error::NotFound) => Ok(None),
+                    Err(e) => Err(Error::from(e)),
+                }
+            })
+            .buffered(ADMIN_READ_CONCURRENCY)
+            .try_filter_map(|entry| async move { Ok(entry) })
+            .try_collect()
+            .await?;
 
         Ok(FailedJobsBody { failed, next })
     }
@@ -552,31 +579,37 @@ impl Registry {
         HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>>,
         HashMap<Digest, Vec<ReferrerInfo>>,
     ) {
+        // Manifest reads and analyses fan out; `buffered` keeps the revision
+        // order so the merged map values stay deterministic.
+        let analyses: Vec<_> = stream::iter(all_revisions.iter().cloned())
+            .map(|digest| async move {
+                let manifest = self.read_manifest(&digest).await?;
+                let analysis = analyze_manifest(&manifest);
+                let mut referrers = Vec::with_capacity(analysis.referrer_candidates.len());
+                for referrer in analysis.referrer_candidates {
+                    let info = self
+                        .enrich_referrer_with_predicate(referrer.info, &referrer.child_digest)
+                        .await;
+                    referrers.push((referrer.subject, info));
+                }
+                Some((digest, analysis.parent_links, referrers))
+            })
+            .buffered(ADMIN_READ_CONCURRENCY)
+            .collect()
+            .await;
+
         let mut child_to_parents: HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>> =
             HashMap::new();
         let mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>> = HashMap::new();
-
-        for digest in all_revisions {
-            let Some(manifest) = self.read_manifest(digest).await else {
-                continue;
-            };
-            let analysis = analyze_manifest(&manifest);
-
-            for (child_digest, platform) in analysis.parent_links {
+        for (digest, parent_links, referrers) in analyses.into_iter().flatten() {
+            for (child_digest, platform) in parent_links {
                 child_to_parents
                     .entry(child_digest)
                     .or_default()
                     .push((digest.clone(), platform));
             }
-
-            for referrer in analysis.referrer_candidates {
-                let info = self
-                    .enrich_referrer_with_predicate(referrer.info, &referrer.child_digest)
-                    .await;
-                docker_referrers
-                    .entry(referrer.subject)
-                    .or_default()
-                    .push(info);
+            for (subject, info) in referrers {
+                docker_referrers.entry(subject).or_default().push(info);
             }
         }
 
@@ -607,66 +640,79 @@ impl Registry {
         child_to_parents: HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>>,
         mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>>,
     ) -> Vec<ManifestEntry> {
-        let mut manifests: Vec<ManifestEntry> = Vec::with_capacity(all_revisions.len());
+        // In-memory assembly first, then the per-revision referrer listing and
+        // link read fan out; `buffered` keeps the revision order.
+        let seeds: Vec<_> = all_revisions
+            .into_iter()
+            .map(|digest| {
+                let tags = digest_to_tags.get(&digest).cloned().unwrap_or_default();
+                let parents = parent_refs_for(&digest, &child_to_parents, digest_to_tags);
+                let referrers = docker_referrers.remove(&digest).unwrap_or_default();
+                (digest, tags, parents, referrers)
+            })
+            .collect();
 
-        for digest in all_revisions {
-            let tags = digest_to_tags.get(&digest).cloned().unwrap_or_default();
-            let parents = parent_refs_for(&digest, &child_to_parents, digest_to_tags);
+        stream::iter(seeds)
+            .map(|(digest, tags, parents, mut referrers)| async move {
+                if let Ok(oci_referrers) = self
+                    .metadata_store
+                    .list_referrers(namespace, &digest, None)
+                    .await
+                {
+                    referrers.extend(oci_referrers.into_iter().map(ReferrerInfo::from));
+                }
 
-            let mut referrers: Vec<ReferrerInfo> =
-                docker_referrers.remove(&digest).unwrap_or_default();
+                let (pushed_at, last_pulled_at) = self
+                    .metadata_store
+                    .read_link(namespace, &LinkKind::Digest(digest.clone()))
+                    .await
+                    .map_or((None, None), |m| (m.created_at, m.accessed_at));
 
-            if let Ok(oci_referrers) = self
-                .metadata_store
-                .list_referrers(namespace, &digest, None)
-                .await
-            {
-                referrers.extend(oci_referrers.into_iter().map(ReferrerInfo::from));
-            }
-
-            let (pushed_at, last_pulled_at) = self
-                .metadata_store
-                .read_link(namespace, &LinkKind::Digest(digest.clone()))
-                .await
-                .map_or((None, None), |m| (m.created_at, m.accessed_at));
-
-            manifests.push(ManifestEntry {
-                digest: digest.to_string(),
-                tags,
-                parents,
-                referrers,
-                pushed_at,
-                last_pulled_at,
-            });
-        }
-
-        manifests
+                ManifestEntry {
+                    digest: digest.to_string(),
+                    tags,
+                    parents,
+                    referrers,
+                    pushed_at,
+                    last_pulled_at,
+                }
+            })
+            .buffered(ADMIN_READ_CONCURRENCY)
+            .collect()
+            .await
     }
 
     async fn count_uploads(&self, namespace: &Namespace) -> Result<usize, Error> {
-        let uploads = collect_all_pages(|token| async move {
-            self.blob_store.list_uploads(namespace, 1000, token).await
-        })
-        .await?;
-        Ok(uploads.len())
+        self.blob_store
+            .stream_uploads(namespace)
+            .try_fold(0, |count, _| async move { Ok(count + 1) })
+            .await
     }
 
     async fn build_digest_to_tags_map(
         &self,
         namespace: &Namespace,
     ) -> Result<HashMap<Digest, Vec<Tag>>, Error> {
-        let all_tags = collect_all_pages(|last| async move {
-            self.metadata_store.list_tags(namespace, 1000, last).await
-        })
-        .await?;
+        let mut all_tags: Vec<Tag> = self
+            .metadata_store
+            .stream_tags(namespace)
+            .try_collect()
+            .await?;
+        all_tags.sort();
 
-        let mut tag_links: Vec<(Tag, Digest)> = Vec::with_capacity(all_tags.len());
-        for tag in all_tags {
-            let link = LinkKind::Tag(tag.clone());
-            if let Ok(link_metadata) = self.metadata_store.read_link(namespace, &link).await {
-                tag_links.push((tag, link_metadata.target));
-            }
-        }
+        // Link reads fan out; `buffered` keeps the sorted tag order so each
+        // digest's tag list stays deterministic. A tag whose link read fails
+        // is skipped.
+        let tag_links: Vec<(Tag, Digest)> = stream::iter(all_tags)
+            .map(|tag| async move {
+                let link = LinkKind::Tag(tag.clone());
+                let metadata = self.metadata_store.read_link(namespace, &link).await.ok()?;
+                Some((tag, metadata.target))
+            })
+            .buffered(ADMIN_READ_CONCURRENCY)
+            .filter_map(|pair| async move { pair })
+            .collect()
+            .await;
 
         Ok(build_digest_to_tags_map_from_pairs(tag_links))
     }

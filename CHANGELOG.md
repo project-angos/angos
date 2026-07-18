@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - `angos prune` now fails to start when a retention rule uses `last_pulled_at` or `top_pulled` while `update_pull_time` is disabled, instead of silently treating every image as never pulled.
+- Every listing-driven operation now streams pages lazily and fans out its per-item reads with bounded concurrency, so maintenance sweeps, the `_ext` info endpoints, and the engine janitors are bound by backend latency instead of serialized round-trips.
 
 ## 1.4.0
 

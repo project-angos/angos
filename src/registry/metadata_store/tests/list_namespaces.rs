@@ -78,12 +78,12 @@ async fn list_namespaces_excludes_upload_only_namespace() {
     .await;
 }
 
-/// The blob store's `list_upload_namespaces` keys off the `_uploads` child,
+/// The blob store's `collect_upload_namespaces` keys off the `_uploads` child,
 /// the mirror of the catalog's `list_namespaces` (which keys off
 /// `_manifests`), so an upload-only namespace surfaces there but not in the
 /// catalog, and a manifest-only one the converse.
 #[tokio::test]
-async fn list_upload_namespaces_keys_off_uploads_not_manifests() {
+async fn collect_upload_namespaces_keys_off_uploads_not_manifests() {
     for_each_backend(async |test_case| {
         let registry = test_case.registry();
         let metadata_store = test_case.metadata_store();
@@ -109,18 +109,18 @@ async fn list_upload_namespaces_keys_off_uploads_not_manifests() {
             .await
             .unwrap();
 
-        let (upload_listed, _) = blob_store.list_upload_namespaces(1000, None).await.unwrap();
+        let upload_listed = blob_store.collect_upload_namespaces(None).await.unwrap();
         assert!(
             upload_listed.contains(&upload_only.to_string()),
-            "an upload-only namespace must appear in list_upload_namespaces; got: {upload_listed:?}"
+            "an upload-only namespace must appear in collect_upload_namespaces; got: {upload_listed:?}"
         );
         assert!(
             upload_listed.contains(&mixed.to_string()),
-            "a namespace with an upload must appear in list_upload_namespaces; got: {upload_listed:?}"
+            "a namespace with an upload must appear in collect_upload_namespaces; got: {upload_listed:?}"
         );
         assert!(
             !upload_listed.contains(&manifest_only.to_string()),
-            "a manifest-only namespace must not appear in list_upload_namespaces; got: {upload_listed:?}"
+            "a manifest-only namespace must not appear in collect_upload_namespaces; got: {upload_listed:?}"
         );
 
         let (manifest_listed, _) = metadata_store.list_namespaces(1000, None).await.unwrap();

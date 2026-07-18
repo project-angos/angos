@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
+use futures_util::stream::{self, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -23,6 +24,11 @@ use crate::periodic::run_periodic;
 
 /// Default age after which an orphan body prefix is eligible for deletion.
 pub const DEFAULT_ORPHAN_AGE_SECS: u64 = 3600; // 1 hour
+
+/// Fan-out for the per-item probes within one janitor listing page: each item
+/// costs a few independent head/get round-trips, run concurrently so a sweep
+/// is bound by backend latency, not item count.
+const SWEEP_CONCURRENCY: usize = 8;
 
 /// Orphan-body janitor.
 ///
@@ -130,9 +136,11 @@ impl BodyJanitor {
                 .await
             {
                 Ok(page) => {
-                    for sub_prefix in &page.sub_prefixes {
-                        self.process_prefix(sub_prefix).await;
-                    }
+                    stream::iter(&page.sub_prefixes)
+                        .for_each_concurrent(SWEEP_CONCURRENCY, |sub_prefix| {
+                            self.process_prefix(sub_prefix)
+                        })
+                        .await;
                     if page.next_token.is_none() {
                         break;
                     }
@@ -353,10 +361,12 @@ impl LockJanitor {
                 .await
             {
                 Ok(page) => {
-                    for suffix in &page.items {
-                        let key = format!(".tx-locks/{suffix}");
-                        self.process_key(&key).await;
-                    }
+                    stream::iter(&page.items)
+                        .for_each_concurrent(SWEEP_CONCURRENCY, |suffix| async move {
+                            let key = format!(".tx-locks/{suffix}");
+                            self.process_key(&key).await;
+                        })
+                        .await;
                     if page.next_token.is_none() {
                         break;
                     }

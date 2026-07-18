@@ -23,10 +23,11 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::stream::{self, Stream, StreamExt};
 use tokio::io::AsyncRead;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
-use angos_storage::{ObjectStore, PresignedStore};
+use angos_storage::{ObjectStore, PresignedStore, paginated};
 use angos_tx_engine::StorageError;
 
 pub use config::BlobStoreConfig;
@@ -37,8 +38,8 @@ pub use config::{FsBackendConfig, S3BackendConfig, TransportFields};
 pub use multipart_cleanup::{MultipartCleanup, OrphanMultipartUpload};
 
 use crate::{
-    oci::Digest,
-    registry::{Error, pagination, path_builder},
+    oci::{Algorithm, Digest},
+    registry::{Error, path_builder},
 };
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
@@ -93,34 +94,29 @@ impl BlobStore {
 // blob CRUD (formerly `impl BlobStore`)
 
 impl BlobStore {
-    #[instrument(skip(self))]
-    pub async fn list_blobs(
-        &self,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        debug!("Fetching {n} blob(s) with continuation token: {continuation_token:?}");
-
-        // Blobs are sharded by algorithm (`blobs/<algo>/<shard>/<hash>/data`); each
-        // blob is the `/data` key under its container.
-        pagination::paginate_by_algorithm(
-            n,
-            continuation_token,
-            |algorithm, limit, cursor| async move {
-                let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
-                let page = self.object.list(&blob_prefix, limit, cursor).await?;
-                let blobs = page
-                    .items
-                    .into_iter()
-                    .filter_map(|key| {
-                        let hash = key.strip_suffix("/data")?.rsplit_once('/')?.1;
-                        Digest::with_algorithm(algorithm, hash).ok()
-                    })
-                    .collect();
-                Ok((blobs, page.next_token))
-            },
-        )
-        .await
+    /// Streams every stored blob digest lazily: the per-algorithm shards
+    /// (`blobs/<algo>/<shard>/<hash>/data`, each blob the `/data` key under
+    /// its container) are chained in algorithm order, at most one listing
+    /// page buffered.
+    pub fn stream_blobs(&self) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
+        stream::iter(Algorithm::supported_algorithms()).flat_map(move |algorithm| {
+            let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
+            paginated(move |token| {
+                let blob_prefix = blob_prefix.clone();
+                async move {
+                    let page = self.object.list(&blob_prefix, 1000, token).await?;
+                    let blobs = page
+                        .items
+                        .into_iter()
+                        .filter_map(|key| {
+                            let hash = key.strip_suffix("/data")?.rsplit_once('/')?.1;
+                            Digest::with_algorithm(*algorithm, hash).ok()
+                        })
+                        .collect();
+                    Ok((blobs, page.next_token))
+                }
+            })
+        })
     }
 
     #[instrument(skip(self))]

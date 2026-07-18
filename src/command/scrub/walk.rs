@@ -8,12 +8,9 @@ use std::sync::{
 
 use futures_util::TryStreamExt;
 
-use angos_storage::ObjectStore;
+use angos_storage::{ObjectStore, paginated};
 
-use crate::{
-    command::scrub::{check::list_all::paginated, error::Error},
-    registry::Error as RegistryError,
-};
+use crate::{command::scrub::error::Error, registry::Error as RegistryError};
 
 /// Keys fetched per listing page. A memory bound only; the concurrency of the
 /// per-key work is the caller's knob.

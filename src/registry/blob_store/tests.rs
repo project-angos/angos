@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
 use chrono::{Duration, Utc};
+use futures_util::TryStreamExt;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
@@ -10,7 +11,7 @@ use crate::{
     registry::Error,
 };
 
-pub async fn test_datastore_list_uploads(store: &BlobStore) {
+pub async fn test_datastore_stream_uploads(store: &BlobStore) {
     let namespace = &Namespace::new("test-repo").unwrap();
 
     let upload_ids = ["upload1", "upload2", "upload3"];
@@ -31,31 +32,11 @@ pub async fn test_datastore_list_uploads(store: &BlobStore) {
             .unwrap();
     }
 
-    let (uploads, _token) = store.list_uploads(namespace, 10, None).await.unwrap();
+    let uploads: Vec<String> = store.stream_uploads(namespace).try_collect().await.unwrap();
     assert_eq!(uploads.len(), upload_ids.len());
     for id in upload_ids {
         assert!(uploads.contains(&id.to_string()));
     }
-
-    let (page1, token1) = store.list_uploads(namespace, 2, None).await.unwrap();
-    assert_eq!(page1.len(), 2);
-    assert!(token1.is_some());
-
-    let (page2, token2) = store.list_uploads(namespace, 2, token1).await.unwrap();
-    assert_eq!(page2.len(), 1);
-    assert!(token2.is_none());
-
-    let (page1, token1) = store.list_uploads(namespace, 1, None).await.unwrap();
-    assert_eq!(page1.len(), 1);
-    assert!(token1.is_some());
-
-    let (page2, token2) = store.list_uploads(namespace, 1, token1).await.unwrap();
-    assert_eq!(page2.len(), 1);
-    assert!(token2.is_some());
-
-    let (page3, token3) = store.list_uploads(namespace, 1, token2).await.unwrap();
-    assert_eq!(page3.len(), 1);
-    assert!(token3.is_none());
 
     let upload_to_complete = upload_ids[0];
     let completed_digest =
@@ -65,7 +46,8 @@ pub async fn test_datastore_list_uploads(store: &BlobStore) {
         .await
         .unwrap();
 
-    let (uploads_after_complete, _) = store.list_uploads(namespace, 10, None).await.unwrap();
+    let uploads_after_complete: Vec<String> =
+        store.stream_uploads(namespace).try_collect().await.unwrap();
     assert_eq!(uploads_after_complete.len(), upload_ids.len() - 1);
     assert!(!uploads_after_complete.contains(&upload_to_complete.to_string()));
 }
@@ -99,24 +81,7 @@ async fn seed_blob(store: &BlobStore, content: &[u8]) -> Digest {
     seed_blob_with(store, content, Algorithm::Sha256).await
 }
 
-/// Drain `list_blobs` one page at a time until the token is `None`, collecting
-/// every blob surfaced.
-async fn drain_blobs(store: &BlobStore, page_size: u16) -> Vec<Digest> {
-    let mut walked = Vec::new();
-    let mut marker = None;
-    loop {
-        let (page, next) = store.list_blobs(page_size, marker).await.unwrap();
-        assert!(page.len() <= usize::from(page_size));
-        walked.extend(page);
-        match next {
-            Some(next_marker) => marker = Some(next_marker),
-            None => break,
-        }
-    }
-    walked
-}
-
-pub async fn test_datastore_list_blobs(store: &BlobStore) {
+pub async fn test_datastore_stream_blobs(store: &BlobStore) {
     let blob_contents = [
         b"aaa_content_1".to_vec(),
         b"bbb_content_2".to_vec(),
@@ -128,29 +93,15 @@ pub async fn test_datastore_list_blobs(store: &BlobStore) {
         digests.push(seed_blob(store, content).await);
     }
 
-    // A single large page returns every blob with no continuation.
-    let (blobs, token) = store.list_blobs(10, None).await.unwrap();
-    assert!(token.is_none());
+    let blobs: Vec<Digest> = store.stream_blobs().try_collect().await.unwrap();
     assert!(blobs.len() >= digests.len());
     for digest in &digests {
         assert!(blobs.contains(digest));
     }
-
-    // Draining one or two at a time surfaces every blob exactly once.
-    for page_size in [1, 2] {
-        let walked = drain_blobs(store, page_size).await;
-        assert_eq!(walked.len(), digests.len());
-        for digest in &digests {
-            assert!(
-                walked.contains(digest),
-                "page_size {page_size} missed {digest}"
-            );
-        }
-    }
 }
 
-pub async fn test_datastore_list_blobs_across_algorithms(store: &BlobStore) {
-    // Blobs of both algorithms live under separate prefixes; the listing must
+pub async fn test_datastore_stream_blobs_across_algorithms(store: &BlobStore) {
+    // Blobs of both algorithms live under separate prefixes; the stream must
     // walk across the boundary and surface each exactly once.
     let mut expected = Vec::new();
     for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
@@ -159,7 +110,7 @@ pub async fn test_datastore_list_blobs_across_algorithms(store: &BlobStore) {
         }
     }
 
-    let walked = drain_blobs(store, 1).await;
+    let walked: Vec<Digest> = store.stream_blobs().try_collect().await.unwrap();
     assert_eq!(walked.len(), expected.len());
     for digest in &expected {
         assert!(walked.contains(digest), "missed {digest}");
@@ -262,7 +213,11 @@ pub async fn test_repeated_promotion_converges(store: &BlobStore) {
     assert_eq!(store.read(&first).await.unwrap(), content);
 
     let namespace = Namespace::new("test/setup").unwrap();
-    let (uploads, _) = store.list_uploads(&namespace, 10, None).await.unwrap();
+    let uploads: Vec<String> = store
+        .stream_uploads(&namespace)
+        .try_collect()
+        .await
+        .unwrap();
     assert!(
         uploads.is_empty(),
         "promoted sessions must be swept: {uploads:?}"
@@ -311,25 +266,25 @@ pub async fn test_complete_upload_fails_on_rerun(store: &BlobStore) {
 use crate::registry::test_utils::for_each_backend;
 
 #[tokio::test]
-async fn list_uploads() {
+async fn stream_uploads() {
     for_each_backend(async |tc| {
-        test_datastore_list_uploads(tc.blob_store().as_ref()).await;
+        test_datastore_stream_uploads(tc.blob_store().as_ref()).await;
     })
     .await;
 }
 
 #[tokio::test]
-async fn list_blobs() {
+async fn stream_blobs() {
     for_each_backend(async |tc| {
-        test_datastore_list_blobs(tc.blob_store().as_ref()).await;
+        test_datastore_stream_blobs(tc.blob_store().as_ref()).await;
     })
     .await;
 }
 
 #[tokio::test]
-async fn list_blobs_across_algorithms() {
+async fn stream_blobs_across_algorithms() {
     for_each_backend(async |tc| {
-        test_datastore_list_blobs_across_algorithms(tc.blob_store().as_ref()).await;
+        test_datastore_stream_blobs_across_algorithms(tc.blob_store().as_ref()).await;
     })
     .await;
 }
