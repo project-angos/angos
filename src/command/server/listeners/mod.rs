@@ -110,6 +110,11 @@ impl<C: Connector> Listener<C> {
     pub fn current_context(&self) -> arc_swap::Guard<Arc<ServerContext>> {
         self.context.load()
     }
+
+    #[cfg(test)]
+    pub fn current_timeouts(&self) -> arc_swap::Guard<Arc<RequestTimeouts>> {
+        self.timeouts.load()
+    }
 }
 
 pub async fn accept_loop<C: Connector>(

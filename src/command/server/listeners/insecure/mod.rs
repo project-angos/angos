@@ -39,9 +39,10 @@ impl InsecureListener {
         Self::build(&config.base, InsecureConnector, context)
     }
 
-    /// Apply a non-listener config reload: the insecure listener has no
-    /// scheme-specific state, so only the server context is swapped.
-    pub fn notify_config_change(&self, context: ServerContext) {
+    /// Apply a config reload: refresh the shared-shell timeouts and swap the
+    /// server context; the insecure listener has no scheme-specific state.
+    pub fn notify_config_change(&self, config: &InsecureListenerConfig, context: ServerContext) {
+        self.store_timeouts(&config.base);
         self.store_context(context);
     }
 }

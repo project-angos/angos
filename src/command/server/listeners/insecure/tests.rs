@@ -189,7 +189,7 @@ async fn test_hot_reload_updates_webhook_config() {
     assert!(!listener.current_context().has_event_dispatcher());
 
     let context_with_webhooks = create_context_with_webhook("https://example.com/webhook").await;
-    listener.notify_config_change(context_with_webhooks);
+    listener.notify_config_change(&listener_config, context_with_webhooks);
 
     assert!(listener.current_context().has_event_dispatcher());
 }
@@ -203,7 +203,7 @@ async fn test_hot_reload_removes_webhooks() {
     assert!(listener.current_context().has_event_dispatcher());
 
     let context_without_webhooks = create_test_server_context().await;
-    listener.notify_config_change(context_without_webhooks);
+    listener.notify_config_change(&listener_config, context_without_webhooks);
 
     assert!(!listener.current_context().has_event_dispatcher());
 }
@@ -234,7 +234,7 @@ async fn test_hot_reload_changes_webhook_url() {
 
     let webhook_b = format!("{}/webhook", server_b.uri());
     let context_b = create_context_with_webhook(&webhook_b).await;
-    listener.notify_config_change(context_b);
+    listener.notify_config_change(&listener_config, context_b);
 
     let current_context = listener.current_context();
     let event = create_test_event();
@@ -284,7 +284,7 @@ async fn test_hot_reload_adds_second_webhook() {
     let listener = InsecureListener::new(&listener_config, context_one);
 
     let context_two = create_context_with_two_webhooks(&server_a.uri(), &server_b.uri()).await;
-    listener.notify_config_change(context_two);
+    listener.notify_config_change(&listener_config, context_two);
 
     let context = listener.current_context();
     context
@@ -316,7 +316,7 @@ async fn test_hot_reload_removes_one_of_two_webhooks() {
     let listener = InsecureListener::new(&listener_config, context_two);
 
     let context_one = create_context_with_webhook(&server_b.uri()).await;
-    listener.notify_config_change(context_one);
+    listener.notify_config_change(&listener_config, context_one);
 
     let context = listener.current_context();
     context
@@ -324,6 +324,24 @@ async fn test_hot_reload_removes_one_of_two_webhooks() {
         .dispatch_events(&[create_test_event()])
         .await
         .unwrap();
+}
+
+// A reload must apply changed timeouts to the running listener, not only the
+// server context.
+#[tokio::test]
+async fn test_hot_reload_updates_timeouts() {
+    let listener_config = InsecureListenerConfig::default();
+    let context = create_test_server_context().await;
+    let listener = InsecureListener::new(&listener_config, context);
+    assert_eq!(listener.current_timeouts().query, Duration::from_hours(1));
+
+    let mut reloaded = InsecureListenerConfig::default();
+    reloaded.base.query_timeout = NonZeroU64::new(10).unwrap();
+    reloaded.base.query_timeout_grace_period = NonZeroU64::new(5).unwrap();
+    listener.notify_config_change(&reloaded, create_test_server_context().await);
+
+    assert_eq!(listener.current_timeouts().query, Duration::from_secs(10));
+    assert_eq!(listener.current_timeouts().grace, Duration::from_secs(5));
 }
 
 #[tokio::test]
@@ -350,7 +368,7 @@ async fn test_hot_reload_in_flight_delivery_not_disrupted() {
     let old_context = Arc::clone(&listener.current_context());
 
     let context_new = create_context_with_webhook(&server_new.uri()).await;
-    listener.notify_config_change(context_new);
+    listener.notify_config_change(&listener_config, context_new);
 
     old_context
         .registry
