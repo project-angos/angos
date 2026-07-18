@@ -102,10 +102,10 @@ async fn test_build_metadata_store_filesystem_success() {
 #[tokio::test]
 async fn test_build_repository_with_upstream() {
     let repo_config = repository::Config {
-        access_policy: AccessPolicyConfig {
+        access_policy: Some(AccessPolicyConfig {
             default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
-        },
+        }),
         upstream: vec![repository::RegistryClientConfig {
             username: Some("testuser".to_string()),
             password: Some(Secret::new("testpass".to_string())),
@@ -130,10 +130,10 @@ async fn test_build_repository_with_upstream() {
 #[tokio::test]
 async fn test_build_repository_with_immutable_tags() {
     let repo_config = repository::Config {
-        access_policy: AccessPolicyConfig {
+        access_policy: Some(AccessPolicyConfig {
             default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
-        },
+        }),
         immutable_tags: true,
         immutable_tags_exclusions: vec![
             configuration::RegexPattern::compile("latest").unwrap(),
@@ -158,10 +158,10 @@ async fn test_build_repository_with_immutable_tags() {
 #[tokio::test]
 async fn test_build_repositories_single() {
     let repo_config = repository::Config {
-        access_policy: AccessPolicyConfig {
+        access_policy: Some(AccessPolicyConfig {
             default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
-        },
+        }),
         ..repository::Config::default()
     };
     let mut configs = HashMap::new();
@@ -181,10 +181,10 @@ async fn test_build_repositories_single() {
 #[tokio::test]
 async fn test_build_repositories_multiple() {
     let repo_config = repository::Config {
-        access_policy: AccessPolicyConfig {
+        access_policy: Some(AccessPolicyConfig {
             default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
-        },
+        }),
         ..repository::Config::default()
     };
     let mut configs = HashMap::new();
@@ -312,17 +312,17 @@ async fn test_build_registry_components_integration() {
 #[tokio::test]
 async fn test_build_repositories_with_different_configs() {
     let repo_config1 = repository::Config {
-        access_policy: AccessPolicyConfig {
+        access_policy: Some(AccessPolicyConfig {
             default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
-        },
+        }),
         ..repository::Config::default()
     };
     let repo_config2 = repository::Config {
-        access_policy: AccessPolicyConfig {
+        access_policy: Some(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![CelRule::compile("identity.username == 'admin'").unwrap()],
-        },
+        }),
         ..repository::Config::default()
     };
 

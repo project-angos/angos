@@ -621,6 +621,40 @@ async fn global_deny_policy_rejects_all_requests() {
     );
 }
 
+// An explicit repository policy of `default = "deny"` with no rules must deny
+// every namespaced request; only an absent policy table means "no repository
+// policy", never a deny-all sentinel.
+#[tokio::test]
+async fn repository_deny_all_policy_rejects_namespaced_request() {
+    let config = load_config(
+        r#"
+            [global.access_policy]
+            default = "allow"
+
+            [repository.myrepo.access_policy]
+            default = "deny"
+        "#,
+    );
+
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
+
+    let route = Action::GetManifest {
+        namespace: Namespace::new("myrepo/app").unwrap(),
+        reference: Reference::from_str("latest").unwrap(),
+    };
+    let identity = ClientIdentity::new(None);
+    let parts = parts_with_uri("/v2/");
+
+    let result = authorizer
+        .authorize_request(&route, &identity, &parts, &registry)
+        .await;
+
+    assert!(
+        matches!(result, Err(AuthError::Unauthorized(_))),
+        "an explicit deny-all repository policy must deny, got: {result:?}"
+    );
+}
+
 // Global allow policy + global webhook returning 200 → request allowed.
 //
 // `Action::ApiVersion` carries no namespace, so `authorize_request` takes the
