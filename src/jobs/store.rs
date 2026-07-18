@@ -968,7 +968,6 @@ impl JobStore {
             };
             if let Some(session) = self
                 .store
-                .executor()
                 .try_acquire(&[job_lock_key(&envelope.lock_key)])
                 .await
                 .map_err(tx_error_to_job)?

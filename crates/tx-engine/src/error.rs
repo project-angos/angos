@@ -37,3 +37,12 @@ pub enum Error {
     #[error("builder error: {0}")]
     Build(String),
 }
+
+impl Error {
+    /// `true` for the outcomes a retry loop should re-attempt against a fresh
+    /// read: [`Error::Conflict`] and [`Error::Precondition`].
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        matches!(self, Error::Conflict | Error::Precondition)
+    }
+}

@@ -116,13 +116,13 @@ impl MetadataStore {
     /// (unreferenced delete) and against concurrent manifest pushes, which
     /// declare the same coarse lock on their link transactions.
     ///
-    /// Lives on the METADATA executor, the one domain every blob-data
+    /// Lives on the METADATA engine, the one domain every blob-data
     /// participant (manifest push, upload, scrub) agrees on, even though the
     /// bytes may be mutated on the separate BLOB engine, so the pairing can't
     /// drift.
     pub async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockSession, Error> {
         let keys = [blob_data_lock_key(digest)];
-        self.executor()
+        self.store
             .acquire(&keys)
             .await
             .map_err(|e| Error::Internal(format!("blob-data lock acquire failed: {e}")))

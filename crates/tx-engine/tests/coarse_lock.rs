@@ -15,6 +15,7 @@ use angos_storage::{MemoryObjectStore, ObjectStore};
 
 use angos_tx_engine::{
     executor::TransactionExecutor,
+    lock::primitive::Lock,
     transaction::{Mutation, Transaction},
 };
 
@@ -43,8 +44,8 @@ fn tx_put_if_absent() -> Transaction {
 }
 
 /// Two transactions sharing a coarse lock must serialise: while one holds the
-/// lock, the other's `try_acquire` on the same key must return `None`.
-async fn assert_coarse_lock_serialises<E>(executor: Arc<E>)
+/// lock, a `try_acquire` on the same key must return `None`.
+async fn assert_coarse_lock_serialises<E>(executor: Arc<E>, lock: Arc<Lock>)
 where
     E: TransactionExecutor + Send + Sync + 'static,
 {
@@ -52,10 +53,10 @@ where
 
     // Hold the coarse lock from a probe task; while held, the other side
     // must observe the contention.
-    let probe_executor = executor.clone();
+    let probe_lock = lock.clone();
     let barrier_probe = barrier.clone();
     let probe = tokio::spawn(async move {
-        let session = probe_executor
+        let session = probe_lock
             .acquire(&[COARSE_KEY.to_string()])
             .await
             .expect("probe acquire");
@@ -67,7 +68,7 @@ where
     });
 
     barrier.wait().await;
-    let attempt = executor
+    let attempt = lock
         .try_acquire(&[COARSE_KEY.to_string()])
         .await
         .expect("try_acquire infallible");
@@ -93,15 +94,17 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coarse_lock_serialises_under_locked_executor() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = test_util::locked_executor(store, test_util::memory_lock());
-    assert_coarse_lock_serialises(executor).await;
+    let lock = test_util::memory_lock();
+    let executor = test_util::locked_executor(store, lock.clone());
+    assert_coarse_lock_serialises(executor, lock).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coarse_lock_serialises_under_cas_executor() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = test_util::cas_executor(store, test_util::memory_lock());
-    assert_coarse_lock_serialises(executor).await;
+    let lock = test_util::memory_lock();
+    let executor = test_util::cas_executor(store, lock.clone());
+    assert_coarse_lock_serialises(executor, lock).await;
 }
 
 /// The CAS executor takes no transaction-scoped lock for its working set, but

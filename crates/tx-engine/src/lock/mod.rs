@@ -159,17 +159,12 @@ impl Drop for LockSession {
 /// [`S3LockStorage`]. Not held as a field on any runtime struct.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct S3LockConfig {
-    #[serde(
-        default = "S3LockConfig::default_ttl_secs",
-        deserialize_with = "deserialize_ttl_secs"
-    )]
+    /// Lock TTL in seconds; the bounds are enforced when the lock is built.
+    #[serde(default = "S3LockConfig::default_ttl_secs")]
     pub ttl_secs: u64,
     #[serde(default = "S3LockConfig::default_max_retries")]
     pub max_retries: u32,
-    #[serde(
-        default = "S3LockConfig::default_retry_delay_ms",
-        deserialize_with = "deserialize_retry_delay_ms"
-    )]
+    #[serde(default = "S3LockConfig::default_retry_delay_ms")]
     pub retry_delay_ms: u64,
     #[serde(default = "S3LockConfig::default_max_hold_secs")]
     pub max_hold_secs: u64,
@@ -182,28 +177,6 @@ pub struct S3LockConfig {
     /// Maximum attempts per storage operation. Defaults to 2.
     #[serde(default = "S3LockConfig::default_max_attempts")]
     pub max_attempts: u32,
-}
-
-fn deserialize_ttl_secs<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<u64, D::Error> {
-    let value = u64::deserialize(deserializer)?;
-    if value < 9 {
-        return Err(serde::de::Error::custom("ttl_secs must be at least 9"));
-    }
-    Ok(value)
-}
-
-fn deserialize_retry_delay_ms<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<u64, D::Error> {
-    let value = u64::deserialize(deserializer)?;
-    if value < 1 {
-        return Err(serde::de::Error::custom(
-            "retry_delay_ms must be at least 1",
-        ));
-    }
-    Ok(value)
 }
 
 impl S3LockConfig {
