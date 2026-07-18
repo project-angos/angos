@@ -4,9 +4,41 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         Error,
+        blob_store::BlobStore,
         metadata_store::{BlobIndexOperation, LinkKind, MetadataStore},
     },
 };
+
+/// Promote the upload session's staged bytes to the canonical blob path and
+/// grant `namespace` its reference, both under the `blob-data:{digest}` lock so
+/// a concurrent reclaim cannot interleave with either step. Promotion is
+/// skipped when the bytes already landed (a racer won), per
+/// [`BlobStore::complete_upload`]'s contract; the grant is idempotent.
+pub async fn promote_and_grant(
+    blob_store: &BlobStore,
+    metadata_store: &MetadataStore,
+    namespace: &Namespace,
+    session_key: &str,
+    digest: &Digest,
+) -> Result<(), Error> {
+    metadata_store
+        .with_blob_data_lock(digest, async {
+            match blob_store.size(digest).await {
+                Ok(_) => {}
+                Err(Error::BlobUnknown | Error::NotFound) => {
+                    blob_store
+                        .complete_upload(namespace, session_key, digest)
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
+
+            BlobOwnership::new(metadata_store)
+                .grant(namespace, digest)
+                .await
+        })
+        .await
+}
 
 pub struct BlobOwnership<'a> {
     metadata_store: &'a MetadataStore,
