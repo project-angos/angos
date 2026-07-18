@@ -279,8 +279,7 @@ impl Lock {
                     lock_metrics().record_acquisition(label, "error");
                     return Err(e);
                 }
-                AcquireAllOutcome::Retry { acquired } => {
-                    self.release_paths(&acquired).await;
+                AcquireAllOutcome::Retry => {
                     if retries == 0 {
                         lock_metrics().observe_acquisition_duration(label, elapsed_ms(start));
                         lock_metrics().record_acquisition(label, "timeout");
@@ -329,8 +328,7 @@ impl Lock {
                 lock_metrics().record_acquisition(label, "error");
                 Err(e)
             }
-            AcquireAllOutcome::Retry { acquired } => {
-                self.release_paths(&acquired).await;
+            AcquireAllOutcome::Retry => {
                 lock_metrics().record_acquisition(label, "timeout");
                 Ok(None)
             }
@@ -339,9 +337,12 @@ impl Lock {
 
     // internal helpers
 
+    /// Acquire every key in order, rolling back on failure: any non-acquired
+    /// outcome releases the already-acquired paths here, so callers never own
+    /// cleanup.
     async fn try_acquire_all_sequential(&self, sorted_keys: &[String]) -> AcquireAllOutcome {
         // Acquired (path, etag) pairs, in acquisition order, so a failed
-        // multi-key attempt can conditionally roll back exactly what it wrote.
+        // multi-key attempt rolls back exactly what it wrote.
         let mut acquired: Vec<(String, String)> = Vec::new();
 
         for key in sorted_keys {
@@ -357,9 +358,11 @@ impl Lock {
                         }
                         Ok(None) => {
                             // Still held or lost the recovery race.
-                            return AcquireAllOutcome::Retry { acquired };
+                            self.release_paths(&acquired).await;
+                            return AcquireAllOutcome::Retry;
                         }
                         Err(e) => {
+                            self.release_paths(&acquired).await;
                             return AcquireAllOutcome::HardError(e);
                         }
                     }
@@ -712,7 +715,7 @@ async fn release_single_path(storage: &dyn LockStorage, path: &str, cached_etag:
 enum AcquireAllOutcome {
     Acquired(HashMap<String, String>),
     HardError(Error),
-    Retry { acquired: Vec<(String, String)> },
+    Retry,
 }
 
 // tests
@@ -720,7 +723,7 @@ enum AcquireAllOutcome {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         sync::{
             Arc, Mutex, RwLock,
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -782,6 +785,9 @@ mod tests {
         get: Mutex<Option<GetScript>>,
         /// When set, `put_if_absent` reports `AlreadyExists`; otherwise `Created`.
         put_absent_exists: Mutex<bool>,
+        /// Keys for which `put_if_absent` reports `AlreadyExists` regardless of
+        /// the global flag, for multi-key scenarios with one contended key.
+        put_absent_exists_keys: Mutex<HashSet<String>>,
         /// When set, `put_if_absent` returns a hard error.
         put_absent_error: Mutex<bool>,
         put_match_calls: AtomicUsize,
@@ -820,6 +826,13 @@ mod tests {
             *self.put_absent_exists.lock().unwrap() = exists;
         }
 
+        fn set_put_absent_exists_for(&self, key: &str) {
+            self.put_absent_exists_keys
+                .lock()
+                .unwrap()
+                .insert(key.to_string());
+        }
+
         fn body_bytes(expired: bool) -> Vec<u8> {
             let refreshed_at = if expired {
                 Utc::now() - ChronoDuration::seconds(120)
@@ -839,13 +852,15 @@ mod tests {
     impl LockStorage for FakeLockStorage {
         async fn put_if_absent(
             &self,
-            _key: &str,
+            key: &str,
             _body: Vec<u8>,
         ) -> Result<PutIfAbsentOutcome, Error> {
             if *self.put_absent_error.lock().unwrap() {
                 return Err(Error::StorageBackend("injected put_if_absent error".into()));
             }
-            if *self.put_absent_exists.lock().unwrap() {
+            if *self.put_absent_exists.lock().unwrap()
+                || self.put_absent_exists_keys.lock().unwrap().contains(key)
+            {
                 Ok(PutIfAbsentOutcome::AlreadyExists)
             } else {
                 Ok(PutIfAbsentOutcome::Created(self.mint_etag()))
@@ -1258,6 +1273,51 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Lock(_))),
             "a continuously-held lock must error after the retry budget is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_releases_acquired_keys_when_stale_recovery_hard_errors() {
+        // Key "a" acquires; key "b" is contended and its stale-recovery read
+        // hard-errors. The failed attempt must roll back "a" instead of
+        // leaking it until TTL.
+        let storage = FakeLockStorage::arc();
+        storage.set_put_absent_exists_for("b");
+        storage.set_get(GetScript::Failure);
+        let lock = lock_with(storage.clone());
+
+        let result = lock.acquire(&["a".to_string(), "b".to_string()]).await;
+        assert!(matches!(result, Err(Error::StorageBackend(_))));
+        assert_eq!(
+            storage.delete_if_match_calls.load(Ordering::Relaxed),
+            1,
+            "the already-acquired key must be released on the hard-error path"
+        );
+        assert_eq!(
+            storage.last_delete_etag.lock().unwrap().as_deref(),
+            Some("\"etag-0\""),
+            "the release must target the etag minted for the acquired key"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_acquire_releases_acquired_keys_when_other_key_contended() {
+        // Key "a" acquires; key "b" is held and fresh. The contended attempt
+        // must roll back "a" before reporting None.
+        let storage = FakeLockStorage::arc();
+        storage.set_put_absent_exists_for("b");
+        storage.set_get(GetScript::Fresh);
+        let lock = lock_with(storage.clone());
+
+        let session = lock
+            .try_acquire(&["a".to_string(), "b".to_string()])
+            .await
+            .expect("no hard error");
+        assert!(session.is_none(), "a held key must yield None");
+        assert_eq!(
+            storage.delete_if_match_calls.load(Ordering::Relaxed),
+            1,
+            "the already-acquired key must be released on the contended path"
         );
     }
 
