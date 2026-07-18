@@ -29,6 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Delete and reclaim decisions no longer treat a failed blob-index read as an absent index: a corrupt shard fails the transaction and a prune revision whose index read errors is skipped, instead of either green-lighting deletion.
+- A repository access policy written as `default = "deny"` with no rules now denies as configured; it was previously indistinguishable from an absent policy and silently ignored.
 - Concurrent pushes sharing a layer no longer strand a blob-index shard update as a permanent partial commit that the recovery loop logged "precondition failed" for on every sweep; shard updates are now idempotent merges that converge under contention.
 - The recovery loop now abandons a committed transaction that stays unreconcilable past a one-hour grace instead of replaying it forever, clearing legacy stranded intents after upgrade; the blob index is reconciled by `angos scrub`.
 - The web UI could not display a manifest or download a blob when redirects were enabled, because a browser cannot follow the cross-origin redirect to a pre-signed S3 URL; GET requests carrying the `X-Angos-No-Redirect` header are now served inline.

@@ -177,8 +177,9 @@ fn test_repository_config() {
             .map(|p| p.expose().as_str()),
         Some("secret")
     );
-    assert_eq!(repo.access_policy.default, AccessMode::Allow);
-    assert_eq!(repo.access_policy.rules.len(), 1);
+    let access_policy = repo.access_policy.as_ref().unwrap();
+    assert_eq!(access_policy.default, AccessMode::Allow);
+    assert_eq!(access_policy.rules.len(), 1);
     assert_eq!(repo.retention_policy.rules.len(), 1);
     assert!(repo.immutable_tags);
     assert_eq!(repo.immutable_tags_exclusions.len(), 1);

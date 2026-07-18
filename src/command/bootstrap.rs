@@ -321,10 +321,10 @@ mod tests {
     #[tokio::test]
     async fn repository_with_default_config_succeeds() {
         let repo_config = repository::Config {
-            access_policy: AccessPolicyConfig {
+            access_policy: Some(AccessPolicyConfig {
                 default: AccessMode::Allow,
                 ..AccessPolicyConfig::default()
-            },
+            }),
             ..repository::Config::default()
         };
         let cache = auth_cache(&cache::Config::Memory).unwrap();
@@ -354,20 +354,20 @@ mod tests {
         configs.insert(
             "team".to_string(),
             repository::Config {
-                access_policy: AccessPolicyConfig {
+                access_policy: Some(AccessPolicyConfig {
                     default: AccessMode::Allow,
                     ..AccessPolicyConfig::default()
-                },
+                }),
                 ..repository::Config::default()
             },
         );
         configs.insert(
             "team/app".to_string(),
             repository::Config {
-                access_policy: AccessPolicyConfig {
+                access_policy: Some(AccessPolicyConfig {
                     default: AccessMode::Allow,
                     ..AccessPolicyConfig::default()
-                },
+                }),
                 ..repository::Config::default()
             },
         );

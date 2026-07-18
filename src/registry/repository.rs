@@ -196,8 +196,7 @@ pub struct Config {
     pub upstream: Vec<RegistryClientConfig>,
     #[serde(default)]
     pub downstream: Vec<ReplicationDownstreamConfig>,
-    #[serde(default)]
-    pub access_policy: AccessPolicyConfig,
+    pub access_policy: Option<AccessPolicyConfig>,
     #[serde(default)]
     pub retention_policy: RetentionPolicyConfig,
     #[serde(default)]

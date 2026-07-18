@@ -12,7 +12,7 @@ use crate::{
     http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
     oci::{Namespace, Tag},
-    policy::{AccessMode, PolicyDecision},
+    policy::PolicyDecision,
     registry::{AccessPolicy, BlobMount, Registry},
 };
 
@@ -358,13 +358,7 @@ fn build_repositories(
 ) -> Result<HashMap<String, AuthorizerRepository>, Error> {
     let mut repositories = HashMap::with_capacity(config.repository.len());
     for (name, repo_config) in &config.repository {
-        let access_policy = if repo_config.access_policy.rules.is_empty()
-            && repo_config.access_policy.default == AccessMode::Deny
-        {
-            None
-        } else {
-            Some(AccessPolicy::new(repo_config.access_policy.clone()))
-        };
+        let access_policy = repo_config.access_policy.clone().map(AccessPolicy::new);
 
         let authorization_webhook = repo_config
             .authorization_webhook
