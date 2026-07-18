@@ -40,7 +40,6 @@ use crate::{
 /// applied inline and no writer is spun up.
 pub fn build_writer(
     store: &Arc<Store>,
-    link_cache_ttl: u64,
     debounce_secs: u64,
 ) -> (Option<AccessTimeWriter>, Option<Arc<FlushHandle>>) {
     if debounce_secs == 0 {
@@ -49,15 +48,9 @@ pub fn build_writer(
 
     let writer = AccessTimeWriter::new();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let flush_backend = MetadataStore {
-        store: store.clone(),
-        cache: None,
-        link_cache_ttl,
-        access_time_writer: Some(writer.clone()),
-        _flush_handle: None,
-    };
     spawn_flush_task(
-        flush_backend,
+        store.clone(),
+        writer.clone(),
         shutdown.clone(),
         Duration::from_secs(debounce_secs),
     );
@@ -65,11 +58,16 @@ pub fn build_writer(
     (Some(writer), Some(Arc::new(FlushHandle::new(shutdown))))
 }
 
-fn spawn_flush_task(flush_backend: MetadataStore, shutdown: Arc<AtomicBool>, interval: Duration) {
+fn spawn_flush_task(
+    store: Arc<Store>,
+    writer: AccessTimeWriter,
+    shutdown: Arc<AtomicBool>,
+    interval: Duration,
+) {
     spawn(async move {
         loop {
             sleep(interval).await;
-            flush_backend.flush_access_times().await;
+            writer.flush(&store).await;
             if shutdown.load(Ordering::Acquire) {
                 return;
             }
@@ -99,7 +97,7 @@ impl AccessTimeWriter {
             .insert(key, (namespace.clone(), link.clone()));
     }
 
-    pub async fn flush(&self, backend: &MetadataStore) {
+    pub async fn flush(&self, store: &Store) {
         let entries: Vec<(Namespace, LinkKind)> = {
             let mut pending = self.pending.lock().await;
             pending.drain().map(|(_, v)| v).collect()
@@ -107,7 +105,7 @@ impl AccessTimeWriter {
 
         stream::iter(entries)
             .for_each_concurrent(10, |(namespace, link)| async move {
-                if let Err(e) = backend.flush_one_access_time(&namespace, &link).await {
+                if let Err(e) = flush_one_access_time(store, &namespace, &link).await {
                     warn!("Failed to flush access time for {namespace}:{link}: {e}");
                 }
             })
@@ -156,7 +154,7 @@ impl MetadataStore {
 
     pub async fn flush_access_times(&self) {
         if let Some(writer) = &self.access_time_writer {
-            writer.flush(self).await;
+            writer.flush(self.store()).await;
         }
     }
 
@@ -181,47 +179,47 @@ impl MetadataStore {
             .await
             .map_err(Error::from)
     }
+}
 
-    /// Flush a single access-time update via a read-modify-write transaction.
-    ///
-    /// A content-hash read guard lets a concurrent writer's fresher timestamp win
-    /// on conflict; access times are advisory, so a `Conflict` after the retry
-    /// budget is silently discarded.
-    async fn flush_one_access_time(
-        &self,
-        namespace: &Namespace,
-        link: &LinkKind,
-    ) -> Result<(), Error> {
-        let link_path = path_builder::link_path(link, namespace);
-        let keys = [link_path.clone()];
-        self.store()
-            .update(
-                &keys,
-                |snaps| {
-                    let link_path = link_path.clone();
-                    async move {
-                        let snap = &snaps[0];
-                        // Link vanished: nothing to stamp. An empty mutation set
-                        // commits a no-op transaction.
-                        if !snap.present {
-                            return Ok(Vec::new());
-                        }
-                        let link_data = serde_json::from_slice::<LinkMetadata>(&snap.body)
-                            .map_err(|e| TxError::Build(e.to_string()))?
-                            .accessed();
-                        let serialized =
-                            Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
-                        Ok(vec![Mutation::Put {
-                            key: link_path,
-                            body: serialized,
-                            expected: None,
-                        }])
+/// Flush a single access-time update via a read-modify-write transaction.
+///
+/// A content-hash read guard lets a concurrent writer's fresher timestamp win
+/// on conflict; access times are advisory, so a `Conflict` after the retry
+/// budget is silently discarded.
+async fn flush_one_access_time(
+    store: &Store,
+    namespace: &Namespace,
+    link: &LinkKind,
+) -> Result<(), Error> {
+    let link_path = path_builder::link_path(link, namespace);
+    let keys = [link_path.clone()];
+    store
+        .update(
+            &keys,
+            |snaps| {
+                let link_path = link_path.clone();
+                async move {
+                    let snap = &snaps[0];
+                    // Link vanished: nothing to stamp. An empty mutation set
+                    // commits a no-op transaction.
+                    if !snap.present {
+                        return Ok(Vec::new());
                     }
-                },
-                DEFAULT_RETRY_BUDGET,
-            )
-            .await
-            .map(|_| ())
-            .map_err(Error::from)
-    }
+                    let link_data = serde_json::from_slice::<LinkMetadata>(&snap.body)
+                        .map_err(|e| TxError::Build(e.to_string()))?
+                        .accessed();
+                    let serialized =
+                        Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
+                    Ok(vec![Mutation::Put {
+                        key: link_path,
+                        body: serialized,
+                        expected: None,
+                    }])
+                }
+            },
+            DEFAULT_RETRY_BUDGET,
+        )
+        .await
+        .map(|_| ())
+        .map_err(Error::from)
 }

@@ -72,11 +72,8 @@ impl Builder {
 
     #[must_use]
     pub fn build(self) -> MetadataStore {
-        let (access_time_writer, flush_handle) = access_time::build_writer(
-            &self.store,
-            self.link_cache_ttl,
-            self.access_time_debounce_secs,
-        );
+        let (access_time_writer, flush_handle) =
+            access_time::build_writer(&self.store, self.access_time_debounce_secs);
 
         MetadataStore {
             store: self.store,
