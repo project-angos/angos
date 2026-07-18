@@ -22,7 +22,7 @@ use crate::{
     metrics_provider,
     oci::{Algorithm, Descriptor, Digest, MediaType, Namespace, Tag},
     registry::{
-        Error,
+        Error, Registry,
         metadata_store::{LinkKind, LinkMetadata, LinkOperation, MetadataStore},
         path_builder,
         s3_connection::S3ConnectionConfig,
@@ -289,7 +289,8 @@ pub async fn test_datastore_delete_tag_directory_guards_unsafe_names(m: Arc<Meta
     );
 }
 
-pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
+pub async fn test_datastore_list_referrers(registry: &Registry) {
+    let m = registry.metadata_store.clone();
     let namespace = &Namespace::new("test-repo").unwrap();
     let base_digest = put_blob_direct(m.store(), b"base manifest content").await;
     let base_link = LinkKind::Digest(base_digest.clone());
@@ -326,7 +327,7 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
 
     create_link(&m, namespace, &referrers_link, &referrer_digest).await;
 
-    let referrers = m.list_referrers(namespace, &base_digest, None).await;
+    let referrers = registry.list_referrers(namespace, &base_digest, None).await;
 
     let expected = vec![Descriptor {
         media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
@@ -339,7 +340,7 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
 
     assert_eq!(referrers.unwrap(), expected);
 
-    let filtered_referrers = m
+    let filtered_referrers = registry
         .list_referrers(
             namespace,
             &base_digest,
@@ -350,7 +351,7 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
 
     assert!(!filtered_referrers.is_empty());
 
-    let non_matching_referrers = m
+    let non_matching_referrers = registry
         .list_referrers(
             namespace,
             &base_digest,
@@ -459,7 +460,7 @@ async fn test_delete_tag_directory_guards_unsafe_names() {
 #[tokio::test]
 async fn test_list_referrers() {
     for_each_backend(async |test_case| {
-        test_datastore_list_referrers(test_case.metadata_store()).await;
+        test_datastore_list_referrers(test_case.registry()).await;
     })
     .await;
 }
@@ -840,7 +841,8 @@ async fn test_read_link_concurrent_readonly() {
     .await;
 }
 
-pub async fn test_datastore_list_referrers_parallel_correctness(m: Arc<MetadataStore>) {
+pub async fn test_datastore_list_referrers_parallel_correctness(registry: &Registry) {
+    let m = registry.metadata_store.clone();
     let namespace = &Namespace::new("test-referrers-parallel").unwrap();
     let subject_digest = put_blob_direct(m.store(), b"subject manifest content").await;
     let subject_link = LinkKind::Digest(subject_digest.clone());
@@ -878,7 +880,7 @@ pub async fn test_datastore_list_referrers_parallel_correctness(m: Arc<MetadataS
         referrer_digests.push(referrer_digest);
     }
 
-    let descriptors = m
+    let descriptors = registry
         .list_referrers(namespace, &subject_digest, None)
         .await
         .unwrap();
@@ -900,7 +902,8 @@ pub async fn test_datastore_list_referrers_parallel_correctness(m: Arc<MetadataS
     }
 }
 
-pub async fn test_datastore_list_referrers_with_artifact_type_filter(m: Arc<MetadataStore>) {
+pub async fn test_datastore_list_referrers_with_artifact_type_filter(registry: &Registry) {
+    let m = registry.metadata_store.clone();
     let namespace = &Namespace::new("test-referrers-filter").unwrap();
     let subject_digest = put_blob_direct(m.store(), b"subject manifest for filter test").await;
     let subject_link = LinkKind::Digest(subject_digest.clone());
@@ -964,7 +967,7 @@ pub async fn test_datastore_list_referrers_with_artifact_type_filter(m: Arc<Meta
         create_link(&m, namespace, &referrer_link, &referrer_digest).await;
     }
 
-    let descriptors = m
+    let descriptors = registry
         .list_referrers(
             namespace,
             &subject_digest,
@@ -989,7 +992,8 @@ pub async fn test_datastore_list_referrers_with_artifact_type_filter(m: Arc<Meta
     }
 }
 
-pub async fn test_datastore_list_referrers_deterministic_order(m: Arc<MetadataStore>) {
+pub async fn test_datastore_list_referrers_deterministic_order(registry: &Registry) {
+    let m = registry.metadata_store.clone();
     let namespace = &Namespace::new("test-referrers-order").unwrap();
     let subject_digest = put_blob_direct(m.store(), b"subject manifest for order test").await;
     let subject_link = LinkKind::Digest(subject_digest.clone());
@@ -1024,15 +1028,15 @@ pub async fn test_datastore_list_referrers_deterministic_order(m: Arc<MetadataSt
         create_link(&m, namespace, &referrer_link, &referrer_digest).await;
     }
 
-    let result1 = m
+    let result1 = registry
         .list_referrers(namespace, &subject_digest, None)
         .await
         .unwrap();
-    let result2 = m
+    let result2 = registry
         .list_referrers(namespace, &subject_digest, None)
         .await
         .unwrap();
-    let result3 = m
+    let result3 = registry
         .list_referrers(namespace, &subject_digest, None)
         .await
         .unwrap();
@@ -1065,7 +1069,7 @@ pub async fn test_datastore_list_referrers_deterministic_order(m: Arc<MetadataSt
 #[tokio::test]
 async fn test_list_referrers_parallel_correctness() {
     for_each_backend(async |test_case| {
-        test_datastore_list_referrers_parallel_correctness(test_case.metadata_store()).await;
+        test_datastore_list_referrers_parallel_correctness(test_case.registry()).await;
     })
     .await;
 }
@@ -1073,7 +1077,7 @@ async fn test_list_referrers_parallel_correctness() {
 #[tokio::test]
 async fn test_list_referrers_with_artifact_type_filter() {
     for_each_backend(async |test_case| {
-        test_datastore_list_referrers_with_artifact_type_filter(test_case.metadata_store()).await;
+        test_datastore_list_referrers_with_artifact_type_filter(test_case.registry()).await;
     })
     .await;
 }
@@ -1081,7 +1085,7 @@ async fn test_list_referrers_with_artifact_type_filter() {
 #[tokio::test]
 async fn test_list_referrers_deterministic_order() {
     for_each_backend(async |test_case| {
-        test_datastore_list_referrers_deterministic_order(test_case.metadata_store()).await;
+        test_datastore_list_referrers_deterministic_order(test_case.registry()).await;
     })
     .await;
 }
@@ -1874,7 +1878,8 @@ async fn test_link_without_media_type_has_none() {
     .await;
 }
 
-pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<MetadataStore>) {
+pub async fn test_datastore_list_referrers_with_stored_descriptor(registry: &Registry) {
+    let m = registry.metadata_store.clone();
     let namespace = &Namespace::new("test-stored-descriptor").unwrap();
 
     // Create a base manifest blob that the referrers will reference
@@ -1912,7 +1917,7 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
     .unwrap();
 
     // list_referrers should return the stored descriptor without reading a blob
-    let referrers = m
+    let referrers = registry
         .list_referrers(namespace, &base_digest, None)
         .await
         .unwrap();
@@ -1920,7 +1925,7 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
     assert_eq!(referrers.len(), 1, "Expected 1 referrer descriptor");
     assert_eq!(referrers[0], descriptor);
 
-    let filtered = m
+    let filtered = registry
         .list_referrers(
             namespace,
             &base_digest,
@@ -1931,7 +1936,7 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
     assert_eq!(filtered.len(), 1, "Should match artifact type filter");
     assert_eq!(filtered[0], descriptor);
 
-    let non_matching = m
+    let non_matching = registry
         .list_referrers(
             namespace,
             &base_digest,
@@ -1948,7 +1953,7 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(m: Arc<Metadat
 #[tokio::test]
 async fn test_list_referrers_with_stored_descriptor() {
     for_each_backend(async |test_case| {
-        test_datastore_list_referrers_with_stored_descriptor(test_case.metadata_store()).await;
+        test_datastore_list_referrers_with_stored_descriptor(test_case.registry()).await;
     })
     .await;
 }

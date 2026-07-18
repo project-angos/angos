@@ -7,20 +7,13 @@ use tracing::{debug, instrument};
 use angos_storage::paginated;
 
 use crate::{
-    oci::{Algorithm, Descriptor, Digest, Namespace, Tag},
+    oci::{Algorithm, Digest, Namespace, Tag},
     registry::{
         Error,
         metadata_store::{LinkKind, MetadataStore},
         pagination, path_builder,
     },
 };
-
-mod referrer_resolver;
-
-/// Fan-out for resolving referrer candidates to descriptors: each candidate is
-/// an independent manifest read, so a bounded window keeps the listing and the
-/// reads overlapped.
-const REFERRER_RESOLVE_CONCURRENCY: usize = 10;
 
 /// Fan-out for the tag link reads behind [`MetadataStore::find_tags_pointing_at`].
 const TAG_LINK_READ_CONCURRENCY: usize = 20;
@@ -168,52 +161,39 @@ impl MetadataStore {
             .await
     }
 
-    #[instrument(skip(self))]
-    pub async fn list_referrers(
+    /// Streams the candidate referrer manifest digests recorded under
+    /// `digest`'s referrers directory, unresolved and unordered. Callers
+    /// resolve each candidate to a descriptor at registry altitude, where the
+    /// blob store holding manifest bodies is in reach.
+    pub fn stream_referrer_digests(
         &self,
         namespace: &Namespace,
         digest: &Digest,
-        artifact_type: Option<String>,
-    ) -> Result<Vec<Descriptor>, Error> {
-        let referrers_dir = &path_builder::manifest_referrers_dir(namespace, digest);
-        let artifact_type = artifact_type.as_ref();
-
-        // Candidate digests stream off the listing while up to
-        // `REFERRER_RESOLVE_CONCURRENCY` of them resolve concurrently, so the
-        // resolution window spans page boundaries and overlaps the page fetches.
-        let mut referrers: Vec<Descriptor> = paginated(|token| async move {
-            let page = self
-                .store()
-                .object_store()
-                .list(referrers_dir, 100, token)
-                .await?;
-            let digest_entries = page
-                .items
-                .iter()
-                .filter_map(|key| {
-                    let parts: Vec<&str> = key.split('/').collect();
-                    if parts.len() < 2 {
-                        return None;
-                    }
-                    let algorithm = parts[0].parse::<Algorithm>().ok()?;
-                    Digest::with_algorithm(algorithm, parts[1]).ok()
-                })
-                .collect();
-            Ok((digest_entries, page.next_token))
+    ) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
+        let referrers_dir = path_builder::manifest_referrers_dir(namespace, digest);
+        paginated(move |token| {
+            let referrers_dir = referrers_dir.clone();
+            async move {
+                let page = self
+                    .store()
+                    .object_store()
+                    .list(&referrers_dir, 100, token)
+                    .await?;
+                let digest_entries = page
+                    .items
+                    .iter()
+                    .filter_map(|key| {
+                        let parts: Vec<&str> = key.split('/').collect();
+                        if parts.len() < 2 {
+                            return None;
+                        }
+                        let algorithm = parts[0].parse::<Algorithm>().ok()?;
+                        Digest::with_algorithm(algorithm, parts[1]).ok()
+                    })
+                    .collect();
+                Ok((digest_entries, page.next_token))
+            }
         })
-        .map_ok(|manifest_digest| async move {
-            Ok::<_, Error>(
-                self.resolve_referrer_descriptor(namespace, digest, manifest_digest, artifact_type)
-                    .await,
-            )
-        })
-        .try_buffer_unordered(REFERRER_RESOLVE_CONCURRENCY)
-        .try_filter_map(|descriptor| async move { Ok(descriptor) })
-        .try_collect()
-        .await?;
-
-        referrers.sort_by(|a, b| a.digest.cmp(&b.digest));
-        Ok(referrers)
     }
 
     pub async fn has_referrers(
