@@ -474,7 +474,10 @@ impl S3Client {
     {
         let attempts = self.max_attempts;
         let fut = async {
-            for attempt in 1..=attempts {
+            // A `loop` (not a bounded `for`) so the final attempt returns its
+            // own result and no post-loop arm is needed.
+            let mut attempt = 1;
+            loop {
                 match request().await {
                     Ok(value) => return Ok(value),
                     // A non-idempotent request is not retried on a status-less
@@ -488,11 +491,11 @@ impl S3Client {
                             && attempt < attempts =>
                     {
                         sleep(self.retry_backoff.delay(attempt - 1)).await;
+                        attempt += 1;
                     }
                     Err(error) => return Err(error),
                 }
             }
-            unreachable!("attempt loop always returns");
         };
         timeout(self.operation_timeout, fut)
             .await

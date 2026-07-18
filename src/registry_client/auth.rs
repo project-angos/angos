@@ -37,8 +37,10 @@ pub fn token_index_cache_key(url: &Url) -> Result<String, Error> {
     Ok(format!("auth-index:{authority}:{}", url.as_str()))
 }
 
-static BEARER_PARAM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(\w+)="([^"]+)""#).unwrap());
+/// `None` only if the literal pattern were malformed; the challenge parser
+/// then degrades to "no bearer challenge" instead of panicking.
+static BEARER_PARAM_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r#"(\w+)="([^"]+)""#).ok());
 
 #[derive(Clone, Debug, Deserialize)]
 struct BearerToken {
@@ -96,7 +98,7 @@ fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
     let bearer_params = header.strip_prefix("Bearer ")?;
     let mut realm: Option<String> = None;
     let mut other: Vec<(String, String)> = Vec::new();
-    for cap in BEARER_PARAM_RE.captures_iter(bearer_params) {
+    for cap in BEARER_PARAM_RE.as_ref()?.captures_iter(bearer_params) {
         let k = cap[1].to_string();
         let v = cap[2].to_string();
         if k == "realm" {
