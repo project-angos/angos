@@ -133,8 +133,8 @@ impl Command {
         let context = ServerContext::new(config, registry)?;
 
         match (&self.listener, &config.server) {
-            (ServiceListener::Insecure(listener), ServerConfig::Insecure(_)) => {
-                listener.notify_config_change(context);
+            (ServiceListener::Insecure(listener), ServerConfig::Insecure(server_config)) => {
+                listener.notify_config_change(server_config, context);
             }
             (ServiceListener::Insecure(listener), ServerConfig::Tls(_)) => {
                 warn!(
@@ -142,7 +142,7 @@ impl Command {
                      restart the server to apply the new listener configuration. \
                      Non-listener changes will still be applied."
                 );
-                listener.notify_config_change(context);
+                listener.store_context(context);
             }
             (ServiceListener::Secure(listener), ServerConfig::Tls(server_config)) => {
                 listener.notify_config_change(server_config, context)?;
