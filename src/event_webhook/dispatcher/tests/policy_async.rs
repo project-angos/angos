@@ -65,3 +65,33 @@ async fn dispatch_async_policy_eventually_delivers() {
         "Async webhook must eventually deliver the request"
     );
 }
+
+#[tokio::test]
+async fn async_deliveries_are_reaped_before_the_next_spawn() {
+    let server = MockServer::start().await;
+    let event = create_test_event();
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let dispatcher =
+        single_hook_dispatcher("async-hook", &server.uri(), DeliveryPolicy::Async, None, 0);
+
+    // Deliveries complete quickly against the mock; each dispatch reaps the
+    // finished tasks first, so the set stays bounded instead of growing by
+    // one entry per event.
+    for _ in 0..20 {
+        dispatcher.dispatch(&event).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let retained = dispatcher.in_flight.lock().await.len();
+    assert!(
+        retained < 20,
+        "completed async deliveries must be reaped, got {retained} retained tasks"
+    );
+
+    dispatcher.shutdown().await;
+}

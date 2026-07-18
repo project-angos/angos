@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A failing required event webhook no longer skips that event's delivery to the remaining endpoints; the failure is surfaced after every matching webhook got its delivery.
+- Async event-webhook deliveries no longer accumulate one finished task handle per event for the life of the server, and their delivery-duration metric now measures the actual delivery instead of the task spawn.
 - A repository access policy written as `default = "deny"` with no rules now denies as configured; it was previously indistinguishable from an absent policy and silently ignored.
 - Concurrent pushes sharing a layer no longer strand a blob-index shard update as a permanent partial commit that the recovery loop logged "precondition failed" for on every sweep; shard updates are now idempotent merges that converge under contention.
 - The recovery loop now abandons a committed transaction that stays unreconcilable past a one-hour grace instead of replaying it forever, clearing legacy stranded intents after upgrade; the blob index is reconciled by `angos scrub`.
