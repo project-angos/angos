@@ -187,6 +187,13 @@ impl Lock {
         self.storage.label()
     }
 
+    /// `true` when the underlying [`LockStorage`] serializes holders across
+    /// processes; see [`LockStorage::is_process_shared`].
+    #[must_use]
+    pub fn is_process_shared(&self) -> bool {
+        self.storage.is_process_shared()
+    }
+
     fn make_body(&self) -> Result<Vec<u8>, Error> {
         let body = LockBody {
             refreshed_at: Utc::now(),
@@ -919,6 +926,10 @@ mod tests {
         fn label(&self) -> &'static str {
             "fake"
         }
+
+        fn is_process_shared(&self) -> bool {
+            false
+        }
     }
 
     fn lock_with(storage: Arc<FakeLockStorage>) -> Lock {
@@ -1477,6 +1488,10 @@ mod tests {
 
         fn label(&self) -> &'static str {
             "concurrency-recording"
+        }
+
+        fn is_process_shared(&self) -> bool {
+            false
         }
     }
 

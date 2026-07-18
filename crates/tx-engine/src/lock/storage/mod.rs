@@ -131,4 +131,9 @@ pub trait LockStorage: Send + Sync + Debug {
 
     /// Returns a human-readable label for metrics / startup logs.
     fn label(&self) -> &'static str;
+
+    /// `true` when lock objects live in storage visible to every process (S3,
+    /// Redis), so separate processes contend on the same locks; `false` for
+    /// process-local storage.
+    fn is_process_shared(&self) -> bool;
 }
