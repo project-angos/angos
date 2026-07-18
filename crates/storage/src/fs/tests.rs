@@ -207,15 +207,13 @@ async fn list_returns_prefix_relative_keys() {
     assert_eq!(page.items, vec!["a".to_string(), "sub/b".to_string()]);
 }
 
-/// `list_all_children` must return every child even when the directory
-/// contains more entries than a single page (`page_size=2` used internally
-/// to exercise the pagination loop).
+/// The FS `list_all_children` override reads the directory once and must
+/// still return every child, separated by kind.
 #[tokio::test]
-async fn list_all_children_returns_all_entries_across_pages() {
+async fn list_all_children_returns_all_entries() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
 
-    // Write five sub-directories' worth of files so we exceed any small page.
     for k in ["ns/a/x", "ns/b/x", "ns/c/x", "ns/d/x", "ns/e/x"] {
         store.put(k, Bytes::from_static(b"v")).await.unwrap();
     }
@@ -231,19 +229,9 @@ async fn list_all_children_returns_all_entries_across_pages() {
             "c".to_string(),
             "d".to_string(),
             "e".to_string(),
-        ],
-        "all sub-prefixes must be returned even across page boundaries"
+        ]
     );
     assert_eq!(objects, vec!["z".to_string()]);
-}
-
-#[tokio::test]
-async fn list_all_children_on_missing_prefix_returns_empty() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    let (sub_prefixes, objects) = store.list_all_children("does/not/exist").await.unwrap();
-    assert!(sub_prefixes.is_empty());
-    assert!(objects.is_empty());
 }
 
 #[tokio::test]

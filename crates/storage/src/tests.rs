@@ -257,6 +257,40 @@ macro_rules! object_store_conformance {
             }
 
             #[tokio::test]
+            async fn list_all_children_is_complete_across_prefix_families() {
+                let (store, _guard) = $fixture;
+                // Names where one is a prefix of another continuing with a
+                // byte below '/': raw S3 key order and bare-name order
+                // disagree for exactly these, so they pin the completeness of
+                // any range-partitioned enumeration.
+                let dirs = ["v", "v1", "v1-rc", "v1.2", "v10", "v2", "x"];
+                for name in dirs {
+                    store
+                        .put(&format!("fam/{name}/leaf"), Bytes::from_static(b"x"))
+                        .await
+                        .unwrap();
+                }
+                store
+                    .put("fam/manifest", Bytes::from_static(b"m"))
+                    .await
+                    .unwrap();
+
+                let (mut sub_prefixes, objects) = store.list_all_children("fam").await.unwrap();
+                sub_prefixes.sort();
+                assert_eq!(sub_prefixes, dirs);
+                assert_eq!(objects, vec!["manifest".to_string()]);
+            }
+
+            #[tokio::test]
+            async fn list_all_children_missing_prefix_returns_empty() {
+                let (store, _guard) = $fixture;
+                let (sub_prefixes, objects) =
+                    store.list_all_children("does/not/exist").await.unwrap();
+                assert!(sub_prefixes.is_empty());
+                assert!(objects.is_empty());
+            }
+
+            #[tokio::test]
             async fn copy_duplicates_object() {
                 let (store, _guard) = $fixture;
                 store

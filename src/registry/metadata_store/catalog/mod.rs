@@ -81,32 +81,31 @@ impl MetadataStore {
         Ok(pagination::paginate_sorted(&tags, n, last.as_deref()))
     }
 
-    /// Streams every valid tag in `namespace` lazily, unsorted; at most one
-    /// listing page is buffered. Tags are validated on write; a malformed
-    /// directory name here is defensive and is dropped rather than surfaced as
-    /// a tag (scrub reports and removes such directories, so the drop is
-    /// silent).
+    /// Streams every valid tag in `namespace`, unsorted, sourced from the
+    /// backend's complete children enumeration (one directory read on FS,
+    /// concurrent name-range scans on S3). Tags are validated on write; a
+    /// malformed directory name here is defensive and is dropped rather than
+    /// surfaced as a tag (scrub reports and removes such directories, so the
+    /// drop is silent).
     pub fn stream_tags(
         &self,
         namespace: &Namespace,
     ) -> impl Stream<Item = Result<Tag, Error>> + Send + '_ {
         let tags_dir = path_builder::manifest_tags_dir(namespace);
-        paginated(move |token| {
-            let tags_dir = tags_dir.clone();
-            async move {
-                let page = self
-                    .store()
-                    .object_store()
-                    .list_children(&tags_dir, 1000, token, None)
-                    .await?;
-                let tags = page
-                    .sub_prefixes
+        stream::once(async move {
+            let (tag_dirs, _) = self
+                .store()
+                .object_store()
+                .list_all_children(&tags_dir)
+                .await?;
+            Ok::<_, Error>(stream::iter(
+                tag_dirs
                     .into_iter()
                     .filter_map(|name| Tag::try_from(name).ok())
-                    .collect();
-                Ok((tags, page.next_token))
-            }
+                    .map(Ok),
+            ))
         })
+        .try_flatten()
     }
 
     /// Lists the RAW tag directory names in `namespace` with NO `Tag`
@@ -132,18 +131,13 @@ impl MetadataStore {
     /// for [`Self::list_tag_names`]'s no-validation contract.
     #[cfg(test)]
     async fn collect_tag_dir_names(&self, namespace: &Namespace) -> Result<Vec<String>, Error> {
-        let tags_dir = &path_builder::manifest_tags_dir(namespace);
-
-        paginated(|token| async move {
-            let page = self
-                .store()
-                .object_store()
-                .list_children(tags_dir, 1000, token, None)
-                .await?;
-            Ok((page.sub_prefixes, page.next_token))
-        })
-        .try_collect()
-        .await
+        let tags_dir = path_builder::manifest_tags_dir(namespace);
+        let (tag_dirs, _) = self
+            .store()
+            .object_store()
+            .list_all_children(&tags_dir)
+            .await?;
+        Ok(tag_dirs)
     }
 
     /// Returns the `LinkKind::Tag` entries in `namespace` that currently point at

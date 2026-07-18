@@ -530,6 +530,10 @@ impl Backend {
         .await
     }
 
+    /// `start_after` is a path-relative key suffix appended to the prefix
+    /// verbatim; the listing starts strictly after that key. Callers wanting
+    /// to skip a whole child directory append the delimiter themselves.
+    ///
     /// # Errors
     /// Forwards [`io::Error`] from [`list_objects_v2_raw`](Self::list_objects_v2_raw)
     /// or a tripped circuit breaker.
@@ -542,7 +546,7 @@ impl Backend {
         start_after: Option<String>,
     ) -> Result<(Vec<String>, Vec<String>, Option<String>), io::Error> {
         let full_prefix = ensure_trailing_slash(self.full_key(path));
-        let full_start_after = start_after.map(|s| format!("{full_prefix}{s}{delimiter}"));
+        let full_start_after = start_after.map(|s| format!("{full_prefix}{s}"));
 
         let res = self
             .list_objects_v2_raw(

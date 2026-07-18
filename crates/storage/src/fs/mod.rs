@@ -37,12 +37,6 @@ use crate::{
     BoxedReader, ByteStream, ChildrenPage, Error, ObjectMeta, ObjectStore, Page, object::dir_prefix,
 };
 
-/// Page step used by [`Backend::list_all_children`] when draining all pages
-/// of a directory listing. 512 is large enough to complete most namespaces in
-/// a single round-trip while staying well within the OS read-dir buffer limits.
-/// It is an internal implementation detail and is not user-tuneable.
-const LIST_ALL_CHILDREN_PAGE_SIZE: u16 = 512;
-
 /// Filename prefix for the temp files [`atomic_write`] creates next to their
 /// target before the rename. These are an implementation detail of atomic
 /// writes and must never be surfaced as objects: a concurrent listing+read
@@ -176,43 +170,6 @@ impl Backend {
             }
             current = parent.parent();
         }
-    }
-
-    /// Enumerate every immediate child name under `prefix`, looping through
-    /// all pages internally until `next_token` is `None`.
-    ///
-    /// Returns separate lists of sub-prefix names and object names,
-    /// both sorted lexicographically. A missing or empty directory yields
-    /// empty lists without an error.
-    ///
-    /// Use this instead of a single `list_children` call whenever you need
-    /// complete enumeration and the number of children is unbounded.
-    ///
-    /// # Errors
-    /// Propagates any I/O error from the underlying directory reads.
-    pub async fn list_all_children(
-        &self,
-        prefix: &str,
-    ) -> Result<(Vec<String>, Vec<String>), Error> {
-        let mut all_sub_prefixes: Vec<String> = Vec::new();
-        let mut all_objects: Vec<String> = Vec::new();
-        let mut token: Option<String> = None;
-
-        loop {
-            let page = self
-                .list_children(prefix, LIST_ALL_CHILDREN_PAGE_SIZE, token, None)
-                .await?;
-            all_sub_prefixes.extend(page.sub_prefixes);
-            all_objects.extend(page.objects);
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
-        }
-
-        all_sub_prefixes.sort();
-        all_objects.sort();
-        Ok((all_sub_prefixes, all_objects))
     }
 }
 
@@ -504,6 +461,22 @@ impl ObjectStore for Backend {
             objects,
             next_token,
         })
+    }
+
+    /// One directory read instead of the default page drain, which re-reads
+    /// the directory once per page.
+    async fn list_all_children(&self, prefix: &str) -> Result<(Vec<String>, Vec<String>), Error> {
+        let entries = read_dir_sorted(&self.full_path(prefix)).await?;
+        let mut sub_prefixes = Vec::new();
+        let mut objects = Vec::new();
+        for (name, file_type) in entries {
+            if file_type.is_dir() {
+                sub_prefixes.push(name);
+            } else {
+                objects.push(name);
+            }
+        }
+        Ok((sub_prefixes, objects))
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {
