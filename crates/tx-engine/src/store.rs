@@ -210,7 +210,7 @@ impl Store {
     /// the backend label.
     #[must_use]
     pub fn lock_is_process_shared(&self) -> bool {
-        self.lock_backend() != "memory"
+        self.lock.is_process_shared()
     }
 
     /// The engine recovery loop as a future that runs until `cancellation`
@@ -494,7 +494,7 @@ mod tests {
 
     use crate::{
         error::Error,
-        lock::LockStrategy,
+        lock::{LockStrategy, S3LockConfig},
         store::Store,
         transaction::{Mutation, Transaction},
     };
@@ -505,6 +505,23 @@ mod tests {
 
     fn cas_store_over(backend: Arc<MemoryObjectStore>) -> Store {
         Store::new(backend.clone(), Some(backend), LockStrategy::Memory, None).expect("store")
+    }
+
+    // The durable job queue gates cross-process coordination on this
+    // capability; it must come from the lock storage, not a display label.
+    #[test]
+    fn lock_is_process_shared_follows_lock_storage() {
+        let backend = Arc::new(MemoryObjectStore::new());
+        assert!(!store_over(backend.clone()).lock_is_process_shared());
+
+        let shared = Store::new(
+            backend.clone(),
+            None,
+            LockStrategy::S3(S3LockConfig::default()),
+            Some(backend),
+        )
+        .expect("store");
+        assert!(shared.lock_is_process_shared());
     }
 
     #[tokio::test]

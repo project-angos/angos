@@ -138,11 +138,14 @@ impl RegistryClientConfig {
     }
 }
 
+/// Resolved basic-auth credentials: `(username, password)`.
+type BasicAuth = (String, Secret<String>);
+
 #[derive(Debug)]
 pub struct RegistryClient {
     pub url: String,
     client: Client,
-    basic_auth: Option<(String, String)>,
+    basic_auth: Option<BasicAuth>,
     cache: Arc<Cache>,
     token_refresh: Mutex<()>,
     max_manifest_size_bytes: usize,
@@ -174,7 +177,7 @@ impl RegistryClient {
     /// the HTTP client cannot be built.
     fn resolve_config_fields(
         config: &RegistryClientConfig,
-    ) -> Result<(Client, Option<(String, String)>), Error> {
+    ) -> Result<(Client, Option<BasicAuth>), Error> {
         let client = HttpClientBuilder::new()
             .rustls_tls()
             .redirect(reqwest::redirect::Policy::limited(
@@ -194,7 +197,7 @@ impl RegistryClient {
             .map_err(Error::Initialization)?;
 
         let basic_auth = match (&config.username, &config.password) {
-            (Some(username), Some(password)) => Some((username.clone(), password.expose().clone())),
+            (Some(username), Some(password)) => Some((username.clone(), password.clone())),
             (Some(_), None) | (None, Some(_)) => {
                 warn!("Username and password must be both provided");
                 None
@@ -567,7 +570,7 @@ impl RegistryClient {
 pub struct RegistryClientBuilder {
     url: String,
     client: Client,
-    basic_auth: Option<(String, String)>,
+    basic_auth: Option<BasicAuth>,
     cache: Arc<Cache>,
     max_manifest_size_bytes: Option<usize>,
 }
@@ -575,7 +578,7 @@ pub struct RegistryClientBuilder {
 impl RegistryClientBuilder {
     /// Optional resolved basic-auth credentials (`username`, `password`).
     #[must_use]
-    pub fn basic_auth(mut self, basic_auth: Option<(String, String)>) -> Self {
+    pub fn basic_auth(mut self, basic_auth: Option<BasicAuth>) -> Self {
         self.basic_auth = basic_auth;
         self
     }

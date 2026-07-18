@@ -245,4 +245,8 @@ impl LockStorage for RedisLockStorage {
     fn label(&self) -> &'static str {
         "redis"
     }
+
+    fn is_process_shared(&self) -> bool {
+        true
+    }
 }

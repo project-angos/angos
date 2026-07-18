@@ -300,6 +300,10 @@ impl LockStorage for S3LockStorage {
     fn label(&self) -> &'static str {
         "s3"
     }
+
+    fn is_process_shared(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
