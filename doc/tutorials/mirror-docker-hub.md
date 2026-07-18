@@ -44,7 +44,7 @@ The `docker-io` repository mirrors all Docker Hub images.
 
 ## Step 2: Add Authentication (Optional but Recommended)
 
-Docker Hub has rate limits for anonymous users. Update your existing `[[repository."docker-io".upstream]]` block with credentials to avoid hitting limits:
+Docker Hub rate-limits pulls, with tighter limits for anonymous users (see [Docker Hub usage limits](https://docs.docker.com/docker-hub/usage/)). Update your existing `[[repository."docker-io".upstream]]` block with credentials to avoid hitting limits:
 
 ```toml
 [[repository."docker-io".upstream]]

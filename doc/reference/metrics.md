@@ -22,7 +22,7 @@ Total number of HTTP requests.
 
 **Labels:**
 - `method`: HTTP method (`GET`, `POST`, `PUT`, `DELETE`, etc.)
-- `route`: Route action (e.g., `get-manifest`, `put-blob`, `list-tags`)
+- `route`: Route action (e.g., `get-manifest`, `get-blob`, `list-tags`)
 - `status`: HTTP status code (`200`, `404`, `500`, etc.)
 
 **Example:**
@@ -87,6 +87,7 @@ The `route` label uses action names from the OCI Distribution API:
 | Route               | Description        |
 |---------------------|--------------------|
 | `healthz`           | Health check       |
+| `readyz`            | Readiness check    |
 | `metrics`           | Prometheus metrics |
 | `get-api-version`   | API version check  |
 | `get-blob`          | Download blob      |
@@ -232,6 +233,36 @@ histogram_quantile(0.95, sum by (webhook, le) (rate(event_webhook_delivery_durat
 
 ---
 
+## Lock Metrics
+
+Distributed-lock operations: acquisition, heartbeat invalidation, and stale-lock recovery. The `backend` label names the configured lock backend; see [Distributed Locking](configuration.md#distributed-locking) for its configuration.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `lock_acquisition_duration_ms` | Histogram | `backend` | Lock acquisition duration in milliseconds |
+| `lock_acquisitions_total` | Counter | `backend`, `result` | Total lock acquisition attempts |
+| `lock_retries_total` | Counter | `backend` | Total lock acquisition retries |
+| `lock_invalidations_total` | Counter | `backend`, `reason` | Total lock invalidations |
+| `lock_recoveries_total` | Counter | `backend`, `result` | Total stale lock recovery attempts |
+
+**Label Values:**
+
+- `backend`: `s3`, `redis`, `memory`
+- `result` (acquisitions): `success`, `timeout`, `error`
+- `result` (recoveries): `success` (stale lock claimed), `lost_race` (another instance claimed it first)
+- `reason` (invalidations): `ownership_lost`, `max_hold_exceeded`, `heartbeat_failure`, `file_disappeared` (both S3 and Redis report transient-failure-driven cancellations as `heartbeat_failure`)
+
+**Example:**
+```promql
+# Lock acquisition failures by backend
+sum by (backend, result) (rate(lock_acquisitions_total{result!="success"}[5m]))
+
+# P95 lock acquisition latency
+histogram_quantile(0.95, rate(lock_acquisition_duration_ms_bucket[5m]))
+```
+
+---
+
 ## Job Queue Metrics
 
 `angos_job_queue_pending` and `angos_job_queue_failed` are published only when
@@ -305,7 +336,7 @@ Total enqueue attempts that did not land on the queue (envelope build or storage
 
 The `angos_job_queue_pending{queue="replication"}` gauge (above) reports
 replication backlog depth; the metrics below cover push outcomes, staleness,
-and scrub reconciliation. See
+and `angos replicate` reconciliation. See
 [Bi-Directional Replication](../explanation/replication.md).
 
 `angos_replication_push_total` and
@@ -364,10 +395,10 @@ Replication reconcile enqueues emitted by `angos replicate`, by outcome.
 **Labels:**
 - `outcome`: `enqueued` (a divergence was enqueued: a push, or a prune delete for a `prune = true` downstream), `failed` (the envelope build or enqueue errored), or `skipped` (a downstream HEAD probe failed, e.g. auth rejection, 5xx, or timeout, so the tag stays unreconciled this pass; a persistently non-zero `skipped` with zero `enqueued` typically means bad downstream credentials)
 
-This counter lives in the `angos scrub` process, which serves no `/metrics`
+This counter lives in the `angos replicate` process, which serves no `/metrics`
 endpoint and exits when the run completes, so Prometheus cannot scrape it. The
 warn-level log lines emitted for failed and skipped tags are the operational
-signal: watch the scrub run's logs (or its exit status) rather than this
+signal: watch the replicate run's logs (or its exit status) rather than this
 counter.
 
 ### Replication Backlog

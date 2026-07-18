@@ -94,8 +94,8 @@ See [Bi-Directional Replication](replication.md) for the full model.
 ### Storage Layer
 
 Abstracted storage backends:
-- **Blob Store**: Large binary content (layers, configs)
-- **Metadata Store**: Manifests, tags, links
+- **Blob Store**: Large binary content (layers, configs, manifest bodies) and in-progress upload sessions
+- **Metadata Store**: Manifest links, tags, blob-index shards
 
 Both can use filesystem or S3, independently configured, but it usually makes sense to use
 the same storage backend for both.
@@ -146,31 +146,44 @@ A client that sends the `X-Angos-No-Redirect` request header is served the body 
 ### Repository Structure
 
 ```
-repository/
-├── namespace/
-│   ├── _manifests/
-│   │   ├── tags/
-│   │   │   └── latest/
-│   │   │       └── link -> sha256:abc123
-│   │   └── revisions/
-│   │       └── sha256:abc123/
-│   │           └── manifest.json
-│   ├── _layers/
-│   │   └── sha256:def456/
-│   │       └── link -> blob
-│   └── _uploads/
-│       └── uuid/
-│           └── data
-└── _blobs/
-    └── sha256:def456
+v2/
+├── repositories/
+│   └── {namespace}/
+│       ├── _manifests/
+│       │   ├── revisions/
+│       │   │   └── {algorithm}/
+│       │   │       └── {hash}/
+│       │   │           └── link
+│       │   └── tags/
+│       │       └── {tag}/
+│       │           └── current/
+│       │               └── link
+│       ├── _layers/
+│       │   └── {algorithm}/
+│       │       └── {hash}/
+│       │           └── link
+│       └── _uploads/
+│           └── {uuid}/
+│               ├── data
+│               ├── startedat
+│               └── hashstates/
+└── blobs/
+    └── {algorithm}/
+        └── {hash_prefix}/
+            └── {hash}/
+                ├── data
+                └── refs/
+                    └── {namespace}.json
 ```
+
+The two stores split this tree by content, not strictly by prefix: the blob store holds the blob `data` files and the `_uploads/` session directories, while the metadata store holds the rest of the `v2/repositories/` tree (links and tags) plus the `refs/` directories under `v2/blobs/`. Each `refs/{namespace}.json` file is a blob-index shard listing the links through which that namespace references the blob.
 
 ### Content Addressing
 
 All content is addressed by digest (SHA-256 or SHA-512):
 - Manifests: `sha256:<hash>` or `sha512:<hash>`
 - Blobs: `sha256:<hash>` or `sha512:<hash>`
-- Tags: Symbolic links to manifest digests
+- Tags: JSON link files (`LinkMetadata`) recording the manifest digest
 
 ---
 

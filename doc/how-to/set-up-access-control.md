@@ -375,7 +375,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/v2/
 ### Debug Logging
 
 ```bash
-RUST_LOG=angos::registry::access_policy=debug \
+RUST_LOG=angos::policy=debug \
   ./angos server
 ```
 

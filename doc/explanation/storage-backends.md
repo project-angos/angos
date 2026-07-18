@@ -62,10 +62,10 @@ sequenceDiagram
 
 Angos separates storage into two logical stores:
 
-| Store              | Contents               | Size       | Access Pattern          |
-|--------------------|------------------------|------------|-------------------------|
-| **Blob Store**     | Layer data, configs    | Large (GB) | Sequential read/write   |
-| **Metadata Store** | Manifests, tags, links | Small (KB) | Random access, frequent |
+| Store              | Contents                                | Size       | Access Pattern          |
+|--------------------|-----------------------------------------|------------|-------------------------|
+| **Blob Store**     | Layers, configs, manifest bodies        | Large (GB) | Sequential read/write   |
+| **Metadata Store** | Manifest links, tags, blob-index shards | Small (KB) | Random access, frequent |
 
 By default, both use the same backend. You can configure them independently:
 
@@ -201,7 +201,7 @@ For multiple registry instances, you need:
 
 ### With S3 Locking (Simplest)
 
-The S3 lock strategy activates the CAS coordinator, which uses S3 conditional requests for all coordination, no extra infrastructure being required. It is the default on S3 metadata stores: with `lock_strategy` unset, Angos probes the provider at startup and uses it whenever the full conditional set is supported: `PutObject` with `If-None-Match: *`, `PutObject` with `If-Match`, and `DeleteObject` with `If-Match`. Selecting it explicitly makes startup fail fast if any of them is missing. Conditional deletes make lock release and lock reclaim race-free: an instance can only ever remove its own lock object.
+The S3 lock strategy activates the CAS coordinator, which uses S3 conditional requests for all coordination, no extra infrastructure being required. It is the default on S3 metadata stores: with `lock_strategy` unset, Angos probes the provider at startup and uses it whenever the full conditional set is supported: `PutObject` with `If-None-Match: *`, `PutObject` with `If-Match`, and `DeleteObject` with `If-Match`. Selecting it explicitly makes startup fail fast if any of them is missing. Setting `conditional_operations = true|false` in `[metadata_store.s3]` declares support explicitly and skips the startup probe; `false` also pins the unset-lock default to the in-process memory lock. Conditional deletes make lock release and lock reclaim race-free: an instance can only ever remove its own lock object.
 
 ```toml
 [blob_store.s3]
@@ -224,7 +224,7 @@ retry_delay_ms = 50    # Delay between retries (default: 50)
 
 ### With S3 + Redis
 
-Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. When the S3 provider supports conditional writes, Angos still uses them for blob-index shard updates; Redis remains responsible for link metadata serialization. To force all metadata write coordination through Redis, explicitly set `conditional_operations = false` in `[metadata_store.s3]`.
+Selecting `lock_strategy = "redis"` makes Redis the lock-object backend. When the S3 provider supports conditional operations, the CAS executor still coordinates every metadata write; Redis supplies only the lock objects. Coordination routes through locks only when conditional operations are unavailable or disabled: set `conditional_operations = false` in `[metadata_store.s3]` to force that.
 
 ```toml
 [blob_store.s3]
@@ -242,11 +242,17 @@ key_prefix = "registry-locks"
 
 [cache.redis]
 url = "redis://redis:6379"
+key_prefix = "angos"
 ```
 
 ---
 
 ## Locking Behavior
+
+The lock is held during:
+- Manifest writes (tag updates)
+- Blob link creation
+- Upload completion
 
 ### In-Memory Locking
 
@@ -283,7 +289,7 @@ retry_delay_ms = 50         # Delay between retries (minimum: 1)
 The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds. Transient heartbeat failures (connect errors, refresh timeouts) accumulate up to a small budget (roughly one TTL of slack) before cancelling the in-flight operation, so a short network blip does not kill in-progress work. Authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
 :::note
-The S3 provider must support conditional writes and conditional deletes. Angos probes for this capability at startup: an explicit `lock_strategy.s3` fails fast when any operation is missing, while an unset lock strategy falls back to the in-process memory lock.
+The S3 provider must support conditional writes and conditional deletes. Angos probes for this capability at startup: an explicit `lock_strategy.s3` fails fast when any operation is missing, while an unset lock strategy falls back to the in-process memory lock. Setting `conditional_operations = true|false` declares support explicitly and skips the probe; `false` also pins the unset-lock default to the memory lock.
 Known providers that support the full conditional set: AWS S3, Exoscale SOS
 :::
 
@@ -308,11 +314,6 @@ Shared filesystems (NFS, EFS) defeat Angos's stateless design and are not recomm
 - **Scaling issues**: Lock contention worsens as replicas increase
 
 For multi-replica deployments, use S3 instead: it provides distributed locking natively via conditional writes, with no additional infrastructure.
-
-Lock is held during:
-- Manifest writes (tag updates)
-- Blob link creation
-- Upload completion
 
 ### Monitoring Lock Operations
 
@@ -490,9 +491,9 @@ access_time_debounce_secs = 60    # seconds (0 to disable)
 For retention policies that use `last_pulled_at`, set thresholds in **days rather than minutes** to account for buffering lag:
 
 ```toml
-# Safe: 30-day threshold tolerates access time imprecision
+# Safe: keep images pulled within 30 days; the threshold tolerates access time imprecision
 [global.retention_policy]
-rules = ["manifest.last_pulled_at < now() - days(30)"]
+rules = ["image.last_pulled_at > now() - days(30)"]
 ```
 
 On lock-coordinated deployments (no CAS), **never set `access_time_debounce_secs = 0`** in production. This disables buffering and causes every manifest pull to acquire and release a lock, which is expensive. Use the default 60 seconds or higher.
@@ -551,17 +552,20 @@ The write path adds entries on push and removes them on successful delete.
 Mid-flight failures or out-of-band edits can leave stale entries pointing to
 namespaces that no longer exist.
 
-Periodic `angos scrub` reconciles every blob-index entry against
-`MetadataStore::read_link`. Entries that fail the probe are removed, and a
+Periodic `angos scrub` probes every blob-index entry against its raw link key
+in the metadata store, bypassing the link cache so a stale cache entry cannot
+mask a repair. Entries whose link file is confirmed missing are removed, and a
 shard whose entries all disappear is itself deleted. This convergence is part
-of every scrub run.
+of every scrub run. Entries that reference a blob whose backing bytes are
+absent are left alone: they usually belong to an in-flight upload or a
+lazily filled pull-through cache entry.
 
 Blob ownership markers (`LinkKind::Blob`) are intentionally retained until the
 client issues an explicit `DELETE /v2/<name>/blobs/<digest>`. They are not
-removed when a namespace's manifests are deleted. When scrub detects that a
-referenced blob's backing bytes are absent, however, the entire blob-index entry
-(including any ownership markers) is purged, so runtime `can_read` no longer
-reports the blob as accessible.
+removed when a namespace's manifests are deleted. Reclaiming byteless entries
+is the job of `angos prune`, which purges them once the shard exceeds an age
+window; ownership grants with no manifest reference are likewise reclaimed by
+prune under the retention policies.
 
 ### Caching
 
@@ -630,6 +634,6 @@ Blob-index shards are the one hot key that many concurrent pushes contend on, so
 
 The CAS-vs-Lock executor choice happens once inside the engine factory based on the configured `lock_strategy` and detected S3 capabilities; subsystems never see it. The on-disk key layout is unchanged from a non-transactional deployment.
 
-The engine keeps three reserved prefixes in the metadata store's backend: `.tx-log/` holds the transaction journal, `.tx-bodies/` holds staged object bodies, and `.tx-locks/` holds lock objects. The blob store's backend carries none of them. Recovery runs automatically and needs no operator configuration. Every server and worker replica runs a recovery loop that completes or rolls back any transaction interrupted by a crash, sweeping every 30 seconds. A body janitor reaps orphaned staged bodies under `.tx-bodies/` once they exceed a TTL, and a lock janitor reclaims cold lock objects under `.tx-locks/` once they exceed their TTL plus a grace period; both janitors sweep every five minutes.
+The engine keeps three reserved prefixes in the metadata store's backend: `.tx-log/` holds the transaction journal, `.tx-bodies/` holds staged object bodies, and `.tx-locks/` holds lock objects. The blob store's backend carries none of them. Recovery runs automatically and needs no operator configuration. Every server and worker replica runs a recovery loop that completes or rolls back any transaction interrupted by a crash, sweeping every 30 seconds. A body janitor reaps orphaned staged bodies under `.tx-bodies/` once they exceed a TTL, and a lock janitor reclaims cold lock objects under `.tx-locks/` once they exceed their TTL plus a grace period. Both janitors run as part of every `angos scrub`, not as background loops in the serving processes, so schedule scrub periodically or staging and lock garbage is never reclaimed.
 
 A committed transaction whose remaining mutation cannot be reconciled is normally transient and clears on a later sweep. If one stays unreconcilable past a one-hour grace (an intent whose mutation cannot converge because its target diverged permanently), the recovery loop abandons it: it reaps the intent with an escalated warning rather than replaying it every sweep forever. The derived blob-index state is reconciled by `angos scrub`, so abandonment loses nothing a stuck replay would have recovered.

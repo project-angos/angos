@@ -286,10 +286,10 @@ du -sh /data/registry
 aws s3 ls s3://my-bucket --summarize --recursive
 ```
 
-Count manifests:
+Count manifests per namespace of a repository (each entry carries a `manifest_count`):
 
 ```bash
-curl http://localhost:8000/_ext/_repositories | jq
+curl http://localhost:8000/_ext/<repository>/_namespaces | jq
 ```
 
 ---
@@ -320,7 +320,7 @@ curl http://localhost:8000/_ext/_repositories | jq
 ### Lock Errors
 
 For multi-replica deployments:
-- Ensure Redis is configured for locking
+- Ensure a shared lock strategy is configured. On an S3 metadata store with conditional-write support, an unset `lock_strategy` defaults to the S3 CAS lock; otherwise configure `lock_strategy.redis`
 - Only run one scrub instance at a time
 
 ### S3 Errors
@@ -337,7 +337,7 @@ For multi-replica deployments:
 2. **Run during low-traffic periods** to minimize impact
 3. **Monitor storage trends** after scheduled runs
 4. **Keep retention policies conservative** initially
-5. **Use Redis locking** for multi-replica deployments
+5. **Use a shared lock strategy** for multi-replica deployments: the S3 CAS lock (the default on S3 metadata stores with conditional-write support) or Redis
 6. **Re-run scrub from the same binary version as the fleet**, especially right after upgrades
 
 ## Reference

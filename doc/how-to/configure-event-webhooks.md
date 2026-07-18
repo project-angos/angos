@@ -232,7 +232,7 @@ Attempt 4: 400ms delay
 ...
 ```
 
-Formula: `100ms * 2^(attempt - 1)`
+Formula: `100ms * 2^(attempt - 1)`, capped at 10 seconds
 
 ```toml
 [event_webhook.reliable]
@@ -296,7 +296,7 @@ In-flight deliveries on the old configuration continue to completion.
 
 ## Graceful Shutdown
 
-On `SIGTERM` or `SIGINT`, the registry drains in-flight async webhook deliveries before shutting down. Deliveries that exceed the shutdown timeout are aborted, logged, and abandoned.
+On `SIGTERM` or `SIGINT`, the registry drains all in-flight async webhook deliveries to completion before shutting down. Each delivery is bounded by its own request timeout and retry budget, so the drain terminates on its own; no delivery is aborted.
 
 ---
 

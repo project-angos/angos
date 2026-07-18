@@ -60,6 +60,8 @@ See the [Quickstart Tutorial](doc/tutorials/quickstart.md) for a complete walkth
 
 ## Documentation
 
+The complete documentation index lives in [doc/index.md](doc/index.md).
+
 ### Tutorials
 
 - [Quickstart](doc/tutorials/quickstart.md) - Get a registry running in 5 minutes
@@ -72,8 +74,15 @@ See the [Quickstart Tutorial](doc/tutorials/quickstart.md) for a complete walkth
 - [Deploy on Kubernetes](doc/how-to/deploy-kubernetes.md)
 - [Configure mTLS](doc/how-to/configure-mtls.md)
 - [Configure GitHub Actions OIDC](doc/how-to/configure-github-actions-oidc.md)
+- [Configure Generic OIDC](doc/how-to/configure-generic-oidc.md)
 - [Set Up Access Control](doc/how-to/set-up-access-control.md)
 - [Configure Retention Policies](doc/how-to/configure-retention-policies.md)
+- [Protect Tags with Immutability](doc/how-to/protect-tags-immutability.md)
+- [Configure Webhook Authorization](doc/how-to/configure-webhook-authorization.md)
+- [Configure Event Webhooks](doc/how-to/configure-event-webhooks.md)
+- [Configure Replication](doc/how-to/configure-replication.md)
+- [Run Storage Maintenance](doc/how-to/run-storage-maintenance.md)
+- [Enable Durable Cache Jobs](doc/how-to/durable-cache-jobs.md)
 - [Enable the Web UI](doc/how-to/enable-web-ui.md)
 - [Troubleshoot Common Issues](doc/how-to/troubleshoot-common-issues.md)
 - [Upgrade Angos](doc/how-to/upgrade.md)
@@ -84,6 +93,8 @@ See the [Quickstart Tutorial](doc/tutorials/quickstart.md) for a complete walkth
 - [CLI Reference](doc/reference/cli.md)
 - [CEL Expressions Reference](doc/reference/cel-expressions.md)
 - [API Endpoints Reference](doc/reference/api-endpoints.md)
+- [Web UI Reference](doc/reference/ui.md)
+- [Event Webhooks Reference](doc/reference/event-webhooks.md)
 - [Metrics Reference](doc/reference/metrics.md)
 
 ### Understanding Angos
@@ -92,29 +103,12 @@ See the [Quickstart Tutorial](doc/tutorials/quickstart.md) for a complete walkth
 - [Storage Backends](doc/explanation/storage-backends.md)
 - [Authentication and Authorization](doc/explanation/authentication-authorization.md)
 - [Pull-Through Caching](doc/explanation/pull-through-caching.md)
+- [Bi-Directional Replication](doc/explanation/replication.md)
 - [Security Model](doc/explanation/security-model.md)
 
 ## Upgrading
 
-### 1.0.x → 1.1.0: Redis lock configuration key renamed
-
-The Redis lock configuration key has moved. The old form is still accepted but deprecated and will be removed in a future release.
-
-```toml
-# Before
-[metadata_store.s3.redis]
-url = "redis://localhost:6379"
-
-# After
-[metadata_store.s3.lock_strategy.redis]
-url = "redis://localhost:6379"
-```
-
-### New features (non-breaking)
-
-**S3-native locking**: multi-replica S3 deployments no longer require Redis. Use `[metadata_store.s3.lock_strategy.s3]` to enable locking backed by S3 conditional writes instead.
-
-**Capabilities declaration**: add a `[metadata_store.s3.capabilities]` table to declare which conditional S3 operations your bucket supports (`put_if_none_match`, `put_if_match`, `delete_if_match`). When present, Angos skips the startup probe that would otherwise detect these capabilities automatically.
+Version-specific migration notes are in the [Upgrade guide](doc/how-to/upgrade.md).
 
 ## Usage
 
@@ -129,9 +123,17 @@ Options:
   --help, help      display usage information
 
 Commands:
-  argon             Generate Argon2 password hashes for basic auth
-  scrub             Check the storage backend for inconsistencies
+  argon             Hash a password following the argon2id algorithm
+  migrate           Convert pre-JSON bare-digest link metadata to the current
+                    JSON format
+  prune             Enforce retention policies and reclaim aged upload-lifecycle
+                    leftovers
+  replicate         Reconcile replicated namespaces with their configured
+                    downstreams
+  scrub             Walk the store, repair inconsistencies, and quarantine
+                    unrecognized objects
   server            Run the registry listeners
+  worker            Process durable background jobs
 ```
 
 ## Additional Endpoints

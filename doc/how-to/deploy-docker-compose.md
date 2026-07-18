@@ -132,7 +132,7 @@ services:
     command: ["-c", "/config/config.toml", "server"]
     restart: unless-stopped
     healthcheck:
-      # /healthz returns 200 when the registry is ready to serve requests
+      # /healthz reports liveness; /readyz reports readiness
       test: ["CMD", "curl", "-f", "-k", "https://localhost:8000/healthz"]
       interval: 30s
       timeout: 10s
@@ -168,6 +168,7 @@ immutable_tags_exclusions = ["^latest$"]
 [[repository."library".upstream]]
 url = "https://registry-1.docker.io"
 # Add credentials for higher rate limits
+# (see https://docs.docker.com/docker-hub/usage/)
 # username = "your-dockerhub-username"
 # password = "your-dockerhub-password"
 
@@ -194,8 +195,6 @@ version: '3.8'
 services:
   registry:
     image: ghcr.io/project-angos/angos:latest
-    ports:
-      - "8000:8000"
     volumes:
       - ./config:/config:ro
       - ./data:/data
@@ -216,6 +215,8 @@ volumes:
   redis-data:
 ```
 
+A published host port can bind only one container, so the service has no `ports` mapping. Front the replicas with a reverse proxy (nginx, Traefik) on the same Compose network, or drop `deploy.replicas` and publish the port on a single replica.
+
 ### Configuration
 
 ```toml
@@ -235,6 +236,7 @@ ttl = 10
 
 [cache.redis]
 url = "redis://redis:6379"
+key_prefix = "angos"
 ```
 
 ---
@@ -251,8 +253,6 @@ version: '3.8'
 services:
   registry:
     image: ghcr.io/project-angos/angos:latest
-    ports:
-      - "8000:8000"
     volumes:
       - ./config:/config:ro
     command: ["-c", "/config/config.toml", "server"]
@@ -260,6 +260,8 @@ services:
     deploy:
       replicas: 2
 ```
+
+As with the Redis setup above, the replicated service has no `ports` mapping; front the replicas with a reverse proxy on the same Compose network.
 
 ### Configuration
 
@@ -272,11 +274,15 @@ port = 8000
 bucket = "my-registry"
 endpoint = "https://s3.amazonaws.com"
 region = "us-east-1"
+access_key_id = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
 
 [metadata_store.s3]
 bucket = "my-registry"
 endpoint = "https://s3.amazonaws.com"
 region = "us-east-1"
+access_key_id = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
 
 [metadata_store.s3.lock_strategy.s3]
 ttl_secs = 30
@@ -293,8 +299,8 @@ At startup, Angos probes the S3 provider to verify conditional write and delete 
 Run maintenance manually with Docker Compose:
 
 ```bash
-docker compose run --rm registry /angos -c /config/config.toml scrub
-docker compose run --rm registry /angos -c /config/config.toml prune
+docker compose run --rm registry -c /config/config.toml scrub
+docker compose run --rm registry -c /config/config.toml prune
 ```
 
 Schedule it with a systemd timer on the host. Create `/etc/systemd/system/registry-maintenance.service`:
@@ -308,8 +314,8 @@ After=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/path/to/registry
-ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml scrub
-ExecStart=/usr/bin/docker compose run --rm registry /angos -c /config/config.toml prune
+ExecStart=/usr/bin/docker compose run --rm registry -c /config/config.toml scrub
+ExecStart=/usr/bin/docker compose run --rm registry -c /config/config.toml prune
 ```
 
 Create `/etc/systemd/system/registry-maintenance.timer`, then enable it with `systemctl enable --now registry-maintenance.timer`:

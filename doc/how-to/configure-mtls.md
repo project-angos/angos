@@ -227,7 +227,7 @@ rules = [
   "identity.certificate.organizations.contains('DevOps')",
 
   # Basic auth for read-only
-  "identity.username != '' && request.action.startsWith('get-')"
+  "identity.username != null && request.action.startsWith('get-')"
 ]
 ```
 

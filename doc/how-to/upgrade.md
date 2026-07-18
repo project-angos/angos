@@ -91,17 +91,6 @@ ttl_secs = 30
 
 See [Distributed Locking](../reference/configuration.md#distributed-locking) in the configuration reference for full options and tuning guidance.
 
-#### S3 Capabilities Declaration
-
-You can declare your S3 provider's conditional operation support upfront to skip the startup probe and enable performance optimizations:
-
-```toml
-[metadata_store.s3]
-conditional_operations = true
-```
-
-See [Conditional Operations](../reference/configuration.md#conditional-operations-metadata_stores3conditional_operations) in the configuration reference for details on when to use this and which providers support it.
-
 ---
 
 ## 1.1.x → 1.2.0
@@ -282,6 +271,23 @@ The blob store is now pure storage with no transaction engine. The in-process jo
 **Who is affected:** Only deployments that run the in-process queue **and** place the blob store and metadata store on separate backends. When both share one backend (the default), the `_jobs/` location is physically unchanged and no action is required.
 
 On a split-backend deployment, drain the in-process queue before upgrading: `_jobs/` records still pending on the blob backend become invisible to the new queue after the upgrade. Cache-fill jobs re-enqueue on the next pull, but an in-flight `event-only` replication push is not re-driven by `angos replicate`, so re-push affected tags if the queue was not drained. Leftover `_jobs/`, `.tx-log/`, `.tx-bodies/`, and `.tx-locks/` objects on the blob backend are inert and can be deleted manually.
+
+---
+
+## 1.3.0 → 1.3.1
+
+### New Features Available in 1.3.1
+
+#### S3 Capabilities Declaration
+
+You can declare your S3 provider's conditional operation support upfront to skip the startup probe and enable performance optimizations:
+
+```toml
+[metadata_store.s3]
+conditional_operations = true
+```
+
+See [Conditional Operations](../reference/configuration.md#conditional-operations-metadata_stores3conditional_operations) in the configuration reference for details on when to use this and which providers support it.
 
 ---
 

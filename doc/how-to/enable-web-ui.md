@@ -89,10 +89,10 @@ rules = [
   "request.action == 'ui-asset' || request.action == 'ui-config'",
 
   # Allow authenticated users to browse
-  "identity.username != '' && request.action.startsWith('list-')",
+  "identity.username != null && request.action.startsWith('list-')",
 
   # Allow reading manifests
-  "identity.username != '' && request.action == 'get-manifest'",
+  "identity.username != null && request.action == 'get-manifest'",
 
   # Restrict deletion to admins
   "identity.username == 'admin' && request.action == 'delete-manifest'"
