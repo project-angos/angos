@@ -5,7 +5,6 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -368,37 +367,7 @@ impl RecoveryLoop {
             })?;
         }
 
-        self.stamp_progress_during_recovery(intent, idx).await
-    }
-
-    /// Mirror the executors' stamp pattern: mark the slot `Applied` and re-PUT
-    /// the intent so subsequent recovery iterations skip it.
-    async fn stamp_progress_during_recovery(
-        &self,
-        intent: &mut IntentRecord,
-        idx: usize,
-    ) -> Result<(), StorageError> {
-        intent.mark_applied(idx);
-        let body = match serde_json::to_vec(intent) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    tx_id = %intent.id,
-                    idx,
-                    error = %e,
-                    "RecoveryLoop: failed to serialise intent after stamping progress"
-                );
-                return Ok(());
-            }
-        };
-        if let Err(e) = self.store.put(&intent.log_key(), Bytes::from(body)).await {
-            warn!(
-                tx_id = %intent.id,
-                idx,
-                error = %e,
-                "RecoveryLoop: failed to re-PUT intent after stamping progress"
-            );
-        }
+        common::stamp_applied(self.store.as_ref(), intent, idx).await;
         Ok(())
     }
 }

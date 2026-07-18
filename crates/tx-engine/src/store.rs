@@ -40,7 +40,7 @@ use crate::{
     },
     janitor::{BodyJanitor, LockJanitor},
     lock::{
-        LockStrategy,
+        LockSession, LockStrategy,
         primitive::Lock,
         storage::{LockStorage, memory::MemoryLockStorage, s3::S3LockStorage},
     },
@@ -259,10 +259,39 @@ impl Store {
     }
 
     /// The transaction executor backing this store. Subsystems use it for
-    /// single-shot transaction execution and engine-lock sessions.
+    /// single-shot transaction execution and the retry helpers.
     #[must_use]
     pub fn executor(&self) -> &Arc<dyn TransactionExecutor> {
         &self.executor
+    }
+
+    // Engine-lock sessions
+
+    /// Non-blocking single-attempt acquire over the engine's internal lock.
+    ///
+    /// Returns `Ok(Some(session))` when all `keys` were acquired without
+    /// contention, or `Ok(None)` when any key is already held so the caller
+    /// should skip this work and move on. The returned [`LockSession`] is owned
+    /// by the caller and must be released via [`LockSession::release`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Lock`] only on a hard storage error.
+    pub async fn try_acquire(&self, keys: &[String]) -> Result<Option<LockSession>, Error> {
+        self.lock.try_acquire(keys).await.map_err(Error::Lock)
+    }
+
+    /// Blocking acquire over the engine's internal lock, retrying on contention
+    /// up to the lock's configured `max_retries` limit. The returned
+    /// [`LockSession`] is owned by the caller and must be released via
+    /// [`LockSession::release`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Lock`] when the retry budget is exhausted or the
+    /// storage backend fails.
+    pub async fn acquire(&self, keys: &[String]) -> Result<LockSession, Error> {
+        self.lock.acquire(keys).await.map_err(Error::Lock)
     }
 
     /// The composed object store: the single surface for raw object I/O
@@ -407,7 +436,7 @@ impl Store {
             }
             match self.executor.execute(builder.build()).await {
                 Ok(outcome) => return Ok((outcome, payload)),
-                Err(Error::Conflict | Error::Precondition) if attempts < max_attempts => {
+                Err(e) if e.is_retriable() && attempts < max_attempts => {
                     debug!(attempts, max_attempts, "Transaction conflict, retrying");
                     attempts += 1;
                 }
@@ -455,38 +484,40 @@ impl Store {
         Ok(payload)
     }
 
-    /// The lock-coordinated fallback for [`Store::update_advisory`]: a
-    /// read-modify-write transaction retried on conflict up to
-    /// [`DEFAULT_RETRY_BUDGET`] extra attempts. An absent `key` errors with
-    /// `NotFound`, matching the CAS path.
+    /// The lock-coordinated fallback for [`Store::update_advisory`]: routed
+    /// through [`Store::update_with_payload`] as a single-key read-modify-write
+    /// retried up to [`DEFAULT_RETRY_BUDGET`] extra attempts. An absent `key`
+    /// errors with `NotFound`, matching the CAS path.
     async fn update_advisory_locked<F, T>(&self, key: &str, map: F) -> Result<T, Error>
     where
         F: Fn(Bytes) -> Result<(Bytes, T), Error> + Send,
         T: Send,
     {
-        let mut attempts = 0u32;
-        loop {
-            let snap = self.read_for_update(key).await.map_err(Error::Storage)?;
-            if !snap.present {
-                return Err(Error::Storage(StorageError::NotFound));
-            }
-            let (mapped, payload) = map(snap.body.clone())?;
-            let tx = Transaction::builder()
-                .read(key.to_string(), snap.body)
-                .mutation(Mutation::Put {
-                    key: key.to_string(),
-                    body: mapped,
-                    expected: None,
-                })
-                .build();
-            match self.executor.execute(tx).await {
-                Ok(_) => return Ok(payload),
-                Err(Error::Conflict | Error::Precondition) if attempts < DEFAULT_RETRY_BUDGET => {
-                    attempts += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let (_outcome, payload) = self
+            .update_with_payload(
+                &[key.to_string()],
+                move |snaps| {
+                    // `map` is synchronous, so the whole attempt is computed
+                    // here and the returned future only carries the result.
+                    let attempt = match snaps.into_iter().next().filter(|snap| snap.present) {
+                        Some(snap) => map(snap.body).map(|(mapped, payload)| {
+                            (
+                                vec![Mutation::Put {
+                                    key: key.to_string(),
+                                    body: mapped,
+                                    expected: None,
+                                }],
+                                payload,
+                            )
+                        }),
+                        None => Err(Error::Storage(StorageError::NotFound)),
+                    };
+                    async move { attempt }
+                },
+                DEFAULT_RETRY_BUDGET,
+            )
+            .await?;
+        Ok(payload)
     }
 }
 

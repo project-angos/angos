@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::{error::Error, lock::LockSession, transaction::Transaction};
+use crate::{error::Error, transaction::Transaction};
 
 /// Default retry budget for [`execute_with_retry`].
 ///
@@ -38,10 +38,13 @@ pub trait TransactionExecutor: Send + Sync {
     /// The executor manages whatever locking it needs internally (the Locked
     /// executor acquires distributed locks on the transaction's lock set; the
     /// CAS executor relies on conditional storage operations and acquires no
-    /// transaction-scoped lock). Callers that hold their own [`LockSession`]
-    /// (for example, the durable job consumer's per-`lock_key` execution
-    /// lock) keep that session alive across this call and release it
-    /// explicitly afterwards.
+    /// transaction-scoped lock). Callers that hold their own lock session
+    /// (obtained via [`Store::try_acquire`] / [`Store::acquire`], for example
+    /// the durable job consumer's per-`lock_key` execution lock) keep that
+    /// session alive across this call and release it explicitly afterwards.
+    ///
+    /// [`Store::try_acquire`]: crate::store::Store::try_acquire
+    /// [`Store::acquire`]: crate::store::Store::acquire
     ///
     /// # Errors
     ///
@@ -53,24 +56,6 @@ pub trait TransactionExecutor: Send + Sync {
     ///   budget.
     /// - [`Error::Storage`]: an underlying storage operation failed.
     async fn execute(&self, tx: Transaction) -> Result<Outcome, Error>;
-
-    /// Non-blocking single-attempt lock acquire over the engine's internal lock.
-    ///
-    /// Returns `Ok(Some(session))` when all `keys` were acquired without
-    /// contention. Returns `Ok(None)` when any key is already held; the caller
-    /// should skip this job and move on. Returns `Err` only on a hard storage
-    /// error.
-    ///
-    /// The returned [`LockSession`] is owned by the caller; it must be
-    /// released via [`LockSession::release`] when the caller is done.
-    async fn try_acquire(&self, keys: &[String]) -> Result<Option<LockSession>, Error>;
-
-    /// Blocking acquire over the engine's internal lock.
-    ///
-    /// Retries on contention up to the lock's configured `max_retries` limit.
-    /// The returned [`LockSession`] is owned by the caller; it must be
-    /// released via [`LockSession::release`] when the caller is done.
-    async fn acquire(&self, keys: &[String]) -> Result<LockSession, Error>;
 }
 
 /// Execute a transaction and a caller-defined payload built by `build`,
@@ -107,7 +92,7 @@ where
         let (tx, payload) = build().await?;
         match executor.execute(tx).await {
             Ok(o) => return Ok((o, payload)),
-            Err(Error::Conflict | Error::Precondition) if attempts < max_attempts => {
+            Err(e) if e.is_retriable() && attempts < max_attempts => {
                 debug!(attempts, max_attempts, "Transaction conflict, retrying");
                 attempts += 1;
             }

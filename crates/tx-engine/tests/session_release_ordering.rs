@@ -1,9 +1,9 @@
 //! Tests for the explicit session-release ordering contract.
 //!
-//! The executor no longer takes a caller session: callers obtain a session
-//! through `try_acquire`/`acquire`, hold it across the transaction (or the
-//! whole `execute_with_retry` loop), then release it themselves. These tests
-//! cover that pattern end-to-end:
+//! The executor never takes a caller session: callers obtain a session
+//! through `Store::try_acquire`/`Store::acquire`, hold it across the
+//! transaction (or the whole `execute_with_retry` loop), then release it
+//! themselves. These tests cover that pattern end-to-end:
 //!
 //! - The executor never releases a caller session.
 //! - A caller holding a session across `execute_with_retry` releases it after
@@ -21,10 +21,9 @@ use angos_storage::{MemoryObjectStore, ObjectStore};
 
 use angos_tx_engine::{
     error::Error,
-    executor::{
-        DEFAULT_RETRY_BUDGET, Outcome, TransactionExecutor, execute_with_retry,
-        locked::LockedExecutor,
-    },
+    executor::{DEFAULT_RETRY_BUDGET, Outcome, execute_with_retry},
+    lock::LockStrategy,
+    store::Store,
     transaction::{Mutation, Transaction},
 };
 
@@ -32,8 +31,8 @@ use angos_tx_engine::test_util;
 
 // Helpers
 
-fn build_executor(store: Arc<dyn ObjectStore>) -> LockedExecutor {
-    LockedExecutor::builder(store, test_util::memory_lock()).build()
+fn build_store(backend: Arc<dyn ObjectStore>) -> Store {
+    Store::new(backend, None, LockStrategy::Memory, None).expect("store")
 }
 
 fn simple_tx() -> Transaction {
@@ -50,8 +49,8 @@ fn simple_tx() -> Transaction {
 /// non-blocking `try_acquire` returning `None`. If the keys are free
 /// `try_acquire` returns `Some(session)`; we release it immediately so the
 /// probe leaves storage pristine.
-async fn keys_are_held(executor: &LockedExecutor, keys: &[String]) -> bool {
-    match executor
+async fn keys_are_held(store: &Store, keys: &[String]) -> bool {
+    match store
         .try_acquire(keys)
         .await
         .expect("try_acquire infallible on memory storage")
@@ -72,22 +71,22 @@ async fn keys_are_held(executor: &LockedExecutor, keys: &[String]) -> bool {
 #[tokio::test]
 async fn caller_session_released_after_successful_execute_with_retry() {
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
-    let executor = build_executor(store.clone());
+    let store = build_store(store.clone());
 
     let caller_keys = vec!["job:lock_key:demo".to_string()];
 
-    let session = executor
+    let session = store
         .acquire(&caller_keys)
         .await
         .expect("acquire caller session");
 
     assert!(
-        keys_are_held(&executor, &caller_keys).await,
+        keys_are_held(&store, &caller_keys).await,
         "caller key should be held by the session before release"
     );
 
     let result: Result<Outcome, Error> = execute_with_retry(
-        &executor,
+        store.executor().as_ref(),
         || async { Ok(simple_tx()) },
         DEFAULT_RETRY_BUDGET,
     )
@@ -98,13 +97,13 @@ async fn caller_session_released_after_successful_execute_with_retry() {
     );
 
     assert!(
-        keys_are_held(&executor, &caller_keys).await,
+        keys_are_held(&store, &caller_keys).await,
         "executor must not release the caller session"
     );
 
     session.release().await;
     assert!(
-        !keys_are_held(&executor, &caller_keys).await,
+        !keys_are_held(&store, &caller_keys).await,
         "lock must be free once caller releases the session"
     );
 }
@@ -117,16 +116,16 @@ async fn caller_session_survives_conflict_exhaust() {
     let mem = MemoryObjectStore::new();
     mem.put("dep", Bytes::from_static(b"body")).await.unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(mem);
-    let executor = build_executor(store.clone());
+    let store = build_store(store.clone());
 
     let caller_keys = vec!["job:lock_key:conflict".to_string()];
-    let session = executor
+    let session = store
         .acquire(&caller_keys)
         .await
         .expect("acquire caller session");
 
     let result: Result<Outcome, Error> = execute_with_retry(
-        &executor,
+        store.executor().as_ref(),
         || async {
             Ok(Transaction::builder()
                 .read("dep", Bytes::from_static(b"stale-content"))
@@ -150,13 +149,13 @@ async fn caller_session_survives_conflict_exhaust() {
         "caller session must still be valid after Conflict"
     );
     assert!(
-        keys_are_held(&executor, &caller_keys).await,
+        keys_are_held(&store, &caller_keys).await,
         "lock must still be held after Conflict exhaust"
     );
 
     session.release().await;
     assert!(
-        !keys_are_held(&executor, &caller_keys).await,
+        !keys_are_held(&store, &caller_keys).await,
         "explicit release must free the lock"
     );
 }
@@ -166,18 +165,17 @@ async fn caller_session_survives_conflict_exhaust() {
 /// afterwards is guaranteed to happen after the durable reap.
 #[tokio::test]
 async fn intent_log_reaped_before_execute_with_retry_returns() {
-    let store = Arc::new(MemoryObjectStore::new());
-    let store_dyn: Arc<dyn ObjectStore> = store.clone();
-    let executor = build_executor(store_dyn);
+    let backend = Arc::new(MemoryObjectStore::new());
+    let store = build_store(backend.clone());
 
     let caller_keys = vec!["job:lock_key:reap".to_string()];
-    let session = executor
+    let session = store
         .acquire(&caller_keys)
         .await
         .expect("acquire caller session");
 
     let result: Result<Outcome, Error> = execute_with_retry(
-        &executor,
+        store.executor().as_ref(),
         || async { Ok(simple_tx()) },
         DEFAULT_RETRY_BUDGET,
     )
@@ -185,7 +183,7 @@ async fn intent_log_reaped_before_execute_with_retry_returns() {
     assert!(result.is_ok());
 
     // Both the intent log and staged bodies are reaped before the call returns.
-    test_util::assert_no_orphans(&*store).await;
+    test_util::assert_no_orphans(&*backend).await;
 
     session.release().await;
 }
@@ -196,15 +194,15 @@ async fn intent_log_reaped_before_execute_with_retry_returns() {
 #[tokio::test]
 async fn executor_execute_never_releases_caller_session() {
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
-    let executor = build_executor(store.clone());
+    let store = build_store(store.clone());
 
     let caller_keys = vec!["job:lock_key:never-touched".to_string()];
-    let session = executor
+    let session = store
         .acquire(&caller_keys)
         .await
         .expect("acquire caller session");
 
-    let result: Result<Outcome, Error> = executor.execute(simple_tx()).await;
+    let result: Result<Outcome, Error> = store.execute(simple_tx()).await;
     assert!(result.is_ok(), "execute should commit: {result:?}");
 
     assert!(
@@ -212,13 +210,13 @@ async fn executor_execute_never_releases_caller_session() {
         "session must still be valid"
     );
     assert!(
-        keys_are_held(&executor, &caller_keys).await,
+        keys_are_held(&store, &caller_keys).await,
         "executor must not release the caller session"
     );
 
     session.release().await;
     assert!(
-        !keys_are_held(&executor, &caller_keys).await,
+        !keys_are_held(&store, &caller_keys).await,
         "explicit release frees the lock"
     );
 }

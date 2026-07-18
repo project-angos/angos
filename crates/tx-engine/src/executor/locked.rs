@@ -33,7 +33,7 @@ use crate::{
         },
     },
     intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationRecord},
-    lock::{LockSession, primitive::Lock},
+    lock::primitive::Lock,
     transaction::Transaction,
 };
 
@@ -161,7 +161,7 @@ impl TransactionExecutor for LockedExecutor {
     /// Acquires the engine-owned lock on `tx.lock_set()` in sorted order,
     /// verifies read fingerprints under the lock, writes the intent, applies
     /// mutations unconditionally, reaps the intent and staged bodies, then
-    /// releases the lock. Any caller-held [`LockSession`] is independent of
+    /// releases the lock. Any caller-held [`LockSession`](crate::lock::LockSession) is independent of
     /// this call; the caller releases it explicitly after `execute` returns.
     async fn execute(&self, tx: Transaction) -> Result<Outcome, Error> {
         let tx_id = Uuid::new_v4();
@@ -219,14 +219,6 @@ impl TransactionExecutor for LockedExecutor {
 
         apply_result?;
         Ok(Outcome { tx_id })
-    }
-
-    async fn try_acquire(&self, keys: &[String]) -> Result<Option<LockSession>, Error> {
-        self.lock.try_acquire(keys).await.map_err(Error::Lock)
-    }
-
-    async fn acquire(&self, keys: &[String]) -> Result<LockSession, Error> {
-        self.lock.acquire(keys).await.map_err(Error::Lock)
     }
 }
 

@@ -49,6 +49,18 @@ use crate::lock::{
 
 const MAX_LOCK_TTL_SECS: u64 = 3600;
 
+/// The heartbeat refreshes a held lock every `ttl_secs / HEARTBEAT_DIVISOR`,
+/// leaving two missed ticks of slack before the TTL expires.
+pub const HEARTBEAT_DIVISOR: u64 = 3;
+
+/// Floor for the derived heartbeat interval, so refreshes never degenerate
+/// into sub-second storage traffic.
+pub const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 3;
+
+/// Minimum lock TTL, derived so the heartbeat interval stays at or above
+/// [`MIN_HEARTBEAT_INTERVAL_SECS`].
+pub const MIN_LOCK_TTL_SECS: u64 = HEARTBEAT_DIVISOR * MIN_HEARTBEAT_INTERVAL_SECS;
+
 // Lock
 
 /// Concrete distributed lock backed by a [`LockStorage`].
@@ -86,8 +98,8 @@ pub struct LockBuilder {
 }
 
 impl LockBuilder {
-    /// Set the lock TTL in seconds. Must be ≥ 9 (heartbeat fires at `ttl/3`).
-    /// Defaults to 30.
+    /// Set the lock TTL in seconds. Must be at least [`MIN_LOCK_TTL_SECS`]
+    /// (the heartbeat fires at `ttl / HEARTBEAT_DIVISOR`). Defaults to 30.
     #[must_use]
     pub fn ttl_secs(mut self, secs: u64) -> Self {
         self.ttl_secs = Some(secs);
@@ -129,8 +141,10 @@ impl LockBuilder {
         let max_retries = self.max_retries.unwrap_or(100);
         let retry_delay_ms = self.retry_delay_ms.unwrap_or(50);
 
-        if ttl_secs < 9 {
-            return Err(Error::InvalidData("ttl_secs must be at least 9".into()));
+        if ttl_secs < MIN_LOCK_TTL_SECS {
+            return Err(Error::InvalidData(format!(
+                "ttl_secs must be at least {MIN_LOCK_TTL_SECS}"
+            )));
         }
         if ttl_secs > MAX_LOCK_TTL_SECS {
             return Err(Error::InvalidData(format!(
@@ -426,7 +440,7 @@ impl Lock {
         let ttl_secs = self.ttl_secs;
         let max_hold_secs = self.max_hold_secs;
         let label = storage.label();
-        let tick_interval = Duration::from_secs(ttl_secs / 3);
+        let tick_interval = Duration::from_secs(ttl_secs / HEARTBEAT_DIVISOR);
 
         spawn(async move {
             let started_at = TokioInstant::now();

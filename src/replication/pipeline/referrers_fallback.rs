@@ -136,7 +136,7 @@ async fn with_subject_lock(
 ) -> Result<(), Error> {
     let lock_keys = [format!("replication-referrers:{namespace}:{subject}")];
     let session = metadata_store
-        .executor()
+        .store()
         .acquire(&lock_keys)
         .await
         .map_err(|e| {

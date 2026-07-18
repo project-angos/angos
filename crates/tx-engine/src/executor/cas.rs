@@ -36,7 +36,7 @@ use crate::{
         },
     },
     intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationRecord},
-    lock::{LockSession, primitive::Lock},
+    lock::primitive::Lock,
     transaction::{Transaction, lock_key_set},
 };
 
@@ -50,11 +50,9 @@ use crate::{
 /// continued forward (each successful mutation stamps its `progress` slot to
 /// `Applied`, which switches the recovery loop into replay-forward mode).
 ///
-/// The `lock` is used only by [`TransactionExecutor::try_acquire`] and
-/// [`TransactionExecutor::acquire`]; it is not involved in the CAS transaction
-/// path. Subsystems that need a distributed execution lock (e.g. the durable
-/// job consumer's per-`lock_key` serialisation) go through these methods rather
-/// than holding a separate `Arc<Lock>`.
+/// The `lock` serialises only the caller-declared coarse lock keys (e.g.
+/// `blob-data:{digest}`) across Apply; the working set itself is coordinated
+/// purely by the conditional operations.
 ///
 /// Constructed via [`CasExecutor::builder`].
 pub struct CasExecutor {
@@ -100,9 +98,9 @@ impl CasExecutorBuilder {
 }
 
 impl CasExecutor {
-    /// Return a builder wrapping the conditional `store` and the `lock` used by
-    /// [`TransactionExecutor::try_acquire`] / [`TransactionExecutor::acquire`].
-    /// The intent TTL is an optional fluent setter on the returned builder.
+    /// Return a builder wrapping the conditional `store` and the `lock` that
+    /// serialises coarse lock keys. The intent TTL is an optional fluent
+    /// setter on the returned builder.
     #[must_use]
     pub fn builder(store: Arc<dyn ConditionalStore>, lock: Arc<Lock>) -> CasExecutorBuilder {
         CasExecutorBuilder {
@@ -497,7 +495,7 @@ impl TransactionExecutor for CasExecutor {
     ///
     /// The CAS executor relies on storage-level conditional operations and
     /// does not acquire a transaction-scoped lock. Any caller-held
-    /// [`LockSession`] is independent of this call; the caller releases it
+    /// [`LockSession`](crate::lock::LockSession) is independent of this call; the caller releases it
     /// explicitly after `execute` returns.
     async fn execute(&self, tx: Transaction) -> Result<Outcome, Error> {
         let tx_id = Uuid::new_v4();
@@ -553,14 +551,6 @@ impl TransactionExecutor for CasExecutor {
 
         apply_result?;
         Ok(Outcome { tx_id })
-    }
-
-    async fn try_acquire(&self, keys: &[String]) -> Result<Option<LockSession>, Error> {
-        self.lock.try_acquire(keys).await.map_err(Error::Lock)
-    }
-
-    async fn acquire(&self, keys: &[String]) -> Result<LockSession, Error> {
-        self.lock.acquire(keys).await.map_err(Error::Lock)
     }
 }
 
