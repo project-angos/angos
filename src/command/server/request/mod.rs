@@ -1,13 +1,12 @@
 use std::{cmp::Ordering, io, sync::LazyLock};
 
-use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use http_body_util::BodyExt;
 use hyper::{
     HeaderMap,
     body::Incoming,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RANGE},
+    header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RANGE},
 };
 use regex::Regex;
 use tokio::io::AsyncRead;
@@ -24,8 +23,6 @@ static SUFFIX_RANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:bytes=)?-(?P<suffix>\d+)$").unwrap());
 
 static BYTES_RANGE_PREFIX: &str = "bytes=";
-static BEARER_SCHEME: &str = "Bearer";
-static BASIC_SCHEME: &str = "Basic";
 static QUALITY_PARAM: &str = "q";
 
 /// Set by the web UI to force an inline body instead of a presigned S3
@@ -75,20 +72,6 @@ impl<'a> RequestHeaders<'a> {
             .into_iter()
             .map(|media_range| media_range.value)
             .collect()
-    }
-
-    pub fn bearer_token(&self) -> Option<String> {
-        self.authorization_parameter(BEARER_SCHEME)
-            .map(str::to_string)
-    }
-
-    pub fn basic_auth(&self) -> Option<(String, String)> {
-        let value = self.authorization_parameter(BASIC_SCHEME)?;
-        let value = BASE64_STANDARD.decode(value).ok()?;
-        let value = String::from_utf8(value).ok()?;
-
-        let (username, password) = value.split_once(':')?;
-        Some((username.to_string(), password.to_string()))
     }
 
     pub fn content_length(&self) -> Result<Option<u64>, Error> {
@@ -202,15 +185,6 @@ impl<'a> RequestHeaders<'a> {
             .map_err(|error| Error::BadRequest(format!("Invalid header value: {error}")))?;
 
         Ok(Some(value.to_string()))
-    }
-
-    fn authorization_parameter(&self, scheme: &str) -> Option<&str> {
-        let value = self.headers.get(AUTHORIZATION)?.to_str().ok()?.trim_start();
-        let (actual_scheme, parameter) = value.split_once(char::is_whitespace)?;
-
-        actual_scheme
-            .eq_ignore_ascii_case(scheme)
-            .then_some(parameter.trim_start())
     }
 }
 

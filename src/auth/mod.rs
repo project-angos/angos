@@ -1,4 +1,5 @@
 pub mod authenticator;
+pub mod authorization;
 pub mod authorizer;
 pub mod basic_auth;
 mod error;
