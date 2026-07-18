@@ -1,100 +1,30 @@
-use std::{fs, path::Path, time::Duration};
+use std::{fs, path::Path};
 
-use reqwest::{Certificate, Client, ClientBuilder, Identity, header::HeaderMap, redirect::Policy};
+use reqwest::{Certificate, ClientBuilder, Identity};
 
-pub struct HttpClientBuilder {
-    builder: ClientBuilder,
-}
-
-impl HttpClientBuilder {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            builder: Client::builder(),
+/// Adds optional CA and client certificate files to `builder`.
+///
+/// # Errors
+///
+/// Returns an error when a configured certificate/key file cannot be read or
+/// parsed.
+pub fn apply_tls_files(
+    mut builder: ClientBuilder,
+    server_ca_bundle: Option<&Path>,
+    client_certificate: Option<&Path>,
+    client_private_key: Option<&Path>,
+) -> Result<ClientBuilder, String> {
+    if let Some(path) = server_ca_bundle {
+        for certificate in load_certificate_bundle(path)? {
+            builder = builder.add_root_certificate(certificate);
         }
     }
 
-    #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.builder = self.builder.timeout(timeout);
-        self
+    if let Some(identity) = load_identity(client_certificate, client_private_key)? {
+        builder = builder.identity(identity);
     }
 
-    /// Bounds how long establishing the connection (TCP + TLS handshake) may
-    /// take. Unlike [`Self::timeout`], it does not cap the transfer itself.
-    #[must_use]
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.builder = self.builder.connect_timeout(timeout);
-        self
-    }
-
-    /// Bounds inactivity between successful reads (it resets on each read), so
-    /// a long but steadily-progressing transfer is not capped while a stalled
-    /// connection still fails.
-    #[must_use]
-    pub fn read_timeout(mut self, timeout: Duration) -> Self {
-        self.builder = self.builder.read_timeout(timeout);
-        self
-    }
-
-    #[must_use]
-    pub fn redirect(mut self, policy: Policy) -> Self {
-        self.builder = self.builder.redirect(policy);
-        self
-    }
-
-    #[must_use]
-    pub fn rustls_tls(mut self) -> Self {
-        self.builder = self.builder.use_rustls_tls();
-        self
-    }
-
-    #[must_use]
-    pub fn default_headers(mut self, headers: HeaderMap) -> Self {
-        self.builder = self.builder.default_headers(headers);
-        self
-    }
-
-    /// Adds optional CA and client certificate files to the client builder.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a configured certificate/key file cannot be read or parsed.
-    pub fn tls_files(
-        mut self,
-        server_ca_bundle: Option<&Path>,
-        client_certificate: Option<&Path>,
-        client_private_key: Option<&Path>,
-    ) -> Result<Self, String> {
-        if let Some(path) = server_ca_bundle {
-            for certificate in load_certificate_bundle(path)? {
-                self.builder = self.builder.add_root_certificate(certificate);
-            }
-        }
-
-        if let Some(identity) = load_identity(client_certificate, client_private_key)? {
-            self.builder = self.builder.identity(identity);
-        }
-
-        Ok(self)
-    }
-
-    /// Builds the configured HTTP client.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the underlying reqwest client cannot be built.
-    pub fn build(self) -> Result<Client, String> {
-        self.builder
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))
-    }
-}
-
-impl Default for HttpClientBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+    Ok(builder)
 }
 
 fn load_certificate_bundle(path: &Path) -> Result<Vec<Certificate>, String> {
@@ -125,8 +55,10 @@ fn load_identity(
 mod tests {
     use std::fs;
 
+    use reqwest::Client;
+
     use crate::{
-        http_client::{HttpClientBuilder, load_certificate_bundle, load_identity},
+        http_client::{apply_tls_files, load_certificate_bundle, load_identity},
         test_fixtures::webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
     };
 
@@ -153,16 +85,20 @@ mod tests {
 
     #[test]
     fn rustls_tls_builds_with_and_without_ca_bundle() {
-        assert!(HttpClientBuilder::new().rustls_tls().build().is_ok());
+        assert!(Client::builder().use_rustls_tls().build().is_ok());
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let file_path = tmp_dir.path().join("bundle.pem");
         fs::write(&file_path, ca_bundle_pem()).unwrap();
 
-        let client = HttpClientBuilder::new()
-            .rustls_tls()
-            .tls_files(Some(&file_path), None, None)
-            .and_then(HttpClientBuilder::build);
+        let client = apply_tls_files(
+            Client::builder().use_rustls_tls(),
+            Some(&file_path),
+            None,
+            None,
+        )
+        .unwrap()
+        .build();
         assert!(client.is_ok());
     }
 

@@ -318,7 +318,7 @@ pub async fn apply_cas(
             body_ref,
             expected,
         } => {
-            let Some(body_bytes) = stage_body(store, body_ref, mode).await? else {
+            let Some(body_bytes) = fetch_staged_body(store, body_ref, mode).await? else {
                 return Ok(());
             };
             let Some(etag) = expected else {
@@ -341,7 +341,7 @@ pub async fn apply_cas(
             }
         }
         MutationRecord::PutIfAbsent { key, body_ref } => {
-            let Some(body_bytes) = stage_body(store, body_ref, mode).await? else {
+            let Some(body_bytes) = fetch_staged_body(store, body_ref, mode).await? else {
                 return Ok(());
             };
             match store.put_if_absent(key, body_bytes).await {
@@ -453,7 +453,7 @@ async fn apply_merge_set_cas(
 ///
 /// Returns `Err(Error::Storage(...))` on a hard storage error (and, in
 /// `Abort` mode, on a `NotFound` for the staged body).
-async fn stage_body(
+async fn fetch_staged_body(
     store: &dyn ConditionalStore,
     body_ref: &str,
     mode: ApplyMode,

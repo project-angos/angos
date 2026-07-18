@@ -1,5 +1,5 @@
 use std::{
-    fmt,
+    fmt, io,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -30,9 +30,9 @@ impl fmt::Display for CircuitBreakerError {
 
 impl std::error::Error for CircuitBreakerError {}
 
-impl From<CircuitBreakerError> for std::io::Error {
+impl From<CircuitBreakerError> for io::Error {
     fn from(e: CircuitBreakerError) -> Self {
-        std::io::Error::other(e.to_string())
+        io::Error::other(e.to_string())
     }
 }
 

@@ -122,6 +122,12 @@ impl Store {
                 // Memory backend: keep builder defaults.
                 Lock::builder(storage)
             }
+            #[cfg(not(feature = "redis"))]
+            LockStrategy::Redis(_) => {
+                return Err(Error::Build(
+                    "redis lock strategy requires the 'redis' feature".to_string(),
+                ));
+            }
             #[cfg(feature = "redis")]
             LockStrategy::Redis(config) => {
                 let storage: Arc<dyn LockStorage> =

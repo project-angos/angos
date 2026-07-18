@@ -519,7 +519,7 @@ impl Registry {
         namespace: &Namespace,
         manifest: &Manifest,
     ) -> Result<(), Error> {
-        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        let ownership = self.blob_ownership();
 
         if let Some(config) = &manifest.config {
             self.validate_manifest_reference(namespace, &ownership, &config.digest)
@@ -565,7 +565,7 @@ impl Registry {
         namespace: &Namespace,
         ops: Vec<LinkOperation>,
     ) -> Result<Vec<LinkOperation>, Error> {
-        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        let ownership = self.blob_ownership();
         let mut retained = Vec::with_capacity(ops.len());
         for op in ops {
             if let LinkOperation::Create { link, target, .. } = &op

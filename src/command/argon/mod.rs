@@ -8,7 +8,6 @@ use argon2::{
 use zeroize::Zeroizing;
 
 #[derive(FromArgs, PartialEq, Debug)]
-#[allow(clippy::struct_excessive_bools)]
 #[argh(
     subcommand,
     name = "argon",

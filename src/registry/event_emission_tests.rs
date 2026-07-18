@@ -97,7 +97,7 @@ impl FsRegistryFixture {
             event_dispatcher: Some(Arc::new(dispatcher)),
             ..RegistryConfig::default()
         };
-        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+        let registry = Registry::new(blob_store, metadata_store, resolver, config);
 
         Self {
             registry,
@@ -708,7 +708,7 @@ impl ReplicationFixture {
             job_queue: Some(job_store.clone()),
             ..RegistryConfig::default()
         };
-        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+        let registry = Registry::new(blob_store, metadata_store, resolver, config);
 
         Self {
             registry,

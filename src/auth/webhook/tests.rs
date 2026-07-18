@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use hyper::{Method, http::request::Builder};
-use reqwest::Client;
+use reqwest::{Client, redirect::Policy};
 use url::Url;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -16,7 +16,7 @@ use crate::{
         headers::{build_header_name, build_header_value, build_headers},
     },
     cache::{self, Cache},
-    http_client::HttpClientBuilder,
+    http_client::apply_tls_files,
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference, Tag},
     secret::Secret,
@@ -68,33 +68,42 @@ fn test_config_deserialize() {
 }
 
 #[test]
-fn mtls_pair_must_be_complete_at_deserialize_time() {
-    let invalid_toml = r#"
+fn mtls_pair_must_be_complete_at_validation() {
+    let config: Config = toml::from_str(
+        r#"
         url = "https://example.com"
         timeout_ms = 1000
         client_certificate_bundle = "/valid/path/to/cert.pem"
-    "#;
-    assert!(toml::from_str::<Config>(invalid_toml).is_err());
+    "#,
+    )
+    .unwrap();
+    assert!(config.validate().is_err());
 
-    let invalid_toml = r#"
+    let config: Config = toml::from_str(
+        r#"
         url = "https://example.com"
         timeout_ms = 1000
         client_private_key = "/valid/path/to/key.pem"
-    "#;
-    assert!(toml::from_str::<Config>(invalid_toml).is_err());
+    "#,
+    )
+    .unwrap();
+    assert!(config.validate().is_err());
 }
 
 #[test]
-fn invalid_forward_header_fails_at_deserialize_time() {
-    let toml = r#"
+fn invalid_forward_header_fails_validation() {
+    let config: Config = toml::from_str(
+        r#"
         url = "https://example.com"
         timeout_ms = 1000
         forward_headers = ["X-Good-Header", "Invalid Header!"]
-    "#;
+    "#,
+    )
+    .unwrap();
 
-    let err = toml::from_str::<Config>(toml).unwrap_err();
+    let err = config.validate().unwrap_err();
     assert!(
-        err.to_string().contains("Invalid Header!"),
+        err.contains("Invalid Header!"),
         "error should identify the invalid forwarded header: {err}"
     );
 }
@@ -241,16 +250,17 @@ fn build_test_config(
 }
 
 fn build_test_client(config: &Config) -> Result<Client, String> {
-    HttpClientBuilder::new()
-        .rustls_tls()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_millis(config.timeout_ms))
-        .tls_files(
-            config.server_ca_bundle.as_deref(),
-            config.client_certificate_bundle.as_deref(),
-            config.client_private_key.as_deref(),
-        )?
-        .build()
+    apply_tls_files(
+        Client::builder()
+            .use_rustls_tls()
+            .redirect(Policy::none())
+            .timeout(Duration::from_millis(config.timeout_ms)),
+        config.server_ca_bundle.as_deref(),
+        config.client_certificate_bundle.as_deref(),
+        config.client_private_key.as_deref(),
+    )?
+    .build()
+    .map_err(|e| format!("Failed to create HTTP client: {e}"))
 }
 
 fn build_test_webhook(

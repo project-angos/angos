@@ -16,7 +16,6 @@
 pub mod memory;
 pub mod s3;
 
-#[cfg(feature = "redis")]
 pub mod redis;
 
 use std::fmt::Debug;

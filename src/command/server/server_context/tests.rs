@@ -188,7 +188,7 @@ pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
         ..RegistryConfig::default()
     };
 
-    Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
+    Registry::new(blob_backend, metadata_store, resolver, registry_config)
 }
 
 pub fn create_test_event() -> Event {
@@ -638,8 +638,7 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
             global_immutable_tags_exclusions: Vec::new(),
             ..RegistryConfig::default()
         },
-    )
-    .unwrap();
+    );
 
     ShutdownFlushHarness {
         registry,

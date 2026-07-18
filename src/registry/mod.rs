@@ -46,6 +46,7 @@ use crate::{
     replication::ReplicationJobHandler,
 };
 pub use blob::{BlobRange, GetBlobResponse};
+use blob_ownership::BlobOwnership;
 pub use error::Error;
 pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
 pub use repository::Repository;
@@ -143,6 +144,11 @@ impl fmt::Debug for Registry {
 }
 
 impl Registry {
+    /// Ownership view over the metadata store's blob index.
+    pub fn blob_ownership(&self) -> BlobOwnership<'_> {
+        BlobOwnership::new(self.metadata_store.as_ref())
+    }
+
     /// Returns an `Arc`: the one registry instance is shared across the server
     /// handlers and background commands.
     #[instrument(skip(blob_store, metadata_store, resolver, config))]
@@ -151,7 +157,7 @@ impl Registry {
         metadata_store: Arc<MetadataStore>,
         resolver: Arc<RepositoryResolver>,
         config: RegistryConfig,
-    ) -> Result<Arc<Self>, Error> {
+    ) -> Arc<Self> {
         let (job_queue, in_process_shutdown): (Arc<JobStore>, Option<CancellationToken>) =
             if let Some(q) = config.job_queue {
                 (q, None)
@@ -167,7 +173,7 @@ impl Registry {
                 (q, Some(shutdown))
             };
 
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             update_pull_time: config.update_pull_time,
             enable_blob_redirect: config.enable_blob_redirect,
             enable_manifest_redirect: config.enable_manifest_redirect,
@@ -182,7 +188,7 @@ impl Registry {
             max_blob_size_bytes: config.max_blob_size_bytes,
             validate_manifest_references: config.validate_manifest_references,
             event_dispatcher: config.event_dispatcher,
-        }))
+        })
     }
 
     /// The configured webhook dispatcher, shared so externally built handlers
@@ -436,8 +442,7 @@ mod in_process_replication_tests {
         let resolver = single_repo_resolver(REPO, repository);
 
         let config = RegistryConfig::default();
-        let registry =
-            Registry::new(blob_store.clone(), metadata_store.clone(), resolver, config).unwrap();
+        let registry = Registry::new(blob_store.clone(), metadata_store.clone(), resolver, config);
 
         (registry, blob_store, metadata_store, dir)
     }

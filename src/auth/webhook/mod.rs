@@ -1,5 +1,4 @@
 mod authorizer;
-mod cache;
 mod config;
 mod headers;
 

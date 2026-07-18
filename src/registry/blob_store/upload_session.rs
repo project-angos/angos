@@ -34,7 +34,7 @@ use std::io::Cursor;
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures_util::stream::Stream;
+use futures_util::{TryStreamExt, stream::Stream};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
     try_join,
@@ -176,26 +176,18 @@ impl BlobStore {
             "{}/",
             path_builder::upload_hash_context_dir(namespace, uuid)
         );
-        let mut highest: Option<u64> = None;
-        let mut token = None;
-        loop {
-            let page = self.object.list(&dir, 1000, token).await?;
-            for key in &page.items {
-                // `list` yields prefix-relative keys, so the trailing path
-                // component is the checkpoint offset (cumulative bytes hashed).
-                let Some(offset) = key.rsplit('/').next().and_then(|s| s.parse::<u64>().ok())
-                else {
-                    continue;
-                };
-                if highest.is_none_or(|best| offset > best) {
-                    highest = Some(offset);
-                }
-            }
-            match page.next_token {
-                Some(t) => token = Some(t),
-                None => break,
-            }
-        }
+        let dir = &dir;
+        let highest: Option<u64> = paginated(move |token| async move {
+            let page = self.object.list(dir, 1000, token).await?;
+            Ok::<_, Error>((page.items, page.next_token))
+        })
+        .try_fold(None, |best: Option<u64>, key| async move {
+            // `list` yields prefix-relative keys, so the trailing path
+            // component is the checkpoint offset (cumulative bytes hashed).
+            let offset = key.rsplit('/').next().and_then(|s| s.parse::<u64>().ok());
+            Ok(best.max(offset))
+        })
+        .await?;
 
         let Some(offset) = highest else {
             return Err(Error::BlobUploadUnknown);

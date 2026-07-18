@@ -2,6 +2,7 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
+use tracing::info;
 
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +30,11 @@ pub async fn build_metadata_store(
     cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
 ) -> Result<Arc<MetadataStore>, Error> {
     let mut storage_config = config.resolve_registry_storage();
+    if matches!(config.registry_storage, RegistryStorageConfig::Inherit)
+        && matches!(&storage_config, RegistryStorageConfig::S3(_))
+    {
+        info!("Auto-configuring S3 metadata-store from blob-store");
+    }
 
     // Resolve S3 conditional-write support once and memoize it so a config
     // hot-reload rebuilds the metadata store without re-probing the endpoint.
@@ -133,8 +139,7 @@ pub async fn build_registry(
         tokio::spawn(handles.recovery(token));
     }
 
-    let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config)
-        .map_err(|e| Error::Initialization(e.to_string()))?;
+    let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);
 
     Ok((registry, pending))
 }

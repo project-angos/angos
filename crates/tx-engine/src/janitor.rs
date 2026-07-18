@@ -382,17 +382,8 @@ impl LockJanitor {
     /// Inspect a single lock object and delete it if expired by more than
     /// `orphan_age`.
     async fn process_key(&self, key: &str) {
-        let meta = match self.store.head(key).await {
-            Ok(m) => m,
-            Err(StorageError::NotFound) => return,
-            Err(e) => {
-                warn!(key, error = %e, "LockJanitor: head failed");
-                return;
-            }
-        };
-
-        let bytes = match self.store.get(key).await {
-            Ok(b) => b,
+        let (bytes, etag, last_modified) = match self.store.get_with_metadata(key).await {
+            Ok(t) => t,
             Err(StorageError::NotFound) => return,
             Err(e) => {
                 warn!(key, error = %e, "LockJanitor: get failed");
@@ -412,18 +403,14 @@ impl LockJanitor {
             }
         };
 
-        if !body.is_expired(meta.last_modified) {
-            return;
-        }
-
-        let reference = meta.last_modified.unwrap_or(body.refreshed_at);
+        let reference = last_modified.unwrap_or(body.refreshed_at);
         let total_grace = ChronoDuration::seconds(body.ttl_secs.cast_signed())
             + ChronoDuration::from_std(self.orphan_age).unwrap_or(ChronoDuration::zero());
         if Utc::now() <= reference + total_grace {
             return;
         }
 
-        let Some(etag) = meta.etag.as_ref() else {
+        let Some(etag) = etag.as_ref() else {
             warn!(
                 key,
                 "LockJanitor: lock object has no ETag; leaving in place"

@@ -12,7 +12,7 @@ use angos_tx_engine::{
 
 use crate::{
     cache::{self, Cache},
-    configuration::{Configuration, RegistryStorageConfig, registry_storage::S3BackendConfig},
+    configuration::{Configuration, RegistryStorageConfig, registry_storage::MetadataS3Config},
     event_webhook::{self, dispatcher::EventDispatcher},
     jobs::store::{self as job_store, JobStore},
     registry::{
@@ -86,7 +86,7 @@ fn ensure_s3_cas_supported(lock_strategy: &LockStrategy, cas: bool) -> Result<()
 
 /// Probe an S3 backend for conditional-write support, rejecting an
 /// operator-configured S3 lock when the provider lacks the conditional set.
-async fn probe_s3(config: &S3BackendConfig) -> Result<bool, Error> {
+async fn probe_s3(config: &MetadataS3Config) -> Result<bool, Error> {
     let http = S3HttpBackend::new(&config.connection.to_client_config())?;
     let storage = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
     let cas = probe_cas_support(storage.as_ref()).await?;
@@ -255,7 +255,7 @@ pub fn registry(
             event_dispatcher: dispatcher,
             ..RegistryConfig::default()
         },
-    )?;
+    );
     Ok(registry)
 }
 
@@ -302,7 +302,7 @@ mod tests {
         command::server::Error as ServerError,
         configuration::{
             RegistryStorageConfig,
-            registry_storage::{FsBackendConfig, S3BackendConfig},
+            registry_storage::{MetadataFsConfig, MetadataS3Config},
         },
         policy::{AccessMode, AccessPolicyConfig},
         registry::{
@@ -412,7 +412,7 @@ mod tests {
     }
 
     fn s3_config_with_lock_strategy(lock_strategy: Option<LockStrategy>) -> RegistryStorageConfig {
-        RegistryStorageConfig::S3(S3BackendConfig {
+        RegistryStorageConfig::S3(MetadataS3Config {
             connection: s3_test_connection(format!("probe-test-{}", uuid::Uuid::new_v4())),
             lock_strategy,
             link_cache_ttl: 30,
@@ -455,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_fs_config_is_noop() {
-        let config = RegistryStorageConfig::FS(FsBackendConfig {
+        let config = RegistryStorageConfig::FS(MetadataFsConfig {
             root_dir: "/tmp/probe-test".to_string(),
             lock_strategy: LockStrategy::Memory,
             sync_to_disk: false,

@@ -26,7 +26,6 @@ use crate::{
         config::{DeliveryPolicy, EventWebhookConfig},
         event::{Event, EventKind},
     },
-    http_client::HttpClientBuilder,
     metrics_provider::metrics_provider,
     secret::Secret,
 };
@@ -211,8 +210,8 @@ impl EventDispatcher {
         let mut endpoints = HashMap::with_capacity(webhooks.len());
 
         for (name, config) in webhooks {
-            let client = HttpClientBuilder::new()
-                .rustls_tls()
+            let client = Client::builder()
+                .use_rustls_tls()
                 .timeout(Duration::from_millis(config.timeout_ms))
                 .build()
                 .map_err(|e| {

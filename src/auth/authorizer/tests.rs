@@ -500,7 +500,7 @@ async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
         ..RegistryConfig::default()
     };
 
-    Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
+    Registry::new(blob_backend, metadata_store, resolver, registry_config)
 }
 
 /// Builds the authorizer and registry pair every `authorize_request` test needs.

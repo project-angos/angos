@@ -31,6 +31,21 @@ fn test_range_with_bytes_prefix() {
 }
 
 #[test]
+fn test_blob_range_double_bytes_prefix_rejected() {
+    let request = Request::builder()
+        .header(RANGE, "bytes=bytes=0-5")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let result = RequestHeaders::new(&parts.headers).blob_range();
+    assert!(
+        result.is_err(),
+        "a doubled bytes= prefix must be rejected, got: {result:?}"
+    );
+}
+
+#[test]
 fn test_blob_range_with_bytes_prefix() {
     let request = Request::builder()
         .header(RANGE, "bytes=0-499")

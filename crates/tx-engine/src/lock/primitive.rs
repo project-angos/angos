@@ -262,7 +262,7 @@ impl Lock {
     /// [`Error::StorageBackend`] on a hard storage error.
     pub async fn acquire(&self, keys: &[String]) -> Result<LockSession, Error> {
         if keys.is_empty() {
-            return Ok(LockSession::sync(Box::new(())));
+            return Ok(LockSession::noop());
         }
 
         let mut sorted: Vec<String> = keys.to_vec();
@@ -313,7 +313,7 @@ impl Lock {
     /// Returns [`Error::StorageBackend`] on a hard storage error.
     pub async fn try_acquire(&self, keys: &[String]) -> Result<Option<LockSession>, Error> {
         if keys.is_empty() {
-            return Ok(Some(LockSession::sync(Box::new(()))));
+            return Ok(Some(LockSession::noop()));
         }
 
         let mut sorted: Vec<String> = keys.to_vec();

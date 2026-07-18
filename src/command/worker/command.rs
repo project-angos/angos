@@ -387,8 +387,7 @@ mod tests {
                 job_queue: Some(Arc::new(JobStore::new(storage.clone(), "worker-test"))),
                 ..RegistryConfig::default()
             },
-        )
-        .unwrap();
+        );
         let context = WorkerContext {
             storage,
             blob_store,

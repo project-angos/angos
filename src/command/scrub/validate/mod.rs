@@ -81,6 +81,8 @@ pub struct Validator {
     /// namespaces, orphan upload sessions), so the per-key walk does not
     /// repeat their prefix-level actions.
     handled: Mutex<HashSet<String>>,
+    /// Digests exempted from this run's blob GC (see [`Self::hold_blob_gc`]).
+    gc_holds: Mutex<HashSet<Digest>>,
     /// Intent records already fetched this run, keyed by log file name. An
     /// intent's expiry and mutation keys never change once written, so a
     /// cached entry stays valid for the whole run.
@@ -102,6 +104,7 @@ impl Validator {
             stats,
             delete_unknown,
             handled: Mutex::new(HashSet::new()),
+            gc_holds: Mutex::new(HashSet::new()),
             intent_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -315,15 +318,17 @@ impl Validator {
     /// run would destroy a still-referenced blob; the next run re-grants from
     /// the manifests and then GC sees the truth.
     pub fn hold_blob_gc(&self, digest: &Digest) {
-        let _ = self.claim(format!("gc-hold:{digest}"));
+        match self.gc_holds.lock() {
+            Ok(mut holds) => holds.insert(digest.clone()),
+            Err(poisoned) => poisoned.into_inner().insert(digest.clone()),
+        };
     }
 
     /// Whether `digest` was exempted from this run's blob GC.
     pub fn blob_gc_held(&self, digest: &Digest) -> bool {
-        let token = format!("gc-hold:{digest}");
-        match self.handled.lock() {
-            Ok(handled) => handled.contains(&token),
-            Err(poisoned) => poisoned.into_inner().contains(&token),
+        match self.gc_holds.lock() {
+            Ok(holds) => holds.contains(digest),
+            Err(poisoned) => poisoned.into_inner().contains(digest),
         }
     }
 }

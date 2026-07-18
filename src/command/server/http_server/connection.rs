@@ -28,6 +28,9 @@ use crate::{
     timing::elapsed_ms,
 };
 
+/// Boxed, type-erased dispatch future. The erasure is load-bearing, not an
+/// optimization: with the concrete future type inlined, `tokio::spawn` fails
+/// on it with an E0275 trait-solver overflow.
 type DispatchFuture =
     Pin<Box<dyn Future<Output = Result<Response<ResponseBody>, ServerError>> + Send + 'static>>;
 

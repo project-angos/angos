@@ -11,50 +11,13 @@
 //! `None` for `last_modified`. The lock TTL is enforced by Redis natively so
 //! there is no need to read `last_modified` for expiry detection.
 
-use std::{fmt::Debug, sync::Arc};
-
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use redis::Client;
-
-use crate::lock::{
-    Error,
-    storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
-};
-
-// ARGV[1] = value, ARGV[2] = ttl_secs
-const SET_NX_SCRIPT: &str = r"
-return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
-";
-
-// ARGV[1] = expected_value, ARGV[2] = ttl_secs, ARGV[3] = new_value
-const REFRESH_SCRIPT: &str = r"
-local current = redis.call('GET', KEYS[1])
-if current == false or current ~= ARGV[1] then
-    return 0
-end
-redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[2])
-return 1
-";
-
-// ARGV[1] = expected_value
-const DELETE_IF_MATCH_SCRIPT: &str = r"
-local current = redis.call('GET', KEYS[1])
-if current == false then
-    return 1
-end
-if current ~= ARGV[1] then
-    return 0
-end
-redis.call('DEL', KEYS[1])
-return 1
-";
+use serde::Deserialize;
 
 /// Configuration for the Redis lock storage.
 ///
 /// This is a DTO. Deserialized from operator config; used to construct a
 /// [`RedisLockStorage`]. Not held as a runtime field.
-#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct RedisLockStorageConfig {
     pub url: String,
     pub ttl: usize,
@@ -88,165 +51,219 @@ impl Default for RedisLockStorageConfig {
     }
 }
 
-/// Redis-backed lock storage.
-///
-/// Safe to clone; all clones share the same [`Client`].
-#[derive(Clone)]
-pub struct RedisLockStorage {
-    client: Arc<Client>,
-    ttl_secs: usize,
-    key_prefix: String,
-}
+#[cfg(feature = "redis")]
+pub use backend::RedisLockStorage;
 
-impl Debug for RedisLockStorage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RedisLockStorage")
-            .field("ttl_secs", &self.ttl_secs)
-            .field("key_prefix", &self.key_prefix)
-            .finish_non_exhaustive()
-    }
-}
+#[cfg(feature = "redis")]
+mod backend {
+    use std::{
+        fmt::{self, Debug},
+        sync::Arc,
+    };
 
-impl RedisLockStorage {
-    /// Construct a [`RedisLockStorage`] from a [`RedisLockStorageConfig`].
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use redis::{Client, Script};
+
+    use crate::lock::{
+        Error,
+        storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
+    };
+
+    // ARGV[1] = value, ARGV[2] = ttl_secs
+    const SET_NX_SCRIPT: &str = r"
+return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
+";
+
+    // ARGV[1] = expected_value, ARGV[2] = ttl_secs, ARGV[3] = new_value
+    const REFRESH_SCRIPT: &str = r"
+local current = redis.call('GET', KEYS[1])
+if current == false or current ~= ARGV[1] then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[2])
+return 1
+";
+
+    // ARGV[1] = expected_value
+    const DELETE_IF_MATCH_SCRIPT: &str = r"
+local current = redis.call('GET', KEYS[1])
+if current == false then
+    return 1
+end
+if current ~= ARGV[1] then
+    return 0
+end
+redis.call('DEL', KEYS[1])
+return 1
+";
+
+    use super::RedisLockStorageConfig;
+
+    /// Redis-backed lock storage.
     ///
-    /// # Errors
-    ///
-    /// Returns a [`redis::RedisError`] if the URL is invalid.
-    pub fn new(config: &RedisLockStorageConfig) -> redis::RedisResult<Self> {
-        let client = Client::open(config.url.clone())?;
-        Ok(Self {
-            client: Arc::new(client),
-            ttl_secs: config.ttl,
-            key_prefix: config.key_prefix.clone(),
-        })
+    /// Safe to clone; all clones share the same [`Client`].
+    #[derive(Clone)]
+    pub struct RedisLockStorage {
+        client: Arc<Client>,
+        ttl_secs: usize,
+        key_prefix: String,
     }
 
-    fn full_key(&self, key: &str) -> String {
-        format!("{}{}", self.key_prefix, key)
-    }
-}
-
-#[async_trait]
-impl LockStorage for RedisLockStorage {
-    async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<PutIfAbsentOutcome, Error> {
-        let full_key = self.full_key(key);
-        // `body` is a JSON `LockBody`; we store its bytes verbatim as the Redis
-        // value. If decoding fails we substitute a sentinel string. The ETag
-        // comparison later will still work because we round-trip the same
-        // bytes.
-        let value = String::from_utf8(body).unwrap_or_else(|_| "unknown".to_string());
-
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
-
-        let result: Option<String> = redis::Script::new(SET_NX_SCRIPT)
-            .key(&full_key)
-            .arg(&value)
-            .arg(self.ttl_secs)
-            .invoke_async(&mut conn)
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis SET NX: {e}")))?;
-
-        if result.as_deref() == Some("OK") {
-            // The value itself serves as the ETag for Redis.
-            Ok(PutIfAbsentOutcome::Created(value))
-        } else {
-            Ok(PutIfAbsentOutcome::AlreadyExists)
+    impl Debug for RedisLockStorage {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("RedisLockStorage")
+                .field("ttl_secs", &self.ttl_secs)
+                .field("key_prefix", &self.key_prefix)
+                .finish_non_exhaustive()
         }
     }
 
-    async fn put_if_match(
-        &self,
-        key: &str,
-        expected_etag: &str,
-        body: Vec<u8>,
-    ) -> Result<PutIfMatchOutcome, Error> {
-        let full_key = self.full_key(key);
-        let new_value = String::from_utf8(body).unwrap_or_else(|_| "unknown".to_string());
+    impl RedisLockStorage {
+        /// Construct a [`RedisLockStorage`] from a [`RedisLockStorageConfig`].
+        ///
+        /// # Errors
+        ///
+        /// Returns a [`redis::RedisError`] if the URL is invalid.
+        pub fn new(config: &RedisLockStorageConfig) -> redis::RedisResult<Self> {
+            let client = Client::open(config.url.clone())?;
+            Ok(Self {
+                client: Arc::new(client),
+                ttl_secs: config.ttl,
+                key_prefix: config.key_prefix.clone(),
+            })
+        }
 
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
-
-        let result: i32 = redis::Script::new(REFRESH_SCRIPT)
-            .key(&full_key)
-            .arg(expected_etag)
-            .arg(self.ttl_secs)
-            .arg(&new_value)
-            .invoke_async(&mut conn)
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis refresh script: {e}")))?;
-
-        if result == 1 {
-            Ok(PutIfMatchOutcome::Updated(new_value))
-        } else {
-            Ok(PutIfMatchOutcome::Mismatch)
+        fn full_key(&self, key: &str) -> String {
+            format!("{}{}", self.key_prefix, key)
         }
     }
 
-    async fn get_with_etag(
-        &self,
-        key: &str,
-    ) -> Result<(Vec<u8>, String, Option<DateTime<Utc>>), Error> {
-        let full_key = self.full_key(key);
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
+    #[async_trait]
+    impl LockStorage for RedisLockStorage {
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            body: Vec<u8>,
+        ) -> Result<PutIfAbsentOutcome, Error> {
+            let full_key = self.full_key(key);
+            // `body` is a JSON `LockBody`; we store its bytes verbatim as the Redis
+            // value. If decoding fails we substitute a sentinel string. The ETag
+            // comparison later will still work because we round-trip the same
+            // bytes.
+            let value = String::from_utf8(body).unwrap_or_else(|_| "unknown".to_string());
 
-        let value: Option<String> = redis::cmd("GET")
-            .arg(&full_key)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis GET: {e}")))?;
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
 
-        match value {
-            None => Err(Error::NotFound),
-            Some(v) => {
-                let etag = v.clone();
-                Ok((v.into_bytes(), etag, None))
+            let result: Option<String> = Script::new(SET_NX_SCRIPT)
+                .key(&full_key)
+                .arg(&value)
+                .arg(self.ttl_secs)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(|e| Error::StorageBackend(format!("Redis SET NX: {e}")))?;
+
+            if result.as_deref() == Some("OK") {
+                // The value itself serves as the ETag for Redis.
+                Ok(PutIfAbsentOutcome::Created(value))
+            } else {
+                Ok(PutIfAbsentOutcome::AlreadyExists)
             }
         }
-    }
 
-    async fn delete_if_match(
-        &self,
-        key: &str,
-        expected_etag: &str,
-    ) -> Result<DeleteIfMatchOutcome, Error> {
-        let full_key = self.full_key(key);
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
+        async fn put_if_match(
+            &self,
+            key: &str,
+            expected_etag: &str,
+            body: Vec<u8>,
+        ) -> Result<PutIfMatchOutcome, Error> {
+            let full_key = self.full_key(key);
+            let new_value = String::from_utf8(body).unwrap_or_else(|_| "unknown".to_string());
 
-        let result: i32 = redis::Script::new(DELETE_IF_MATCH_SCRIPT)
-            .key(&full_key)
-            .arg(expected_etag)
-            .invoke_async(&mut conn)
-            .await
-            .map_err(|e| Error::StorageBackend(format!("Redis delete-if-match script: {e}")))?;
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
 
-        if result == 1 {
-            Ok(DeleteIfMatchOutcome::Deleted)
-        } else {
-            Ok(DeleteIfMatchOutcome::Mismatch)
+            let result: i32 = Script::new(REFRESH_SCRIPT)
+                .key(&full_key)
+                .arg(expected_etag)
+                .arg(self.ttl_secs)
+                .arg(&new_value)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(|e| Error::StorageBackend(format!("Redis refresh script: {e}")))?;
+
+            if result == 1 {
+                Ok(PutIfMatchOutcome::Updated(new_value))
+            } else {
+                Ok(PutIfMatchOutcome::Mismatch)
+            }
         }
-    }
 
-    fn label(&self) -> &'static str {
-        "redis"
-    }
+        async fn get_with_etag(
+            &self,
+            key: &str,
+        ) -> Result<(Vec<u8>, String, Option<DateTime<Utc>>), Error> {
+            let full_key = self.full_key(key);
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
 
-    fn is_process_shared(&self) -> bool {
-        true
+            let value: Option<String> = redis::cmd("GET")
+                .arg(&full_key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| Error::StorageBackend(format!("Redis GET: {e}")))?;
+
+            match value {
+                None => Err(Error::NotFound),
+                Some(v) => {
+                    let etag = v.clone();
+                    Ok((v.into_bytes(), etag, None))
+                }
+            }
+        }
+
+        async fn delete_if_match(
+            &self,
+            key: &str,
+            expected_etag: &str,
+        ) -> Result<DeleteIfMatchOutcome, Error> {
+            let full_key = self.full_key(key);
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| Error::StorageBackend(format!("Redis connect: {e}")))?;
+
+            let result: i32 = Script::new(DELETE_IF_MATCH_SCRIPT)
+                .key(&full_key)
+                .arg(expected_etag)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(|e| Error::StorageBackend(format!("Redis delete-if-match script: {e}")))?;
+
+            if result == 1 {
+                Ok(DeleteIfMatchOutcome::Deleted)
+            } else {
+                Ok(DeleteIfMatchOutcome::Mismatch)
+            }
+        }
+
+        fn label(&self) -> &'static str {
+            "redis"
+        }
+
+        fn is_process_shared(&self) -> bool {
+            true
+        }
     }
 }
