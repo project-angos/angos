@@ -5,18 +5,21 @@ mod auth;
 mod error;
 mod write;
 
-use std::{future::Future, io, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet, future::Future, io, path::Path, str::FromStr, sync::Arc, time::Duration,
+};
 
 use auth::token_index_cache_key;
 use futures_util::TryStreamExt;
 use reqwest::{
     Client, Method, RequestBuilder, Response, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LINK},
+    redirect::Policy,
 };
 use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 use url::Url;
 
 pub use crate::registry_client::{
@@ -26,8 +29,8 @@ pub use crate::registry_client::{
 
 use crate::{
     cache::Cache,
-    http_client::HttpClientBuilder,
-    oci::{Digest, MediaType, Reference},
+    http_client::apply_tls_files,
+    oci::{Digest, MediaType, Reference, Tag},
     registry::{
         DOCKER_CONTENT_DIGEST, blob_store::BoxedReader, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     },
@@ -151,6 +154,13 @@ pub struct RegistryClient {
     max_manifest_size_bytes: usize,
 }
 
+/// Body of an OCI `GET /v2/<ns>/tags/list` response.
+#[derive(Deserialize)]
+struct TagsListBody {
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
 impl RegistryClient {
     /// Starts building a registry client from individual resolved fields. The
     /// base `url`, the pre-built HTTP `client` (carrying the resolved
@@ -178,23 +188,22 @@ impl RegistryClient {
     fn resolve_config_fields(
         config: &RegistryClientConfig,
     ) -> Result<(Client, Option<BasicAuth>), Error> {
-        let client = HttpClientBuilder::new()
-            .rustls_tls()
-            .redirect(reqwest::redirect::Policy::limited(
-                config.max_redirect as usize,
-            ))
+        let builder = Client::builder()
+            .use_rustls_tls()
+            .redirect(Policy::limited(config.max_redirect as usize))
             // No whole-transfer deadline: a connect bound plus a per-read stall
             // bound so replicating a large blob is not capped by total time.
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .read_timeout(Duration::from_secs(config.read_timeout_secs))
-            .tls_files(
-                config.server_ca_bundle.as_deref().map(Path::new),
-                config.client_certificate.as_deref().map(Path::new),
-                config.client_private_key.as_deref().map(Path::new),
-            )
-            .map_err(Error::Initialization)?
-            .build()
-            .map_err(Error::Initialization)?;
+            .read_timeout(Duration::from_secs(config.read_timeout_secs));
+        let client = apply_tls_files(
+            builder,
+            config.server_ca_bundle.as_deref().map(Path::new),
+            config.client_certificate.as_deref().map(Path::new),
+            config.client_private_key.as_deref().map(Path::new),
+        )
+        .map_err(Error::Initialization)?
+        .build()
+        .map_err(|e| Error::Initialization(format!("Failed to create HTTP client: {e}")))?;
 
         let basic_auth = match (&config.username, &config.password) {
             (Some(username), Some(password)) => Some((username.clone(), password.clone())),
@@ -457,6 +466,85 @@ impl RegistryClient {
         Err(Error::Internal(format!(
             "blob_exists: downstream returned status {status}"
         )))
+    }
+
+    /// Lists every tag of a repository on the downstream, following `Link`
+    /// rel="next" pagination.
+    ///
+    /// A `404` (repository absent downstream) yields an empty list rather than
+    /// an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a request fails, access is rejected, or a non-404
+    /// page has a non-success status or unparseable body.
+    #[instrument(skip(self))]
+    pub async fn list_tags(&self, location: &str) -> Result<Vec<Tag>, Error> {
+        // Guards against non-terminating pagination: `visited` stops an exact
+        // page-URL cycle; `MAX_PAGES` backstops endless distinct pages.
+        const MAX_PAGES: usize = 10_000;
+
+        let mut tags: Vec<Tag> = Vec::new();
+        let mut next = Some(location.to_string());
+        let mut visited = HashSet::new();
+
+        while let Some(page_location) = next.take() {
+            if visited.len() >= MAX_PAGES {
+                return Err(Error::Internal(format!(
+                    "list_tags exceeded {MAX_PAGES} pages; downstream pagination does not terminate"
+                )));
+            }
+            if !visited.insert(page_location.clone()) {
+                // Cyclic `rel="next"`: stop with the tags gathered so far (a
+                // partial list only under-reconciles).
+                break;
+            }
+
+            let response = self.query(&Method::GET, &[], &page_location).await?;
+
+            if response.status() == StatusCode::NOT_FOUND {
+                return Ok(tags);
+            }
+            if !response.status().is_success() {
+                return Err(Error::Internal(format!(
+                    "list_tags failed with status {}",
+                    response.status()
+                )));
+            }
+
+            next = Self::parse_next_link(&response);
+
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| Error::Internal(format!("failed to read tags/list body: {e}")))?;
+            let parsed: TagsListBody = serde_json::from_slice(&body)
+                .map_err(|e| Error::Internal(format!("failed to parse tags/list body: {e}")))?;
+
+            for name in parsed.tags {
+                match Tag::try_from(name) {
+                    Ok(tag) => tags.push(tag),
+                    Err(e) => warn!("ignoring invalid tag in downstream tags/list: {e}"),
+                }
+            }
+        }
+
+        Ok(tags)
+    }
+
+    /// Extracts the `Link` rel="next" continuation URL (`<...>; rel="next"`),
+    /// resolved against the response's final URL, or `None` when absent.
+    fn parse_next_link(response: &Response) -> Option<String> {
+        let header = response.headers().get(LINK)?.to_str().ok()?;
+        let url = header
+            .split(',')
+            .filter(|entry| entry.contains("rel=\"next\"") || entry.contains("rel=next"))
+            .find_map(|entry| {
+                let start = entry.find('<')?;
+                let end = entry[start + 1..].find('>')? + start + 1;
+                Some(&entry[start + 1..end])
+            })?;
+        response.url().join(url).ok().map(|u| u.to_string())
     }
 
     /// Streams a blob from the upstream registry.

@@ -17,7 +17,6 @@ use crate::{
     registry::{
         Error, Registry, RegistryConfig, Repository,
         blob::{BlobRange, GetBlobResponse},
-        blob_ownership::BlobOwnership,
         blob_store,
         blob_store::{BlobStore, BlobStoreConfig},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -179,7 +178,7 @@ pub fn create_test_registry_with(
         ..RegistryConfig::default()
     };
 
-    Registry::new(blob_store, metadata_store, resolver, config).unwrap()
+    Registry::new(blob_store, metadata_store, resolver, config)
 }
 
 /// Write raw bytes at the canonical link path for `link` in `namespace`,
@@ -255,7 +254,8 @@ pub async fn get_blob(
     digest: &Digest,
     range: Option<BlobRange>,
 ) -> Result<GetBlobResponse, Error> {
-    let has_access = BlobOwnership::new(registry.metadata_store.as_ref())
+    let has_access = registry
+        .blob_ownership()
         .can_read(namespace, digest)
         .await?;
     registry

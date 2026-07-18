@@ -53,6 +53,24 @@ fn validate_url_prefix(repo_name: &Namespace, prefix: &str) -> Result<Option<Nam
     })
 }
 
+/// Resolve one upstream/downstream client config: split the URL into the
+/// registry base and its namespace prefix, validate the prefix, and build the
+/// client against the base URL.
+fn build_client(
+    config: &RegistryClientConfig,
+    repo_name: &Namespace,
+    cache: &Arc<Cache>,
+    max_manifest_size_bytes: usize,
+) -> Result<(RegistryClient, Option<Namespace>), Error> {
+    let (base_url, prefix_str) = split_registry_url(&config.url);
+    let target_namespace = validate_url_prefix(repo_name, &prefix_str)?;
+    let mut client_config = config.clone();
+    client_config.url = base_url;
+    let client =
+        RegistryClient::from_config(&client_config, Arc::clone(cache), max_manifest_size_bytes)?;
+    Ok((client, target_namespace))
+}
+
 /// One resolved pull-through upstream: the URL-formatting client plus the
 /// namespace mapping (`local_namespace` to strip, optional `target_namespace` to
 /// prepend) applied via [`Namespace::remote`].
@@ -92,15 +110,8 @@ async fn build_upstreams(
     task::spawn_blocking(move || {
         let mut upstreams = Vec::new();
         for config in &upstream_configs {
-            let (base_url, prefix_str) = split_registry_url(&config.url);
-            let target_namespace = validate_url_prefix(&repo_name, &prefix_str)?;
-            let mut client_config = config.clone();
-            client_config.url = base_url;
-            let client = RegistryClient::from_config(
-                &client_config,
-                Arc::clone(&cache),
-                max_manifest_size_bytes,
-            )?;
+            let (client, target_namespace) =
+                build_client(config, &repo_name, &cache, max_manifest_size_bytes)?;
             upstreams.push(Upstream {
                 client,
                 local_namespace: Some(repo_name.clone()),
@@ -150,15 +161,8 @@ async fn build_downstreams(
     task::spawn_blocking(move || {
         let mut downstreams = Vec::new();
         for config in &downstream_configs {
-            let (base_url, prefix_str) = split_registry_url(&config.client.url);
-            let target_namespace = validate_url_prefix(&repo_name, &prefix_str)?;
-            let mut client_config = config.client.clone();
-            client_config.url = base_url;
-            let registry_client = RegistryClient::from_config(
-                &client_config,
-                Arc::clone(&cache),
-                max_manifest_size_bytes,
-            )?;
+            let (registry_client, target_namespace) =
+                build_client(&config.client, &repo_name, &cache, max_manifest_size_bytes)?;
             // A URL path replaces this repository's prefix; a bare host mirrors
             // the namespace verbatim (no strip).
             let local_namespace = target_namespace.as_ref().map(|_| repo_name.clone());

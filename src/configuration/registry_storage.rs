@@ -1,5 +1,4 @@
 use serde::{Deserialize, Deserializer};
-use tracing::info;
 
 use angos_tx_engine::lock::{
     LockStrategy, S3LockConfig, resolve_lock_strategy,
@@ -11,13 +10,13 @@ use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
 // FS backend config
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct FsBackendConfig {
+pub struct MetadataFsConfig {
     pub root_dir: String,
     pub lock_strategy: LockStrategy,
     pub sync_to_disk: bool,
 }
 
-impl Default for FsBackendConfig {
+impl Default for MetadataFsConfig {
     fn default() -> Self {
         Self {
             root_dir: String::new(),
@@ -27,7 +26,7 @@ impl Default for FsBackendConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for FsBackendConfig {
+impl<'de> Deserialize<'de> for MetadataFsConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -47,7 +46,7 @@ impl<'de> Deserialize<'de> for FsBackendConfig {
         let lock_strategy = resolve_lock_strategy(raw.lock_strategy, raw.redis, false)?
             .unwrap_or(LockStrategy::Memory);
 
-        Ok(FsBackendConfig {
+        Ok(MetadataFsConfig {
             root_dir: raw.root_dir,
             lock_strategy,
             sync_to_disk: raw.sync_to_disk,
@@ -58,11 +57,11 @@ impl<'de> Deserialize<'de> for FsBackendConfig {
 // S3 backend config
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct S3BackendConfig {
+pub struct MetadataS3Config {
     pub connection: S3ConnectionConfig,
     /// Operator-configured lock backend. `None` means unset: the effective
     /// strategy then follows the provider's conditional-write support (see
-    /// [`S3BackendConfig::resolved_lock_strategy`]).
+    /// [`MetadataS3Config::resolved_lock_strategy`]).
     pub lock_strategy: Option<LockStrategy>,
     pub link_cache_ttl: u64,
     pub access_time_debounce_secs: u64,
@@ -82,7 +81,7 @@ pub struct S3BackendConfig {
     pub conditional_operations: Option<bool>,
 }
 
-impl Default for S3BackendConfig {
+impl Default for MetadataS3Config {
     fn default() -> Self {
         Self {
             connection: S3ConnectionConfig::default(),
@@ -94,7 +93,7 @@ impl Default for S3BackendConfig {
     }
 }
 
-impl S3BackendConfig {
+impl MetadataS3Config {
     /// The effective lock strategy given the provider's conditional-write
     /// support. An unset `lock_strategy` defaults to the S3 lock backend when
     /// CAS is available, so coordination works across processes out of the
@@ -108,7 +107,7 @@ impl S3BackendConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for S3BackendConfig {
+impl<'de> Deserialize<'de> for MetadataS3Config {
     // Custom impl because `lock_strategy` must be resolved from optional
     // `redis` / `lock_strategy` keys via `resolve_lock_strategy`.
     // The connection fields come in flat alongside the metadata-specific
@@ -139,7 +138,7 @@ impl<'de> Deserialize<'de> for S3BackendConfig {
         // depends on CAS support, resolved at build time.
         let lock_strategy = resolve_lock_strategy(raw.lock_strategy, raw.redis, true)?;
 
-        Ok(S3BackendConfig {
+        Ok(MetadataS3Config {
             connection: raw.connection,
             lock_strategy,
             link_cache_ttl: raw.link_cache_ttl,
@@ -180,23 +179,24 @@ pub enum RegistryStorageConfig {
     #[default]
     Inherit,
     #[serde(rename = "fs")]
-    FS(FsBackendConfig),
+    FS(MetadataFsConfig),
     #[serde(rename = "s3")]
-    S3(S3BackendConfig),
+    S3(MetadataS3Config),
 }
 
 impl RegistryStorageConfig {
     /// Build a `RegistryStorageConfig` that mirrors the given blob-store config.
     pub fn from_blob_store(blob: &blob_store::BlobStoreConfig) -> Self {
         match blob {
-            blob_store::BlobStoreConfig::FS(config) => RegistryStorageConfig::FS(FsBackendConfig {
-                root_dir: config.root_dir.clone(),
-                sync_to_disk: config.sync_to_disk,
-                ..Default::default()
-            }),
+            blob_store::BlobStoreConfig::FS(config) => {
+                RegistryStorageConfig::FS(MetadataFsConfig {
+                    root_dir: config.root_dir.clone(),
+                    sync_to_disk: config.sync_to_disk,
+                    ..Default::default()
+                })
+            }
             blob_store::BlobStoreConfig::S3(config) => {
-                info!("Auto-configuring S3 metadata-store from blob-store");
-                RegistryStorageConfig::S3(S3BackendConfig {
+                RegistryStorageConfig::S3(MetadataS3Config {
                     connection: config.connection.clone(),
                     ..Default::default()
                 })
@@ -259,7 +259,7 @@ mod tests {
     }
 
     /// `[metadata_store.s3]` round-trip: flat TOML deserialises into a
-    /// `S3BackendConfig` whose `connection` carries the right values and whose
+    /// `MetadataS3Config` whose `connection` carries the right values and whose
     /// metadata-specific keys override their defaults.
     #[test]
     fn s3_backend_config_toml_round_trip() {
@@ -274,7 +274,7 @@ mod tests {
             access_time_debounce_secs = 120
         "#;
 
-        let cfg: S3BackendConfig = toml::from_str(toml).expect("deserialize");
+        let cfg: MetadataS3Config = toml::from_str(toml).expect("deserialize");
         assert_eq!(cfg.connection.access_key_id.expose(), "meta-key");
         assert_eq!(cfg.connection.secret_key.expose(), "meta-secret");
         assert_eq!(cfg.connection.endpoint, "https://meta.s3.example.com");
@@ -295,7 +295,7 @@ mod tests {
             endpoint      = "http://localhost:9000"
             bucket        = "b"
         "#;
-        let err = toml::from_str::<S3BackendConfig>(toml).expect_err("region must be required");
+        let err = toml::from_str::<MetadataS3Config>(toml).expect_err("region must be required");
         assert!(
             err.to_string().contains("region"),
             "error should mention the missing `region` field, got: {err}"
@@ -317,14 +317,14 @@ mod tests {
 
     #[test]
     fn conditional_operations_round_trips() {
-        let cfg: S3BackendConfig =
+        let cfg: MetadataS3Config =
             toml::from_str(&s3_toml_with("conditional_operations = false")).expect("deserialize");
         assert_eq!(cfg.conditional_operations, Some(false));
     }
 
     #[test]
     fn unset_lock_strategy_resolves_from_cas_support() {
-        let cfg: S3BackendConfig = toml::from_str(&s3_toml_with("")).expect("deserialize");
+        let cfg: MetadataS3Config = toml::from_str(&s3_toml_with("")).expect("deserialize");
         assert_eq!(cfg.lock_strategy, None);
         assert_eq!(
             cfg.resolved_lock_strategy(true),
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn explicit_lock_strategy_wins_over_cas_default() {
-        let cfg: S3BackendConfig =
+        let cfg: MetadataS3Config =
             toml::from_str(&s3_toml_with(r#"lock_strategy = "memory""#)).expect("deserialize");
         assert_eq!(cfg.resolved_lock_strategy(true), LockStrategy::Memory);
     }

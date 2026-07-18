@@ -7,7 +7,10 @@
 //! loop, and performs post-apply cleanup. Single-link primitives live in
 //! [`super::storage`].
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    mem,
+};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -231,7 +234,7 @@ impl LinkMutations {
         let body = serde_json::to_vec(&metadata)
             .map(Bytes::from)
             .map_err(TxError::Serde)?;
-        self.builder = std::mem::take(&mut self.builder).mutation(Mutation::Put {
+        self.builder = mem::take(&mut self.builder).mutation(Mutation::Put {
             key: path_builder::link_path(link, namespace),
             body,
             expected: None,
@@ -243,7 +246,7 @@ impl LinkMutations {
     /// `Delete` `link`, queue its blob-index `Remove` against `target`, and
     /// record it among the deleted links.
     fn delete_link(&mut self, namespace: &Namespace, link: &LinkKind, target: &Digest) {
-        self.builder = std::mem::take(&mut self.builder).mutation(Mutation::Delete {
+        self.builder = mem::take(&mut self.builder).mutation(Mutation::Delete {
             key: path_builder::link_path(link, namespace),
             expected: None,
         });

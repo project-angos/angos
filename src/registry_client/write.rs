@@ -6,32 +6,22 @@
 //! header resolved when the session was opened ([`UploadSession::auth`]) and
 //! surfaces a `401` as an error instead of retrying.
 
-use std::collections::HashSet;
-
 use bytes::Bytes;
 use reqwest::{
     Body, Method, Response, StatusCode,
-    header::{CONTENT_LENGTH, CONTENT_TYPE, LINK, LOCATION},
+    header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
 };
-use serde::Deserialize;
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
 use crate::{
-    oci::{Digest, Tag},
+    oci::Digest,
     registry::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT},
     registry_client::{
         Error, REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP,
     },
 };
-
-/// Body of an OCI `GET /v2/<ns>/tags/list` response.
-#[derive(Deserialize)]
-struct TagsListBody {
-    #[serde(default)]
-    tags: Vec<String>,
-}
 
 /// Outcome of a manifest push.
 ///
@@ -527,84 +517,5 @@ impl RegistryClient {
         }
 
         Ok(DeleteManifestOutcome::Deleted)
-    }
-
-    /// Lists every tag of a repository on the downstream, following `Link`
-    /// rel="next" pagination.
-    ///
-    /// A `404` (repository absent downstream) yields an empty list rather than
-    /// an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a request fails, access is rejected, or a non-404
-    /// page has a non-success status or unparseable body.
-    #[instrument(skip(self))]
-    pub async fn list_tags(&self, location: &str) -> Result<Vec<Tag>, Error> {
-        // Guards against non-terminating pagination: `visited` stops an exact
-        // page-URL cycle; `MAX_PAGES` backstops endless distinct pages.
-        const MAX_PAGES: usize = 10_000;
-
-        let mut tags: Vec<Tag> = Vec::new();
-        let mut next = Some(location.to_string());
-        let mut visited = HashSet::new();
-
-        while let Some(page_location) = next.take() {
-            if visited.len() >= MAX_PAGES {
-                return Err(Error::Internal(format!(
-                    "list_tags exceeded {MAX_PAGES} pages; downstream pagination does not terminate"
-                )));
-            }
-            if !visited.insert(page_location.clone()) {
-                // Cyclic `rel="next"`: stop with the tags gathered so far (a
-                // partial list only under-reconciles).
-                break;
-            }
-
-            let response = self.query(&Method::GET, &[], &page_location).await?;
-
-            if response.status() == StatusCode::NOT_FOUND {
-                return Ok(tags);
-            }
-            if !response.status().is_success() {
-                return Err(Error::Internal(format!(
-                    "list_tags failed with status {}",
-                    response.status()
-                )));
-            }
-
-            next = Self::parse_next_link(&response);
-
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| Error::Internal(format!("failed to read tags/list body: {e}")))?;
-            let parsed: TagsListBody = serde_json::from_slice(&body)
-                .map_err(|e| Error::Internal(format!("failed to parse tags/list body: {e}")))?;
-
-            for name in parsed.tags {
-                match Tag::try_from(name) {
-                    Ok(tag) => tags.push(tag),
-                    Err(e) => warn!("ignoring invalid tag in downstream tags/list: {e}"),
-                }
-            }
-        }
-
-        Ok(tags)
-    }
-
-    /// Extracts the `Link` rel="next" continuation URL (`<...>; rel="next"`),
-    /// resolved against the response's final URL, or `None` when absent.
-    fn parse_next_link(response: &Response) -> Option<String> {
-        let header = response.headers().get(LINK)?.to_str().ok()?;
-        let url = header
-            .split(',')
-            .filter(|entry| entry.contains("rel=\"next\"") || entry.contains("rel=next"))
-            .find_map(|entry| {
-                let start = entry.find('<')?;
-                let end = entry[start + 1..].find('>')? + start + 1;
-                Some(&entry[start + 1..end])
-            })?;
-        response.url().join(url).ok().map(|u| u.to_string())
     }
 }

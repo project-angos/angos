@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, io, sync::LazyLock};
+use std::{cmp::Ordering, io};
 
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
@@ -8,7 +8,6 @@ use hyper::{
     body::Incoming,
     header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RANGE},
 };
-use regex::Regex;
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
 
@@ -16,11 +15,6 @@ use crate::{
     command::server::error::Error, oci::MediaType, registry::BlobRange,
     registry_client::X_ANGOS_SOURCE_TIMESTAMP,
 };
-
-static START_END_RANGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:bytes=)?(?P<start>\d+)-(?P<end>\d+)?$").unwrap());
-static SUFFIX_RANGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:bytes=)?-(?P<suffix>\d+)$").unwrap());
 
 static BYTES_RANGE_PREFIX: &str = "bytes=";
 static QUALITY_PARAM: &str = "q";
@@ -146,7 +140,10 @@ impl<'a> RequestHeaders<'a> {
             return Ok(None);
         };
 
-        parse_start_end_range(&range_header).map(Some)
+        // The prefix is optional here: ranged offsets arrive both bare and
+        // `bytes=`-prefixed in the wild.
+        let range_value = strip_bytes_prefix(&range_header).unwrap_or(&range_header);
+        parse_start_end_range(range_value).map(Some)
     }
 
     pub fn blob_range(&self) -> Result<Option<BlobRange>, Error> {
@@ -162,17 +159,17 @@ impl<'a> RequestHeaders<'a> {
             return Ok(None);
         }
 
-        if START_END_RANGE_RE.is_match(range_value) {
-            let (start, end) = parse_start_end_range(range_value)?;
-            return Ok(Some(BlobRange::FromTo { start, end }));
+        if let Some(suffix) = range_value.strip_prefix('-') {
+            if !is_digits(suffix) {
+                return Err(invalid_range_header(&range_header));
+            }
+            return Ok(Some(BlobRange::Suffix(parse_range_number(
+                suffix, "suffix",
+            )?)));
         }
 
-        if SUFFIX_RANGE_RE.is_match(range_value) {
-            let suffix = parse_suffix_range(range_value)?;
-            return Ok(Some(BlobRange::Suffix(suffix)));
-        }
-
-        Err(invalid_range_header(&range_header))
+        let (start, end) = parse_start_end_range(range_value)?;
+        Ok(Some(BlobRange::FromTo { start, end }))
     }
 
     fn header_string(&self, header: HeaderName) -> Result<Option<String>, Error> {
@@ -211,48 +208,34 @@ fn invalid_range_header(range_header: &str) -> Error {
     Error::RangeNotSatisfiable(msg)
 }
 
-fn parse_start_end_range(range_header: &str) -> Result<(u64, Option<u64>), Error> {
-    let captures = START_END_RANGE_RE
-        .captures(range_header)
-        .ok_or_else(|| invalid_range_header(range_header))?;
+/// Parses a `start-end` range value where `end` is optional (`100-200`, `0-`).
+fn parse_start_end_range(range_value: &str) -> Result<(u64, Option<u64>), Error> {
+    let (start, end) = range_value
+        .split_once('-')
+        .filter(|(start, end)| is_digits(start) && (end.is_empty() || is_digits(end)))
+        .ok_or_else(|| invalid_range_header(range_value))?;
 
-    let (Some(start), end) = (captures.name("start"), captures.name("end")) else {
-        return Err(invalid_range_header(range_header));
-    };
-
-    let start = start.as_str().parse::<u64>().map_err(|error| {
-        let msg = format!("Error parsing 'start' in Range header: {error}");
-        Error::RangeNotSatisfiable(msg)
-    })?;
-
-    if let Some(end) = end {
-        let end = end.as_str().parse::<u64>().map_err(|error| {
-            let msg = format!("Error parsing 'end' in Range header: {error}");
-            Error::RangeNotSatisfiable(msg)
-        })?;
-
-        if start > end {
-            let msg = format!("Invalid Range header: start ({start}) > end ({end})");
-            return Err(Error::RangeNotSatisfiable(msg));
-        }
-
-        Ok((start, Some(end)))
-    } else {
-        Ok((start, None))
+    let start = parse_range_number(start, "start")?;
+    if end.is_empty() {
+        return Ok((start, None));
     }
+
+    let end = parse_range_number(end, "end")?;
+    if start > end {
+        let msg = format!("Invalid Range header: start ({start}) > end ({end})");
+        return Err(Error::RangeNotSatisfiable(msg));
+    }
+
+    Ok((start, Some(end)))
 }
 
-fn parse_suffix_range(range_header: &str) -> Result<u64, Error> {
-    let captures = SUFFIX_RANGE_RE
-        .captures(range_header)
-        .ok_or_else(|| invalid_range_header(range_header))?;
+fn is_digits(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
 
-    let Some(suffix) = captures.name("suffix") else {
-        return Err(invalid_range_header(range_header));
-    };
-
-    suffix.as_str().parse::<u64>().map_err(|error| {
-        let msg = format!("Error parsing 'suffix' in Range header: {error}");
+fn parse_range_number(value: &str, part: &str) -> Result<u64, Error> {
+    value.parse::<u64>().map_err(|error| {
+        let msg = format!("Error parsing '{part}' in Range header: {error}");
         Error::RangeNotSatisfiable(msg)
     })
 }

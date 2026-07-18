@@ -22,8 +22,13 @@ static TAG_REGEX: LazyLock<Regex> =
 pub struct Tag(String);
 
 impl Tag {
+    /// The single validation predicate shared by every constructor.
+    fn is_valid(s: &str) -> bool {
+        TAG_REGEX.is_match(s)
+    }
+
     pub fn new(s: &str) -> Result<Self, Error> {
-        if TAG_REGEX.is_match(s) {
+        if Self::is_valid(s) {
             Ok(Self(s.to_owned()))
         } else {
             Err(Error::InvalidReference(format!("Invalid tag: '{s}'")))
@@ -43,7 +48,7 @@ impl TryFrom<String> for Tag {
     type Error = Error;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        if TAG_REGEX.is_match(&s) {
+        if Self::is_valid(&s) {
             Ok(Self(s))
         } else {
             Err(Error::InvalidReference(format!("Invalid tag: '{s}'")))

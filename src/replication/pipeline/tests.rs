@@ -27,6 +27,7 @@ use crate::{
     registry_client::{
         REPLICATION_SUPERSEDED_CODE, RegistryClient, UploadSession, X_ANGOS_SOURCE_TIMESTAMP,
     },
+    replication::ReplicationDownstream,
     replication::pipeline::{PushContext, PushOutcome, delete_manifest, push_manifest},
     test_fixtures::mocks::mount_blob_upload_accepted,
 };
@@ -43,23 +44,25 @@ fn test_blob_store() -> (Arc<BlobStore>, Arc<MetadataStore>, Arc<Store>, TempDir
     (blob_store, metadata_store, store, dir)
 }
 
-/// The modal test `PushContext`: same-namespace downstream, no remapping,
-/// four concurrent pushes, no source timestamp.
+/// The modal test downstream: no remapping, four concurrent pushes.
+fn test_downstream(client: Arc<RegistryClient>) -> ReplicationDownstream {
+    ReplicationDownstream::builder("test".to_string(), client, 4).build()
+}
+
+/// The modal test `PushContext`: same-namespace downstream, no source
+/// timestamp.
 fn push_context<'a>(
-    client: &'a RegistryClient,
+    downstream: &'a ReplicationDownstream,
     blob_store: &'a Arc<BlobStore>,
     metadata_store: &'a Arc<MetadataStore>,
     namespace: &'a Namespace,
 ) -> PushContext<'a> {
     PushContext {
-        downstream: client,
+        downstream,
         blob_store,
         metadata_store,
         namespace,
         downstream_namespace: namespace,
-        downstream_local_namespace: None,
-        downstream_target_namespace: None,
-        max_concurrent_pushes: 4,
         source_ts: None,
     }
 }
@@ -171,9 +174,9 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -245,11 +248,11 @@ async fn referrers_fallback_put_is_timestamp_less() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         source_ts: Some("2026-06-03T00:00:00Z"),
-        ..push_context(&client, &blob_store, &metadata_store, &namespace)
+        ..push_context(&downstream, &blob_store, &metadata_store, &namespace)
     };
     push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
         .await
@@ -304,9 +307,9 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(
         &ctx,
         &manifest_digest,
@@ -372,9 +375,9 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes).await;
 
     assert!(
@@ -454,9 +457,9 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let (a, b) = tokio::join!(
         push_manifest(&ctx, &digest_a, None, Some("v1"), bytes_a),
         push_manifest(&ctx, &digest_b, None, Some("v2"), bytes_b),
@@ -513,9 +516,9 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
         .await;
 
     // Any fallback-tag PUT would 404 (no mock) and surface as an error.
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -585,9 +588,9 @@ async fn index_lands_after_its_child_manifest() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &index_digest,
@@ -652,9 +655,9 @@ async fn index_lands_after_all_children_when_fanned_out() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &index_digest,
@@ -751,9 +754,9 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
         .await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -836,9 +839,9 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
         .await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -888,11 +891,11 @@ async fn push_manifest_stamps_source_timestamp_header() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         source_ts: Some("2026-06-03T00:00:00Z"),
-        ..push_context(&client, &blob_store, &metadata_store, &namespace)
+        ..push_context(&downstream, &blob_store, &metadata_store, &namespace)
     };
     push_manifest(
         &ctx,
@@ -927,9 +930,9 @@ async fn push_manifest_skips_put_when_downstream_already_converged() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
@@ -971,9 +974,9 @@ async fn repeated_layer_digest_uploads_the_blob_once() {
     mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&layer]).await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
         .await
         .expect("a manifest repeating a layer digest must push it once");
@@ -1021,9 +1024,9 @@ async fn converged_skip_head_sends_standard_accept_headers() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1105,9 +1108,9 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let outcome = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1177,9 +1180,9 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
         .await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &index_digest).await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let outcome = push_manifest(
         &ctx,
         &index_digest,
@@ -1234,9 +1237,9 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1309,9 +1312,9 @@ async fn failed_patch_cancels_the_upload_session() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1380,9 +1383,9 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
         .await
         .expect("a converged subject-bearing manifest must re-push the referrers fallback");
@@ -1410,9 +1413,9 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
         .await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -1437,9 +1440,9 @@ async fn push_manifest_puts_when_downstream_head_returns_404() {
 
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(
         &ctx,
         &manifest_digest,
@@ -1492,9 +1495,9 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
         .await
         .expect("a typeless body must recover its Content-Type from the revision link");
@@ -1559,9 +1562,9 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     push_manifest(&ctx, &index_digest, None, Some("v1"), index_bytes)
         .await
         .expect("a typeless child must recover its Content-Type and the index must land");
@@ -1585,11 +1588,11 @@ async fn push_manifest_treats_lww_superseded_409_as_success() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         source_ts: Some("2026-06-03T00:00:00Z"),
-        ..push_context(&client, &blob_store, &metadata_store, &namespace)
+        ..push_context(&downstream, &blob_store, &metadata_store, &namespace)
     };
     push_manifest(
         &ctx,
@@ -1619,9 +1622,9 @@ async fn push_manifest_propagates_immutable_409_as_error() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let result = push_manifest(
         &ctx,
         &manifest_digest,
@@ -1777,9 +1780,9 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
         .mount(&mock_server)
         .await;
 
-    let client = downstream_client(&mock_server.uri());
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&client, &blob_store, &metadata_store, &namespace);
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let result = super::upload_into_session(&ctx, &absent, &session).await;
     assert!(result.is_err(), "a missing local blob must fail the upload");
 

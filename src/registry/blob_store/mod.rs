@@ -7,7 +7,9 @@
 //! caller (push, upload, delete, scrub) acquires before mutating blob bytes. FS
 //! and S3 share one code path (the [`BlobStoreConfig`] enum only picks the
 //! storage handles); all public methods are inherent on `BlobStore`, with no
-//! caller-facing trait.
+//! caller-facing trait. The one deliberate exception is
+//! [`multipart_cleanup::MultipartCleanup`], kept as a trait so prune can
+//! inject a test double.
 
 mod config;
 pub mod hashing_reader;

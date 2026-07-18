@@ -303,84 +303,99 @@ impl ReplicationJobHandler {
     ) -> Result<(), Error> {
         let namespace = &payload.namespace;
         let downstream = self.resolve_downstream(namespace, &payload.downstream)?;
-        let registry_client = &downstream.registry_client;
         // `Err` is unreachable for a routed namespace; the map stays defensive.
         let downstream_namespace = downstream.remote(namespace).map_err(|e| {
             Error::Storage(format!(
                 "invalid downstream namespace for '{namespace}': {e}"
             ))
         })?;
-        let max_concurrent_pushes = downstream.max_concurrent_pushes;
 
         if envelope.kind == REPLICATION_DELETE_MANIFEST_KIND {
-            let reference = if let Some(tag) = &payload.tag {
-                Reference::Tag(tag.clone())
-            } else {
-                let digest = payload.digest.as_deref().ok_or_else(|| {
-                    Error::Storage(format!(
-                        "tag-less delete for '{namespace}' has no digest reference"
-                    ))
-                })?;
-                Reference::Digest(
-                    digest
-                        .parse()
-                        .map_err(|e| Error::Storage(format!("invalid digest '{digest}': {e}")))?,
-                )
-            };
-            let outcome = pipeline::delete_manifest(
-                registry_client,
-                &self.metadata_store,
-                namespace,
-                downstream_namespace.as_ref(),
-                &reference,
-                payload.source_ts.as_deref(),
+            self.attempt_delete(payload, downstream, &downstream_namespace)
+                .await
+        } else {
+            self.attempt_push(payload, downstream, &downstream_namespace)
+                .await
+        }
+    }
+
+    async fn attempt_delete(
+        &self,
+        payload: &ReplicationPushPayload,
+        downstream: &ReplicationDownstream,
+        downstream_namespace: &Namespace,
+    ) -> Result<(), Error> {
+        let namespace = &payload.namespace;
+        let reference = if let Some(tag) = &payload.tag {
+            Reference::Tag(tag.clone())
+        } else {
+            let digest = payload.digest.as_deref().ok_or_else(|| {
+                Error::Storage(format!(
+                    "tag-less delete for '{namespace}' has no digest reference"
+                ))
+            })?;
+            Reference::Digest(
+                digest
+                    .parse()
+                    .map_err(|e| Error::Storage(format!("invalid digest '{digest}': {e}")))?,
             )
+        };
+        let outcome = pipeline::delete_manifest(
+            &downstream.registry_client,
+            &self.metadata_store,
+            namespace,
+            downstream_namespace.as_ref(),
+            &reference,
+            payload.source_ts.as_deref(),
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        Self::record_success(&payload.downstream, outcome);
+        Ok(())
+    }
+
+    async fn attempt_push(
+        &self,
+        payload: &ReplicationPushPayload,
+        downstream: &ReplicationDownstream,
+        downstream_namespace: &Namespace,
+    ) -> Result<(), Error> {
+        let namespace = &payload.namespace;
+        // Re-resolving the digest at execute time gives latest-wins for a
+        // coalesced job.
+        let Some((digest, created_at)) = self.resolve_current_digest(namespace, payload).await?
+        else {
+            debug!(
+                namespace = %namespace,
+                tag = ?payload.tag,
+                digest = ?payload.digest,
+                "Push target no longer exists locally; treating as converged no-op"
+            );
+            return Ok(());
+        };
+        // Re-derive source_ts from the resolved tag's created_at (not the
+        // payload) so receiver-side last-writer-wins compares against the
+        // digest actually sent, for coalesced and reconcile pushes alike.
+        // A tag-less push has no local timestamp, so the payload value
+        // carries through (the receiver skips LWW for it).
+        let source_ts = created_at
+            .map(|ts| ts.to_rfc3339())
+            .or_else(|| payload.source_ts.clone());
+        let body = self.blob_store.read(&digest).await.map_err(|e| {
+            Error::Storage(format!("failed to read local manifest '{digest}': {e}"))
+        })?;
+        let ctx = PushContext {
+            downstream,
+            blob_store: &self.blob_store,
+            metadata_store: &self.metadata_store,
+            namespace,
+            downstream_namespace,
+            source_ts: source_ts.as_deref(),
+        };
+        let outcome = pipeline::push_manifest(&ctx, &digest, None, payload.tag.as_deref(), body)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
-            Self::record_success(&payload.downstream, outcome);
-        } else {
-            // Re-resolving the digest at execute time gives latest-wins for a
-            // coalesced job.
-            let Some((digest, created_at)) =
-                self.resolve_current_digest(namespace, payload).await?
-            else {
-                debug!(
-                    namespace = %namespace,
-                    tag = ?payload.tag,
-                    digest = ?payload.digest,
-                    "Push target no longer exists locally; treating as converged no-op"
-                );
-                return Ok(());
-            };
-            // Re-derive source_ts from the resolved tag's created_at (not the
-            // payload) so receiver-side last-writer-wins compares against the
-            // digest actually sent, for coalesced and reconcile pushes alike.
-            // A tag-less push has no local timestamp, so the payload value
-            // carries through (the receiver skips LWW for it).
-            let source_ts = created_at
-                .map(|ts| ts.to_rfc3339())
-                .or_else(|| payload.source_ts.clone());
-            let body = self.blob_store.read(&digest).await.map_err(|e| {
-                Error::Storage(format!("failed to read local manifest '{digest}': {e}"))
-            })?;
-            let ctx = PushContext {
-                downstream: registry_client,
-                blob_store: &self.blob_store,
-                metadata_store: &self.metadata_store,
-                namespace,
-                downstream_namespace: &downstream_namespace,
-                downstream_local_namespace: downstream.local_namespace.as_ref(),
-                downstream_target_namespace: downstream.target_namespace.as_ref(),
-                max_concurrent_pushes,
-                source_ts: source_ts.as_deref(),
-            };
-            let outcome =
-                pipeline::push_manifest(&ctx, &digest, None, payload.tag.as_deref(), body)
-                    .await
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-            Self::record_success(&payload.downstream, outcome);
-        }
-
+        Self::record_success(&payload.downstream, outcome);
         Ok(())
     }
 }
@@ -407,8 +422,10 @@ impl JobHandler for ReplicationJobHandler {
         // The handler itself needs no origin filter.
 
         // Record `failed` exactly once on any Err; success metrics are recorded
-        // inside the attempt.
-        self.attempt(envelope, &payload)
+        // inside the attempt. The boxing is load-bearing: the concrete future
+        // chain below `attempt` overflows rustc's layout query depth in
+        // release builds.
+        Box::pin(self.attempt(envelope, &payload))
             .await
             .inspect_err(|_| Self::record_failure(&payload.downstream))?;
 

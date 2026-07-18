@@ -6,7 +6,7 @@ use crate::{
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
         Error, Registry,
-        blob_ownership::{BlobOwnership, promote_and_grant},
+        blob_ownership::promote_and_grant,
         blob_store::{hashing_reader::HashingReader, resumable_hasher::Hasher},
     },
 };
@@ -110,9 +110,7 @@ impl Registry {
                     return Err(Error::DigestInvalid);
                 }
 
-                BlobOwnership::new(self.metadata_store.as_ref())
-                    .grant(namespace, digest)
-                    .await?;
+                self.blob_ownership().grant(namespace, digest).await?;
 
                 Ok(true)
             })
@@ -149,14 +147,15 @@ impl Registry {
         self.metadata_store
             .with_blob_data_lock(&mount.digest, async {
                 if self.blob_store.size(&mount.digest).await.is_err()
-                    || !BlobOwnership::new(self.metadata_store.as_ref())
+                    || !self
+                        .blob_ownership()
                         .can_read(source, &mount.digest)
                         .await?
                 {
                     return Ok(None);
                 }
 
-                BlobOwnership::new(self.metadata_store.as_ref())
+                self.blob_ownership()
                     .grant(namespace, &mount.digest)
                     .await?;
                 Ok(Some(mount.digest.clone()))
@@ -176,9 +175,7 @@ impl Registry {
         }
 
         if let Some(from) = &mount.from {
-            let readable = BlobOwnership::new(self.metadata_store.as_ref())
-                .can_read(from, &mount.digest)
-                .await?;
+            let readable = self.blob_ownership().can_read(from, &mount.digest).await?;
             return Ok(if readable {
                 vec![from.clone()]
             } else {
@@ -186,7 +183,8 @@ impl Registry {
             });
         }
 
-        let mut candidates = BlobOwnership::new(self.metadata_store.as_ref())
+        let mut candidates = self
+            .blob_ownership()
             .referencing_namespaces(&mount.digest)
             .await?;
         // Sort before truncating so the kept candidates are deterministic.
@@ -221,9 +219,7 @@ impl Registry {
     ) -> Result<StartUploadResponse, Error> {
         if let Some(digest) = digest
             && self.blob_store.size(&digest).await.is_ok()
-            && BlobOwnership::new(self.metadata_store.as_ref())
-                .can_read(namespace, &digest)
-                .await?
+            && self.blob_ownership().can_read(namespace, &digest).await?
         {
             return Ok(StartUploadResponse::ExistingBlob {
                 namespace: namespace.clone(),
@@ -534,7 +530,6 @@ mod tests {
         oci::{Algorithm, Digest, Namespace, UploadSessionId},
         registry::{
             BlobMount, Error, Registry, RegistryConfig, StartUploadResponse,
-            blob_ownership::BlobOwnership,
             blob_store::BlobStore,
             metadata_store::LinkKind,
             path_builder,
@@ -625,7 +620,8 @@ mod tests {
                 }
             }
 
-            BlobOwnership::new(registry.metadata_store.as_ref())
+            registry
+                .blob_ownership()
                 .grant(namespace, &digest)
                 .await
                 .unwrap();
@@ -657,7 +653,8 @@ mod tests {
             let content = b"cross-repo mountable blob";
 
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
-            BlobOwnership::new(registry.metadata_store.as_ref())
+            registry
+                .blob_ownership()
                 .grant(source, &digest)
                 .await
                 .unwrap();
@@ -685,7 +682,8 @@ mod tests {
             }
 
             assert!(
-                BlobOwnership::new(registry.metadata_store.as_ref())
+                registry
+                    .blob_ownership()
                     .can_read(target, &digest)
                     .await
                     .unwrap(),
@@ -695,9 +693,10 @@ mod tests {
         .await;
     }
 
-    // Mount event emission (blob.push on a satisfied mount, nothing on the
-    // session fallback) is covered by `event_emission_tests::mount_emits_blob_push_event`
-    // and `event_emission_tests::mount_fallback_emits_no_event`.
+    // Mount event emission is covered by
+    // `event_emission_tests::mount_emits_blob_push_event` and
+    // `event_emission_tests::mount_fallback_still_emits_intent_event` (the
+    // intent-first event stays even when the mount falls back to a session).
 
     #[tokio::test]
     async fn test_mount_blob_falls_back_when_source_lacks_blob() {
@@ -732,7 +731,8 @@ mod tests {
             }
 
             assert!(
-                !BlobOwnership::new(registry.metadata_store.as_ref())
+                !registry
+                    .blob_ownership()
                     .can_read(target, &digest)
                     .await
                     .unwrap(),
@@ -779,7 +779,8 @@ mod tests {
             let content = b"automatically discoverable blob";
 
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
-            BlobOwnership::new(registry.metadata_store.as_ref())
+            registry
+                .blob_ownership()
                 .grant(owner, &digest)
                 .await
                 .unwrap();
@@ -805,7 +806,8 @@ mod tests {
                 }
             }
             assert!(
-                BlobOwnership::new(registry.metadata_store.as_ref())
+                registry
+                    .blob_ownership()
                     .can_read(target, &digest)
                     .await
                     .unwrap(),
@@ -854,7 +856,8 @@ mod tests {
             // Guards the authorize-then-grant TOCTOU: the grant is conditioned
             // on the authorized source, not on `owner`.
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
-            BlobOwnership::new(registry.metadata_store.as_ref())
+            registry
+                .blob_ownership()
                 .grant(owner, &digest)
                 .await
                 .unwrap();
@@ -873,7 +876,8 @@ mod tests {
                 "mount must fall back when the authorized source does not hold the blob"
             );
             assert!(
-                !BlobOwnership::new(registry.metadata_store.as_ref())
+                !registry
+                    .blob_ownership()
                     .can_read(target, &digest)
                     .await
                     .unwrap(),
@@ -893,7 +897,7 @@ mod tests {
             let content = b"candidate resolution blob";
 
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
-            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+            let ownership = registry.blob_ownership();
             ownership.grant(source, &digest).await.unwrap();
             ownership.grant(other, &digest).await.unwrap();
 
@@ -949,7 +953,8 @@ mod tests {
             let content = b"mount authorization blob";
 
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
-            BlobOwnership::new(registry.metadata_store.as_ref())
+            registry
+                .blob_ownership()
                 .grant(source, &digest)
                 .await
                 .unwrap();
@@ -1374,7 +1379,8 @@ mod tests {
         let content = b"shared upload content";
         let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
-        BlobOwnership::new(registry.metadata_store.as_ref())
+        registry
+            .blob_ownership()
             .grant(first_namespace, &digest)
             .await
             .unwrap();
@@ -1411,7 +1417,8 @@ mod tests {
 
         assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
         assert!(
-            BlobOwnership::new(registry.metadata_store.as_ref())
+            registry
+                .blob_ownership()
                 .can_read(second_namespace, &digest)
                 .await
                 .unwrap()
@@ -1442,7 +1449,8 @@ mod tests {
         let content = b"shared monolithic upload content";
         let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
-        BlobOwnership::new(registry.metadata_store.as_ref())
+        registry
+            .blob_ownership()
             .grant(first_namespace, &digest)
             .await
             .unwrap();
@@ -1468,7 +1476,8 @@ mod tests {
             .unwrap();
 
         assert!(
-            BlobOwnership::new(registry.metadata_store.as_ref())
+            registry
+                .blob_ownership()
                 .can_read(second_namespace, &digest)
                 .await
                 .unwrap()
@@ -1857,7 +1866,6 @@ mod tests {
             resolver,
             config,
         )
-        .unwrap()
     }
 
     #[tokio::test]

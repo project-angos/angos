@@ -19,6 +19,7 @@ use bytesize::ByteSize;
 use futures_util::{StreamExt, stream};
 use uuid::Uuid;
 
+use super::staged_key;
 use crate::test_util::frame;
 use crate::tests::{conditional_store_conformance, object_store_conformance};
 use crate::{ObjectStore, PresignedStore, s3::Backend};
@@ -93,20 +94,6 @@ async fn head_surfaces_etag() {
 }
 
 // uploads
-
-/// The staging container for an upload key: its final path segment replaced
-/// with `staged`. Mirrors the backend's internal derivation so tests can probe
-/// the staged remainder.
-fn staged_key(key: &str, offset: u64) -> String {
-    format!("{}/{offset}", staged_container(key))
-}
-
-fn staged_container(key: &str) -> String {
-    match key.rfind('/') {
-        Some(idx) => format!("{}/staged", &key[..idx]),
-        None => "staged".to_string(),
-    }
-}
 
 /// Number of committed parts for the in-flight multipart upload at `key`, or 0
 /// when no multipart upload is open.

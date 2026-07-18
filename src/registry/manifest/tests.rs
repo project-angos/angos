@@ -2991,7 +2991,7 @@ mod noop_suppression_tests {
             job_queue: Some(job_store.clone()),
             ..RegistryConfig::default()
         };
-        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+        let registry = Registry::new(blob_store, metadata_store, resolver, config);
         (registry, job_store, dir)
     }
 
@@ -3633,7 +3633,7 @@ mod dispatch_replication_tests {
             job_queue: Some(job_store.clone()),
             ..RegistryConfig::default()
         };
-        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+        let registry = Registry::new(blob_store, metadata_store, resolver, config);
 
         (registry, job_store, dir)
     }

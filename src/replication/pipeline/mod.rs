@@ -21,6 +21,7 @@ use crate::{
         parse_manifest_digests,
     },
     registry_client::{DeleteManifestOutcome, RegistryClient, UploadSession},
+    replication::ReplicationDownstream,
     replication::{Error, manifest_accept_types},
 };
 
@@ -49,34 +50,25 @@ pub enum PushOutcome {
 }
 
 /// Per-push invariants shared across the recursion and the blob fan-out: the
-/// borrowed downstream and stores, the concurrency cap, the namespace, and the
-/// last-writer-wins source timestamp. The per-manifest varying inputs (digest,
-/// media type, tag, body) stay direct arguments to [`push_manifest`].
+/// borrowed downstream and stores, the namespace, and the last-writer-wins
+/// source timestamp. The per-manifest varying inputs (digest, media type, tag,
+/// body) stay direct arguments to [`push_manifest`].
 ///
 /// Built once at the handler call site; the recursion passes the same context
 /// to every child since children push into the same namespace.
 pub struct PushContext<'a> {
-    pub downstream: &'a RegistryClient,
+    pub downstream: &'a ReplicationDownstream,
     pub blob_store: &'a Arc<BlobStore>,
     pub metadata_store: &'a Arc<MetadataStore>,
     pub namespace: &'a Namespace,
     /// The remote namespace this push targets on the downstream, derived by the
-    /// handler from the local namespace.
+    /// handler via [`ReplicationDownstream::remote`].
     pub downstream_namespace: &'a Namespace,
-    /// Local namespace prefix the downstream strips before mapping, mirrored from
-    /// [`ReplicationDownstream::local_namespace`]; `None` for a verbatim mirror.
-    /// Used to map a cross-repo mount sibling to its downstream location.
-    pub downstream_local_namespace: Option<&'a Namespace>,
-    /// Target namespace prefix the downstream prepends after stripping, mirrored
-    /// from [`ReplicationDownstream::target_namespace`]; `None` for a verbatim
-    /// mirror.
-    pub downstream_target_namespace: Option<&'a Namespace>,
-    pub max_concurrent_pushes: usize,
     pub source_ts: Option<&'a str>,
 }
 
 /// Pushes the manifest at `digest` (and everything it references) to
-/// `ctx.downstream`, then binds `tag` to it when set.
+/// `ctx.downstream`'s registry, then binds `tag` to it when set.
 ///
 /// Child manifests land before the parent index, referenced blobs are
 /// HEAD-probed and only transferred when absent, and `ctx.source_ts` (the
@@ -109,6 +101,7 @@ pub async fn push_manifest(
     };
     let location = ctx
         .downstream
+        .registry_client
         .get_manifest_path(ctx.downstream_namespace.as_ref(), &reference);
 
     // The converged skip runs before child recursion and the blob sweep: a
@@ -121,6 +114,7 @@ pub async fn push_manifest(
     if parsed.subject.is_none()
         && ctx
             .downstream
+            .registry_client
             .head_manifest(&manifest_accept_types(), &location)
             .await
             .is_ok_and(|(_, downstream_digest, _)| &downstream_digest == digest)
@@ -157,6 +151,7 @@ pub async fn push_manifest(
 
     let result = ctx
         .downstream
+        .registry_client
         .put_manifest(
             &location,
             effective_media_type.as_deref(),
@@ -194,7 +189,7 @@ pub async fn push_manifest(
     // subject, so push the referrers fallback tag.
     if let Some(body) = fallback_body.filter(|_| result.subject.is_none()) {
         push_referrers_fallback(
-            ctx.downstream,
+            &ctx.downstream.registry_client,
             ctx.metadata_store,
             ctx.namespace,
             ctx.downstream_namespace.as_ref(),
@@ -226,7 +221,7 @@ async fn push_child_manifests(
                 .map(|_| ())
         })
         // Config rejects 0; the floor guards direct builder misuse.
-        .buffer_unordered(ctx.max_concurrent_pushes.max(1))
+        .buffer_unordered(ctx.downstream.max_concurrent_pushes.max(1))
         .try_collect::<Vec<()>>()
         .await
         .map(|_| ())
@@ -248,7 +243,7 @@ async fn push_blobs(ctx: &PushContext<'_>, parsed: &ParsedManifestDigests) -> Re
     stream::iter(blobs)
         .map(|blob| async move { push_one_blob(ctx, &blob).await })
         // Config rejects 0; the floor guards direct builder misuse.
-        .buffer_unordered(ctx.max_concurrent_pushes.max(1))
+        .buffer_unordered(ctx.downstream.max_concurrent_pushes.max(1))
         .try_collect::<Vec<()>>()
         .await?;
 
@@ -264,15 +259,14 @@ async fn mount_candidate(
     metadata_store: &Arc<MetadataStore>,
     namespace: &Namespace,
     digest: &Digest,
-    local: Option<&Namespace>,
-    target: Option<&Namespace>,
+    downstream: &ReplicationDownstream,
 ) -> Option<String> {
     let sibling = BlobOwnership::new(metadata_store)
         .smallest_referencing_namespace(digest, namespace)
         .await
         .ok()
         .flatten()?;
-    sibling.remote(local, target).ok().map(|m| m.to_string())
+    downstream.remote(&sibling).ok().map(|m| m.to_string())
 }
 
 /// Transfers a single blob to the downstream if it is not already present,
@@ -280,34 +274,36 @@ async fn mount_candidate(
 async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Error> {
     let head_location = ctx
         .downstream
+        .registry_client
         .get_blob_path(ctx.downstream_namespace.as_ref(), digest);
     // Existence-only probe: any 2xx means present (the optional
     // Docker-Content-Digest header is not required, so a converged blob never
     // dead-letters on a minimal downstream); a 404 means absent; a transient
     // failure fails the push so the job retries instead of doing a pointless
     // full upload.
-    if ctx.downstream.blob_exists(&head_location).await? {
+    if ctx
+        .downstream
+        .registry_client
+        .blob_exists(&head_location)
+        .await?
+    {
         debug!(namespace = %ctx.namespace, %digest, "Blob already present on downstream; skipping");
         return Ok(());
     }
 
     let start_location = ctx
         .downstream
+        .registry_client
         .get_uploads_start_path(ctx.downstream_namespace.as_ref());
 
     // The mount is a pure optimization: a miss opens a session and a policy
     // rejection falls through to a plain upload, so it can never fail the push.
-    if let Some(from) = mount_candidate(
-        ctx.metadata_store,
-        ctx.namespace,
-        digest,
-        ctx.downstream_local_namespace,
-        ctx.downstream_target_namespace,
-    )
-    .await
+    if let Some(from) =
+        mount_candidate(ctx.metadata_store, ctx.namespace, digest, ctx.downstream).await
     {
         match ctx
             .downstream
+            .registry_client
             .mount_blob(&start_location, digest, Some(&from))
             .await
         {
@@ -324,7 +320,11 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
         }
     }
 
-    let session = ctx.downstream.start_upload(&start_location).await?;
+    let session = ctx
+        .downstream
+        .registry_client
+        .start_upload(&start_location)
+        .await?;
     upload_into_session(ctx, digest, &session).await
 }
 
@@ -340,7 +340,7 @@ async fn upload_into_session(
         Err(e) => {
             // The session is already open; cancel it, like the patch/complete
             // failure paths, so a dying push does not strand it on the downstream.
-            cancel_upload_session(ctx.downstream, &session.url).await;
+            cancel_upload_session(&ctx.downstream.registry_client, &session.url).await;
             return Err(Error::Internal(format!(
                 "failed to open local blob '{digest}': {e}"
             )));
@@ -348,6 +348,7 @@ async fn upload_into_session(
     };
     let patched_url = match ctx
         .downstream
+        .registry_client
         .patch_upload(
             &session.url,
             session.auth.as_deref(),
@@ -358,12 +359,17 @@ async fn upload_into_session(
     {
         Ok(url) => url,
         Err(e) => {
-            cancel_upload_session(ctx.downstream, &session.url).await;
+            cancel_upload_session(&ctx.downstream.registry_client, &session.url).await;
             return Err(Error::Client(e));
         }
     };
-    if let Err(e) = ctx.downstream.complete_upload(&patched_url, digest).await {
-        cancel_upload_session(ctx.downstream, &patched_url).await;
+    if let Err(e) = ctx
+        .downstream
+        .registry_client
+        .complete_upload(&patched_url, digest)
+        .await
+    {
+        cancel_upload_session(&ctx.downstream.registry_client, &patched_url).await;
         return Err(Error::Client(e));
     }
 

@@ -22,8 +22,13 @@ const MAX_NAMESPACE_LENGTH: usize = 255;
 pub struct Namespace(String);
 
 impl Namespace {
+    /// The single validation predicate shared by every constructor.
+    fn is_valid(s: &str) -> bool {
+        s.len() <= MAX_NAMESPACE_LENGTH && NAMESPACE_RE.is_match(s)
+    }
+
     pub fn new(s: &str) -> Result<Self, Error> {
-        if s.len() <= MAX_NAMESPACE_LENGTH && NAMESPACE_RE.is_match(s) {
+        if Self::is_valid(s) {
             Ok(Self(s.to_owned()))
         } else {
             Err(Error::InvalidNamespace(s.to_string()))
@@ -94,7 +99,7 @@ impl TryFrom<String> for Namespace {
     type Error = Error;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        if s.len() <= MAX_NAMESPACE_LENGTH && NAMESPACE_RE.is_match(&s) {
+        if Self::is_valid(&s) {
             Ok(Self(s))
         } else {
             Err(Error::InvalidNamespace(s))

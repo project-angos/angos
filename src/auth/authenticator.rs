@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use hyper::http::request::Parts;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, info, instrument, warn};
+use tracing::{Span, debug, info, instrument, warn};
 
 use crate::{
     auth::Error,
@@ -13,7 +13,6 @@ use crate::{
     },
     cache::Cache,
     configuration::Configuration,
-    http_client::HttpClientBuilder,
     identity::ClientIdentity,
     metrics_provider::metrics_provider,
 };
@@ -55,10 +54,10 @@ impl Authenticator {
     pub fn new(config: &Configuration, cache: &Arc<Cache>) -> Result<Self, Error> {
         let auth_config = &config.auth;
         let oidc_client = Arc::new(
-            HttpClientBuilder::new()
+            Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .map_err(Error::Initialization)?,
+                .map_err(|e| Error::Initialization(format!("Failed to create HTTP client: {e}")))?,
         );
 
         let mtls_validator = MtlsValidator::new();
@@ -111,7 +110,7 @@ impl Authenticator {
         };
 
         identity.auth_method = select_auth_method(mtls_ok, oidc_ok, basic_ok);
-        tracing::Span::current().record("auth_method", identity.auth_method.unwrap_or("anonymous"));
+        Span::current().record("auth_method", identity.auth_method.unwrap_or("anonymous"));
         Ok(identity)
     }
 

@@ -207,8 +207,8 @@ async fn reconcile_push_step(
         .collect::<Vec<_>>()
         .await;
 
-    // Apply phase (serial): the sink is `&mut`. Skips are counted so a
-    // persistently failing downstream stays visible.
+    // Apply phase: actions apply serially in probe order. Skips are counted so
+    // a persistently failing downstream stays visible.
     let mut skipped: usize = 0;
     for probe in probes {
         match probe {

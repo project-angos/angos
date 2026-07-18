@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
 
 use hyper::http::request::Parts;
-use reqwest::Client;
+use reqwest::{Client, redirect::Policy};
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     auth::webhook::{self, WebhookAuthorizer},
     cache::Cache,
     configuration::{Configuration, RegexPattern},
-    http_client::HttpClientBuilder,
+    http_client::apply_tls_files,
     identity::{Action, ClientIdentity},
     oci::{Namespace, Tag},
     policy::PolicyDecision,
@@ -63,6 +63,8 @@ struct AuditIdentity<'a> {
     oidc_provider_type: Option<&'a str>,
 }
 
+// Debug is this projection's sole consumer; the manual impl (not a derive)
+// keeps each logged field an explicit, lint-visible choice.
 impl fmt::Debug for AuditIdentity<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuditIdentity")
@@ -341,15 +343,14 @@ fn build_webhooks(
 }
 
 fn build_webhook_client(config: &webhook::Config) -> Result<Client, String> {
-    HttpClientBuilder::new()
-        .rustls_tls()
-        .redirect(reqwest::redirect::Policy::none())
-        .tls_files(
-            config.server_ca_bundle.as_deref(),
-            config.client_certificate_bundle.as_deref(),
-            config.client_private_key.as_deref(),
-        )?
-        .build()
+    apply_tls_files(
+        Client::builder().use_rustls_tls().redirect(Policy::none()),
+        config.server_ca_bundle.as_deref(),
+        config.client_certificate_bundle.as_deref(),
+        config.client_private_key.as_deref(),
+    )?
+    .build()
+    .map_err(|e| format!("Failed to create HTTP client: {e}"))
 }
 
 fn build_repositories(

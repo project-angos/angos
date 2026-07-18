@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fs, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as DeError};
 
 use angos_tx_engine::lock::LockStrategy;
 
@@ -16,6 +16,21 @@ mod ui;
 pub mod watcher;
 
 pub use error::Error;
+
+/// Deserialize a positive integer into a `NonZero` type, naming `field` in the
+/// rejection. The single home of the "must be > 0" config validation.
+pub fn deserialize_positive_nonzero<'de, D, P, N>(
+    deserializer: D,
+    field: &str,
+) -> Result<N, D::Error>
+where
+    D: Deserializer<'de>,
+    P: Deserialize<'de>,
+    N: TryFrom<P>,
+{
+    let value = P::deserialize(deserializer)?;
+    N::try_from(value).map_err(|_| D::Error::custom(format!("{field} must be > 0")))
+}
 pub use global::GlobalConfig;
 pub use observability::ObservabilityConfig;
 pub use regex_pattern::RegexPattern;
@@ -142,15 +157,11 @@ fn validate_global(
         ));
     }
 
-    global
-        .authorization_webhook
-        .as_ref()
-        .map(|name| {
-            auth_webhooks.get(name).ok_or_else(|| {
-                Error::InvalidFormat(format!("Webhook '{name}' not found (referenced globally)"))
-            })
-        })
-        .transpose()?;
+    validate_auth_webhook_ref(
+        global.authorization_webhook.as_deref(),
+        auth_webhooks,
+        "referenced globally",
+    )?;
 
     validate_event_webhook_refs(
         &global.event_webhooks,
@@ -206,19 +217,32 @@ fn validate_repositories(
     event_webhooks: &HashMap<String, EventWebhookConfig>,
 ) -> Result<(), Error> {
     for (repo_name, repo) in repositories {
-        if let Some(name) = repo
-            .authorization_webhook
-            .as_deref()
-            .filter(|n| !n.is_empty())
-        {
-            auth_webhooks.get(name).map(|_| ()).ok_or_else(|| {
-                Error::InvalidFormat(format!(
-                    "Webhook '{name}' not found (referenced in '{repo_name}' repository)"
-                ))
-            })?;
-        }
         let context = format!("referenced in '{repo_name}' repository");
+        validate_auth_webhook_ref(
+            repo.authorization_webhook
+                .as_deref()
+                .filter(|n| !n.is_empty()),
+            auth_webhooks,
+            &context,
+        )?;
         validate_event_webhook_refs(&repo.event_webhooks, event_webhooks, &context)?;
+    }
+    Ok(())
+}
+
+/// Validates that an optional authorization-webhook reference names a
+/// configured webhook; `context` identifies the referencing site in the error.
+fn validate_auth_webhook_ref(
+    name: Option<&str>,
+    known: &HashMap<String, webhook::Config>,
+    context: &str,
+) -> Result<(), Error> {
+    if let Some(name) = name
+        && !known.contains_key(name)
+    {
+        return Err(Error::InvalidFormat(format!(
+            "Webhook '{name}' not found ({context})"
+        )));
     }
     Ok(())
 }

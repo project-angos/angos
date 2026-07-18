@@ -6,51 +6,22 @@ use url::Url;
 
 use crate::{auth::webhook::headers::build_header_name, secret::Secret};
 
+/// The DTO always parses; [`Config::validate`] runs in
+/// [`WebhookAuthorizer::new`](super::WebhookAuthorizer), the single
+/// enforcement point, so programmatic construction is checked too.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(try_from = "ConfigFields")]
 pub struct Config {
     pub url: Url,
     pub timeout_ms: u64,
+    #[serde(flatten)]
     pub auth: Option<WebhookAuth>,
     pub client_certificate_bundle: Option<PathBuf>,
     pub client_private_key: Option<PathBuf>,
     pub server_ca_bundle: Option<PathBuf>,
-    pub forward_headers: Vec<String>,
-    pub cache_ttl: u64,
-}
-
-#[derive(Deserialize)]
-struct ConfigFields {
-    url: Url,
-    timeout_ms: u64,
-    #[serde(flatten)]
-    auth: Option<WebhookAuth>,
-    client_certificate_bundle: Option<PathBuf>,
-    client_private_key: Option<PathBuf>,
-    server_ca_bundle: Option<PathBuf>,
     #[serde(default)]
-    forward_headers: Vec<String>,
+    pub forward_headers: Vec<String>,
     #[serde(default = "Config::default_cache_ttl")]
-    cache_ttl: u64,
-}
-
-impl TryFrom<ConfigFields> for Config {
-    type Error = String;
-
-    fn try_from(fields: ConfigFields) -> Result<Self, Self::Error> {
-        let config = Self {
-            url: fields.url,
-            timeout_ms: fields.timeout_ms,
-            auth: fields.auth,
-            client_certificate_bundle: fields.client_certificate_bundle,
-            client_private_key: fields.client_private_key,
-            server_ca_bundle: fields.server_ca_bundle,
-            forward_headers: fields.forward_headers,
-            cache_ttl: fields.cache_ttl,
-        };
-        config.validate()?;
-        Ok(config)
-    }
+    pub cache_ttl: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -11,7 +11,7 @@ use crate::{
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
         Error, Registry, Repository,
-        blob_ownership::{BlobOwnership, promote_and_grant},
+        blob_ownership::promote_and_grant,
         blob_store::{BlobStore, BoxedReader},
         metadata_store::{LinkKind, MetadataStore},
     },
@@ -166,9 +166,7 @@ impl Registry {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<HeadBlobResponse, Error> {
-        let has_access = BlobOwnership::new(self.metadata_store.as_ref())
-            .can_read(namespace, digest)
-            .await?;
+        let has_access = self.blob_ownership().can_read(namespace, digest).await?;
 
         if !repository.is_pull_through() && !has_access {
             return Err(Error::BlobUnknown);
@@ -301,7 +299,7 @@ impl Registry {
 
     #[instrument]
     pub async fn delete_blob(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
-        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        let ownership = self.blob_ownership();
         let links = ownership.references(namespace, digest).await?;
 
         if links.is_empty() {
@@ -349,9 +347,7 @@ impl Registry {
     ) -> Result<GetBlobResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
-        let has_access = BlobOwnership::new(self.metadata_store.as_ref())
-            .can_read(namespace, digest)
-            .await?;
+        let has_access = self.blob_ownership().can_read(namespace, digest).await?;
 
         if !repository.is_pull_through() && !has_access {
             return Err(Error::BlobUnknown);
@@ -395,7 +391,6 @@ mod tests {
     use crate::{
         oci::{Namespace, Tag},
         registry::{
-            blob_ownership::BlobOwnership,
             metadata_store::{BlobIndexOperation, LinkOperation},
             test_utils::{
                 create_test_blob, for_each_backend, get_blob, metadata_store_over, put_blob_direct,
@@ -416,7 +411,7 @@ mod tests {
             let second = &Namespace::new("test-repo/second").unwrap();
             let content = b"shared blob content";
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
-            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+            let ownership = registry.blob_ownership();
 
             ownership.grant(first, &digest).await.unwrap();
 
@@ -568,7 +563,8 @@ mod tests {
             let content = b"test blob content";
 
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
-            BlobOwnership::new(registry.metadata_store.as_ref())
+            registry
+                .blob_ownership()
                 .grant(namespace, &digest)
                 .await
                 .unwrap();
@@ -654,7 +650,8 @@ mod tests {
             for link in cases {
                 let content = format!("content for {link}").into_bytes();
                 let digest = put_blob_direct(registry.metadata_store.store(), &content).await;
-                BlobOwnership::new(registry.metadata_store.as_ref())
+                registry
+                    .blob_ownership()
                     .grant(namespace, &digest)
                     .await
                     .unwrap();
@@ -698,7 +695,7 @@ mod tests {
             let second = &Namespace::new("test-repo/second").unwrap();
             let content = b"shared blob content";
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
-            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+            let ownership = registry.blob_ownership();
 
             ownership.grant(first, &digest).await.unwrap();
             ownership.grant(second, &digest).await.unwrap();

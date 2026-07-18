@@ -3,20 +3,11 @@ use hyper::{Response, StatusCode, body::Bytes, header::CONTENT_TYPE};
 use serde::Serialize;
 
 use crate::{
-    command::server::{ServerContext, error::Error, response_body::ResponseBody},
+    command::server::{
+        ServerContext, error::Error, handlers::json_response, response_body::ResponseBody,
+    },
     metrics_provider::metrics_provider,
 };
-
-pub fn json_response(
-    status: StatusCode,
-    body: impl Serialize,
-) -> Result<Response<ResponseBody>, Error> {
-    let json = serde_json::to_string(&body)?;
-    Ok(Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/json")
-        .body(ResponseBody::Fixed(Full::new(Bytes::from(json))))?)
-}
 
 pub fn handle_ui_config(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
     #[derive(Serialize)]

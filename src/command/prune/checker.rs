@@ -1066,8 +1066,7 @@ mod tests {
                 event_dispatcher: Some(Arc::new(dispatcher)),
                 ..RegistryConfig::default()
             },
-        )
-        .unwrap();
+        );
         let executor = Executor::new(test_case.blob_store(), metadata_store.clone(), job_store)
             .with_registry(registry);
 

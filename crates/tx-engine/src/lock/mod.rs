@@ -41,6 +41,8 @@ use tokio::{runtime::Handle, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::lock::storage::redis::RedisLockStorageConfig;
+
 pub mod metrics;
 pub mod primitive;
 pub mod storage;
@@ -85,7 +87,6 @@ type AsyncReleaseFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send
 /// runtime so the remote lock is freed without waiting on TTL. If no runtime is
 /// available the remote lock expires via the backend's TTL.
 pub struct LockSession {
-    sync_guard: Option<Box<dyn Send>>,
     async_release: Option<AsyncReleaseFn>,
     /// Fired by the backend's heartbeat task to signal lock-ownership
     /// loss.
@@ -94,12 +95,10 @@ pub struct LockSession {
 }
 
 impl LockSession {
-    /// In-process session. The `Drop` of `guard` is the entire release.
-    /// No heartbeat, no remote release.
+    /// Session for an empty key set: nothing to release, no heartbeat.
     #[must_use]
-    pub fn sync(guard: Box<dyn Send>) -> Self {
+    pub fn noop() -> Self {
         Self {
-            sync_guard: Some(guard),
             async_release: None,
             cancellation: CancellationToken::new(),
             heartbeat_handle: None,
@@ -113,7 +112,6 @@ impl LockSession {
         heartbeat_handle: JoinHandle<()>,
     ) -> Self {
         Self {
-            sync_guard: None,
             async_release: Some(Box::new(release_fn)),
             cancellation,
             heartbeat_handle: Some(heartbeat_handle),
@@ -135,7 +133,6 @@ impl LockSession {
         if let Some(release_fn) = self.async_release.take() {
             release_fn().await;
         }
-        drop(self.sync_guard.take());
     }
 }
 
@@ -257,8 +254,9 @@ impl Default for S3LockConfig {
 #[serde(rename_all = "lowercase")]
 pub enum LockStrategy {
     Memory,
-    #[cfg(feature = "redis")]
-    Redis(storage::redis::RedisLockStorageConfig),
+    /// Parsed unconditionally (DTOs always parse); selecting it without the
+    /// `redis` feature is rejected by [`crate::store::Store::new`].
+    Redis(RedisLockStorageConfig),
     S3(S3LockConfig),
 }
 
@@ -273,16 +271,12 @@ pub enum LockStrategy {
 /// # Errors
 ///
 /// Returns `Err(E::custom(...))` when both `lock_strategy` and `redis` are
-/// provided, when S3 lock strategy is requested on a non-S3 metadata store,
-/// or when the Redis feature is not enabled.
-#[allow(
-    clippy::ignored_unit_patterns,
-    reason = "redis param is Option<()> when feature is disabled; () wildcard is correct in that branch"
-)]
+/// provided, or when the S3 lock strategy is requested on a non-S3 metadata
+/// store. A Redis selection without the `redis` feature parses here and is
+/// rejected by [`crate::store::Store::new`].
 pub fn resolve_lock_strategy<E: serde::de::Error>(
     lock_strategy: Option<LockStrategy>,
-    #[cfg(feature = "redis")] redis: Option<storage::redis::RedisLockStorageConfig>,
-    #[cfg(not(feature = "redis"))] redis: Option<()>,
+    redis: Option<RedisLockStorageConfig>,
     allow_s3: bool,
 ) -> Result<Option<LockStrategy>, E> {
     match (lock_strategy, redis) {
@@ -293,12 +287,7 @@ pub fn resolve_lock_strategy<E: serde::de::Error>(
             "S3 lock strategy is not supported for filesystem metadata store",
         )),
         (Some(strategy), None) => Ok(Some(strategy)),
-        #[cfg(feature = "redis")]
         (None, Some(redis_config)) => Ok(Some(LockStrategy::Redis(redis_config))),
-        #[cfg(not(feature = "redis"))]
-        (None, Some(_)) => Err(E::custom(
-            "redis lock strategy requested but the 'redis' feature is not enabled",
-        )),
         (None, None) => Ok(None),
     }
 }
