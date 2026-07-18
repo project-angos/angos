@@ -1,4 +1,4 @@
-//! Pure key categorization for the scrub walk.
+//! Pure key categorization for the maintenance walks (scrub, prune's sweeps).
 //!
 //! [`categorize`] maps a raw object-store key onto the union of both stores'
 //! layouts (the blob and metadata stores can share one physical root, so a

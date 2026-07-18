@@ -29,6 +29,15 @@ use crate::{
     },
 };
 
+/// Records a `replication_reconcile_total` outcome (`enqueued`, `failed`, or
+/// `skipped`).
+pub fn record_reconcile_outcome(outcome: &str) {
+    metrics_provider()
+        .replication_reconcile_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 /// Single queue carrying every replication job; the downstream is encoded in the
 /// `lock_key` and payload.
 /// Push a manifest (and everything it references) to a downstream.

@@ -12,6 +12,6 @@ pub use crate::replication::downstream::{ReplicationDownstream, ReplicationMode}
 pub use crate::replication::error::Error;
 pub use crate::replication::handler::{
     REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationJobHandler,
-    ReplicationPushPayload, build_envelope, build_prune_delete_envelope,
+    ReplicationPushPayload, build_envelope, build_prune_delete_envelope, record_reconcile_outcome,
 };
 pub use crate::replication::wire::manifest_accept_types;

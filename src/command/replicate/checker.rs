@@ -10,19 +10,14 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, warn};
 
 use crate::{
-    command::scrub::{
-        Error,
-        action::Action,
-        check::NamespaceChecker,
-        executor::{ActionSink, record_reconcile_outcome},
-    },
+    command::maintenance::{Error, action::Action, check::NamespaceChecker, executor::ActionSink},
     oci::{Digest, Namespace, Reference, Tag},
     registry::{
         metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
     registry_client::Error as ClientError,
-    replication::{ReplicationDownstream, manifest_accept_types},
+    replication::{ReplicationDownstream, manifest_accept_types, record_reconcile_outcome},
 };
 
 /// Fan-out for the local tag-digest link reads collected before reconciling a
@@ -309,7 +304,7 @@ mod tests {
 
     use super::ReplicationChecker;
     use crate::{
-        command::scrub::{
+        command::maintenance::{
             Error,
             action::Action,
             check::NamespaceChecker,

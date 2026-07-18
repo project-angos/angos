@@ -9,7 +9,7 @@ use futures_util::stream::{self, StreamExt};
 use tracing::warn;
 
 use crate::{
-    command::scrub::{error::Error, executor::ActionSink},
+    command::maintenance::{error::Error, executor::ActionSink},
     oci::Namespace,
     registry::metadata_store::MetadataStore,
 };

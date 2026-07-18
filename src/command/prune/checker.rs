@@ -8,7 +8,7 @@ use tracing::{debug, error};
 use chrono::Duration;
 
 use crate::{
-    command::scrub::{Error, action::Action, check::NamespaceChecker, executor::ActionSink},
+    command::maintenance::{Error, action::Action, check::NamespaceChecker, executor::ActionSink},
     oci::{Digest, Namespace, Tag},
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
@@ -539,7 +539,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        command::scrub::{
+        command::maintenance::{
             action::Action,
             executor::{Executor, RETENTION_ACTOR},
         },

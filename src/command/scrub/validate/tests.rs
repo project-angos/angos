@@ -8,11 +8,13 @@ use uuid::Uuid;
 use angos_tx_engine::intent::{IntentRecord, MutationProgress, MutationRecord};
 
 use crate::{
-    command::scrub::{
-        action::{Action, LOST_AND_FOUND_PREFIX},
-        executor::{ActionSink, Executor},
-        validate::{Pass, Validator},
-        walk::{self, WalkStats},
+    command::{
+        maintenance::{
+            action::{Action, LOST_AND_FOUND_PREFIX},
+            executor::{ActionSink, Executor},
+            walk::{self, WalkStats},
+        },
+        scrub::validate::{Pass, Validator},
     },
     oci::{Digest, Namespace, Reference, Tag},
     registry::{

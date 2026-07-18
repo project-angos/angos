@@ -8,14 +8,13 @@ use uuid::Uuid;
 use angos_storage::ObjectStore;
 
 use crate::{
-    command::scrub::{
+    command::maintenance::{
         action::{Action, LOST_AND_FOUND_PREFIX, WalkedStore},
         error::Error,
     },
     event_webhook::event::EventActor,
     jobs::store::{Error as JobStoreError, JobEnvelope, JobStore},
     jobs::{JobState, Queue},
-    metrics_provider::metrics_provider,
     oci::{Digest, Namespace, Reference, Tag},
     registry::{
         Error as RegistryError, Registry,
@@ -24,7 +23,7 @@ use crate::{
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
-        build_envelope, build_prune_delete_envelope,
+        build_envelope, build_prune_delete_envelope, record_reconcile_outcome,
     },
 };
 
@@ -153,15 +152,6 @@ impl Executor {
         record_reconcile_outcome("enqueued");
         Ok(())
     }
-}
-
-/// Records a `replication_reconcile_total` outcome (`enqueued`, `failed`, or
-/// `skipped`).
-pub fn record_reconcile_outcome(outcome: &str) {
-    metrics_provider()
-        .replication_reconcile_total
-        .with_label_values(&[outcome])
-        .inc();
 }
 
 impl Executor {

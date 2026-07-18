@@ -2,8 +2,8 @@ use angos_tx_engine::lock;
 
 use crate::{cache, command::bootstrap::Error as BootstrapError, policy, registry};
 
-/// Errors raised by the maintenance machinery shared between `scrub` and
-/// `prune`. `Display` stays command-neutral: the logging call sites and the
+/// Errors raised by the maintenance machinery shared by `scrub`, `prune`, and
+/// `replicate`. `Display` stays command-neutral: the logging call sites and the
 /// top-level command handlers add the attribution.
 ///
 /// The `Initialization` string variant covers call sites where the source

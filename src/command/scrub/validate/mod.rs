@@ -30,10 +30,10 @@ use angos_tx_engine::{
 };
 
 use crate::{
-    command::scrub::{
+    command::maintenance::{
+        Error,
         action::{Action, WalkedStore},
         categorize::{KeyCategory, categorize},
-        error::Error,
         executor::ActionSink,
         walk::WalkStats,
     },

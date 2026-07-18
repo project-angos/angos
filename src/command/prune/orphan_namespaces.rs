@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use tracing::{error, warn};
 
 use crate::{
-    command::scrub::{Error, action::Action, executor::ActionSink},
+    command::maintenance::{Error, action::Action, executor::ActionSink},
     oci::Namespace,
     registry::{
         blob_store::BlobStore, metadata_store::MetadataStore,
@@ -116,7 +116,7 @@ async fn clear_uploads(
 mod tests {
     use super::*;
     use crate::{
-        command::scrub::executor::Executor,
+        command::maintenance::executor::Executor,
         registry::{
             repository_resolver::RepositoryResolver,
             test_utils::{create_test_repositories, for_each_backend, seed_manifest},

@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use angos_tx_engine::StorageError;
 
 use crate::{
-    command::scrub::{
+    command::maintenance::{
         Error,
         action::Action,
         categorize::{KeyCategory, categorize},
@@ -291,7 +291,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::{
-        command::scrub::executor::Executor,
+        command::maintenance::executor::Executor,
         oci::{Digest, Namespace},
         registry::{
             blob_store::OrphanMultipartUpload,

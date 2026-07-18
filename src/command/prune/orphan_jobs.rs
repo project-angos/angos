@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::{
     cache_fill::CacheFetchBlobPayload,
-    command::scrub::{Error, action::Action, executor::ActionSink},
+    command::maintenance::{Error, action::Action, executor::ActionSink},
     jobs::store::{Error as JobStoreError, JobStore},
     jobs::{JobState, Queue},
     registry::{Repository, repository_resolver::RepositoryResolver},
@@ -255,11 +255,11 @@ mod tests {
     use crate::{
         cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
         command::{
-            prune::orphan_jobs::{OrphanJobChecker, OrphanQueue},
-            scrub::{
+            maintenance::{
                 action::Action,
                 executor::{ActionSink, DryRunSink, Executor},
             },
+            prune::orphan_jobs::{OrphanJobChecker, OrphanQueue},
         },
         jobs::{
             JobState, Queue,
