@@ -64,16 +64,18 @@ pub fn non_empty_links_or_not_found(links: HashSet<LinkKind>) -> Result<HashSet<
 // Store read-modify-write
 
 /// Read one per-namespace shard: its raw bytes plus parsed links, or `None`
-/// when absent.
+/// when absent. A present shard that fails to parse is an error, never an
+/// empty set: the reclaim decisions built on this read must fail closed.
 pub async fn read_shard(
     store: &Store,
     shard_path: &str,
 ) -> Result<Option<(Bytes, HashSet<LinkKind>)>, StorageError> {
     match store.object_store().get(shard_path).await {
         Ok(data) => {
-            let raw = Bytes::from(data.clone());
-            let links: HashSet<LinkKind> = serde_json::from_slice(&data).unwrap_or_default();
-            Ok(Some((raw, links)))
+            let links: HashSet<LinkKind> = serde_json::from_slice(&data).map_err(|e| {
+                StorageError::Backend(format!("corrupt blob-index shard {shard_path}: {e}"))
+            })?;
+            Ok(Some((Bytes::from(data), links)))
         }
         Err(StorageError::NotFound) => Ok(None),
         Err(e) => Err(e),

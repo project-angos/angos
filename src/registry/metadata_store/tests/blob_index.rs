@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use bytes::Bytes;
+
 use angos_tx_engine::lock::{LockStrategy, S3LockConfig};
 
 use super::test_config;
@@ -7,7 +9,12 @@ use crate::{
     oci::{Digest, Namespace, Tag},
     registry::{
         Error,
-        metadata_store::{BlobIndexOperation, LinkKind, LinkOperation},
+        metadata_store::{
+            BlobIndexOperation, LinkKind, LinkOperation,
+            blob_index::shard::{read_shard, shard_will_be_empty},
+        },
+        path_builder,
+        test_utils::fs_test_stack,
     },
 };
 
@@ -308,4 +315,32 @@ async fn test_has_blob_references_ignores_empty_cas_shards() {
         .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
+}
+
+// A corrupt shard must fail the reclaim read instead of parsing as an empty
+// link set that green-lights blob-data deletion.
+#[tokio::test]
+async fn corrupt_shard_fails_reclaim_read_instead_of_parsing_empty() {
+    let stack = fs_test_stack();
+    let store = stack.store.as_ref();
+    let namespace = Namespace::new("corrupt-shard-test").unwrap();
+    let digest =
+        Digest::from_str("sha256:ff00000000000000000000000000000000000000000000000000000000000001")
+            .unwrap();
+
+    let shard_path = path_builder::blob_index_shard_path(&digest, &namespace);
+    store
+        .object_store()
+        .put(&shard_path, Bytes::from_static(b"not json"))
+        .await
+        .unwrap();
+
+    let result = read_shard(store, &shard_path).await;
+    assert!(result.is_err(), "corrupt shard must error, got: {result:?}");
+
+    let will_be_empty = shard_will_be_empty(store, &[], &shard_path).await;
+    assert!(
+        will_be_empty.is_err(),
+        "reclaim decision over a corrupt shard must fail closed, got: {will_be_empty:?}"
+    );
 }

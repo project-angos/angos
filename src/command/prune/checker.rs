@@ -336,11 +336,18 @@ impl RetentionChecker {
         last_pulled: &[String],
     ) -> Vec<&'a Tag> {
         tags.iter()
-            .filter(|tag| {
-                !self
-                    .should_retain_tag(namespace, tag, last_pushed, last_pulled)
-                    .unwrap_or(true)
-            })
+            .filter(
+                |tag| match self.should_retain_tag(namespace, tag, last_pushed, last_pulled) {
+                    Ok(retain) => !retain,
+                    Err(e) => {
+                        error!(
+                            "Retention evaluation failed for '{namespace}:{}', retaining: {e}",
+                            tag.name
+                        );
+                        false
+                    }
+                },
+            )
             .map(|tag| &tag.name)
             .collect()
     }
@@ -440,12 +447,25 @@ impl RetentionChecker {
         last_pulled: &[String],
         sink: &dyn ActionSink,
     ) -> Result<(), Error> {
-        let is_protected = self.is_protected(namespace, digest).await?;
+        // A missing blob index means "no links"; any other read failure must
+        // propagate rather than pass for "unprotected" on a delete path.
+        let blob_index = match self.metadata_store.read_blob_index(digest).await {
+            Ok(index) => Some(index),
+            Err(RegistryError::NotFound) => None,
+            Err(e) => return Err(e.into()),
+        };
+
+        let is_protected = self
+            .is_protected(namespace, digest, blob_index.as_ref())
+            .await?;
         if is_protected {
             debug!("Skipping protected manifest '{namespace}@{digest}'");
         }
 
-        let has_tags = !is_protected && self.has_tags(namespace, digest).await?;
+        let has_tags = !is_protected
+            && blob_index.as_ref().is_some_and(|index| {
+                has_link_kind(index, namespace, |link| matches!(link, LinkKind::Tag(_)))
+            });
 
         let metadata = if is_protected || has_tags {
             None
@@ -488,31 +508,21 @@ impl RetentionChecker {
         }
     }
 
-    async fn is_protected(&self, namespace: &Namespace, digest: &Digest) -> Result<bool, Error> {
-        if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && has_link_kind(&blob_index, namespace, |link| {
+    async fn is_protected(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+        blob_index: Option<&BlobIndex>,
+    ) -> Result<bool, Error> {
+        if blob_index.is_some_and(|index| {
+            has_link_kind(index, namespace, |link| {
                 matches!(link, LinkKind::Manifest(_, _))
             })
-        {
+        }) {
             return Ok(true);
         }
 
-        if self.metadata_store.has_referrers(namespace, digest).await? {
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    async fn has_tags(&self, namespace: &Namespace, digest: &Digest) -> Result<bool, Error> {
-        if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && has_link_kind(&blob_index, namespace, |link| {
-                matches!(link, LinkKind::Tag(_))
-            })
-        {
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(self.metadata_store.has_referrers(namespace, digest).await?)
     }
 }
 
