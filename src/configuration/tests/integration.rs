@@ -6,7 +6,9 @@ use crate::{
     auth::oidc,
     cache,
     configuration::listeners::ClientAuth,
-    configuration::{Configuration, Error, RegistryStorageConfig, ServerConfig},
+    configuration::{
+        Configuration, Error, RegistryStorageConfig, ResolvedStorageConfig, ServerConfig,
+    },
     policy::AccessMode,
     registry::blob_store,
     replication::ReplicationMode,
@@ -398,7 +400,7 @@ fn test_metadata_store_s3_with_redis() {
     let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        RegistryStorageConfig::S3(s3_config) => {
+        ResolvedStorageConfig::S3(s3_config) => {
             assert_eq!(s3_config.connection.bucket, "metadata-bucket");
             match &s3_config.lock_strategy {
                 Some(LockStrategy::Redis(lock_config)) => {
@@ -408,7 +410,7 @@ fn test_metadata_store_s3_with_redis() {
                 other => panic!("Expected Redis lock strategy, got {other:?}"),
             }
         }
-        RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
+        ResolvedStorageConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -432,7 +434,7 @@ fn test_metadata_store_fs_with_redis() {
     let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        RegistryStorageConfig::FS(fs_config) => {
+        ResolvedStorageConfig::FS(fs_config) => {
             assert_eq!(fs_config.root_dir, "/data/metadata");
             match &fs_config.lock_strategy {
                 LockStrategy::Redis(lock_config) => {
@@ -442,7 +444,7 @@ fn test_metadata_store_fs_with_redis() {
                 other => panic!("Expected Redis lock strategy, got {other:?}"),
             }
         }
-        RegistryStorageConfig::Inherit | RegistryStorageConfig::S3(_) => {
+        ResolvedStorageConfig::S3(_) => {
             panic!("Expected FS metadata store config")
         }
     }
@@ -722,7 +724,7 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
     let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        RegistryStorageConfig::S3(s3_config) => {
+        ResolvedStorageConfig::S3(s3_config) => {
             assert_eq!(s3_config.connection.bucket, "metadata-bucket");
             match &s3_config.lock_strategy {
                 Some(LockStrategy::S3(lock_config)) => {
@@ -733,7 +735,7 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
                 other => panic!("Expected S3 lock strategy, got {other:?}"),
             }
         }
-        RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
+        ResolvedStorageConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -932,7 +934,7 @@ fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
     let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        RegistryStorageConfig::S3(s3_config) => match &s3_config.lock_strategy {
+        ResolvedStorageConfig::S3(s3_config) => match &s3_config.lock_strategy {
             Some(LockStrategy::S3(lock_config)) => {
                 assert_eq!(lock_config.ttl_secs, 60);
                 assert_eq!(lock_config.max_retries, 50);
@@ -940,7 +942,7 @@ fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
             }
             other => panic!("Expected S3 lock strategy, got {other:?}"),
         },
-        RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
+        ResolvedStorageConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -972,14 +974,14 @@ fn test_metadata_store_s3_lock_strategy_memory() {
     let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        RegistryStorageConfig::S3(s3_config) => {
+        ResolvedStorageConfig::S3(s3_config) => {
             assert!(
                 matches!(s3_config.lock_strategy, Some(LockStrategy::Memory)),
                 "Expected Memory lock strategy, got {:?}",
                 s3_config.lock_strategy
             );
         }
-        RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
+        ResolvedStorageConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
