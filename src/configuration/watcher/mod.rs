@@ -233,11 +233,26 @@ struct WatchState<'a> {
     _watcher: notify::RecommendedWatcher,
 }
 
-async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
+/// Why [`run_event_loop`] handed control back to [`watch_config_loop`].
+enum LoopOutcome {
+    /// The watched TLS directory set changed; rebuild the watcher over the new
+    /// set and resume watching.
+    RebuildWatcher,
+    /// The event channel closed; stop watching.
+    ChannelClosed,
+}
+
+/// Whether a configuration reload changed the set of watched TLS directories.
+enum TlsDirs {
+    Changed,
+    Unchanged,
+}
+
+async fn run_event_loop(state: &mut WatchState<'_>) -> LoopOutcome {
     loop {
         let Some(event) = state.rx.recv().await else {
             error!("Config watcher channel closed");
-            return false;
+            return LoopOutcome::ChannelClosed;
         };
 
         let initial_kind = classify_event(
@@ -260,22 +275,22 @@ async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
         .await
         else {
             error!("Config watcher channel closed");
-            return false;
+            return LoopOutcome::ChannelClosed;
         };
 
         match kind {
             ChangeKind::Irrelevant => {}
             ChangeKind::Config => {
-                if reload_config(
+                let reloaded = reload_config(
                     &state.config_path.raw,
                     &state.config_dir.raw,
                     state.cached_config,
                     &state.tls_dirs.raw,
                     state.notifier,
                 )
-                .await
-                {
-                    return true;
+                .await;
+                if let TlsDirs::Changed = reloaded {
+                    return LoopOutcome::RebuildWatcher;
                 }
             }
             ChangeKind::Tls => {
@@ -285,16 +300,16 @@ async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
     }
 }
 
-/// Handles a `ChangeKind::Config` event: loads the new configuration, notifies
-/// the subscriber, and returns `true` when the set of watched TLS directories
-/// has changed, signalling that the outer loop must rebuild the watcher.
+/// Handles a `ChangeKind::Config` event: loads the new configuration and
+/// notifies the subscriber, reporting whether the watched TLS directory set
+/// changed.
 async fn reload_config(
     config_path: &Path,
     config_dir: &Path,
     cached_config: &mut Option<Configuration>,
     tls_dirs: &HashSet<PathBuf>,
     notifier: &dyn ConfigNotifier,
-) -> bool {
+) -> TlsDirs {
     info!("Configuration change detected, reloading");
     match Configuration::load(config_path) {
         Ok(cfg) => {
@@ -302,11 +317,15 @@ async fn reload_config(
             info!("Configuration reloaded");
             let new_tls_dirs = compute_tls_dirs(&cfg, config_dir);
             *cached_config = Some(cfg);
-            new_tls_dirs != *tls_dirs
+            if new_tls_dirs == *tls_dirs {
+                TlsDirs::Unchanged
+            } else {
+                TlsDirs::Changed
+            }
         }
         Err(e) => {
             warn!("Failed to reload configuration: {e}");
-            false
+            TlsDirs::Unchanged
         }
     }
 }
@@ -339,8 +358,9 @@ async fn watch_config_loop(
             notifier: notifier.as_ref(),
             _watcher: watcher,
         };
-        if !run_event_loop(&mut state).await {
-            return Ok(());
+        match run_event_loop(&mut state).await {
+            LoopOutcome::RebuildWatcher => {}
+            LoopOutcome::ChannelClosed => return Ok(()),
         }
     }
 }
