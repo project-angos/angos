@@ -10,7 +10,10 @@ use serde::{Deserialize, de};
 use tracing::{debug, instrument};
 
 use super::{AuthMiddleware, AuthResult};
-use crate::{auth::Error, command::server::RequestHeaders, identity::ClientIdentity};
+use crate::{
+    auth::{Error, authorization::basic_credentials},
+    identity::ClientIdentity,
+};
 
 /// An Argon2 password hash string, validated at deserialize time.
 #[derive(Clone)]
@@ -124,8 +127,7 @@ impl AuthMiddleware for BasicAuthValidator {
         parts: &Parts,
         identity: &mut ClientIdentity,
     ) -> Result<AuthResult, Error> {
-        let headers = RequestHeaders::new(&parts.headers);
-        let Some((username, password)) = headers.basic_auth() else {
+        let Some((username, password)) = basic_credentials(&parts.headers) else {
             return Ok(AuthResult::NoCredentials);
         };
 

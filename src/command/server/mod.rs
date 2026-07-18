@@ -15,5 +15,4 @@ mod ui;
 pub use command::{Command, Options};
 pub use error::Error;
 pub use http_server::serve_request;
-pub use request::RequestHeaders;
 pub use server_context::ServerContext;
