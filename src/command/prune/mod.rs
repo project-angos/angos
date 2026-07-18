@@ -51,6 +51,34 @@ pub struct Options {
     pub concurrency: usize,
 }
 
+/// Refuses to prune when a retention rule reads pull-time data that is never
+/// recorded: with `update_pull_time` disabled such rules match nothing, so
+/// enforcing them would delete actively pulled images.
+fn ensure_pull_time_rules_are_recorded(config: &Configuration) -> Result<(), Error> {
+    if config.global.update_pull_time {
+        return Ok(());
+    }
+    let mut offenders = Vec::new();
+    if config.global.retention_policy.uses_pull_time() {
+        offenders.push("global".to_string());
+    }
+    for (name, repository) in &config.repository {
+        if repository.retention_policy.uses_pull_time() {
+            offenders.push(format!("repository '{name}'"));
+        }
+    }
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    offenders.sort();
+    Err(Error::Initialization(format!(
+        "retention rules of {} use last_pulled_at or top_pulled but update_pull_time is disabled, \
+         so pull times are never recorded and actively pulled images would be deleted; \
+         enable update_pull_time or remove those rules",
+        offenders.join(", ")
+    )))
+}
+
 /// The registry-wide retention policy, or `None` when no global rules are
 /// configured (per-repository policies still apply).
 pub fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
@@ -69,6 +97,7 @@ pub fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Ret
 /// aged upload-lifecycle leftovers within the `-u` window and queued jobs
 /// whose configuration is gone.
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
+    ensure_pull_time_rules_are_recorded(config)?;
     let window = Duration::from_std(options.uploads.into())
         .map_err(|e| Error::Initialization(format!("Upload window is invalid: {e}")))?;
     let bootstrap::MaintenanceContext {
@@ -167,10 +196,20 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::CelRule;
+    use crate::{
+        policy::CelRule, registry::repository, test_fixtures::configuration::minimal_config,
+    };
 
     fn rule(s: &str) -> CelRule {
         CelRule::compile(s).unwrap()
+    }
+
+    fn config_with_global_rules(sources: &[&str]) -> Configuration {
+        let mut config = minimal_config();
+        config.global.retention_policy = RetentionPolicyConfig {
+            rules: sources.iter().map(|s| rule(s)).collect(),
+        };
+        config
     }
 
     #[test]
@@ -189,5 +228,45 @@ mod tests {
         let result = global_retention_policy(&config);
 
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn prune_refuses_global_pull_time_rules_without_update_pull_time() {
+        let config = config_with_global_rules(&["top_pulled(5)"]);
+        let error = ensure_pull_time_rules_are_recorded(&config).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("update_pull_time"), "message: {message}");
+        assert!(message.contains("global"), "message: {message}");
+    }
+
+    #[test]
+    fn prune_reports_repository_pull_time_rules_without_update_pull_time() {
+        let mut config = minimal_config();
+        config.repository.insert(
+            "team".to_string(),
+            repository::Config {
+                retention_policy: RetentionPolicyConfig {
+                    rules: vec![rule("image.last_pulled_at > now() - days(7)")],
+                },
+                ..Default::default()
+            },
+        );
+        let error = ensure_pull_time_rules_are_recorded(&config).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("repository 'team'"), "message: {message}");
+    }
+
+    #[test]
+    fn prune_accepts_pull_time_rules_with_update_pull_time() {
+        let mut config = config_with_global_rules(&["top_pulled(5)"]);
+        config.global.update_pull_time = true;
+        assert!(ensure_pull_time_rules_are_recorded(&config).is_ok());
+    }
+
+    #[test]
+    fn prune_accepts_push_based_rules_without_update_pull_time() {
+        let config =
+            config_with_global_rules(&["top_pushed(3)", "image.pushed_at > now() - days(30)"]);
+        assert!(ensure_pull_time_rules_are_recorded(&config).is_ok());
     }
 }

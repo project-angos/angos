@@ -11,7 +11,7 @@ Set up automated cleanup of old container images using CEL-based retention polic
 ## Prerequisites
 
 - Angos running
-- `update_pull_time = true` if using pull-based retention
+- `update_pull_time = true` if using pull-based retention (`image.last_pulled_at`, `top_pulled`); `prune` refuses to start when such rules are configured without it, since pull times would never be recorded and actively pulled images would be deleted
 
 ## How Retention Works
 
@@ -92,14 +92,16 @@ rules = [
 ]
 ```
 
-### Top-K Retention
+### Top-n Retention
 
 ```toml
 rules = [
-  'top_pushed(10)',  # Keep 10 most recently pushed
-  'top_pulled(5)'    # Keep 5 most recently pulled
+  'top_pushed(10)',  # Keep 10 most recently pushed tags
+  'top_pulled(5)'    # Keep 5 most recently pulled tags
 ]
 ```
+
+`top_pushed` and `top_pulled` rank tags, so untagged manifests and grant-only blobs never match them. With only count-based rules, everything untagged is deleted, including the revisions its own tag deletions orphan; that is what lets a top-n policy reclaim storage. Add a time-based rule such as `image.pushed_at > now() - days(7)` if recent untagged content must survive.
 
 ### Semantic Version Tags
 
@@ -133,8 +135,8 @@ rules = [
 ```
 
 **Rule Functions:**
-- `top_pushed(n)` - Keep the n most recently pushed manifests
-- `top_pulled(n)` - Keep the n most recently pulled manifests
+- `top_pushed(n)` - Keep the n most recently pushed tags
+- `top_pulled(n)` - Keep the n most recently pulled tags
 
 ---
 
