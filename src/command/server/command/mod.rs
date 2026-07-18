@@ -9,12 +9,15 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::warn;
 
 use crate::{
-    command::server::{
-        ServerContext,
-        error::Error,
-        listeners::{
-            insecure::InsecureListener,
-            tls::{ServerTlsConfig, TlsListener},
+    command::{
+        bootstrap,
+        server::{
+            ServerContext,
+            error::Error,
+            listeners::{
+                insecure::InsecureListener,
+                tls::{ServerTlsConfig, TlsListener},
+            },
         },
     },
     configuration::{Configuration, ServerConfig},
@@ -76,13 +79,15 @@ impl Command {
     pub async fn new(config: &Configuration) -> Result<Command, Error> {
         let cached_conditional_operations = Arc::new(Mutex::new(None));
         let engine_maintenance = CancellationToken::new();
+        let auth_cache = bootstrap::auth_cache(&config.cache)?;
         let (registry, pending) = setup::build_registry(
             config,
+            &auth_cache,
             &cached_conditional_operations,
             Some(engine_maintenance.clone()),
         )
         .await?;
-        let context = ServerContext::new(config, registry)?;
+        let context = ServerContext::new(config, &auth_cache, registry)?;
 
         let listener = match &config.server {
             ServerConfig::Insecure(server_config) => {
@@ -120,8 +125,14 @@ impl Command {
     }
 
     pub async fn notify_config_change(&self, config: &Configuration) -> Result<(), Error> {
-        let (registry, pending) =
-            setup::build_registry(config, &self.cached_conditional_operations, None).await?;
+        let auth_cache = bootstrap::auth_cache(&config.cache)?;
+        let (registry, pending) = setup::build_registry(
+            config,
+            &auth_cache,
+            &self.cached_conditional_operations,
+            None,
+        )
+        .await?;
 
         if pending.is_some() != self.pending_refresh.is_some() {
             warn!(
@@ -130,7 +141,7 @@ impl Command {
             );
         }
 
-        let context = ServerContext::new(config, registry)?;
+        let context = ServerContext::new(config, &auth_cache, registry)?;
 
         match (&self.listener, &config.server) {
             (ServiceListener::Insecure(listener), ServerConfig::Insecure(server_config)) => {

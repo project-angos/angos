@@ -119,8 +119,8 @@ pub async fn probe_storage(config: &RegistryStorageConfig) -> Result<Option<bool
 /// For S3 without an operator-declared `conditional_operations` this probes
 /// the endpoint to configure the executor. Server callers that want to
 /// memoize the probe across hot-reloads should resolve it up front (see
-/// `setup::build_metadata_store`) and inject it into the config so this
-/// path skips the probe.
+/// `setup::build_registry`) and inject it into the config so this path
+/// skips the probe.
 pub async fn build_store(config: &RegistryStorageConfig) -> Result<Arc<Store>, Error> {
     let store = match config {
         RegistryStorageConfig::Inherit => {

@@ -12,7 +12,7 @@ use crate::{
     configuration::{Configuration, RegistryStorageConfig},
     event_webhook::dispatcher::EventDispatcher,
     jobs::store::{self as job_store, JobStore},
-    registry::{Registry, RegistryConfig, metadata_store::MetadataStore},
+    registry::{Registry, RegistryConfig},
 };
 
 /// Handle on the durable job-store and the interval the server should refresh
@@ -24,11 +24,13 @@ pub struct PendingGaugeRefresh {
     pub ready_horizon_secs: u64,
 }
 
-pub async fn build_metadata_store(
+/// Resolve the registry-storage config once per (re)build, injecting the
+/// memoized S3 conditional-write probe so every consumer of the resolved
+/// config shares one verdict and hot reloads never re-probe the endpoint.
+async fn resolve_storage_config(
     config: &Configuration,
-    cache: &Arc<Cache>,
     cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
-) -> Result<Arc<MetadataStore>, Error> {
+) -> Result<RegistryStorageConfig, Error> {
     let mut storage_config = config.resolve_registry_storage();
     if matches!(config.registry_storage, RegistryStorageConfig::Inherit)
         && matches!(&storage_config, RegistryStorageConfig::S3(_))
@@ -36,10 +38,8 @@ pub async fn build_metadata_store(
         info!("Auto-configuring S3 metadata-store from blob-store");
     }
 
-    // Resolve S3 conditional-write support once and memoize it so a config
-    // hot-reload rebuilds the metadata store without re-probing the endpoint.
-    // An operator-declared value skips this entirely. Injecting the resolved
-    // value into the config means `build_store` won't re-probe.
+    // An operator-declared value skips the probe entirely. Injecting the
+    // resolved value into the config means `build_store` won't re-probe.
     if matches!(&storage_config, RegistryStorageConfig::S3(b) if b.conditional_operations.is_none())
     {
         let cached = *cached_conditional_operations
@@ -62,9 +62,7 @@ pub async fn build_metadata_store(
         }
     }
 
-    bootstrap::metadata_store(&storage_config, cache)
-        .await
-        .map_err(Error::from)
+    Ok(storage_config)
 }
 
 /// Build the runtime `Registry`. When `[global.job_queue]` selects a durable
@@ -77,16 +75,18 @@ pub async fn build_metadata_store(
 /// it was already started by the initial bootstrap.
 pub async fn build_registry(
     config: &Configuration,
+    auth_cache: &Arc<Cache>,
     cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
     engine_maintenance: Option<CancellationToken>,
 ) -> Result<(Arc<Registry>, Option<PendingGaugeRefresh>), Error> {
-    let auth_cache = bootstrap::auth_cache(&config.cache)?;
     let blob_backend = Arc::new(config.blob_store.build_backend()?);
-    let metadata_store =
-        build_metadata_store(config, &auth_cache, cached_conditional_operations).await?;
+    let storage_config = resolve_storage_config(config, cached_conditional_operations).await?;
+    let metadata_store = bootstrap::metadata_store(&storage_config, auth_cache)
+        .await
+        .map_err(Error::from)?;
     let max_manifest_size_bytes = config.global.max_manifest_size_bytes();
     let repositories =
-        bootstrap::repositories(&config.repository, &auth_cache, max_manifest_size_bytes).await?;
+        bootstrap::repositories(&config.repository, auth_cache, max_manifest_size_bytes).await?;
 
     let mut registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
@@ -106,37 +106,25 @@ pub async fn build_registry(
     // When [global.job_queue] is present, route cache-fill jobs through the
     // durable backend (so they survive restarts and let `angos worker` drain
     // them) and surface the pending count on this server's /metrics for
-    // autoscaling. The storage handles are shared with the metadata store.
-    //
-    // Always fetch the shared storage handles when this is the initial
-    // bootstrap so we can spawn the engine maintenance loops against the same
-    // store the metadata/job paths use.
-    let storage_config = config.resolve_registry_storage();
-    let maintenance_handles = if engine_maintenance.is_some() || config.global.job_queue.is_some() {
-        Some(bootstrap::build_store(&storage_config).await?)
-    } else {
-        None
-    };
-
+    // autoscaling. The job store and the engine maintenance loop share the
+    // metadata store's engine façade, so no second store is wired and the
+    // conditional-write probe runs at most once per process.
     let pending = if let Some(jq_config) = &config.global.job_queue {
-        if let Some(handles) = maintenance_handles.as_ref() {
-            job_store::ensure_shared_lock(handles)?;
-            let job_store: Arc<JobStore> = Arc::new(JobStore::new(handles.clone(), "server"));
-            registry_config.job_queue = Some(job_store.clone());
-            Some(PendingGaugeRefresh {
-                store: job_store,
-                interval: Duration::from_secs(jq_config.pending_refresh_interval_secs),
-                ready_horizon_secs: jq_config.pending_ready_horizon_secs,
-            })
-        } else {
-            None
-        }
+        let engine = metadata_store.store_arc();
+        job_store::ensure_shared_lock(&engine)?;
+        let job_store: Arc<JobStore> = Arc::new(JobStore::new(engine, "server"));
+        registry_config.job_queue = Some(job_store.clone());
+        Some(PendingGaugeRefresh {
+            store: job_store,
+            interval: Duration::from_secs(jq_config.pending_refresh_interval_secs),
+            ready_horizon_secs: jq_config.pending_ready_horizon_secs,
+        })
     } else {
         None
     };
 
-    if let (Some(token), Some(handles)) = (engine_maintenance, maintenance_handles) {
-        tokio::spawn(handles.recovery(token));
+    if let Some(token) = engine_maintenance {
+        tokio::spawn(metadata_store.store_arc().recovery(token));
     }
 
     let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);

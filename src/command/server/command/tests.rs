@@ -93,8 +93,7 @@ fn test_build_blob_store_filesystem_success() {
 async fn test_build_metadata_store_filesystem_success() {
     let (config, _blobs, _meta) = create_minimal_config();
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
-    let result =
-        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
+    let result = bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await;
 
     assert!(result.is_ok());
 }
@@ -208,7 +207,13 @@ async fn test_build_repositories_multiple() {
 #[tokio::test]
 async fn test_build_registry_minimal_config() {
     let (config, _blobs, _meta) = create_minimal_config();
-    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None).await;
+    let result = setup::build_registry(
+        &config,
+        &bootstrap::auth_cache(&config.cache).expect("auth cache"),
+        &Arc::new(Mutex::new(None)),
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
 }
@@ -216,7 +221,13 @@ async fn test_build_registry_minimal_config() {
 #[tokio::test]
 async fn test_build_registry_with_repositories() {
     let (config, _blobs, _meta) = create_config_with_repository();
-    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None).await;
+    let result = setup::build_registry(
+        &config,
+        &bootstrap::auth_cache(&config.cache).expect("auth cache"),
+        &Arc::new(Mutex::new(None)),
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
 }
@@ -228,7 +239,13 @@ async fn test_build_registry_with_update_pull_time() {
     let (mut config, _blobs, _meta) = create_minimal_config();
     config.global.update_pull_time = true;
 
-    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None).await;
+    let result = setup::build_registry(
+        &config,
+        &bootstrap::auth_cache(&config.cache).expect("auth cache"),
+        &Arc::new(Mutex::new(None)),
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
 }
@@ -283,10 +300,9 @@ async fn test_build_registry_components_integration() {
 
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
-    let metadata_store =
-        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
-            .await
-            .unwrap();
+    let metadata_store = bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache)
+        .await
+        .unwrap();
     let repositories = bootstrap::repositories(
         &config.repository,
         &auth_cache,
