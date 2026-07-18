@@ -8,7 +8,10 @@ use tracing::warn;
 use angos_tx_engine::StorageError;
 
 use crate::{
-    command::scrub::{action::WalkedStore, error::Error, validate::Validator},
+    command::{
+        maintenance::{Error, action::WalkedStore},
+        scrub::validate::Validator,
+    },
     jobs::{
         JobState, Queue,
         store::{DeadLetterRead, JobEnvelope, LockKeyIndex},

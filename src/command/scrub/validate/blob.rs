@@ -8,11 +8,13 @@ use tracing::warn;
 use angos_tx_engine::StorageError;
 
 use crate::{
-    command::scrub::{
-        action::{Action, WalkedStore},
-        categorize::UploadArtifact,
-        error::Error,
-        validate::Validator,
+    command::{
+        maintenance::{
+            Error,
+            action::{Action, WalkedStore},
+            categorize::UploadArtifact,
+        },
+        scrub::validate::Validator,
     },
     oci::{Digest, Namespace},
     registry::Error as RegistryError,

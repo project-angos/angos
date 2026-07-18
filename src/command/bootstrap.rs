@@ -298,7 +298,7 @@ mod tests {
     use crate::{
         cache,
         command::bootstrap::{self, Error, auth_cache, build_store, probe_storage, repositories},
-        command::scrub::Error as ScrubError,
+        command::maintenance::Error as MaintenanceError,
         command::server::Error as ServerError,
         configuration::{
             RegistryStorageConfig,
@@ -393,15 +393,15 @@ mod tests {
     #[test]
     fn error_into_scrub_error_registry_variant() {
         let bootstrap_err: Error = registry::Error::BlobUnknown.into();
-        let scrub_err: ScrubError = bootstrap_err.into();
-        assert!(matches!(scrub_err, ScrubError::Registry(_)));
+        let scrub_err: MaintenanceError = bootstrap_err.into();
+        assert!(matches!(scrub_err, MaintenanceError::Registry(_)));
     }
 
     #[test]
     fn error_into_scrub_error_cache_variant() {
         let bootstrap_err: Error = cache::Error::Execution("x".to_string()).into();
-        let scrub_err: ScrubError = bootstrap_err.into();
-        assert!(matches!(scrub_err, ScrubError::Cache(_)));
+        let scrub_err: MaintenanceError = bootstrap_err.into();
+        assert!(matches!(scrub_err, MaintenanceError::Cache(_)));
     }
 
     #[test]

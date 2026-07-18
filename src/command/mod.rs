@@ -1,5 +1,6 @@
 pub mod argon;
 pub mod bootstrap;
+pub mod maintenance;
 pub mod migrate;
 pub mod prune;
 pub mod replicate;

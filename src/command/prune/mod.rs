@@ -16,10 +16,11 @@ pub use checker::RetentionChecker;
 use crate::{
     command::{
         bootstrap,
-        scrub::{
-            Error, check, default_concurrency,
+        maintenance::{
+            Error, check,
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
         },
+        scrub::default_concurrency,
     },
     configuration::Configuration,
     jobs::store::JobStore,

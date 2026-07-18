@@ -11,7 +11,7 @@ pub use checker::ReplicationChecker;
 use crate::{
     command::{
         bootstrap,
-        scrub::{
+        maintenance::{
             Error, check,
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
         },

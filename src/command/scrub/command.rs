@@ -15,12 +15,12 @@ use tracing::info;
 use crate::{
     command::{
         bootstrap,
-        scrub::{
-            error::Error,
+        maintenance::{
+            Error,
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
-            validate::{Pass, Validator},
             walk::{self, WalkStats},
         },
+        scrub::validate::{Pass, Validator},
     },
     configuration::Configuration,
     registry::{Registry, blob_store::BlobStore, metadata_store::MetadataStore, path_builder},
@@ -171,7 +171,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        command::scrub::action::LOST_AND_FOUND_PREFIX,
+        command::maintenance::action::LOST_AND_FOUND_PREFIX,
         oci::{Digest, Namespace},
         registry::{
             metadata_store::LinkMetadata, path_builder as paths, test_utils::seed_manifest,

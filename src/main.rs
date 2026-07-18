@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    command::{argon, bootstrap, migrate, prune, replicate, scrub, server, worker},
+    command::{argon, bootstrap, maintenance, migrate, prune, replicate, scrub, server, worker},
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
     metrics_provider::initialize_metrics,
 };
@@ -223,7 +223,10 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
     }
 }
 
-async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
+async fn run_scrub(
+    options: scrub::Options,
+    config: Configuration,
+) -> Result<(), maintenance::Error> {
     let mut scrub = scrub::Command::new(&options, &config).await?;
     scrub.run().await
 }

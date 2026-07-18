@@ -9,10 +9,12 @@ use tracing::{debug, warn};
 use angos_tx_engine::StorageError;
 
 use crate::{
-    command::scrub::{
-        action::{Action, WalkedStore},
-        error::Error,
-        validate::Validator,
+    command::{
+        maintenance::{
+            Error,
+            action::{Action, WalkedStore},
+        },
+        scrub::validate::Validator,
     },
     oci::{Digest, Namespace},
     registry::{Error as RegistryError, metadata_store::LinkKind, path_builder},
