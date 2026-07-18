@@ -15,6 +15,7 @@ use uuid::Uuid;
 use angos_tx_engine::store::Store;
 
 use crate::{
+    cache_fill::CacheFillJobHandler,
     command::bootstrap::{self, Error},
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
     jobs::Queue,
@@ -288,7 +289,12 @@ impl WorkerContext {
                 self.blob_store.clone(),
                 self.metadata_store.clone(),
             )),
-            Queue::Cache => self.registry.cache_job_handler(),
+            Queue::Cache => Arc::new(CacheFillJobHandler::new(
+                self.repositories.clone(),
+                self.blob_store.clone(),
+                self.metadata_store.clone(),
+                self.registry.event_dispatcher(),
+            )),
         };
 
         Components {
@@ -309,14 +315,14 @@ mod tests {
 
     use super::{WorkerContext, resolve_queues};
     use crate::{
+        cache_fill::CACHE_FETCH_BLOB_KIND,
         jobs::{
             Queue,
             store::{JobEnvelope, JobStore},
         },
         metrics_provider,
         registry::{
-            Registry, RegistryConfig, blob_store::BlobStore,
-            cache_job_handler::CACHE_FETCH_BLOB_KIND, metadata_store::MetadataStore,
+            Registry, RegistryConfig, blob_store::BlobStore, metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver, test_utils::build_store,
         },
         replication::REPLICATION_PUSH_MANIFEST_KIND,

@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, instrument, warn};
 
 use crate::{
+    cache_fill::CACHE_ACTOR,
     event_webhook::event::{Event, EventActor, EventKind},
     jobs::Queue,
     metrics_provider::metrics_provider,
@@ -20,7 +21,6 @@ use crate::{
     registry::{
         Error, Registry, Repository,
         blob_ownership::BlobOwnership,
-        cache_job_handler::CACHE_ACTOR,
         metadata_store::{LinkKind, LinkMetadata, LinkOperation, LinksCommit},
     },
     replication::{
