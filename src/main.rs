@@ -118,9 +118,13 @@ enum SubCommand {
 }
 
 fn main() {
-    rustls::crypto::aws_lc_rs::default_provider()
+    if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .is_err()
+    {
+        eprintln!("Failed to install rustls crypto provider");
+        exit(1);
+    }
 
     let cli_args: GlobalArguments = argh::from_env();
 
@@ -132,17 +136,20 @@ fn main() {
         }
     };
 
-    if let Err(e) = initialize_metrics() {
-        eprintln!("Failed to initialize metrics provider: {e}");
-        exit(1);
-    }
+    initialize_metrics();
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.global.max_concurrent_requests)
         .enable_all()
         .build()
-        .expect("Failed to create Tokio runtime")
-        .block_on(run_command(cli_args, config));
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Failed to create Tokio runtime: {e}");
+            exit(1);
+        }
+    };
+    runtime.block_on(run_command(cli_args, config));
 }
 
 async fn run_command(cli_args: GlobalArguments, config: Configuration) {
@@ -292,7 +299,7 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     {
-        ctrl_c.await.expect("failed to listen for Ctrl+C");
+        let _ = ctrl_c.await;
     }
 }
 

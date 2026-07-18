@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    process::exit,
+    sync::{Arc, LazyLock},
+};
 
 use angos_tx_engine::lock::metrics::{LockMetrics, set_lock_metrics};
 use prometheus::{
@@ -17,23 +20,29 @@ pub enum Error {
     Encode(String),
 }
 
-static METRICS: OnceLock<MetricsProvider> = OnceLock::new();
+static METRICS: LazyLock<MetricsProvider> = LazyLock::new(|| {
+    // The sink store is a no-op when already installed; it records lazily, so
+    // installing it mid-initialization cannot re-enter this closure.
+    let _ = set_lock_metrics(Arc::new(PrometheusLockMetrics));
+    match MetricsProvider::new() {
+        Ok(provider) => provider,
+        // Only a duplicate metric registration (a programmer error any
+        // metric-recording test catches) lands here; fail as fast as the old
+        // startup initialization did.
+        Err(e) => {
+            eprintln!("Failed to initialize metrics provider: {e}");
+            exit(1);
+        }
+    }
+});
 
-/// Initializes the metrics provider at startup.
-///
-/// Must be called once before any code that records a metric runs. Also
-/// installs the lock-metrics sink in `angos-tx-engine` so the lock backends
-/// (which live in the engine crate but have no `metrics_provider` access)
-/// can record observations into the same prometheus registry.
-///
-/// Returns `Err` if metric registration fails or if called more than once.
-pub fn initialize_metrics() -> Result<(), Error> {
-    let provider = MetricsProvider::new()?;
-    METRICS
-        .set(provider)
-        .map_err(|_| Error::Initialization("metrics provider already initialized".to_string()))?;
-    set_lock_metrics(Arc::new(PrometheusLockMetrics))
-        .map_err(|_| Error::Initialization("lock metrics sink already installed".to_string()))
+/// Initializes the metrics provider and the lock-metrics sink in
+/// `angos-tx-engine` (the lock backends live in the engine crate with no
+/// `metrics_provider` access and record into the same prometheus registry).
+/// Recording self-initializes on first use; calling this at startup only
+/// front-loads the registration work.
+pub fn initialize_metrics() {
+    LazyLock::force(&METRICS);
 }
 
 /// Adapter implementing [`LockMetrics`] over the process-wide
@@ -78,16 +87,9 @@ impl LockMetrics for PrometheusLockMetrics {
     }
 }
 
-/// Returns a reference to the initialized metrics provider.
-///
-/// # Panics
-///
-/// Panics if `initialize_metrics()` has not been called. This is a programmer
-/// error: all code paths that record metrics run after startup initialization.
+/// Returns the process-wide metrics provider, initializing it on first use.
 pub fn metrics_provider() -> &'static MetricsProvider {
-    METRICS
-        .get()
-        .expect("initialize_metrics() must be called at startup before any metric is recorded")
+    &METRICS
 }
 
 pub struct InFlightGuard;
@@ -324,8 +326,7 @@ impl MetricsProvider {
 
 #[cfg(test)]
 pub fn init_for_tests() {
-    // Ignore the already-initialized error: tests run in parallel and share one process.
-    let _ = initialize_metrics();
+    initialize_metrics();
 }
 
 #[cfg(test)]
@@ -468,18 +469,25 @@ mod tests {
     }
 
     #[test]
-    fn initialize_metrics_rejects_double_init() {
-        // Ensure the global is set, then call initialize_metrics() again.
-        init_for_tests();
-        let result = initialize_metrics();
-        assert!(
-            matches!(result, Err(Error::Initialization(_))),
-            "second initialize_metrics call must return Err(Initialization), got: {result:?}"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("already initialized"),
-            "error message must mention 'already initialized', got: {err_msg}"
+    fn metrics_survive_repeated_initialization() {
+        // Recording needs no prior initialize_metrics() call, and repeated
+        // initialization must keep the same provider instead of replacing it.
+        let counter = metrics_provider()
+            .metric_http_request_total
+            .with_label_values(&["SELFTEST", "/self-init", "200"]);
+        counter.inc();
+        let value = counter.get();
+
+        initialize_metrics();
+        initialize_metrics();
+
+        assert_eq!(
+            metrics_provider()
+                .metric_http_request_total
+                .with_label_values(&["SELFTEST", "/self-init", "200"])
+                .get(),
+            value,
+            "re-initialization must not replace the provider"
         );
     }
 }
