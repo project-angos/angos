@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.4.0 - UNRELEASED
 
+### Security
+
+- Debug-formatting a registry client (pull-through upstream or replication downstream) no longer exposes the configured password; the client stores it in the redacting `Secret` wrapper.
+
 ### Added
 
 - New `angos migrate` command rewrites pre-JSON bare-digest link files as JSON, converting registries seeded from a raw Docker `distribution` on-disk layout.
