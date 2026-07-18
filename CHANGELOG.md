@@ -4,16 +4,8 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
 
-### Changed
-
-- `angos prune` now fails to start when a retention rule uses `last_pulled_at` or `top_pulled` while `update_pull_time` is disabled, instead of silently treating every image as never pulled.
-- Every listing-driven operation now streams pages lazily and fans out its per-item reads with bounded concurrency, so maintenance sweeps, the `_ext` info endpoints, and the engine janitors are bound by backend latency instead of serialized round-trips; whole-store blob enumeration additionally walks its hash-shard prefixes in parallel.
-- Complete child enumerations (notably the tags listing) now read the directory once on the filesystem backend and scan disjoint name ranges concurrently on S3, instead of chaining every page through one continuation token.
-- `/readyz` now probes storage with one bounded listing instead of enumerating the whole namespace catalog on every poll, and the namespace walk keeps its scan fan-out saturated instead of pausing at every tree level.
-
-## 1.4.0
+## 1.4.0 - UNRELEASED
 
 ### Added
 
@@ -29,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The transaction engine's garbage janitors (orphaned staging bodies, expired lock objects) no longer run as background loops in the server and worker; `angos scrub` sweeps them instead, while the recovery loop stays in serving processes.
 - A `put-manifest` CEL policy input now exposes `request.digest` (by-digest push) and `request.tags` (the tags the push creates) instead of `request.reference`; update any access policy that gated a manifest push on `request.reference`.
 - The `_ext` namespace walk now lists a directory's siblings concurrently, and a single-repository listing walks only that repository's subtree, so the repository and namespace listings are no longer bottlenecked by sequential whole-store scans on S3.
+- `angos prune` now fails to start when a retention rule uses `last_pulled_at` or `top_pulled` while `update_pull_time` is disabled, instead of silently treating every image as never pulled.
+- Every listing-driven operation now streams pages lazily and fans out its per-item reads with bounded concurrency, so maintenance sweeps, the `_ext` info endpoints, and the engine janitors are bound by backend latency instead of serialized round-trips; whole-store blob enumeration additionally walks its hash-shard prefixes in parallel.
+- Complete child enumerations (notably the tags listing) now read the directory once on the filesystem backend and scan disjoint name ranges concurrently on S3, instead of chaining every page through one continuation token.
+- `/readyz` now probes storage with one bounded listing instead of enumerating the whole namespace catalog on every poll, and the namespace walk keeps its scan fan-out saturated instead of pausing at every tree level.
 
 ### Fixed
 
@@ -37,6 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The web UI could not display a manifest or download a blob when redirects were enabled, because a browser cannot follow the cross-origin redirect to a pre-signed S3 URL; GET requests carrying the `X-Angos-No-Redirect` header are now served inline.
 - The transaction engine's body janitor never actually reclaimed orphaned `.tx-bodies/` staging: it mishandled the listing's relative names and always concluded there was nothing to delete.
 - On the filesystem backend, deleting a single object sometimes left its now-empty parent directories behind, and directory-based listings served them back (a deleted tag kept appearing in the tag list).
+- Referrer listing now reads fallback manifest content through the blob store, so referrers resolve when the blob and metadata stores use separate backends.
 
 ### Removed
 

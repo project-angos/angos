@@ -655,11 +655,7 @@ impl Registry {
 
         stream::iter(seeds)
             .map(|(digest, tags, parents, mut referrers)| async move {
-                if let Ok(oci_referrers) = self
-                    .metadata_store
-                    .list_referrers(namespace, &digest, None)
-                    .await
-                {
+                if let Ok(oci_referrers) = self.list_referrers(namespace, &digest, None).await {
                     referrers.extend(oci_referrers.into_iter().map(ReferrerInfo::from));
                 }
 
