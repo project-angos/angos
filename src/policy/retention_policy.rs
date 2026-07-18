@@ -37,6 +37,16 @@ pub struct RetentionPolicyConfig {
     pub rules: Vec<CelRule>,
 }
 
+impl RetentionPolicyConfig {
+    /// True when any rule reads pull-time data (`image.last_pulled_at` or
+    /// `top_pulled`), which is only recorded when `update_pull_time` is enabled.
+    pub fn uses_pull_time(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.source.contains("last_pulled_at") || rule.source.contains("top_pulled")
+        })
+    }
+}
+
 /// Seconds since the Unix epoch, guaranteed non-negative.
 ///
 /// Constructed from `i64` values returned by `chrono::DateTime::timestamp()`.
@@ -516,5 +526,23 @@ mod tests {
     #[test]
     fn days_normal_value() {
         assert_eq!(days(7), 7 * 86400);
+    }
+
+    #[test]
+    fn uses_pull_time_detects_pull_dependent_rules() {
+        for source in ["top_pulled(5)", "image.last_pulled_at > now() - days(7)"] {
+            let config = RetentionPolicyConfig {
+                rules: vec![CelRule::compile(source).unwrap()],
+            };
+            assert!(config.uses_pull_time(), "{source} must be detected");
+        }
+
+        let push_only = RetentionPolicyConfig {
+            rules: vec![
+                CelRule::compile("top_pushed(3)").unwrap(),
+                CelRule::compile("image.pushed_at > now() - days(30)").unwrap(),
+            ],
+        };
+        assert!(!push_only.uses_pull_time());
     }
 }

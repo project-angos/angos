@@ -8,12 +8,16 @@ use std::{fmt, sync::Arc};
 use cel_interpreter::{Context, ExecutionError, Program, Value};
 use serde::{Deserialize, de};
 
-/// A pre-compiled CEL expression.
+/// A pre-compiled CEL expression, keeping its source for configuration
+/// checks and messages.
 ///
 /// Wraps [`Program`] in an [`Arc`] so that [`CelRule`] implements [`Clone`]
 /// without requiring [`Program`] itself to be cloneable.
 #[derive(Debug, Clone)]
-pub struct CelRule(Arc<Program>);
+pub struct CelRule {
+    program: Arc<Program>,
+    pub source: Arc<str>,
+}
 
 impl CelRule {
     /// Compiles a CEL expression from source.
@@ -29,19 +33,22 @@ impl CelRule {
             return Err("CEL rule cannot be empty".to_string());
         }
         Program::compile(source)
-            .map(|program| Self(Arc::new(program)))
+            .map(|program| Self {
+                program: Arc::new(program),
+                source: source.into(),
+            })
             .map_err(|e| format!("Failed to compile CEL rule '{source}': {e}"))
     }
 
     /// Executes the compiled program against a CEL context.
     pub fn execute(&self, context: &Context) -> Result<Value, ExecutionError> {
-        self.0.execute(context)
+        self.program.execute(context)
     }
 }
 
 impl fmt::Display for CelRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<cel_rule>")
+        write!(f, "{}", self.source)
     }
 }
 

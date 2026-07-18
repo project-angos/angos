@@ -11,7 +11,7 @@ Set up automated cleanup of old container images using CEL-based retention polic
 ## Prerequisites
 
 - Angos running
-- `update_pull_time = true` if using pull-based retention
+- `update_pull_time = true` if using pull-based retention (`image.last_pulled_at`, `top_pulled`); `prune` refuses to start when such rules are configured without it, since pull times would never be recorded and actively pulled images would be deleted
 
 ## How Retention Works
 

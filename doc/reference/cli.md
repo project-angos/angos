@@ -156,7 +156,7 @@ It also performs the configuration-relative cleanup, always on:
 - **Orphan namespaces**: every namespace not owned by any configured `[repository]` loses its revisions, tags, in-flight uploads, and blob-ownership grants. The blast radius is every namespace whose owning repository is no longer in your config, so run `--dry-run` after config changes. Refused when no repositories are configured, so an emptied config can never wipe the registry.
 - **Orphan jobs**: queued replication and cache jobs whose downstream or repository is no longer configured.
 
-Prune is the config-and-time command: run it against the same configuration file the servers use.
+Prune is the config-and-time command: run it against the same configuration file the servers use. It refuses to start when a retention rule uses `image.last_pulled_at` or `top_pulled` while `update_pull_time` is disabled: pull times would never be recorded, so those rules would match nothing and actively pulled images would be deleted.
 
 **Options:**
 

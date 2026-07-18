@@ -156,6 +156,8 @@ Information about the manifest being evaluated.
 
 Rankings are per namespace and contain tag names only: an untagged image has `image.tag == null` and never matches `top_pushed` or `top_pulled`.
 
+`top_pulled` and `image.last_pulled_at` require `update_pull_time = true`; `angos prune` refuses to start otherwise, since pull times would never be recorded.
+
 ### String Functions (CEL built-in)
 
 | Function               | Description                 |
