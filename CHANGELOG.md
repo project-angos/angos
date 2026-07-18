@@ -34,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A failing required event webhook no longer skips that event's delivery to the remaining endpoints; the failure is surfaced after every matching webhook got its delivery.
 - Async event-webhook deliveries no longer accumulate one finished task handle per event for the life of the server, and their delivery-duration metric now measures the actual delivery instead of the task spawn.
+- A configuration reload now applies `query_timeout` and `query_timeout_grace_period` changes to the non-TLS listener; previously only the TLS listener picked them up without a restart.
 - Delete and reclaim decisions no longer treat a failed blob-index read as an absent index: a corrupt shard fails the transaction and a prune revision whose index read errors is skipped, instead of either green-lighting deletion.
 - A repository access policy written as `default = "deny"` with no rules now denies as configured; it was previously indistinguishable from an absent policy and silently ignored.
 - Concurrent pushes sharing a layer no longer strand a blob-index shard update as a permanent partial commit that the recovery loop logged "precondition failed" for on every sweep; shard updates are now idempotent merges that converge under contention.

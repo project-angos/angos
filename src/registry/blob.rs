@@ -11,7 +11,7 @@ use crate::{
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
         Error, Registry, Repository,
-        blob_ownership::BlobOwnership,
+        blob_ownership::{BlobOwnership, promote_and_grant},
         blob_store::{BlobStore, BoxedReader},
         metadata_store::{LinkKind, MetadataStore},
     },
@@ -134,20 +134,24 @@ pub async fn cache_blob(
             digest.algorithm(),
         )
         .await?;
-    // Promote the staged bytes and grant the reference under the blob-data lock
-    // so a concurrent delete cannot reclaim the blob in the window between the
-    // two store-local commits. This is the same coarse lock `delete_blob` holds
-    // while reclaiming, and mirrors the manifest path's bytes-then-link order.
-    metadata_store
-        .with_blob_data_lock(digest, async {
-            blob_store
-                .complete_upload(namespace, session_id.as_ref(), digest)
-                .await?;
-            BlobOwnership::new(metadata_store)
-                .grant(namespace, digest)
-                .await
-        })
-        .await?;
+    // Promotion and grant share the coarse lock `delete_blob` holds while
+    // reclaiming, mirroring the manifest path's bytes-then-link order. A racer
+    // that already promoted the bytes leaves this session behind; the
+    // best-effort delete reclaims it.
+    promote_and_grant(
+        blob_store,
+        metadata_store,
+        namespace,
+        session_id.as_ref(),
+        digest,
+    )
+    .await?;
+    if let Err(error) = blob_store
+        .delete_upload(namespace, session_id.as_ref())
+        .await
+    {
+        warn!("Failed to delete completed upload state: {error}");
+    }
 
     info!("Caching of {digest} completed");
     Ok(())
