@@ -151,8 +151,10 @@ Information about the manifest being evaluated.
 
 | Function        | Description                               |
 |-----------------|-------------------------------------------|
-| `top_pushed(k)` | True if among k most recently pushed tags |
-| `top_pulled(k)` | True if among k most recently pulled tags |
+| `top_pushed(n)` | True if among n most recently pushed tags |
+| `top_pulled(n)` | True if among n most recently pulled tags |
+
+Rankings are per namespace and contain tag names only: an untagged image has `image.tag == null` and never matches `top_pushed` or `top_pulled`.
 
 ### String Functions (CEL built-in)
 

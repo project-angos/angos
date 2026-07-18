@@ -180,6 +180,9 @@ impl RetentionPolicy {
         Ok(context)
     }
 
+    /// Builds a `top_pushed`/`top_pulled` CEL function over a tag ranking.
+    /// Untagged subjects never match: this is what lets a count-only policy
+    /// reclaim the revisions its own tag deletions orphan.
     fn build_top_fn(tag: Option<String>, list: Vec<String>) -> impl Fn(i64) -> bool + Send + Sync {
         move |count: i64| {
             let Some(ref tag) = tag else {
