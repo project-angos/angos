@@ -6,7 +6,7 @@ use crate::{
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
         Error, Registry,
-        blob_ownership::BlobOwnership,
+        blob_ownership::{BlobOwnership, promote_and_grant},
         blob_store::{hashing_reader::HashingReader, resumable_hasher::Hasher},
     },
 };
@@ -477,23 +477,14 @@ impl Registry {
             return Err(Error::DigestInvalid);
         }
 
-        self.metadata_store
-            .with_blob_data_lock(digest, async {
-                match self.blob_store.size(digest).await {
-                    Ok(_) => {}
-                    Err(Error::BlobUnknown | Error::NotFound) => {
-                        self.blob_store
-                            .complete_upload(namespace, &session_key, digest)
-                            .await?;
-                    }
-                    Err(error) => return Err(error),
-                }
-
-                BlobOwnership::new(self.metadata_store.as_ref())
-                    .grant(namespace, digest)
-                    .await
-            })
-            .await?;
+        promote_and_grant(
+            &self.blob_store,
+            self.metadata_store.as_ref(),
+            namespace,
+            &session_key,
+            digest,
+        )
+        .await?;
 
         self.finish_completed_upload(namespace, &session_key, digest)
             .await
