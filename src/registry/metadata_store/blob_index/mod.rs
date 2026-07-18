@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 
-use futures_util::stream::TryStreamExt;
+use futures_util::{Stream, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -103,14 +103,16 @@ impl MetadataStore {
             .map(|c| c.reclaim_blob)
     }
 
-    #[instrument(skip(self))]
-    pub async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
-        let refs_dir = &path_builder::blob_index_refs_dir(digest);
-
-        // Shard names stream off the listing while up to
-        // `SHARD_READ_CONCURRENCY` shard bodies are read concurrently; the
-        // merge folds each shard in without materializing the shard list.
-        let (index, found_shards) = paginated(|token| async move {
+    /// Stream each present shard under `refs_dir` as its relative filename plus
+    /// raw body: shard names page off the listing while up to
+    /// [`SHARD_READ_CONCURRENCY`] bodies read concurrently. A shard deleted
+    /// between listing and read is dropped; parsing is left to the caller so
+    /// each derives its own decode and empty-shard policy.
+    fn stream_shards<'a>(
+        &'a self,
+        refs_dir: &'a str,
+    ) -> impl Stream<Item = Result<(String, Vec<u8>), Error>> + 'a {
+        paginated(move |token| async move {
             let page = self
                 .store()
                 .object_store()
@@ -118,39 +120,38 @@ impl MetadataStore {
                 .await?;
             Ok((page.objects, page.next_token))
         })
-        .map_ok(|obj| async move {
+        .map_ok(move |obj| async move {
             let shard_path = format!("{refs_dir}/{obj}");
             match self.store().object_store().get(&shard_path).await {
-                Ok(data) => {
-                    // The shard filename was written from a validated
-                    // `Namespace`; an undecodable name is skipped.
-                    match (
-                        serde_json::from_slice::<HashSet<LinkKind>>(&data),
-                        Namespace::new(&decode_blob_index_shard_namespace(&obj)),
-                    ) {
-                        (Ok(links), Ok(namespace)) if !links.is_empty() => {
-                            Ok(Some((namespace, links)))
-                        }
-                        _ => Ok(None),
-                    }
-                }
+                Ok(data) => Ok(Some((obj, data))),
                 Err(StorageError::NotFound) => Ok(None),
                 Err(e) => Err(Error::from(e)),
             }
         })
         .try_buffer_unordered(SHARD_READ_CONCURRENCY)
-        .try_fold(
-            (BlobIndex::default(), false),
-            |(mut index, _), shard| async move {
-                if let Some((namespace, links)) = shard {
-                    index.namespace.insert(namespace, links);
-                }
-                Ok((index, true))
-            },
-        )
-        .await?;
+        .try_filter_map(|shard| async move { Ok(shard) })
+    }
 
-        if !found_shards || index.namespace.is_empty() {
+    #[instrument(skip(self))]
+    pub async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
+        let refs_dir = path_builder::blob_index_refs_dir(digest);
+        let mut index = BlobIndex::default();
+        let mut shards = pin!(self.stream_shards(&refs_dir));
+        while let Some((obj, data)) = shards.try_next().await? {
+            // The shard filename was written from a validated `Namespace`; an
+            // undecodable name or unparseable body is skipped.
+            let (Ok(links), Ok(namespace)) = (
+                serde_json::from_slice::<HashSet<LinkKind>>(&data),
+                Namespace::new(&decode_blob_index_shard_namespace(&obj)),
+            ) else {
+                continue;
+            };
+            if !links.is_empty() {
+                index.namespace.insert(namespace, links);
+            }
+        }
+
+        if index.namespace.is_empty() {
             return Err(Error::NotFound);
         }
         Ok(index)
@@ -158,35 +159,14 @@ impl MetadataStore {
 
     #[instrument(skip(self))]
     pub async fn has_blob_references(&self, digest: &Digest) -> Result<bool, Error> {
-        let refs_dir = &path_builder::blob_index_refs_dir(digest);
+        let refs_dir = path_builder::blob_index_refs_dir(digest);
 
-        // Full listing pages with concurrent shard reads, short-circuiting on
-        // the first non-empty shard; the single-shard common case stays one
-        // list plus one get.
-        let mut shard_reads = pin!(
-            paginated(|token| async move {
-                let page = self
-                    .store()
-                    .object_store()
-                    .list_children(refs_dir, 1000, token, None)
-                    .await?;
-                Ok((page.objects, page.next_token))
-            })
-            .map_ok(|obj| async move {
-                let shard_path = format!("{refs_dir}/{obj}");
-                match self.store().object_store().get(&shard_path).await {
-                    Ok(data) => {
-                        let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
-                        Ok(!links.is_empty())
-                    }
-                    Err(StorageError::NotFound) => Ok(false),
-                    Err(e) => Err(Error::from(e)),
-                }
-            })
-            .try_buffer_unordered(SHARD_READ_CONCURRENCY)
-        );
-        while let Some(non_empty) = shard_reads.try_next().await? {
-            if non_empty {
+        // Short-circuit on the first non-empty shard; the single-shard common
+        // case stays one list plus one get.
+        let mut shards = pin!(self.stream_shards(&refs_dir));
+        while let Some((_, data)) = shards.try_next().await? {
+            let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
+            if !links.is_empty() {
                 return Ok(true);
             }
         }
