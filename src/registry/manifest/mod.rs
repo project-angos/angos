@@ -184,39 +184,31 @@ impl Registry {
         is_tag_immutable: bool,
     ) -> Result<HeadManifestResponse, Error> {
         let local = self.head_local_manifest(namespace, &reference).await;
-
-        if !repository.is_pull_through() {
-            return local
-                .map(|meta| HeadManifestResponse {
-                    media_type: meta.media_type,
-                    digest: meta.digest,
-                    size: meta.size,
-                })
-                .map_err(|_| {
-                    error!("Failed to head local manifest: {namespace}:{reference}");
-                    Error::ManifestUnknown
-                });
-        }
-
-        if let Ok(meta) = local {
-            let use_local = !self
-                .needs_upstream_pull_manifest(
-                    repository,
-                    accepted_types,
-                    namespace,
-                    &reference,
-                    is_tag_immutable,
-                    &meta.digest,
-                )
-                .await?;
-
-            if use_local {
-                return Ok(HeadManifestResponse {
-                    media_type: meta.media_type,
-                    digest: meta.digest,
-                    size: meta.size,
-                });
-            }
+        let serveable = self
+            .serveable_local(
+                namespace,
+                &reference,
+                repository.is_pull_through(),
+                local,
+                async |meta| {
+                    self.needs_upstream_pull_manifest(
+                        repository,
+                        accepted_types,
+                        namespace,
+                        &reference,
+                        is_tag_immutable,
+                        &meta.digest,
+                    )
+                    .await
+                },
+            )
+            .await?;
+        if let Some(meta) = serveable {
+            return Ok(HeadManifestResponse {
+                media_type: meta.media_type,
+                digest: meta.digest,
+                size: meta.size,
+            });
         }
 
         let body = self
@@ -282,29 +274,27 @@ impl Registry {
         is_tag_immutable: bool,
     ) -> Result<ManifestBody, Error> {
         let local = self.get_local_manifest(namespace, &reference).await;
-
-        if !repository.is_pull_through() {
-            return local.map_err(|_| {
-                error!("Failed to get local manifest: {namespace}:{reference}");
-                Error::ManifestUnknown
-            });
-        }
-
-        if let Ok(manifest) = local {
-            let use_local = !self
-                .needs_upstream_pull_manifest(
-                    repository,
-                    accepted_types,
-                    namespace,
-                    &reference,
-                    is_tag_immutable,
-                    &manifest.digest,
-                )
-                .await?;
-
-            if use_local {
-                return Ok(manifest);
-            }
+        let serveable = self
+            .serveable_local(
+                namespace,
+                &reference,
+                repository.is_pull_through(),
+                local,
+                async |body| {
+                    self.needs_upstream_pull_manifest(
+                        repository,
+                        accepted_types,
+                        namespace,
+                        &reference,
+                        is_tag_immutable,
+                        &body.digest,
+                    )
+                    .await
+                },
+            )
+            .await?;
+        if let Some(manifest) = serveable {
+            return Ok(manifest);
         }
 
         let (media_type, digest, content) = repository
@@ -342,6 +332,33 @@ impl Registry {
             digest,
             content,
         })
+    }
+
+    /// The serve-local gate shared by manifest HEAD and GET: `Some(local)`
+    /// when the local manifest is served (always for a non-pull-through
+    /// repository; for pull-through when `needs_upstream` says no pull is
+    /// needed), `None` to fall through to the upstream path. A non-pull-through
+    /// repository with no local manifest is `Error::ManifestUnknown`.
+    async fn serveable_local<T>(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+        pull_through: bool,
+        local: Result<T, Error>,
+        needs_upstream: impl AsyncFnOnce(&T) -> Result<bool, Error>,
+    ) -> Result<Option<T>, Error> {
+        if !pull_through {
+            return local.map(Some).map_err(|_| {
+                error!("Failed to read local manifest: {namespace}:{reference}");
+                Error::ManifestUnknown
+            });
+        }
+        if let Ok(value) = local
+            && !needs_upstream(&value).await?
+        {
+            return Ok(Some(value));
+        }
+        Ok(None)
     }
 
     async fn needs_upstream_pull_manifest(

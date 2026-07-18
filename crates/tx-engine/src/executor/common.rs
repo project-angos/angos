@@ -243,14 +243,19 @@ async fn apply_merge_set_object(
     }
 }
 
-/// Per-key semantics for [`apply_object_store`], mirroring
-/// [`super::cas::CasApplyMode`]. `Abort` is the Locked executor's healthy path:
-/// it honors `expected` (HEAD/ETag compare) and fails closed on a precondition
-/// miss. `Reconcile` is the recovery replay path: idempotent, and it ignores
-/// `expected` because the precondition was already validated at commit time.
+/// Per-key precondition-failure semantics shared by [`apply_object_store`] and
+/// [`super::cas::apply_cas`]: the op dispatch is identical across both modes,
+/// only the handling of a failed precondition (and of an absent target)
+/// differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectApplyMode {
+pub enum ApplyMode {
+    /// Healthy-path apply: a failed precondition is a hard
+    /// `Err(Error::Precondition)` and an absent staged body or delete target
+    /// propagates as a storage error.
     Abort,
+    /// Recovery reconcile / replay-forward path: already-applied outcomes are
+    /// `Ok(())`; only true contention (a live body differing from the staged
+    /// body under CAS) is `Err(Error::PartialCommit)`.
     Reconcile,
 }
 
@@ -268,7 +273,7 @@ pub enum ObjectApplyMode {
 pub async fn apply_object_store(
     store: &dyn ObjectStore,
     mutation: &MutationRecord,
-    mode: ObjectApplyMode,
+    mode: ApplyMode,
 ) -> Result<(), Error> {
     match mutation {
         MutationRecord::Put {
@@ -276,7 +281,7 @@ pub async fn apply_object_store(
             body_ref,
             expected,
         } => {
-            if mode == ObjectApplyMode::Abort
+            if mode == ApplyMode::Abort
                 && let Some(etag) = expected
             {
                 check_expected_match(store, key, etag).await?;
@@ -287,7 +292,7 @@ pub async fn apply_object_store(
                     .await
                     .map_err(Error::Storage),
                 // Reconcile: a reaped staging body means the canonical write already landed.
-                Err(StorageError::NotFound) if mode == ObjectApplyMode::Reconcile => Ok(()),
+                Err(StorageError::NotFound) if mode == ApplyMode::Reconcile => Ok(()),
                 Err(e) => Err(Error::Storage(e)),
             }
         }
@@ -295,21 +300,21 @@ pub async fn apply_object_store(
             // Abort: the key exists, so the precondition fails. Reconcile: that is
             // the expected idempotent outcome of a replayed insert.
             Ok(_) => match mode {
-                ObjectApplyMode::Abort => Err(Error::Precondition),
-                ObjectApplyMode::Reconcile => Ok(()),
+                ApplyMode::Abort => Err(Error::Precondition),
+                ApplyMode::Reconcile => Ok(()),
             },
             Err(StorageError::NotFound) => match store.get(body_ref).await {
                 Ok(body) => store
                     .put(key, Bytes::from(body))
                     .await
                     .map_err(Error::Storage),
-                Err(StorageError::NotFound) if mode == ObjectApplyMode::Reconcile => Ok(()),
+                Err(StorageError::NotFound) if mode == ApplyMode::Reconcile => Ok(()),
                 Err(e) => Err(Error::Storage(e)),
             },
             Err(e) => Err(Error::Storage(e)),
         },
         MutationRecord::Delete { key, expected } => {
-            if mode == ObjectApplyMode::Abort
+            if mode == ApplyMode::Abort
                 && let Some(etag) = expected
             {
                 match store.head(key).await {
@@ -325,14 +330,14 @@ pub async fn apply_object_store(
             }
             match store.delete(key).await {
                 Ok(()) => Ok(()),
-                Err(StorageError::NotFound) if mode == ObjectApplyMode::Reconcile => Ok(()),
+                Err(StorageError::NotFound) if mode == ApplyMode::Reconcile => Ok(()),
                 Err(e) => Err(Error::Storage(e)),
             }
         }
         MutationRecord::Copy { src, dst } => store.copy(src, dst).await.map_err(Error::Storage),
         MutationRecord::Move { src, dst } => match mode {
-            ObjectApplyMode::Abort => store.move_object(src, dst).await.map_err(Error::Storage),
-            ObjectApplyMode::Reconcile => move_idempotent(store, src, dst)
+            ApplyMode::Abort => store.move_object(src, dst).await.map_err(Error::Storage),
+            ApplyMode::Reconcile => move_idempotent(store, src, dst)
                 .await
                 .map_err(Error::Storage),
         },

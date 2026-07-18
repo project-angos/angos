@@ -15,8 +15,8 @@ use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 use crate::{
     error::Error,
     executor::{
-        cas::{CasApplyMode, apply_cas},
-        common,
+        cas::apply_cas,
+        common::{self, ApplyMode},
     },
     intent::{INTENT_LOG_PREFIX, IntentRecord, MutationProgress},
     lock::primitive::Lock,
@@ -196,7 +196,7 @@ impl RecoveryLoop {
                     for suffix in page.items {
                         // `list` returns keys relative to the prefix; reconstruct
                         // the full key so `get`/`delete` resolve correctly.
-                        let key = format!(".tx-log/{suffix}");
+                        let key = format!("{INTENT_LOG_PREFIX}/{suffix}");
                         self.process_intent(&key).await;
                     }
                     if page.next_token.is_none() {
@@ -348,7 +348,7 @@ impl RecoveryLoop {
 
         let mutation = intent.mutations[idx].clone();
         if let Some(cs) = &self.conditional_store {
-            apply_cas(cs.as_ref(), &mutation, CasApplyMode::Reconcile)
+            apply_cas(cs.as_ref(), &mutation, ApplyMode::Reconcile)
                 .await
                 .map_err(|e| match e {
                     Error::PartialCommit => StorageError::PreconditionFailed,
@@ -359,7 +359,7 @@ impl RecoveryLoop {
             common::apply_object_store(
                 self.store.as_ref(),
                 &mutation,
-                common::ObjectApplyMode::Reconcile,
+                common::ApplyMode::Reconcile,
             )
             .await
             .map_err(|e| match e {

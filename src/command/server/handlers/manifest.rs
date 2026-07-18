@@ -19,24 +19,10 @@ use crate::{
     registry::{GetManifestResponse, OCI_SUBJECT, OCI_TAG},
 };
 
-fn head_manifest_headers(media_type: Option<&str>, digest: &Digest, size: u64) -> HeaderMap {
+fn manifest_headers(media_type: Option<&str>, digest: &Digest, size: u64) -> HeaderMap {
     let headers = ResponseHeaders::new()
         .docker_content_digest(digest)
         .content_length(size);
-    match media_type {
-        Some(media_type) => headers.content_type(media_type).into_inner(),
-        None => headers.into_inner(),
-    }
-}
-
-fn get_manifest_body_headers(
-    media_type: Option<&str>,
-    digest: &Digest,
-    content_length: u64,
-) -> HeaderMap {
-    let headers = ResponseHeaders::new()
-        .docker_content_digest(digest)
-        .content_length(content_length);
     match media_type {
         Some(media_type) => headers.content_type(media_type).into_inner(),
         None => headers.into_inner(),
@@ -103,7 +89,7 @@ pub async fn handle_head_manifest(
 
     build_response(
         StatusCode::OK,
-        head_manifest_headers(
+        manifest_headers(
             response.media_type.as_deref(),
             &response.digest,
             response.size,
@@ -152,7 +138,7 @@ pub async fn handle_get_manifest(
             content,
         } => build_response(
             StatusCode::OK,
-            get_manifest_body_headers(media_type.as_deref(), &digest, content.len() as u64),
+            manifest_headers(media_type.as_deref(), &digest, content.len() as u64),
             ResponseBody::fixed(content),
         ),
     }
@@ -269,8 +255,8 @@ mod tests {
     };
 
     use super::{
-        get_manifest_body_headers, get_manifest_redirect_headers, handle_get_manifest,
-        head_manifest_headers, put_manifest, put_manifest_headers,
+        get_manifest_redirect_headers, handle_get_manifest, manifest_headers, put_manifest,
+        put_manifest_headers,
     };
 
     const MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -283,7 +269,7 @@ mod tests {
 
     #[test]
     fn head_manifest_headers_carries_digest_length_and_media_type() {
-        let headers = head_manifest_headers(Some(MEDIA_TYPE), &sample_digest(), 42);
+        let headers = manifest_headers(Some(MEDIA_TYPE), &sample_digest(), 42);
         assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
         assert_eq!(headers[CONTENT_LENGTH.as_str()], "42");
         assert_eq!(headers[CONTENT_TYPE.as_str()], MEDIA_TYPE);
@@ -291,7 +277,7 @@ mod tests {
 
     #[test]
     fn head_manifest_headers_omits_content_type_without_media_type() {
-        let headers = head_manifest_headers(None, &sample_digest(), 7);
+        let headers = manifest_headers(None, &sample_digest(), 7);
         assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
         assert_eq!(headers[CONTENT_LENGTH.as_str()], "7");
         assert!(!headers.contains_key(CONTENT_TYPE.as_str()));
@@ -299,7 +285,7 @@ mod tests {
 
     #[test]
     fn get_manifest_body_headers_carries_digest_length_and_media_type() {
-        let headers = get_manifest_body_headers(Some(MEDIA_TYPE), &sample_digest(), 128);
+        let headers = manifest_headers(Some(MEDIA_TYPE), &sample_digest(), 128);
         assert_eq!(headers[DOCKER_CONTENT_DIGEST], sample_digest().to_string());
         assert_eq!(headers[CONTENT_LENGTH.as_str()], "128");
         assert_eq!(headers[CONTENT_TYPE.as_str()], MEDIA_TYPE);

@@ -4,7 +4,9 @@ use std::{
     path::PathBuf,
 };
 
-use serde::{Deserialize, Deserializer, de::Error};
+use serde::{Deserialize, Deserializer};
+
+use crate::configuration::deserialize_positive_nonzero;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ListenerBaseConfig {
@@ -132,14 +134,12 @@ fn deserialize_query_timeout<'de, D>(deserializer: D) -> Result<NonZeroU64, D::E
 where
     D: Deserializer<'de>,
 {
-    let value = u64::deserialize(deserializer)?;
-    NonZeroU64::new(value).ok_or_else(|| D::Error::custom("query_timeout must be > 0"))
+    deserialize_positive_nonzero::<_, u64, _>(deserializer, "query_timeout")
 }
 
 fn deserialize_query_timeout_grace_period<'de, D>(deserializer: D) -> Result<NonZeroU64, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = u64::deserialize(deserializer)?;
-    NonZeroU64::new(value).ok_or_else(|| D::Error::custom("query_timeout_grace_period must be > 0"))
+    deserialize_positive_nonzero::<_, u64, _>(deserializer, "query_timeout_grace_period")
 }

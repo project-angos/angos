@@ -1,39 +1,19 @@
 use hyper::{Response, StatusCode};
-use serde::Serialize;
 
 use crate::{
     command::server::{
-        ServerContext,
-        error::Error,
-        handlers::build_response,
-        response::{APPLICATION_JSON, HeaderMap, ResponseHeaders},
-        response_body::ResponseBody,
+        ServerContext, error::Error, handlers::json_response, response_body::ResponseBody,
     },
     jobs::{JobState, Queue},
     oci::Namespace,
 };
-
-fn json_headers() -> HeaderMap {
-    ResponseHeaders::new()
-        .content_type(APPLICATION_JSON)
-        .into_inner()
-}
-
-/// Serialize a typed admin body into a `200 OK` `application/json` response.
-fn json_response<T: Serialize>(body: &T) -> Result<Response<ResponseBody>, Error> {
-    build_response(
-        StatusCode::OK,
-        json_headers(),
-        ResponseBody::fixed(serde_json::to_vec(body)?),
-    )
-}
 
 pub async fn handle_list_repositories(
     context: &ServerContext,
 ) -> Result<Response<ResponseBody>, Error> {
     let body = context.registry.get_repositories_info().await?;
 
-    json_response(&body)
+    json_response(StatusCode::OK, &body)
 }
 
 pub async fn handle_list_namespaces(
@@ -42,7 +22,7 @@ pub async fn handle_list_namespaces(
 ) -> Result<Response<ResponseBody>, Error> {
     let body = context.registry.get_namespaces_info(repository).await?;
 
-    json_response(&body)
+    json_response(StatusCode::OK, &body)
 }
 
 pub async fn handle_list_revisions(
@@ -51,7 +31,7 @@ pub async fn handle_list_revisions(
 ) -> Result<Response<ResponseBody>, Error> {
     let body = context.registry.get_revisions_info(namespace).await?;
 
-    json_response(&body)
+    json_response(StatusCode::OK, &body)
 }
 
 pub async fn handle_list_uploads(
@@ -60,7 +40,7 @@ pub async fn handle_list_uploads(
 ) -> Result<Response<ResponseBody>, Error> {
     let body = context.registry.get_uploads_info(namespace).await?;
 
-    json_response(&body)
+    json_response(StatusCode::OK, &body)
 }
 
 pub async fn handle_list_jobs(
@@ -71,7 +51,7 @@ pub async fn handle_list_jobs(
 ) -> Result<Response<ResponseBody>, Error> {
     let body = context.registry.get_jobs_info(queue, n, after).await?;
 
-    json_response(&body)
+    json_response(StatusCode::OK, &body)
 }
 
 pub async fn handle_list_failed_jobs(
@@ -85,7 +65,7 @@ pub async fn handle_list_failed_jobs(
         .get_failed_jobs_info(queue, n, after)
         .await?;
 
-    json_response(&body)
+    json_response(StatusCode::OK, &body)
 }
 
 pub async fn handle_retry_job(

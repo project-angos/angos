@@ -31,7 +31,7 @@ use crate::{
     executor::{
         Outcome, TransactionExecutor, common,
         common::{
-            build_intent, finish, rollback, stage_bodies, stamp_applied, stamp_progress,
+            ApplyMode, build_intent, finish, rollback, stage_bodies, stamp_applied, stamp_progress,
             write_intent,
         },
     },
@@ -172,15 +172,14 @@ impl CasExecutor {
         let tx_id = intent.id;
         for idx in 0..intent.mutations.len() {
             let mutation = intent.mutations[idx].clone();
-            match apply_cas(self.store.as_ref(), &mutation, CasApplyMode::Abort).await {
+            match apply_cas(self.store.as_ref(), &mutation, ApplyMode::Abort).await {
                 Ok(()) => stamp_applied(self.store.as_ref(), intent, idx).await,
                 Err(Error::Precondition) => {
                     if intent.any_applied() {
                         // The transaction is committed (at least one slot is
                         // Applied). Apply the stale-stamp recovery heuristic:
                         // compare the live body against the staged body.
-                        match apply_cas(self.store.as_ref(), &mutation, CasApplyMode::Reconcile)
-                            .await
+                        match apply_cas(self.store.as_ref(), &mutation, ApplyMode::Reconcile).await
                         {
                             Ok(()) => {
                                 // Live body matches staged body: the
@@ -286,34 +285,13 @@ fn is_read_keyed(record: &MutationRecord, reads: &PreparedReads) -> bool {
         .any(|key| reads.etags.contains_key(key) || reads.absent.contains(key))
 }
 
-/// Per-key precondition-failure semantics for [`apply_cas`].
-///
-/// The op dispatch (`put`/`put_if_match`/`put_if_absent`/`delete`/
-/// `delete_if_match`/`copy`/`move`) is identical across both modes; only the
-/// handling of a `PreconditionFailed` (and a vanished staged body or a missing
-/// delete target) differs, which is what this mode selects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CasApplyMode {
-    /// Healthy-path apply. A `PreconditionFailed` is a hard failure
-    /// (`Err(Error::Precondition)`) and a vanished staged body or a missing
-    /// delete target propagates as a storage error.
-    Abort,
-    /// Recovery reconcile / replay-forward path. A `PreconditionFailed` on a
-    /// body write triggers a live-vs-staged hash compare (match means already
-    /// applied `Ok(())`; mismatch means `Err(Error::PartialCommit)`); a
-    /// `PreconditionFailed` on `put_if_absent`/`delete_if_match`, a vanished
-    /// staged body, and a missing delete target are all treated as
-    /// already-applied `Ok(())`.
-    Reconcile,
-}
-
 /// Apply a single mutation using conditional storage operations.
 ///
 /// The op dispatch is shared by the CAS executor's healthy apply path
-/// ([`CasApplyMode::Abort`]) and by both the CAS executor's partial-commit
-/// handler and the `RecoveryLoop`'s replay path ([`CasApplyMode::Reconcile`]);
+/// ([`ApplyMode::Abort`]) and by both the CAS executor's partial-commit
+/// handler and the `RecoveryLoop`'s replay path ([`ApplyMode::Reconcile`]);
 /// `mode` selects the per-key precondition-failure semantics (see
-/// [`CasApplyMode`]).
+/// [`ApplyMode`]).
 ///
 /// In `Reconcile` mode, on a `PreconditionFailed` for a conditional `Put` the
 /// live body's SHA-256 hash is compared against the staged body. A match means
@@ -332,7 +310,7 @@ pub enum CasApplyMode {
 pub async fn apply_cas(
     store: &dyn ConditionalStore,
     mutation: &MutationRecord,
-    mode: CasApplyMode,
+    mode: ApplyMode,
 ) -> Result<(), Error> {
     match mutation {
         MutationRecord::Put {
@@ -350,8 +328,8 @@ pub async fn apply_cas(
             match store.put_if_match(key, etag, body_bytes.clone()).await {
                 Ok(_) => Ok(()),
                 Err(StorageError::PreconditionFailed) => match mode {
-                    CasApplyMode::Abort => Err(Error::Precondition),
-                    CasApplyMode::Reconcile => {
+                    ApplyMode::Abort => Err(Error::Precondition),
+                    ApplyMode::Reconcile => {
                         if live_body_matches(store, key, &body_bytes).await? {
                             Ok(())
                         } else {
@@ -369,8 +347,8 @@ pub async fn apply_cas(
             match store.put_if_absent(key, body_bytes).await {
                 Ok(_) => Ok(()),
                 Err(StorageError::PreconditionFailed) => match mode {
-                    CasApplyMode::Abort => Err(Error::Precondition),
-                    CasApplyMode::Reconcile => Ok(()),
+                    ApplyMode::Abort => Err(Error::Precondition),
+                    ApplyMode::Reconcile => Ok(()),
                 },
                 Err(e) => Err(Error::Storage(e)),
             }
@@ -379,14 +357,14 @@ pub async fn apply_cas(
             Some(etag) => match store.delete_if_match(key, etag).await {
                 Ok(()) => Ok(()),
                 Err(StorageError::PreconditionFailed) => match mode {
-                    CasApplyMode::Abort => Err(Error::Precondition),
-                    CasApplyMode::Reconcile => Ok(()),
+                    ApplyMode::Abort => Err(Error::Precondition),
+                    ApplyMode::Reconcile => Ok(()),
                 },
                 Err(e) => Err(Error::Storage(e)),
             },
             None => match store.delete(key).await {
                 Ok(()) => Ok(()),
-                Err(StorageError::NotFound) if mode == CasApplyMode::Reconcile => Ok(()),
+                Err(StorageError::NotFound) if mode == ApplyMode::Reconcile => Ok(()),
                 Err(e) => Err(Error::Storage(e)),
             },
         },
@@ -395,11 +373,11 @@ pub async fn apply_cas(
             Ok(())
         }
         MutationRecord::Move { src, dst } => match mode {
-            CasApplyMode::Abort => {
+            ApplyMode::Abort => {
                 store.move_object(src, dst).await.map_err(Error::Storage)?;
                 Ok(())
             }
-            CasApplyMode::Reconcile => common::move_idempotent(store, src, dst)
+            ApplyMode::Reconcile => common::move_idempotent(store, src, dst)
                 .await
                 .map_err(Error::Storage),
         },
@@ -466,9 +444,9 @@ async fn apply_merge_set_cas(
 /// Fetch the staged body for a `Put`/`PutIfAbsent`.
 ///
 /// Returns `Ok(Some(bytes))` with the staged body, or `Ok(None)` when the body
-/// is gone and the mutation should be skipped (only in [`CasApplyMode::Reconcile`],
+/// is gone and the mutation should be skipped (only in [`ApplyMode::Reconcile`],
 /// where a vanished staged body means the canonical write already landed and the
-/// prefix was reaped). In [`CasApplyMode::Abort`] a missing body propagates as a
+/// prefix was reaped). In [`ApplyMode::Abort`] a missing body propagates as a
 /// storage error.
 ///
 /// # Errors
@@ -478,11 +456,11 @@ async fn apply_merge_set_cas(
 async fn stage_body(
     store: &dyn ConditionalStore,
     body_ref: &str,
-    mode: CasApplyMode,
+    mode: ApplyMode,
 ) -> Result<Option<Bytes>, Error> {
     match store.get(body_ref).await {
         Ok(body) => Ok(Some(Bytes::from(body))),
-        Err(StorageError::NotFound) if mode == CasApplyMode::Reconcile => Ok(None),
+        Err(StorageError::NotFound) if mode == ApplyMode::Reconcile => Ok(None),
         Err(e) => Err(Error::Storage(e)),
     }
 }

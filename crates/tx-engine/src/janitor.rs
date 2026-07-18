@@ -362,7 +362,7 @@ impl LockJanitor {
                 Ok(page) => {
                     stream::iter(&page.items)
                         .for_each_concurrent(SWEEP_CONCURRENCY, |suffix| async move {
-                            let key = format!(".tx-locks/{suffix}");
+                            let key = format!("{LOCK_OBJECTS_PREFIX}/{suffix}");
                             self.process_key(&key).await;
                         })
                         .await;

@@ -28,7 +28,7 @@ use crate::{
     executor::{
         Outcome, TransactionExecutor,
         common::{
-            ObjectApplyMode, apply_object_store, build_intent, finish, stage_bodies, stamp_applied,
+            ApplyMode, apply_object_store, build_intent, finish, stage_bodies, stamp_applied,
             write_intent,
         },
     },
@@ -105,7 +105,7 @@ impl LockedExecutor {
     /// is honored via a HEAD/ETag compare under the lock, mirroring the CAS
     /// executor's `put_if_match` / `delete_if_match` semantics.
     async fn apply_mutation(&self, mutation: &MutationRecord) -> Result<(), Error> {
-        apply_object_store(self.store.as_ref(), mutation, ObjectApplyMode::Abort).await
+        apply_object_store(self.store.as_ref(), mutation, ApplyMode::Abort).await
     }
 
     /// Verify read fingerprints after acquiring the lock.

@@ -1,8 +1,13 @@
 use std::collections::HashMap;
 
 use hyper::{Response, StatusCode};
+use serde::Serialize;
 
-use crate::command::server::{error::Error, response_body::ResponseBody};
+use crate::command::server::{
+    error::Error,
+    response::{APPLICATION_JSON, ResponseHeaders},
+    response_body::ResponseBody,
+};
 
 pub mod blob;
 pub mod content_discovery;
@@ -21,4 +26,18 @@ pub fn build_response(
         builder = builder.header(name, value);
     }
     Ok(builder.body(body)?)
+}
+
+/// Serialize `body` into an `application/json` response with `status`.
+pub fn json_response<T: Serialize>(
+    status: StatusCode,
+    body: &T,
+) -> Result<Response<ResponseBody>, Error> {
+    build_response(
+        status,
+        ResponseHeaders::new()
+            .content_type(APPLICATION_JSON)
+            .into_inner(),
+        ResponseBody::fixed(serde_json::to_vec(body)?),
+    )
 }

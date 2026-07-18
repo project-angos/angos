@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic)]
 
-use std::{process::exit, sync::Arc, time::Duration};
+use std::{fmt::Display, process::exit, sync::Arc, time::Duration};
 
 use argh::FromArgs;
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
@@ -162,61 +162,23 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
     };
 
     let exit_code = match cli_args.subcommand {
-        SubCommand::Argon(_) => match argon::run() {
-            Ok(()) => 0,
-            Err(err) => {
-                error!("Argon error: {}", err);
-                1
-            }
-        },
+        SubCommand::Argon(_) => report("Argon", argon::run()),
         SubCommand::Migrate(migrate_options) => {
-            match migrate::run(&migrate_options, &config).await {
-                Ok(()) => 0,
-                Err(err) => {
-                    error!("Migrate error: {err}");
-                    1
-                }
-            }
+            report("Migrate", migrate::run(&migrate_options, &config).await)
         }
-        SubCommand::Prune(prune_options) => match prune::run(&prune_options, &config).await {
-            Ok(()) => 0,
-            Err(err) => {
-                error!("Prune error: {err}");
-                1
-            }
-        },
-        SubCommand::Replicate(replicate_options) => {
-            match replicate::run(&replicate_options, &config).await {
-                Ok(()) => 0,
-                Err(err) => {
-                    error!("Replicate error: {err}");
-                    1
-                }
-            }
+        SubCommand::Prune(prune_options) => {
+            report("Prune", prune::run(&prune_options, &config).await)
         }
-        SubCommand::Scrub(scrub_options) => match run_scrub(scrub_options, config).await {
-            Ok(()) => 0,
-            Err(err) => {
-                error!("Scrub error: {err}");
-                1
-            }
-        },
-        SubCommand::Serve(_) => match run_server(cli_args, config).await {
-            Ok(()) => 0,
-            Err(err) => {
-                error!("Server error: {err}");
-                1
-            }
-        },
-        SubCommand::Worker(worker_options) => {
-            match run_worker(&cli_args.config, worker_options, config).await {
-                Ok(()) => 0,
-                Err(err) => {
-                    error!("Worker error: {err}");
-                    1
-                }
-            }
-        }
+        SubCommand::Replicate(replicate_options) => report(
+            "Replicate",
+            replicate::run(&replicate_options, &config).await,
+        ),
+        SubCommand::Scrub(scrub_options) => report("Scrub", run_scrub(scrub_options, config).await),
+        SubCommand::Serve(_) => report("Server", run_server(cli_args, config).await),
+        SubCommand::Worker(worker_options) => report(
+            "Worker",
+            run_worker(&cli_args.config, worker_options, config).await,
+        ),
     };
 
     if let Some(provider) = tracer_provider
@@ -227,6 +189,17 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
 
     if exit_code != 0 {
         exit(exit_code);
+    }
+}
+
+/// Log a failed subcommand under `label` and map the result to an exit code.
+fn report(label: &str, result: Result<(), impl Display>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            error!("{label} error: {err}");
+            1
+        }
     }
 }
 

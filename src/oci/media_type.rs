@@ -31,8 +31,13 @@ static MEDIA_TYPE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 pub struct MediaType(String);
 
 impl MediaType {
+    /// The single validation predicate shared by every constructor.
+    fn is_valid(s: &str) -> bool {
+        MEDIA_TYPE_REGEX.is_match(s)
+    }
+
     pub fn new(s: &str) -> Result<Self, Error> {
-        if MEDIA_TYPE_REGEX.is_match(s) {
+        if Self::is_valid(s) {
             Ok(Self(s.to_owned()))
         } else {
             Err(Error::InvalidMediaType(s.to_string()))
@@ -52,7 +57,7 @@ impl TryFrom<String> for MediaType {
     type Error = Error;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        if MEDIA_TYPE_REGEX.is_match(&s) {
+        if Self::is_valid(&s) {
             Ok(Self(s))
         } else {
             Err(Error::InvalidMediaType(s))

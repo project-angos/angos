@@ -1,9 +1,10 @@
 use std::num::NonZeroUsize;
 
 use bytesize::ByteSize;
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer};
 
 use crate::{
+    configuration::deserialize_positive_nonzero,
     configuration::{RegexPattern, TrustedProxy},
     jobs::store::JobQueueConfig,
     policy::{AccessPolicyConfig, RetentionPolicyConfig},
@@ -89,22 +90,11 @@ fn default_max_concurrent_cache_jobs() -> NonZeroUsize {
     DEFAULT_MAX_CONCURRENT_CACHE_JOBS
 }
 
-fn deserialize_positive_nonzero<'de, D>(
-    deserializer: D,
-    field: &str,
-) -> Result<NonZeroUsize, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = usize::deserialize(deserializer)?;
-    NonZeroUsize::new(value).ok_or_else(|| D::Error::custom(format!("{field} must be > 0")))
-}
-
 fn deserialize_max_concurrent_cache_jobs<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_positive_nonzero(deserializer, "max_concurrent_cache_jobs")
+    deserialize_positive_nonzero::<_, usize, _>(deserializer, "max_concurrent_cache_jobs")
 }
 
 fn default_max_concurrent_replication_jobs() -> NonZeroUsize {
@@ -117,7 +107,7 @@ fn deserialize_max_concurrent_replication_jobs<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    deserialize_positive_nonzero(deserializer, "max_concurrent_replication_jobs")
+    deserialize_positive_nonzero::<_, usize, _>(deserializer, "max_concurrent_replication_jobs")
 }
 
 fn default_max_manifest_size() -> ByteSize {
