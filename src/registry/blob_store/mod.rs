@@ -23,7 +23,7 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::stream::{self, Stream, StreamExt};
+use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::io::AsyncRead;
 use tracing::instrument;
 
@@ -43,6 +43,9 @@ use crate::{
 };
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
+
+/// Fan-out for the per-shard page chains behind [`BlobStore::stream_blobs`].
+const BLOB_LIST_CONCURRENCY: usize = 32;
 
 /// Summary of an in-progress or completed upload session.
 #[derive(Debug, Clone)]
@@ -94,28 +97,57 @@ impl BlobStore {
 // blob CRUD (formerly `impl BlobStore`)
 
 impl BlobStore {
-    /// Streams every stored blob digest lazily: the per-algorithm shards
-    /// (`blobs/<algo>/<shard>/<hash>/data`, each blob the `/data` key under
-    /// its container) are chained in algorithm order, at most one listing
-    /// page buffered.
+    /// Streams every stored blob digest, unordered. Blobs live at
+    /// `blobs/<algo>/<shard>/<hash>/data` with the shard the hash's first two
+    /// hex digits, so hashes distribute uniformly over the shard directories:
+    /// each algorithm's existing shards are discovered with one children
+    /// listing, then walked as up to [`BLOB_LIST_CONCURRENCY`] concurrent
+    /// page chains instead of one serial continuation-token chain.
     pub fn stream_blobs(&self) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
         stream::iter(Algorithm::supported_algorithms()).flat_map(move |algorithm| {
-            let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
-            paginated(move |token| {
-                let blob_prefix = blob_prefix.clone();
-                async move {
-                    let page = self.object.list(&blob_prefix, 1000, token).await?;
-                    let blobs = page
-                        .items
-                        .into_iter()
-                        .filter_map(|key| {
-                            let hash = key.strip_suffix("/data")?.rsplit_once('/')?.1;
-                            Digest::with_algorithm(*algorithm, hash).ok()
-                        })
-                        .collect();
-                    Ok((blobs, page.next_token))
-                }
+            stream::once(async move {
+                let root = &format!("{}/{algorithm}/", path_builder::blobs_root_dir());
+                paginated(|token| async move {
+                    let page = self.object.list_children(root, 1000, token, None).await?;
+                    Ok::<_, Error>((page.sub_prefixes, page.next_token))
+                })
+                .try_collect::<Vec<String>>()
+                .await
             })
+            .map_ok(move |shards| {
+                stream::iter(
+                    shards
+                        .into_iter()
+                        .map(move |shard| Box::pin(self.shard_blobs(*algorithm, shard))),
+                )
+                .flatten_unordered(BLOB_LIST_CONCURRENCY)
+            })
+            .try_flatten()
+        })
+    }
+
+    /// One shard directory's blobs (each the `<hash>/data` key under the
+    /// shard prefix), one listing page at a time.
+    fn shard_blobs(
+        &self,
+        algorithm: Algorithm,
+        shard: String,
+    ) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
+        let prefix = format!("{}/{algorithm}/{shard}/", path_builder::blobs_root_dir());
+        paginated(move |token| {
+            let prefix = prefix.clone();
+            async move {
+                let page = self.object.list(&prefix, 1000, token).await?;
+                let blobs = page
+                    .items
+                    .into_iter()
+                    .filter_map(|key| {
+                        let hash = key.strip_suffix("/data")?;
+                        Digest::with_algorithm(algorithm, hash).ok()
+                    })
+                    .collect();
+                Ok((blobs, page.next_token))
+            }
         })
     }
 
