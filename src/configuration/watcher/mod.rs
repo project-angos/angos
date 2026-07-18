@@ -191,14 +191,43 @@ fn build_watcher(
     Ok(watcher)
 }
 
+/// A watched path in both forms: `raw` is the operator-supplied path handed to
+/// `notify` and used for loading and logging; `canonical` is matched against the
+/// canonicalized paths `notify` reports on its events.
+struct WatchedPath {
+    raw: PathBuf,
+    canonical: PathBuf,
+}
+
+impl WatchedPath {
+    fn new(raw: PathBuf) -> Self {
+        let canonical = fs::canonicalize(&raw).unwrap_or_else(|_| raw.clone());
+        Self { raw, canonical }
+    }
+}
+
+/// The watched TLS directories in both forms; rebuilt each loop iteration from
+/// the freshly loaded configuration. See [`WatchedPath`].
+struct WatchedDirs {
+    raw: HashSet<PathBuf>,
+    canonical: HashSet<PathBuf>,
+}
+
+impl WatchedDirs {
+    fn new(raw: HashSet<PathBuf>) -> Self {
+        let canonical = raw
+            .iter()
+            .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+            .collect();
+        Self { raw, canonical }
+    }
+}
+
 struct WatchState<'a> {
     rx: &'a mut mpsc::Receiver<Event>,
-    config_path: &'a Path,
-    config_dir: &'a Path,
-    canonical_config_path: &'a Path,
-    canonical_config_dir: &'a Path,
-    tls_dirs: HashSet<PathBuf>,
-    canonical_tls_dirs: HashSet<PathBuf>,
+    config_path: &'a WatchedPath,
+    config_dir: &'a WatchedPath,
+    tls_dirs: WatchedDirs,
     cached_config: &'a mut Option<Configuration>,
     notifier: &'a dyn ConfigNotifier,
     _watcher: notify::RecommendedWatcher,
@@ -213,9 +242,9 @@ async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
 
         let initial_kind = classify_event(
             &event,
-            state.canonical_config_path,
-            state.canonical_config_dir,
-            &state.canonical_tls_dirs,
+            &state.config_path.canonical,
+            &state.config_dir.canonical,
+            &state.tls_dirs.canonical,
         );
         if matches!(initial_kind, ChangeKind::Irrelevant) {
             continue;
@@ -224,9 +253,9 @@ async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
         let Some(kind) = coalesce_events(
             state.rx,
             initial_kind,
-            state.canonical_config_path,
-            state.canonical_config_dir,
-            &state.canonical_tls_dirs,
+            &state.config_path.canonical,
+            &state.config_dir.canonical,
+            &state.tls_dirs.canonical,
         )
         .await
         else {
@@ -238,10 +267,10 @@ async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
             ChangeKind::Irrelevant => {}
             ChangeKind::Config => {
                 if reload_config(
-                    state.config_path,
-                    state.config_dir,
+                    &state.config_path.raw,
+                    &state.config_dir.raw,
                     state.cached_config,
-                    &state.tls_dirs,
+                    &state.tls_dirs.raw,
                     state.notifier,
                 )
                 .await
@@ -250,7 +279,7 @@ async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
                 }
             }
             ChangeKind::Tls => {
-                reload_tls(state.cached_config, state.config_path, state.notifier);
+                reload_tls(state.cached_config, &state.config_path.raw, state.notifier);
             }
         }
     }
@@ -291,28 +320,21 @@ async fn watch_config_loop(
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let canonical_config_path =
-        fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
-    let canonical_config_dir = fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone());
-    let mut cached_config = load_initial_config(&config_path);
+    let config_path = WatchedPath::new(config_path);
+    let config_dir = WatchedPath::new(config_dir);
+    let mut cached_config = load_initial_config(&config_path.raw);
     loop {
         let tls_dirs = cached_config
             .as_ref()
-            .map(|cfg| compute_tls_dirs(cfg, &config_dir))
+            .map(|cfg| compute_tls_dirs(cfg, &config_dir.raw))
             .unwrap_or_default();
-        let canonical_tls_dirs: HashSet<PathBuf> = tls_dirs
-            .iter()
-            .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
-            .collect();
-        let watcher = build_watcher(&config_dir, &tls_dirs, tx.clone())?;
+        let tls_dirs = WatchedDirs::new(tls_dirs);
+        let watcher = build_watcher(&config_dir.raw, &tls_dirs.raw, tx.clone())?;
         let mut state = WatchState {
             rx: &mut rx,
             config_path: &config_path,
             config_dir: &config_dir,
-            canonical_config_path: &canonical_config_path,
-            canonical_config_dir: &canonical_config_dir,
             tls_dirs,
-            canonical_tls_dirs,
             cached_config: &mut cached_config,
             notifier: notifier.as_ref(),
             _watcher: watcher,

@@ -249,13 +249,15 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
 
     let response = registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Digest(digest.clone()),
-            media_type.clone(),
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Digest(digest.clone()),
+                mime_type: media_type.clone(),
+                tags: vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()],
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content.clone()),
-            vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()],
         )
         .await
         .expect("by-digest push with tag params must succeed");
@@ -304,13 +306,15 @@ async fn accept_put_manifest_by_tag_ignores_tag_params() {
 
     let response = registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("v1").unwrap()),
-            media_type.clone(),
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("v1").unwrap()),
+                mime_type: media_type.clone(),
+                tags: vec![Tag::new("ignored").unwrap()],
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content.clone()),
-            vec![Tag::new("ignored").unwrap()],
         )
         .await
         .expect("by-tag push must succeed");
@@ -512,13 +516,15 @@ async fn accept_put_manifest_honors_reference_validation_flag() {
     );
     permissive
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            media_type.clone(),
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type: media_type.clone(),
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content.clone()),
-            Vec::new(),
         )
         .await
         .expect("permissive registry must accept a missing child manifest reference");
@@ -529,13 +535,15 @@ async fn accept_put_manifest_honors_reference_validation_flag() {
         create_test_registry_with(strict_case.blob_store(), strict_case.metadata_store(), true);
     let Err(err) = strict
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
     else {
@@ -574,13 +582,15 @@ async fn permissive_push_does_not_grant_read_of_unowned_referenced_blob() {
     );
     permissive
         .accept_put_manifest(
-            None,
-            None,
-            &attacker,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace: &attacker,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("permissive registry accepts a push referencing unowned blobs");
@@ -632,13 +642,15 @@ async fn permissive_push_does_not_grant_read_of_unowned_child_manifest() {
     let (content, media_type) = index_manifest_with_child(&child_digest);
     permissive
         .accept_put_manifest(
-            None,
-            None,
-            &attacker,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace: &attacker,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("permissive registry accepts an index referencing an unowned child manifest");
@@ -698,13 +710,15 @@ async fn permissive_push_of_owned_references_yields_a_pullable_manifest() {
     );
     permissive
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("permissive registry accepts a push referencing owned blobs");
@@ -1252,13 +1266,15 @@ async fn accept_put_manifest_rejects_body_above_limit() {
 
     let err = registry
         .accept_put_manifest(
-            None,
-            None,
-            namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap(),
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type: MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap(),
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(body),
-            Vec::new(),
         )
         .await
         .err()
@@ -1409,13 +1425,15 @@ async fn test_handle_put_manifest() {
         let manifest_stream = Cursor::new(content.clone());
         let response = registry
             .accept_put_manifest(
-                None,
-                None,
-                namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type.clone(),
+                PutManifestRequest {
+                    namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type.clone(),
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 manifest_stream,
-                Vec::new(),
             )
             .await
             .expect("put manifest failed");
@@ -1987,13 +2005,15 @@ async fn seed_tag(registry: &Registry, namespace: &Namespace, tag: &str) -> (Vec
     let (content, media_type) = create_test_manifest(registry, namespace).await;
     registry
         .accept_put_manifest(
-            None,
-            None,
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type.clone(),
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type.clone(),
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content.clone()),
-            Vec::new(),
         )
         .await
         .expect("seed tag push");
@@ -2027,13 +2047,15 @@ async fn accept_put_manifest_stamps_created_at_from_source_ts() {
 
     registry
         .accept_put_manifest(
-            None,
-            Some(source_ts),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(source_ts),
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("replicated push must store");
@@ -2056,13 +2078,15 @@ async fn accept_put_manifest_without_source_ts_stamps_local_clock() {
     let (content, media_type) = create_test_manifest(registry, namespace).await;
     registry
         .accept_put_manifest(
-            None,
-            None,
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("client push must store");
@@ -2086,13 +2110,15 @@ async fn accept_put_manifest_rejects_lww_older_source_ts() {
 
     let result = registry
         .accept_put_manifest(
-            None,
-            Some(older),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(older),
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .err();
@@ -2116,13 +2142,15 @@ async fn accept_put_manifest_accepts_lww_newer_source_ts() {
 
     registry
         .accept_put_manifest(
-            None,
-            Some(newer),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(newer),
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("newer source_ts must win over the older local tag");
@@ -2142,13 +2170,15 @@ async fn accept_put_manifest_accepts_lww_equal_source_ts() {
 
     registry
         .accept_put_manifest(
-            None,
-            Some(created_at),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(created_at),
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("equal source_ts must converge (not be superseded)");
@@ -2196,26 +2226,30 @@ async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
 
     registry
         .accept_put_manifest(
-            None,
-            Some(ts),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            larger_mt,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: larger_mt,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(ts),
+            },
             Cursor::new(larger),
-            Vec::new(),
         )
         .await
         .expect("seed the larger-digest manifest");
 
     let result = registry
         .accept_put_manifest(
-            None,
-            Some(ts),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            smaller_mt,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: smaller_mt,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(ts),
+            },
             Cursor::new(smaller),
-            Vec::new(),
         )
         .await
         .err();
@@ -2239,26 +2273,30 @@ async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
 
     registry
         .accept_put_manifest(
-            None,
-            Some(ts),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            smaller_mt,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: smaller_mt,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(ts),
+            },
             Cursor::new(smaller),
-            Vec::new(),
         )
         .await
         .expect("seed the smaller-digest manifest");
 
     registry
         .accept_put_manifest(
-            None,
-            Some(ts),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            larger_mt,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: larger_mt,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(ts),
+            },
             Cursor::new(larger),
-            Vec::new(),
         )
         .await
         .expect("an equal-timestamp write with a larger digest must win");
@@ -2314,13 +2352,15 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
     let incoming = created_at + chrono::Duration::seconds(60);
     let result = registry
         .accept_put_manifest(
-            None,
-            Some(incoming),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(incoming),
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .err();
@@ -2539,13 +2579,15 @@ async fn accept_put_manifest_accepts_lww_when_local_absent() {
 
     registry
         .accept_put_manifest(
-            None,
-            Some(very_old),
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(very_old),
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("absent local tag must accept any source_ts");
@@ -2562,13 +2604,15 @@ async fn accept_put_manifest_without_source_ts_skips_lww() {
 
     registry
         .accept_put_manifest(
-            None,
-            None,
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("client write (no source_ts) must skip LWW");
@@ -2586,13 +2630,15 @@ async fn accept_put_manifest_digest_reference_skips_lww() {
 
     registry
         .accept_put_manifest(
-            None,
-            Some(very_old),
-            namespace,
-            Reference::Digest(digest),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Digest(digest),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: Some(very_old),
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("digest reference must skip LWW");
@@ -2726,13 +2772,15 @@ async fn same_digest_re_push_preserves_created_at() {
 
     registry
         .accept_put_manifest(
-            None,
-            None,
-            namespace,
-            Reference::Tag(Tag::new(tag).unwrap()),
-            media_type,
+            PutManifestRequest {
+                namespace,
+                reference: Reference::Tag(Tag::new(tag).unwrap()),
+                mime_type: media_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(content),
-            Vec::new(),
         )
         .await
         .expect("idempotent re-push of the same digest");
@@ -2955,7 +3003,7 @@ mod noop_suppression_tests {
         jobs::{Queue, store::JobStore},
         oci::{Digest, MediaType, Namespace, Reference, Tag},
         registry::{
-            Registry, RegistryConfig,
+            PutManifestRequest, Registry, RegistryConfig,
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{
                 FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,
@@ -3047,13 +3095,15 @@ mod noop_suppression_tests {
 
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type.clone(),
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type.clone(),
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content_a.clone()),
-                Vec::new(),
             )
             .await
             .expect("first tag push");
@@ -3072,13 +3122,15 @@ mod noop_suppression_tests {
         // cycles without origin tracking.
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type.clone(),
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type.clone(),
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content_a.clone()),
-                Vec::new(),
             )
             .await
             .expect("re-assert same tag->digest");
@@ -3091,13 +3143,15 @@ mod noop_suppression_tests {
         let (content_b, media_type_b) = create_second_manifest(&registry, &namespace).await;
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type_b,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type_b,
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content_b),
-                Vec::new(),
             )
             .await
             .expect("move tag to a new digest");
@@ -3120,13 +3174,15 @@ mod noop_suppression_tests {
 
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Digest(digest.clone()),
-                media_type.clone(),
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Digest(digest.clone()),
+                    mime_type: media_type.clone(),
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content.clone()),
-                Vec::new(),
             )
             .await
             .expect("first digest push");
@@ -3144,13 +3200,15 @@ mod noop_suppression_tests {
         // staying 0 proves the gate, not the dedup index, suppressed the replay.
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Digest(digest),
-                media_type,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Digest(digest),
+                    mime_type: media_type,
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content),
-                Vec::new(),
             )
             .await
             .expect("re-push same revision");
@@ -3176,13 +3234,15 @@ mod noop_suppression_tests {
 
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Digest(digest.clone()),
-                media_type.clone(),
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Digest(digest.clone()),
+                    mime_type: media_type.clone(),
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content.clone()),
-                Vec::new(),
             )
             .await
             .expect("first digest push");
@@ -3201,13 +3261,15 @@ mod noop_suppression_tests {
         // the unchanged digest push once alongside the changed tag, so two jobs land.
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Digest(digest.clone()),
-                media_type.clone(),
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Digest(digest.clone()),
+                    mime_type: media_type.clone(),
+                    tags: vec![Tag::new(tag).unwrap()],
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content.clone()),
-                vec![Tag::new(tag).unwrap()],
             )
             .await
             .expect("re-push present digest with a new tag");
@@ -3226,13 +3288,15 @@ mod noop_suppression_tests {
         // Both the digest and the tag are now present, so nothing changed.
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Digest(digest),
-                media_type,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Digest(digest),
+                    mime_type: media_type,
+                    tags: vec![Tag::new(tag).unwrap()],
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content),
-                vec![Tag::new(tag).unwrap()],
             )
             .await
             .expect("re-push present digest with the same present tag");
@@ -3252,13 +3316,15 @@ mod noop_suppression_tests {
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type,
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content),
-                Vec::new(),
             )
             .await
             .expect("seed tag push");
@@ -3308,13 +3374,15 @@ mod noop_suppression_tests {
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type.clone(),
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type.clone(),
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content.clone()),
-                Vec::new(),
             )
             .await
             .expect("seed tag push");
@@ -3339,13 +3407,15 @@ mod noop_suppression_tests {
 
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type,
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content),
-                Vec::new(),
             )
             .await
             .expect("re-push tag");
@@ -3387,13 +3457,15 @@ mod noop_suppression_tests {
         let push_ts = Utc::now() - Duration::hours(2);
         registry
             .accept_put_manifest(
-                None,
-                Some(push_ts),
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type,
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: Some(push_ts),
+                },
                 Cursor::new(content),
-                Vec::new(),
             )
             .await
             .expect("seed replicated tag push");
@@ -3431,13 +3503,15 @@ mod noop_suppression_tests {
         let digest = Digest::sha256_of_bytes(&content);
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new("latest").unwrap()),
-                media_type,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new("latest").unwrap()),
+                    mime_type: media_type,
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content),
-                Vec::new(),
             )
             .await
             .expect("seed tag push");
@@ -3476,13 +3550,15 @@ mod noop_suppression_tests {
         let digest = Digest::sha256_of_bytes(&content);
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new("latest").unwrap()),
-                media_type,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new("latest").unwrap()),
+                    mime_type: media_type,
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content),
-                Vec::new(),
             )
             .await
             .expect("seed tag push");
@@ -3524,13 +3600,15 @@ mod noop_suppression_tests {
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type.clone(),
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type.clone(),
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content.clone()),
-                Vec::new(),
             )
             .await
             .expect("seed tag push");
@@ -3538,13 +3616,15 @@ mod noop_suppression_tests {
 
         registry
             .accept_put_manifest(
-                None,
-                None,
-                &namespace,
-                Reference::Tag(Tag::new(tag).unwrap()),
-                media_type,
+                PutManifestRequest {
+                    namespace: &namespace,
+                    reference: Reference::Tag(Tag::new(tag).unwrap()),
+                    mime_type: media_type,
+                    tags: Vec::new(),
+                    actor: None,
+                    source_ts: None,
+                },
                 Cursor::new(content),
-                Vec::new(),
             )
             .await
             .expect("re-assert same tag->digest");

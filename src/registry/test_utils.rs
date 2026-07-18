@@ -15,7 +15,7 @@ use crate::{
     oci::{Digest, MediaType, Namespace, Tag, UploadSessionId},
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        Error, Registry, RegistryConfig, Repository,
+        CompleteUploadRequest, Error, Registry, RegistryConfig, Repository,
         blob::{BlobRange, GetBlobResponse},
         blob_store,
         blob_store::{BlobStore, BlobStoreConfig},
@@ -214,12 +214,14 @@ pub async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[
     let digest = Digest::sha256_of_bytes(&body);
     registry
         .complete_upload(
-            None,
-            namespace,
-            &session_id,
-            &digest,
-            None,
-            Some(body.len() as u64),
+            CompleteUploadRequest {
+                actor: None,
+                namespace,
+                session_id: &session_id,
+                digest: &digest,
+                start_offset: None,
+                content_length: Some(body.len() as u64),
+            },
             Cursor::new(body),
         )
         .await

@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 
-use hyper::{Response, StatusCode};
+use hyper::{Response, StatusCode, body::Incoming, http::request::Parts};
 use serde::Serialize;
 
-use crate::command::server::{
-    error::Error,
-    response::{APPLICATION_JSON, ResponseHeaders},
-    response_body::ResponseBody,
+use crate::{
+    command::server::{
+        ServerContext,
+        error::Error,
+        response::{APPLICATION_JSON, ResponseHeaders},
+        response_body::ResponseBody,
+    },
+    identity::ClientIdentity,
 };
 
 pub mod blob;
@@ -15,6 +19,16 @@ pub mod ext;
 pub mod manifest;
 pub mod upload;
 pub mod version;
+
+/// The shared environment for a body-carrying `PUT` handler: the server
+/// context, the parsed request head, the streaming body, and the authenticated
+/// identity. Built by the dispatcher and consumed once, since the body moves.
+pub struct PutRequest<'a> {
+    pub context: &'a ServerContext,
+    pub parts: &'a Parts,
+    pub incoming: Incoming,
+    pub identity: &'a ClientIdentity,
+}
 
 pub fn build_response(
     status: StatusCode,

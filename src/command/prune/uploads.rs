@@ -142,8 +142,15 @@ pub async fn sweep_byteless_shards(
     sink: &dyn ActionSink,
     concurrency: usize,
 ) -> Result<(), Error> {
-    let now = Utc::now();
     let objects = metadata_store.store().object_store();
+    let ctx = ShardSweep {
+        blob_store,
+        metadata_store,
+        window,
+        now: Utc::now(),
+        sink,
+    };
+    let ctx = &ctx;
     walk::for_each_key(
         objects,
         path_builder::blobs_root_dir(),
@@ -152,18 +159,7 @@ pub async fn sweep_byteless_shards(
             let KeyCategory::BlobIndexShard { digest, namespace } = categorize(&key) else {
                 return;
             };
-            if let Err(e) = sweep_one_shard(
-                blob_store,
-                metadata_store,
-                &key,
-                &digest,
-                &namespace,
-                window,
-                now,
-                sink,
-            )
-            .await
-            {
+            if let Err(e) = sweep_one_shard(ctx, &key, &digest, &namespace).await {
                 error!("prune: failed to check shard '{key}': {e}");
             }
         },
@@ -171,18 +167,22 @@ pub async fn sweep_byteless_shards(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The state a single byteless-shard check shares across the whole sweep.
+struct ShardSweep<'a> {
+    blob_store: &'a Arc<BlobStore>,
+    metadata_store: &'a Arc<MetadataStore>,
+    window: Duration,
+    now: DateTime<Utc>,
+    sink: &'a dyn ActionSink,
+}
+
 async fn sweep_one_shard(
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
+    ctx: &ShardSweep<'_>,
     key: &str,
     blob: &Digest,
     namespace_raw: &str,
-    window: Duration,
-    now: DateTime<Utc>,
-    sink: &dyn ActionSink,
 ) -> Result<(), Error> {
-    match blob_store.size(blob).await {
+    match ctx.blob_store.size(blob).await {
         Ok(_) => return Ok(()),
         Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {}
         Err(e) => return Err(e.into()),
@@ -190,7 +190,7 @@ async fn sweep_one_shard(
     let Ok(namespace) = Namespace::new(namespace_raw) else {
         return Ok(());
     };
-    let meta = match metadata_store.store().object_store().head(key).await {
+    let meta = match ctx.metadata_store.store().object_store().head(key).await {
         Ok(meta) => meta,
         Err(StorageError::NotFound) => return Ok(()),
         Err(e) => return Err(RegistryError::from(e).into()),
@@ -200,21 +200,23 @@ async fn sweep_one_shard(
         // that granted before its bytes landed.
         return Ok(());
     };
-    if now.signed_duration_since(last_modified) < window {
+    if ctx.now.signed_duration_since(last_modified) < ctx.window {
         return Ok(());
     }
 
     warn!("prune: purging index entries for byteless blob '{blob}' in '{namespace}'");
-    let links = metadata_store
+    let links = ctx
+        .metadata_store
         .read_blob_index_namespace(&namespace, blob)
         .await?;
     for link in links {
-        sink.apply(Action::RemoveBlobIndexLink {
-            namespace: namespace.clone(),
-            blob: blob.clone(),
-            link,
-        })
-        .await?;
+        ctx.sink
+            .apply(Action::RemoveBlobIndexLink {
+                namespace: namespace.clone(),
+                blob: blob.clone(),
+                link,
+            })
+            .await?;
     }
     Ok(())
 }

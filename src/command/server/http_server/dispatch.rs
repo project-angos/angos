@@ -80,10 +80,13 @@ async fn dispatch_route<'a>(
             uuid,
             digest,
         } => {
-            handlers::upload::handle_put_upload(
-                context, parts, incoming, &namespace, uuid, &digest, identity,
-            )
-            .await
+            let request = handlers::PutRequest {
+                context,
+                parts,
+                incoming,
+                identity,
+            };
+            handlers::upload::handle_put_upload(request, &namespace, uuid, &digest).await
         }
         Action::DeleteUpload { namespace, uuid } => {
             handlers::upload::handle_delete_upload(context, &namespace, uuid).await
@@ -110,10 +113,13 @@ async fn dispatch_route<'a>(
         } => handlers::manifest::handle_head_manifest(context, parts, &namespace, reference).await,
         Action::PutManifest { namespace, target } => {
             let (reference, tags) = target.into_parts();
-            handlers::manifest::handle_put_manifest(
-                context, parts, incoming, &namespace, reference, tags, identity,
-            )
-            .await
+            let request = handlers::PutRequest {
+                context,
+                parts,
+                incoming,
+                identity,
+            };
+            handlers::manifest::handle_put_manifest(request, &namespace, reference, tags).await
         }
         Action::DeleteManifest {
             namespace,
