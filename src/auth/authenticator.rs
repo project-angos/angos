@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use hyper::http::request::Parts;
 use reqwest::Client;
@@ -53,12 +53,13 @@ pub struct Authenticator {
 impl Authenticator {
     pub fn new(config: &Configuration, cache: &Arc<Cache>) -> Result<Self, Error> {
         let auth_config = &config.auth;
-        let oidc_client = Arc::new(
-            Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .map_err(|e| Error::Initialization(format!("Failed to create HTTP client: {e}")))?,
-        );
+        // No client-level timeout: each OIDC fetch carries a per-request
+        // timeout from its provider config (`http_request_timeout_secs`,
+        // `jwks_refresh_timeout_secs`).
+        let oidc_client =
+            Arc::new(Client::builder().build().map_err(|e| {
+                Error::Initialization(format!("Failed to create HTTP client: {e}"))
+            })?);
 
         let mtls_validator = MtlsValidator::new();
         let oidc_validators = Self::build_oidc_validators(auth_config, &oidc_client, cache);

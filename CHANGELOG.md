@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - New `angos migrate` command rewrites pre-JSON bare-digest link files as JSON, converting registries seeded from a raw Docker `distribution` on-disk layout.
 - New `scrub --delete-unknown` flag deletes unrecognized keys outright instead of quarantining them under `_lost_and_found/`.
 - New `prune --concurrency` option (default 25) checks namespaces, uploads, blobs, and shards concurrently within each sweep, like the scrub walk.
+- New OIDC provider options `http_request_timeout_secs` (default 30) and `jwks_refresh_timeout_secs` (default 5) make the previously hardcoded JWKS/discovery fetch timeouts configurable per provider.
 
 ### Changed
 

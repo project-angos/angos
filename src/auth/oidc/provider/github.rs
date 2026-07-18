@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::Error,
-    auth::oidc::provider::{BaseConfig, HasBaseConfig, OidcProvider},
+    auth::oidc::provider::{BaseConfig, OidcProvider},
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -22,6 +22,10 @@ pub struct ProviderConfig {
     pub clock_skew_tolerance: u64,
     #[serde(default = "BaseConfig::default_allowed_algorithms")]
     pub allowed_algorithms: Vec<Algorithm>,
+    #[serde(default = "BaseConfig::default_http_request_timeout_secs")]
+    pub http_request_timeout_secs: u64,
+    #[serde(default = "BaseConfig::default_jwks_refresh_timeout_secs")]
+    pub jwks_refresh_timeout_secs: u64,
 }
 
 fn default_github_issuer() -> String {
@@ -46,18 +50,18 @@ impl Provider {
                 required_audience: config.required_audience,
                 clock_skew_tolerance: config.clock_skew_tolerance,
                 allowed_algorithms: config.allowed_algorithms,
+                http_request_timeout_secs: config.http_request_timeout_secs,
+                jwks_refresh_timeout_secs: config.jwks_refresh_timeout_secs,
             },
         }
     }
 }
 
-impl HasBaseConfig for Provider {
+impl OidcProvider for Provider {
     fn base_config(&self) -> &BaseConfig {
         &self.base
     }
-}
 
-impl OidcProvider for Provider {
     fn name(&self) -> &'static str {
         "GitHub Actions"
     }
@@ -91,6 +95,8 @@ pub mod tests {
             required_audience: None,
             clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
             allowed_algorithms: BaseConfig::default_allowed_algorithms(),
+            http_request_timeout_secs: BaseConfig::default_http_request_timeout_secs(),
+            jwks_refresh_timeout_secs: BaseConfig::default_jwks_refresh_timeout_secs(),
         }
     }
 
