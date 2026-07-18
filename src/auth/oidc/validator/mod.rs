@@ -28,11 +28,6 @@ struct Jwks {
 }
 
 #[derive(Debug)]
-struct FetchedJwks {
-    jwks: Jwks,
-    from_cache: bool,
-}
-
 struct CachedJson<T> {
     value: T,
     from_cache: bool,
@@ -61,19 +56,17 @@ pub async fn validate_oidc_token(
         .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
     verify_allowed_algorithm(provider, header.alg)?;
 
-    let mut fetched_jwks = fetch_jwks(provider, client, cache).await?;
-    if fetched_jwks.from_cache && cached_jwks_misses_kid(&fetched_jwks.jwks, &header) {
+    let mut jwks = fetch_jwks(provider, client, cache).await?;
+    if jwks.from_cache && cached_jwks_misses_kid(&jwks.value, &header) {
         info!(
             "Cached JWKS for provider {} does not contain kid {:?}; refreshing",
             provider.name(),
             header.kid
         );
-        fetched_jwks =
-            fetch_jwks_with_cache(provider, client, cache, false, Some(JWKS_REFRESH_TIMEOUT))
-                .await?;
+        jwks = refresh_jwks(provider, client, cache).await?;
     }
 
-    verify_jwt_with_header(token, &header, &fetched_jwks.jwks, provider_name, provider)
+    verify_jwt_with_header(token, &header, &jwks.value, provider_name, provider)
 }
 
 fn verify_jwt_with_header(
@@ -136,7 +129,7 @@ fn verify_jwt_with_header(
 }
 
 fn verify_allowed_algorithm(provider: &dyn OidcProvider, alg: Algorithm) -> Result<(), Error> {
-    if provider.allowed_algorithms().contains(&alg) {
+    if provider.base_config().allowed_algorithms.contains(&alg) {
         return Ok(());
     }
     Err(Error::Unauthorized(format!(
@@ -146,15 +139,16 @@ fn verify_allowed_algorithm(provider: &dyn OidcProvider, alg: Algorithm) -> Resu
 }
 
 fn build_validation(provider: &dyn OidcProvider, alg: Algorithm) -> Validation {
+    let base = provider.base_config();
     let mut validation = Validation::new(alg);
-    validation.algorithms = provider.allowed_algorithms().to_vec();
-    validation.set_issuer(&[provider.issuer()]);
-    if let Some(aud) = provider.required_audience() {
-        validation.set_audience(&[aud]);
+    validation.algorithms.clone_from(&base.allowed_algorithms);
+    validation.set_issuer(&[base.issuer.as_str()]);
+    if let Some(aud) = &base.required_audience {
+        validation.set_audience(&[aud.as_str()]);
     } else {
         validation.validate_aud = false;
     }
-    validation.leeway = provider.clock_skew_tolerance();
+    validation.leeway = base.clock_skew_tolerance;
     validation.validate_exp = true;
     validation.validate_nbf = true;
     validation
@@ -207,7 +201,7 @@ async fn get_jwks_url(
     cache: &Cache,
     fetch_timeout: Option<Duration>,
 ) -> Result<String, Error> {
-    if let Some(uri) = provider.jwks_uri() {
+    if let Some(uri) = provider.base_config().jwks_uri.as_deref() {
         return Ok(uri.to_string());
     }
     let oidc_config =
@@ -218,13 +212,13 @@ async fn get_jwks_url(
 
 fn jwks_cache_key(provider: &dyn OidcProvider) -> String {
     let provider_name = provider.name();
-    let issuer_hash = sha256_hex(provider.issuer());
+    let issuer_hash = sha256_hex(&provider.base_config().issuer);
     format!("oidc:{provider_name}:jwks:{issuer_hash}")
 }
 
 fn oidc_configuration_cache_key(provider: &dyn OidcProvider) -> String {
     let provider_name = provider.name();
-    let issuer_hash = sha256_hex(provider.issuer());
+    let issuer_hash = sha256_hex(&provider.base_config().issuer);
     format!("oidc:{provider_name}:config:{issuer_hash}")
 }
 
@@ -272,32 +266,24 @@ where
     })
 }
 
+/// Load the provider's JWKS, preferring the cache. `from_cache` on the result
+/// tells the caller whether it may still be stale for a just-rotated key.
 async fn fetch_jwks(
     provider: &dyn OidcProvider,
     client: &Client,
     cache: &Cache,
-) -> Result<FetchedJwks, Error> {
-    fetch_jwks_with_cache(provider, client, cache, true, None).await
-}
-
-async fn fetch_jwks_with_cache(
-    provider: &dyn OidcProvider,
-    client: &Client,
-    cache: &Cache,
-    read_cache: bool,
-    fetch_timeout: Option<Duration>,
-) -> Result<FetchedJwks, Error> {
+) -> Result<CachedJson<Jwks>, Error> {
     let cache_key = jwks_cache_key(provider);
-    let jwks_url = get_jwks_url(provider, client, cache, fetch_timeout).await?;
+    let jwks_url = get_jwks_url(provider, client, cache, None).await?;
     let fetched = fetch_cached_json::<Jwks, _>(
         CachedJsonRequest {
             client,
             cache,
             cache_key: &cache_key,
             url: &jwks_url,
-            ttl: provider.jwks_refresh_interval(),
-            read_cache,
-            fetch_timeout,
+            ttl: provider.base_config().jwks_refresh_interval,
+            read_cache: true,
+            fetch_timeout: None,
         },
         |_| Ok(()),
     )
@@ -306,11 +292,34 @@ async fn fetch_jwks_with_cache(
     if !fetched.from_cache {
         info!("Fetched JWKS from {jwks_url}");
     }
+    Ok(fetched)
+}
 
-    Ok(FetchedJwks {
-        jwks: fetched.value,
-        from_cache: fetched.from_cache,
-    })
+/// Force a fresh JWKS fetch, bypassing the cache under a short timeout. Used
+/// when a cached JWKS is missing the token's key id (a rotated signing key).
+async fn refresh_jwks(
+    provider: &dyn OidcProvider,
+    client: &Client,
+    cache: &Cache,
+) -> Result<CachedJson<Jwks>, Error> {
+    let cache_key = jwks_cache_key(provider);
+    let jwks_url = get_jwks_url(provider, client, cache, Some(JWKS_REFRESH_TIMEOUT)).await?;
+    let fetched = fetch_cached_json::<Jwks, _>(
+        CachedJsonRequest {
+            client,
+            cache,
+            cache_key: &cache_key,
+            url: &jwks_url,
+            ttl: provider.base_config().jwks_refresh_interval,
+            read_cache: false,
+            fetch_timeout: Some(JWKS_REFRESH_TIMEOUT),
+        },
+        |_| Ok(()),
+    )
+    .await?;
+
+    info!("Fetched JWKS from {jwks_url}");
+    Ok(fetched)
 }
 
 #[cfg(test)]
@@ -329,14 +338,17 @@ async fn fetch_oidc_configuration_with_timeout(
     fetch_timeout: Option<Duration>,
 ) -> Result<OpenIdConfiguration, Error> {
     let cache_key = oidc_configuration_cache_key(provider);
-    let config_url = format!("{}/.well-known/openid-configuration", provider.issuer());
+    let config_url = format!(
+        "{}/.well-known/openid-configuration",
+        provider.base_config().issuer
+    );
     let fetched = fetch_cached_json::<OpenIdConfiguration, _>(
         CachedJsonRequest {
             client,
             cache,
             cache_key: &cache_key,
             url: &config_url,
-            ttl: provider.jwks_refresh_interval(),
+            ttl: provider.base_config().jwks_refresh_interval,
             read_cache: true,
             fetch_timeout,
         },
@@ -354,10 +366,10 @@ fn validate_oidc_configuration(
     provider: &dyn OidcProvider,
     config: &OpenIdConfiguration,
 ) -> Result<(), Error> {
-    if config.issuer != provider.issuer() {
+    let expected_issuer = &provider.base_config().issuer;
+    if &config.issuer != expected_issuer {
         return Err(Error::Unauthorized(format!(
-            "OIDC configuration issuer mismatch: expected {}, got {}",
-            provider.issuer(),
+            "OIDC configuration issuer mismatch: expected {expected_issuer}, got {}",
             config.issuer
         )));
     }

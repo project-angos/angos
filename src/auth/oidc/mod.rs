@@ -16,7 +16,7 @@ use crate::{
     auth::{
         AuthMiddleware, AuthResult, Error,
         authorization::{basic_credentials, bearer_token},
-        oidc::provider::{generic, github},
+        oidc::provider::{BaseConfig, generic, github},
     },
     cache::Cache,
     identity::{ClientIdentity, OidcClaims},
@@ -25,7 +25,7 @@ use crate::{
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum Config {
-    Generic(generic::ProviderConfig),
+    Generic(BaseConfig),
     GitHub(github::ProviderConfig),
 }
 
@@ -154,7 +154,7 @@ mod tests {
     };
 
     fn build_config(issuer: &str) -> Config {
-        Config::Generic(generic::ProviderConfig {
+        Config::Generic(BaseConfig {
             required_audience: None,
             ..build_test_provider_config(issuer)
         })
@@ -213,7 +213,7 @@ mod tests {
         let config = build_config("https://auth.example.com");
 
         let provider = config.to_backend();
-        assert_eq!(provider.issuer(), "https://auth.example.com");
+        assert_eq!(provider.base_config().issuer, "https://auth.example.com");
         assert_eq!(provider.name(), "Generic OIDC");
     }
 
@@ -223,7 +223,7 @@ mod tests {
 
         let provider = config.to_backend();
         assert_eq!(
-            provider.issuer(),
+            provider.base_config().issuer,
             "https://token.actions.githubusercontent.com"
         );
         assert_eq!(provider.name(), "GitHub Actions");
@@ -239,7 +239,10 @@ mod tests {
             OidcValidator::new("test-provider".to_string(), &config, client.clone(), cache);
 
         assert_eq!(validator.provider_name, "test-provider");
-        assert_eq!(validator.provider.issuer(), "https://auth.example.com");
+        assert_eq!(
+            validator.provider.base_config().issuer,
+            "https://auth.example.com"
+        );
         assert!(Arc::ptr_eq(&validator.client, &client));
     }
 
@@ -253,7 +256,7 @@ mod tests {
 
         assert_eq!(validator.provider_name, "github");
         assert_eq!(
-            validator.provider.issuer(),
+            validator.provider.base_config().issuer,
             "https://token.actions.githubusercontent.com"
         );
     }

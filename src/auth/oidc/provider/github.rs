@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::Error,
-    auth::oidc::provider::{BaseConfig, HasBaseConfig, OidcProvider},
+    auth::oidc::provider::{BaseConfig, OidcProvider},
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -51,13 +51,11 @@ impl Provider {
     }
 }
 
-impl HasBaseConfig for Provider {
+impl OidcProvider for Provider {
     fn base_config(&self) -> &BaseConfig {
         &self.base
     }
-}
 
-impl OidcProvider for Provider {
     fn name(&self) -> &'static str {
         "GitHub Actions"
     }

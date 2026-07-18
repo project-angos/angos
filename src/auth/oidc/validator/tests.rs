@@ -12,10 +12,7 @@ use crate::{
     auth::Error,
     auth::oidc::{
         Jwk, OidcProvider,
-        provider::{
-            BaseConfig, HasBaseConfig,
-            generic::{Provider, ProviderConfig},
-        },
+        provider::{BaseConfig, generic::Provider},
         validator::{
             Jwks, OpenIdConfiguration, fetch_jwks, fetch_oidc_configuration, jwks_cache_key,
             oidc_configuration_cache_key, validate_oidc_token, verify_allowed_algorithm,
@@ -30,8 +27,8 @@ use crate::{
     },
 };
 
-pub fn build_test_provider_config(uri: &str) -> ProviderConfig {
-    ProviderConfig {
+pub fn build_test_provider_config(uri: &str) -> BaseConfig {
+    BaseConfig {
         issuer: uri.to_string(),
         jwks_uri: Some(format!("{uri}/.well-known/jwks")),
         jwks_refresh_interval: 3600,
@@ -69,7 +66,7 @@ async fn test_fetch_jwks_with_explicit_uri() {
 
     mount_jwks(&mock_server, jwks_response).await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
     };
@@ -82,7 +79,7 @@ async fn test_fetch_jwks_with_explicit_uri() {
 
     assert!(result.is_ok());
     let jwks = result.unwrap();
-    assert_eq!(jwks.jwks.keys.len(), 1);
+    assert_eq!(jwks.value.keys.len(), 1);
     assert!(!jwks.from_cache);
 }
 
@@ -113,7 +110,7 @@ async fn test_fetch_jwks_with_discovery() {
 
     mount_jwks(&mock_server, jwks_response).await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         jwks_uri: None,
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
@@ -127,7 +124,7 @@ async fn test_fetch_jwks_with_discovery() {
 
     assert!(result.is_ok());
     let jwks = result.unwrap();
-    assert_eq!(jwks.jwks.keys.len(), 1);
+    assert_eq!(jwks.value.keys.len(), 1);
     assert!(!jwks.from_cache);
 }
 
@@ -152,7 +149,7 @@ async fn test_fetch_jwks_uses_cache() {
         .mount(&mock_server)
         .await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
     };
@@ -179,7 +176,7 @@ async fn test_fetch_jwks_http_error() {
         .mount(&mock_server)
         .await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
     };
@@ -213,7 +210,7 @@ async fn test_fetch_oidc_configuration_success() {
         .mount(&mock_server)
         .await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         jwks_uri: None,
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
@@ -250,7 +247,7 @@ async fn test_fetch_oidc_configuration_uses_cache() {
         .mount(&mock_server)
         .await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         jwks_uri: None,
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
@@ -282,7 +279,7 @@ async fn test_fetch_oidc_configuration_issuer_mismatch() {
         .mount(&mock_server)
         .await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         jwks_uri: None,
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
@@ -319,7 +316,7 @@ async fn test_fetch_oidc_configuration_http_error() {
         .mount(&mock_server)
         .await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         jwks_uri: None,
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
@@ -344,7 +341,7 @@ async fn test_fetch_jwks_network_error_returns_provider_unavailable() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         required_audience: None,
         ..build_test_provider_config(&url)
     };
@@ -517,7 +514,7 @@ async fn test_validate_oidc_token_rejects_disallowed_algorithm_before_jwks_fetch
     let claims = valid_claims(&mock_server.uri(), "test-audience");
 
     let token = make_token(&claims, KID);
-    let config = ProviderConfig {
+    let config = BaseConfig {
         allowed_algorithms: vec![Algorithm::RS256],
         ..build_test_provider_config(&mock_server.uri())
     };
@@ -648,7 +645,7 @@ async fn test_validate_oidc_token_no_audience_validation() {
 
     let token = make_token(&claims, KID);
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
     };
@@ -670,7 +667,7 @@ async fn test_validate_oidc_token_invalid_jwt_format() {
     let jwks_response = json!({ "keys": [] });
     mount_jwks(&mock_server, jwks_response).await;
 
-    let config = ProviderConfig {
+    let config = BaseConfig {
         required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
     };
@@ -758,13 +755,11 @@ impl TestProvider {
     }
 }
 
-impl HasBaseConfig for TestProvider {
+impl OidcProvider for TestProvider {
     fn base_config(&self) -> &BaseConfig {
         &self.base
     }
-}
 
-impl OidcProvider for TestProvider {
     fn name(&self) -> &'static str {
         "Test"
     }

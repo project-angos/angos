@@ -4,15 +4,24 @@ pub mod github;
 use std::collections::HashMap;
 
 use jsonwebtoken::Algorithm;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::Error;
 
+/// Shared OIDC provider configuration. The generic provider deserializes into
+/// it directly; the GitHub provider builds it from its own defaults.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BaseConfig {
     pub issuer: String,
+    #[serde(default)]
     pub jwks_uri: Option<String>,
+    #[serde(default = "BaseConfig::default_jwks_refresh_interval")]
     pub jwks_refresh_interval: u64,
+    #[serde(default)]
     pub required_audience: Option<String>,
+    #[serde(default = "BaseConfig::default_clock_skew_tolerance")]
     pub clock_skew_tolerance: u64,
+    #[serde(default = "BaseConfig::default_allowed_algorithms")]
     pub allowed_algorithms: Vec<Algorithm>,
 }
 
@@ -30,38 +39,12 @@ impl BaseConfig {
     }
 }
 
-/// Provides the shared OIDC configuration required by every provider.
-pub trait HasBaseConfig {
+/// An OIDC provider: its shared [`BaseConfig`] plus provider-specific claim
+/// validation. Field access goes through [`OidcProvider::base_config`].
+pub trait OidcProvider: Send + Sync {
     fn base_config(&self) -> &BaseConfig;
-}
 
-/// OIDC provider behavior layered on top of the shared base configuration.
-pub trait OidcProvider: HasBaseConfig + Send + Sync {
     fn name(&self) -> &'static str;
-
-    fn issuer(&self) -> &str {
-        &self.base_config().issuer
-    }
-
-    fn jwks_uri(&self) -> Option<&str> {
-        self.base_config().jwks_uri.as_deref()
-    }
-
-    fn jwks_refresh_interval(&self) -> u64 {
-        self.base_config().jwks_refresh_interval
-    }
-
-    fn required_audience(&self) -> Option<&str> {
-        self.base_config().required_audience.as_deref()
-    }
-
-    fn clock_skew_tolerance(&self) -> u64 {
-        self.base_config().clock_skew_tolerance
-    }
-
-    fn allowed_algorithms(&self) -> &[Algorithm] {
-        &self.base_config().allowed_algorithms
-    }
 
     fn validate_provider_claims(
         &self,
