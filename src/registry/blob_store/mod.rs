@@ -23,10 +23,11 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::io::AsyncRead;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
-use angos_storage::{ObjectStore, PresignedStore};
+use angos_storage::{ObjectStore, PresignedStore, paginated};
 use angos_tx_engine::StorageError;
 
 pub use config::BlobStoreConfig;
@@ -37,11 +38,14 @@ pub use config::{FsBackendConfig, S3BackendConfig, TransportFields};
 pub use multipart_cleanup::{MultipartCleanup, OrphanMultipartUpload};
 
 use crate::{
-    oci::Digest,
-    registry::{Error, pagination, path_builder},
+    oci::{Algorithm, Digest},
+    registry::{Error, path_builder},
 };
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
+
+/// Fan-out for the per-shard page chains behind [`BlobStore::stream_blobs`].
+const BLOB_LIST_CONCURRENCY: usize = 32;
 
 /// Summary of an in-progress or completed upload session.
 #[derive(Debug, Clone)]
@@ -93,34 +97,59 @@ impl BlobStore {
 // blob CRUD (formerly `impl BlobStore`)
 
 impl BlobStore {
-    #[instrument(skip(self))]
-    pub async fn list_blobs(
-        &self,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        debug!("Fetching {n} blob(s) with continuation token: {continuation_token:?}");
+    /// Streams every stored blob digest, unordered. Blobs live at
+    /// `blobs/<algo>/<shard>/<hash>/data` with the shard the hash's first two
+    /// hex digits, so hashes distribute uniformly over the shard directories:
+    /// each algorithm's existing shards are discovered with one children
+    /// listing, then walked as up to [`BLOB_LIST_CONCURRENCY`] concurrent
+    /// page chains instead of one serial continuation-token chain.
+    pub fn stream_blobs(&self) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
+        stream::iter(Algorithm::supported_algorithms()).flat_map(move |algorithm| {
+            stream::once(async move {
+                let root = &format!("{}/{algorithm}/", path_builder::blobs_root_dir());
+                paginated(|token| async move {
+                    let page = self.object.list_children(root, 1000, token, None).await?;
+                    Ok::<_, Error>((page.sub_prefixes, page.next_token))
+                })
+                .try_collect::<Vec<String>>()
+                .await
+            })
+            .map_ok(move |shards| {
+                stream::iter(
+                    shards
+                        .into_iter()
+                        .map(move |shard| Box::pin(self.shard_blobs(*algorithm, &shard))),
+                )
+                .flatten_unordered(BLOB_LIST_CONCURRENCY)
+            })
+            .try_flatten()
+        })
+    }
 
-        // Blobs are sharded by algorithm (`blobs/<algo>/<shard>/<hash>/data`); each
-        // blob is the `/data` key under its container.
-        pagination::paginate_by_algorithm(
-            n,
-            continuation_token,
-            |algorithm, limit, cursor| async move {
-                let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
-                let page = self.object.list(&blob_prefix, limit, cursor).await?;
+    /// One shard directory's blobs (each the `<hash>/data` key under the
+    /// shard prefix), one listing page at a time. The returned stream borrows
+    /// only `self`: `shard` is consumed into the owned prefix up front.
+    fn shard_blobs<'a>(
+        &'a self,
+        algorithm: Algorithm,
+        shard: &str,
+    ) -> impl Stream<Item = Result<Digest, Error>> + Send + use<'a> {
+        let prefix = format!("{}/{algorithm}/{shard}/", path_builder::blobs_root_dir());
+        paginated(move |token| {
+            let prefix = prefix.clone();
+            async move {
+                let page = self.object.list(&prefix, 1000, token).await?;
                 let blobs = page
                     .items
                     .into_iter()
                     .filter_map(|key| {
-                        let hash = key.strip_suffix("/data")?.rsplit_once('/')?.1;
+                        let hash = key.strip_suffix("/data")?;
                         Digest::with_algorithm(algorithm, hash).ok()
                     })
                     .collect();
                 Ok((blobs, page.next_token))
-            },
-        )
-        .await
+            }
+        })
     }
 
     #[instrument(skip(self))]

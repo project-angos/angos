@@ -34,12 +34,14 @@ use std::io::Cursor;
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
+use futures_util::stream::Stream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
     try_join,
 };
 use tracing::instrument;
 
+use angos_storage::paginated;
 use angos_tx_engine::StorageError;
 
 use crate::{
@@ -220,55 +222,30 @@ impl BlobStore {
         Ok(())
     }
 
-    #[instrument(skip(self))]
-    pub async fn list_uploads(
+    /// Streams every in-flight upload UUID in `namespace` lazily, unsorted;
+    /// at most one listing page is buffered.
+    pub fn stream_uploads(
         &self,
         namespace: &Namespace,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
+    ) -> impl Stream<Item = Result<String, Error>> + Send + '_ {
         let root = format!("{}/", path_builder::uploads_root_dir(namespace));
-        let mut uuids: Vec<String> = Vec::new();
-        let mut token = None;
-        loop {
-            let page = self.object.list_children(&root, 1000, token, None).await?;
-            // Sub-prefix names are bare per the `ChildrenPage` contract, so the
-            // upload UUIDs can be taken directly.
-            uuids.extend(page.sub_prefixes);
-            match page.next_token {
-                Some(t) => token = Some(t),
-                None => break,
+        paginated(move |token| {
+            let root = root.clone();
+            async move {
+                let page = self.object.list_children(&root, 1000, token, None).await?;
+                // Sub-prefix names are bare per the `ChildrenPage` contract, so
+                // the upload UUIDs can be taken directly.
+                Ok((page.sub_prefixes, page.next_token))
             }
-        }
-        uuids.sort();
-
-        Ok(pagination::paginate(
-            &uuids,
-            n,
-            continuation_token.as_deref(),
-        ))
-    }
-
-    /// Lists the namespaces holding an `_uploads` directory. Upload sessions
-    /// live on the blob store, so discovery walks this store: the metadata
-    /// catalog keys namespaces off `_manifests` and cannot see an upload-only
-    /// namespace when the two stores are separate backends.
-    #[instrument(skip(self))]
-    pub async fn list_upload_namespaces(
-        &self,
-        n: u16,
-        last: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
-        let mut namespaces = self.collect_upload_namespaces(None).await?;
-        namespaces.sort_unstable();
-
-        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+        })
     }
 
     /// Walks the `_uploads`-keyed tree in a single concurrent walk and returns
     /// every namespace with an upload session, unpaginated and unsorted. `scope`
     /// restricts the walk to one repository's subtree; `None` walks the whole
-    /// store.
+    /// store. Upload sessions live on the blob store, so discovery walks this
+    /// store: the metadata catalog keys namespaces off `_manifests` and cannot
+    /// see an upload-only namespace when the two stores are separate backends.
     #[instrument(skip(self))]
     pub async fn collect_upload_namespaces(
         &self,
@@ -281,11 +258,9 @@ impl BlobStore {
             &prefix,
             "_uploads",
             pagination::NAMESPACE_WALK_CONCURRENCY,
-            |path, token| async move {
-                self.object
-                    .list_children(&path, 1000, token, None)
-                    .await
-                    .map_err(Error::from)
+            |path| async move {
+                let (sub_prefixes, _) = self.object.list_all_children(&path).await?;
+                Ok(sub_prefixes)
             },
         )
         .await

@@ -120,6 +120,28 @@ pub trait ObjectStore: Send + Sync {
         start_after: Option<String>,
     ) -> Result<ChildrenPage, Error>;
 
+    /// Complete one-level enumeration: every immediate child under `prefix`,
+    /// as `(sub_prefixes, objects)` with no ordering guarantee.
+    ///
+    /// The default drains [`ObjectStore::list_children`] pages serially.
+    /// Backends override it with their cheapest complete form: FS reads the
+    /// directory once, S3 walks disjoint name ranges concurrently, so callers
+    /// needing the full child set use this instead of paging themselves.
+    async fn list_all_children(&self, prefix: &str) -> Result<(Vec<String>, Vec<String>), Error> {
+        let mut sub_prefixes = Vec::new();
+        let mut objects = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self.list_children(prefix, 1000, token, None).await?;
+            sub_prefixes.extend(page.sub_prefixes);
+            objects.extend(page.objects);
+            token = page.next_token;
+            if token.is_none() {
+                return Ok((sub_prefixes, objects));
+            }
+        }
+    }
+
     /// Server-side copy from `source` to `destination`. Backends choose
     /// whether to issue a single-shot copy or a multipart copy based on
     /// source size and backend-specific thresholds.

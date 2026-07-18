@@ -1,29 +1,26 @@
-use std::{cmp::Reverse, sync::Arc};
+use std::{cmp::Reverse, pin::pin, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, TryStreamExt, future::join_all};
+use futures_util::{StreamExt, TryStreamExt};
 use tracing::{debug, error};
 
 use chrono::Duration;
 
 use crate::{
-    command::scrub::{
-        Error,
-        action::Action,
-        check::{NamespaceChecker, list_all},
-        executor::ActionSink,
-    },
+    command::scrub::{Error, action::Action, check::NamespaceChecker, executor::ActionSink},
     oci::{Digest, Namespace, Tag},
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
         Error as RegistryError, Repository,
         blob_store::BlobStore,
         metadata_store::{BlobIndex, LinkKind, LinkMetadata, MetadataStore},
-        pagination::collect_all_pages,
         repository_resolver::RepositoryResolver,
     },
 };
+
+/// Fan-out for the per-tag link-metadata reads feeding the retention rankings.
+const TAG_METADATA_CONCURRENCY: usize = 16;
 
 struct TagWithMetadata {
     name: Tag,
@@ -174,7 +171,9 @@ pub async fn sweep_orphan_grants(
     concurrency: usize,
 ) -> Result<(), Error> {
     let now = Utc::now();
-    list_all::blobs(blob_store)
+    blob_store
+        .stream_blobs()
+        .err_into()
         .try_for_each_concurrent(concurrency, |blob| async move {
             if let Err(e) = sweep_grants_for_blob(
                 blob_store,
@@ -281,13 +280,7 @@ impl NamespaceChecker for RetentionChecker {
     async fn check(&self, namespace: &Namespace, sink: &dyn ActionSink) -> Result<(), Error> {
         debug!("Checking retention policies on '{namespace}'");
 
-        let tag_names = collect_all_pages(|marker| async move {
-            self.metadata_store.list_tags(namespace, 1000, marker).await
-        })
-        .await
-        .map_err(Error::from)?;
-
-        let tag_metadata = self.fetch_tag_metadata(namespace, &tag_names).await?;
+        let tag_metadata = self.fetch_tag_metadata(namespace).await?;
         let (last_pushed, last_pulled) = Self::build_sorted_rankings(&tag_metadata);
 
         let tags = self.get_deletable_tags(namespace, &tag_metadata, &last_pushed, &last_pulled);
@@ -299,49 +292,28 @@ impl NamespaceChecker for RetentionChecker {
 }
 
 impl RetentionChecker {
+    /// Reads every tag's link metadata, the tag listing streaming into up to
+    /// `TAG_METADATA_CONCURRENCY` concurrent link reads.
     async fn fetch_tag_metadata(
         &self,
         namespace: &Namespace,
-        tag_names: &[Tag],
     ) -> Result<Vec<TagWithMetadata>, Error> {
-        const BATCH_SIZE: usize = 100;
-
-        let mut all_tags = Vec::new();
-        for chunk in tag_names.chunks(BATCH_SIZE) {
-            let batch = self.fetch_metadata_batch(namespace, chunk).await?;
-            all_tags.extend(batch);
-        }
-        Ok(all_tags)
-    }
-
-    async fn fetch_metadata_batch(
-        &self,
-        namespace: &Namespace,
-        tag_names: &[Tag],
-    ) -> Result<Vec<TagWithMetadata>, Error> {
-        join_all(
-            tag_names
-                .iter()
-                .map(|tag| self.fetch_single_tag_metadata(namespace, tag.clone())),
-        )
-        .await
-        .into_iter()
-        .collect()
-    }
-
-    async fn fetch_single_tag_metadata(
-        &self,
-        namespace: &Namespace,
-        tag: Tag,
-    ) -> Result<TagWithMetadata, Error> {
-        let metadata = self
-            .metadata_store
-            .read_link(namespace, &LinkKind::Tag(tag.clone()))
-            .await?;
-        Ok(TagWithMetadata {
-            name: tag,
-            metadata,
-        })
+        self.metadata_store
+            .stream_tags(namespace)
+            .err_into::<Error>()
+            .map_ok(|tag| async move {
+                let metadata = self
+                    .metadata_store
+                    .read_link(namespace, &LinkKind::Tag(tag.clone()))
+                    .await?;
+                Ok(TagWithMetadata {
+                    name: tag,
+                    metadata,
+                })
+            })
+            .try_buffered(TAG_METADATA_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     fn build_sorted_rankings(tags: &[TagWithMetadata]) -> (Vec<String>, Vec<String>) {
@@ -446,7 +418,7 @@ impl RetentionChecker {
         last_pulled: &[String],
         sink: &dyn ActionSink,
     ) -> Result<(), Error> {
-        let mut revisions = list_all::revisions(&self.metadata_store, namespace);
+        let mut revisions = pin!(self.metadata_store.stream_revisions(namespace));
         while let Some(digest) = revisions.next().await {
             let digest = digest?;
             if let Err(e) = self

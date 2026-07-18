@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -20,6 +21,9 @@ use crate::{
 /// Keyset page size for the pending and failed scans; pages are looped to
 /// exhaustion, so this only bounds memory per round-trip.
 const PAGE_SIZE: u16 = 256;
+
+/// Fan-out for the per-key payload reads within one page.
+const PAYLOAD_READ_CONCURRENCY: usize = 16;
 
 /// Which durable queue an [`OrphanJobChecker`] scans, carrying the per-queue
 /// orphan classification.
@@ -166,8 +170,19 @@ impl OrphanJobChecker {
             }
             .map_err(|e| Error::JobQueue(format!("failed to list {queue} jobs: {e}")))?;
 
-            for storage_key in keys {
-                let Some(payload) = self.read_payload(state, &storage_key).await? else {
+            // Payload reads fan out; classification and the sink stay serial
+            // in key order.
+            let payloads: Vec<(String, Option<Value>)> = stream::iter(keys)
+                .map(|storage_key| async move {
+                    let payload = self.read_payload(state, &storage_key).await?;
+                    Ok::<_, Error>((storage_key, payload))
+                })
+                .buffered(PAYLOAD_READ_CONCURRENCY)
+                .try_collect()
+                .await?;
+
+            for (storage_key, payload) in payloads {
+                let Some(payload) = payload else {
                     continue;
                 };
                 // A payload that fails to decode is skipped: scrub must not

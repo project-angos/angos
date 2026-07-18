@@ -1,21 +1,29 @@
 //! The namespace / tag / revision / referrer catalog: the content-derived
 //! enumeration endpoints and the namespace tree-walk they build on.
 
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use tracing::{debug, instrument};
+
+use angos_storage::paginated;
 
 use crate::{
     oci::{Algorithm, Descriptor, Digest, Namespace, Tag},
     registry::{
         Error,
         metadata_store::{LinkKind, MetadataStore},
-        pagination,
-        pagination::collect_all_pages,
-        path_builder,
+        pagination, path_builder,
     },
 };
 
 mod referrer_resolver;
+
+/// Fan-out for resolving referrer candidates to descriptors: each candidate is
+/// an independent manifest read, so a bounded window keeps the listing and the
+/// reads overlapped.
+const REFERRER_RESOLVE_CONCURRENCY: usize = 10;
+
+/// Fan-out for the tag link reads behind [`MetadataStore::find_tags_pointing_at`].
+const TAG_LINK_READ_CONCURRENCY: usize = 20;
 
 impl MetadataStore {
     /// Lists the namespaces holding manifest content (a `_manifests` child);
@@ -47,12 +55,10 @@ impl MetadataStore {
             &prefix,
             "_manifests",
             pagination::NAMESPACE_WALK_CONCURRENCY,
-            |path, token| async move {
-                self.store()
-                    .object_store()
-                    .list_children(&path, 1000, token, None)
-                    .await
-                    .map_err(Error::from)
+            |path| async move {
+                let (sub_prefixes, _) =
+                    self.store().object_store().list_all_children(&path).await?;
+                Ok(sub_prefixes)
             },
         )
         .await
@@ -67,18 +73,37 @@ impl MetadataStore {
     ) -> Result<(Vec<Tag>, Option<String>), Error> {
         debug!("Listing {n} tag(s) for namespace '{namespace}' starting with last '{last:?}'");
 
-        // Tags are validated on write; a malformed directory name here is
-        // defensive and is dropped rather than surfaced as a tag. Scrub now
-        // reports and removes such directories, so the drop is silent.
-        let mut tags: Vec<Tag> = self
-            .collect_tag_dir_names(namespace)
-            .await?
-            .into_iter()
-            .filter_map(|name| Tag::try_from(name).ok())
-            .collect();
+        let mut tags: Vec<Tag> = self.stream_tags(namespace).try_collect().await?;
         tags.sort();
 
         Ok(pagination::paginate_sorted(&tags, n, last.as_deref()))
+    }
+
+    /// Streams every valid tag in `namespace`, unsorted, sourced from the
+    /// backend's complete children enumeration (one directory read on FS,
+    /// concurrent name-range scans on S3). Tags are validated on write; a
+    /// malformed directory name here is defensive and is dropped rather than
+    /// surfaced as a tag (scrub reports and removes such directories, so the
+    /// drop is silent).
+    pub fn stream_tags(
+        &self,
+        namespace: &Namespace,
+    ) -> impl Stream<Item = Result<Tag, Error>> + Send + '_ {
+        let tags_dir = path_builder::manifest_tags_dir(namespace);
+        stream::once(async move {
+            let (tag_dirs, _) = self
+                .store()
+                .object_store()
+                .list_all_children(&tags_dir)
+                .await?;
+            Ok::<_, Error>(stream::iter(
+                tag_dirs
+                    .into_iter()
+                    .filter_map(|name| Tag::try_from(name).ok())
+                    .map(Ok),
+            ))
+        })
+        .try_flatten()
     }
 
     /// Lists the RAW tag directory names in `namespace` with NO `Tag`
@@ -100,28 +125,17 @@ impl MetadataStore {
         Ok(pagination::paginate_sorted(&names, n, last.as_deref()))
     }
 
-    /// Enumerates every raw tag directory name under `namespace`'s tags dir.
-    /// Paginates in memory like `list_namespaces`: backend `start-after`
-    /// ordering and exclusive-`last` semantics aren't portable across backends.
+    /// Enumerates every raw tag directory name under `namespace`'s tags dir,
+    /// for [`Self::list_tag_names`]'s no-validation contract.
+    #[cfg(test)]
     async fn collect_tag_dir_names(&self, namespace: &Namespace) -> Result<Vec<String>, Error> {
         let tags_dir = path_builder::manifest_tags_dir(namespace);
-
-        let mut names = Vec::new();
-        let mut token = None;
-        loop {
-            let page = self
-                .store()
-                .object_store()
-                .list_children(&tags_dir, 1000, token, None)
-                .await?;
-            names.extend(page.sub_prefixes);
-            match page.next_token {
-                Some(next) => token = Some(next),
-                None => break,
-            }
-        }
-
-        Ok(names)
+        let (tag_dirs, _) = self
+            .store()
+            .object_store()
+            .list_all_children(&tags_dir)
+            .await?;
+        Ok(tag_dirs)
     }
 
     /// Returns the `LinkKind::Tag` entries in `namespace` that currently point at
@@ -134,31 +148,24 @@ impl MetadataStore {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<Vec<LinkKind>, Error> {
-        let all_tags =
-            collect_all_pages(|marker| async move { self.list_tags(namespace, 100, marker).await })
-                .await?;
-
-        let matching = stream::iter(all_tags)
-            .map(|tag| async move {
+        // Tags stream off the listing straight into the link reads; a tag
+        // whose read fails is skipped rather than matched.
+        self.stream_tags(namespace)
+            .map_ok(|tag| async move {
                 let result = self
                     .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
                     .await;
-                (tag, result)
+                Ok::<_, Error>((tag, result))
             })
-            .buffer_unordered(20)
-            .filter_map(|(tag, result)| async move {
-                if let Ok(metadata) = result
-                    && &metadata.target == digest
-                {
-                    Some(LinkKind::Tag(tag))
-                } else {
-                    None
-                }
+            .try_buffer_unordered(TAG_LINK_READ_CONCURRENCY)
+            .try_filter_map(|(tag, result)| async move {
+                Ok(match result {
+                    Ok(metadata) if &metadata.target == digest => Some(LinkKind::Tag(tag)),
+                    _ => None,
+                })
             })
-            .collect::<Vec<_>>()
-            .await;
-
-        Ok(matching)
+            .try_collect()
+            .await
     }
 
     #[instrument(skip(self))]
@@ -168,19 +175,19 @@ impl MetadataStore {
         digest: &Digest,
         artifact_type: Option<String>,
     ) -> Result<Vec<Descriptor>, Error> {
-        let referrers_dir = path_builder::manifest_referrers_dir(namespace, digest);
+        let referrers_dir = &path_builder::manifest_referrers_dir(namespace, digest);
+        let artifact_type = artifact_type.as_ref();
 
-        let mut referrers = Vec::new();
-        let mut token = None;
-
-        loop {
+        // Candidate digests stream off the listing while up to
+        // `REFERRER_RESOLVE_CONCURRENCY` of them resolve concurrently, so the
+        // resolution window spans page boundaries and overlaps the page fetches.
+        let mut referrers: Vec<Descriptor> = paginated(|token| async move {
             let page = self
                 .store()
                 .object_store()
-                .list(&referrers_dir, 100, token)
+                .list(referrers_dir, 100, token)
                 .await?;
-
-            let digest_entries: Vec<Digest> = page
+            let digest_entries = page
                 .items
                 .iter()
                 .filter_map(|key| {
@@ -192,31 +199,18 @@ impl MetadataStore {
                     Digest::with_algorithm(algorithm, parts[1]).ok()
                 })
                 .collect();
-
-            let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
-                .map(|manifest_digest| {
-                    let artifact_type = artifact_type.as_ref();
-                    async move {
-                        self.resolve_referrer_descriptor(
-                            namespace,
-                            digest,
-                            manifest_digest,
-                            artifact_type,
-                        )
-                        .await
-                    }
-                })
-                .buffer_unordered(10)
-                .collect()
-                .await;
-
-            referrers.extend(results.into_iter().flatten());
-
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
-        }
+            Ok((digest_entries, page.next_token))
+        })
+        .map_ok(|manifest_digest| async move {
+            Ok::<_, Error>(
+                self.resolve_referrer_descriptor(namespace, digest, manifest_digest, artifact_type)
+                    .await,
+            )
+        })
+        .try_buffer_unordered(REFERRER_RESOLVE_CONCURRENCY)
+        .try_filter_map(|descriptor| async move { Ok(descriptor) })
+        .try_collect()
+        .await?;
 
         referrers.sort_by(|a, b| a.digest.cmp(&b.digest));
         Ok(referrers)
@@ -236,61 +230,39 @@ impl MetadataStore {
         Ok(!page.items.is_empty())
     }
 
-    pub async fn list_revisions(
-        &self,
-        namespace: &Namespace,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        debug!(
-            "Fetching {n} revision(s) for namespace '{namespace}' with continuation token: {continuation_token:?}"
-        );
-
-        // Manifest revisions are sharded by algorithm (`revisions/<algo>/<hash>`).
-        pagination::paginate_by_algorithm(
-            n,
-            continuation_token,
-            |algorithm, limit, cursor| async move {
-                let revisions_dir =
-                    path_builder::manifest_revisions_link_root_dir(namespace, algorithm.as_str());
-                let page = self
-                    .store()
-                    .object_store()
-                    .list_children(&revisions_dir, limit, cursor, None)
-                    .await?;
-                let revisions = page
-                    .sub_prefixes
-                    .into_iter()
-                    .filter_map(|key| Digest::with_algorithm(algorithm, key).ok())
-                    .collect();
-                Ok((revisions, page.next_token))
-            },
-        )
-        .await
+    /// Streams every manifest revision digest in `namespace` lazily: the
+    /// per-algorithm shards (`revisions/<algo>/<hash>`) are chained in
+    /// algorithm order, at most one listing page buffered.
+    pub fn stream_revisions<'a>(
+        &'a self,
+        namespace: &'a Namespace,
+    ) -> impl Stream<Item = Result<Digest, Error>> + Send + 'a {
+        stream::iter(Algorithm::supported_algorithms()).flat_map(move |algorithm| {
+            let revisions_dir =
+                path_builder::manifest_revisions_link_root_dir(namespace, algorithm.as_str());
+            paginated(move |token| {
+                let revisions_dir = revisions_dir.clone();
+                async move {
+                    let page = self
+                        .store()
+                        .object_store()
+                        .list_children(&revisions_dir, 1000, token, None)
+                        .await?;
+                    let revisions = page
+                        .sub_prefixes
+                        .into_iter()
+                        .filter_map(|key| Digest::with_algorithm(*algorithm, key).ok())
+                        .collect();
+                    Ok((revisions, page.next_token))
+                }
+            })
+        })
     }
 
     pub async fn count_manifests(&self, namespace: &Namespace) -> Result<usize, Error> {
-        let mut count = 0;
-        for &algorithm in Algorithm::supported_algorithms() {
-            let revisions_dir =
-                path_builder::manifest_revisions_link_root_dir(namespace, algorithm.as_str());
-            let mut token = None;
-            loop {
-                let page = self
-                    .store()
-                    .object_store()
-                    .list_children(&revisions_dir, 1000, token, None)
-                    .await?;
-
-                count += page.sub_prefixes.len();
-                token = page.next_token;
-                if token.is_none() {
-                    break;
-                }
-            }
-        }
-
-        Ok(count)
+        self.stream_revisions(namespace)
+            .try_fold(0, |count, _| async move { Ok(count + 1) })
+            .await
     }
 
     /// Delete an entire tag directory by prefix. Used by scrub for an invalid

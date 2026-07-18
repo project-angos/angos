@@ -26,6 +26,7 @@ mod error;
 #[cfg(any(test, feature = "test-util"))]
 mod memory;
 mod object;
+mod pagination;
 mod presigned;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
@@ -45,6 +46,7 @@ pub use crate::error::Error;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::memory::MemoryObjectStore;
 pub use crate::object::ObjectStore;
+pub use crate::pagination::paginated;
 pub use crate::presigned::PresignedStore;
 pub use crate::types::{ChildrenPage, Etag, ObjectMeta, Page};
 pub use crate::upload_session::{

@@ -4,13 +4,14 @@
 //! the grant sweep in `checker`, and invalid-name directories are scrub's
 //! (structural) concern.
 
+use std::pin::pin;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use tracing::{error, warn};
 
 use crate::{
-    command::scrub::{Error, action::Action, check::list_all, executor::ActionSink},
+    command::scrub::{Error, action::Action, executor::ActionSink},
     oci::Namespace,
     registry::{
         blob_store::BlobStore, metadata_store::MetadataStore,
@@ -35,9 +36,7 @@ pub async fn sweep_orphan_namespaces(
         return Ok(());
     }
 
-    let mut namespaces = list_all::namespaces(metadata_store);
-    while let Some(namespace) = namespaces.next().await {
-        let namespace = namespace?;
+    for namespace in metadata_store.collect_namespaces(None).await? {
         if resolver.resolve(&namespace).is_some() {
             continue;
         }
@@ -53,9 +52,7 @@ pub async fn sweep_orphan_namespaces(
 
     // Upload-only namespaces are absent from the catalog, so sweep them off
     // the blob store's upload tree.
-    let mut upload_namespaces = list_all::upload_namespaces(blob_store);
-    while let Some(namespace) = upload_namespaces.next().await {
-        let namespace = namespace?;
+    for namespace in blob_store.collect_upload_namespaces(None).await? {
         if resolver.resolve(&namespace).is_some() {
             continue;
         }
@@ -79,7 +76,7 @@ async fn clear_namespace(
     namespace: &Namespace,
     sink: &dyn ActionSink,
 ) -> Result<(), Error> {
-    let mut revisions = list_all::revisions(metadata_store, namespace);
+    let mut revisions = pin!(metadata_store.stream_revisions(namespace));
     while let Some(digest) = revisions.next().await {
         sink.apply(Action::DeleteOrphanManifest {
             namespace: namespace.clone(),
@@ -87,7 +84,7 @@ async fn clear_namespace(
         })
         .await?;
     }
-    let mut tags = list_all::tags(metadata_store, namespace);
+    let mut tags = pin!(metadata_store.stream_tags(namespace));
     while let Some(tag) = tags.next().await {
         sink.apply(Action::DeleteTag {
             namespace: namespace.clone(),
@@ -104,7 +101,7 @@ async fn clear_uploads(
     namespace: &Namespace,
     sink: &dyn ActionSink,
 ) -> Result<(), Error> {
-    let mut uploads = list_all::uploads(blob_store, namespace);
+    let mut uploads = pin!(blob_store.stream_uploads(namespace));
     while let Some(uuid) = uploads.next().await {
         sink.apply(Action::DeleteExpiredUpload {
             namespace: namespace.clone(),

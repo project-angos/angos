@@ -1,13 +1,11 @@
 //! The namespace-checker seam shared by `prune` (retention) and `replicate`
-//! (reconciliation), plus the paginated enumeration streams in [`list_all`].
-//! Scrub itself validates per key through `validate`, not through checkers.
-
-pub mod list_all;
+//! (reconciliation). Scrub itself validates per key through `validate`, not
+//! through checkers.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::TryStreamExt;
+use futures_util::stream::{self, StreamExt};
 use tracing::warn;
 
 use crate::{
@@ -36,19 +34,23 @@ pub async fn check_namespaces(
     sink: &dyn ActionSink,
     concurrency: usize,
 ) -> Result<(), Error> {
-    list_all::namespaces(metadata_store)
-        .try_for_each_concurrent(concurrency, |namespace| async move {
+    let namespaces = metadata_store
+        .collect_namespaces(None)
+        .await
+        .map_err(Error::from)?;
+    stream::iter(namespaces)
+        .for_each_concurrent(concurrency, |namespace| async move {
             let namespace = match Namespace::new(&namespace) {
                 Ok(namespace) => namespace,
                 Err(e) => {
                     warn!("Skipping invalid enumerated namespace '{namespace}': {e}");
-                    return Ok(());
+                    return;
                 }
             };
             if let Err(e) = checker.check(&namespace, sink).await {
                 warn!("Check failed for namespace '{namespace}': {e}");
             }
-            Ok(())
         })
-        .await
+        .await;
+    Ok(())
 }

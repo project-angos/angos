@@ -234,9 +234,13 @@ impl Registry {
         }
     }
 
+    /// One bounded listing probes the metadata backend; readiness must not
+    /// walk the namespace tree.
     pub async fn check_ready(&self) -> Result<(), Error> {
         self.metadata_store
-            .list_namespaces(1, None)
+            .store()
+            .object_store()
+            .list_children(path_builder::repository_dir(), 1, None, None)
             .await
             .map_err(|e| Error::Internal(format!("storage backend not ready: {e}")))?;
         Ok(())

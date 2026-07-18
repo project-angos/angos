@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use tracing::{debug, error, info, warn};
 
 use angos_tx_engine::StorageError;
@@ -17,7 +17,6 @@ use crate::{
         Error,
         action::Action,
         categorize::{KeyCategory, categorize},
-        check::list_all,
         executor::ActionSink,
         walk,
     },
@@ -66,15 +65,15 @@ pub async fn sweep_upload_sessions(
     sink: &dyn ActionSink,
     concurrency: usize,
 ) -> Result<(), Error> {
-    let mut namespaces = list_all::upload_namespaces(blob_store);
-    while let Some(namespace) = namespaces.next().await {
-        let namespace = namespace?;
+    for namespace in blob_store.collect_upload_namespaces(None).await? {
         let Ok(namespace) = Namespace::new(&namespace) else {
             // Invalid upload namespaces are scrub's concern.
             continue;
         };
         let namespace = &namespace;
-        list_all::uploads(blob_store, namespace)
+        blob_store
+            .stream_uploads(namespace)
+            .err_into::<Error>()
             .try_for_each_concurrent(concurrency, |uuid| async move {
                 if let Err(e) = sweep_one_upload(blob_store, namespace, &uuid, window, sink).await {
                     error!("prune: failed to check upload '{namespace}/{uuid}': {e}");

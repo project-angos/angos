@@ -16,6 +16,7 @@ use angos_s3_client::{
 };
 use bytes::Bytes;
 use bytesize::ByteSize;
+use futures_util::{StreamExt, stream};
 use uuid::Uuid;
 
 use crate::test_util::frame;
@@ -43,6 +44,42 @@ fn backend_with(uniform_parts: bool, part_size: u64) -> Backend {
 object_store_conformance!((backend(), ()));
 
 conditional_store_conformance!((backend(), ()));
+
+/// More than one page of children all starting with the same character drives
+/// the whole partitioned enumeration: the probe truncates, the `v` range
+/// re-splits on its second character, the boundary-named dir (`v`) and object
+/// (`v0`) pin the exclusive-start bookkeeping between adjacent ranges. The
+/// boundary object deliberately has no same-named dir: rustfs merges a
+/// same-named object and prefix, dropping the prefix from any listing.
+#[tokio::test]
+async fn list_all_children_partitions_skewed_names_completely() {
+    let store = backend();
+
+    let mut dirs: Vec<String> = (0..1100).map(|i| format!("v{i:04}")).collect();
+    dirs.extend(["v", "va", "va-x", "va.y", "vaz"].map(str::to_string));
+    stream::iter(dirs.iter().cloned().map(|name| {
+        let store = store.clone();
+        async move {
+            store
+                .put(&format!("skew/{name}/leaf"), Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+    }))
+    .buffer_unordered(64)
+    .collect::<Vec<_>>()
+    .await;
+    store
+        .put("skew/v0", Bytes::from_static(b"o"))
+        .await
+        .unwrap();
+
+    let (mut sub_prefixes, objects) = store.list_all_children("skew").await.unwrap();
+    sub_prefixes.sort();
+    dirs.sort();
+    assert_eq!(sub_prefixes, dirs);
+    assert_eq!(objects, ["v0"]);
+}
 
 #[tokio::test]
 async fn head_surfaces_etag() {
@@ -266,7 +303,7 @@ async fn upload_uniform_mixed_known_then_chunked_stays_uniform() {
     let key = format!("up/uniform-mixed/{}/data", Uuid::new_v4());
     // First a known-length part_size body, then a chunked body large enough to
     // flush two more parts plus a remainder.
-    let first: Vec<u8> = (0..PART as u32).map(|i| (i % 251) as u8).collect();
+    let first: Vec<u8> = (0..PART).map(|i| (i % 251) as u8).collect();
     let second: Vec<u8> = (0..23 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
 
     store.create_upload(&key).await.unwrap();

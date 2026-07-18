@@ -11,11 +11,16 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use futures_util::stream::{self, StreamExt};
 
 use crate::{
     oci::Namespace,
     registry::{Error, blob_store::BlobStore, path_builder},
 };
+
+/// Fan-out for the per-upload session-marker probes: each aged upload needs
+/// one independent `head`, so a page's probes run concurrently.
+const ORPHAN_PROBE_CONCURRENCY: usize = 16;
 
 /// A multipart upload with no live session, eligible to be aborted.
 pub struct OrphanMultipartUpload {
@@ -79,31 +84,39 @@ impl MultipartCleanup for BlobStore {
         let mut key_marker: Option<String> = None;
         let mut upload_id_marker: Option<String> = None;
 
+        // The dual key/upload-id markers keep this loop bespoke; within each
+        // page the session-marker probes fan out concurrently.
         loop {
             let page = self
                 .object
                 .list_multipart_uploads(key_marker.as_deref(), upload_id_marker.as_deref())
                 .await?;
 
-            for upload in page.uploads {
+            let candidates = page.uploads.into_iter().filter_map(|upload| {
                 if !is_orphan(upload.initiated_at, now, timeout) {
-                    continue;
+                    return None;
                 }
-                let Some((namespace, uuid)) = parse_upload_key(&upload.key) else {
-                    continue;
-                };
-                let Ok(namespace) = Namespace::new(namespace) else {
-                    continue;
-                };
+                let (namespace, uuid) = parse_upload_key(&upload.key)?;
+                let namespace = Namespace::new(namespace).ok()?;
                 let startedat_path = path_builder::upload_start_date_path(&namespace, uuid);
-                if self.object.head(&startedat_path).await.is_ok() {
-                    continue;
-                }
-                orphans.push(OrphanMultipartUpload {
-                    key: upload.key,
-                    upload_id: upload.upload_id,
-                });
-            }
+                Some((upload, startedat_path))
+            });
+            let page_orphans = stream::iter(candidates)
+                .map(|(upload, startedat_path)| async move {
+                    // A live session (its `startedat` marker exists) is not an
+                    // orphan.
+                    match self.object.head(&startedat_path).await {
+                        Ok(_) => None,
+                        Err(_) => Some(OrphanMultipartUpload {
+                            key: upload.key,
+                            upload_id: upload.upload_id,
+                        }),
+                    }
+                })
+                .buffer_unordered(ORPHAN_PROBE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            orphans.extend(page_orphans.into_iter().flatten());
 
             if page.next_key_marker.is_none() {
                 break;

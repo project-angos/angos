@@ -5,11 +5,13 @@
 //! both the pure in-memory layer and the store read-modify-write.
 
 use std::collections::{HashMap, HashSet};
+use std::pin::pin;
 
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
+use angos_storage::paginated;
 use angos_tx_engine::{
     StorageError,
     error::Error as TxError,
@@ -29,8 +31,8 @@ use crate::{
 pub mod shard;
 
 use self::shard::{
-    SHARD_READ_CONCURRENCY, append_shard_for_digest, collect_blob_index_shards,
-    decode_blob_index_shard_namespace, non_empty_links_or_not_found,
+    SHARD_READ_CONCURRENCY, append_shard_for_digest, decode_blob_index_shard_namespace,
+    non_empty_links_or_not_found,
 };
 
 // Domain types
@@ -103,61 +105,50 @@ impl MetadataStore {
 
     #[instrument(skip(self))]
     pub async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
-        let refs_dir = path_builder::blob_index_refs_dir(digest);
-        let mut index = BlobIndex::default();
-        let mut found_shards = false;
-        let mut token = None;
+        let refs_dir = &path_builder::blob_index_refs_dir(digest);
 
-        loop {
+        // Shard names stream off the listing while up to
+        // `SHARD_READ_CONCURRENCY` shard bodies are read concurrently; the
+        // merge folds each shard in without materializing the shard list.
+        let (index, found_shards) = paginated(|token| async move {
             let page = self
                 .store()
                 .object_store()
-                .list_children(&refs_dir, 1000, token, None)
+                .list_children(refs_dir, 1000, token, None)
                 .await?;
-
-            if !page.objects.is_empty() {
-                found_shards = true;
-            }
-
-            let shard_results = stream::iter(page.objects.into_iter().map(|obj| {
-                let shard_path = format!("{refs_dir}/{obj}");
-                async move {
-                    match self.store().object_store().get(&shard_path).await {
-                        Ok(data) => {
-                            // The shard filename was written from a validated
-                            // `Namespace`; an undecodable name is skipped.
-                            match (
-                                serde_json::from_slice::<HashSet<LinkKind>>(&data),
-                                Namespace::new(&decode_blob_index_shard_namespace(&obj)),
-                            ) {
-                                (Ok(links), Ok(namespace)) if !links.is_empty() => {
-                                    Ok(Some((namespace, links)))
-                                }
-                                _ => Ok(None),
-                            }
+            Ok((page.objects, page.next_token))
+        })
+        .map_ok(|obj| async move {
+            let shard_path = format!("{refs_dir}/{obj}");
+            match self.store().object_store().get(&shard_path).await {
+                Ok(data) => {
+                    // The shard filename was written from a validated
+                    // `Namespace`; an undecodable name is skipped.
+                    match (
+                        serde_json::from_slice::<HashSet<LinkKind>>(&data),
+                        Namespace::new(&decode_blob_index_shard_namespace(&obj)),
+                    ) {
+                        (Ok(links), Ok(namespace)) if !links.is_empty() => {
+                            Ok(Some((namespace, links)))
                         }
-                        Err(StorageError::NotFound) => Ok(None),
-                        Err(e) => Err(Error::from(e)),
+                        _ => Ok(None),
                     }
                 }
-            }))
-            .buffer_unordered(SHARD_READ_CONCURRENCY)
-            .collect::<Vec<Result<Option<(Namespace, HashSet<LinkKind>)>, Error>>>()
-            .await;
-
-            let shards = shard_results
-                .into_iter()
-                .filter_map(Result::transpose)
-                .collect::<Result<Vec<_>, _>>()?;
-            index
-                .namespace
-                .extend(collect_blob_index_shards(shards).namespace);
-
-            token = page.next_token;
-            if token.is_none() {
-                break;
+                Err(StorageError::NotFound) => Ok(None),
+                Err(e) => Err(Error::from(e)),
             }
-        }
+        })
+        .try_buffer_unordered(SHARD_READ_CONCURRENCY)
+        .try_fold(
+            (BlobIndex::default(), false),
+            |(mut index, _), shard| async move {
+                if let Some((namespace, links)) = shard {
+                    index.namespace.insert(namespace, links);
+                }
+                Ok((index, true))
+            },
+        )
+        .await?;
 
         if !found_shards || index.namespace.is_empty() {
             return Err(Error::NotFound);
@@ -167,33 +158,36 @@ impl MetadataStore {
 
     #[instrument(skip(self))]
     pub async fn has_blob_references(&self, digest: &Digest) -> Result<bool, Error> {
-        let refs_dir = path_builder::blob_index_refs_dir(digest);
-        let mut token = None;
+        let refs_dir = &path_builder::blob_index_refs_dir(digest);
 
-        loop {
-            let page = self
-                .store()
-                .object_store()
-                .list_children(&refs_dir, 1, token, None)
-                .await?;
-
-            for obj in page.objects {
+        // Full listing pages with concurrent shard reads, short-circuiting on
+        // the first non-empty shard; the single-shard common case stays one
+        // list plus one get.
+        let mut shard_reads = pin!(
+            paginated(|token| async move {
+                let page = self
+                    .store()
+                    .object_store()
+                    .list_children(refs_dir, 1000, token, None)
+                    .await?;
+                Ok((page.objects, page.next_token))
+            })
+            .map_ok(|obj| async move {
                 let shard_path = format!("{refs_dir}/{obj}");
                 match self.store().object_store().get(&shard_path).await {
                     Ok(data) => {
                         let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
-                        if !links.is_empty() {
-                            return Ok(true);
-                        }
+                        Ok(!links.is_empty())
                     }
-                    Err(StorageError::NotFound) => {}
-                    Err(e) => return Err(e.into()),
+                    Err(StorageError::NotFound) => Ok(false),
+                    Err(e) => Err(Error::from(e)),
                 }
-            }
-
-            token = page.next_token;
-            if token.is_none() {
-                break;
+            })
+            .try_buffer_unordered(SHARD_READ_CONCURRENCY)
+        );
+        while let Some(non_empty) = shard_reads.try_next().await? {
+            if non_empty {
+                return Ok(true);
             }
         }
 

@@ -10,6 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{Duration, Utc};
+use futures_util::TryStreamExt;
 
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageS3Backend};
@@ -361,7 +362,7 @@ pub async fn test_datastore_list_referrers(m: Arc<MetadataStore>) {
     assert!(non_matching_referrers.is_empty());
 }
 
-pub async fn test_datastore_list_revisions(m: Arc<MetadataStore>) {
+pub async fn test_datastore_stream_revisions(m: Arc<MetadataStore>) {
     let namespace = &Namespace::new("test-repo").unwrap();
 
     let manifest_contents = [
@@ -379,46 +380,19 @@ pub async fn test_datastore_list_revisions(m: Arc<MetadataStore>) {
         create_link(&m, namespace, &digest_link, &digest).await;
     }
 
-    let (revisions, token) = m.list_revisions(namespace, 10, None).await.unwrap();
+    let revisions: Vec<Digest> = m.stream_revisions(namespace).try_collect().await.unwrap();
     assert_eq!(revisions.len(), digests.len());
-    assert!(token.is_none());
     for digest in &digests {
         assert!(revisions.contains(digest));
     }
-
-    let (page1, token1) = m.list_revisions(namespace, 2, None).await.unwrap();
-    assert_eq!(page1.len(), 2);
-    assert!(token1.is_some());
-
-    let (page2, token2) = m.list_revisions(namespace, 2, token1).await.unwrap();
-    assert_eq!(page2.len(), 1);
-    assert!(token2.is_none());
-
-    // Test basic pagination (1 item per page): draining until the token is None
-    // must surface every revision exactly once.
-    let mut walked = Vec::new();
-    let mut marker = None;
-    loop {
-        let (page, next) = m.list_revisions(namespace, 1, marker).await.unwrap();
-        assert!(page.len() <= 1);
-        walked.extend(page);
-        match next {
-            Some(next_marker) => marker = Some(next_marker),
-            None => break,
-        }
-    }
-    assert_eq!(walked.len(), digests.len());
-    for digest in &digests {
-        assert!(walked.contains(digest));
-    }
 }
 
-pub async fn test_datastore_list_revisions_across_algorithms(m: Arc<MetadataStore>) {
+pub async fn test_datastore_stream_revisions_across_algorithms(m: Arc<MetadataStore>) {
     let namespace = &Namespace::new("multi-algo-repo").unwrap();
 
     // Two revisions per algorithm. sha256 and sha512 are stored under separate
-    // prefixes; the merged listing must concatenate them in global sort order
-    // (every sha256 before every sha512) and paginate across the boundary.
+    // prefixes; the stream must chain them in global sort order (every sha256
+    // before every sha512), each exactly once.
     let mut expected = Vec::new();
     for content in [b"a".as_slice(), b"b".as_slice()] {
         for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
@@ -429,24 +403,8 @@ pub async fn test_datastore_list_revisions_across_algorithms(m: Arc<MetadataStor
     }
     expected.sort();
 
-    // A single large page returns every revision, globally sorted.
-    let (all, token) = m.list_revisions(namespace, 100, None).await.unwrap();
-    assert!(token.is_none());
+    let all: Vec<Digest> = m.stream_revisions(namespace).try_collect().await.unwrap();
     assert_eq!(all, expected);
-
-    // Walking one at a time visits the same set across the algorithm boundary,
-    // exactly once each, ending with a `None` token.
-    let mut walked = Vec::new();
-    let mut marker = None;
-    loop {
-        let (page, next) = m.list_revisions(namespace, 1, marker).await.unwrap();
-        walked.extend(page);
-        match next {
-            Some(next_marker) => marker = Some(next_marker),
-            None => break,
-        }
-    }
-    assert_eq!(walked, expected);
 }
 
 pub async fn test_datastore_link_operations(m: Arc<MetadataStore>) {
@@ -507,17 +465,17 @@ async fn test_list_referrers() {
 }
 
 #[tokio::test]
-async fn test_list_revisions() {
+async fn test_stream_revisions() {
     for_each_backend(async |test_case| {
-        test_datastore_list_revisions(test_case.metadata_store()).await;
+        test_datastore_stream_revisions(test_case.metadata_store()).await;
     })
     .await;
 }
 
 #[tokio::test]
-async fn test_list_revisions_across_algorithms() {
+async fn test_stream_revisions_across_algorithms() {
     for_each_backend(async |test_case| {
-        test_datastore_list_revisions_across_algorithms(test_case.metadata_store()).await;
+        test_datastore_stream_revisions_across_algorithms(test_case.metadata_store()).await;
     })
     .await;
 }

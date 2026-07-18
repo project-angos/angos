@@ -7,9 +7,9 @@ use std::sync::Arc;
 use angos_s3_client::{Backend as S3Client, BackendConfig};
 use angos_storage::fs::Backend as FsBackend;
 use angos_storage::s3::Backend as S3Store;
-use angos_storage::{Error as StorageError, ObjectStore};
+use angos_storage::{Error as StorageError, ObjectStore, paginated};
 use bytes::Bytes;
-use futures_util::{StreamExt, stream};
+use futures_util::{TryStreamExt, stream};
 use sha2::{Digest, Sha256};
 
 use crate::error::{GateError, GateResult};
@@ -112,17 +112,12 @@ impl GateStore {
 
     /// Every key under `prefix`, across pages.
     pub async fn keys_under(&self, prefix: &str) -> GateResult<Vec<String>> {
-        let mut keys = Vec::new();
-        let mut token = None;
-        loop {
+        paginated(|token| async move {
             let page = self.store.list(prefix, LIST_PAGE_SIZE, token).await?;
-            keys.extend(page.items);
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
-        }
-        Ok(keys)
+            Ok::<_, GateError>((page.items, page.next_token))
+        })
+        .try_collect()
+        .await
     }
 
     /// Open a real in-flight multipart upload at `key` with one committed
@@ -165,37 +160,26 @@ impl GateStore {
     }
 
     /// Hash every object in the store. Content is re-read and re-hashed on
-    /// every call so the snapshot trusts nothing cached.
+    /// every call so the snapshot trusts nothing cached; keys stream off the
+    /// listing straight into up to `SNAPSHOT_CONCURRENCY` concurrent reads.
     pub async fn snapshot(&self) -> GateResult<Snapshot> {
-        let mut keys = Vec::new();
-        let mut token = None;
-        loop {
+        paginated(|token| async move {
             let page = self.store.list("", LIST_PAGE_SIZE, token).await?;
-            keys.extend(page.items);
-            token = page.next_token;
-            if token.is_none() {
-                break;
+            Ok::<_, GateError>((page.items, page.next_token))
+        })
+        .map_ok(|key| {
+            let store = Arc::clone(&self.store);
+            async move {
+                let body = store.get(&key).await?;
+                Ok((key, sha256_hex(&body)))
             }
-        }
-
-        let hashed: Vec<Result<(String, String), StorageError>> = stream::iter(keys)
-            .map(|key| {
-                let store = Arc::clone(&self.store);
-                async move {
-                    let body = store.get(&key).await?;
-                    Ok((key, sha256_hex(&body)))
-                }
-            })
-            .buffer_unordered(SNAPSHOT_CONCURRENCY)
-            .collect()
-            .await;
-
-        let mut snap = Snapshot::new();
-        for entry in hashed {
-            let (key, hash) = entry?;
+        })
+        .try_buffer_unordered(SNAPSHOT_CONCURRENCY)
+        .try_fold(Snapshot::new(), |mut snap, (key, hash)| async move {
             snap.insert(key, hash);
-        }
-        Ok(snap)
+            Ok(snap)
+        })
+        .await
     }
 }
 
