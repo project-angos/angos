@@ -9,13 +9,11 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::{
+    cache_fill::CacheFetchBlobPayload,
     command::scrub::{Error, action::Action, executor::ActionSink},
     jobs::store::{Error as JobStoreError, JobStore},
     jobs::{JobState, Queue},
-    registry::{
-        Repository, cache_job_handler::CacheFetchBlobPayload,
-        repository_resolver::RepositoryResolver,
-    },
+    registry::{Repository, repository_resolver::RepositoryResolver},
     replication::ReplicationPushPayload,
 };
 
@@ -240,6 +238,7 @@ mod tests {
     use serde_json::json;
 
     use crate::{
+        cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
         command::{
             prune::orphan_jobs::{OrphanJobChecker, OrphanQueue},
             scrub::{
@@ -255,7 +254,6 @@ mod tests {
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             Repository,
-            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
             metadata_store::MetadataStore,
             repository::Upstream,
             repository_resolver::RepositoryResolver,

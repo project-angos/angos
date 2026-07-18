@@ -1,9 +1,4 @@
-use std::{
-    fmt,
-    num::NonZeroUsize,
-    sync::{Arc, Weak},
-    time::Duration,
-};
+use std::{fmt, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use tokio::{select, time::sleep};
 use tokio_util::sync::CancellationToken;
@@ -13,7 +8,6 @@ mod admin;
 pub mod blob;
 pub mod blob_ownership;
 pub mod blob_store;
-pub mod cache_job_handler;
 pub mod content_discovery;
 mod error;
 #[cfg(test)]
@@ -33,6 +27,7 @@ pub mod version;
 pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
+    cache_fill::CacheFillJobHandler,
     configuration::{
         RegexPattern,
         global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
@@ -45,7 +40,7 @@ use crate::{
     },
     oci::Namespace,
     registry::{
-        blob_store::BlobStore, cache_job_handler::CacheJobHandler, metadata_store::MetadataStore,
+        blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationJobHandler,
@@ -148,9 +143,8 @@ impl fmt::Debug for Registry {
 }
 
 impl Registry {
-    /// Returns an `Arc` because the in-process job queue's cache handler
-    /// holds a `Weak` self-reference, so cache fills run (and emit events)
-    /// through the registry itself.
+    /// Returns an `Arc`: the one registry instance is shared across the server
+    /// handlers and background commands.
     #[instrument(skip(blob_store, metadata_store, resolver, config))]
     pub fn new(
         blob_store: Arc<BlobStore>,
@@ -158,45 +152,44 @@ impl Registry {
         resolver: Arc<RepositoryResolver>,
         config: RegistryConfig,
     ) -> Result<Arc<Self>, Error> {
-        Ok(Arc::new_cyclic(|registry| {
-            let (job_queue, in_process_shutdown): (Arc<JobStore>, Option<CancellationToken>) =
-                if let Some(q) = config.job_queue {
-                    (q, None)
-                } else {
-                    let (q, shutdown) = build_in_process_queue(
-                        &resolver,
-                        &blob_store,
-                        &metadata_store,
-                        config.max_concurrent_cache_jobs,
-                        config.max_concurrent_replication_jobs,
-                        registry.clone(),
-                    );
-                    (q, Some(shutdown))
-                };
+        let (job_queue, in_process_shutdown): (Arc<JobStore>, Option<CancellationToken>) =
+            if let Some(q) = config.job_queue {
+                (q, None)
+            } else {
+                let (q, shutdown) = build_in_process_queue(
+                    &resolver,
+                    &blob_store,
+                    &metadata_store,
+                    config.max_concurrent_cache_jobs,
+                    config.max_concurrent_replication_jobs,
+                    config.event_dispatcher.clone(),
+                );
+                (q, Some(shutdown))
+            };
 
-            Self {
-                update_pull_time: config.update_pull_time,
-                enable_blob_redirect: config.enable_blob_redirect,
-                enable_manifest_redirect: config.enable_manifest_redirect,
-                blob_store,
-                metadata_store,
-                resolver,
-                job_queue,
-                in_process_shutdown,
-                global_immutable_tags: config.global_immutable_tags,
-                global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
-                max_manifest_size_bytes: config.max_manifest_size_bytes,
-                max_blob_size_bytes: config.max_blob_size_bytes,
-                validate_manifest_references: config.validate_manifest_references,
-                event_dispatcher: config.event_dispatcher,
-            }
+        Ok(Arc::new(Self {
+            update_pull_time: config.update_pull_time,
+            enable_blob_redirect: config.enable_blob_redirect,
+            enable_manifest_redirect: config.enable_manifest_redirect,
+            blob_store,
+            metadata_store,
+            resolver,
+            job_queue,
+            in_process_shutdown,
+            global_immutable_tags: config.global_immutable_tags,
+            global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
+            max_manifest_size_bytes: config.max_manifest_size_bytes,
+            max_blob_size_bytes: config.max_blob_size_bytes,
+            validate_manifest_references: config.validate_manifest_references,
+            event_dispatcher: config.event_dispatcher,
         }))
     }
 
-    /// A cache-fill job handler backed by this registry, for external drains
-    /// (`angos worker`).
-    pub fn cache_job_handler(self: &Arc<Self>) -> Arc<dyn JobHandler> {
-        Arc::new(CacheJobHandler::new(Arc::downgrade(self)))
+    /// The configured webhook dispatcher, shared so externally built handlers
+    /// (the worker's cache-fill handler) emit through the same instance that
+    /// [`Registry::shutdown`] drains.
+    pub fn event_dispatcher(&self) -> Option<Arc<EventDispatcher>> {
+        self.event_dispatcher.clone()
     }
 
     pub async fn flush_pending_writes(&self) {
@@ -280,12 +273,17 @@ fn build_in_process_queue(
     metadata_store: &Arc<MetadataStore>,
     cache_concurrency: NonZeroUsize,
     replication_concurrency: NonZeroUsize,
-    registry: Weak<Registry>,
+    event_dispatcher: Option<Arc<EventDispatcher>>,
 ) -> (Arc<JobStore>, CancellationToken) {
     let job_store: Arc<JobStore> =
         Arc::new(JobStore::new(metadata_store.store_arc(), "in-process"));
 
-    let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(registry));
+    let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheFillJobHandler::new(
+        resolver.clone(),
+        blob_store.clone(),
+        metadata_store.clone(),
+        event_dispatcher,
+    ));
 
     // Drain replication only when a downstream is configured: with none, the
     // queue stays empty forever, so its loops would just storm the object store

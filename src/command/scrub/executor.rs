@@ -626,10 +626,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
         jobs::store::FailOutcome,
         oci::Digest,
         registry::{
-            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
             metadata_store::{LinkKind, LinkOperation},
             test_utils::{build_store, for_each_backend, put_blob_direct},
         },

@@ -4,16 +4,15 @@ use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
+    cache_fill::build_envelope,
     event_webhook::event::{Event, EventActor, EventKind},
     jobs::Queue,
-    jobs::store::JobEnvelope,
     metrics_provider::metrics_provider,
     oci::{Digest, Namespace, UploadSessionId},
     registry::{
         Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::{BlobStore, BoxedReader},
-        cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
         metadata_store::{LinkKind, MetadataStore},
     },
 };
@@ -243,16 +242,7 @@ impl Registry {
     /// logged and counted on `angos_job_queue_enqueue_failures_total` but never
     /// bubbles up, so a scheduling glitch cannot degrade the client response.
     async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
-        let payload = CacheFetchBlobPayload {
-            namespace: namespace.clone(),
-            digest: digest.to_string(),
-        };
-        let envelope = match JobEnvelope::new(
-            Queue::Cache,
-            CACHE_FETCH_BLOB_KIND,
-            format!("{}.{namespace}:{digest}", Queue::Cache),
-            &payload,
-        ) {
+        let envelope = match build_envelope(namespace, digest) {
             Ok(envelope) => envelope,
             Err(e) => {
                 warn!("Failed to build cache job envelope for {digest}: {e}");
