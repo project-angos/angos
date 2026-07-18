@@ -170,7 +170,7 @@ rules = [
 ]
 ```
 
-This rule allows access when `identity.username` is not empty, meaning the user has authenticated with valid credentials.
+This rule allows access when `identity.username` is set, meaning the client has authenticated with valid credentials. For anonymous clients `identity.username` is `null`, so the rule does not match.
 
 ## What's Next?
 

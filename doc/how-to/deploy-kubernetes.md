@@ -262,6 +262,7 @@ ttl = 10
 
 [cache.redis]
 url = "redis://redis:6379"
+key_prefix = "angos"
 ```
 
 ---

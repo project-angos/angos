@@ -65,11 +65,7 @@ Returns the UI configuration.
 
 ### Static Assets
 
-```
-GET /_ui/*
-```
-
-Serves static UI assets (JavaScript, CSS, fonts).
+Static assets have no dedicated URL prefix. Every `GET` or `HEAD` request outside the API routes (`/v2/...`, `/_ext/...`, `/_ui/config`, `/healthz`, `/readyz`, `/metrics`) serves the embedded single-page app, falling back to `index.html` for paths that match no bundled asset. Only the configuration endpoint above uses the `/_ui` prefix.
 
 ---
 
@@ -96,10 +92,10 @@ rules = [
   "request.action == 'ui-asset' || request.action == 'ui-config'",
 
   # Allow authenticated users to browse
-  "identity.username != '' && request.action.startsWith('list-')",
+  "identity.username != null && request.action.startsWith('list-')",
 
   # Allow reading manifests
-  "identity.username != '' && request.action == 'get-manifest'"
+  "identity.username != null && request.action == 'get-manifest'"
 ]
 ```
 
@@ -108,9 +104,9 @@ rules = [
 ```toml
 rules = [
   "request.action == 'ui-asset' || request.action == 'ui-config'",
-  "identity.username != '' && request.action.startsWith('list-')",
-  "identity.username != '' && request.action == 'get-manifest'",
-  "identity.username != '' && request.action == 'get-blob'"
+  "identity.username != null && request.action.startsWith('list-')",
+  "identity.username != null && request.action == 'get-manifest'",
+  "identity.username != null && request.action == 'get-blob'"
 ]
 ```
 
@@ -119,7 +115,7 @@ rules = [
 ```toml
 rules = [
   "request.action == 'ui-asset' || request.action == 'ui-config'",
-  "identity.username != ''"
+  "identity.username != null"
 ]
 ```
 

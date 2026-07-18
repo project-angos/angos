@@ -27,7 +27,7 @@ Useful modules:
 - `angos::configuration` - Config loading/watching
 - `angos::auth` - Authentication
 - `angos::cache` - Pull-through cache
-- `angos::registry::access_policy` - Policy evaluation
+- `angos::policy` - Policy evaluation
 
 ---
 
@@ -52,7 +52,7 @@ Useful modules:
    ```toml
    [global.access_policy]
    default = "deny"
-   rules = ["identity.username != ''"]
+   rules = ["identity.username != null"]
    ```
 
 ### "forbidden: access denied"
@@ -62,7 +62,7 @@ Useful modules:
 **Solutions**:
 1. Enable policy debug logging:
    ```bash
-   RUST_LOG=angos::registry::access_policy=debug
+   RUST_LOG=angos::policy=debug
    ```
 
 2. Check rules match your identity and action
@@ -156,7 +156,7 @@ Malformed certificates receive a generic `Invalid certificate` response. Enable 
    ```toml
    immutable_tags_exclusions = ["^latest$", "^your-tag$"]
    ```
-3. Disable immutability for the repository
+3. Disable immutability where it is enabled; a tag is immutable when the global flag or the repository flag is true, so a repository setting cannot override a global `immutable_tags = true`
 
 ### Push Timeout
 
@@ -350,7 +350,7 @@ Add to access policy:
 ```toml
 rules = [
   "request.action == 'ui-asset' || request.action == 'ui-config'",
-  "identity.username != '' && request.action.startsWith('list-')"
+  "identity.username != null && request.action.startsWith('list-')"
 ]
 ```
 

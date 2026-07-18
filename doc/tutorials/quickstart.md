@@ -67,12 +67,12 @@ This configures the registry to:
 ## Step 3: Start the Registry
 
 ```bash
-./angos -c config.toml server
+RUST_LOG=info ./angos -c config.toml server
 ```
 
-You should see output indicating the server is running:
-```
-Listening on 0.0.0.0:8000 (non-TLS)
+Angos emits JSON logs, and `RUST_LOG=info` makes startup messages visible. You should see a log line containing `Listening on 0.0.0.0:8000`:
+```json
+{"timestamp":"2026-07-18T18:21:50.620961Z","level":"INFO","fields":{"message":"Listening on 0.0.0.0:8000 (non-TLS)"},"target":"angos::command::server::listeners"}
 ```
 
 ## Step 4: Configure Docker for Insecure Registry

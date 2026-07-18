@@ -19,7 +19,7 @@ Retention policies define which images to **keep**. Images not matching any rule
 
 ```mermaid
 sequenceDiagram
-    participant S as Scrubber
+    participant S as Prune
     participant M as Manifest
     participant R as Retention Rules
 

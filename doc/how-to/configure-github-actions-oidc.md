@@ -268,9 +268,10 @@ RUST_LOG=angos::auth=debug ./angos server
 
 You should see:
 ```
-OIDC token validated for provider github-actions
-Claims: repository=myorg/myrepo, ref=refs/heads/main, actor=username
+OIDC token validated for provider 'github-actions' (type='GitHub Actions', sub=Some("repo:myorg/myrepo:ref:refs/heads/main"), iss=Some("https://token.actions.githubusercontent.com"))
 ```
+
+The log only includes the provider name/type and the `sub`/`iss` claims; the full claims map is never logged, to avoid leaking user/CI metadata.
 
 ---
 

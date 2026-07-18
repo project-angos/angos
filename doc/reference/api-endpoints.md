@@ -47,6 +47,8 @@ a digest that exists in storage but is not linked to the requested namespace ret
 
 Range requests for pull-through repositories are supported only after the blob is available locally. A range request for an uncached pull-through blob returns `416`; request the full blob first to populate the cache.
 
+When blob redirects are enabled (`global.enable_blob_redirect`, default `true`) and the blob store supports presigned URLs, `GET` may answer with a `307` redirect. Sending an `X-Angos-No-Redirect` header with any non-empty value other than `0` or `false` forces an inline body instead. The web UI sends it because a browser `fetch` cannot follow the cross-origin presigned redirect; OCI clients never send it.
+
 ```
 DELETE /v2/{namespace}/blobs/{digest}
 ```
@@ -124,6 +126,8 @@ GET  /v2/{namespace}/manifests/{reference}
 ```
 
 Check existence or download a manifest. `{reference}` can be a tag or digest.
+
+When manifest redirects are enabled (`global.enable_manifest_redirect`, default `true`) and the blob store supports presigned URLs, `GET` may answer with a `307` redirect. As for blobs, an `X-Angos-No-Redirect` header with any non-empty value other than `0` or `false` forces an inline body instead.
 
 ```
 PUT /v2/{namespace}/manifests/{reference}
@@ -260,18 +264,23 @@ List all configured repositories with their namespace counts.
 GET /_ext/{repository}/_namespaces
 ```
 
-List namespaces within a repository.
+List namespaces within a repository, with the repository's effective configuration.
 
 **Response:**
 ```json
 {
+  "repository": "library",
   "namespaces": [
     {
-      "name": "nginx",
-      "manifests": 25,
-      "uploads": 0
+      "name": "library/nginx",
+      "manifest_count": 25,
+      "upload_count": 0
     }
-  ]
+  ],
+  "pull_through_cache": true,
+  "upstream_urls": ["https://registry-1.docker.io"],
+  "immutable_tags": false,
+  "immutable_tags_exclusions": []
 }
 ```
 
@@ -281,23 +290,37 @@ List namespaces within a repository.
 GET /_ext/{namespace}/_revisions
 ```
 
-List all manifest revisions with tags and parent relationships.
+List all manifest revisions with tags, parent relationships, and referrers.
 
 **Response:**
 ```json
 {
-  "revisions": [
+  "name": "library/nginx",
+  "manifests": [
     {
       "digest": "sha256:abc123...",
-      "media_type": "application/vnd.oci.image.index.v1+json",
       "tags": ["latest", "1.25.0"],
-      "parent": null,
-      "pushed_at": 1703123456,
-      "last_pulled_at": 1703200000
+      "parents": [
+        {
+          "digest": "sha256:def456...",
+          "tags": ["latest"],
+          "platform": {"os": "linux", "architecture": "amd64"}
+        }
+      ],
+      "referrers": [
+        {
+          "digest": "sha256:789abc...",
+          "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json"
+        }
+      ],
+      "pushed_at": "2026-01-01T12:00:00Z",
+      "last_pulled_at": "2026-01-02T08:30:00Z"
     }
   ]
 }
 ```
+
+`parents` and `referrers` are omitted when empty; `pushed_at` and `last_pulled_at` are omitted when not recorded.
 
 ### List Uploads
 
@@ -310,11 +333,12 @@ List blob uploads in progress.
 **Response:**
 ```json
 {
+  "name": "library/nginx",
   "uploads": [
     {
       "uuid": "123e4567-e89b-12d3-a456-426614174000",
       "size": 1048576,
-      "started_at": 1703123456
+      "started_at": "2026-01-01T12:00:00Z"
     }
   ]
 }
@@ -432,7 +456,7 @@ Returns `200 OK` if the service is running. Use this for Kubernetes liveness pro
 GET /readyz
 ```
 
-Returns `200 OK` if the storage backend is healthy and ready to handle requests. Checks accessibility of the blob store, metadata store, and lock backend.
+Returns `200 OK` when the metadata store answers a single bounded listing. The check does not walk the namespace tree and does not probe the blob store or lock backend.
 
 Use this for Kubernetes readiness probes to detect when a replica is unable to serve traffic.
 
@@ -489,7 +513,7 @@ Returns UI configuration.
 
 ## Authentication
 
-All endpoints (except `/healthz` and `/readyz`) require authentication when access policies are configured.
+Every route passes through the access policy, including `/healthz` and `/readyz` (actions `healthz` and `readyz`). A default-deny policy must allow those actions or health and readiness probes fail.
 
 ### Methods
 
@@ -551,7 +575,7 @@ Errors follow OCI Distribution error format:
 | Code                  | HTTP Status  | Description               |
 |-----------------------|--------------|---------------------------|
 | `BLOB_UNKNOWN`        | 404          | Blob does not exist       |
-| `BLOB_UPLOAD_INVALID` | 400          | Invalid upload            |
+| `BLOB_UPLOAD_INVALID` | 413          | Blob upload exceeds `global.max_blob_size` |
 | `BLOB_UPLOAD_UNKNOWN` | 404          | Upload session not found  |
 | `DIGEST_INVALID`      | 400          | Invalid digest format     |
 | `MANIFEST_BLOB_UNKNOWN` | 404        | Manifest reference is missing |
@@ -559,10 +583,9 @@ Errors follow OCI Distribution error format:
 | `MANIFEST_UNKNOWN`    | 404          | Manifest does not exist   |
 | `NAME_INVALID`        | 400          | Invalid repository name   |
 | `NAME_UNKNOWN`        | 404          | Repository not found      |
-| `SIZE_INVALID`        | 400          | Size mismatch             |
-| `TAG_INVALID`         | 400          | Invalid tag               |
+| `SIZE_INVALID`        | 416          | Requested range not satisfiable |
 | `CONFLICT`            | 409          | Write rejected, for example, an immutable tag cannot be overwritten |
 | `REPLICATION_SUPERSEDED` | 409       | Replication write rejected by last-writer-wins (the local copy is strictly newer) |
 | `UNAUTHORIZED`        | 401          | Authentication required   |
 | `DENIED`              | 403 or 405   | Access denied by policy, or blob is still referenced |
-| `UNSUPPORTED`         | 415          | Unsupported operation     |
+| `UNSUPPORTED`         | 400          | Unsupported operation     |

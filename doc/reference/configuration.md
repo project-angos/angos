@@ -18,6 +18,7 @@ Most configuration changes take effect immediately without restart. The followin
 - Enabling or disabling TLS
 - Changing storage backend type (filesystem ↔ S3)
 - Changing lock strategy
+- Adding or removing `[global.job_queue]`
 
 TLS certificate files are also automatically reloaded when they change.
 
@@ -38,11 +39,12 @@ Timeout values must be greater than zero.
 
 When omitted, the server runs without TLS (insecure).
 
-| Option                      | Type   | Default  | Description                       |
-|-----------------------------|--------|----------|-----------------------------------|
-| `server_certificate_bundle` | string | required | Path to server certificate (PEM)  |
-| `server_private_key`        | string | required | Path to server private key (PEM)  |
-| `client_ca_bundle`          | string | -        | Path to client CA bundle for mTLS |
+| Option                      | Type   | Default      | Description                       |
+|-----------------------------|--------|--------------|-----------------------------------|
+| `server_certificate_bundle` | string | required     | Path to server certificate (PEM)  |
+| `server_private_key`        | string | required     | Path to server private key (PEM)  |
+| `client_ca_bundle`          | string | -            | Path to client CA bundle for mTLS |
+| `client_auth`               | string | `"optional"` | `"optional"` accepts both anonymous clients and clients whose certificate validates against `client_ca_bundle`; `"required"` rejects the TLS handshake without a valid client certificate and needs `client_ca_bundle` set. Ignored when `client_ca_bundle` is unset |
 
 ---
 
@@ -136,7 +138,7 @@ Token and key cache configuration. Defaults to in-memory (not suitable for multi
 | Option       | Type   | Default  | Description                                  |
 |--------------|--------|----------|----------------------------------------------|
 | `url`        | string | required | Redis URL (e.g., `"redis://localhost:6379"`) |
-| `key_prefix` | string | -        | Prefix for cache keys                        |
+| `key_prefix` | string | required | Prefix for cache keys                        |
 
 ---
 
@@ -277,15 +279,7 @@ conditional_operations = false
 
 ### Distributed Locking
 
-Multi-replica deployments require a distributed lock backend. The `lock_strategy` field on the metadata store selects the backend. Three options are available:
-
-**Lock Strategy Compatibility Matrix:**
-
-| Lock Strategy | S3 metadata | FS metadata |
-|---|---|---|
-| memory | Yes | Yes |
-| redis | Yes | Yes |
-| s3 | Yes | No |
+Multi-replica deployments require a distributed lock backend. The `lock_strategy` field on the metadata store selects the backend. Three options are available; see [Lock Strategy Compatibility](#lock-strategy-compatibility) for the backend support matrix.
 
 > **Note:** `lock_strategy = "s3"` selects the CAS-based coordinator and requires the provider to support the full conditional set (`If-None-Match` and `If-Match` on PUT, `If-Match` on DELETE); startup fails fast if any is missing. `lock_strategy = "memory"` and `"redis"` select the lock coordinator, but Angos still uses conditional writes for blob-index shard updates when available.
 
@@ -313,21 +307,21 @@ retry_delay_ms = 50
 
 | Option                          | Type | Default | Description                  |
 |---------------------------------|------|---------|------------------------------|
-| `ttl_secs`                      | u64  | `30`    | Lock TTL in seconds (minimum: 9). Heartbeat renews at intervals of `ttl_secs / 3` |
+| `ttl_secs`                      | u64  | `30`    | Lock TTL in seconds (9 to 3600). Heartbeat renews at intervals of `ttl_secs / 3` |
 | `max_retries`                   | u32  | `100`   | Max lock acquisition retries |
 | `retry_delay_ms`                | u64  | `50`    | Delay between retries (minimum: 1) |
-| `max_hold_secs`                 | u64  | `300`   | Maximum lock hold duration in seconds (minimum: 10, must be >= `ttl_secs`). Guard is invalidated if held beyond this duration |
+| `max_hold_secs`                 | u64  | `300`   | Maximum lock hold duration in seconds (must be >= `ttl_secs`). Guard is invalidated if held beyond this duration |
 | `operation_timeout_secs`        | u64  | `15`    | Total timeout for lock S3 operations |
 | `operation_attempt_timeout_secs`| u64  | `4`     | Per-attempt timeout for lock S3 operations |
 | `max_attempts`                  | u32  | `2`     | Maximum retry attempts for lock S3 operations |
 
-> **Lock operation timeouts:** Lock operations use their own S3 client with significantly tighter timeouts than blob/metadata operations. This is intentional: lock operations are small JSON payloads and should fail fast rather than blocking for minutes on a stuck request. The defaults (`operation_timeout_secs = 15`, `operation_attempt_timeout_secs = 4`, `max_attempts = 2`) ensure that a single stuck request cannot consume an entire heartbeat interval (10s with default TTL). Each heartbeat tick is also capped to the heartbeat interval to prevent the slow path (two sequential SDK calls) from exceeding it. A startup warning is emitted if `operation_attempt_timeout_secs × max_attempts >= ttl_secs / 3`. For high-latency S3 scenarios, increase these values but keep `attempt_timeout × max_attempts` below the heartbeat interval.
+> **Lock operation timeouts:** Lock operations use their own S3 client with significantly tighter timeouts than blob/metadata operations. This is intentional: lock operations are small JSON payloads and should fail fast rather than blocking for minutes on a stuck request. The defaults (`operation_timeout_secs = 15`, `operation_attempt_timeout_secs = 4`, `max_attempts = 2`) ensure that a single stuck request cannot consume an entire heartbeat interval (10s with default TTL). Each heartbeat tick is also capped to the heartbeat interval to prevent the slow path (two sequential SDK calls) from exceeding it. For high-latency S3 scenarios, increase these values but keep `attempt_timeout × max_attempts` below the heartbeat interval.
 
 **Heartbeat Mechanism:**
 
 The S3 lock implementation uses a heartbeat to keep locks alive. Once acquired, a background task automatically renews the lock at regular intervals of `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, the heartbeat runs every 10 seconds. This allows the lock to remain valid beyond the initial TTL as long as the lock-holder remains alive. If a lock-holder crashes, other instances must wait for the full `ttl_secs` duration before the lock becomes available for recovery.
 
-Transient heartbeat failures (connect errors, refresh timeouts, network blips) accumulate up to a small budget (roughly one TTL of slack) before cancelling the in-flight operation. Authoritative signals cancel immediately: S3 reports `ownership_lost`, `etag_unavailable`, `file_disappeared`, or `max_hold_exceeded`; Redis reports `ownership_lost` (refresh script detected the key was overwritten). When the budget is exhausted, the heartbeat emits `heartbeat_failure` for both backends to flag the cancellation as transient-failure-driven rather than authoritative.
+Transient heartbeat failures (connect errors, refresh timeouts, network blips) accumulate up to a small budget (roughly one TTL of slack) before cancelling the in-flight operation. Authoritative signals cancel immediately: S3 reports `ownership_lost`, `file_disappeared`, or `max_hold_exceeded`; Redis reports `ownership_lost` (refresh script detected the key was overwritten). When the budget is exhausted, the heartbeat emits `heartbeat_failure` for both backends to flag the cancellation as transient-failure-driven rather than authoritative.
 
 Locks are released as part of the operation flow: a successful operation releases its lock before returning. If the surrounding request or task is cancelled mid-operation, a best-effort background release fires on the current Tokio runtime so the remote lock is freed promptly without waiting on TTL. The fallback applies only when a runtime is still available; during process shutdown the lock expires via `ttl_secs`.
 
@@ -421,8 +415,8 @@ Repository namespace keys must not overlap: a key like `team` and a key like `te
 
 | Option                      | Type     | Default  | Description                     |
 |-----------------------------|----------|----------|---------------------------------|
-| `immutable_tags`            | bool     | inherits | Override global immutable tags  |
-| `immutable_tags_exclusions` | [string] | inherits | Override global exclusions      |
+| `immutable_tags`            | bool     | `false`  | Enable immutable tags for this repository. The effective flag is this value OR `global.immutable_tags`, so a repository can add immutability but never opt out of a global `true` |
+| `immutable_tags_exclusions` | [string] | inherits | Replaces the global exclusion list when non-empty |
 | `authorization_webhook`     | string   | inherits | Webhook name (empty to disable) |
 | `event_webhooks`            | [string] | inherits | Event webhook names              |
 
@@ -465,7 +459,7 @@ Array of downstream registries to which this repository's mutations are replicat
 
 `mode` values:
 - `event+reconcile` (default): push on every local mutation **and** include in `angos replicate`.
-- `event-only`: push on local mutations; excluded from scrub reconciliation.
+- `event-only`: push on local mutations; excluded from `angos replicate` reconciliation.
 - `reconcile-only`: excluded from live pushes; mirrored only via `angos replicate`.
 
 If either `client_certificate` or `client_private_key` is set, both must be set.
@@ -491,7 +485,7 @@ HTTP POST notifications for registry operations. See [Event Webhooks Reference](
 | `events`            | [string] | required | Event types to deliver (at least one)            |
 | `token`             | string   | -        | Bearer token and HMAC signing secret             |
 | `timeout_ms`        | u64      | `5000`   | HTTP request timeout in milliseconds             |
-| `max_retries`       | u32      | `0`      | Maximum retry attempts after initial failure     |
+| `max_retries`       | u32      | policy   | Maximum retry attempts after initial failure (max 16); defaults to `3` for `required`, `0` otherwise |
 | `repository_filter` | [string] | -        | Regex patterns to match repository names         |
 
 `url`, `events`, `token`, and `repository_filter` are validated when the
@@ -517,24 +511,7 @@ Webhooks are enabled by referencing their names:
 
 ### Prometheus Metrics
 
-Angos emits Prometheus metrics on the `/metrics` endpoint. The following metrics are available for lock operations:
-
-**Lock Metrics:**
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `lock_acquisition_duration_ms` | Histogram | `backend` | Lock acquisition duration in milliseconds |
-| `lock_acquisitions_total` | Counter | `backend`, `result` | Total lock acquisition attempts |
-| `lock_retries_total` | Counter | `backend` | Total lock acquisition retries |
-| `lock_invalidations_total` | Counter | `backend`, `reason` | Total lock invalidations |
-| `lock_recoveries_total` | Counter | `backend`, `result` | Total stale lock recovery attempts |
-
-**Label Values:**
-
-- `backend`: `s3`, `redis`, `memory`
-- `result` (acquisitions): `success`, `timeout`, `error`
-- `result` (recoveries): `acquired`, `not_stale`, `failed`, `error`
-- `reason` (invalidations): `ownership_lost`, `max_hold_exceeded`, `heartbeat_failure`, `etag_unavailable`, `file_disappeared` (both S3 and Redis report heartbeat-side failures as `heartbeat_failure`)
+Angos emits Prometheus metrics on the `/metrics` endpoint, including a family of lock metrics for the distributed lock backends. See [Lock Metrics](metrics.md#lock-metrics) for the metric names and label values.
 
 ---
 
@@ -587,6 +564,7 @@ ttl = 10
 
 [cache.redis]
 url = "redis://localhost:6379"
+key_prefix = "angos"
 
 [auth.identity.admin]
 username = "admin"
@@ -597,7 +575,7 @@ provider = "github"
 
 [global.access_policy]
 default = "deny"
-rules = ["identity.username != ''"]
+rules = ["identity.username != null"]
 
 [repository."docker-io"]
 [[repository."docker-io".upstream]]

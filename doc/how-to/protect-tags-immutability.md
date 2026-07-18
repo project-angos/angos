@@ -41,24 +41,23 @@ immutable_tags_exclusions = [
 
 ## Repository-Specific Settings
 
-Override global settings per repository:
+A repository can add immutability on top of the global setting, but cannot remove it: a tag is immutable when the global flag or the repository flag is true. To keep some repositories mutable, leave the global flag off and enable immutability per repository.
+
+Per-repository `immutable_tags_exclusions` replace the global list when non-empty; otherwise the global list applies.
 
 ```toml
-# Global default
+# Global default: all tags mutable
 [global]
-immutable_tags = true
-immutable_tags_exclusions = ["^latest$"]
-
-# Development: all tags mutable
-[repository."dev"]
 immutable_tags = false
 
-# Production: stricter exclusions
+# Development repositories inherit the global default: all tags mutable
+
+# Production: immutable, only 'latest' may change
 [repository."production"]
 immutable_tags = true
 immutable_tags_exclusions = ["^latest$"]
 
-# Staging: allow more mutable tags
+# Staging: immutable, more mutable tags
 [repository."staging"]
 immutable_tags = true
 immutable_tags_exclusions = [
@@ -102,12 +101,17 @@ immutable_tags_exclusions = [
 
 ### Protect Release Tags Only
 
+The pattern engine does not support negative lookahead, so "everything except vX.Y.Z" cannot be written as a single exclusion. List the mutable tag conventions explicitly instead:
+
 ```toml
 immutable_tags = true
 immutable_tags_exclusions = [
-  "^(?!v[0-9]+\\.[0-9]+\\.[0-9]+$).*$"  # Everything except vX.Y.Z
+  "^(?:latest|main|develop)$",   # Branch tags stay mutable
+  "^(?:dev|feature|nightly)-.*$" # Work-in-progress tags stay mutable
 ]
 ```
+
+Release tags such as `v1.2.3` match no exclusion and stay immutable.
 
 ### CI/CD Friendly
 
@@ -195,7 +199,8 @@ Response includes `immutable_tags: true/false` per repository.
 
 **Can't overwrite expected mutable tag:**
 - Check exclusion patterns match the tag
-- Repository settings override global
+- Non-empty repository exclusions replace the global list
+- A repository cannot disable a global `immutable_tags = true`
 - Patterns are regex, escape special characters
 
 **Immutability not enforced:**

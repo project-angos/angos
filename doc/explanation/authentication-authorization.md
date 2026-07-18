@@ -291,8 +291,9 @@ rules = [
 ]
 ```
 
-Because the queue holds cache-fill work items and the mutations requeue or
-delete them, treat these actions as a privileged surface: under a fail-closed
+Because the queue holds cache-fill and replication work items and the
+mutations requeue or delete them, treat these actions as a privileged
+surface: under a fail-closed
 `default = "deny"` policy they are denied to anyone the admin rule does not
 match.
 

@@ -112,36 +112,6 @@ url = "https://registry-1.docker.io"
 
 ## Request Flow
 
-### Manifest Request
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Registry
-    participant Cache
-    participant Upstream
-
-    Client->>Registry: GET /v2/library/nginx/manifests/1.29.0
-
-    Registry->>Cache: Check manifest
-    alt Cached + Immutable
-        Cache-->>Registry: Return manifest
-    else Cached + Mutable
-        Registry->>Upstream: HEAD (check digest)
-        alt Same digest
-            Cache-->>Registry: Return manifest
-        else Different digest
-            Registry->>Upstream: GET manifest
-            Registry->>Cache: Update cache
-        end
-    else Not cached
-        Registry->>Upstream: GET manifest
-        Registry->>Cache: Store manifest
-    end
-
-    Registry-->>Client: Manifest
-```
-
 ### Blob Request
 
 ```mermaid
@@ -205,10 +175,7 @@ This approach:
 
 ### Problem
 
-Upstream registries impose rate limits:
-- Docker Hub: 100 pulls/6 hours (anonymous)
-- Docker Hub: 200 pulls/6 hours (authenticated)
-- Other registries vary
+Upstream registries impose rate limits. Docker Hub limits pulls per account or IP over a time window, with higher limits for authenticated and paid accounts; see [Docker Hub usage limits](https://docs.docker.com/docker-hub/usage/) for current figures. Other registries vary.
 
 ### Solution
 
@@ -339,7 +306,20 @@ to route cache-fill work through a shared queue drained by `angos worker`.
 ```toml
 [[repository."library".upstream]]
 url = "https://registry-1.docker.io"
-max_redirect = 5  # Follow up to 5 redirects
+connect_timeout_secs = 30  # TCP + TLS handshake (default: 30)
+read_timeout_secs = 300    # Inactivity between reads (default: 300)
+```
+
+`read_timeout_secs` bounds the stall between two reads, not the whole transfer: a slow but progressing blob download is never cut off by a total deadline.
+
+### Redirects
+
+`max_redirect` (default 5) caps how many upstream redirects a request follows:
+
+```toml
+[[repository."library".upstream]]
+url = "https://registry-1.docker.io"
+max_redirect = 5
 ```
 
 ---

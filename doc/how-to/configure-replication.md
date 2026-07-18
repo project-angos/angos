@@ -42,6 +42,8 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (pos
 | `prune` | bool | `false` | When `true`, reconciliation also **deletes** tags present on this downstream but absent locally (authoritative one-way mirror). **Leave `false` for active-active peers**; see [Reconcile on Demand](#reconcile-on-demand). |
 | `username` / `password` | string | - | Basic auth for the downstream |
 | `max_redirect` | u8 | `5` | Maximum redirects to follow |
+| `connect_timeout_secs` | u64 | `30` | Timeout for establishing the connection (TCP + TLS handshake) |
+| `read_timeout_secs` | u64 | `300` | Timeout for inactivity between reads during a transfer; a slow but progressing blob transfer is never cut off by a total deadline |
 | `server_ca_bundle` | string | - | CA bundle to verify the downstream's TLS certificate |
 | `client_certificate` / `client_private_key` | string | - | mTLS to the downstream (both required together) |
 

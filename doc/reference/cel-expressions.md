@@ -93,6 +93,7 @@ Optional `request` fields are **omitted** when unset (only `request.action` is a
 | Action              | Description                  |
 |---------------------|------------------------------|
 | `healthz`           | Health check endpoint        |
+| `readyz`            | Readiness check endpoint     |
 | `metrics`           | Prometheus metrics endpoint  |
 | `get-api-version`   | API version check            |
 | `start-upload`      | Start blob upload            |
@@ -276,9 +277,9 @@ rules = [
 ## Error Handling
 
 **Access policy rules:**
-- Rules that fail to evaluate (e.g., null access) are skipped with a warning
+- A rule that fails to evaluate or returns a non-boolean value stops evaluation immediately and denies the request (fail-closed), with a `warn`-level log
 - For default-deny: at least one rule must return true to allow
-- For default-allow: at least one rule must return false to deny
+- For default-allow: the first rule returning true denies
 - Always check `identity.oidc != null` before accessing OIDC fields
 - Use bracket notation for claims: `identity.oidc.claims['claim_name']`
 

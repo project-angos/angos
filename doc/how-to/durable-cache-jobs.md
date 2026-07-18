@@ -116,6 +116,7 @@ configured the server publishes:
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `angos_job_queue_pending` | Gauge | `queue` | Pending jobs ready within the configured readiness horizon (`pending_ready_horizon_secs`, default 600 s). Refreshed by a background ticker; use this for KEDA autoscaling. Saturates at 10 000 (read as "≥ 10 000") to cap S3 `LIST` cost per refresh. |
+| `angos_job_queue_failed` | Gauge | `queue` | Dead-lettered jobs currently under `_jobs/failed/<queue>/`. Refreshed by the same ticker and saturates at the same 10 000 cap; keeps dead-letters observable even though `angos worker` has no metrics endpoint. |
 | `angos_job_queue_enqueued_total` | Counter | `queue`, `dedup` | Jobs submitted. `dedup="hit"` means a duplicate `lock_key` was suppressed. |
 
 `angos worker` has no HTTP listener and therefore exposes no metrics of its
@@ -178,9 +179,10 @@ of queue depth. `pending_refresh_interval_secs` is enforced to be ≥ 5 at
 config load (sub-5s ticks induce LIST storms on S3).
 
 **Backoff schedule:** Failed jobs are retried with exponential backoff:
-`min(1 min × 2^attempts, 10 min)`. With the default 5-attempt budget a job
-retries 4 times with delays of 2, 4, 8 and 10 minutes (24 minutes total)
-before being moved to the dead-letter queue.
+`min(100 ms × 2^attempts, 10 s)`, where `attempts` counts the failures so
+far. With the default 5-attempt budget a job retries 4 times with delays of
+200 ms, 400 ms, 800 ms and 1.6 s (3 seconds total) before being moved to the
+dead-letter queue.
 
 **Transactional engine path:** All writes (enqueue, complete, retry, and
 dead-letter) are routed through the transactional engine regardless of the
