@@ -23,6 +23,13 @@ pub struct BaseConfig {
     pub clock_skew_tolerance: u64,
     #[serde(default = "BaseConfig::default_allowed_algorithms")]
     pub allowed_algorithms: Vec<Algorithm>,
+    /// Timeout for an OIDC HTTP fetch (JWKS or discovery document).
+    #[serde(default = "BaseConfig::default_http_request_timeout_secs")]
+    pub http_request_timeout_secs: u64,
+    /// Timeout for the forced JWKS refetch triggered when a cached JWKS is
+    /// missing the token's key id (a rotated signing key).
+    #[serde(default = "BaseConfig::default_jwks_refresh_timeout_secs")]
+    pub jwks_refresh_timeout_secs: u64,
 }
 
 impl BaseConfig {
@@ -36,6 +43,14 @@ impl BaseConfig {
 
     pub fn default_allowed_algorithms() -> Vec<Algorithm> {
         vec![Algorithm::RS256]
+    }
+
+    pub fn default_http_request_timeout_secs() -> u64 {
+        30
+    }
+
+    pub fn default_jwks_refresh_timeout_secs() -> u64 {
+        5
     }
 }
 

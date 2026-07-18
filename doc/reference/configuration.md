@@ -373,6 +373,8 @@ Usernames must be unique across all `auth.identity` entries; a duplicate causes 
 | `required_audience`     | string | -                                                                | Required audience claim         |
 | `clock_skew_tolerance`  | u64    | `60`                                                             | Clock skew tolerance (seconds)  |
 | `allowed_algorithms`    | array  | `["RS256"]`                                                       | Allowed JWT signing algorithms  |
+| `http_request_timeout_secs` | u64 | `30`                                                          | Timeout for a JWKS or discovery HTTP fetch (seconds) |
+| `jwks_refresh_timeout_secs` | u64 | `5`                                                           | Timeout for the forced JWKS refetch on key rotation (seconds) |
 
 #### Generic Provider
 
@@ -385,6 +387,8 @@ Usernames must be unique across all `auth.identity` entries; a duplicate causes 
 | `required_audience`     | string | -          | Required audience claim                      |
 | `clock_skew_tolerance`  | u64    | `60`       | Clock skew tolerance (seconds)               |
 | `allowed_algorithms`    | array  | `["RS256"]` | Allowed JWT signing algorithms              |
+| `http_request_timeout_secs` | u64 | `30`     | Timeout for a JWKS or discovery HTTP fetch (seconds) |
+| `jwks_refresh_timeout_secs` | u64 | `5`      | Timeout for the forced JWKS refetch on key rotation (seconds) |
 
 `allowed_algorithms` accepts JWT algorithm names such as `"RS256"`, `"RS384"`, `"RS512"`, `"ES256"`, and `"ES384"`. Angos rejects tokens whose header claims an algorithm outside the provider allowlist before signature verification to prevent algorithm-confusion attacks.
 

@@ -35,6 +35,8 @@ pub fn build_test_provider_config(uri: &str) -> BaseConfig {
         required_audience: Some("test-audience".to_string()),
         clock_skew_tolerance: 60,
         allowed_algorithms: vec![Algorithm::ES256],
+        http_request_timeout_secs: 30,
+        jwks_refresh_timeout_secs: 5,
     }
 }
 
@@ -744,6 +746,8 @@ impl TestProvider {
                 required_audience: audience.map(str::to_string),
                 clock_skew_tolerance: 0,
                 allowed_algorithms: vec![Algorithm::ES256],
+                http_request_timeout_secs: 30,
+                jwks_refresh_timeout_secs: 5,
             },
             claim_error: None,
         }

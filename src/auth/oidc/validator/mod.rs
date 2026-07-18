@@ -43,8 +43,6 @@ struct CachedJsonRequest<'a> {
     fetch_timeout: Option<Duration>,
 }
 
-const JWKS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
-
 pub async fn validate_oidc_token(
     provider_name: &str,
     provider: &dyn OidcProvider,
@@ -273,8 +271,9 @@ async fn fetch_jwks(
     client: &Client,
     cache: &Cache,
 ) -> Result<CachedJson<Jwks>, Error> {
+    let timeout = Duration::from_secs(provider.base_config().http_request_timeout_secs);
     let cache_key = jwks_cache_key(provider);
-    let jwks_url = get_jwks_url(provider, client, cache, None).await?;
+    let jwks_url = get_jwks_url(provider, client, cache, Some(timeout)).await?;
     let fetched = fetch_cached_json::<Jwks, _>(
         CachedJsonRequest {
             client,
@@ -283,7 +282,7 @@ async fn fetch_jwks(
             url: &jwks_url,
             ttl: provider.base_config().jwks_refresh_interval,
             read_cache: true,
-            fetch_timeout: None,
+            fetch_timeout: Some(timeout),
         },
         |_| Ok(()),
     )
@@ -302,8 +301,9 @@ async fn refresh_jwks(
     client: &Client,
     cache: &Cache,
 ) -> Result<CachedJson<Jwks>, Error> {
+    let timeout = Duration::from_secs(provider.base_config().jwks_refresh_timeout_secs);
     let cache_key = jwks_cache_key(provider);
-    let jwks_url = get_jwks_url(provider, client, cache, Some(JWKS_REFRESH_TIMEOUT)).await?;
+    let jwks_url = get_jwks_url(provider, client, cache, Some(timeout)).await?;
     let fetched = fetch_cached_json::<Jwks, _>(
         CachedJsonRequest {
             client,
@@ -312,7 +312,7 @@ async fn refresh_jwks(
             url: &jwks_url,
             ttl: provider.base_config().jwks_refresh_interval,
             read_cache: false,
-            fetch_timeout: Some(JWKS_REFRESH_TIMEOUT),
+            fetch_timeout: Some(timeout),
         },
         |_| Ok(()),
     )
