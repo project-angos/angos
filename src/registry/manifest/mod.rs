@@ -47,6 +47,30 @@ enum ReferencePolicy {
     Trusted,
 }
 
+/// The inputs to [`Registry::accept_put_manifest`]; the manifest body is passed
+/// separately as a stream. Shared with the HTTP handler that builds it, so the
+/// domain and handler sides of the put-manifest path stay in step.
+pub struct PutManifestRequest<'a> {
+    pub namespace: &'a Namespace,
+    pub reference: Reference,
+    pub mime_type: MediaType,
+    pub tags: Vec<Tag>,
+    pub actor: Option<EventActor>,
+    pub source_ts: Option<DateTime<Utc>>,
+}
+
+/// The validated inputs to [`Registry::store_manifest`]; the manifest bytes are
+/// passed separately.
+#[derive(Clone, Copy)]
+struct StoreManifest<'a> {
+    namespace: &'a Namespace,
+    reference: &'a Reference,
+    content_type: Option<&'a MediaType>,
+    created_tags: &'a [Tag],
+    reference_policy: ReferencePolicy,
+    created_at: Option<DateTime<Utc>>,
+}
+
 fn manifest_event(
     kind: EventKind,
     namespace: &Namespace,
@@ -317,13 +341,15 @@ impl Registry {
         }
 
         self.store_manifest(
-            namespace,
-            &reference,
-            media_type.as_ref(),
+            &StoreManifest {
+                namespace,
+                reference: &reference,
+                content_type: media_type.as_ref(),
+                created_tags: &[],
+                reference_policy: ReferencePolicy::Trusted,
+                created_at: None,
+            },
             &content,
-            &[],
-            ReferencePolicy::Trusted,
-            None,
         )
         .await?;
 
@@ -410,28 +436,32 @@ impl Registry {
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
         self.store_manifest(
-            namespace,
-            reference,
-            content_type,
+            &StoreManifest {
+                namespace,
+                reference,
+                content_type,
+                created_tags: &[],
+                reference_policy: ReferencePolicy::Strict,
+                created_at: None,
+            },
             body,
-            &[],
-            ReferencePolicy::Strict,
-            None,
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn store_manifest(
         &self,
-        namespace: &Namespace,
-        reference: &Reference,
-        content_type: Option<&MediaType>,
+        write: &StoreManifest<'_>,
         body: &[u8],
-        created_tags: &[Tag],
-        reference_policy: ReferencePolicy,
-        created_at: Option<DateTime<Utc>>,
     ) -> Result<PutManifestResponse, Error> {
+        let StoreManifest {
+            namespace,
+            reference,
+            content_type,
+            created_tags,
+            reference_policy,
+            created_at,
+        } = *write;
         let mut manifest = parse_and_validate_manifest(body, content_type)?;
         // A digest reference fixes the algorithm to verify against; a tag push has
         // no client-chosen algorithm, so the manifest lands under its canonical
@@ -929,21 +959,26 @@ impl Registry {
     /// `tags` carries the pre-validated values of `?tag=` query parameters; they
     /// apply only when `reference` is a `Reference::Digest`. A by-tag push
     /// ignores them and creates no extra tags.
-    #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, body_stream, actor))]
+    #[instrument(
+        skip(self, body_stream, request),
+        fields(namespace = %request.namespace, reference = %request.reference)
+    )]
     pub async fn accept_put_manifest<S>(
         &self,
-        actor: Option<EventActor>,
-        source_ts: Option<DateTime<Utc>>,
-        namespace: &Namespace,
-        reference: Reference,
-        mime_type: MediaType,
+        request: PutManifestRequest<'_>,
         body_stream: S,
-        tags: Vec<Tag>,
     ) -> Result<PutManifestResponse, Error>
     where
         S: AsyncRead + Unpin + Send,
     {
+        let PutManifestRequest {
+            namespace,
+            reference,
+            mime_type,
+            tags,
+            actor,
+            source_ts,
+        } = request;
         let resolved_repository = self.resolver.resolve(namespace);
 
         let created_tags: Vec<Tag> = match &reference {
@@ -986,13 +1021,15 @@ impl Registry {
         };
         let response = self
             .store_manifest(
-                namespace,
-                &reference,
-                Some(&mime_type),
+                &StoreManifest {
+                    namespace,
+                    reference: &reference,
+                    content_type: Some(&mime_type),
+                    created_tags: &created_tags,
+                    reference_policy,
+                    created_at: source_ts,
+                },
                 &request_body,
-                &created_tags,
-                reference_policy,
-                source_ts,
             )
             .await?;
 

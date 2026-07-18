@@ -48,9 +48,11 @@ use crate::{
 pub use blob::{BlobRange, GetBlobResponse};
 use blob_ownership::BlobOwnership;
 pub use error::Error;
-pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
+pub use manifest::{
+    GetManifestResponse, ParsedManifestDigests, PutManifestRequest, parse_manifest_digests,
+};
 pub use repository::Repository;
-pub use upload::{BlobMount, StartUploadResponse};
+pub use upload::{BlobMount, CompleteUploadRequest, StartUploadResponse};
 
 /// OCI wire header names shared by the server responses and the transport
 /// client. Response-only header names live in `command::server::response`.

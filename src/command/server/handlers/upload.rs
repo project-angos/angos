@@ -4,7 +4,7 @@ use crate::{
     command::server::{
         ServerContext,
         error::Error,
-        handlers::build_response,
+        handlers::{PutRequest, build_response},
         request::{RequestHeaders, incoming_into_async_read},
         response::{HeaderMap, ResponseHeaders},
         response_body::ResponseBody,
@@ -12,7 +12,7 @@ use crate::{
     event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{Digest, Namespace, UploadSessionId},
-    registry::{BlobMount, DOCKER_UPLOAD_UUID, StartUploadResponse},
+    registry::{BlobMount, CompleteUploadRequest, DOCKER_UPLOAD_UUID, StartUploadResponse},
 };
 
 /// Headers for a completed-blob response (used by `StartUpload` when the digest
@@ -148,31 +148,29 @@ pub async fn handle_patch_upload(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_put_upload(
-    context: &ServerContext,
-    parts: &Parts,
-    incoming: Incoming,
+    request: PutRequest<'_>,
     namespace: &Namespace,
     uuid: UploadSessionId,
     digest: &Digest,
-    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
+    let headers = RequestHeaders::new(&request.parts.headers);
     let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
     let content_length = headers.content_length()?;
-    let body_reader = incoming_into_async_read(incoming);
+    let body_reader = incoming_into_async_read(request.incoming);
 
-    let actor = Some(EventActor::from(identity.clone()));
-    let response = context
+    let response = request
+        .context
         .registry
         .complete_upload(
-            actor,
-            namespace,
-            &uuid,
-            digest,
-            start_offset,
-            content_length,
+            CompleteUploadRequest {
+                actor: Some(EventActor::from(request.identity.clone())),
+                namespace,
+                session_id: &uuid,
+                digest,
+                start_offset,
+                content_length,
+            },
             body_reader,
         )
         .await?;

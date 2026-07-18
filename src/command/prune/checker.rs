@@ -170,23 +170,21 @@ pub async fn sweep_orphan_grants(
     sink: &dyn ActionSink,
     concurrency: usize,
 ) -> Result<(), Error> {
-    let now = Utc::now();
+    let ctx = GrantSweep {
+        blob_store,
+        metadata_store,
+        resolver,
+        global_policy,
+        in_flight_window,
+        now: Utc::now(),
+        sink,
+    };
+    let ctx = &ctx;
     blob_store
         .stream_blobs()
         .err_into()
         .try_for_each_concurrent(concurrency, |blob| async move {
-            if let Err(e) = sweep_grants_for_blob(
-                blob_store,
-                metadata_store,
-                resolver,
-                global_policy,
-                &blob,
-                in_flight_window,
-                now,
-                sink,
-            )
-            .await
-            {
+            if let Err(e) = sweep_grants_for_blob(ctx, &blob).await {
                 error!("prune: failed to check grants for blob {blob}: {e}");
             }
             Ok(())
@@ -194,29 +192,30 @@ pub async fn sweep_orphan_grants(
         .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn sweep_grants_for_blob(
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    resolver: &Arc<RepositoryResolver>,
-    global_policy: Option<&RetentionPolicy>,
-    blob: &Digest,
+/// The state a single grant-only blob check shares across the whole sweep.
+struct GrantSweep<'a> {
+    blob_store: &'a Arc<BlobStore>,
+    metadata_store: &'a Arc<MetadataStore>,
+    resolver: &'a Arc<RepositoryResolver>,
+    global_policy: Option<&'a RetentionPolicy>,
     in_flight_window: Duration,
     now: DateTime<Utc>,
-    sink: &dyn ActionSink,
-) -> Result<(), Error> {
+    sink: &'a dyn ActionSink,
+}
+
+async fn sweep_grants_for_blob(ctx: &GrantSweep<'_>, blob: &Digest) -> Result<(), Error> {
     // In-flight guard on the bytes' mtime; without one (or with the bytes
     // absent) leave the blob to scrub's orphan GC.
-    let last_modified = match blob_store.last_modified(blob).await {
+    let last_modified = match ctx.blob_store.last_modified(blob).await {
         Ok(Some(ts)) => ts,
         Ok(None) | Err(RegistryError::BlobUnknown | RegistryError::NotFound) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    if now.signed_duration_since(last_modified) < in_flight_window {
+    if ctx.now.signed_duration_since(last_modified) < ctx.in_flight_window {
         return Ok(());
     }
 
-    let index = match metadata_store.read_blob_index(blob).await {
+    let index = match ctx.metadata_store.read_blob_index(blob).await {
         Ok(index) => index,
         Err(RegistryError::NotFound) => return Ok(()),
         Err(e) => return Err(e.into()),
@@ -232,13 +231,14 @@ async fn sweep_grants_for_blob(
         // being cleared by the orphan-namespace sweep; revoke its grants
         // outright (the executor's under-lock re-check still spares a blob a
         // not-yet-cascaded manifest references).
-        let repository = resolver.resolve(&namespace);
-        if repository.is_none() && resolver.len() > 0 {
-            sink.apply(Action::RemoveOrphanBlobGrant {
-                namespace,
-                blob: blob.clone(),
-            })
-            .await?;
+        let repository = ctx.resolver.resolve(&namespace);
+        if repository.is_none() && ctx.resolver.len() > 0 {
+            ctx.sink
+                .apply(Action::RemoveOrphanBlobGrant {
+                    namespace,
+                    blob: blob.clone(),
+                })
+                .await?;
             continue;
         }
         // A tracked link (Layer/Config/Manifest) means a manifest references
@@ -247,16 +247,17 @@ async fn sweep_grants_for_blob(
         if !links.contains(&grant) || links.iter().any(LinkKind::is_tracked) {
             continue;
         }
-        let global = check_global_policy(global_policy, &subject, &[], &[])?;
+        let global = check_global_policy(ctx.global_policy, &subject, &[], &[])?;
         let repo = check_repo_policy(repository, &subject, &[], &[])?;
         if policies_retain(&global, &repo) {
             continue;
         }
-        sink.apply(Action::RemoveOrphanBlobGrant {
-            namespace,
-            blob: blob.clone(),
-        })
-        .await?;
+        ctx.sink
+            .apply(Action::RemoveOrphanBlobGrant {
+                namespace,
+                blob: blob.clone(),
+            })
+            .await?;
     }
     Ok(())
 }

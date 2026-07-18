@@ -471,7 +471,6 @@ impl Lock {
                     tick_interval,
                     &etag_cache,
                     &mut consecutive_failures,
-                    label,
                 )
                 .await
                 {
@@ -494,10 +493,6 @@ enum HeartbeatOutcome {
     Invalidate(&'static str),
 }
 
-// reason: all 7 parameters are the narrowly-scoped heartbeat state that callers
-// provide individually; bundling them into a struct would obscure ownership and
-// complicate borrowing of `consecutive_failures` as `&mut`.
-#[allow(clippy::too_many_arguments)]
 async fn run_heartbeat_tick(
     paths: &[String],
     storage: &dyn LockStorage,
@@ -505,7 +500,6 @@ async fn run_heartbeat_tick(
     tick_deadline: Duration,
     etag_cache: &Arc<RwLock<HashMap<String, String>>>,
     consecutive_failures: &mut u32,
-    _label: &'static str,
 ) -> HeartbeatOutcome {
     let mut had_failure = false;
 
@@ -1053,7 +1047,6 @@ mod tests {
             Duration::from_secs(3),
             &etag_cache,
             &mut consecutive,
-            "fake",
         )
         .await;
 
@@ -1091,7 +1084,6 @@ mod tests {
             tick,
             &etag_cache,
             &mut consecutive,
-            "fake",
         )
         .await;
         assert!(matches!(o1, HeartbeatOutcome::Continue));
@@ -1102,7 +1094,6 @@ mod tests {
             tick,
             &etag_cache,
             &mut consecutive,
-            "fake",
         )
         .await;
         assert!(matches!(o2, HeartbeatOutcome::Continue));
@@ -1113,7 +1104,6 @@ mod tests {
             tick,
             &etag_cache,
             &mut consecutive,
-            "fake",
         )
         .await;
 
@@ -1137,7 +1127,6 @@ mod tests {
             Duration::from_secs(3),
             &etag_cache,
             &mut consecutive,
-            "fake",
         )
         .await;
 
@@ -1163,7 +1152,6 @@ mod tests {
             Duration::from_secs(3),
             &etag_cache,
             &mut consecutive,
-            "fake",
         )
         .await;
 
@@ -1531,7 +1519,6 @@ mod tests {
             Duration::from_secs(3),
             &etag_cache,
             &mut consecutive,
-            "concurrency-recording",
         )
         .await;
 

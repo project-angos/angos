@@ -29,7 +29,7 @@ use crate::{
     jobs::store::JobStore,
     oci::{Digest, MediaType, Namespace, Reference, Tag},
     registry::{
-        BlobMount, Registry, RegistryConfig, Repository, StartUploadResponse,
+        BlobMount, PutManifestRequest, Registry, RegistryConfig, Repository, StartUploadResponse,
         blob_ownership::BlobOwnership,
         metadata_store::LinkKind,
         repository_resolver::RepositoryResolver,
@@ -163,13 +163,15 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
     fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -218,13 +220,15 @@ async fn digest_push_suppresses_tag_create_event() {
     let tag_response = fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("seed").unwrap()),
-            mime_type.clone(),
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("seed").unwrap()),
+                mime_type: mime_type.clone(),
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes.clone()),
-            Vec::new(),
         )
         .await
         .expect("seed push");
@@ -236,13 +240,15 @@ async fn digest_push_suppresses_tag_create_event() {
     fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Digest(digest),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Digest(digest),
+                mime_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            Vec::new(),
         )
         .await
         .expect("digest push");
@@ -276,13 +282,15 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
     fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("v1").unwrap()),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("v1").unwrap()),
+                mime_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            Vec::new(),
         )
         .await
         .expect("put manifest");
@@ -326,13 +334,15 @@ async fn digest_delete_suppresses_tag_delete_event() {
     let push = fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("to-delete").unwrap()),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("to-delete").unwrap()),
+                mime_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            Vec::new(),
         )
         .await
         .expect("put manifest");
@@ -378,13 +388,15 @@ async fn tag_push_event_payload_has_all_required_fields() {
     fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("stable").unwrap()),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("stable").unwrap()),
+                mime_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");
@@ -453,13 +465,15 @@ async fn digest_push_with_tag_params_emits_tag_create_per_tag() {
     fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Digest(digest.clone()),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Digest(digest.clone()),
+                mime_type,
+                tags: vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()],
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()],
         )
         .await
         .expect("by-digest push with tag params must succeed");
@@ -502,13 +516,15 @@ async fn noop_push_still_emits_events() {
     fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            mime_type.clone(),
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type: mime_type.clone(),
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes.clone()),
-            Vec::new(),
         )
         .await
         .expect("seed tag push");
@@ -517,13 +533,15 @@ async fn noop_push_still_emits_events() {
     fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            Vec::new(),
         )
         .await
         .expect("re-assert same tag->digest");
@@ -649,13 +667,15 @@ async fn failing_required_webhook_blocks_the_write() {
     let result = fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(tag.clone()),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(tag.clone()),
+                mime_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            Vec::new(),
         )
         .await;
     assert!(
@@ -745,13 +765,15 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
     fixture
         .registry
         .accept_put_manifest(
-            None,
-            None,
-            &namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            mime_type,
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type,
+                tags: Vec::new(),
+                actor: None,
+                source_ts: None,
+            },
             Cursor::new(manifest_bytes),
-            Vec::new(),
         )
         .await
         .expect("accept_put_manifest");

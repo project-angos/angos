@@ -34,7 +34,7 @@ where
 pub use global::GlobalConfig;
 pub use observability::ObservabilityConfig;
 pub use regex_pattern::RegexPattern;
-pub use registry_storage::RegistryStorageConfig;
+pub use registry_storage::{RegistryStorageConfig, ResolvedStorageConfig};
 pub use server::ServerConfig;
 pub use trusted_proxy::TrustedProxy;
 pub use ui::UiConfig;
@@ -110,14 +110,13 @@ impl TryFrom<ConfigurationFields> for Configuration {
 }
 
 impl Configuration {
-    pub fn resolve_registry_storage(&self) -> RegistryStorageConfig {
+    pub fn resolve_registry_storage(&self) -> ResolvedStorageConfig {
         match &self.registry_storage {
             RegistryStorageConfig::Inherit => {
-                RegistryStorageConfig::from_blob_store(&self.blob_store)
+                ResolvedStorageConfig::from_blob_store(&self.blob_store)
             }
-            RegistryStorageConfig::FS(_) | RegistryStorageConfig::S3(_) => {
-                self.registry_storage.clone()
-            }
+            RegistryStorageConfig::FS(fs) => ResolvedStorageConfig::FS(fs.clone()),
+            RegistryStorageConfig::S3(s3) => ResolvedStorageConfig::S3(s3.clone()),
         }
     }
 
@@ -180,24 +179,15 @@ fn validate_durable_queue_lock(config: &Configuration) -> Result<(), Error> {
         return Ok(());
     }
     let memory_locked = match config.resolve_registry_storage() {
-        RegistryStorageConfig::FS(fs) => matches!(fs.lock_strategy, LockStrategy::Memory),
+        ResolvedStorageConfig::FS(fs) => matches!(fs.lock_strategy, LockStrategy::Memory),
         // An unset S3 lock strategy resolves against the provider's
         // conditional-write support at startup, so only a declared
         // `conditional_operations = false` makes the memory fallback certain
         // here; the probed no-CAS case is rejected at startup instead.
-        RegistryStorageConfig::S3(s3) => matches!(
+        ResolvedStorageConfig::S3(s3) => matches!(
             s3.resolved_lock_strategy(s3.conditional_operations.unwrap_or(true)),
             LockStrategy::Memory
         ),
-        // `resolve_registry_storage` must map `Inherit` to a concrete backend;
-        // fail closed rather than silently skip the lock check.
-        RegistryStorageConfig::Inherit => {
-            return Err(Error::InvalidFormat(
-                "[metadata_store] did not resolve to a concrete backend before \
-                 durable-queue lock validation"
-                    .to_string(),
-            ));
-        }
     };
     if memory_locked {
         return Err(Error::InvalidFormat(
@@ -269,7 +259,7 @@ fn validate_event_webhook_refs(
 mod metadata_resolver_tests {
     use angos_tx_engine::lock::LockStrategy;
 
-    use crate::configuration::{Configuration, RegistryStorageConfig};
+    use crate::configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig};
 
     #[test]
     fn test_inherit_resolves_to_fs_from_fs_blob_store() {
@@ -290,12 +280,14 @@ mod metadata_resolver_tests {
 
         let resolved = config.resolve_registry_storage();
         match resolved {
-            RegistryStorageConfig::FS(fs_config) => {
+            ResolvedStorageConfig::FS(fs_config) => {
                 assert_eq!(fs_config.root_dir, "/data/blobs");
                 assert!(fs_config.sync_to_disk);
                 assert_eq!(fs_config.lock_strategy, LockStrategy::Memory);
             }
-            other => panic!("expected FS storage config from Inherit, got {other:?}"),
+            other @ ResolvedStorageConfig::S3(_) => {
+                panic!("expected FS storage config from Inherit, got {other:?}")
+            }
         }
     }
 
@@ -324,10 +316,12 @@ mod metadata_resolver_tests {
 
         let resolved = config.resolve_registry_storage();
         match resolved {
-            RegistryStorageConfig::FS(fs_config) => {
+            ResolvedStorageConfig::FS(fs_config) => {
                 assert_eq!(fs_config.root_dir, "/custom/metadata");
             }
-            other => panic!("expected explicit FS storage config, got {other:?}"),
+            other @ ResolvedStorageConfig::S3(_) => {
+                panic!("expected explicit FS storage config, got {other:?}")
+            }
         }
     }
 
@@ -360,7 +354,7 @@ mod metadata_resolver_tests {
 
         let resolved = config.resolve_registry_storage();
         match resolved {
-            RegistryStorageConfig::S3(s3_config) => {
+            ResolvedStorageConfig::S3(s3_config) => {
                 assert_eq!(s3_config.connection.bucket, "metadata-bucket");
                 assert_eq!(s3_config.connection.region, "eu-west-1");
                 assert_eq!(
@@ -368,7 +362,9 @@ mod metadata_resolver_tests {
                     "https://metadata.example.com"
                 );
             }
-            other => panic!("expected explicit S3 storage config, got {other:?}"),
+            other @ ResolvedStorageConfig::FS(_) => {
+                panic!("expected explicit S3 storage config, got {other:?}")
+            }
         }
     }
 
@@ -395,7 +391,7 @@ mod metadata_resolver_tests {
 
         let resolved = config.resolve_registry_storage();
         match resolved {
-            RegistryStorageConfig::S3(s3_config) => {
+            ResolvedStorageConfig::S3(s3_config) => {
                 assert_eq!(s3_config.connection.bucket, "my-bucket");
                 assert_eq!(s3_config.connection.region, "us-east-1");
                 assert_eq!(s3_config.connection.endpoint, "https://s3.example.com");
@@ -403,7 +399,9 @@ mod metadata_resolver_tests {
                 assert_eq!(s3_config.connection.secret_key.expose(), "secret456");
                 assert_eq!(s3_config.connection.key_prefix, "prefix/");
             }
-            other => panic!("expected S3 storage config from Inherit, got {other:?}"),
+            other @ ResolvedStorageConfig::FS(_) => {
+                panic!("expected S3 storage config from Inherit, got {other:?}")
+            }
         }
     }
 

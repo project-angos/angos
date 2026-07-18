@@ -184,19 +184,32 @@ pub enum RegistryStorageConfig {
     S3(MetadataS3Config),
 }
 
-impl RegistryStorageConfig {
-    /// Build a `RegistryStorageConfig` that mirrors the given blob-store config.
+/// A [`RegistryStorageConfig`] after its `Inherit` default has been resolved to
+/// a concrete backend by
+/// [`Configuration::resolve_registry_storage`](crate::configuration::Configuration::resolve_registry_storage).
+/// Having only two variants lets every consumer match without a dead `Inherit`
+/// arm.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ResolvedStorageConfig {
+    FS(MetadataFsConfig),
+    S3(MetadataS3Config),
+}
+
+impl ResolvedStorageConfig {
+    /// Build a `ResolvedStorageConfig` that mirrors the given blob-store config,
+    /// the resolution of the `Inherit` default.
     pub fn from_blob_store(blob: &blob_store::BlobStoreConfig) -> Self {
         match blob {
             blob_store::BlobStoreConfig::FS(config) => {
-                RegistryStorageConfig::FS(MetadataFsConfig {
+                ResolvedStorageConfig::FS(MetadataFsConfig {
                     root_dir: config.root_dir.clone(),
                     sync_to_disk: config.sync_to_disk,
                     ..Default::default()
                 })
             }
             blob_store::BlobStoreConfig::S3(config) => {
-                RegistryStorageConfig::S3(MetadataS3Config {
+                ResolvedStorageConfig::S3(MetadataS3Config {
                     connection: config.connection.clone(),
                     ..Default::default()
                 })
@@ -219,12 +232,12 @@ mod tests {
             root_dir: "/var/lib/registry".to_string(),
             sync_to_disk: true,
         });
-        match RegistryStorageConfig::from_blob_store(&blob) {
-            RegistryStorageConfig::FS(c) => {
+        match ResolvedStorageConfig::from_blob_store(&blob) {
+            ResolvedStorageConfig::FS(c) => {
                 assert_eq!(c.root_dir, "/var/lib/registry");
                 assert!(c.sync_to_disk);
             }
-            RegistryStorageConfig::Inherit | RegistryStorageConfig::S3(_) => {
+            ResolvedStorageConfig::S3(_) => {
                 panic!("expected FS storage config")
             }
         }
@@ -243,8 +256,8 @@ mod tests {
             },
             ..blob_store::S3BackendConfig::default()
         });
-        match RegistryStorageConfig::from_blob_store(&blob) {
-            RegistryStorageConfig::S3(c) => {
+        match ResolvedStorageConfig::from_blob_store(&blob) {
+            ResolvedStorageConfig::S3(c) => {
                 assert_eq!(c.connection.bucket, "test-bucket");
                 assert_eq!(c.connection.region, "us-east-1");
                 assert_eq!(c.connection.endpoint, "http://localhost:9000");
@@ -252,7 +265,7 @@ mod tests {
                 assert_eq!(c.connection.secret_key.expose(), "secret");
                 assert_eq!(c.connection.key_prefix, "foo");
             }
-            RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
+            ResolvedStorageConfig::FS(_) => {
                 panic!("expected S3 storage config")
             }
         }

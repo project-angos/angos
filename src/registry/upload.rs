@@ -60,6 +60,18 @@ pub struct CompleteUploadResponse {
     pub digest: Digest,
 }
 
+/// The non-body inputs to [`Registry::complete_upload`]: the completing actor,
+/// the target session and digest, and the optional resume offset and declared
+/// length. The blob body is passed separately as the stream.
+pub struct CompleteUploadRequest<'a> {
+    pub actor: Option<EventActor>,
+    pub namespace: &'a Namespace,
+    pub session_id: &'a UploadSessionId,
+    pub digest: &'a Digest,
+    pub start_offset: Option<u64>,
+    pub content_length: Option<u64>,
+}
+
 impl Registry {
     async fn complete_existing_upload<S>(
         &self,
@@ -378,21 +390,30 @@ impl Registry {
         })
     }
 
-    #[instrument(skip(stream, actor))]
-    #[allow(clippy::too_many_arguments)]
+    #[instrument(
+        skip(stream, request),
+        fields(
+            namespace = %request.namespace,
+            session_id = %request.session_id,
+            digest = %request.digest,
+        )
+    )]
     pub async fn complete_upload<S>(
         &self,
-        actor: Option<EventActor>,
-        namespace: &Namespace,
-        session_id: &UploadSessionId,
-        digest: &Digest,
-        start_offset: Option<u64>,
-        content_length: Option<u64>,
+        request: CompleteUploadRequest<'_>,
         stream: S,
     ) -> Result<CompleteUploadResponse, Error>
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
+        let CompleteUploadRequest {
+            actor,
+            namespace,
+            session_id,
+            digest,
+            start_offset,
+            content_length,
+        } = request;
         let session_key = session_id.to_string();
 
         // Intent-first emission: the event fires before the finalize, so a
@@ -529,7 +550,7 @@ mod tests {
         identity::ClientIdentity,
         oci::{Algorithm, Digest, Namespace, UploadSessionId},
         registry::{
-            BlobMount, Error, Registry, RegistryConfig, StartUploadResponse,
+            BlobMount, CompleteUploadRequest, Error, Registry, RegistryConfig, StartUploadResponse,
             blob_store::BlobStore,
             metadata_store::LinkKind,
             path_builder,
@@ -1090,12 +1111,14 @@ mod tests {
             let expected_digest = Digest::sha256_of_bytes(content);
             registry
                 .complete_upload(
-                    None,
-                    namespace,
-                    &session_id,
-                    &expected_digest,
-                    None,
-                    None,
+                    CompleteUploadRequest {
+                        actor: None,
+                        namespace,
+                        session_id: &session_id,
+                        digest: &expected_digest,
+                        start_offset: None,
+                        content_length: None,
+                    },
                     Cursor::new(Vec::new()),
                 )
                 .await
@@ -1140,12 +1163,14 @@ mod tests {
             let empty_stream = Cursor::new(Vec::new());
             let response = registry
                 .complete_upload(
-                    None,
-                    namespace,
-                    &session_id,
-                    &expected_digest,
-                    None,
-                    Some(0),
+                    CompleteUploadRequest {
+                        actor: None,
+                        namespace,
+                        session_id: &session_id,
+                        digest: &expected_digest,
+                        start_offset: None,
+                        content_length: Some(0),
+                    },
                     empty_stream,
                 )
                 .await
@@ -1188,12 +1213,14 @@ mod tests {
                 let expected_digest = Digest::from_bytes(algorithm, content);
                 let response = registry
                     .complete_upload(
-                        None,
-                        namespace,
-                        &session_id,
-                        &expected_digest,
-                        None,
-                        Some(content.len() as u64),
+                        CompleteUploadRequest {
+                            actor: None,
+                            namespace,
+                            session_id: &session_id,
+                            digest: &expected_digest,
+                            start_offset: None,
+                            content_length: Some(content.len() as u64),
+                        },
                         Cursor::new(content.to_vec()),
                     )
                     .await
@@ -1248,12 +1275,14 @@ mod tests {
             let expected_digest = Digest::from_bytes(Algorithm::Sha512, full_content);
             let response = registry
                 .complete_upload(
-                    None,
-                    namespace,
-                    &session_id,
-                    &expected_digest,
-                    None,
-                    Some(0),
+                    CompleteUploadRequest {
+                        actor: None,
+                        namespace,
+                        session_id: &session_id,
+                        digest: &expected_digest,
+                        start_offset: None,
+                        content_length: Some(0),
+                    },
                     Cursor::new(Vec::new()),
                 )
                 .await
@@ -1297,12 +1326,14 @@ mod tests {
             let wrong_digest = Digest::from_bytes(Algorithm::Sha512, b"different content");
             let result = registry
                 .complete_upload(
-                    None,
-                    namespace,
-                    &session_id,
-                    &wrong_digest,
-                    None,
-                    Some(0),
+                    CompleteUploadRequest {
+                        actor: None,
+                        namespace,
+                        session_id: &session_id,
+                        digest: &wrong_digest,
+                        start_offset: None,
+                        content_length: Some(0),
+                    },
                     Cursor::new(Vec::new()),
                 )
                 .await;
@@ -1346,12 +1377,14 @@ mod tests {
         let expected_digest = Digest::sha256_of_bytes(content);
         let response = registry
             .complete_upload(
-                None,
-                namespace,
-                &session_id,
-                &expected_digest,
-                None,
-                Some(0),
+                CompleteUploadRequest {
+                    actor: None,
+                    namespace,
+                    session_id: &session_id,
+                    digest: &expected_digest,
+                    start_offset: None,
+                    content_length: Some(0),
+                },
                 Cursor::new(Vec::new()),
             )
             .await
@@ -1404,12 +1437,14 @@ mod tests {
 
         registry
             .complete_upload(
-                None,
-                second_namespace,
-                &session_id,
-                &digest,
-                None,
-                Some(0),
+                CompleteUploadRequest {
+                    actor: None,
+                    namespace: second_namespace,
+                    session_id: &session_id,
+                    digest: &digest,
+                    start_offset: None,
+                    content_length: Some(0),
+                },
                 Cursor::new(Vec::new()),
             )
             .await
@@ -1464,12 +1499,14 @@ mod tests {
 
         registry
             .complete_upload(
-                None,
-                second_namespace,
-                &session_id,
-                &digest,
-                None,
-                Some(content.len() as u64),
+                CompleteUploadRequest {
+                    actor: None,
+                    namespace: second_namespace,
+                    session_id: &session_id,
+                    digest: &digest,
+                    start_offset: None,
+                    content_length: Some(content.len() as u64),
+                },
                 Cursor::new(content),
             )
             .await
@@ -1627,12 +1664,14 @@ mod tests {
             let empty_stream = Cursor::new(Vec::new());
             let result = registry
                 .complete_upload(
-                    None,
-                    namespace,
-                    &session_id,
-                    &wrong_digest,
-                    None,
-                    Some(0),
+                    CompleteUploadRequest {
+                        actor: None,
+                        namespace,
+                        session_id: &session_id,
+                        digest: &wrong_digest,
+                        start_offset: None,
+                        content_length: Some(0),
+                    },
                     empty_stream,
                 )
                 .await;
@@ -1662,12 +1701,14 @@ mod tests {
             // Declare far fewer bytes than the body actually carries.
             let result = registry
                 .complete_upload(
-                    None,
-                    namespace,
-                    &session_id,
-                    &digest,
-                    None,
-                    Some(10),
+                    CompleteUploadRequest {
+                        actor: None,
+                        namespace,
+                        session_id: &session_id,
+                        digest: &digest,
+                        start_offset: None,
+                        content_length: Some(10),
+                    },
                     Cursor::new(content),
                 )
                 .await;
@@ -1817,12 +1858,14 @@ mod tests {
         let empty_stream = Cursor::new(Vec::new());
         let result = registry
             .complete_upload(
-                None,
-                namespace,
-                &session_id,
-                &Digest::sha256_of_bytes(content),
-                None,
-                Some(0),
+                CompleteUploadRequest {
+                    actor: None,
+                    namespace,
+                    session_id: &session_id,
+                    digest: &Digest::sha256_of_bytes(content),
+                    start_offset: None,
+                    content_length: Some(0),
+                },
                 empty_stream,
             )
             .await;
@@ -1964,12 +2007,14 @@ mod tests {
         let digest = Digest::sha256_of_bytes(content);
         let result = registry
             .complete_upload(
-                None,
-                namespace,
-                &session_id,
-                &digest,
-                None,
-                None,
+                CompleteUploadRequest {
+                    actor: None,
+                    namespace,
+                    session_id: &session_id,
+                    digest: &digest,
+                    start_offset: None,
+                    content_length: None,
+                },
                 Cursor::new(content.to_vec()),
             )
             .await;

@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     cache::Cache,
     command::{bootstrap, server::error::Error},
-    configuration::{Configuration, RegistryStorageConfig},
+    configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig},
     event_webhook::dispatcher::EventDispatcher,
     jobs::store::{self as job_store, JobStore},
     registry::{Registry, RegistryConfig},
@@ -30,17 +30,17 @@ pub struct PendingGaugeRefresh {
 async fn resolve_storage_config(
     config: &Configuration,
     cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
-) -> Result<RegistryStorageConfig, Error> {
+) -> Result<ResolvedStorageConfig, Error> {
     let mut storage_config = config.resolve_registry_storage();
     if matches!(config.registry_storage, RegistryStorageConfig::Inherit)
-        && matches!(&storage_config, RegistryStorageConfig::S3(_))
+        && matches!(&storage_config, ResolvedStorageConfig::S3(_))
     {
         info!("Auto-configuring S3 metadata-store from blob-store");
     }
 
     // An operator-declared value skips the probe entirely. Injecting the
     // resolved value into the config means `build_store` won't re-probe.
-    if matches!(&storage_config, RegistryStorageConfig::S3(b) if b.conditional_operations.is_none())
+    if matches!(&storage_config, ResolvedStorageConfig::S3(b) if b.conditional_operations.is_none())
     {
         let cached = *cached_conditional_operations
             .lock()
@@ -57,7 +57,7 @@ async fn resolve_storage_config(
                 .unwrap_or_else(PoisonError::into_inner) = Some(resolved);
             resolved
         };
-        if let RegistryStorageConfig::S3(ref mut backend_config) = storage_config {
+        if let ResolvedStorageConfig::S3(ref mut backend_config) = storage_config {
             backend_config.conditional_operations = Some(cas);
         }
     }

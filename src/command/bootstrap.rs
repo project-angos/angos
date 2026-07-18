@@ -12,7 +12,7 @@ use angos_tx_engine::{
 
 use crate::{
     cache::{self, Cache},
-    configuration::{Configuration, RegistryStorageConfig, registry_storage::MetadataS3Config},
+    configuration::{Configuration, ResolvedStorageConfig, registry_storage::MetadataS3Config},
     event_webhook::{self, dispatcher::EventDispatcher},
     jobs::store::{self as job_store, JobStore},
     registry::{
@@ -98,18 +98,11 @@ async fn probe_s3(config: &MetadataS3Config) -> Result<bool, Error> {
 
 /// Probe the underlying S3 store for conditional-write support.
 ///
-/// Returns `None` for FS configs (nothing to probe). Returns
-/// [`Error::Coordination`] when called on the `Inherit` variant: callers
-/// must resolve first via `Configuration::resolve_registry_storage`.
-pub async fn probe_storage(config: &RegistryStorageConfig) -> Result<Option<bool>, Error> {
+/// Returns `None` for FS configs (nothing to probe).
+pub async fn probe_storage(config: &ResolvedStorageConfig) -> Result<Option<bool>, Error> {
     match config {
-        RegistryStorageConfig::Inherit => Err(Error::Coordination(
-            "RegistryStorageConfig::Inherit reached probe_storage(); callers must \
-             resolve via Configuration::resolve_registry_storage first"
-                .to_string(),
-        )),
-        RegistryStorageConfig::S3(config) => Ok(Some(probe_s3(config).await?)),
-        RegistryStorageConfig::FS(_) => Ok(None),
+        ResolvedStorageConfig::S3(config) => Ok(Some(probe_s3(config).await?)),
+        ResolvedStorageConfig::FS(_) => Ok(None),
     }
 }
 
@@ -121,16 +114,9 @@ pub async fn probe_storage(config: &RegistryStorageConfig) -> Result<Option<bool
 /// memoize the probe across hot-reloads should resolve it up front (see
 /// `setup::build_registry`) and inject it into the config so this path
 /// skips the probe.
-pub async fn build_store(config: &RegistryStorageConfig) -> Result<Arc<Store>, Error> {
+pub async fn build_store(config: &ResolvedStorageConfig) -> Result<Arc<Store>, Error> {
     let store = match config {
-        RegistryStorageConfig::Inherit => {
-            return Err(Error::Coordination(
-                "RegistryStorageConfig::Inherit reached build_store(); callers must \
-                 resolve via Configuration::resolve_registry_storage first"
-                    .to_string(),
-            ));
-        }
-        RegistryStorageConfig::FS(config) => {
+        ResolvedStorageConfig::FS(config) => {
             if matches!(config.lock_strategy, LockStrategy::S3(_)) {
                 return Err(Error::Coordination(
                     "S3 lock strategy is not supported for filesystem storage".to_string(),
@@ -147,7 +133,7 @@ pub async fn build_store(config: &RegistryStorageConfig) -> Result<Arc<Store>, E
             );
             Store::new(object, None, config.lock_strategy.clone(), None)?
         }
-        RegistryStorageConfig::S3(config) => {
+        ResolvedStorageConfig::S3(config) => {
             let cas = match config.conditional_operations {
                 Some(declared) => declared,
                 None => probe_s3(config).await?,
@@ -181,12 +167,12 @@ pub async fn build_store(config: &RegistryStorageConfig) -> Result<Arc<Store>, E
 }
 
 pub async fn metadata_store(
-    config: &RegistryStorageConfig,
+    config: &ResolvedStorageConfig,
     auth_cache: &Arc<Cache>,
 ) -> Result<Arc<MetadataStore>, Error> {
     let store = build_store(config).await?;
 
-    let s3_ttl = if let RegistryStorageConfig::S3(s3_cfg) = config {
+    let s3_ttl = if let ResolvedStorageConfig::S3(s3_cfg) = config {
         (s3_cfg.link_cache_ttl, s3_cfg.access_time_debounce_secs)
     } else {
         (0, 0)
@@ -301,7 +287,7 @@ mod tests {
         command::maintenance::Error as MaintenanceError,
         command::server::Error as ServerError,
         configuration::{
-            RegistryStorageConfig,
+            ResolvedStorageConfig,
             registry_storage::{MetadataFsConfig, MetadataS3Config},
         },
         policy::{AccessMode, AccessPolicyConfig},
@@ -411,8 +397,8 @@ mod tests {
         assert!(matches!(server_err, ServerError::Initialization(_)));
     }
 
-    fn s3_config_with_lock_strategy(lock_strategy: Option<LockStrategy>) -> RegistryStorageConfig {
-        RegistryStorageConfig::S3(MetadataS3Config {
+    fn s3_config_with_lock_strategy(lock_strategy: Option<LockStrategy>) -> ResolvedStorageConfig {
+        ResolvedStorageConfig::S3(MetadataS3Config {
             connection: s3_test_connection(format!("probe-test-{}", uuid::Uuid::new_v4())),
             lock_strategy,
             link_cache_ttl: 30,
@@ -455,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_fs_config_is_noop() {
-        let config = RegistryStorageConfig::FS(MetadataFsConfig {
+        let config = ResolvedStorageConfig::FS(MetadataFsConfig {
             root_dir: "/tmp/probe-test".to_string(),
             lock_strategy: LockStrategy::Memory,
             sync_to_disk: false,

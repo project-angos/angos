@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
-use hyper::{Response, StatusCode, body::Incoming, http::request::Parts};
+use hyper::{Response, StatusCode, http::request::Parts};
 use tokio::io::AsyncRead;
 
 use crate::{
     command::server::{
         ServerContext,
         error::Error,
-        handlers::build_response,
+        handlers::{PutRequest, build_response},
         request::{RequestHeaders, incoming_into_async_read},
         response::{HeaderMap, ResponseHeaders},
         response_body::ResponseBody,
@@ -16,7 +15,7 @@ use crate::{
     event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{Digest, MediaType, Namespace, Reference, Tag},
-    registry::{GetManifestResponse, OCI_SUBJECT, OCI_TAG},
+    registry::{GetManifestResponse, OCI_SUBJECT, OCI_TAG, PutManifestRequest},
 };
 
 fn manifest_headers(media_type: Option<&str>, digest: &Digest, size: u64) -> HeaderMap {
@@ -146,32 +145,17 @@ pub async fn handle_get_manifest(
 
 /// The stream-generic core of [`handle_put_manifest`], separate so tests can
 /// drive it with an in-memory body instead of a hyper [`Incoming`].
-#[allow(clippy::too_many_arguments)]
 async fn put_manifest<S>(
     context: &ServerContext,
-    namespace: &Namespace,
-    reference: Reference,
-    mime_type: MediaType,
+    request: PutManifestRequest<'_>,
     body_stream: S,
-    tags: Vec<Tag>,
-    identity: &ClientIdentity,
-    source_ts: Option<DateTime<Utc>>,
 ) -> Result<Response<ResponseBody>, Error>
 where
     S: AsyncRead + Unpin + Send,
 {
-    let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .accept_put_manifest(
-            actor,
-            source_ts,
-            namespace,
-            reference,
-            mime_type,
-            body_stream,
-            tags,
-        )
+        .accept_put_manifest(request, body_stream)
         .await?;
 
     build_response(
@@ -204,32 +188,30 @@ pub async fn handle_delete_manifest(
     build_response(StatusCode::ACCEPTED, HashMap::new(), ResponseBody::empty())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_put_manifest(
-    context: &ServerContext,
-    parts: &Parts,
-    incoming: Incoming,
+    request: PutRequest<'_>,
     namespace: &Namespace,
     reference: Reference,
     tags: Vec<Tag>,
-    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
+    let headers = RequestHeaders::new(&request.parts.headers);
     let mime_type = headers.content_type()?.ok_or(Error::BadRequest(
         "No Content-Type header provided".to_string(),
     ))?;
     let source_ts = headers.source_timestamp();
-    let body_stream = incoming_into_async_read(incoming);
+    let body_stream = incoming_into_async_read(request.incoming);
 
     put_manifest(
-        context,
-        namespace,
-        reference,
-        mime_type,
+        request.context,
+        PutManifestRequest {
+            namespace,
+            reference,
+            mime_type,
+            tags,
+            actor: Some(EventActor::from(request.identity.clone())),
+            source_ts,
+        },
         body_stream,
-        tags,
-        identity,
-        source_ts,
     )
     .await
 }
@@ -248,9 +230,10 @@ mod tests {
             ServerContext, error::Error, request::RequestHeaders,
             server_context::tests::create_test_repo_context,
         },
+        event_webhook::event::EventActor,
         identity::ClientIdentity,
         oci::{Digest, MediaType, Namespace, Reference, Tag},
-        registry::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, OCI_TAG},
+        registry::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, OCI_TAG, PutManifestRequest},
         registry_client::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     };
 
@@ -380,13 +363,15 @@ mod tests {
 
         let put_resp = put_manifest(
             &context,
-            &namespace,
-            Reference::Tag(Tag::new("latest").unwrap()),
-            MediaType::new(MEDIA_TYPE).unwrap(),
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                mime_type: MediaType::new(MEDIA_TYPE).unwrap(),
+                tags: Vec::new(),
+                actor: Some(EventActor::from(identity.clone())),
+                source_ts: None,
+            },
             std::io::Cursor::new(manifest_a()),
-            Vec::new(),
-            &identity,
-            None,
         )
         .await
         .expect("seeding the manifest must succeed");
@@ -431,13 +416,15 @@ mod tests {
         let newer_ts = Utc::now() - Duration::seconds(10);
         let seed_resp = put_manifest(
             &context,
-            &namespace,
-            tag(),
-            MediaType::new(MEDIA_TYPE).unwrap(),
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: tag(),
+                mime_type: MediaType::new(MEDIA_TYPE).unwrap(),
+                tags: Vec::new(),
+                actor: Some(EventActor::from(identity.clone())),
+                source_ts: Some(newer_ts),
+            },
             std::io::Cursor::new(manifest_b()),
-            Vec::new(),
-            &identity,
-            Some(newer_ts),
         )
         .await
         .expect("seeding the newer local tag must succeed");
@@ -469,13 +456,15 @@ mod tests {
 
         let result = put_manifest(
             &context,
-            &namespace,
-            tag(),
-            MediaType::new(MEDIA_TYPE).unwrap(),
+            PutManifestRequest {
+                namespace: &namespace,
+                reference: tag(),
+                mime_type: MediaType::new(MEDIA_TYPE).unwrap(),
+                tags: Vec::new(),
+                actor: Some(EventActor::from(identity.clone())),
+                source_ts,
+            },
             std::io::Cursor::new(manifest_a()),
-            Vec::new(),
-            &identity,
-            source_ts,
         )
         .await;
 
