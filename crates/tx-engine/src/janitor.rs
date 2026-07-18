@@ -163,9 +163,8 @@ impl BodyJanitor {
             return;
         };
 
-        // Age estimation: v4 UUIDs are random but we can use object head for
-        // last-modified. Fall back to skipping if head is unavailable.
-        // Simpler: check whether the intent exists first.
+        // Check for a live intent first, then age-gate the orphan via the
+        // first body object's last-modified.
         let intent_key = format!("{INTENT_LOG_PREFIX}/{tx_id}.json");
         match self.store.head(&intent_key).await {
             Ok(_) => {

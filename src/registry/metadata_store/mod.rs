@@ -17,9 +17,9 @@ pub use link::{LinkKind, LinkMetadata, LinkOperation, LinksCommit, LinksTx};
 
 use access_time::{AccessTimeWriter, FlushHandle};
 
-/// Canonical key for the coarse `blob-data:{digest}` lock — the single source of
-/// truth shared by [`MetadataStore::acquire_blob_data_lock`] and the
-/// `coarse_lock(...)` calls in `link::ops`, so the two never drift.
+/// Canonical key for the coarse `blob-data:{digest}` lock, held via
+/// [`MetadataStore::acquire_blob_data_lock`] / `with_blob_data_lock` by every
+/// path that mutates a blob's bytes or ownership grants.
 pub fn blob_data_lock_key(digest: &Digest) -> String {
     format!("blob-data:{digest}")
 }
@@ -116,8 +116,8 @@ impl MetadataStore {
     /// (unreferenced delete) and against concurrent manifest pushes, which
     /// declare the same coarse lock on their link transactions.
     ///
-    /// Lives on the METADATA executor — the one domain every blob-data
-    /// participant (manifest push, upload, scrub) agrees on — even though the
+    /// Lives on the METADATA executor, the one domain every blob-data
+    /// participant (manifest push, upload, scrub) agrees on, even though the
     /// bytes may be mutated on the separate BLOB engine, so the pairing can't
     /// drift.
     pub async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockSession, Error> {

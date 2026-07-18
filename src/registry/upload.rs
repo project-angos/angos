@@ -695,9 +695,10 @@ mod tests {
         .await;
     }
 
-    // Mount event emission (blob.push on a satisfied mount, nothing on the
-    // session fallback) is covered by `event_emission_tests::mount_emits_blob_push_event`
-    // and `event_emission_tests::mount_fallback_emits_no_event`.
+    // Mount event emission is covered by
+    // `event_emission_tests::mount_emits_blob_push_event` and
+    // `event_emission_tests::mount_fallback_still_emits_intent_event` (the
+    // intent-first event stays even when the mount falls back to a session).
 
     #[tokio::test]
     async fn test_mount_blob_falls_back_when_source_lacks_blob() {
