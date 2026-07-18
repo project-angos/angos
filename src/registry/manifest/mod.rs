@@ -590,13 +590,9 @@ impl Registry {
         let events = delete_events(namespace, repository, digest_str, reference, actor);
         self.dispatch_events(&events).await?;
 
-        // A delete carries no incoming digest, so a timestamp tie keeps the
-        // strictly-greater rule and the delete proceeds.
-        self.check_lww_not_superseded(namespace, reference, source_ts, None)
-            .await?;
-
         // A digest delete cascades to every pointing tag; resolve them first
-        // for the suppression gate, the LWW guard, and the link plan.
+        // for the suppression gate and the link plan. LWW guarding of a
+        // replicated delete happens in the link transaction planner.
         let pointing_tags = if let Reference::Digest(digest) = reference {
             self.metadata_store
                 .find_tags_pointing_at(namespace, digest)
@@ -615,7 +611,7 @@ impl Registry {
             .await;
 
         let ops = self
-            .plan_manifest_delete_ops(namespace, reference, &pointing_tags, source_ts)
+            .plan_manifest_delete_ops(reference, &pointing_tags)
             .await?;
 
         self.commit_manifest_delete(namespace, reference, &ops, source_ts)
@@ -677,26 +673,18 @@ impl Registry {
         }
     }
 
-    /// Builds the link plan for a delete. A digest delete first guards against a
-    /// newer local re-point of a pointing tag (LWW) and reads the manifest to
-    /// cascade its child links; a tag delete drops only the tag link.
+    /// Builds the link plan for a delete. A digest delete reads the manifest to
+    /// cascade its child links; a tag delete drops only the tag link. The
+    /// planner's LWW gate rejects the plan when a pointing tag was re-pointed
+    /// locally after a replicated delete was authored.
     async fn plan_manifest_delete_ops(
         &self,
-        namespace: &Namespace,
         reference: &Reference,
         pointing_tags: &[LinkKind],
-        source_ts: Option<DateTime<Utc>>,
     ) -> Result<Vec<LinkOperation>, Error> {
         let Reference::Digest(digest) = reference else {
             return Ok(link_plan::delete(reference, None, &[]));
         };
-
-        // A tag re-pointed locally after the delete was authored must not be
-        // dropped by the older replicated delete.
-        if let Some(source_ts) = source_ts {
-            self.check_digest_delete_not_superseded(namespace, pointing_tags, source_ts)
-                .await?;
-        }
 
         let manifest = self
             .blob_store
@@ -852,20 +840,22 @@ impl Registry {
         })
     }
 
-    /// Last-writer-wins guard for a replication-originated tag write: rejects
-    /// with [`Error::ReplicationSuperseded`] (a distinct 409 the sender records
-    /// as convergence, not a retryable conflict) when the local tag strictly
-    /// supersedes the incoming `source_ts` per [`Self::link_supersedes`].
-    /// Skipped without a `source_ts` (genuine client write) and for digest
-    /// references (content-addressed); ordering uses the author's write time,
-    /// persisted as `created_at` and propagated verbatim across hops, so
-    /// multi-hop ordering is deterministic.
+    /// Advisory last-writer-wins fast-fail for a replication-originated tag
+    /// write, saving the manifest blob write when the local tag already
+    /// supersedes the incoming `source_ts`; the authoritative read-set-validated
+    /// gate lives in the link transaction planner and applies the same
+    /// [`LinkMetadata::supersedes`] rule. Skipped without a `source_ts` (genuine
+    /// client write) and for digest references (content-addressed); ordering
+    /// uses the author's write time, persisted as `created_at` and propagated
+    /// verbatim across hops. The read bypasses the link cache to avoid its
+    /// multi-replica staleness, and read errors other than `NotFound` fail
+    /// closed.
     async fn check_lww_not_superseded(
         &self,
         namespace: &Namespace,
         reference: &Reference,
         source_ts: Option<DateTime<Utc>>,
-        incoming_digest: Option<&Digest>,
+        incoming_digest: &Digest,
     ) -> Result<(), Error> {
         let Some(source_ts) = source_ts else {
             return Ok(());
@@ -874,67 +864,19 @@ impl Registry {
             return Ok(());
         };
 
-        if let Some(created_at) = self
-            .link_supersedes(
-                namespace,
-                &LinkKind::Tag(tag.clone()),
-                source_ts,
-                incoming_digest,
-            )
-            .await?
-        {
-            return Err(Error::ReplicationSuperseded(format!(
-                "local tag '{tag}' (created {created_at}) is newer than the replicated source ({source_ts})"
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// `Some(created_at)` iff the local link strictly supersedes the incoming
-    /// write per [`LinkMetadata::supersedes`]; `None` when the link is absent
-    /// or loses. Read errors other than `ReferenceNotFound` fail closed, and
-    /// reads bypass the link cache to avoid its multi-replica staleness.
-    async fn link_supersedes(
-        &self,
-        namespace: &Namespace,
-        link: &LinkKind,
-        source_ts: DateTime<Utc>,
-        incoming_digest: Option<&Digest>,
-    ) -> Result<Option<DateTime<Utc>>, Error> {
         let metadata = match self
             .metadata_store
-            .read_link_reference(namespace, link)
+            .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
             .await
         {
             Ok(metadata) => metadata,
-            Err(Error::NotFound) => return Ok(None),
+            Err(Error::NotFound) => return Ok(()),
             Err(err) => return Err(err),
         };
-        Ok(metadata.supersedes(source_ts, incoming_digest))
-    }
-
-    /// Last-writer-wins guard for a replication-originated digest delete: the
-    /// delete cascades to every pointing tag, so a tag re-pointed locally
-    /// after the delete was authored rejects the whole delete with
-    /// [`Error::ReplicationSuperseded`], preserving the tag and the revision
-    /// it still references.
-    async fn check_digest_delete_not_superseded(
-        &self,
-        namespace: &Namespace,
-        tags: &[LinkKind],
-        source_ts: DateTime<Utc>,
-    ) -> Result<(), Error> {
-        for tag in tags {
-            // No incoming digest, so a timestamp tie lets the delete proceed.
-            if let Some(created_at) = self
-                .link_supersedes(namespace, tag, source_ts, None)
-                .await?
-            {
-                return Err(Error::ReplicationSuperseded(format!(
-                    "local {tag} (created {created_at}) is newer than the replicated digest delete ({source_ts})"
-                )));
-            }
+        if let Some(created_at) = metadata.supersedes(source_ts, Some(incoming_digest)) {
+            return Err(Error::ReplicationSuperseded(format!(
+                "local tag '{tag}' (created {created_at}) is newer than the replicated source ({source_ts})"
+            )));
         }
 
         Ok(())
@@ -1017,7 +959,7 @@ impl Registry {
         );
         self.dispatch_events(&events).await?;
 
-        self.check_lww_not_superseded(namespace, &reference, source_ts, Some(&digest))
+        self.check_lww_not_superseded(namespace, &reference, source_ts, &digest)
             .await?;
 
         let reference_policy = if self.validate_manifest_references {
