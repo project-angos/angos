@@ -312,6 +312,104 @@ impl Backend {
         }
         Ok(())
     }
+
+    /// Emit whole multipart parts from `reader` for a known-length append of
+    /// `available` bytes, returning the trailing sub-part remainder. Uniform
+    /// mode flushes `part_size` parts; non-uniform mode flushes everything as
+    /// one part once `available` reaches the operator-configured `part_size`,
+    /// but never below the S3 5 MiB floor (a smaller non-final `UploadPart`
+    /// would be rejected).
+    async fn emit_known_length_parts<R>(
+        &self,
+        key: &str,
+        upload_id: &mut Option<String>,
+        parts: &mut Vec<UploadedPart>,
+        reader: &mut R,
+        available: u64,
+    ) -> Result<Vec<u8>, Error>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let nonuniform_threshold = self.part_size.max(MIN_PART_SIZE);
+        let (parts_to_emit, emit_size, restaged) = if self.uniform_parts {
+            let part_size = self.part_size;
+            let full = available / part_size;
+            (full, part_size, available - full * part_size)
+        } else if available >= nonuniform_threshold {
+            (1u64, available, 0u64)
+        } else {
+            (0u64, 0u64, available)
+        };
+
+        for _ in 0..parts_to_emit {
+            let part_number = next_part_number(parts)?;
+            // Open the multipart lazily, only when a part actually needs
+            // flushing.
+            let id = ensure_upload_id(&self.client, upload_id, key).await?;
+            let etag = stream_part(&self.client, key, &id, part_number, emit_size, reader).await?;
+            parts.push(UploadedPart {
+                part_number,
+                e_tag: etag,
+                size: emit_size,
+            });
+        }
+
+        let mut remainder = Vec::with_capacity(
+            usize::try_from(restaged).map_err(|e| Error::Backend(e.to_string()))?,
+        );
+        (&mut *reader)
+            .take(restaged)
+            .read_to_end(&mut remainder)
+            .await?;
+        let actual = u64::try_from(remainder.len()).map_err(|e| Error::Backend(e.to_string()))?;
+        if actual != restaged {
+            return Err(Error::Backend(format!(
+                "short read while restaging: expected {restaged}, got {actual}",
+            )));
+        }
+        Ok(remainder)
+    }
+
+    /// Drain `reader` to EOF for an unknown-length append (a chunked request
+    /// with no `Content-Length`), flushing a `part_size` part each time one
+    /// accumulates and returning the trailing short read as the remainder.
+    /// Non-final parts thus match the known-length uniform path, so a
+    /// mixed-mode session stays uniform.
+    async fn drain_chunked_parts<R>(
+        &self,
+        key: &str,
+        upload_id: &mut Option<String>,
+        parts: &mut Vec<UploadedPart>,
+        reader: &mut R,
+    ) -> Result<Vec<u8>, Error>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let flush_size = self.part_size;
+        let cap = usize::try_from(flush_size).map_err(|e| Error::Backend(e.to_string()))?;
+        loop {
+            let mut buf = Vec::with_capacity(cap);
+            (&mut *reader)
+                .take(flush_size)
+                .read_to_end(&mut buf)
+                .await?;
+            if (buf.len() as u64) < flush_size {
+                return Ok(buf);
+            }
+            let part_number = next_part_number(parts)?;
+            let id = ensure_upload_id(&self.client, upload_id, key).await?;
+            let body: ByteStream = Box::pin(stream::once(async move { Ok(Bytes::from(buf)) }));
+            let etag = self
+                .client
+                .upload_part_streaming(key, &id, part_number, flush_size, body)
+                .await?;
+            parts.push(UploadedPart {
+                part_number,
+                e_tag: etag,
+                size: flush_size,
+            });
+        }
+    }
 }
 
 /// In-flight multipart state recovered from S3 by [`Backend::recover_upload`].
@@ -476,82 +574,22 @@ impl ObjectStore for Backend {
         let combined = chain_staged_with_body(staged_bytes, body);
         let mut reader = StreamReader::new(combined);
 
-        // Emit whole multipart parts; `remainder` is the trailing sub-part bytes
-        // to restage at the new committed offset.
-        let remainder: Vec<u8> = if let Some(len) = len {
-            let available = staged_len + len;
-
-            // Non-uniform mode flushes once the combined bytes reach the
-            // operator-configured `part_size`, but never below the S3 5 MiB
-            // floor (a smaller non-final `UploadPart` would be rejected).
-            let nonuniform_threshold = self.part_size.max(MIN_PART_SIZE);
-            let (parts_to_emit, emit_size, restaged) = if self.uniform_parts {
-                let part_size = self.part_size;
-                let full = available / part_size;
-                (full, part_size, available - full * part_size)
-            } else if available >= nonuniform_threshold {
-                (1u64, available, 0u64)
-            } else {
-                (0u64, 0u64, available)
-            };
-
-            for _ in 0..parts_to_emit {
-                let part_number = next_part_number(&parts)?;
-                // Open the multipart lazily, only when a part actually needs
-                // flushing.
-                let id = ensure_upload_id(&self.client, &mut upload_id, key).await?;
-                let etag = stream_part(&self.client, key, &id, part_number, emit_size, &mut reader)
-                    .await?;
-                parts.push(UploadedPart {
-                    part_number,
-                    e_tag: etag,
-                    size: emit_size,
-                });
+        // Emit whole multipart parts; the remainder is the trailing sub-part
+        // bytes to restage at the new committed offset.
+        let remainder = match len {
+            Some(len) => {
+                self.emit_known_length_parts(
+                    key,
+                    &mut upload_id,
+                    &mut parts,
+                    &mut reader,
+                    staged_len + len,
+                )
+                .await?
             }
-
-            let mut remainder = Vec::with_capacity(
-                usize::try_from(restaged).map_err(|e| Error::Backend(e.to_string()))?,
-            );
-            (&mut reader)
-                .take(restaged)
-                .read_to_end(&mut remainder)
-                .await?;
-            let actual =
-                u64::try_from(remainder.len()).map_err(|e| Error::Backend(e.to_string()))?;
-            if actual != restaged {
-                return Err(Error::Backend(format!(
-                    "short read while restaging: expected {restaged}, got {actual}",
-                )));
-            }
-            remainder
-        } else {
-            // Unknown length (a chunked request with no `Content-Length`): drain
-            // `reader` to EOF, flushing a part each time `flush_size` bytes
-            // accumulate. This handles all unknown-length input (uniform and
-            // non-uniform), flushing `part_size` parts and buffering up to
-            // `part_size` at a time. Non-final parts are thus always `part_size`,
-            // matching the known-length uniform path so a mixed-mode session
-            // stays uniform. The trailing short read is the remainder.
-            let flush_size = self.part_size;
-            let cap = usize::try_from(flush_size).map_err(|e| Error::Backend(e.to_string()))?;
-            loop {
-                let mut buf = Vec::with_capacity(cap);
-                (&mut reader).take(flush_size).read_to_end(&mut buf).await?;
-                if (buf.len() as u64) < flush_size {
-                    break buf;
-                }
-                let part_number = next_part_number(&parts)?;
-                let id = ensure_upload_id(&self.client, &mut upload_id, key).await?;
-                let body: ByteStream = Box::pin(stream::once(async move { Ok(Bytes::from(buf)) }));
-                let etag = self
-                    .client
-                    .upload_part_streaming(key, &id, part_number, flush_size, body)
-                    .await?;
-                parts.push(UploadedPart {
-                    part_number,
-                    e_tag: etag,
-                    size: flush_size,
-                });
+            None => {
+                self.drain_chunked_parts(key, &mut upload_id, &mut parts, &mut reader)
+                    .await?
             }
         };
 
