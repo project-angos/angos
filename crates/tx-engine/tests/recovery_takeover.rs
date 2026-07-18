@@ -638,6 +638,10 @@ impl LockStorage for OwnershipLostLockStorage {
     fn label(&self) -> &'static str {
         "ownership-lost"
     }
+
+    fn is_process_shared(&self) -> bool {
+        true
+    }
 }
 
 /// Fix: `LockedExecutor::execute` must fence Apply against lock-loss. While the
