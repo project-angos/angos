@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
+use tokio::try_join;
 use tracing::instrument;
 
 use crate::{
@@ -731,8 +732,11 @@ impl Registry {
     /// namespace holding only in-progress uploads is absent from it; the blob
     /// store's `_uploads`-keyed listing is merged so pending uploads surface.
     async fn collect_namespaces(&self, scope: Option<&str>) -> Result<Vec<String>, Error> {
-        let mut namespaces = self.metadata_store.collect_namespaces(scope).await?;
-        namespaces.extend(self.blob_store.collect_upload_namespaces(scope).await?);
+        let (mut namespaces, upload_namespaces) = try_join!(
+            self.metadata_store.collect_namespaces(scope),
+            self.blob_store.collect_upload_namespaces(scope),
+        )?;
+        namespaces.extend(upload_namespaces);
 
         namespaces.sort_unstable();
         namespaces.dedup();

@@ -55,12 +55,10 @@ impl MetadataStore {
             &prefix,
             "_manifests",
             pagination::NAMESPACE_WALK_CONCURRENCY,
-            |path, token| async move {
-                self.store()
-                    .object_store()
-                    .list_children(&path, 1000, token, None)
-                    .await
-                    .map_err(Error::from)
+            |path| async move {
+                let (sub_prefixes, _) =
+                    self.store().object_store().list_all_children(&path).await?;
+                Ok(sub_prefixes)
             },
         )
         .await

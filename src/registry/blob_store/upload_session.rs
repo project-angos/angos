@@ -258,11 +258,9 @@ impl BlobStore {
             &prefix,
             "_uploads",
             pagination::NAMESPACE_WALK_CONCURRENCY,
-            |path, token| async move {
-                self.object
-                    .list_children(&path, 1000, token, None)
-                    .await
-                    .map_err(Error::from)
+            |path| async move {
+                let (sub_prefixes, _) = self.object.list_all_children(&path).await?;
+                Ok(sub_prefixes)
             },
         )
         .await

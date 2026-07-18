@@ -1,12 +1,12 @@
+use std::collections::VecDeque;
 use std::future::Future;
 
-use angos_storage::ChildrenPage;
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
-/// Fan-out for the concurrent namespace walk. The tree is shallow and wide (one
-/// node per repository path segment), so a directory's siblings are listed in
-/// parallel to hide per-request backend latency, which dominates on S3.
-pub const NAMESPACE_WALK_CONCURRENCY: usize = 32;
+/// Fan-out for the concurrent namespace walk: up to this many directories are
+/// scanned at once, refilled from the backlog as scans complete, to hide
+/// per-request backend latency, which dominates on S3.
+pub const NAMESPACE_WALK_CONCURRENCY: usize = 128;
 
 /// One scanned directory: its namespace name when it holds the `marker` child,
 /// and the sub-directories to descend into.
@@ -23,81 +23,72 @@ struct DirectoryScan {
 ///
 /// `root_prefix` seeds the namespace name of `root_path` (empty for a
 /// whole-store walk, `"{repository}/"` to restrict the walk to one repository's
-/// subtree while keeping the repository segment in the returned names). The walk
-/// runs breadth-first, listing each level's directories concurrently, so the
-/// returned order is unspecified and callers that need ordering must sort.
+/// subtree while keeping the repository segment in the returned names). The
+/// walk keeps up to `concurrency` directory scans in flight continuously,
+/// queueing discovered sub-directories as scans complete, so the returned
+/// order is unspecified and callers that need ordering must sort.
 ///
-/// `list_children(path, token)` returns one page of `path`'s immediate
-/// children on whichever store is being walked.
+/// `children_of(path)` returns every immediate child directory name of `path`
+/// on whichever store is being walked.
 pub async fn collect_namespaces_with_marker<E, List, ListFut>(
     root_path: &str,
     root_prefix: &str,
     marker: &str,
     concurrency: usize,
-    list_children: List,
+    children_of: List,
 ) -> Result<Vec<String>, E>
 where
-    List: Fn(String, Option<String>) -> ListFut,
-    ListFut: Future<Output = Result<ChildrenPage, E>>,
+    List: Fn(String) -> ListFut,
+    ListFut: Future<Output = Result<Vec<String>, E>>,
 {
+    let concurrency = concurrency.max(1);
     let mut namespaces = Vec::new();
-    let mut frontier = vec![(root_path.to_string(), root_prefix.to_string())];
+    let mut backlog = VecDeque::from([(root_path.to_string(), root_prefix.to_string())]);
+    let mut in_flight = FuturesUnordered::new();
 
-    while !frontier.is_empty() {
-        let scanned: Vec<Result<DirectoryScan, E>> = stream::iter(frontier.drain(..))
-            .map(|(path, prefix)| scan_directory(&list_children, marker, path, prefix))
-            .buffer_unordered(concurrency.max(1))
-            .collect()
-            .await;
-
-        let mut next_frontier = Vec::new();
-        for scan in scanned {
-            let scan = scan?;
-            if let Some(namespace) = scan.namespace {
-                namespaces.push(namespace);
-            }
-            next_frontier.extend(scan.children);
+    while !(backlog.is_empty() && in_flight.is_empty()) {
+        while in_flight.len() < concurrency {
+            let Some((path, prefix)) = backlog.pop_front() else {
+                break;
+            };
+            in_flight.push(scan_directory(&children_of, marker, path, prefix));
         }
-        frontier = next_frontier;
+        let Some(scan) = in_flight.next().await else {
+            break;
+        };
+        let scan = scan?;
+        if let Some(namespace) = scan.namespace {
+            namespaces.push(namespace);
+        }
+        backlog.extend(scan.children);
     }
 
     Ok(namespaces)
 }
 
-/// Page through `path`'s immediate children, deciding whether it is a namespace
+/// Enumerate `path`'s immediate children, deciding whether it is a namespace
 /// and collecting the sub-directories to descend into.
 async fn scan_directory<E, List, ListFut>(
-    list_children: &List,
+    children_of: &List,
     marker: &str,
     path: String,
     prefix: String,
 ) -> Result<DirectoryScan, E>
 where
-    List: Fn(String, Option<String>) -> ListFut,
-    ListFut: Future<Output = Result<ChildrenPage, E>>,
+    List: Fn(String) -> ListFut,
+    ListFut: Future<Output = Result<Vec<String>, E>>,
 {
-    let mut token = None;
     let mut is_namespace = false;
     let mut children = Vec::new();
-
-    loop {
-        let page = list_children(path.clone(), token).await?;
-
-        for entry in &page.sub_prefixes {
-            if entry == marker {
-                is_namespace = true;
-                continue;
-            }
-            if entry.starts_with('_') {
-                continue;
-            }
-            children.push((format!("{path}/{entry}"), format!("{prefix}{entry}/")));
+    for entry in children_of(path.clone()).await? {
+        if entry == marker {
+            is_namespace = true;
+            continue;
         }
-
-        token = page.next_token;
-        if token.is_none() {
-            break;
+        if entry.starts_with('_') {
+            continue;
         }
+        children.push((format!("{path}/{entry}"), format!("{prefix}{entry}/")));
     }
 
     let namespace = is_namespace
