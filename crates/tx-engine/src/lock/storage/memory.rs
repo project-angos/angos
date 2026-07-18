@@ -144,4 +144,8 @@ impl LockStorage for MemoryLockStorage {
     fn label(&self) -> &'static str {
         "memory"
     }
+
+    fn is_process_shared(&self) -> bool {
+        false
+    }
 }

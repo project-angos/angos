@@ -161,9 +161,8 @@ impl RegistryClient {
         cache_key: &str,
     ) -> Result<String, Error> {
         let mut req = self.client.get(challenge.token_url()?);
-        if let Some((user, pass)) = &self.basic_auth {
-            let encoded = BASE64_STANDARD.encode(format!("{user}:{pass}"));
-            req = req.header(AUTHORIZATION, format!("Basic {encoded}"));
+        if self.basic_auth.is_some() {
+            req = req.header(AUTHORIZATION, self.build_basic_auth_header()?);
         }
 
         let resp = req
@@ -199,7 +198,7 @@ impl RegistryClient {
         let (user, pass) = self.basic_auth.as_ref().ok_or_else(|| {
             Error::Unauthorized("Basic auth required but not configured".to_string())
         })?;
-        let encoded = BASE64_STANDARD.encode(format!("{user}:{pass}"));
+        let encoded = BASE64_STANDARD.encode(format!("{user}:{}", pass.expose()));
         Ok(format!("Basic {encoded}"))
     }
 }

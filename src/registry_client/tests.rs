@@ -104,6 +104,28 @@ fn test_new_with_both_credentials() {
     assert!(client.basic_auth.is_some());
 }
 
+// The client (and everything holding it, like a replication downstream) is
+// Debug-formatted in logs; the configured password must never appear there.
+#[test]
+fn debug_output_redacts_basic_auth_password() {
+    let config = RegistryClientConfig {
+        username: Some("user".to_string()),
+        password: Some(Secret::new("hunter2".to_string())),
+        ..test_client_config("https://example.com")
+    };
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+
+    let debug = format!("{client:?}");
+    assert!(
+        !debug.contains("hunter2"),
+        "Debug must not leak the password, got: {debug}"
+    );
+    assert!(debug.contains("[REDACTED]"));
+}
+
 #[tokio::test]
 async fn test_head_blob_success() {
     let mock_server = MockServer::start().await;
