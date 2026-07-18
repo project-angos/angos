@@ -238,3 +238,40 @@ async fn dispatch_records_delivery_duration_metric() {
         "event_webhook_delivery_duration_seconds must appear in the /metrics registry output"
     );
 }
+
+#[tokio::test]
+async fn dispatch_delivers_to_all_endpoints_despite_required_failure() {
+    let failing = MockServer::start().await;
+    let succeeding = MockServer::start().await;
+    let event = create_test_event();
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&failing)
+        .await;
+
+    // Regardless of endpoint iteration order, the succeeding hook must get its
+    // delivery even though the failing required hook errors the dispatch.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&succeeding)
+        .await;
+
+    let mut webhooks = HashMap::new();
+    webhooks.insert(
+        "failing-hook".to_string(),
+        create_test_webhook_config(&failing.uri(), DeliveryPolicy::Required, None, 0),
+    );
+    webhooks.insert(
+        "succeeding-hook".to_string(),
+        create_test_webhook_config(&succeeding.uri(), DeliveryPolicy::Required, None, 0),
+    );
+    let dispatcher = build_dispatcher(webhooks);
+
+    let result = dispatcher.dispatch(&event).await;
+    assert!(
+        result.is_err(),
+        "the failing required hook must surface an error"
+    );
+}
