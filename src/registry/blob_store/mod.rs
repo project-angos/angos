@@ -118,7 +118,7 @@ impl BlobStore {
                 stream::iter(
                     shards
                         .into_iter()
-                        .map(move |shard| Box::pin(self.shard_blobs(*algorithm, shard))),
+                        .map(move |shard| Box::pin(self.shard_blobs(*algorithm, &shard))),
                 )
                 .flatten_unordered(BLOB_LIST_CONCURRENCY)
             })
@@ -127,12 +127,13 @@ impl BlobStore {
     }
 
     /// One shard directory's blobs (each the `<hash>/data` key under the
-    /// shard prefix), one listing page at a time.
-    fn shard_blobs(
-        &self,
+    /// shard prefix), one listing page at a time. The returned stream borrows
+    /// only `self`: `shard` is consumed into the owned prefix up front.
+    fn shard_blobs<'a>(
+        &'a self,
         algorithm: Algorithm,
-        shard: String,
-    ) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
+        shard: &str,
+    ) -> impl Stream<Item = Result<Digest, Error>> + Send + use<'a> {
         let prefix = format!("{}/{algorithm}/{shard}/", path_builder::blobs_root_dir());
         paginated(move |token| {
             let prefix = prefix.clone();

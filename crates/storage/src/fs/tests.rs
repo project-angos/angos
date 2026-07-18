@@ -276,10 +276,11 @@ async fn listings_skip_atomic_write_temporaries() {
 /// sibling-`mkdir` race when concurrent writes share a parent directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_writes_under_shared_parent_all_succeed() {
+    const TASKS: usize = 64;
+
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
 
-    const TASKS: usize = 64;
     let mut handles = Vec::with_capacity(TASKS);
     for i in 0..TASKS {
         let store = store.clone();

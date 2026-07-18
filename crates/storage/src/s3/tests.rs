@@ -303,7 +303,7 @@ async fn upload_uniform_mixed_known_then_chunked_stays_uniform() {
     let key = format!("up/uniform-mixed/{}/data", Uuid::new_v4());
     // First a known-length part_size body, then a chunked body large enough to
     // flush two more parts plus a remainder.
-    let first: Vec<u8> = (0..PART as u32).map(|i| (i % 251) as u8).collect();
+    let first: Vec<u8> = (0..PART).map(|i| (i % 251) as u8).collect();
     let second: Vec<u8> = (0..23 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
 
     store.create_upload(&key).await.unwrap();

@@ -531,7 +531,7 @@ mod tests {
         write_body(&store, tx_id, 0).await;
 
         BodyJanitor::builder(store.clone() as Arc<dyn ObjectStore>)
-            .orphan_age(Duration::from_secs(3600))
+            .orphan_age(Duration::from_hours(1))
             .build()
             .sweep()
             .await;
