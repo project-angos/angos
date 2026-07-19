@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Debug-formatting a registry client (pull-through upstream or replication downstream) no longer exposes the configured password; the client stores it in the redacting `Secret` wrapper.
 - A pull-through cache fill now rejects a fetched blob whose bytes do not hash to the requested digest, so a compromised or man-in-the-middle upstream can no longer poison the cache with content stored under a trusted digest.
 - A 5xx response body no longer includes the internal error string (which could carry a backend URL or connection detail); the full detail is logged server-side and the client receives only the error code and a request id to quote.
+- The authorization-webhook decision cache is now keyed on the full set of forwarded request headers (host, URI, and operator-forwarded headers) rather than just identity and action, so a cached allow can no longer be replayed across a different forwarded context the webhook could have denied.
 
 ### Added
 
