@@ -16,7 +16,7 @@ use angos_s3_client::{
 };
 use bytes::Bytes;
 use bytesize::ByteSize;
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use uuid::Uuid;
 
 use super::staged_key;
@@ -80,6 +80,58 @@ async fn list_all_children_partitions_skewed_names_completely() {
     dirs.sort();
     assert_eq!(sub_prefixes, dirs);
     assert_eq!(objects, ["v0"]);
+}
+
+/// The concurrent flat scan enumerates exactly what one plain serial list does:
+/// the range partition adds and drops nothing. A dense cluster sharing a leading
+/// character forces the probe to truncate and one range to page serially; keys
+/// named exactly like split boundaries and keys in the open first and last
+/// ranges exercise the exclusive-low, inclusive-high edges.
+///
+/// The invariant is checked against the backend's own listing, not the put set:
+/// rustfs's `ListObjectsV2` can omit a handful of the existing objects, so the
+/// point under test is that the fan-out matches a single serial listing key for
+/// key, not that rustfs enumerates everything.
+#[tokio::test]
+async fn list_all_matches_a_plain_serial_list() {
+    let store = backend();
+
+    let mut keys: Vec<String> = (0..1100).map(|i| format!("data/{i:04}/blob")).collect();
+    keys.extend(
+        [
+            "0", "0z", "9", "A", "Z", "_", "a", "m", "m0", "z", "zz", "~edge",
+        ]
+        .map(str::to_string),
+    );
+    stream::iter(keys.iter().map(|key| {
+        let store = store.clone();
+        let key = format!("flat/{key}");
+        async move { store.put(&key, Bytes::from_static(b"x")).await.unwrap() }
+    }))
+    .buffer_unordered(64)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut plain = plain_list(&store, "flat").await;
+    let mut scanned: Vec<String> = store.list_all("flat").try_collect().await.unwrap();
+    plain.sort();
+    scanned.sort();
+    assert_eq!(scanned, plain);
+}
+
+/// Drain the plain paginated flat list of `prefix` into one vec.
+async fn plain_list(store: &Backend, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut token = None;
+    loop {
+        let page = store.list(prefix, 1000, token).await.unwrap();
+        out.extend(page.items);
+        match page.next_token {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    out
 }
 
 #[tokio::test]

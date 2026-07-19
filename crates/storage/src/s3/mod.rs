@@ -59,9 +59,9 @@ use tokio::{
 use tokio_util::{io::StreamReader, task::AbortOnDropHandle};
 
 use crate::{
-    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, MultipartUploadPage,
-    ObjectMeta, ObjectStore, Page, PendingMultipartUpload, PresignedStore, channel_stream,
-    object::dir_prefix,
+    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, KeyStream,
+    MultipartUploadPage, ObjectMeta, ObjectStore, Page, PendingMultipartUpload, PresignedStore,
+    channel_stream, object::dir_prefix,
 };
 
 mod range_scan;
@@ -375,7 +375,7 @@ impl ObjectStore for Backend {
         n: u16,
         token: Option<String>,
     ) -> Result<Page<String>, Error> {
-        let (items, next_token) = self.client.list_objects(prefix, n, token).await?;
+        let (items, next_token) = self.client.list_objects(prefix, n, token, None).await?;
         Ok(Page { items, next_token })
     }
 
@@ -402,6 +402,10 @@ impl ObjectStore for Backend {
 
     async fn list_all_children(&self, prefix: &str) -> Result<(Vec<String>, Vec<String>), Error> {
         range_scan::scan_all_children(&self.client, prefix).await
+    }
+
+    fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
+        range_scan::scan_all_keys(&self.client, prefix)
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {

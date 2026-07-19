@@ -14,6 +14,7 @@ use std::str;
 
 use argh::FromArgs;
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use tracing::{debug, info, warn};
 
 use angos_storage::ObjectStore;
@@ -28,9 +29,6 @@ use crate::{
 mod error;
 
 pub use error::Error;
-
-/// Number of link keys fetched per flat-listing page.
-const PAGE_SIZE: u16 = 100;
 
 /// A link file's on-disk form, decided by trying to parse its raw bytes.
 enum LinkForm {
@@ -97,28 +95,18 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
 }
 
 /// Walk every link object under the repositories root, rewriting each
-/// bare-digest file as JSON. Paginates so it never holds more than one page of
-/// keys in memory.
+/// bare-digest file as JSON. Streams the keys so it never holds more than one
+/// listing page in memory.
 async fn migrate_links(object_store: &dyn ObjectStore, dry_run: bool) -> Result<Report, Error> {
     let root = path_builder::repository_dir();
     let mut report = Report::default();
-    let mut token = None;
-    loop {
-        let page = object_store
-            .list(root, PAGE_SIZE, token)
-            .await
-            .map_err(registry::Error::from)?;
-        for key in page.items {
-            // `list` yields keys relative to `root`; rebuild the full key before
-            // touching the object.
-            if key.ends_with("/link") {
-                let full_key = format!("{root}/{key}");
-                migrate_one(object_store, &full_key, dry_run, &mut report).await?;
-            }
-        }
-        match page.next_token {
-            Some(next) => token = Some(next),
-            None => break,
+    let mut keys = object_store.list_all(root).map_err(registry::Error::from);
+    while let Some(key) = keys.try_next().await? {
+        // `list_all` yields keys relative to `root`; rebuild the full key before
+        // touching the object.
+        if key.ends_with("/link") {
+            let full_key = format!("{root}/{key}");
+            migrate_one(object_store, &full_key, dry_run, &mut report).await?;
         }
     }
     Ok(report)
