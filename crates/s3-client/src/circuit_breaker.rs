@@ -1,5 +1,5 @@
 use std::{
-    fmt, io,
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -29,12 +29,6 @@ impl fmt::Display for CircuitBreakerError {
 }
 
 impl std::error::Error for CircuitBreakerError {}
-
-impl From<CircuitBreakerError> for io::Error {
-    fn from(e: CircuitBreakerError) -> Self {
-        io::Error::other(e.to_string())
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct CircuitBreaker {

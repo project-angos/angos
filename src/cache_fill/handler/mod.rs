@@ -161,22 +161,22 @@ impl CacheFillJobHandler {
 impl JobHandler for CacheFillJobHandler {
     async fn execute(&self, envelope: &JobEnvelope) -> Result<Transaction, Error> {
         if envelope.kind != CACHE_FETCH_BLOB_KIND {
-            return Err(Error::Storage(format!(
+            return Err(Error::Execution(format!(
                 "unsupported job kind '{}'; expected '{CACHE_FETCH_BLOB_KIND}'",
                 envelope.kind,
             )));
         }
         let payload: CacheFetchBlobPayload = serde_json::from_value(envelope.payload.clone())
-            .map_err(|e| Error::Storage(format!("failed to deserialize job payload: {e}")))?;
+            .map_err(|e| Error::Execution(format!("failed to deserialize job payload: {e}")))?;
 
         let digest: Digest = payload
             .digest
             .parse()
-            .map_err(|e| Error::Storage(format!("invalid digest '{}': {e}", payload.digest)))?;
+            .map_err(|e| Error::Execution(format!("invalid digest '{}': {e}", payload.digest)))?;
 
         self.fill(&payload.namespace, &digest)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Execution(e.to_string()))?;
 
         Ok(Transaction::builder().build())
     }

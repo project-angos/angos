@@ -286,9 +286,7 @@ impl RecoveryLoop {
         let len = intent.mutations.len();
         for idx in 0..len {
             if let Err(e) = self.apply_mutation(intent, idx).await {
-                if matches!(e, StorageError::PreconditionFailed)
-                    && self.abandon_deadline_passed(intent)
-                {
+                if matches!(e, Error::PartialCommit) && self.abandon_deadline_passed(intent) {
                     warn!(
                         tx_id = %intent.id,
                         idx,
@@ -336,35 +334,21 @@ impl RecoveryLoop {
     /// On true contention (`Error::PartialCommit` from the CAS path), the
     /// mutation is left `Pending` and the error is surfaced so the caller stops
     /// replay and leaves the intent for the next sweep.
-    async fn apply_mutation(
-        &self,
-        intent: &mut IntentRecord,
-        idx: usize,
-    ) -> Result<(), StorageError> {
+    async fn apply_mutation(&self, intent: &mut IntentRecord, idx: usize) -> Result<(), Error> {
         if matches!(intent.progress.get(idx), Some(MutationProgress::Applied)) {
             return Ok(());
         }
 
         let mutation = intent.mutations[idx].clone();
         if let Some(cs) = &self.conditional_store {
-            apply_cas(cs.as_ref(), &mutation, ApplyMode::Reconcile)
-                .await
-                .map_err(|e| match e {
-                    Error::PartialCommit => StorageError::PreconditionFailed,
-                    Error::Storage(s) => s,
-                    other => StorageError::Backend(other.to_string()),
-                })?;
+            apply_cas(cs.as_ref(), &mutation, ApplyMode::Reconcile).await?;
         } else {
             common::apply_object_store(
                 self.store.as_ref(),
                 &mutation,
                 common::ApplyMode::Reconcile,
             )
-            .await
-            .map_err(|e| match e {
-                Error::Storage(s) => s,
-                other => StorageError::Backend(other.to_string()),
-            })?;
+            .await?;
         }
 
         common::stamp_applied(self.store.as_ref(), intent, idx).await;

@@ -192,7 +192,7 @@ impl ReplicationJobHandler {
         downstream_name: &str,
     ) -> Result<&'a ReplicationDownstream, Error> {
         let repository = self.resolver.resolve(namespace).ok_or_else(|| {
-            Error::Storage(format!(
+            Error::Execution(format!(
                 "no repository configured for namespace '{namespace}'"
             ))
         })?;
@@ -205,7 +205,7 @@ impl ReplicationJobHandler {
             .iter()
             .find(|d| d.name == downstream_name)
             .ok_or_else(|| {
-                Error::Storage(format!(
+                Error::Execution(format!(
                     "no downstream '{downstream_name}' configured for namespace '{namespace}'"
                 ))
             })
@@ -265,19 +265,19 @@ impl ReplicationJobHandler {
             {
                 Ok(link) => Ok(Some((link.target, link.created_at))),
                 Err(MetadataStoreError::NotFound) => Ok(None),
-                Err(e) => Err(Error::Storage(format!(
+                Err(e) => Err(Error::Execution(format!(
                     "failed to read tag '{tag}' in '{namespace}': {e}"
                 ))),
             }
         } else {
             let digest_str = payload.digest.as_deref().ok_or_else(|| {
-                Error::Storage(format!(
+                Error::Execution(format!(
                     "tag-less push for '{namespace}' has no digest to resolve"
                 ))
             })?;
             let digest: Digest = digest_str
                 .parse()
-                .map_err(|e| Error::Storage(format!("invalid digest '{digest_str}': {e}")))?;
+                .map_err(|e| Error::Execution(format!("invalid digest '{digest_str}': {e}")))?;
             // A content-addressed digest carries no local version timestamp.
             match self
                 .metadata_store
@@ -286,7 +286,7 @@ impl ReplicationJobHandler {
             {
                 Ok(_) => Ok(Some((digest, None))),
                 Err(MetadataStoreError::NotFound) => Ok(None),
-                Err(e) => Err(Error::Storage(format!(
+                Err(e) => Err(Error::Execution(format!(
                     "failed to read revision '{digest}' in '{namespace}': {e}"
                 ))),
             }
@@ -305,7 +305,7 @@ impl ReplicationJobHandler {
         let downstream = self.resolve_downstream(namespace, &payload.downstream)?;
         // `Err` is unreachable for a routed namespace; the map stays defensive.
         let downstream_namespace = downstream.remote(namespace).map_err(|e| {
-            Error::Storage(format!(
+            Error::Execution(format!(
                 "invalid downstream namespace for '{namespace}': {e}"
             ))
         })?;
@@ -330,14 +330,14 @@ impl ReplicationJobHandler {
             Reference::Tag(tag.clone())
         } else {
             let digest = payload.digest.as_deref().ok_or_else(|| {
-                Error::Storage(format!(
+                Error::Execution(format!(
                     "tag-less delete for '{namespace}' has no digest reference"
                 ))
             })?;
             Reference::Digest(
                 digest
                     .parse()
-                    .map_err(|e| Error::Storage(format!("invalid digest '{digest}': {e}")))?,
+                    .map_err(|e| Error::Execution(format!("invalid digest '{digest}': {e}")))?,
             )
         };
         let outcome = pipeline::delete_manifest(
@@ -349,7 +349,7 @@ impl ReplicationJobHandler {
             payload.source_ts.as_deref(),
         )
         .await
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Execution(e.to_string()))?;
         Self::record_success(&payload.downstream, outcome);
         Ok(())
     }
@@ -382,7 +382,7 @@ impl ReplicationJobHandler {
             .map(|ts| ts.to_rfc3339())
             .or_else(|| payload.source_ts.clone());
         let body = self.blob_store.read(&digest).await.map_err(|e| {
-            Error::Storage(format!("failed to read local manifest '{digest}': {e}"))
+            Error::Execution(format!("failed to read local manifest '{digest}': {e}"))
         })?;
         let ctx = PushContext {
             downstream,
@@ -394,7 +394,7 @@ impl ReplicationJobHandler {
         };
         let outcome = pipeline::push_manifest(&ctx, &digest, None, payload.tag.as_deref(), body)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Execution(e.to_string()))?;
         Self::record_success(&payload.downstream, outcome);
         Ok(())
     }
@@ -406,7 +406,7 @@ impl JobHandler for ReplicationJobHandler {
         if envelope.kind != REPLICATION_PUSH_MANIFEST_KIND
             && envelope.kind != REPLICATION_DELETE_MANIFEST_KIND
         {
-            return Err(Error::Storage(format!(
+            return Err(Error::Execution(format!(
                 "unsupported job kind '{}'; expected one of '{REPLICATION_PUSH_MANIFEST_KIND}', \
                  '{REPLICATION_DELETE_MANIFEST_KIND}'",
                 envelope.kind,
@@ -414,7 +414,7 @@ impl JobHandler for ReplicationJobHandler {
         }
 
         let payload: ReplicationPushPayload = serde_json::from_value(envelope.payload.clone())
-            .map_err(|e| Error::Storage(format!("failed to deserialize job payload: {e}")))?;
+            .map_err(|e| Error::Execution(format!("failed to deserialize job payload: {e}")))?;
 
         // Loop prevention is no-op suppression at the mutation boundary: mutation
         // methods only dispatch replication when local state actually changed, so

@@ -12,7 +12,8 @@
 use std::{sync::Arc, time::Duration};
 
 use angos_s3_client::{
-    Backend as S3Backend, BackendConfig as S3Config, test_util::integration_config,
+    Backend as S3Backend, BackendConfig as S3Config, Error as S3Error,
+    test_util::integration_config,
 };
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -654,14 +655,15 @@ async fn upload_nonuniform_default_still_flushes_at_5_mib() {
     );
     // The single emitted part holds the whole 6 MiB, so the staged remainder at
     // that offset must be absent (nothing left staged).
-    assert_eq!(
-        store
-            .client
-            .object_size(&staged_key(&key, len))
-            .await
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::NotFound,
+    assert!(
+        matches!(
+            store
+                .client
+                .object_size(&staged_key(&key, len))
+                .await
+                .unwrap_err(),
+            S3Error::NotFound(_)
+        ),
         "nothing should be left staged"
     );
     assert!(
@@ -747,14 +749,15 @@ async fn upload_abort_removes_orphans_and_staged() {
         .await
         .unwrap();
     assert!(remaining.iter().all(|u| u.key != key));
-    assert_eq!(
-        store
-            .client
-            .object_size(&staged_key(&key, 0))
-            .await
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::NotFound,
+    assert!(
+        matches!(
+            store
+                .client
+                .object_size(&staged_key(&key, 0))
+                .await
+                .unwrap_err(),
+            S3Error::NotFound(_)
+        ),
         "staged remainder must be deleted by abort"
     );
     store.delete_prefix(&prefix).await.unwrap();

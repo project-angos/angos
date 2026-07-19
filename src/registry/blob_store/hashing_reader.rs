@@ -102,7 +102,7 @@ where
                 }
                 Err(e) => {
                     let _ = tx.send(Err(io::Error::other(e.to_string()))).await;
-                    return Err(Error::RangeNotSatisfiable);
+                    return Err(Error::Io(e));
                 }
             }
         }

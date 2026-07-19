@@ -6,7 +6,8 @@ mod error;
 mod write;
 
 use std::{
-    collections::HashSet, future::Future, io, path::Path, str::FromStr, sync::Arc, time::Duration,
+    collections::HashSet, fmt::Display, future::Future, io, path::Path, str::FromStr, sync::Arc,
+    time::Duration,
 };
 
 use auth::token_index_cache_key;
@@ -47,26 +48,31 @@ pub const X_ANGOS_SOURCE_TIMESTAMP: &str = "X-Angos-Source-Timestamp";
 /// convergence (job completes) while any other 409 still retries/dead-letters.
 pub const REPLICATION_SUPERSEDED_CODE: &str = "REPLICATION_SUPERSEDED";
 
-/// Classifies a non-success read status: only a true 404 maps to `not_found`, so
-/// callers can tell a genuinely absent object from a transient probe failure.
+/// Classifies a non-success read status: a true 404 maps to `not_found` so
+/// callers can tell a genuinely absent object from a transient probe failure,
+/// and a 405 maps to `Unsupported` (the remote rejects the method).
 fn classify_read_failure(status: StatusCode, op: &str, not_found: Error) -> Error {
-    if status == StatusCode::NOT_FOUND {
-        not_found
-    } else {
-        Error::Internal(format!("{op}: downstream returned status {status}"))
+    match status {
+        StatusCode::NOT_FOUND => not_found,
+        StatusCode::METHOD_NOT_ALLOWED => Error::Unsupported,
+        _ => Error::Internal(format!("{op}: downstream returned status {status}")),
     }
 }
 
+/// Reads and parses a required response header, naming it in an `Internal` error
+/// when it is absent or unparseable (a protocol fault, not an unsupported
+/// operation).
 fn parse_header<T: FromStr>(
     response: &Response,
-    header: impl reqwest::header::AsHeaderName,
+    header: impl reqwest::header::AsHeaderName + Display,
 ) -> Result<T, Error> {
+    let name = header.to_string();
     response
         .headers()
         .get(header)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse().ok())
-        .ok_or(Error::Unsupported)
+        .ok_or_else(|| Error::Internal(format!("missing or invalid '{name}' response header")))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
