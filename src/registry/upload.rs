@@ -99,20 +99,19 @@ impl Registry {
                     HashingReader::new(&mut *stream, Hasher::for_algorithm(digest.algorithm()));
                 match content_length {
                     Some(expected) => {
+                        // Draining faults are I/O (surface the source); only the
+                        // read-vs-declared comparison is a length mismatch (416).
                         let read = copy(
                             &mut (&mut reader).take(expected.saturating_add(1)),
                             &mut sink(),
                         )
-                        .await
-                        .map_err(|_| Error::RangeNotSatisfiable)?;
+                        .await?;
                         if read != expected {
                             return Err(Error::RangeNotSatisfiable);
                         }
                     }
                     None => {
-                        copy(&mut reader, &mut sink())
-                            .await
-                            .map_err(|_| Error::RangeNotSatisfiable)?;
+                        copy(&mut reader, &mut sink()).await?;
                     }
                 }
 

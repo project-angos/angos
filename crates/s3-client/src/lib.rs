@@ -7,7 +7,7 @@
 //! `io::Error`, the storage-level [`Error`] and a handful of plain-data record
 //! types).
 
-use std::{future::Future, io};
+use std::future::Future;
 
 use bytesize::ByteSize;
 
@@ -76,40 +76,14 @@ impl Backend {
     }
 
     /// Run `op` behind the circuit breaker: fail fast while the breaker is
-    /// open, otherwise execute it and feed the outcome back. `NotFound`
-    /// counts as success since the backend answered.
-    ///
-    /// # Errors
-    /// Returns an [`io::Error`] with [`io::ErrorKind::Other`] when the
-    /// circuit breaker has tripped on repeated upstream failures; otherwise
-    /// forwards `op`'s error.
-    pub async fn guarded_io<T>(
-        &self,
-        op: impl Future<Output = Result<T, io::Error>>,
-    ) -> Result<T, io::Error> {
-        self.circuit_breaker.check()?;
-        let result = op.await;
-        match &result {
-            Ok(_) => self.circuit_breaker.record_success(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => self.circuit_breaker.record_success(),
-            Err(_) => self.circuit_breaker.record_failure(),
-        }
-        result
-    }
-
-    /// [`guarded_io`](Self::guarded_io) for conditional operations returning
-    /// [`Error`]: `PreconditionFailed` and `NotFound` count as success.
+    /// open, otherwise execute it and feed the outcome back. `NotFound` and
+    /// `PreconditionFailed` count as success since the backend answered.
     ///
     /// # Errors
     /// Returns [`Error::Io`] when the circuit breaker has tripped on repeated
     /// upstream failures; otherwise forwards `op`'s error.
-    pub async fn guarded_data<T>(
-        &self,
-        op: impl Future<Output = Result<T, Error>>,
-    ) -> Result<T, Error> {
-        self.circuit_breaker
-            .check()
-            .map_err(|e| Error::Io(e.to_string()))?;
+    pub async fn guarded<T>(&self, op: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+        self.circuit_breaker.check()?;
         let result = op.await;
         match &result {
             Ok(_) | Err(Error::PreconditionFailed | Error::NotFound(_)) => {

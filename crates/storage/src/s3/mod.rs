@@ -45,9 +45,9 @@
 //! `part_size` `UploadPart` each time `part_size` bytes accumulate and staging
 //! the sub-`part_size` remainder, buffering up to `part_size` at a time.
 
-use std::{collections::HashSet, io, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use angos_s3_client::{Backend as S3Backend, UploadedPart};
+use angos_s3_client::{Backend as S3Backend, Error as S3Error, UploadedPart};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -184,7 +184,7 @@ impl Backend {
     async fn staged_size(&self, key: &str, offset: u64) -> Result<u64, Error> {
         match self.client.object_size(&staged_key(key, offset)).await {
             Ok(size) => Ok(size),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(S3Error::NotFound(_)) => Ok(0),
             Err(e) => Err(Error::Backend(e.to_string())),
         }
     }
@@ -669,7 +669,7 @@ async fn load_staged(client: &S3Backend, staging: &str, expected: u64) -> Result
     }
     match client.read(staging).await {
         Ok(bytes) => Ok(bytes),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(S3Error::NotFound(_)) => Ok(Vec::new()),
         Err(e) => Err(Error::Backend(e.to_string())),
     }
 }

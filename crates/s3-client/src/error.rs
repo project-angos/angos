@@ -1,5 +1,7 @@
 use std::{fmt, io};
 
+use crate::circuit_breaker::CircuitBreakerError;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     Configuration(String),
@@ -28,6 +30,12 @@ impl From<io::Error> for Error {
         } else {
             Error::Io(err.to_string())
         }
+    }
+}
+
+impl From<CircuitBreakerError> for Error {
+    fn from(err: CircuitBreakerError) -> Self {
+        Error::Io(err.to_string())
     }
 }
 

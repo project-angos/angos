@@ -101,6 +101,11 @@ pub enum Error {
     Initialization(String),
     #[error("storage error: {0}")]
     Storage(String),
+    /// A job handler failed to do its work (deserialize its payload, reach an
+    /// upstream, apply its effect). Distinct from [`Self::Storage`] so a handler
+    /// fault does not dead-letter mislabelled as a queue storage error.
+    #[error("job execution failed: {0}")]
+    Execution(String),
     #[error("not found")]
     NotFound,
 }
