@@ -140,10 +140,6 @@ pub fn ensure_shared_lock(store: &Store) -> Result<(), Error> {
 }
 
 // ---------------------------------------------------------------------------
-// Queue
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -542,13 +538,12 @@ impl JobStore {
     /// at the first key whose prefix is in the future.
     pub async fn list_pending(&self, queue: Queue, n: u16) -> Result<Vec<String>, Error> {
         let prefix = job_pending_dir(queue.as_str());
-        let page = self.store.object_store().list(&prefix, 1000, None).await?;
+        let page = self.store.object_store().list(&prefix, n, None).await?;
 
         Ok(page
             .items
             .into_iter()
             .filter_map(|name| name.strip_suffix(".json").map(str::to_string))
-            .take(n as usize)
             .collect())
     }
 
@@ -724,15 +719,16 @@ impl JobStore {
                 // and we don't delete the fresh index. Passing the index's own
                 // `storage_key` as the target makes the conditional delete fire
                 // for this orphan while reusing the shared fingerprint guard.
-                let (read, delete) = Self::conditional_index_delete(
+                let mut tx = Transaction::builder().build();
+                if let Some((read, delete)) = Self::conditional_index_delete(
                     index_path,
                     &data,
                     &index.storage_key,
                     &index.storage_key,
-                );
-                let mut tx = Transaction::builder().build();
-                tx.reads.extend(read);
-                tx.mutations.extend(delete);
+                ) {
+                    tx.reads.push(read);
+                    tx.mutations.push(delete);
+                }
                 match self.store.execute(tx).await {
                     Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(false),
                     Err(e) => {
@@ -795,9 +791,9 @@ impl JobStore {
         index_body: &[u8],
         index_storage_key: &str,
         target_storage_key: &str,
-    ) -> (Option<Read>, Option<Mutation>) {
+    ) -> Option<(Read, Mutation)> {
         if index_storage_key != target_storage_key {
-            return (None, None);
+            return None;
         }
         let read = Read {
             key: index_path.clone(),
@@ -807,7 +803,36 @@ impl JobStore {
             key: index_path,
             expected: None,
         };
-        (Some(read), Some(delete))
+        Some((read, delete))
+    }
+
+    /// Fold a conditional dedup-index delete into `tx`: read the current index
+    /// for `lock_key`, and when it still points at `target_storage_key`, add its
+    /// fingerprint-guarded delete so a concurrent enqueue that refreshed the
+    /// index becomes a no-op conflict instead of a clobber. A missing index or a
+    /// mismatched target leaves `tx` untouched.
+    async fn fold_index_cleanup(
+        &self,
+        tx: &mut Transaction,
+        queue: Queue,
+        lock_key: &str,
+        target_storage_key: &str,
+    ) -> Result<(), Error> {
+        let Some((index_storage_key, body)) = self.get_lock_key_index_raw(queue, lock_key).await?
+        else {
+            return Ok(());
+        };
+        let index_path = job_lock_key_index_path(queue.as_str(), lock_key);
+        if let Some((read, delete)) = Self::conditional_index_delete(
+            index_path,
+            &body,
+            &index_storage_key,
+            target_storage_key,
+        ) {
+            tx.reads.push(read);
+            tx.mutations.push(delete);
+        }
+        Ok(())
     }
 
     /// Retire the dedup index of a just-claimed job so a same-`lock_key`
@@ -817,23 +842,17 @@ impl JobStore {
     /// conditional plus fingerprint-guarded so a producer's newer index is
     /// never clobbered.
     async fn retire_claimed_index(&self, queue: Queue, lock_key: &str, storage_key: &str) {
-        let (index_storage_key, body) = match self.get_lock_key_index_raw(queue, lock_key).await {
-            Ok(Some(found)) => found,
-            Ok(None) => return,
-            Err(e) => {
-                warn!(lock_key, error = %e, "Failed to read dedup index at claim");
-                return;
-            }
-        };
-        let index_path = job_lock_key_index_path(queue.as_str(), lock_key);
-        let (read, delete) =
-            Self::conditional_index_delete(index_path, &body, &index_storage_key, storage_key);
-        if delete.is_none() {
+        let mut tx = Transaction::builder().build();
+        if let Err(e) = self
+            .fold_index_cleanup(&mut tx, queue, lock_key, storage_key)
+            .await
+        {
+            warn!(lock_key, error = %e, "Failed to read dedup index at claim");
             return;
         }
-        let mut tx = Transaction::builder().build();
-        tx.reads.extend(read);
-        tx.mutations.extend(delete);
+        if tx.mutations.is_empty() {
+            return;
+        }
         if let Err(e) = self.store.execute(tx).await
             && !matches!(e, TxError::Conflict | TxError::Precondition)
         {
@@ -958,7 +977,7 @@ impl JobStore {
             if let Some(not_before) = parse_not_before(&storage_key)
                 && not_before > now
             {
-                next_ready = Some(next_ready.map_or(not_before, |t| t.min(not_before)));
+                next_ready = Some(not_before);
                 break;
             }
             let envelope = match self.read_pending(queue, &storage_key).await {
@@ -1031,14 +1050,15 @@ impl JobStore {
         match self.get_raw(&index_path).await {
             Ok(body) => match parse_lock_key_index(&body) {
                 Ok(index) => {
-                    let (read, delete) = Self::conditional_index_delete(
+                    if let Some((read, delete)) = Self::conditional_index_delete(
                         index_path,
                         &body,
                         &index.storage_key,
                         &storage_key,
-                    );
-                    tx.reads.extend(read);
-                    tx.mutations.extend(delete);
+                    ) {
+                        tx.reads.push(read);
+                        tx.mutations.push(delete);
+                    }
                 }
                 Err(_) => {
                     tx.mutations.push(Mutation::Delete {
@@ -1198,27 +1218,13 @@ impl JobStore {
             .build();
 
         // Conditionally include the index delete: only when the index still
-        // points at our storage_key. Read the index to get the fingerprint.
-        let index_path = job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
-        match self
-            .get_lock_key_index_raw(envelope.queue, &envelope.lock_key)
+        // points at our storage_key, guarded by its read fingerprint.
+        if let Err(e) = self
+            .fold_index_cleanup(&mut tx, envelope.queue, &envelope.lock_key, &storage_key)
             .await
         {
-            Ok(Some((index_storage_key, body))) => {
-                let (read, delete) = Self::conditional_index_delete(
-                    index_path,
-                    &body,
-                    &index_storage_key,
-                    &storage_key,
-                );
-                tx.reads.extend(read);
-                tx.mutations.extend(delete);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                session.release().await;
-                return Err(e);
-            }
+            session.release().await;
+            return Err(e);
         }
 
         let result = self.store.execute(tx).await;
@@ -1334,21 +1340,8 @@ impl JobStore {
         // Fold a conditional index delete: only when the index still points at
         // this storage key. The read fingerprint turns a concurrent index
         // refresh into a no-op conflict rather than clobbering a fresh index.
-        let index_path = job_lock_key_index_path(queue.as_str(), &envelope.lock_key);
-        match self.get_lock_key_index_raw(queue, &envelope.lock_key).await {
-            Ok(Some((index_storage_key, body))) => {
-                let (read, delete) = Self::conditional_index_delete(
-                    index_path,
-                    &body,
-                    &index_storage_key,
-                    storage_key,
-                );
-                tx.reads.extend(read);
-                tx.mutations.extend(delete);
-            }
-            Ok(None) => {}
-            Err(e) => return Err(e),
-        }
+        self.fold_index_cleanup(&mut tx, queue, &envelope.lock_key, storage_key)
+            .await?;
 
         self.store
             .execute(tx)
