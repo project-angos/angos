@@ -208,13 +208,7 @@ fn validate_repositories(
 ) -> Result<(), Error> {
     for (repo_name, repo) in repositories {
         let context = format!("referenced in '{repo_name}' repository");
-        validate_auth_webhook_ref(
-            repo.authorization_webhook
-                .as_deref()
-                .filter(|n| !n.is_empty()),
-            auth_webhooks,
-            &context,
-        )?;
+        validate_auth_webhook_ref(repo.authorization_webhook_ref(), auth_webhooks, &context)?;
         validate_event_webhook_refs(&repo.event_webhooks, event_webhooks, &context)?;
     }
     Ok(())

@@ -212,6 +212,18 @@ pub struct Config {
     pub event_webhooks: Vec<String>,
 }
 
+impl Config {
+    /// The repository's authorization-webhook reference, treating a blank string
+    /// as unset. Configuration validation and authorizer construction share this
+    /// so `authorization_webhook = ""` resolves to no webhook in both, instead of
+    /// passing validation and then missing the authorizer lookup.
+    pub fn authorization_webhook_ref(&self) -> Option<&str> {
+        self.authorization_webhook
+            .as_deref()
+            .filter(|name| !name.is_empty())
+    }
+}
+
 pub struct Repository {
     pub name: Namespace,
     pub upstreams: Vec<Upstream>,
