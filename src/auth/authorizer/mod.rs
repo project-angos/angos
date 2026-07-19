@@ -138,33 +138,17 @@ impl Authorizer {
         registry: &Registry,
     ) -> Result<(), Error> {
         debug!("Evaluating global access policy");
-        match self.global_access_policy.evaluate(action, identity) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny => {
-                log_denial("global policy", identity);
-                return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
-            }
-            PolicyDecision::Indeterminate(err) => {
-                warn!("Global access policy indeterminate, denying: {err}");
-                log_denial("global policy (indeterminate)", identity);
-                return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
-            }
-        }
+        enforce_policy(
+            self.global_access_policy.evaluate(action, identity),
+            "global",
+            identity,
+        )?;
 
         if let Some(namespace) = action.get_namespace() {
             self.authorize_namespace_request(namespace, action, identity, request, registry)
                 .await?;
         } else if let Some(webhook) = &self.global_authorization_webhook {
-            debug!(
-                "Evaluating global webhook authorization: {}",
-                webhook.name()
-            );
-
-            let allowed = webhook.authorize(action, identity, request).await?;
-            if !allowed {
-                log_denial(&format!("global webhook '{}'", webhook.name()), identity);
-                return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
-            }
+            enforce_webhook(webhook, "global webhook", action, identity, request).await?;
         }
 
         Ok(())
@@ -229,51 +213,30 @@ impl Authorizer {
                 ))
             })?;
 
-        if let Some(ref access_policy) = auth_repo.access_policy {
-            match access_policy.evaluate(action, identity) {
-                PolicyDecision::Allow => {}
-                PolicyDecision::Deny => {
-                    log_denial(
-                        &format!("repository '{}' policy", repository.name),
-                        identity,
-                    );
-                    return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
-                }
-                PolicyDecision::Indeterminate(err) => {
-                    warn!(
-                        "Repository '{}' access policy indeterminate, denying: {err}",
-                        repository.name
-                    );
-                    log_denial(
-                        &format!("repository '{}' policy (indeterminate)", repository.name),
-                        identity,
-                    );
-                    return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
-                }
-            }
+        if let Some(access_policy) = &auth_repo.access_policy {
+            enforce_policy(
+                access_policy.evaluate(action, identity),
+                &format!("repository '{}'", repository.name),
+                identity,
+            )?;
         }
 
         self.check_immutable_tag(repository.name.as_ref(), action)?;
+
+        // Reject pull-through pushes before the paid webhook round-trip: a
+        // pull-through cache never accepts writes whatever a webhook would say.
+        if repository.is_pull_through() && action.is_push() {
+            return Err(Error::Unauthorized(
+                "Push operations are not supported on pull-through cache repositories".to_string(),
+            ));
+        }
 
         let webhook = auth_repo
             .authorization_webhook
             .as_ref()
             .or(self.global_authorization_webhook.as_ref());
-
         if let Some(webhook) = webhook {
-            debug!("Evaluating webhook authorization: {}", webhook.name());
-
-            let allowed = webhook.authorize(action, identity, request).await?;
-            if !allowed {
-                log_denial(&format!("webhook '{}'", webhook.name()), identity);
-                return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
-            }
-        }
-
-        if repository.is_pull_through() && action.is_push() {
-            return Err(Error::Unauthorized(
-                "Push operations are not supported on pull-through cache repositories".to_string(),
-            ));
+            enforce_webhook(webhook, "webhook", action, identity, request).await?;
         }
 
         Ok(())
@@ -362,8 +325,7 @@ fn build_repositories(
         let access_policy = repo_config.access_policy.clone().map(AccessPolicy::new);
 
         let authorization_webhook = repo_config
-            .authorization_webhook
-            .as_ref()
+            .authorization_webhook_ref()
             .map(|name| lookup_webhook(webhook_authorizers, name))
             .transpose()?;
 
@@ -378,6 +340,45 @@ fn build_repositories(
         );
     }
     Ok(repositories)
+}
+
+/// Map a policy `decision` for `scope` (e.g. `"global"`, `"repository 'foo'"`)
+/// to an authorization result, logging and denying on `Deny` or
+/// `Indeterminate`.
+fn enforce_policy(
+    decision: PolicyDecision,
+    scope: &str,
+    identity: &ClientIdentity,
+) -> Result<(), Error> {
+    match decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::Deny => {
+            log_denial(&format!("{scope} policy"), identity);
+            Err(Error::Unauthorized(ACCESS_DENIED.to_string()))
+        }
+        PolicyDecision::Indeterminate(err) => {
+            warn!("{scope} access policy indeterminate, denying: {err}");
+            log_denial(&format!("{scope} policy (indeterminate)"), identity);
+            Err(Error::Unauthorized(ACCESS_DENIED.to_string()))
+        }
+    }
+}
+
+/// Evaluate `webhook` for the request, denying when it does not grant access.
+/// `label` names the scope in the logs (e.g. `"webhook"`, `"global webhook"`).
+async fn enforce_webhook(
+    webhook: &WebhookAuthorizer,
+    label: &str,
+    action: &Action,
+    identity: &ClientIdentity,
+    request: &Parts,
+) -> Result<(), Error> {
+    debug!("Evaluating {label} authorization: {}", webhook.name());
+    if webhook.authorize(action, identity, request).await? {
+        return Ok(());
+    }
+    log_denial(&format!("{label} '{}'", webhook.name()), identity);
+    Err(Error::Unauthorized(ACCESS_DENIED.to_string()))
 }
 
 fn log_denial(reason: &str, identity: &ClientIdentity) {

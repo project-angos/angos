@@ -96,6 +96,28 @@ fn test_authorizer_new_with_repository_config() {
 }
 
 #[test]
+fn empty_repository_webhook_reference_builds_without_a_webhook() {
+    // A blank `authorization_webhook` is unset, matching config validation, so
+    // construction resolves it to no repository webhook rather than failing the
+    // authorizer lookup for an empty name.
+    let config = load_config(
+        r#"
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+            authorization_webhook = ""
+        "#,
+    );
+    let cache = cache::Config::Memory.to_backend().unwrap();
+
+    let authorizer = Authorizer::new(&config, &cache).expect("blank webhook ref must build");
+    let repo = authorizer
+        .repositories
+        .get("myrepo")
+        .expect("repository present");
+    assert!(repo.authorization_webhook.is_none());
+}
+
+#[test]
 fn test_invalid_global_regex_fails_at_deserialize() {
     let result = try_load_config(
         r#"
@@ -589,6 +611,53 @@ async fn test_pull_through_repo_blocks_push_operations() {
     assert!(
         result.is_err(),
         "StartUpload should be blocked on pull-through cache repositories"
+    );
+}
+
+// A pull-through push is rejected before the webhook is consulted: the cache
+// never accepts writes, so the paid webhook round-trip is skipped. The mock's
+// `expect(0)` fails on drop if the webhook is ever called.
+#[tokio::test]
+async fn pull_through_push_rejected_before_calling_webhook() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = load_config(&format!(
+        r#"
+            [global.access_policy]
+            default = "allow"
+
+            [repository."docker-io"]
+            authorization_webhook = "gatekeeper"
+
+            [[repository."docker-io".upstream]]
+            url = "https://registry-1.docker.io"
+
+            [auth.webhook.gatekeeper]
+            url = "{url}"
+            timeout_ms = 1000
+        "#,
+        url = mock_server.uri()
+    ));
+    let (authorizer, registry) = authorizer_and_registry(&config).await;
+
+    let identity = ClientIdentity::new(None);
+    let parts = parts_with_uri("/v2/");
+    let push = Action::StartUpload {
+        namespace: Namespace::new("docker-io/library/nginx").unwrap(),
+        digest: None,
+    };
+
+    let result = authorizer
+        .authorize_request(&push, &identity, &parts, &registry)
+        .await;
+    assert!(
+        matches!(result, Err(AuthError::Unauthorized(_))),
+        "pull-through push must be denied, got: {result:?}"
     );
 }
 
