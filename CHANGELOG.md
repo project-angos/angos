@@ -43,6 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Delete and reclaim decisions no longer treat a failed blob-index read as an absent index: a corrupt shard fails the transaction and a prune revision whose index read errors is skipped, instead of either green-lighting deletion.
 - A replication or cache-fill job whose downstream or upstream returns `403` is now dead-lettered immediately as a terminal denial instead of retrying until its budget is exhausted, since retrying cannot clear a permission failure.
 - A transient backend failure while retiring an orphaned job dedup index is now surfaced instead of being swallowed as a miss, so the lingering index can no longer make an enqueue collide on its `PutIfAbsent` and silently drop a distinct job as a false duplicate.
+- A blob `HEAD` now returns `500` for a transient or internal storage fault instead of reporting the blob absent with a `404`, matching the `GET` path; only a genuine miss is a `404`.
 - The web UI manifest tree no longer hides a manifest that lists itself as a parent or referrer; the self-reference is ignored so the manifest still renders.
 - Navigating the web UI quickly between manifests or namespaces no longer lets a slow earlier response overwrite the current view; a superseded load is discarded.
 - A repository access policy written as `default = "deny"` with no rules now denies as configured; it was previously indistinguishable from an absent policy and silently ignored.

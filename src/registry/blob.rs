@@ -42,6 +42,7 @@ pub enum GetBlobResponse {
     },
 }
 
+#[derive(Debug)]
 pub struct HeadBlobResponse {
     pub digest: Digest,
     pub size: u64,
@@ -195,11 +196,11 @@ impl Registry {
                         size,
                     });
                 }
-                Err(error) if !repository.is_pull_through() => {
-                    warn!("Blob with digest {digest} not found: {error}");
-                    return Err(Error::BlobUnknown);
-                }
-                Err(_) => {}
+                // Mirror GET: a genuine miss on a pull-through repo re-heads
+                // upstream; every other error (a transient or internal fault)
+                // propagates instead of masquerading as a 404.
+                Err(Error::BlobUnknown) if repository.is_pull_through() => {}
+                Err(error) => return Err(error),
             }
         }
 
@@ -398,7 +399,12 @@ impl Registry {
 mod tests {
     use std::{io::Cursor, sync::Arc, time::Duration};
 
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_storage::{
+        Error as StorageError, MemoryObjectStore, ObjectStore,
+        fs::Backend as StorageFsBackend,
+        test_util::{HookedStore, StoreHook, StoreOp},
+    };
+    use async_trait::async_trait;
     use tempfile::TempDir;
     use tokio::{io::AsyncReadExt, time::sleep};
 
@@ -407,8 +413,10 @@ mod tests {
         oci::{Namespace, Tag},
         registry::{
             metadata_store::{BlobIndexOperation, LinkOperation},
+            path_builder,
             test_utils::{
-                create_test_blob, for_each_backend, get_blob, metadata_store_over, put_blob_direct,
+                create_test_blob, create_test_registry, for_each_backend, get_blob,
+                metadata_store_over, put_blob_direct,
             },
         },
     };
@@ -478,6 +486,59 @@ mod tests {
             assert_eq!(response.size, content.len() as u64);
         })
         .await;
+    }
+
+    /// Fails the `head` of one key, modelling a transient backend fault on the
+    /// blob-size probe while leaving every other operation intact.
+    struct FailHeadOf {
+        key: String,
+    }
+
+    #[async_trait]
+    impl StoreHook for FailHeadOf {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            match op {
+                StoreOp::Head { key } if key == self.key => {
+                    Err(StorageError::Backend("injected head failure".to_string()))
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn head_blob_propagates_transient_error_instead_of_404() {
+        let namespace = &Namespace::new("test-repo").unwrap();
+        let digest = Digest::sha256_of_bytes(b"transient-head-blob");
+
+        // The blob-size `head` fails transiently; the grant and repository reads
+        // still succeed, so the request reaches the size probe with access.
+        let inner: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+        let object: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
+            inner,
+            FailHeadOf {
+                key: path_builder::blob_path(&digest),
+            },
+        ));
+        let blob_store = Arc::new(BlobStore::new(object.clone(), None));
+        let registry = create_test_registry(blob_store, metadata_store_over(object));
+
+        registry
+            .blob_ownership()
+            .grant(namespace, &digest)
+            .await
+            .unwrap();
+        let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+        // A transient fault must surface (500), not masquerade as a missing blob
+        // (404) the way GET already avoids.
+        let result = registry
+            .head_blob(repository, &[], namespace, &digest)
+            .await;
+        assert!(
+            matches!(result, Err(Error::Internal(_))),
+            "a transient size() error must propagate, not map to BlobUnknown; got {result:?}"
+        );
     }
 
     #[tokio::test]
