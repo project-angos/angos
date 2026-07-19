@@ -52,10 +52,6 @@ pub fn lock_path(key: &str) -> String {
     format!("{LOCK_OBJECTS_PREFIX}/{shard}/{key}")
 }
 
-/// Maximum number of attempts (the initial write plus reconciling retries)
-/// for a conditional lock write whose transport outcome is ambiguous.
-const MAX_CONDITIONAL_ATTEMPTS: u32 = 3;
-
 /// The `(body, ETag, last_modified)` read-back of a lock object, as returned by
 /// [`ConditionalStore::get_with_metadata`].
 type LockReadback = Result<(Vec<u8>, Option<Etag>, Option<DateTime<Utc>>), StorageError>;
@@ -133,6 +129,7 @@ fn reconcile_match(readback: LockReadback, our_body: &[u8], expected_etag: &str)
 pub struct S3LockStorage {
     store: Arc<dyn ConditionalStore>,
     conditional_retry: Backoff,
+    conditional_max_attempts: u32,
 }
 
 impl Debug for S3LockStorage {
@@ -143,11 +140,14 @@ impl Debug for S3LockStorage {
 
 impl S3LockStorage {
     /// Construct an `S3LockStorage` from an existing conditional store.
+    /// `conditional_max_attempts` bounds the initial write plus reconciling
+    /// retries for an ambiguous conditional outcome.
     #[must_use]
-    pub fn new(store: Arc<dyn ConditionalStore>) -> Self {
+    pub fn new(store: Arc<dyn ConditionalStore>, conditional_max_attempts: u32) -> Self {
         Self {
             store,
             conditional_retry: Backoff::constant(Duration::from_millis(25)).with_jitter(),
+            conditional_max_attempts,
         }
     }
 }
@@ -170,7 +170,7 @@ impl LockStorage for S3LockStorage {
                     return Ok(PutIfAbsentOutcome::AlreadyExists);
                 }
                 Err(e) => {
-                    if attempts >= MAX_CONDITIONAL_ATTEMPTS {
+                    if attempts >= self.conditional_max_attempts {
                         return Err(Error::StorageBackend(e.to_string()));
                     }
                     // Ambiguous backend error (typically a status-less transport
@@ -214,7 +214,7 @@ impl LockStorage for S3LockStorage {
                 }
                 Err(StorageError::PreconditionFailed) => return Ok(PutIfMatchOutcome::Mismatch),
                 Err(e) => {
-                    if attempts >= MAX_CONDITIONAL_ATTEMPTS {
+                    if attempts >= self.conditional_max_attempts {
                         return Err(Error::StorageBackend(e.to_string()));
                     }
                     match reconcile_match(
@@ -259,7 +259,7 @@ impl LockStorage for S3LockStorage {
                     // sustained pressure so that a stale-lock-recovery read (or a
                     // heartbeat re-read) does not fail an acquire (and therefore
                     // a blob upload or delete) on a transient error.
-                    if attempts >= MAX_CONDITIONAL_ATTEMPTS {
+                    if attempts >= self.conditional_max_attempts {
                         return Err(Error::StorageBackend(e.to_string()));
                     }
                     debug!(key, attempts, error = %e, "S3LockStorage: ambiguous lock read, retrying");
@@ -287,7 +287,7 @@ impl LockStorage for S3LockStorage {
                     // transport error: if the first attempt landed, the retry
                     // observes an absent object (or a foreign successor) and
                     // never deletes anything that is not ours.
-                    if attempts >= MAX_CONDITIONAL_ATTEMPTS {
+                    if attempts >= self.conditional_max_attempts {
                         return Err(Error::StorageBackend(e.to_string()));
                     }
                     debug!(key, attempts, error = %e, "S3LockStorage: ambiguous conditional delete, retrying");
@@ -328,16 +328,19 @@ mod tests {
         storage::{
             DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome,
             s3::{
-                AbsentReconcile, MAX_CONDITIONAL_ATTEMPTS, MatchReconcile, S3LockStorage,
-                lock_path, reconcile_absent, reconcile_match,
+                AbsentReconcile, MatchReconcile, S3LockStorage, lock_path, reconcile_absent,
+                reconcile_match,
             },
         },
     };
 
+    /// The conditional-attempt budget the tests assert against.
+    const MAX_CONDITIONAL_ATTEMPTS: u32 = 3;
+
     /// `MemoryObjectStore` implements `ConditionalStore`, so it stands in for a
     /// CAS-capable S3 backend with no live infrastructure.
     fn storage() -> S3LockStorage {
-        S3LockStorage::new(Arc::new(MemoryObjectStore::new()))
+        S3LockStorage::new(Arc::new(MemoryObjectStore::new()), MAX_CONDITIONAL_ATTEMPTS)
     }
 
     #[tokio::test]
@@ -671,7 +674,7 @@ mod tests {
         // read-back finds our own body, so the acquire succeeds: the exact
         // regression this layer repairs.
         let store = flaky_store(&[Fault::LandThenError], &[]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         let outcome = lock.put_if_absent("k", b"the-body".to_vec()).await.unwrap();
 
@@ -690,7 +693,7 @@ mod tests {
     #[tokio::test]
     async fn put_if_absent_transport_error_without_landing_retries_then_creates() {
         let store = flaky_store(&[Fault::ErrorNoLand], &[]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         let outcome = lock.put_if_absent("k", b"the-body".to_vec()).await.unwrap();
 
@@ -712,7 +715,7 @@ mod tests {
             .put_if_absent(&lock_path("k"), Bytes::from_static(b"competitor"))
             .await
             .unwrap();
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         let outcome = lock.put_if_absent("k", b"mine".to_vec()).await.unwrap();
 
@@ -727,7 +730,7 @@ mod tests {
         // No faults: the second acquire hits a real PreconditionFailed and must
         // NOT reconcile or retry.
         let store = flaky_store(&[], &[]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         lock.put_if_absent("k", b"first".to_vec()).await.unwrap();
         let gets_before = store.hook().get_calls.load(Ordering::SeqCst);
@@ -745,7 +748,7 @@ mod tests {
     async fn put_if_absent_budget_exhausted_propagates_error() {
         let faults = vec![Fault::ErrorNoLand; MAX_CONDITIONAL_ATTEMPTS as usize];
         let store = flaky_store(&faults, &[]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         let result = lock.put_if_absent("k", b"the-body".to_vec()).await;
 
@@ -764,7 +767,7 @@ mod tests {
     async fn put_if_match_lost_ack_landed_returns_updated() {
         // Create the object, capture its ETag, then fault a refresh that lands.
         let store = flaky_store(&[], &[Fault::LandThenError]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         let PutIfAbsentOutcome::Created(etag) =
             lock.put_if_absent("k", b"v1".to_vec()).await.unwrap()
@@ -783,7 +786,7 @@ mod tests {
     #[tokio::test]
     async fn put_if_match_takeover_during_transport_error_is_mismatch() {
         let store = flaky_store(&[], &[Fault::ErrorNoLand]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         let PutIfAbsentOutcome::Created(stale_etag) =
             lock.put_if_absent("k", b"v1".to_vec()).await.unwrap()
@@ -825,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn delete_if_match_transport_error_without_landing_retries_then_deletes() {
         let store = flaky_store(&[], &[]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
         let PutIfAbsentOutcome::Created(etag) =
             lock.put_if_absent("k", b"v1".to_vec()).await.unwrap()
         else {
@@ -851,7 +854,7 @@ mod tests {
         // The DELETE lands but the ack is lost. The replay observes an absent
         // object, which counts as Deleted; nothing foreign is ever removed.
         let store = flaky_store(&[], &[]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
         let PutIfAbsentOutcome::Created(etag) =
             lock.put_if_absent("k", b"v1".to_vec()).await.unwrap()
         else {
@@ -880,7 +883,7 @@ mod tests {
             .await
             .unwrap();
         store.hook().set_get_faults(&[Fault::ErrorNoLand]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         let (body, _etag, _) = lock.get_with_etag("k").await.unwrap();
 
@@ -901,7 +904,7 @@ mod tests {
         store
             .hook()
             .set_get_faults(&vec![Fault::ErrorNoLand; MAX_CONDITIONAL_ATTEMPTS as usize]);
-        let lock = S3LockStorage::new(store.clone());
+        let lock = S3LockStorage::new(store.clone(), MAX_CONDITIONAL_ATTEMPTS);
 
         let result = lock.get_with_etag("k").await;
 

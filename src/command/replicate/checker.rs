@@ -30,6 +30,7 @@ const TAG_RESOLVE_CONCURRENCY: usize = 16;
 pub struct ReplicationChecker {
     metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
+    tag_resolve_concurrency: usize,
 }
 
 impl ReplicationChecker {
@@ -41,7 +42,16 @@ impl ReplicationChecker {
         Self {
             metadata_store,
             resolver,
+            tag_resolve_concurrency: TAG_RESOLVE_CONCURRENCY,
         }
+    }
+
+    /// Override the per-tag digest-resolve fan-out; the replicate command
+    /// derives it from its `--concurrency` option.
+    #[must_use]
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.tag_resolve_concurrency = concurrency.max(1);
+        self
     }
 
     /// Whether this downstream participates in the reconcile run for `namespace`.
@@ -279,7 +289,7 @@ impl NamespaceChecker for ReplicationChecker {
                 let digest = self.local_digest(namespace, &tag).await;
                 Ok((tag, digest))
             })
-            .try_buffered(TAG_RESOLVE_CONCURRENCY)
+            .try_buffered(self.tag_resolve_concurrency)
             .try_collect()
             .await?;
 

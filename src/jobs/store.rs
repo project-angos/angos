@@ -164,6 +164,56 @@ pub struct JobQueueConfig {
     pub pending_refresh_interval_secs: u64,
     #[serde(default = "default_pending_ready_horizon_secs")]
     pub pending_ready_horizon_secs: u64,
+    #[serde(default = "default_job_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_retry_backoff_min_ms")]
+    pub retry_backoff_min_ms: u64,
+    #[serde(default = "default_retry_backoff_max_ms")]
+    pub retry_backoff_max_ms: u64,
+}
+
+impl JobQueueConfig {
+    /// The retry policy an operator configured for the durable queue.
+    #[must_use]
+    pub fn retry_policy(&self) -> JobRetryPolicy {
+        JobRetryPolicy {
+            max_attempts: self.max_attempts,
+            backoff_min_ms: self.retry_backoff_min_ms,
+            backoff_max_ms: self.retry_backoff_max_ms,
+        }
+    }
+}
+
+/// The retry budget and backoff bounds a [`JobStore`] applies to failing jobs.
+/// Defaults match the historical in-code constants; the durable queue sources
+/// them from [`JobQueueConfig`].
+#[derive(Clone, Copy, Debug)]
+pub struct JobRetryPolicy {
+    pub max_attempts: u32,
+    pub backoff_min_ms: u64,
+    pub backoff_max_ms: u64,
+}
+
+impl Default for JobRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_job_max_attempts(),
+            backoff_min_ms: default_retry_backoff_min_ms(),
+            backoff_max_ms: default_retry_backoff_max_ms(),
+        }
+    }
+}
+
+fn default_job_max_attempts() -> u32 {
+    5
+}
+
+fn default_retry_backoff_min_ms() -> u64 {
+    100
+}
+
+fn default_retry_backoff_max_ms() -> u64 {
+    10_000
 }
 
 /// Floor on `pending_refresh_interval_secs`. The same value is the documented
@@ -241,7 +291,9 @@ impl JobEnvelope {
             lock_key: lock_key.into(),
             created_at: Utc::now(),
             attempts: 0,
-            max_attempts: 5,
+            // 0 means "unset": `JobStore::enqueue` stamps the queue's configured
+            // budget unless a caller set an explicit per-job value first.
+            max_attempts: 0,
             payload: serde_json::to_value(payload)?,
         })
     }
@@ -510,6 +562,7 @@ pub struct JobStore {
     retry_backoff: Backoff,
     claim_error_backoff: Backoff,
     consecutive_claim_errors: AtomicU32,
+    max_attempts: u32,
 }
 
 impl JobStore {
@@ -517,20 +570,33 @@ impl JobStore {
     ///
     /// `worker_id` is a structured-log tag that makes concurrent workers'
     /// `claim_one` actions distinguishable in aggregated logs. Pass an empty
-    /// string for producer-only instances.
+    /// string for producer-only instances. The retry policy defaults to
+    /// [`JobRetryPolicy::default`]; the durable queue overrides it with
+    /// [`Self::with_retry_policy`].
     pub fn new(store: Arc<Store>, worker_id: impl Into<String>) -> Self {
+        Self::with_retry_policy(store, worker_id, JobRetryPolicy::default())
+    }
+
+    /// [`Self::new`] with an operator-configured retry policy (see
+    /// [`JobQueueConfig::retry_policy`]).
+    pub fn with_retry_policy(
+        store: Arc<Store>,
+        worker_id: impl Into<String>,
+        retry: JobRetryPolicy,
+    ) -> Self {
+        let backoff = || {
+            Backoff::exponential(
+                Duration::from_millis(retry.backoff_min_ms),
+                Duration::from_millis(retry.backoff_max_ms),
+            )
+        };
         Self {
             store,
             worker_id: worker_id.into(),
-            retry_backoff: Backoff::exponential(
-                Duration::from_millis(100),
-                Duration::from_secs(10),
-            ),
-            claim_error_backoff: Backoff::exponential(
-                Duration::from_millis(100),
-                Duration::from_secs(10),
-            ),
+            retry_backoff: backoff(),
+            claim_error_backoff: backoff(),
             consecutive_claim_errors: AtomicU32::new(0),
+            max_attempts: retry.max_attempts,
         }
     }
 
@@ -878,7 +944,12 @@ impl JobStore {
     /// and the pending file. If two replicas race and both observe absence,
     /// only one wins at the engine's Prepare/Apply stage; the loser receives
     /// `Conflict` or `Precondition` and we treat that as a dedup hit.
-    pub async fn enqueue(&self, envelope: JobEnvelope) -> Result<(), Error> {
+    pub async fn enqueue(&self, mut envelope: JobEnvelope) -> Result<(), Error> {
+        // Apply the queue's configured retry budget unless a caller pinned an
+        // explicit per-job value (a non-zero `max_attempts`).
+        if envelope.max_attempts == 0 {
+            envelope.max_attempts = self.max_attempts;
+        }
         // Fast path: index present and pending exists, a hit, no writes needed.
         if self
             .find_pending_with_lock_key(envelope.queue, &envelope.lock_key)

@@ -100,6 +100,7 @@ pub struct OrphanJobChecker {
     job_store: Arc<JobStore>,
     resolver: Arc<RepositoryResolver>,
     queue: OrphanQueue,
+    payload_read_concurrency: usize,
 }
 
 impl OrphanJobChecker {
@@ -117,7 +118,16 @@ impl OrphanJobChecker {
             job_store,
             resolver,
             queue,
+            payload_read_concurrency: PAYLOAD_READ_CONCURRENCY,
         }
+    }
+
+    /// Override the payload-read fan-out; the prune command derives it from its
+    /// `--concurrency` option.
+    #[must_use]
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.payload_read_concurrency = concurrency.max(1);
+        self
     }
 
     /// Reads the raw payload for one storage key. Returns `Ok(None)` for a key
@@ -177,7 +187,7 @@ impl OrphanJobChecker {
                     let payload = self.read_payload(state, &storage_key).await?;
                     Ok::<_, Error>((storage_key, payload))
                 })
-                .buffered(PAYLOAD_READ_CONCURRENCY)
+                .buffered(self.payload_read_concurrency)
                 .try_collect()
                 .await?;
 
@@ -237,9 +247,11 @@ pub async fn sweep_orphan_jobs(
     job_store: &Arc<JobStore>,
     resolver: &Arc<RepositoryResolver>,
     sink: &dyn ActionSink,
+    concurrency: usize,
 ) -> Result<(), Error> {
     for queue in [OrphanQueue::Replication, OrphanQueue::Cache] {
         OrphanJobChecker::new(job_store.clone(), resolver.clone(), queue)
+            .with_concurrency(concurrency)
             .check_all(sink)
             .await?;
     }

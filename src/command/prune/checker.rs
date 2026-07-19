@@ -31,6 +31,7 @@ pub struct RetentionChecker {
     metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
     global_retention_policy: Option<Arc<RetentionPolicy>>,
+    tag_metadata_concurrency: usize,
 }
 
 fn has_link_kind(
@@ -272,7 +273,16 @@ impl RetentionChecker {
             metadata_store,
             resolver,
             global_retention_policy,
+            tag_metadata_concurrency: TAG_METADATA_CONCURRENCY,
         }
+    }
+
+    /// Override the per-tag link-read fan-out; the prune command derives it from
+    /// its `--concurrency` option.
+    #[must_use]
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.tag_metadata_concurrency = concurrency.max(1);
+        self
     }
 }
 
@@ -312,7 +322,7 @@ impl RetentionChecker {
                     metadata,
                 })
             })
-            .try_buffered(TAG_METADATA_CONCURRENCY)
+            .try_buffered(self.tag_metadata_concurrency)
             .try_collect()
             .await
     }

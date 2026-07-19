@@ -177,6 +177,11 @@ pub struct S3LockConfig {
     /// Maximum attempts per storage operation. Defaults to 2.
     #[serde(default = "S3LockConfig::default_max_attempts")]
     pub max_attempts: u32,
+    /// Maximum attempts (initial write plus reconciling retries) for a
+    /// conditional lock write whose transport outcome is ambiguous. Defaults
+    /// to 3.
+    #[serde(default = "S3LockConfig::default_conditional_max_attempts")]
+    pub conditional_max_attempts: u32,
 }
 
 impl S3LockConfig {
@@ -201,6 +206,9 @@ impl S3LockConfig {
     fn default_max_attempts() -> u32 {
         2
     }
+    fn default_conditional_max_attempts() -> u32 {
+        3
+    }
 }
 
 impl Default for S3LockConfig {
@@ -213,6 +221,7 @@ impl Default for S3LockConfig {
             operation_timeout_secs: Self::default_operation_timeout_secs(),
             operation_attempt_timeout_secs: Self::default_operation_attempt_timeout_secs(),
             max_attempts: Self::default_max_attempts(),
+            conditional_max_attempts: Self::default_conditional_max_attempts(),
         }
     }
 }

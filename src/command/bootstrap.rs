@@ -169,6 +169,7 @@ pub async fn build_store(config: &ResolvedStorageConfig) -> Result<Arc<Store>, E
 pub async fn metadata_store(
     config: &ResolvedStorageConfig,
     auth_cache: &Arc<Cache>,
+    namespace_walk_concurrency: usize,
 ) -> Result<Arc<MetadataStore>, Error> {
     let store = build_store(config).await?;
 
@@ -180,7 +181,8 @@ pub async fn metadata_store(
 
     let mut builder = MetadataStore::builder(store)
         .link_cache_ttl(s3_ttl.0)
-        .access_time_debounce_secs(s3_ttl.1);
+        .access_time_debounce_secs(s3_ttl.1)
+        .namespace_walk_concurrency(namespace_walk_concurrency);
 
     // Wire in the auth cache for link-metadata caching (only meaningful on S3,
     // where link_cache_ttl > 0 by default).
@@ -201,8 +203,18 @@ pub struct MaintenanceContext {
 /// metadata store, and the resolved repositories, in the one canonical order.
 pub async fn maintenance_context(config: &Configuration) -> Result<MaintenanceContext, Error> {
     let auth_cache = auth_cache(&config.cache)?;
-    let blob_store = Arc::new(config.blob_store.build_backend()?);
-    let metadata_store = metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
+    let blob_store = Arc::new(
+        config
+            .blob_store
+            .build_backend()?
+            .with_namespace_walk_concurrency(config.global.namespace_walk_concurrency),
+    );
+    let metadata_store = metadata_store(
+        &config.resolve_registry_storage(),
+        &auth_cache,
+        config.global.namespace_walk_concurrency,
+    )
+    .await?;
     let repositories = repositories(
         &config.repository,
         &auth_cache,

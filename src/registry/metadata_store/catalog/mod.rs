@@ -47,7 +47,7 @@ impl MetadataStore {
             &root,
             &prefix,
             "_manifests",
-            pagination::NAMESPACE_WALK_CONCURRENCY,
+            self.namespace_walk_concurrency,
             |path| async move {
                 let (sub_prefixes, _) =
                     self.store().object_store().list_all_children(&path).await?;

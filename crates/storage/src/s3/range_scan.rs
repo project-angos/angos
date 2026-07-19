@@ -36,9 +36,6 @@ use crate::{KeyStream, error::Error, pagination::paginated};
 /// One S3 list page per range scan.
 const RANGE_PAGE_SIZE: u16 = 1000;
 
-/// Max concurrent range chains a truncated scan fans out to.
-const RANGE_CONCURRENCY: usize = 16;
-
 // children scan
 
 /// Enumerate every immediate child of `prefix` as `(sub_prefixes, objects)`. A
@@ -48,6 +45,7 @@ const RANGE_CONCURRENCY: usize = 16;
 pub async fn scan_all_children(
     client: &S3Backend,
     prefix: &str,
+    concurrency: usize,
 ) -> Result<(Vec<String>, Vec<String>), Error> {
     // Probe: a single page settles any listing that fits in one.
     let (sub_prefixes, objects, next_token) = children_page(client, prefix, None, None).await?;
@@ -58,9 +56,10 @@ pub async fn scan_all_children(
     let ranges = partition_ranges(None, split_bounds(""), None);
     let parts: Vec<(Vec<String>, Vec<String>)> = stream::iter(ranges)
         .map(|(lo, hi)| async move {
-            scan_children_range_split(client, prefix, lo.as_deref(), hi.as_deref()).await
+            scan_children_range_split(client, prefix, lo.as_deref(), hi.as_deref(), concurrency)
+                .await
         })
-        .buffer_unordered(RANGE_CONCURRENCY)
+        .buffer_unordered(concurrency)
         .try_collect()
         .await?;
     Ok(merge_parts(parts))
@@ -119,6 +118,7 @@ async fn scan_children_range_split(
     prefix: &str,
     lo: Option<&str>,
     hi: Option<&str>,
+    concurrency: usize,
 ) -> Result<(Vec<String>, Vec<String>), Error> {
     let (mut sub_prefixes, mut objects, next) = children_page(client, prefix, None, lo).await?;
     let stop = retain_range(&mut sub_prefixes, &mut objects, lo, hi);
@@ -140,7 +140,7 @@ async fn scan_children_range_split(
         .map(|(sub_lo, sub_hi)| async move {
             scan_children_range(client, prefix, sub_lo.as_deref(), sub_hi.as_deref()).await
         })
-        .buffer_unordered(RANGE_CONCURRENCY)
+        .buffer_unordered(concurrency)
         .try_collect()
         .await?;
     Ok(merge_parts(parts))
@@ -189,7 +189,11 @@ fn retain_range(
 /// Keys sharing a long common prefix (e.g. a single content-addressed subtree)
 /// all fall in one range, which then drains as a serial chain; a keyspace that
 /// diverges near the front (many namespaces) parallelises across ranges.
-pub fn scan_all_keys<'a>(client: &'a S3Backend, prefix: &'a str) -> KeyStream<'a> {
+pub fn scan_all_keys<'a>(
+    client: &'a S3Backend,
+    prefix: &'a str,
+    concurrency: usize,
+) -> KeyStream<'a> {
     Box::pin(
         stream::once(async move {
             // Probe: a single page settles any listing that fits in one.
@@ -201,7 +205,7 @@ pub fn scan_all_keys<'a>(client: &'a S3Backend, prefix: &'a str) -> KeyStream<'a
             let ranges = partition_ranges(None, split_bounds(""), None);
             let fanned = stream::iter(ranges)
                 .map(move |(lo, hi)| drain_key_range(client, prefix, lo, hi))
-                .flatten_unordered(RANGE_CONCURRENCY);
+                .flatten_unordered(concurrency);
             Ok(Box::pin(fanned) as KeyStream<'a>)
         })
         .try_flatten(),

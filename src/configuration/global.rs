@@ -8,6 +8,7 @@ use crate::{
     configuration::{RegexPattern, TrustedProxy},
     jobs::store::JobQueueConfig,
     policy::{AccessPolicyConfig, RetentionPolicyConfig},
+    registry::pagination::NAMESPACE_WALK_CONCURRENCY,
 };
 
 /// Default cap on concurrent in-process cache-fill jobs. Evaluated at
@@ -74,12 +75,28 @@ pub struct GlobalConfig {
     pub event_webhooks: Vec<String>,
     #[serde(default)]
     pub job_queue: Option<JobQueueConfig>,
+    /// Seconds to keep draining in-flight work on shutdown before forcing exit.
+    /// Align this with the orchestrator's termination grace period.
+    #[serde(default = "default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
+    /// Concurrent directory scans a catalog / upload-namespace walk keeps in
+    /// flight, hiding per-request backend latency on S3.
+    #[serde(default = "default_namespace_walk_concurrency")]
+    pub namespace_walk_concurrency: usize,
     /// Proxy IPs or CIDR networks whose `X-Forwarded-For`/`X-Real-IP` headers
     /// are honored as the client IP. From any other peer (the default, since
     /// the list is empty) those headers are ignored and the socket address is
     /// used, so clients cannot spoof IP-gated policies.
     #[serde(default)]
     pub trusted_proxies: Vec<TrustedProxy>,
+}
+
+fn default_shutdown_drain_secs() -> u64 {
+    30
+}
+
+fn default_namespace_walk_concurrency() -> usize {
+    NAMESPACE_WALK_CONCURRENCY
 }
 
 fn default_max_concurrent_requests() -> usize {
@@ -149,6 +166,8 @@ impl Default for GlobalConfig {
             authorization_webhook: None,
             event_webhooks: Vec::new(),
             job_queue: None,
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+            namespace_walk_concurrency: default_namespace_walk_concurrency(),
             trusted_proxies: Vec::new(),
         }
     }

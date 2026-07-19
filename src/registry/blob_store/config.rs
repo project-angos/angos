@@ -7,17 +7,23 @@
 //! backend. The blob store holds no transaction executor: blob-lifecycle
 //! serialisation lives on the metadata store's `blob-data:{digest}` lock.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bytesize::ByteSize;
 use serde::Deserialize;
 
 use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3TransportConfig};
 use angos_storage::{
-    ObjectStore, PresignedStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
+    ObjectStore, PresignedStore,
+    fs::Backend as StorageFsBackend,
+    s3::{Backend as StorageS3Backend, DEFAULT_RANGE_CONCURRENCY},
 };
 
-use crate::registry::{Error, blob_store::BlobStore, s3_connection::S3ConnectionConfig};
+use crate::registry::{
+    Error,
+    blob_store::{BlobStore, DEFAULT_PRESIGN_TTL_SECS},
+    s3_connection::S3ConnectionConfig,
+};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct FsBackendConfig {
@@ -52,6 +58,12 @@ pub struct TransportFields {
     pub operation_timeout_secs: u64,
     pub operation_attempt_timeout_secs: u64,
     pub max_attempts: u32,
+    pub circuit_breaker_threshold: u32,
+    pub circuit_breaker_cooldown_secs: u64,
+    /// Max concurrent range chains a truncated children/flat scan fans out to.
+    pub children_scan_concurrency: usize,
+    /// Lifetime, in seconds, of a generated presigned download URL.
+    pub presign_ttl_secs: u64,
 }
 
 impl Default for TransportFields {
@@ -66,6 +78,10 @@ impl Default for TransportFields {
             operation_timeout_secs: t.operation_timeout_secs,
             operation_attempt_timeout_secs: t.operation_attempt_timeout_secs,
             max_attempts: t.max_attempts,
+            circuit_breaker_threshold: t.circuit_breaker_threshold,
+            circuit_breaker_cooldown_secs: t.circuit_breaker_cooldown_secs,
+            children_scan_concurrency: DEFAULT_RANGE_CONCURRENCY,
+            presign_ttl_secs: DEFAULT_PRESIGN_TTL_SECS,
         }
     }
 }
@@ -112,6 +128,8 @@ impl BlobStoreConfig {
                     operation_timeout_secs: config.transport.operation_timeout_secs,
                     operation_attempt_timeout_secs: config.transport.operation_attempt_timeout_secs,
                     max_attempts: config.transport.max_attempts,
+                    circuit_breaker_threshold: config.transport.circuit_breaker_threshold,
+                    circuit_breaker_cooldown_secs: config.transport.circuit_breaker_cooldown_secs,
                     ..config.connection.to_client_config()
                 };
                 let http =
@@ -120,11 +138,13 @@ impl BlobStoreConfig {
                     StorageS3Backend::builder(Arc::new(http))
                         .part_size(config.transport.multipart_part_size.as_u64())
                         .uniform_parts(config.transport.multipart_uniform_parts)
+                        .range_concurrency(config.transport.children_scan_concurrency)
                         .build(),
                 );
                 let object: Arc<dyn ObjectStore> = backend.clone();
                 let presign: Arc<dyn PresignedStore> = backend;
-                Ok(BlobStore::new(object, Some(presign)))
+                Ok(BlobStore::new(object, Some(presign))
+                    .with_presign_ttl(Duration::from_secs(config.transport.presign_ttl_secs)))
             }
         }
     }

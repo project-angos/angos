@@ -112,7 +112,8 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         metadata_store.clone(),
         repositories.clone(),
         global_policy.clone(),
-    );
+    )
+    .with_concurrency(options.concurrency);
     let mut registry = None;
     let sink: Box<dyn ActionSink> = if options.dry_run {
         info!("Dry-run mode: no changes will be made to the storage");
@@ -178,6 +179,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             &Arc::new(JobStore::new(metadata_store.store_arc(), "prune-orphans")),
             &repositories,
             sink.as_ref(),
+            options.concurrency,
         )
         .await,
     ];
