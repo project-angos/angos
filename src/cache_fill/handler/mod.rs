@@ -26,6 +26,16 @@ use crate::{
     },
 };
 
+/// Maps a registry error to a job error, preserving an upstream authorization
+/// denial as the terminal [`Error::Denied`] so the worker dead-letters it
+/// instead of retrying against an unchangeable outcome.
+fn job_error(error: RegistryError) -> Error {
+    match error {
+        RegistryError::Denied(msg) => Error::Denied(msg),
+        other => Error::Execution(other.to_string()),
+    }
+}
+
 pub const CACHE_FETCH_BLOB_KIND: &str = "cache.fetch_blob";
 
 /// Internal-process name stamped on the events cache fills emit.
@@ -176,7 +186,7 @@ impl JobHandler for CacheFillJobHandler {
 
         self.fill(&payload.namespace, &digest)
             .await
-            .map_err(|e| Error::Execution(e.to_string()))?;
+            .map_err(job_error)?;
 
         Ok(Transaction::builder().build())
     }

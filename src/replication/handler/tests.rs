@@ -14,7 +14,7 @@ use angos_tx_engine::store::Store;
 use crate::{
     cache,
     jobs::Queue,
-    jobs::store::{JobEnvelope, JobHandler},
+    jobs::store::{Error, JobEnvelope, JobHandler},
     metrics_provider,
     oci::{Digest, Namespace, Tag},
     registry::{
@@ -300,6 +300,45 @@ async fn execute_pushes_manifest_with_head_before_put() {
     assert!(tx.mutations.is_empty(), "push returns an empty transaction");
     // wiremock `.expect(...)` assertions are verified on MockServer drop.
     drop(mock_server);
+}
+
+/// A downstream `403` on the manifest push is a terminal denial: the handler
+/// surfaces `Error::Denied` (not a retryable `Storage`) so the worker
+/// dead-letters it instead of retrying against revoked credentials.
+#[tokio::test]
+async fn execute_maps_downstream_403_to_denied() {
+    metrics_provider::init_for_tests();
+    let mock_server = MockServer::start().await;
+
+    let FsTestStack {
+        dir: _dir,
+        store,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
+
+    let (_manifest_digest, config_digest, layer_digest) =
+        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
+
+    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&mock_server)
+        .await;
+
+    let resolver = single_repo_resolver(
+        REPO,
+        repository_with_downstream(downstream_client(&mock_server.uri())),
+    );
+    let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
+
+    let envelope = build_envelope(&sample_payload()).unwrap();
+    let result = handler.execute(&envelope).await;
+    assert!(
+        matches!(result, Err(Error::Denied(_))),
+        "a downstream 403 must surface as a terminal Denied, got {result:?}"
+    );
 }
 
 /// A prefixed downstream must push at the mapped path: local `nginx/app` strips

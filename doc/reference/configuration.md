@@ -19,6 +19,7 @@ Most configuration changes take effect immediately without restart. The followin
 - Changing storage backend type (filesystem ↔ S3)
 - Changing lock strategy
 - Adding or removing `[global.job_queue]`
+- `max_concurrent_cache_jobs` / `max_concurrent_replication_jobs` on a standalone `angos worker`: the worker's pool size is fixed at startup, so a running worker must be restarted to change it (the server's in-process drain applies the change on reload).
 
 TLS certificate files are also automatically reloaded when they change.
 

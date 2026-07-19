@@ -108,6 +108,8 @@ pub enum Error {
     Execution(String),
     #[error("not found")]
     NotFound,
+    #[error("denied: {0}")]
+    Denied(String),
 }
 
 impl From<StorageError> for Error {
@@ -1223,6 +1225,23 @@ impl JobStore {
         };
 
         self.fail_retry(session, updated, storage_key, next_at)
+            .await
+    }
+
+    /// Record a non-retryable failure: the job is dead-lettered immediately,
+    /// bypassing the retry budget. Used when retrying cannot succeed (an
+    /// authorization denial).
+    pub async fn fail_terminal(
+        &self,
+        claimed: ClaimedJob,
+        err: &str,
+    ) -> Result<FailOutcome, Error> {
+        let ClaimedJob {
+            envelope,
+            storage_key,
+            session,
+        } = claimed;
+        self.fail_dead_letter(session, envelope, storage_key, err)
             .await
     }
 

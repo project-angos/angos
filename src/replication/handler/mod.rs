@@ -23,11 +23,22 @@ use crate::{
         metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
+    registry_client::Error as RegistryClientError,
     replication::{
-        ReplicationDownstream,
+        Error as ReplicationError, ReplicationDownstream,
         pipeline::{self, PushContext, PushOutcome},
     },
 };
+
+/// Maps a replication error to a job error, preserving a downstream
+/// authorization denial as the terminal [`Error::Denied`] so the worker
+/// dead-letters it instead of retrying against an unchangeable outcome.
+fn job_error(error: ReplicationError) -> Error {
+    match error {
+        ReplicationError::Client(RegistryClientError::Denied(msg)) => Error::Denied(msg),
+        other => Error::Execution(other.to_string()),
+    }
+}
 
 /// Records a `replication_reconcile_total` outcome (`enqueued`, `failed`, or
 /// `skipped`).
@@ -349,7 +360,7 @@ impl ReplicationJobHandler {
             payload.source_ts.as_deref(),
         )
         .await
-        .map_err(|e| Error::Execution(e.to_string()))?;
+        .map_err(job_error)?;
         Self::record_success(&payload.downstream, outcome);
         Ok(())
     }
@@ -394,7 +405,7 @@ impl ReplicationJobHandler {
         };
         let outcome = pipeline::push_manifest(&ctx, &digest, None, payload.tag.as_deref(), body)
             .await
-            .map_err(|e| Error::Execution(e.to_string()))?;
+            .map_err(job_error)?;
         Self::record_success(&payload.downstream, outcome);
         Ok(())
     }

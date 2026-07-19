@@ -36,7 +36,14 @@ pub async fn execute_one(consumer: &JobStore, handler: &dyn JobHandler, claimed:
         Some(Err(err)) => {
             warn!(lock_key, error = %err, "Job handler returned error");
             let err_msg = err.to_string();
-            match consumer.fail(claimed, &err_msg).await {
+            // A denial is non-retryable: dead-letter it now rather than burn the
+            // retry budget against an outcome that cannot change.
+            let outcome = if matches!(err, Error::Denied(_)) {
+                consumer.fail_terminal(claimed, &err_msg).await
+            } else {
+                consumer.fail(claimed, &err_msg).await
+            };
+            match outcome {
                 Ok(FailOutcome::Retried { next_at }) => {
                     info!(lock_key, %next_at, "Job scheduled for retry");
                 }
@@ -150,6 +157,56 @@ mod tests {
                 .await
                 .expect("run_once second call"),
             "queue must be empty after job completes"
+        );
+    }
+
+    struct DeniedHandler;
+
+    #[async_trait]
+    impl JobHandler for DeniedHandler {
+        async fn execute(&self, _envelope: &JobEnvelope) -> Result<Transaction, Error> {
+            Err(Error::Denied("downstream forbade the push".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_error_dead_letters_without_retrying() {
+        metrics_provider::init_for_tests();
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+
+        store
+            .enqueue(
+                JobEnvelope::new(Queue::Cache, "test.denied", "cache.ns:sha256:denied", &())
+                    .expect("envelope"),
+            )
+            .await
+            .expect("enqueue");
+
+        assert!(
+            run_once(&store, &DeniedHandler, Queue::Cache)
+                .await
+                .expect("run_once"),
+            "the denied job must be processed"
+        );
+
+        // A denial is terminal: the job is dead-lettered on the first attempt
+        // rather than re-queued to burn its retry budget.
+        assert_eq!(
+            store
+                .count_failed(Queue::Cache)
+                .await
+                .expect("count_failed"),
+            1,
+            "a denied job must be dead-lettered immediately"
+        );
+        assert_eq!(
+            store
+                .count_pending(Queue::Cache, 600)
+                .await
+                .expect("count_pending"),
+            0,
+            "a denied job must not be re-queued for retry"
         );
     }
 
