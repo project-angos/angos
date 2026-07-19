@@ -106,26 +106,38 @@ impl BlobStore {
     /// listing, then walked as up to [`BLOB_LIST_CONCURRENCY`] concurrent
     /// page chains instead of one serial continuation-token chain.
     pub fn stream_blobs(&self) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
-        stream::iter(Algorithm::supported_algorithms()).flat_map(move |algorithm| {
-            stream::once(async move {
-                let root = &format!("{}/{algorithm}/", path_builder::blobs_root_dir());
-                paginated(|token| async move {
-                    let page = self.object.list_children(root, 1000, token, None).await?;
-                    Ok::<_, Error>((page.sub_prefixes, page.next_token))
-                })
-                .try_collect::<Vec<String>>()
-                .await
-            })
-            .map_ok(move |shards| {
-                stream::iter(
-                    shards
-                        .into_iter()
-                        .map(move |shard| Box::pin(self.shard_blobs(*algorithm, &shard))),
-                )
-                .flatten_unordered(BLOB_LIST_CONCURRENCY)
-            })
-            .try_flatten()
+        stream::once(async move {
+            let shards = self.collect_blob_shards().await?;
+            Ok::<_, Error>(
+                stream::iter(shards)
+                    .map(move |(algorithm, shard)| Box::pin(self.shard_blobs(algorithm, &shard)))
+                    .flatten_unordered(BLOB_LIST_CONCURRENCY),
+            )
         })
+        .try_flatten()
+    }
+
+    /// The existing `(algorithm, shard)` directories across every supported
+    /// algorithm, each algorithm discovered with one children listing. Shard
+    /// names are a small bounded set (two-hex-digit prefixes), so collecting
+    /// them up front lets [`Self::stream_blobs`] walk every shard as one
+    /// concurrent fan-out rather than a stream of streams of streams.
+    async fn collect_blob_shards(&self) -> Result<Vec<(Algorithm, String)>, Error> {
+        let mut shards = Vec::new();
+        for algorithm in Algorithm::supported_algorithms() {
+            let root = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
+            let names = paginated(move |token| {
+                let root = root.clone();
+                async move {
+                    let page = self.object.list_children(&root, 1000, token, None).await?;
+                    Ok::<_, Error>((page.sub_prefixes, page.next_token))
+                }
+            })
+            .try_collect::<Vec<String>>()
+            .await?;
+            shards.extend(names.into_iter().map(|shard| (*algorithm, shard)));
+        }
+        Ok(shards)
     }
 
     /// One shard directory's blobs (each the `<hash>/data` key under the

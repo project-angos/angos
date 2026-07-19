@@ -45,7 +45,7 @@ pub use crate::conditional::ConditionalStore;
 pub use crate::error::Error;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::memory::MemoryObjectStore;
-pub use crate::object::ObjectStore;
+pub use crate::object::{KeyStream, ObjectStore};
 pub use crate::pagination::paginated;
 pub use crate::presigned::PresignedStore;
 pub use crate::types::{ChildrenPage, Etag, ObjectMeta, Page};

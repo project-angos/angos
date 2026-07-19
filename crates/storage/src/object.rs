@@ -1,14 +1,21 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, pin::Pin};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::Stream;
 
 use crate::{
     BoxedReader,
     error::Error,
+    pagination::paginated,
     types::{ChildrenPage, ObjectMeta, Page},
     upload_session::{ByteStream, MultipartUploadPage},
 };
+
+/// A lazily-streamed flat enumeration of object keys, one `Result` per key.
+/// [`ObjectStore::list_all`] returns this boxed form so it stays object-safe
+/// behind `dyn ObjectStore` while backends pick their own concrete stream.
+pub type KeyStream<'a> = Pin<Box<dyn Stream<Item = Result<String, Error>> + Send + 'a>>;
 
 /// Normalise `prefix` to a directory boundary for [`ObjectStore::delete_prefix`].
 ///
@@ -119,6 +126,21 @@ pub trait ObjectStore: Send + Sync {
         token: Option<String>,
         start_after: Option<String>,
     ) -> Result<ChildrenPage, Error>;
+
+    /// Flat-recursive enumeration of *every* key under `prefix`, streamed
+    /// lazily with no caller-managed continuation token. Keys arrive in no
+    /// guaranteed order.
+    ///
+    /// The default drains [`ObjectStore::list`] pages serially. The S3 backend
+    /// overrides it to walk disjoint key ranges concurrently, so a whole-store
+    /// scan (scrub, migration) is bounded by its slowest range rather than by
+    /// one serial continuation-token chain.
+    fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
+        Box::pin(paginated(move |token| async move {
+            let page = self.list(prefix, 1000, token).await?;
+            Ok((page.items, page.next_token))
+        }))
+    }
 
     /// Complete one-level enumeration: every immediate child under `prefix`,
     /// as `(sub_prefixes, objects)` with no ordering guarantee.

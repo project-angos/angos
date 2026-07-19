@@ -167,47 +167,16 @@ impl CasExecutor {
     ///   is left in `.tx-log/` for the recovery loop and
     ///   `Err(Error::PartialCommit)` is returned so the caller skips `reap`.
     async fn apply_all(&self, intent: &mut IntentRecord) -> Result<(), Error> {
-        let tx_id = intent.id;
         for idx in 0..intent.mutations.len() {
             let mutation = intent.mutations[idx].clone();
             match apply_cas(self.store.as_ref(), &mutation, ApplyMode::Abort).await {
                 Ok(()) => stamp_applied(self.store.as_ref(), intent, idx).await,
                 Err(Error::Precondition) => {
                     if intent.any_applied() {
-                        // The transaction is committed (at least one slot is
-                        // Applied). Apply the stale-stamp recovery heuristic:
-                        // compare the live body against the staged body.
-                        match apply_cas(self.store.as_ref(), &mutation, ApplyMode::Reconcile).await
-                        {
-                            Ok(()) => {
-                                // Live body matches staged body: the
-                                // healthy-path write landed without its stamp.
-                                // Stamp and continue forward.
-                                if let Err(stamp_err) =
-                                    stamp_progress(self.store.as_ref(), intent, idx).await
-                                {
-                                    warn!(
-                                        tx_id = %tx_id,
-                                        idx,
-                                        error = %stamp_err,
-                                        "Failed to stamp stale-stamp-recovered mutation; \
-                                         recovery will re-apply idempotently"
-                                    );
-                                }
-                            }
-                            Err(Error::PartialCommit) => {
-                                // True contention: live body differs from staged
-                                // body. Preserve the intent for the recovery loop.
-                                warn!(
-                                    tx_id = %tx_id,
-                                    idx,
-                                    "CAS true contention mid-Apply; \
-                                     leaving intent for recovery loop"
-                                );
-                                return Err(Error::PartialCommit);
-                            }
-                            Err(e) => return Err(e),
-                        }
+                        // Committed (a slot is Applied): reconcile this slot,
+                        // continuing forward when it recovers and propagating
+                        // `PartialCommit` on true contention.
+                        self.recover_mid_apply(intent, idx, &mutation).await?;
                     } else {
                         rollback(self.store.as_ref(), intent).await;
                         return Err(Error::Precondition);
@@ -223,6 +192,43 @@ impl CasExecutor {
             }
         }
         Ok(())
+    }
+
+    /// Reconcile mutation `idx` after a mid-Apply precondition failure on an
+    /// already-committed transaction, applying the stale-stamp recovery
+    /// heuristic: a `Reconcile` apply that succeeds means the healthy-path write
+    /// landed without its stamp, so stamp the slot and let the caller continue
+    /// forward; a `PartialCommit` means true contention (the live body differs
+    /// from the staged body), so leave the intent for the recovery loop.
+    async fn recover_mid_apply(
+        &self,
+        intent: &mut IntentRecord,
+        idx: usize,
+        mutation: &MutationRecord,
+    ) -> Result<(), Error> {
+        match apply_cas(self.store.as_ref(), mutation, ApplyMode::Reconcile).await {
+            Ok(()) => {
+                if let Err(stamp_err) = stamp_progress(self.store.as_ref(), intent, idx).await {
+                    warn!(
+                        tx_id = %intent.id,
+                        idx,
+                        error = %stamp_err,
+                        "Failed to stamp stale-stamp-recovered mutation; \
+                         recovery will re-apply idempotently"
+                    );
+                }
+                Ok(())
+            }
+            Err(Error::PartialCommit) => {
+                warn!(
+                    tx_id = %intent.id,
+                    idx,
+                    "CAS true contention mid-Apply; leaving intent for recovery loop"
+                );
+                Err(Error::PartialCommit)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

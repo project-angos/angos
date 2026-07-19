@@ -575,6 +575,10 @@ impl Backend {
         Ok((prefixes, objects, next_token))
     }
 
+    /// `start_after` is a path-relative key the listing starts strictly after,
+    /// appended to the prefix verbatim; it is mutually exclusive with a
+    /// continuation token, so pass it only on a chain's first page.
+    ///
     /// # Errors
     /// Forwards [`io::Error`] from
     /// [`list_objects_v2_raw`](Self::list_objects_v2_raw).
@@ -583,10 +587,18 @@ impl Backend {
         path: &str,
         max_keys: u16,
         continuation_token: Option<String>,
+        start_after: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), io::Error> {
         let full_prefix = ensure_trailing_slash(self.full_key(path));
+        let full_start_after = start_after.map(|s| format!("{full_prefix}{s}"));
         let res = self
-            .list_objects_v2_raw(&full_prefix, max_keys, continuation_token, None, None)
+            .list_objects_v2_raw(
+                &full_prefix,
+                max_keys,
+                continuation_token,
+                None,
+                full_start_after,
+            )
             .await?;
         let objects = res
             .contents
@@ -1398,7 +1410,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(backend.list_objects("prefix", 10, None).await.is_err());
+        assert!(
+            backend
+                .list_objects("prefix", 10, None, None)
+                .await
+                .is_err()
+        );
         assert!(backend.delete_prefix("prefix").await.is_err());
 
         assert_attempts(

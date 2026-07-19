@@ -8,13 +8,9 @@ use std::sync::{
 
 use futures_util::TryStreamExt;
 
-use angos_storage::{ObjectStore, paginated};
+use angos_storage::ObjectStore;
 
 use crate::{command::maintenance::error::Error, registry::Error as RegistryError};
-
-/// Keys fetched per listing page. A memory bound only; the concurrency of the
-/// per-key work is the caller's knob.
-const PAGE_SIZE: u16 = 1000;
 
 /// Run `process` over every key under `prefix` in `store`, at most
 /// `concurrency` keys in flight at once. Keys are absolute (the prefix is
@@ -33,21 +29,11 @@ where
     F: Fn(String) -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send,
 {
-    let stream = paginated(move |token| async move {
-        let page = store
-            .list(prefix, PAGE_SIZE, token)
-            .await
-            .map_err(RegistryError::from)?;
-        let items = page
-            .items
-            .into_iter()
-            .map(|key| join_key(prefix, &key))
-            .collect();
-        Ok((items, page.next_token))
-    });
-
     let process = &process;
-    stream
+    store
+        .list_all(prefix)
+        .map_ok(|key| join_key(prefix, &key))
+        .map_err(|e| RegistryError::from(e).into())
         .try_for_each_concurrent(concurrency.max(1), |key| async move {
             process(key).await;
             Ok(())
