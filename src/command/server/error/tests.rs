@@ -125,21 +125,64 @@ fn test_as_json_all_error_types() {
     for (error, expected_code, expected_message) in errors {
         let json = error.as_json(None);
         assert_eq!(json["errors"][0]["code"], expected_code);
-        assert_eq!(json["errors"][0]["message"], expected_message);
+        // 5xx bodies suppress the internal message; 4xx surface it.
+        if error.status_code().is_server_error() {
+            assert!(
+                json["errors"][0]["message"].is_null(),
+                "5xx must not leak {expected_message:?}"
+            );
+        } else {
+            assert_eq!(json["errors"][0]["message"], expected_message);
+        }
+    }
+}
+
+/// Security regression guard for L6: a 5xx body must never carry the internal
+/// error string. The detail is logged server-side (via the response extension),
+/// not surfaced to the client, which keeps the request id to quote to an
+/// operator.
+#[test]
+fn test_5xx_body_omits_internal_error_string() {
+    let secret = "connection failed to postgres://user:pw@internal-host/db";
+    let errors = [
+        Error::Internal(secret.to_string()),
+        Error::Execution(secret.to_string()),
+        Error::Initialization(secret.to_string()),
+        Error::ProviderUnavailable(secret.to_string()),
+        Error::Custom {
+            status_code: StatusCode::BAD_GATEWAY,
+            code: "UPSTREAM".to_string(),
+            msg: Some(secret.to_string()),
+        },
+    ];
+    let request_id = "req-abc".to_string();
+    for error in errors {
+        assert!(error.status_code().is_server_error());
+        let body = error.as_json(Some(&request_id)).to_string();
+        assert!(
+            !body.contains(secret),
+            "5xx body leaked internal detail: {body}"
+        );
+        assert!(
+            body.contains(&request_id),
+            "request id must still be present"
+        );
     }
 }
 
 #[test]
 fn test_as_json_custom_error() {
+    // A non-5xx custom error surfaces its message (5xx suppression is covered
+    // by `test_5xx_body_omits_internal_error_string`).
     let error = Error::Custom {
-        status_code: StatusCode::BAD_GATEWAY,
-        code: "UPSTREAM_TIMEOUT".to_string(),
-        msg: Some("Backend timed out".to_string()),
+        status_code: StatusCode::TOO_MANY_REQUESTS,
+        code: "TOOMANYREQUESTS".to_string(),
+        msg: Some("Rate limit exceeded".to_string()),
     };
     let json = error.as_json(None);
 
-    assert_eq!(json["errors"][0]["code"], "UPSTREAM_TIMEOUT");
-    assert_eq!(json["errors"][0]["message"], "Backend timed out");
+    assert_eq!(json["errors"][0]["code"], "TOOMANYREQUESTS");
+    assert_eq!(json["errors"][0]["message"], "Rate limit exceeded");
 }
 
 #[test]
@@ -231,17 +274,18 @@ fn test_registry_error_to_server_error_mapping() {
             "SIZE_INVALID",
             None,
         ),
+        // 500s carry no client message: the internal detail is logged, not leaked.
         (
             registry::Error::Internal("Database error".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
-            Some("Database error"),
+            None,
         ),
         (
             registry::Error::Initialization("Config error".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
-            Some("Config error"),
+            None,
         ),
     ];
 
@@ -250,8 +294,9 @@ fn test_registry_error_to_server_error_mapping() {
         assert_eq!(error.status_code(), expected_status);
         let json = error.as_json(None);
         assert_eq!(json["errors"][0]["code"], expected_code);
-        if let Some(msg) = expected_message {
-            assert_eq!(json["errors"][0]["message"], msg);
+        match expected_message {
+            Some(msg) => assert_eq!(json["errors"][0]["message"], msg),
+            None => assert!(json["errors"][0]["message"].is_null()),
         }
     }
 }
@@ -267,9 +312,9 @@ fn test_blob_referenced_registry_error_mapping() {
 }
 
 /// Variants outside the OCI-spec set route through the wildcard arm to a
-/// generic 500 `INTERNAL_ERROR` carrying the rendered Display text.
-/// Pins this contract so a regression that broke `error.to_string()`
-/// formatting (or accidentally rerouted typed variants) would fail.
+/// generic 500 `INTERNAL_ERROR`. The rendered Display text stays server-side
+/// (logs); the client body carries no message. Pins both the routing and the
+/// no-leak contract.
 #[test]
 fn test_typed_registry_variants_route_to_internal_server_error() {
     let cases: Vec<(registry::Error, &str)> = vec![
@@ -284,7 +329,13 @@ fn test_typed_registry_variants_route_to_internal_server_error() {
     ];
 
     for (registry_error, expected_display_prefix) in cases {
-        let display = registry_error.to_string();
+        // Display text is retained for server-side logging.
+        assert!(
+            registry_error
+                .to_string()
+                .starts_with(expected_display_prefix),
+            "expected Display to start with {expected_display_prefix:?}"
+        );
         let server_error: Error = registry_error.into();
         assert_eq!(
             server_error.status_code(),
@@ -292,14 +343,10 @@ fn test_typed_registry_variants_route_to_internal_server_error() {
         );
         let json = server_error.as_json(None);
         assert_eq!(json["errors"][0]["code"], "INTERNAL_ERROR");
-        let message = json["errors"][0]["message"]
-            .as_str()
-            .expect("message must be a string");
         assert!(
-            message.starts_with(expected_display_prefix),
-            "expected message to start with {expected_display_prefix:?}, got: {message:?}"
+            json["errors"][0]["message"].is_null(),
+            "a 5xx body must not leak the internal Display text"
         );
-        assert_eq!(message, display, "message must equal Display output");
     }
 }
 
