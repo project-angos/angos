@@ -766,6 +766,9 @@ impl JobStore {
     /// submits a one-mutation engine transaction to delete the stale index,
     /// guarded by a read fingerprint so a concurrent enqueue that refreshes
     /// the index between our GET and the apply is never accidentally deleted.
+    /// A transient failure to delete the orphan is returned as an error rather
+    /// than `false`, so the caller never proceeds to an enqueue the lingering
+    /// index would silently coalesce away.
     pub async fn find_pending_with_lock_key(
         &self,
         queue: Queue,
@@ -803,12 +806,16 @@ impl JobStore {
                 match self.store.execute(tx).await {
                     Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(false),
                     Err(e) => {
+                        // Surface the transient failure instead of swallowing it
+                        // as `false`: the un-retired index would otherwise make
+                        // the caller's enqueue collide on `PutIfAbsent` and drop
+                        // a distinct job as a false dedup hit.
                         warn!(
                             lock_key,
                             error = %e,
                             "Failed to remove orphan lock-key index via engine",
                         );
-                        Ok(false)
+                        Err(tx_error_to_job(e))
                     }
                 }
             }
@@ -951,10 +958,12 @@ impl JobStore {
             envelope.max_attempts = self.max_attempts;
         }
         // Fast path: index present and pending exists, a hit, no writes needed.
+        // A lookup error (including a failed orphan self-heal) is propagated
+        // rather than swallowed as a miss, so a lingering orphan index cannot
+        // make the slow-path `PutIfAbsent` coalesce this distinct job away.
         if self
             .find_pending_with_lock_key(envelope.queue, &envelope.lock_key)
-            .await
-            .unwrap_or(false)
+            .await?
         {
             metrics_provider()
                 .job_queue_enqueued_total

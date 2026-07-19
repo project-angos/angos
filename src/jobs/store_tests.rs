@@ -1,10 +1,15 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{TimeZone as _, Utc};
 use tempfile::TempDir;
 
-use angos_storage::{MemoryObjectStore, ObjectStore, fs::Backend as StorageFsBackend};
+use angos_storage::{
+    Error as StorageError, MemoryObjectStore, ObjectStore,
+    fs::Backend as StorageFsBackend,
+    test_util::{HookedStore, StoreHook, StoreOp},
+};
 use angos_tx_engine::transaction::{Mutation, Transaction};
 
 use crate::jobs::store::{
@@ -472,6 +477,65 @@ async fn future_storage_key_yields_next_ready_without_claiming() {
 #[tokio::test]
 async fn orphan_index_is_self_healed_on_next_lookup() {
     for_each_job_backend(run_orphan_index_is_self_healed_on_next_lookup).await;
+}
+
+/// Fails the plain `Delete` of one key, modelling a transient backend error on
+/// the orphan-index self-heal while leaving every other op untouched.
+struct FailIndexDelete {
+    index_path: String,
+}
+
+#[async_trait]
+impl StoreHook for FailIndexDelete {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        match op {
+            StoreOp::Delete { key } if key == self.index_path => Err(StorageError::Backend(
+                "injected orphan-delete failure".to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn orphan_index_transient_delete_failure_does_not_drop_enqueue() {
+    metrics_provider::init_for_tests();
+    let lock_key = "cache.ns:sha256:orphan-transient";
+    let index_path = crate::jobs::store::job_lock_key_index_path("cache", lock_key);
+
+    let inner: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+    let hook = FailIndexDelete {
+        index_path: index_path.clone(),
+    };
+    let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(inner.clone(), hook));
+    let store = Arc::new(JobStore::new(build_store(hooked), "test-worker"));
+
+    // Seed an orphan index (index present, pending file absent) through the
+    // inner store so the fault hook does not intercept the fixture write.
+    let storage_key = make_storage_key(Utc::now(), "phantom-id");
+    let index_data = serialize_lock_key_index(&storage_key).expect("serialize");
+    inner
+        .put(&index_path, Bytes::from(index_data))
+        .await
+        .expect("seed index");
+
+    // The self-heal delete fails transiently, so the lookup surfaces the error
+    // rather than reporting a false miss.
+    assert!(
+        store
+            .find_pending_with_lock_key(Queue::Cache, lock_key)
+            .await
+            .is_err(),
+        "a transient orphan-cleanup failure must surface as an error",
+    );
+
+    // And the enqueue must not silently drop the distinct job: it propagates the
+    // failure instead of colliding with the lingering index on `PutIfAbsent` and
+    // returning a false dedup hit.
+    assert!(
+        store.enqueue(dummy_envelope(lock_key)).await.is_err(),
+        "enqueue must not silently drop a job behind an un-retired orphan index",
+    );
 }
 
 #[tokio::test]
