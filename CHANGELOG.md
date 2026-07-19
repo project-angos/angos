@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Security
 
 - Debug-formatting a registry client (pull-through upstream or replication downstream) no longer exposes the configured password; the client stores it in the redacting `Secret` wrapper.
+- A pull-through cache fill now rejects a fetched blob whose bytes do not hash to the requested digest, so a compromised or man-in-the-middle upstream can no longer poison the cache with content stored under a trusted digest.
 
 ### Added
 

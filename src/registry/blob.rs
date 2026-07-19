@@ -125,7 +125,7 @@ pub async fn cache_blob(
         .create_upload(namespace, session_id.as_ref())
         .await?;
     // A single-shot copy of a known blob: hash only the target algorithm.
-    blob_store
+    let (computed_digest, _) = blob_store
         .write_monolithic_upload(
             namespace,
             session_id.as_ref(),
@@ -134,6 +134,21 @@ pub async fn cache_blob(
             digest.algorithm(),
         )
         .await?;
+    // Reject a pull-through blob whose bytes do not hash to the requested
+    // digest: a compromised or man-in-the-middle upstream must not poison the
+    // cache under a trusted digest. Reclaim the staged bytes so repeated
+    // poisoning attempts cannot fill the disk; they are never promoted or
+    // granted, so no client can read them.
+    if &computed_digest != digest {
+        warn!("Pull-through blob digest mismatch: expected {digest}, got {computed_digest}");
+        if let Err(error) = blob_store
+            .delete_upload(namespace, session_id.as_ref())
+            .await
+        {
+            warn!("Failed to delete mismatched upload state: {error}");
+        }
+        return Err(Error::DigestInvalid);
+    }
     // Promotion and grant share the coarse lock `delete_blob` holds while
     // reclaiming, mirroring the manifest path's bytes-then-link order. A racer
     // that already promoted the bytes leaves this session behind; the
@@ -772,6 +787,39 @@ mod tests {
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
+        })
+        .await;
+    }
+
+    /// Pull-through cache poisoning guard: an upstream serving bytes that do not
+    /// hash to the requested digest must be rejected, and the poisoned bytes
+    /// must never be cached under the trusted digest.
+    #[tokio::test]
+    async fn cache_blob_rejects_content_not_matching_requested_digest() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+            let namespace = Namespace::new("test-repo").unwrap();
+            let poisoned = b"bytes an upstream served for the wrong digest";
+            let requested = Digest::sha256_of_bytes(b"what the client actually asked for");
+
+            let result = cache_blob(
+                &registry.blob_store,
+                &registry.metadata_store,
+                &namespace,
+                &requested,
+                Box::new(Cursor::new(poisoned.to_vec())),
+                poisoned.len() as u64,
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(Error::DigestInvalid)),
+                "mismatched pull-through content must be rejected; got: {result:?}"
+            );
+            assert!(
+                registry.blob_store.read(&requested).await.is_err(),
+                "poisoned bytes must not be cached under the requested digest"
+            );
         })
         .await;
     }
