@@ -31,6 +31,10 @@
 	let deleting = $state(false);
 	let expanded: Set<string> = $state(new Set());
 
+	// Monotonic token: each load claims the next value, so a slow response from
+	// a superseded load is discarded instead of overwriting the current view.
+	let loadToken = 0;
+
 	function toggleExpand(digest: string, event: MouseEvent) {
 		event.stopPropagation();
 		const newExpanded = new Set(expanded);
@@ -51,12 +55,14 @@
 	});
 
 	async function loadNamespace(namespace: string) {
+		const token = ++loadToken;
 		loading = true;
 		error = null;
 		const [revisionsResult, uploadsResult] = await Promise.all([
 			fetchRevisions(namespace),
 			fetchUploads(namespace)
 		]);
+		if (token !== loadToken) return;
 		if (revisionsResult.error) {
 			error = revisionsResult.error;
 		} else if (revisionsResult.data) {
@@ -72,6 +78,7 @@
 	}
 
 	async function loadManifest(namespace: string, reference: string) {
+		const token = ++loadToken;
 		loading = true;
 		error = null;
 		tags = [];
@@ -79,6 +86,7 @@
 		childReferrers = new Map();
 
 		const result = await fetchManifest(namespace, reference);
+		if (token !== loadToken) return;
 		if (result.error) {
 			error = result.error;
 			loading = false;
@@ -90,6 +98,7 @@
 
 		if (digest) {
 			const revisionsResult = await fetchRevisions(namespace);
+			if (token !== loadToken) return;
 			if (revisionsResult.data) {
 				const entry = revisionsResult.data.manifests.find(m => m.digest === digest);
 				if (entry) {

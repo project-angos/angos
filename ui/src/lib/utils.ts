@@ -235,18 +235,22 @@ export function buildTree(manifests: ManifestEntry[]): TreeNode[] {
 	const manifestToAttestations = new Map<string, { digest: string; type: AttestationType; artifactType?: string }[]>();
 
 	for (const m of manifests) {
-		if (m.parents && m.parents.length > 0) {
+		// Skip a self-reference: a manifest that lists itself as a parent or
+		// referrer must not exclude itself from the roots, or it renders nowhere.
+		const parents = (m.parents ?? []).filter((parent) => parent.digest !== m.digest);
+		if (parents.length > 0) {
 			childDigests.add(m.digest);
-			for (const parent of m.parents) {
+			for (const parent of parents) {
 				const children = parentToChildren.get(parent.digest) ?? [];
 				children.push({ manifest: m, platform: parent.platform });
 				parentToChildren.set(parent.digest, children);
 			}
 		}
 
-		if (m.referrers && m.referrers.length > 0) {
+		const referrers = (m.referrers ?? []).filter((referrer) => referrer.digest !== m.digest);
+		if (referrers.length > 0) {
 			const attestations: { digest: string; type: AttestationType; artifactType?: string }[] = [];
-			for (const referrer of m.referrers) {
+			for (const referrer of referrers) {
 				referrerDigests.add(referrer.digest);
 				attestations.push({
 					digest: referrer.digest,

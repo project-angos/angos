@@ -212,7 +212,7 @@ export async function fetchFailedJobs(
 }
 
 export async function retryJob(queue: JobQueue, storageKey: string): Promise<string | null> {
-	return postAction(`/_ext/_jobs/failed/${storageKey}/retry?queue=${queue}`);
+	return postAction(`/_ext/_jobs/failed/${encodeURIComponent(storageKey)}/retry?queue=${queue}`);
 }
 
 export async function deleteJob(
@@ -220,7 +220,7 @@ export async function deleteJob(
 	state: JobState,
 	storageKey: string
 ): Promise<string | null> {
-	return deleteResource(`/_ext/_jobs/${state}/${storageKey}?queue=${queue}`);
+	return deleteResource(`/_ext/_jobs/${state}/${encodeURIComponent(storageKey)}?queue=${queue}`);
 }
 
 export interface ManifestResult {
