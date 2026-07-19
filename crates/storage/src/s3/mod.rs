@@ -68,6 +68,9 @@ mod range_scan;
 
 pub const DEFAULT_PART_SIZE: u64 = 5 * 1024 * 1024;
 
+/// Default concurrent range chains a truncated children/flat scan fans out to.
+pub const DEFAULT_RANGE_CONCURRENCY: usize = 16;
+
 const FRAME_SIZE: usize = 1024 * 1024;
 const FRAME_BUFFER_CAPACITY: usize = 8;
 /// S3 protocol floor for non-final multipart parts: a part must be at least
@@ -81,6 +84,7 @@ pub struct Builder {
     client: Arc<S3Backend>,
     part_size: u64,
     uniform_parts: bool,
+    range_concurrency: usize,
 }
 
 impl Builder {
@@ -89,7 +93,16 @@ impl Builder {
             client,
             part_size: DEFAULT_PART_SIZE,
             uniform_parts: false,
+            range_concurrency: DEFAULT_RANGE_CONCURRENCY,
         }
+    }
+
+    /// Max concurrent range chains a truncated whole-directory or whole-store
+    /// scan fans out to. Defaults to [`DEFAULT_RANGE_CONCURRENCY`].
+    #[must_use]
+    pub fn range_concurrency(mut self, concurrency: usize) -> Self {
+        self.range_concurrency = concurrency.max(1);
+        self
     }
 
     /// Target part size for upload sessions (uniform mode) or minimum part
@@ -119,6 +132,7 @@ impl Builder {
             client: self.client,
             part_size: self.part_size,
             uniform_parts: self.uniform_parts,
+            range_concurrency: self.range_concurrency,
         }
     }
 }
@@ -129,6 +143,7 @@ pub struct Backend {
     pub client: Arc<S3Backend>,
     pub part_size: u64,
     pub uniform_parts: bool,
+    pub range_concurrency: usize,
 }
 
 impl Backend {
@@ -401,11 +416,11 @@ impl ObjectStore for Backend {
     }
 
     async fn list_all_children(&self, prefix: &str) -> Result<(Vec<String>, Vec<String>), Error> {
-        range_scan::scan_all_children(&self.client, prefix).await
+        range_scan::scan_all_children(&self.client, prefix, self.range_concurrency).await
     }
 
     fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
-        range_scan::scan_all_keys(&self.client, prefix)
+        range_scan::scan_all_keys(&self.client, prefix, self.range_concurrency)
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {

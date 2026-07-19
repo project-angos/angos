@@ -93,7 +93,12 @@ fn test_build_blob_store_filesystem_success() {
 async fn test_build_metadata_store_filesystem_success() {
     let (config, _blobs, _meta) = create_minimal_config();
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
-    let result = bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await;
+    let result = bootstrap::metadata_store(
+        &config.resolve_registry_storage(),
+        &auth_cache,
+        config.global.namespace_walk_concurrency,
+    )
+    .await;
 
     assert!(result.is_ok());
 }
@@ -300,9 +305,13 @@ async fn test_build_registry_components_integration() {
 
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
-    let metadata_store = bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache)
-        .await
-        .unwrap();
+    let metadata_store = bootstrap::metadata_store(
+        &config.resolve_registry_storage(),
+        &auth_cache,
+        config.global.namespace_walk_concurrency,
+    )
+    .await
+    .unwrap();
     let repositories = bootstrap::repositories(
         &config.repository,
         &auth_cache,

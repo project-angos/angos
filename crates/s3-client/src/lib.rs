@@ -71,7 +71,10 @@ impl Backend {
             multipart_copy_threshold: config.multipart_copy_threshold.as_u64(),
             multipart_copy_chunk_size: config.multipart_copy_chunk_size.as_u64(),
             multipart_copy_jobs: config.multipart_copy_jobs,
-            circuit_breaker: CircuitBreaker::new(),
+            circuit_breaker: CircuitBreaker::new(
+                config.circuit_breaker_threshold,
+                config.circuit_breaker_cooldown_secs,
+            ),
         })
     }
 

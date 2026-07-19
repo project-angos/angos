@@ -9,9 +9,6 @@ use std::{
 
 use tracing::warn;
 
-const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
-const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 10;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitBreakerError {
     pub failures: u32,
@@ -40,13 +37,19 @@ impl From<CircuitBreakerError> for io::Error {
 pub struct CircuitBreaker {
     consecutive_failures: Arc<AtomicU32>,
     opened_at_epoch_secs: Arc<AtomicU64>,
+    threshold: u32,
+    cooldown_secs: u64,
 }
 
 impl CircuitBreaker {
-    pub fn new() -> Self {
+    /// Build a breaker that opens after `threshold` consecutive failures and
+    /// stays open for `cooldown_secs` before admitting a half-open probe.
+    pub fn new(threshold: u32, cooldown_secs: u64) -> Self {
         Self {
             consecutive_failures: Arc::new(AtomicU32::new(0)),
             opened_at_epoch_secs: Arc::new(AtomicU64::new(0)),
+            threshold,
+            cooldown_secs,
         }
     }
 
@@ -61,7 +64,7 @@ impl CircuitBreaker {
     /// a backend that may still be down.
     pub fn check(&self) -> Result<(), CircuitBreakerError> {
         let failures = self.consecutive_failures.load(Ordering::Acquire);
-        if failures < CIRCUIT_BREAKER_THRESHOLD {
+        if failures < self.threshold {
             return Ok(());
         }
         let opened_at = self.opened_at_epoch_secs.load(Ordering::Acquire);
@@ -71,9 +74,9 @@ impl CircuitBreaker {
             .as_secs();
         let rejected = || CircuitBreakerError {
             failures,
-            cooldown_secs: CIRCUIT_BREAKER_COOLDOWN_SECS,
+            cooldown_secs: self.cooldown_secs,
         };
-        if now.saturating_sub(opened_at) < CIRCUIT_BREAKER_COOLDOWN_SECS {
+        if now.saturating_sub(opened_at) < self.cooldown_secs {
             return Err(rejected());
         }
         // Half-open: the cooldown has elapsed. Admit a single probe per window
@@ -112,19 +115,14 @@ impl CircuitBreaker {
         // when a request slipped through after the previous cooldown expired and failed.
         self.opened_at_epoch_secs.store(now, Ordering::Release);
         let prev = self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
-        if prev + 1 == CIRCUIT_BREAKER_THRESHOLD {
+        if prev + 1 == self.threshold {
             warn!(
-                threshold = CIRCUIT_BREAKER_THRESHOLD,
-                cooldown_secs = CIRCUIT_BREAKER_COOLDOWN_SECS,
-                "Circuit breaker opened after {CIRCUIT_BREAKER_THRESHOLD} consecutive failures"
+                threshold = self.threshold,
+                cooldown_secs = self.cooldown_secs,
+                "Circuit breaker opened after {} consecutive failures",
+                self.threshold
             );
         }
-    }
-}
-
-impl Default for CircuitBreaker {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -134,9 +132,16 @@ mod tests {
 
     use super::*;
 
+    const THRESHOLD: u32 = 5;
+    const COOLDOWN_SECS: u64 = 10;
+
+    fn breaker() -> CircuitBreaker {
+        CircuitBreaker::new(THRESHOLD, COOLDOWN_SECS)
+    }
+
     #[test]
-    fn default_is_equivalent_to_new() {
-        let cb = CircuitBreaker::default();
+    fn new_breaker_starts_closed() {
+        let cb = breaker();
         assert_eq!(cb.consecutive_failures.load(Ordering::Acquire), 0);
         assert_eq!(cb.opened_at_epoch_secs.load(Ordering::Acquire), 0);
         assert!(cb.check().is_ok());
@@ -144,8 +149,8 @@ mod tests {
 
     #[test]
     fn open_error_message_contains_expected_wording() {
-        let cb = CircuitBreaker::new();
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        let cb = breaker();
+        for _ in 0..THRESHOLD {
             cb.record_failure();
         }
         let err = cb.check().unwrap_err();
@@ -155,36 +160,36 @@ mod tests {
             "error must mention 'circuit breaker open', got: {msg}"
         );
         assert!(
-            msg.contains(&CIRCUIT_BREAKER_THRESHOLD.to_string()),
+            msg.contains(&THRESHOLD.to_string()),
             "error must include failure count, got: {msg}"
         );
         assert!(
-            msg.contains(&CIRCUIT_BREAKER_COOLDOWN_SECS.to_string()),
+            msg.contains(&COOLDOWN_SECS.to_string()),
             "error must include cooldown seconds, got: {msg}"
         );
     }
 
     #[test]
     fn open_error_carries_typed_failure_count_and_cooldown() {
-        let cb = CircuitBreaker::new();
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        let cb = breaker();
+        for _ in 0..THRESHOLD {
             cb.record_failure();
         }
         let err = cb.check().unwrap_err();
-        assert_eq!(err.failures, CIRCUIT_BREAKER_THRESHOLD);
-        assert_eq!(err.cooldown_secs, CIRCUIT_BREAKER_COOLDOWN_SECS);
+        assert_eq!(err.failures, THRESHOLD);
+        assert_eq!(err.cooldown_secs, COOLDOWN_SECS);
     }
 
     #[test]
     fn success_mid_sequence_resets_failure_count() {
-        let cb = CircuitBreaker::new();
-        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+        let cb = breaker();
+        for _ in 0..(THRESHOLD - 1) {
             cb.record_failure();
         }
         cb.record_success();
 
         // After the reset, THRESHOLD - 1 additional failures must not open the breaker.
-        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+        for _ in 0..(THRESHOLD - 1) {
             cb.record_failure();
         }
         assert!(
@@ -202,15 +207,15 @@ mod tests {
 
     #[test]
     fn post_cooldown_success_fully_clears_state() {
-        let cb = CircuitBreaker::new();
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        let cb = breaker();
+        for _ in 0..THRESHOLD {
             cb.record_failure();
         }
         // Simulate cooldown elapse by rewinding `opened_at`.
         cb.opened_at_epoch_secs.store(
             cb.opened_at_epoch_secs
                 .load(Ordering::Acquire)
-                .saturating_sub(CIRCUIT_BREAKER_COOLDOWN_SECS + 1),
+                .saturating_sub(COOLDOWN_SECS + 1),
             Ordering::Release,
         );
         assert!(cb.check().is_ok(), "breaker should pass after cooldown");
@@ -235,8 +240,8 @@ mod tests {
 
     #[test]
     fn check_passes_when_below_threshold() {
-        let cb = CircuitBreaker::new();
-        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+        let cb = breaker();
+        for _ in 0..(THRESHOLD - 1) {
             cb.record_failure();
         }
         assert!(cb.check().is_ok());
@@ -244,8 +249,8 @@ mod tests {
 
     #[test]
     fn record_success_clears_opened_at_and_failure_count() {
-        let cb = CircuitBreaker::new();
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        let cb = breaker();
+        for _ in 0..THRESHOLD {
             cb.record_failure();
         }
         assert!(cb.check().is_err());
@@ -259,15 +264,15 @@ mod tests {
 
     #[test]
     fn record_failure_after_cooldown_re_arms_opened_at() {
-        let cb = CircuitBreaker::new();
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        let cb = breaker();
+        for _ in 0..THRESHOLD {
             cb.record_failure();
         }
         let initial_opened_at = cb.opened_at_epoch_secs.load(Ordering::Acquire);
 
         // Simulate cooldown elapse by rewinding `opened_at` past the cooldown window.
         cb.opened_at_epoch_secs.store(
-            initial_opened_at.saturating_sub(CIRCUIT_BREAKER_COOLDOWN_SECS + 1),
+            initial_opened_at.saturating_sub(COOLDOWN_SECS + 1),
             Ordering::Release,
         );
         assert!(
@@ -296,7 +301,7 @@ mod tests {
         // Without the release-before-publish ordering, `check()` could see failures=5 but
         // opened_at=0 and incorrectly return Ok.
         for _ in 0..100 {
-            let cb = CircuitBreaker::new();
+            let cb = breaker();
             let cb_clone = cb.clone();
             let handles: Vec<_> = (0..16)
                 .map(|_| {
@@ -325,7 +330,7 @@ mod tests {
             // Invariant: whenever a checker thread sees failures >= THRESHOLD,
             // opened_at must be non-zero (i.e., set by some prior record_failure).
             for (failures, opened_at) in observations {
-                if failures >= CIRCUIT_BREAKER_THRESHOLD {
+                if failures >= THRESHOLD {
                     assert!(
                         opened_at != 0,
                         "race observed: failures={failures} but opened_at=0"
@@ -338,14 +343,14 @@ mod tests {
     /// Helper: open the breaker and rewind `opened_at` so the cooldown reads as
     /// elapsed, leaving the breaker half-open ready to admit one probe.
     fn open_and_elapse_cooldown() -> CircuitBreaker {
-        let cb = CircuitBreaker::new();
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        let cb = breaker();
+        for _ in 0..THRESHOLD {
             cb.record_failure();
         }
         cb.opened_at_epoch_secs.store(
             cb.opened_at_epoch_secs
                 .load(Ordering::Acquire)
-                .saturating_sub(CIRCUIT_BREAKER_COOLDOWN_SECS + 1),
+                .saturating_sub(COOLDOWN_SECS + 1),
             Ordering::Release,
         );
         cb
@@ -409,7 +414,7 @@ mod tests {
         cb.opened_at_epoch_secs.store(
             cb.opened_at_epoch_secs
                 .load(Ordering::Acquire)
-                .saturating_sub(CIRCUIT_BREAKER_COOLDOWN_SECS + 1),
+                .saturating_sub(COOLDOWN_SECS + 1),
             Ordering::Release,
         );
         assert!(

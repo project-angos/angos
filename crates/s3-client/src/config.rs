@@ -24,6 +24,8 @@ pub struct BackendConfig {
     pub operation_timeout_secs: u64,
     pub operation_attempt_timeout_secs: u64,
     pub max_attempts: u32,
+    pub circuit_breaker_threshold: u32,
+    pub circuit_breaker_cooldown_secs: u64,
 }
 
 impl Default for BackendConfig {
@@ -43,6 +45,8 @@ impl Default for BackendConfig {
             operation_timeout_secs: 900,
             operation_attempt_timeout_secs: 300,
             max_attempts: 3,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_cooldown_secs: 10,
         }
     }
 }

@@ -41,13 +41,16 @@ pub use multipart_cleanup::{MultipartCleanup, OrphanMultipartUpload};
 
 use crate::{
     oci::{Algorithm, Digest},
-    registry::{Error, path_builder},
+    registry::{Error, pagination, path_builder},
 };
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
 
 /// Fan-out for the per-shard page chains behind [`BlobStore::stream_blobs`].
 const BLOB_LIST_CONCURRENCY: usize = 32;
+
+/// Default lifetime of a presigned blob download URL.
+pub const DEFAULT_PRESIGN_TTL_SECS: u64 = 1800;
 
 /// Summary of an in-progress or completed upload session.
 #[derive(Debug, Clone)]
@@ -64,6 +67,10 @@ pub struct BlobStore {
     /// Presign backend, when the storage supports it (S3 only). Absent for FS,
     /// where reads stream instead.
     presign: Option<Arc<dyn PresignedStore>>,
+    /// Lifetime of a generated presigned download URL.
+    presign_ttl: Duration,
+    /// Concurrent directory scans an upload-namespace walk keeps in flight.
+    namespace_walk_concurrency: usize,
 }
 
 impl Debug for BlobStore {
@@ -74,10 +81,31 @@ impl Debug for BlobStore {
 
 impl BlobStore {
     /// Construct a blob store over `object`, optionally with a `presign`
-    /// backend for signed download URLs (S3; `None` on FS).
+    /// backend for signed download URLs (S3; `None` on FS). Presigned URLs
+    /// default to [`DEFAULT_PRESIGN_TTL_SECS`]; override with
+    /// [`Self::with_presign_ttl`].
     #[must_use]
     pub fn new(object: Arc<dyn ObjectStore>, presign: Option<Arc<dyn PresignedStore>>) -> Self {
-        BlobStore { object, presign }
+        BlobStore {
+            object,
+            presign,
+            presign_ttl: Duration::from_secs(DEFAULT_PRESIGN_TTL_SECS),
+            namespace_walk_concurrency: pagination::NAMESPACE_WALK_CONCURRENCY,
+        }
+    }
+
+    /// Set the lifetime of generated presigned download URLs.
+    #[must_use]
+    pub fn with_presign_ttl(mut self, ttl: Duration) -> Self {
+        self.presign_ttl = ttl;
+        self
+    }
+
+    /// Set the concurrent directory-scan fan-out for upload-namespace walks.
+    #[must_use]
+    pub fn with_namespace_walk_concurrency(mut self, concurrency: usize) -> Self {
+        self.namespace_walk_concurrency = concurrency.max(1);
+        self
     }
 
     /// The underlying object store, for raw key access outside the blob API:
@@ -261,7 +289,7 @@ impl BlobStore {
         };
         let path = path_builder::blob_path(digest);
         let url = presign
-            .presign_get(&path, Duration::from_mins(30), content_type)
+            .presign_get(&path, self.presign_ttl, content_type)
             .await?;
         Ok(Some(url))
     }

@@ -144,7 +144,10 @@ impl Store {
                 let lock_store = s3_lock_store.ok_or_else(|| {
                     Error::Build("S3 lock strategy requires an S3 conditional store".to_string())
                 })?;
-                let storage: Arc<dyn LockStorage> = Arc::new(S3LockStorage::new(lock_store));
+                let storage: Arc<dyn LockStorage> = Arc::new(S3LockStorage::new(
+                    lock_store,
+                    config.conditional_max_attempts,
+                ));
                 Lock::builder(storage)
                     .ttl_secs(config.ttl_secs)
                     .max_retries(config.max_retries)

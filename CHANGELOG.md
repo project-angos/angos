@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - New `scrub --delete-unknown` flag deletes unrecognized keys outright instead of quarantining them under `_lost_and_found/`.
 - New `prune --concurrency` option (default 25) checks namespaces, uploads, blobs, and shards concurrently within each sweep, like the scrub walk.
 - New OIDC provider options `http_request_timeout_secs` (default 30) and `jwks_refresh_timeout_secs` (default 5) make the previously hardcoded JWKS/discovery fetch timeouts configurable per provider.
+- Previously hardcoded operational constants are now configurable (the S3 circuit breaker, children-scan and namespace-walk fan-outs, presigned-URL TTL, durable-queue retry policy, S3 lock ambiguous-write retries, and shutdown drain grace), and the prune/replicate sweep fan-outs derive from their concurrency options.
 
 ### Changed
 

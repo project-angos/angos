@@ -79,11 +79,20 @@ pub async fn build_registry(
     cached_conditional_operations: &Arc<Mutex<Option<bool>>>,
     engine_maintenance: Option<CancellationToken>,
 ) -> Result<(Arc<Registry>, Option<PendingGaugeRefresh>), Error> {
-    let blob_backend = Arc::new(config.blob_store.build_backend()?);
+    let blob_backend = Arc::new(
+        config
+            .blob_store
+            .build_backend()?
+            .with_namespace_walk_concurrency(config.global.namespace_walk_concurrency),
+    );
     let storage_config = resolve_storage_config(config, cached_conditional_operations).await?;
-    let metadata_store = bootstrap::metadata_store(&storage_config, auth_cache)
-        .await
-        .map_err(Error::from)?;
+    let metadata_store = bootstrap::metadata_store(
+        &storage_config,
+        auth_cache,
+        config.global.namespace_walk_concurrency,
+    )
+    .await
+    .map_err(Error::from)?;
     let max_manifest_size_bytes = config.global.max_manifest_size_bytes();
     let repositories =
         bootstrap::repositories(&config.repository, auth_cache, max_manifest_size_bytes).await?;
@@ -112,7 +121,11 @@ pub async fn build_registry(
     let pending = if let Some(jq_config) = &config.global.job_queue {
         let engine = metadata_store.store_arc();
         job_store::ensure_shared_lock(&engine)?;
-        let job_store: Arc<JobStore> = Arc::new(JobStore::new(engine, "server"));
+        let job_store: Arc<JobStore> = Arc::new(JobStore::with_retry_policy(
+            engine,
+            "server",
+            jq_config.retry_policy(),
+        ));
         registry_config.job_queue = Some(job_store.clone());
         Some(PendingGaugeRefresh {
             store: job_store,

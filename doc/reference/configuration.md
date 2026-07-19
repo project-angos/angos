@@ -65,6 +65,8 @@ When omitted, the server runs without TLS (insecure).
 | `allow_missing_manifest_references` | bool | `true` | When `true` (default), accept a manifest push whose referenced blobs or child manifests are not yet present/owned in the namespace; the missing references stay unreadable until their content is pushed. Set to `false` to reject such pushes with `MANIFEST_BLOB_UNKNOWN`. See note below. |
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
 | `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
+| `shutdown_drain_secs`       | u64      | `30`     | Seconds to keep draining in-flight work on shutdown before forcing exit. |
+| `namespace_walk_concurrency`| usize    | `128`    | Concurrent directory scans a catalog / upload-namespace walk keeps in flight, hiding per-request backend latency on S3. |
 | `trusted_proxies`           | [string] | `[]`     | Proxy IPs or CIDR networks (e.g. `"10.0.0.1"`, `"10.0.0.0/8"`) whose `X-Forwarded-For`/`X-Real-IP` headers are honored as the client IP. From any other peer those headers are ignored and the socket address is used. |
 
 `max_manifest_size` and `max_blob_size` must be greater than zero.
@@ -91,7 +93,7 @@ the **same backend configured for `[metadata_store]`** (filesystem or S3,
 whichever metadata uses), under a hardcoded top-level `_jobs/` prefix; the lock
 strategy is likewise inherited from `[metadata_store]`. There is therefore no
 job-queue-level backend, credential, prefix, or lock-strategy setting: the
-section accepts only the two tunables below.
+section accepts only the tunables below.
 
 > **A shared lock strategy is required.** The durable queue is drained by
 > separate processes, so the per-job execution lock must be shared across them.
@@ -108,6 +110,9 @@ section accepts only the two tunables below.
 |---|---|---|---|
 | `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. Must be at least `5` (sub-5s ticks induce LIST storms on S3). |
 | `pending_ready_horizon_secs` | u64 | `600` | Readiness horizon for the `angos_job_queue_pending` gauge. Only envelopes whose `not_before` falls within `[..., now + horizon]` are counted. Set comfortably larger than your worker pod startup time so KEDA has lead time to scale up before the work becomes claimable. |
+| `max_attempts` | u32 | `5` | Times a failing job is retried before it is dead-lettered. |
+| `retry_backoff_min_ms` | u64 | `100` | First retry backoff delay; the exponential schedule grows from here. |
+| `retry_backoff_max_ms` | u64 | `10000` | Ceiling on the exponential retry backoff. |
 
 > **Per-`lock_key` execution TTL is governed by the lock backend.** A worker that claims a job holds the lock configured under `[metadata_store]` for the duration of execution; the TTL on the lock object (`[metadata_store.fs.lock_strategy.redis].ttl`, `[metadata_store.s3.lock_strategy.s3].ttl_secs`) is what bounds how long another worker has to wait if the holder dies mid-job. Transient heartbeat failures (connect or refresh errors) tolerate a small budget (roughly one TTL of slack) before cancelling the job, so a brief network blip does not waste in-progress work; authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
@@ -171,6 +176,10 @@ Choose one: `blob_store.fs` or `blob_store.s3`.
 | `max_attempts`                   | u32    | `3`       | Retry attempts for S3 operations   |
 | `operation_timeout_secs`         | u64    | `900`     | Total operation timeout            |
 | `operation_attempt_timeout_secs` | u64    | `300`     | Per-attempt timeout                |
+| `circuit_breaker_threshold`      | u32    | `5`       | Consecutive failures that trip the circuit breaker open |
+| `circuit_breaker_cooldown_secs`  | u64    | `10`      | Seconds the tripped breaker stays open before a half-open probe |
+| `children_scan_concurrency`      | usize  | `16`      | Concurrent range chains a truncated children/flat scan fans out to |
+| `presign_ttl_secs`               | u64    | `1800`    | Lifetime of a generated presigned download URL |
 
 #### S3 Blob Upload Modes
 
@@ -314,6 +323,7 @@ retry_delay_ms = 50
 | `operation_timeout_secs`        | u64  | `15`    | Total timeout for lock S3 operations |
 | `operation_attempt_timeout_secs`| u64  | `4`     | Per-attempt timeout for lock S3 operations |
 | `max_attempts`                  | u32  | `2`     | Maximum retry attempts for lock S3 operations |
+| `conditional_max_attempts`      | u32  | `3`     | Attempts (initial write plus reconciling retries) for a conditional lock write whose transport outcome is ambiguous |
 
 > **Lock operation timeouts:** Lock operations use their own S3 client with significantly tighter timeouts than blob/metadata operations. This is intentional: lock operations are small JSON payloads and should fail fast rather than blocking for minutes on a stuck request. The defaults (`operation_timeout_secs = 15`, `operation_attempt_timeout_secs = 4`, `max_attempts = 2`) ensure that a single stuck request cannot consume an entire heartbeat interval (10s with default TTL). Each heartbeat tick is also capped to the heartbeat interval to prevent the slow path (two sequential SDK calls) from exceeding it. For high-latency S3 scenarios, increase these values but keep `attempt_timeout × max_attempts` below the heartbeat interval.
 

@@ -2,7 +2,11 @@ use std::{future::Future, sync::Arc};
 
 use angos_tx_engine::{executor::TransactionExecutor, lock::LockSession, store::Store};
 
-use crate::{cache::Cache, oci::Digest, registry::Error};
+use crate::{
+    cache::Cache,
+    oci::Digest,
+    registry::{Error, pagination},
+};
 
 mod access_time;
 mod blob_index;
@@ -33,6 +37,8 @@ pub struct MetadataStore {
     store: Arc<Store>,
     cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
+    /// Concurrent directory scans a catalog namespace walk keeps in flight.
+    namespace_walk_concurrency: usize,
     access_time_writer: Option<AccessTimeWriter>,
     // Held for Drop side-effect: signals the flush task to exit when the last clone is dropped.
     _flush_handle: Option<Arc<FlushHandle>>,
@@ -43,6 +49,7 @@ pub struct Builder {
     cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
     access_time_debounce_secs: u64,
+    namespace_walk_concurrency: usize,
 }
 
 impl Builder {
@@ -52,6 +59,7 @@ impl Builder {
             cache: None,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
+            namespace_walk_concurrency: pagination::NAMESPACE_WALK_CONCURRENCY,
         }
     }
 
@@ -70,6 +78,13 @@ impl Builder {
         self
     }
 
+    /// Concurrent directory-scan fan-out for catalog namespace walks.
+    #[must_use]
+    pub fn namespace_walk_concurrency(mut self, concurrency: usize) -> Self {
+        self.namespace_walk_concurrency = concurrency.max(1);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> MetadataStore {
         let (access_time_writer, flush_handle) =
@@ -79,6 +94,7 @@ impl Builder {
             store: self.store,
             cache: self.cache,
             link_cache_ttl: self.link_cache_ttl,
+            namespace_walk_concurrency: self.namespace_walk_concurrency,
             access_time_writer,
             _flush_handle: flush_handle,
         }

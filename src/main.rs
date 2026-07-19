@@ -227,7 +227,9 @@ async fn run_worker(
         () = worker.run() => Ok(()),
         () = shutdown_signal() => {
             info!("Shutdown signal received, draining in-flight jobs");
-            worker.shutdown_with_timeout(Duration::from_secs(30)).await;
+            worker
+                .shutdown_with_timeout(Duration::from_secs(config.global.shutdown_drain_secs))
+                .await;
             info!("Graceful shutdown complete");
             Ok(())
         }
@@ -246,7 +248,9 @@ async fn run_server(options: GlobalArguments, config: Configuration) -> Result<(
         result = server.run() => result,
         () = shutdown_signal() => {
             info!("Shutdown signal received, draining in-flight webhook deliveries");
-            server.shutdown_with_timeout(Duration::from_secs(30)).await;
+            server
+                .shutdown_with_timeout(Duration::from_secs(config.global.shutdown_drain_secs))
+                .await;
             info!("Graceful shutdown complete");
             Ok(())
         }
