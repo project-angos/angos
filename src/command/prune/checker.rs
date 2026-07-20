@@ -49,6 +49,15 @@ fn to_epoch(timestamp: Option<DateTime<Utc>>) -> i64 {
     timestamp.map_or(0, |t| t.timestamp())
 }
 
+/// Push time for retention: an unknown timestamp is treated as the current
+/// instant so an age rule keeps content of unknown age (a migrated legacy link
+/// carries none) rather than deleting it as if pushed at the Unix epoch. Pull
+/// time keeps `to_epoch`, since an unknown (never-pulled) timestamp is
+/// legitimately cold.
+fn pushed_at_epoch(created_at: Option<DateTime<Utc>>) -> i64 {
+    created_at.map_or_else(|| Utc::now().timestamp(), |t| t.timestamp())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum PolicyDecision {
     Retain,
@@ -138,7 +147,7 @@ fn decide_orphan_fate(
 
     let manifest = ManifestImage {
         tag: None,
-        pushed_at: EpochSeconds::from_seconds(to_epoch(metadata.created_at)),
+        pushed_at: EpochSeconds::from_seconds(pushed_at_epoch(metadata.created_at)),
         last_pulled_at: EpochSeconds::from_seconds(to_epoch(metadata.accessed_at)),
     };
 
@@ -394,7 +403,7 @@ impl RetentionChecker {
 
         let manifest = ManifestImage {
             tag: Some(tag.name.to_string()),
-            pushed_at: EpochSeconds::from_seconds(to_epoch(tag.metadata.created_at)),
+            pushed_at: EpochSeconds::from_seconds(pushed_at_epoch(tag.metadata.created_at)),
             last_pulled_at: EpochSeconds::from_seconds(to_epoch(tag.metadata.accessed_at)),
         };
 
@@ -1310,6 +1319,27 @@ mod tests {
         let metadata = dummy_metadata();
         let fate = decide_orphan_fate(false, false, Some(&metadata), None, None, &[], &[]).unwrap();
         assert_eq!(fate, Fate::Retain);
+    }
+
+    #[test]
+    fn decide_orphan_fate_retains_unknown_push_time_under_age_policy() {
+        // A migrated legacy link carries no `created_at`; an age rule must not
+        // treat it as pushed at the Unix epoch and delete recent content.
+        let metadata = dummy_metadata();
+        assert!(metadata.created_at.is_none());
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.pushed_at > now() - days(30)").unwrap()],
+            },
+            Arc::new(SystemClock),
+        );
+        let fate = decide_orphan_fate(false, false, Some(&metadata), None, Some(&policy), &[], &[])
+            .unwrap();
+        assert_eq!(
+            fate,
+            Fate::Retain,
+            "content with an unknown push time must not be age-deleted"
+        );
     }
 
     #[test]

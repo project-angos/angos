@@ -45,6 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A transient backend failure while retiring an orphaned job dedup index is now surfaced instead of being swallowed as a miss, so the lingering index can no longer make an enqueue collide on its `PutIfAbsent` and silently drop a distinct job as a false duplicate.
 - A blob `HEAD` now returns `500` for a transient or internal storage fault instead of reporting the blob absent with a `404`, matching the `GET` path; only a genuine miss is a `404`.
 - A `prune = true` reconcile no longer enqueues a delete for a downstream tag on the strength of a stale local snapshot; each prune candidate is re-checked against live local state, so a tag pushed mid-reconcile is not reaped.
+- Retention no longer treats content with an unknown push time (a migrated legacy link carries none) as pushed at the Unix epoch; an age rule like `image.pushed_at > now() - days(30)` now keeps it instead of deleting it, while never-pulled content stays eligible for pull-age deletion.
 - The web UI manifest tree no longer hides a manifest that lists itself as a parent or referrer; the self-reference is ignored so the manifest still renders.
 - Navigating the web UI quickly between manifests or namespaces no longer lets a slow earlier response overwrite the current view; a superseded load is discarded.
 - A repository access policy written as `default = "deny"` with no rules now denies as configured; it was previously indistinguishable from an absent policy and silently ignored.
