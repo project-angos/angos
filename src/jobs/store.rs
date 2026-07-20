@@ -1078,6 +1078,21 @@ impl JobStore {
                 .await
                 .map_err(tx_error_to_job)?
             {
+                // Re-read under the execution lock: another worker may have
+                // completed this job (deleting the pending file) between our
+                // first read and the lock acquisition. Without this the stale
+                // envelope would be re-run and could dead-letter a finished job.
+                let envelope = match self.read_pending(queue, &storage_key).await {
+                    Ok(envelope) => envelope,
+                    Err(Error::NotFound) => {
+                        session.release().await;
+                        continue;
+                    }
+                    Err(e) => {
+                        session.release().await;
+                        return Err(e);
+                    }
+                };
                 debug!(
                     lock_key = envelope.lock_key.as_str(),
                     worker_id = self.worker_id.as_str(),

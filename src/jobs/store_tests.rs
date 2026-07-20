@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -535,6 +538,52 @@ async fn orphan_index_transient_delete_failure_does_not_drop_enqueue() {
     assert!(
         store.enqueue(dummy_envelope(lock_key)).await.is_err(),
         "enqueue must not silently drop a job behind an un-retired orphan index",
+    );
+}
+
+/// Fails the second `get` of a pending-job file with `NotFound`, modelling
+/// another worker completing the job (deleting its pending file) between the
+/// claim's first read and its post-acquire re-read.
+struct VanishOnSecondPendingRead {
+    pending_reads: AtomicUsize,
+}
+
+#[async_trait]
+impl StoreHook for VanishOnSecondPendingRead {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        if let StoreOp::Get { key } = op
+            && key.contains("/pending/")
+            && self.pending_reads.fetch_add(1, Ordering::SeqCst) >= 1
+        {
+            return Err(StorageError::NotFound);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn claim_rechecks_pending_under_lock_and_skips_a_vanished_job() {
+    metrics_provider::init_for_tests();
+    let inner: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+    let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
+        inner,
+        VanishOnSecondPendingRead {
+            pending_reads: AtomicUsize::new(0),
+        },
+    ));
+    let store = Arc::new(JobStore::new(build_store(hooked), "test-worker"));
+
+    store
+        .enqueue(dummy_envelope("cache.ns:sha256:vanish"))
+        .await
+        .expect("enqueue");
+
+    // The claim reads the pending file, acquires the lock, then re-reads: the
+    // re-read finds it gone, so the job is skipped rather than claimed as stale.
+    let outcome = store.claim_one(Queue::Cache).await.expect("claim");
+    assert!(
+        outcome.claimed.is_none(),
+        "a job whose pending file vanished after lock acquisition must not be claimed"
     );
 }
 
