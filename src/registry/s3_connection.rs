@@ -11,6 +11,9 @@ use crate::secret::Secret;
 use angos_s3_client::BackendConfig as S3TransportConfig;
 use angos_tx_engine::lock::S3LockConfig;
 
+/// `User-Agent` the S3 transport advertises
+const USER_AGENT: &str = concat!("angos/", env!("CARGO_PKG_VERSION"));
+
 /// Connection-level parameters for an S3-compatible backend.
 ///
 /// All credential, endpoint, bucket and region fields are required when this
@@ -45,6 +48,7 @@ impl S3ConnectionConfig {
             bucket: self.bucket.clone(),
             region: self.region.clone(),
             key_prefix: self.key_prefix.clone(),
+            user_agent: Some(USER_AGENT.to_string()),
             ..S3TransportConfig::default()
         }
     }
@@ -72,6 +76,16 @@ impl S3ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_config_advertises_the_angos_product_version() {
+        let transport = S3ConnectionConfig::default().to_client_config();
+        assert_eq!(
+            transport.user_agent,
+            Some(format!("angos/{}", env!("CARGO_PKG_VERSION"))),
+            "the S3 client must advertise the angos version, not the transport crate's",
+        );
+    }
 
     #[test]
     fn deserialize_flat_toml_keys() {

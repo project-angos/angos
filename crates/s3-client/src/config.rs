@@ -26,6 +26,8 @@ pub struct BackendConfig {
     pub max_attempts: u32,
     pub circuit_breaker_threshold: u32,
     pub circuit_breaker_cooldown_secs: u64,
+    #[serde(skip)]
+    pub user_agent: Option<String>,
 }
 
 impl Default for BackendConfig {
@@ -47,6 +49,7 @@ impl Default for BackendConfig {
             max_attempts: 3,
             circuit_breaker_threshold: 5,
             circuit_breaker_cooldown_secs: 10,
+            user_agent: None,
         }
     }
 }

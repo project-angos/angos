@@ -224,6 +224,7 @@ pub struct S3Client {
     max_attempts: u32,
     retry_backoff: Backoff,
     signing_key_cache: Arc<Mutex<Option<CachedSigningKey>>>,
+    user_agent: String,
 }
 
 #[derive(Clone)]
@@ -300,6 +301,10 @@ impl S3Client {
             retry_backoff: Backoff::exponential(Duration::from_millis(50), Duration::from_secs(1))
                 .with_jitter(),
             signing_key_cache: Arc::new(Mutex::new(None)),
+            user_agent: config
+                .user_agent
+                .clone()
+                .unwrap_or_else(|| USER_AGENT_VALUE.to_string()),
         })
     }
 
@@ -527,7 +532,7 @@ impl S3Client {
         let target = self.request_target(key, query);
 
         insert_header(&mut headers, HOST, &self.host)?;
-        insert_header(&mut headers, USER_AGENT, USER_AGENT_VALUE)?;
+        insert_header(&mut headers, USER_AGENT, &self.user_agent)?;
         insert_header(
             &mut headers,
             HeaderName::from_static("x-amz-date"),
@@ -973,6 +978,23 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn user_agent_uses_the_configured_value() {
+        let client = S3Client::new(&BackendConfig {
+            endpoint: "https://s3.amazonaws.com".to_string(),
+            bucket: "b".to_string(),
+            user_agent: Some("angos/9.9.9".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(client.user_agent, "angos/9.9.9");
+    }
+
+    #[test]
+    fn user_agent_falls_back_to_this_crate_version_when_unset() {
+        assert_eq!(test_client().user_agent, USER_AGENT_VALUE);
     }
 
     #[test]
