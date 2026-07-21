@@ -108,6 +108,8 @@ pub enum Error {
     Execution(String),
     #[error("not found")]
     NotFound,
+    #[error("denied: {0}")]
+    Denied(String),
 }
 
 impl From<StorageError> for Error {
@@ -766,6 +768,9 @@ impl JobStore {
     /// submits a one-mutation engine transaction to delete the stale index,
     /// guarded by a read fingerprint so a concurrent enqueue that refreshes
     /// the index between our GET and the apply is never accidentally deleted.
+    /// A transient failure to delete the orphan is returned as an error rather
+    /// than `false`, so the caller never proceeds to an enqueue the lingering
+    /// index would silently coalesce away.
     pub async fn find_pending_with_lock_key(
         &self,
         queue: Queue,
@@ -803,12 +808,16 @@ impl JobStore {
                 match self.store.execute(tx).await {
                     Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(false),
                     Err(e) => {
+                        // Surface the transient failure instead of swallowing it
+                        // as `false`: the un-retired index would otherwise make
+                        // the caller's enqueue collide on `PutIfAbsent` and drop
+                        // a distinct job as a false dedup hit.
                         warn!(
                             lock_key,
                             error = %e,
                             "Failed to remove orphan lock-key index via engine",
                         );
-                        Ok(false)
+                        Err(tx_error_to_job(e))
                     }
                 }
             }
@@ -951,10 +960,12 @@ impl JobStore {
             envelope.max_attempts = self.max_attempts;
         }
         // Fast path: index present and pending exists, a hit, no writes needed.
+        // A lookup error (including a failed orphan self-heal) is propagated
+        // rather than swallowed as a miss, so a lingering orphan index cannot
+        // make the slow-path `PutIfAbsent` coalesce this distinct job away.
         if self
             .find_pending_with_lock_key(envelope.queue, &envelope.lock_key)
-            .await
-            .unwrap_or(false)
+            .await?
         {
             metrics_provider()
                 .job_queue_enqueued_total
@@ -1067,6 +1078,21 @@ impl JobStore {
                 .await
                 .map_err(tx_error_to_job)?
             {
+                // Re-read under the execution lock: another worker may have
+                // completed this job (deleting the pending file) between our
+                // first read and the lock acquisition. Without this the stale
+                // envelope would be re-run and could dead-letter a finished job.
+                let envelope = match self.read_pending(queue, &storage_key).await {
+                    Ok(envelope) => envelope,
+                    Err(Error::NotFound) => {
+                        session.release().await;
+                        continue;
+                    }
+                    Err(e) => {
+                        session.release().await;
+                        return Err(e);
+                    }
+                };
                 debug!(
                     lock_key = envelope.lock_key.as_str(),
                     worker_id = self.worker_id.as_str(),
@@ -1214,6 +1240,23 @@ impl JobStore {
         };
 
         self.fail_retry(session, updated, storage_key, next_at)
+            .await
+    }
+
+    /// Record a non-retryable failure: the job is dead-lettered immediately,
+    /// bypassing the retry budget. Used when retrying cannot succeed (an
+    /// authorization denial).
+    pub async fn fail_terminal(
+        &self,
+        claimed: ClaimedJob,
+        err: &str,
+    ) -> Result<FailOutcome, Error> {
+        let ClaimedJob {
+            envelope,
+            storage_key,
+            session,
+        } = claimed;
+        self.fail_dead_letter(session, envelope, storage_key, err)
             .await
     }
 

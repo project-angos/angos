@@ -85,6 +85,17 @@ fn append_query(base: &str, query: &str) -> String {
     format!("{base}{separator}{query}")
 }
 
+/// Classifies a failed (non-2xx) write response. A `403` is a terminal
+/// authorization denial that no retry can clear; anything else is a retryable
+/// failure. Mirrors the `send_stream` mapping so every write path agrees.
+fn write_failure(op: &str, status: StatusCode) -> Error {
+    if status == StatusCode::FORBIDDEN {
+        Error::Denied(format!("{op} rejected with 403"))
+    } else {
+        Error::Internal(format!("{op} failed with status {status}"))
+    }
+}
+
 impl RegistryClient {
     /// Sends a byte-bodied request via [`RegistryClient::send_with_auth_retry`].
     ///
@@ -241,10 +252,7 @@ impl RegistryClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(Error::Internal(format!(
-                "start_upload failed with status {}",
-                response.status()
-            )));
+            return Err(write_failure("start_upload", response.status()));
         }
 
         Ok(UploadSession {
@@ -300,10 +308,7 @@ impl RegistryClient {
         }
 
         if !response.status().is_success() {
-            return Err(Error::Internal(format!(
-                "mount_blob failed with status {}",
-                response.status()
-            )));
+            return Err(write_failure("mount_blob", response.status()));
         }
 
         Ok(Some(UploadSession {
@@ -341,10 +346,7 @@ impl RegistryClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(Error::Internal(format!(
-                "patch_upload failed with status {}",
-                response.status()
-            )));
+            return Err(write_failure("patch_upload", response.status()));
         }
 
         Self::parse_location(&response)
@@ -366,10 +368,7 @@ impl RegistryClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(Error::Internal(format!(
-                "complete_upload failed with status {}",
-                response.status()
-            )));
+            return Err(write_failure("complete_upload", response.status()));
         }
 
         Ok(())
@@ -395,10 +394,7 @@ impl RegistryClient {
         }
 
         if !response.status().is_success() {
-            return Err(Error::Internal(format!(
-                "delete_upload failed with status {}",
-                response.status()
-            )));
+            return Err(write_failure("delete_upload", response.status()));
         }
 
         Ok(())
@@ -451,10 +447,7 @@ impl RegistryClient {
         }
 
         if !response.status().is_success() {
-            return Err(Error::Internal(format!(
-                "put_manifest failed with status {}",
-                response.status()
-            )));
+            return Err(write_failure("put_manifest", response.status()));
         }
 
         let digest = response
@@ -510,10 +503,7 @@ impl RegistryClient {
         }
 
         if !response.status().is_success() {
-            return Err(Error::Internal(format!(
-                "delete_manifest failed with status {}",
-                response.status()
-            )));
+            return Err(write_failure("delete_manifest", response.status()));
         }
 
         Ok(DeleteManifestOutcome::Deleted)

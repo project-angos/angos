@@ -13,6 +13,7 @@ use crate::{
     command::maintenance::{Error, action::Action, check::NamespaceChecker, executor::ActionSink},
     oci::{Digest, Namespace, Reference, Tag},
     registry::{
+        Error as RegistryError,
         metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
@@ -58,6 +59,19 @@ impl ReplicationChecker {
     fn downstream_included(downstream: &ReplicationDownstream, namespace: &Namespace) -> bool {
         downstream.mode.participates_in_reconcile()
             && downstream.matches_namespace(namespace.as_ref())
+    }
+
+    /// Re-reads whether `tag` is definitely absent locally right now. Used to
+    /// re-check a prune candidate against live state, since the reconcile tag
+    /// snapshot is stale by the time the downstream listing returns. A read
+    /// error counts as present, never absent, so uncertainty never deletes.
+    async fn tag_absent_locally(&self, namespace: &Namespace, tag: &Tag) -> bool {
+        matches!(
+            self.metadata_store
+                .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
+                .await,
+            Err(RegistryError::NotFound)
+        )
     }
 
     /// Resolves the current local digest for `tag` in `namespace`, bypassing
@@ -125,6 +139,12 @@ impl ReplicationChecker {
         let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_ref()).collect();
         for tag in downstream_tags {
             if local_set.contains(tag.as_ref()) {
+                continue;
+            }
+            // The snapshot is stale by now: a tag pushed locally after it was
+            // taken is absent here yet present downstream. Re-read live state so
+            // a fresh tag is not reaped for merely missing the snapshot.
+            if !self.tag_absent_locally(namespace, &tag).await {
                 continue;
             }
             if let Err(e) = sink
@@ -986,6 +1006,71 @@ mod tests {
             &sink.lock().unwrap()[0],
             Action::EnqueueReplicationDelete { downstream, namespace, tag }
                 if downstream == DOWNSTREAM && namespace == NAMESPACE && tag == "stray"
+        ));
+    }
+
+    #[tokio::test]
+    async fn prune_rechecks_live_state_and_spares_a_tag_pushed_after_snapshot() {
+        let FsTestStack {
+            dir: _dir,
+            store,
+            metadata_store,
+            ..
+        } = fs_test_stack();
+        let mock_server = MockServer::start().await;
+
+        // "fresh" was pushed locally after the reconcile snapshot was captured.
+        let manifest = put_blob_direct(&store, b"fresh-bytes").await;
+        metadata_store
+            .update_links(
+                &namespace(),
+                &[LinkOperation::create(
+                    LinkKind::Tag(Tag::new("fresh").unwrap()),
+                    manifest.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        // The downstream carries the freshly-pushed tag plus a genuinely-gone one.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["fresh", "stray"] })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let repo = repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::EventReconcile,
+            true,
+        );
+        let downstream = &repo.replication[0];
+        let checker = ReplicationChecker::new(
+            metadata_store.clone(),
+            resolver_for(repository(
+                downstream_client(&mock_server.uri()),
+                ReplicationMode::EventReconcile,
+                true,
+            )),
+        );
+
+        // The snapshot omits "fresh": it did not exist when the snapshot was taken.
+        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        checker
+            .reconcile_downstream(downstream, &namespace(), &[], &sink)
+            .await;
+
+        let actions = sink.lock().unwrap();
+        assert_eq!(
+            actions.len(),
+            1,
+            "the live re-check must spare 'fresh' and delete only 'stray'"
+        );
+        assert!(matches!(
+            &actions[0],
+            Action::EnqueueReplicationDelete { tag, .. } if tag == "stray"
         ));
     }
 

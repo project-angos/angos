@@ -42,6 +42,7 @@ pub enum GetBlobResponse {
     },
 }
 
+#[derive(Debug)]
 pub struct HeadBlobResponse {
     pub digest: Digest,
     pub size: u64,
@@ -125,7 +126,7 @@ pub async fn cache_blob(
         .create_upload(namespace, session_id.as_ref())
         .await?;
     // A single-shot copy of a known blob: hash only the target algorithm.
-    blob_store
+    let (computed_digest, _) = blob_store
         .write_monolithic_upload(
             namespace,
             session_id.as_ref(),
@@ -134,6 +135,21 @@ pub async fn cache_blob(
             digest.algorithm(),
         )
         .await?;
+    // Reject a pull-through blob whose bytes do not hash to the requested
+    // digest: a compromised or man-in-the-middle upstream must not poison the
+    // cache under a trusted digest. Reclaim the staged bytes so repeated
+    // poisoning attempts cannot fill the disk; they are never promoted or
+    // granted, so no client can read them.
+    if &computed_digest != digest {
+        warn!("Pull-through blob digest mismatch: expected {digest}, got {computed_digest}");
+        if let Err(error) = blob_store
+            .delete_upload(namespace, session_id.as_ref())
+            .await
+        {
+            warn!("Failed to delete mismatched upload state: {error}");
+        }
+        return Err(Error::DigestInvalid);
+    }
     // Promotion and grant share the coarse lock `delete_blob` holds while
     // reclaiming, mirroring the manifest path's bytes-then-link order. A racer
     // that already promoted the bytes leaves this session behind; the
@@ -180,11 +196,11 @@ impl Registry {
                         size,
                     });
                 }
-                Err(error) if !repository.is_pull_through() => {
-                    warn!("Blob with digest {digest} not found: {error}");
-                    return Err(Error::BlobUnknown);
-                }
-                Err(_) => {}
+                // Mirror GET: a genuine miss on a pull-through repo re-heads
+                // upstream; every other error (a transient or internal fault)
+                // propagates instead of masquerading as a 404.
+                Err(Error::BlobUnknown) if repository.is_pull_through() => {}
+                Err(error) => return Err(error),
             }
         }
 
@@ -383,7 +399,12 @@ impl Registry {
 mod tests {
     use std::{io::Cursor, sync::Arc, time::Duration};
 
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_storage::{
+        Error as StorageError, MemoryObjectStore, ObjectStore,
+        fs::Backend as StorageFsBackend,
+        test_util::{HookedStore, StoreHook, StoreOp},
+    };
+    use async_trait::async_trait;
     use tempfile::TempDir;
     use tokio::{io::AsyncReadExt, time::sleep};
 
@@ -392,8 +413,10 @@ mod tests {
         oci::{Namespace, Tag},
         registry::{
             metadata_store::{BlobIndexOperation, LinkOperation},
+            path_builder,
             test_utils::{
-                create_test_blob, for_each_backend, get_blob, metadata_store_over, put_blob_direct,
+                create_test_blob, create_test_registry, for_each_backend, get_blob,
+                metadata_store_over, put_blob_direct,
             },
         },
     };
@@ -463,6 +486,59 @@ mod tests {
             assert_eq!(response.size, content.len() as u64);
         })
         .await;
+    }
+
+    /// Fails the `head` of one key, modelling a transient backend fault on the
+    /// blob-size probe while leaving every other operation intact.
+    struct FailHeadOf {
+        key: String,
+    }
+
+    #[async_trait]
+    impl StoreHook for FailHeadOf {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            match op {
+                StoreOp::Head { key } if key == self.key => {
+                    Err(StorageError::Backend("injected head failure".to_string()))
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn head_blob_propagates_transient_error_instead_of_404() {
+        let namespace = &Namespace::new("test-repo").unwrap();
+        let digest = Digest::sha256_of_bytes(b"transient-head-blob");
+
+        // The blob-size `head` fails transiently; the grant and repository reads
+        // still succeed, so the request reaches the size probe with access.
+        let inner: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+        let object: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
+            inner,
+            FailHeadOf {
+                key: path_builder::blob_path(&digest),
+            },
+        ));
+        let blob_store = Arc::new(BlobStore::new(object.clone(), None));
+        let registry = create_test_registry(blob_store, metadata_store_over(object));
+
+        registry
+            .blob_ownership()
+            .grant(namespace, &digest)
+            .await
+            .unwrap();
+        let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+        // A transient fault must surface (500), not masquerade as a missing blob
+        // (404) the way GET already avoids.
+        let result = registry
+            .head_blob(repository, &[], namespace, &digest)
+            .await;
+        assert!(
+            matches!(result, Err(Error::Internal(_))),
+            "a transient size() error must propagate, not map to BlobUnknown; got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -772,6 +848,39 @@ mod tests {
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
+        })
+        .await;
+    }
+
+    /// Pull-through cache poisoning guard: an upstream serving bytes that do not
+    /// hash to the requested digest must be rejected, and the poisoned bytes
+    /// must never be cached under the trusted digest.
+    #[tokio::test]
+    async fn cache_blob_rejects_content_not_matching_requested_digest() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+            let namespace = Namespace::new("test-repo").unwrap();
+            let poisoned = b"bytes an upstream served for the wrong digest";
+            let requested = Digest::sha256_of_bytes(b"what the client actually asked for");
+
+            let result = cache_blob(
+                &registry.blob_store,
+                &registry.metadata_store,
+                &namespace,
+                &requested,
+                Box::new(Cursor::new(poisoned.to_vec())),
+                poisoned.len() as u64,
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(Error::DigestInvalid)),
+                "mismatched pull-through content must be rejected; got: {result:?}"
+            );
+            assert!(
+                registry.blob_store.read(&requested).await.is_err(),
+                "poisoned bytes must not be cached under the requested digest"
+            );
         })
         .await;
     }

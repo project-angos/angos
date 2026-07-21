@@ -10,6 +10,7 @@ use crate::{
         response_body::ResponseBody,
     },
     oci::{Descriptor, Digest, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_SCHEMA_VERSION, Tag},
+    registry::content_discovery::DEFAULT_PAGE_SIZE,
 };
 
 #[derive(Serialize, Debug)]
@@ -92,7 +93,9 @@ pub async fn handle_list_catalog(
     n: Option<u16>,
     last: Option<String>,
 ) -> Result<Response<ResponseBody>, Error> {
-    let (repositories, link) = context.registry.list_catalog_entries(n, last).await?;
+    let (repositories, next_last) = context.registry.list_catalog_entries(n, last).await?;
+    let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
+    let link = next_last.map(|last| format!("/v2/_catalog?n={n}&last={last}"));
 
     build_response(
         StatusCode::OK,
@@ -107,10 +110,12 @@ pub async fn handle_list_tags(
     n: Option<u16>,
     last: Option<String>,
 ) -> Result<Response<ResponseBody>, Error> {
-    let (tags, link) = context
+    let (tags, next_last) = context
         .registry
         .list_tag_entries(namespace, n, last)
         .await?;
+    let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
+    let link = next_last.map(|last| format!("/v2/{namespace}/tags/list?n={n}&last={last}"));
 
     build_response(
         StatusCode::OK,

@@ -111,28 +111,41 @@ pub fn build_headers(
     Ok(headers)
 }
 
-pub fn build_cache_key(
-    name: &str,
-    action: &Action,
-    identity: &ClientIdentity,
-) -> Result<String, Error> {
-    let Ok(key_material) = serde_json::to_vec(&(identity, action)) else {
-        let msg = "Failed to serialize webhook cache key".to_string();
-        return Err(Error::Execution(msg));
-    };
+/// Cache key for a webhook decision: a digest over the exact set of forwarded
+/// request headers. Keying off the forwarded context (not just identity and
+/// action) means the key covers everything the webhook can decide on, so a
+/// cached allow can never be replayed across a different host, URI, or
+/// operator-forwarded header. Entries are length-prefixed and sorted for a
+/// canonical, order-independent digest.
+pub fn build_cache_key(name: &str, headers: &HeaderMap) -> String {
+    let mut entries: Vec<(&[u8], &[u8])> = headers
+        .iter()
+        .map(|(header, value)| (header.as_str().as_bytes(), value.as_bytes()))
+        .collect();
+    entries.sort_unstable();
 
-    Ok(format!("webhook:{name}:{}", sha256_hex(key_material)))
+    let mut material = Vec::new();
+    for (header, value) in entries {
+        material.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        material.extend_from_slice(header);
+        material.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        material.extend_from_slice(value);
+    }
+    format!("webhook:{name}:{}", sha256_hex(material))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::str::FromStr;
 
-    use serde_json::json;
+    use hyper::{
+        Request,
+        http::{HeaderMap, HeaderName, HeaderValue, request::Parts},
+    };
 
-    use super::build_cache_key;
+    use super::{build_cache_key, build_headers};
     use crate::{
-        identity::{Action, ClientIdentity, OidcClaims},
+        identity::{Action, ClientIdentity},
         oci::{Namespace, Reference, Tag},
     };
 
@@ -146,63 +159,82 @@ mod tests {
         id
     }
 
+    /// A bare GET `Parts` carrying the given request headers.
+    fn parts_with_headers(headers: &[(&str, &str)]) -> Parts {
+        let mut builder = Request::builder();
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    /// Cache key as the authorizer computes it: a digest of the headers
+    /// forwarded to the webhook.
+    fn key_for(
+        name: &str,
+        forward: &[String],
+        action: &Action,
+        identity: &ClientIdentity,
+        parts: &Parts,
+    ) -> String {
+        build_cache_key(
+            name,
+            &build_headers(forward, action, identity, parts).unwrap(),
+        )
+    }
+
+    fn simple_key(name: &str, action: &Action, identity: &ClientIdentity) -> String {
+        key_for(name, &[], action, identity, &parts_with_headers(&[]))
+    }
+
+    fn get_manifest(tag: &str) -> Action {
+        Action::GetManifest {
+            namespace: Namespace::new("library/nginx").unwrap(),
+            reference: Reference::Tag(Tag::new(tag).unwrap()),
+        }
+    }
+
     #[test]
     fn same_inputs_produce_same_key() {
         let action = Action::ApiVersion;
         let identity = anonymous();
-
-        let k1 = build_cache_key("wh", &action, &identity).unwrap();
-        let k2 = build_cache_key("wh", &action, &identity).unwrap();
-
-        assert_eq!(k1, k2);
+        assert_eq!(
+            simple_key("wh", &action, &identity),
+            simple_key("wh", &action, &identity)
+        );
     }
 
     #[test]
     fn different_action_produces_different_key() {
         let identity = anonymous();
-
-        let k_api = build_cache_key("wh", &Action::ApiVersion, &identity).unwrap();
-        let k_manifest = build_cache_key(
-            "wh",
-            &Action::GetManifest {
-                namespace: Namespace::new("library/nginx").unwrap(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-            },
-            &identity,
-        )
-        .unwrap();
-
-        assert_ne!(k_api, k_manifest);
+        assert_ne!(
+            simple_key("wh", &Action::ApiVersion, &identity),
+            simple_key("wh", &get_manifest("latest"), &identity)
+        );
     }
 
     #[test]
     fn different_identity_produces_different_key() {
         let action = Action::ApiVersion;
-
-        let k_anon = build_cache_key("wh", &action, &anonymous()).unwrap();
-        let k_user = build_cache_key("wh", &action, &identity_with_username("alice")).unwrap();
-
-        assert_ne!(k_anon, k_user);
+        assert_ne!(
+            simple_key("wh", &action, &anonymous()),
+            simple_key("wh", &action, &identity_with_username("alice"))
+        );
     }
 
     #[test]
     fn different_webhook_name_produces_different_key() {
         let action = Action::ApiVersion;
         let identity = anonymous();
-
-        let k_a = build_cache_key("webhook-a", &action, &identity).unwrap();
-        let k_b = build_cache_key("webhook-b", &action, &identity).unwrap();
-
-        assert_ne!(k_a, k_b);
+        assert_ne!(
+            simple_key("webhook-a", &action, &identity),
+            simple_key("webhook-b", &action, &identity)
+        );
     }
 
     #[test]
     fn key_contains_webhook_prefix_and_name() {
-        let action = Action::ApiVersion;
-        let identity = anonymous();
-
-        let key = build_cache_key("my-hook", &action, &identity).unwrap();
-
+        let key = simple_key("my-hook", &Action::ApiVersion, &anonymous());
         assert!(
             key.starts_with("webhook:my-hook:"),
             "key must be prefixed with 'webhook:<name>:': {key}"
@@ -211,66 +243,101 @@ mod tests {
 
     #[test]
     fn key_uses_bounded_sha256_digest() {
-        let action = Action::ApiVersion;
-        let identity = anonymous();
-
-        let key = build_cache_key("my-hook", &action, &identity).unwrap();
+        let key = simple_key("my-hook", &Action::ApiVersion, &anonymous());
         let digest = key.strip_prefix("webhook:my-hook:").unwrap();
-
         assert_eq!(digest.len(), 64);
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn key_does_not_expose_oidc_claims() {
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity {
-            oidc: Some(OidcClaims {
-                provider_name: "github-actions".to_string(),
-                provider_type: "GitHub Actions".to_string(),
-                claims: HashMap::from([
-                    ("sub".to_string(), json!("repo:private/repo:ref:main")),
-                    ("email".to_string(), json!("person@example.com")),
-                    ("custom_claim".to_string(), json!("internal-secret")),
-                ]),
-            }),
-            ..ClientIdentity::new(None)
-        };
-
-        let key = build_cache_key("my-hook", &action, &identity).unwrap();
-
-        assert!(!key.contains("person@example.com"), "key was: {key}");
-        assert!(!key.contains("repo:private/repo"), "key was: {key}");
-        assert!(!key.contains("internal-secret"), "key was: {key}");
-        assert!(!key.contains("custom_claim"), "key was: {key}");
-        assert!(!key.contains("email"), "key was: {key}");
-        assert!(!key.contains("sub"), "key was: {key}");
+    fn key_does_not_expose_forwarded_values_in_plaintext() {
+        // The key is a digest, so a sensitive forwarded value never appears
+        // verbatim in it.
+        let key = key_for(
+            "my-hook",
+            &["X-Secret".to_string()],
+            &Action::ApiVersion,
+            &identity_with_username("secret-user"),
+            &parts_with_headers(&[("X-Secret", "topsecret-value")]),
+        );
+        assert!(!key.contains("secret-user"), "key was: {key}");
+        assert!(!key.contains("topsecret-value"), "key was: {key}");
     }
 
     #[test]
     fn different_reference_same_namespace_produces_different_key() {
         let identity = anonymous();
+        assert_ne!(
+            simple_key("wh", &get_manifest("latest"), &identity),
+            simple_key("wh", &get_manifest("v1.0.0"), &identity)
+        );
+    }
 
-        let k_latest = build_cache_key(
-            "wh",
-            &Action::GetManifest {
-                namespace: Namespace::new("library/nginx").unwrap(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-            },
-            &identity,
-        )
-        .unwrap();
+    // Regression guards for M1: a cached decision must not replay across a
+    // forwarded context the webhook could have decided on differently.
 
-        let k_v1 = build_cache_key(
-            "wh",
-            &Action::GetManifest {
-                namespace: Namespace::new("library/nginx").unwrap(),
-                reference: Reference::Tag(Tag::new("v1.0.0").unwrap()),
-            },
-            &identity,
-        )
-        .unwrap();
+    #[test]
+    fn different_forwarded_host_produces_different_key() {
+        let action = Action::ApiVersion;
+        let identity = anonymous();
+        assert_ne!(
+            key_for(
+                "wh",
+                &[],
+                &action,
+                &identity,
+                &parts_with_headers(&[("Host", "a.example")])
+            ),
+            key_for(
+                "wh",
+                &[],
+                &action,
+                &identity,
+                &parts_with_headers(&[("Host", "b.example")])
+            ),
+            "a cached allow must not replay across a different Host"
+        );
+    }
 
-        assert_ne!(k_latest, k_v1);
+    #[test]
+    fn different_forwarded_header_value_produces_different_key() {
+        let action = Action::ApiVersion;
+        let identity = anonymous();
+        let forward = ["X-Tenant".to_string()];
+        assert_ne!(
+            key_for(
+                "wh",
+                &forward,
+                &action,
+                &identity,
+                &parts_with_headers(&[("X-Tenant", "tenant-a")])
+            ),
+            key_for(
+                "wh",
+                &forward,
+                &action,
+                &identity,
+                &parts_with_headers(&[("X-Tenant", "tenant-b")])
+            ),
+            "a cached allow must not replay across a different forwarded header"
+        );
+    }
+
+    #[test]
+    fn key_is_independent_of_header_insertion_order() {
+        let build = |pairs: &[(&str, &str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.append(
+                    HeaderName::from_str(name).unwrap(),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            build_cache_key("wh", &map)
+        };
+        assert_eq!(
+            build(&[("a-header", "1"), ("b-header", "2")]),
+            build(&[("b-header", "2"), ("a-header", "1")])
+        );
     }
 }

@@ -10,6 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Security
 
 - Debug-formatting a registry client (pull-through upstream or replication downstream) no longer exposes the configured password; the client stores it in the redacting `Secret` wrapper.
+- A pull-through cache fill now rejects a fetched blob whose bytes do not hash to the requested digest, so a compromised or man-in-the-middle upstream can no longer poison the cache with content stored under a trusted digest.
+- A 5xx response body no longer includes the internal error string (which could carry a backend URL or connection detail); the full detail is logged server-side and the client receives only the error code and a request id to quote.
+- The authorization-webhook decision cache is now keyed on the full set of forwarded request headers (host, URI, and operator-forwarded headers) rather than just identity and action, so a cached allow can no longer be replayed across a different forwarded context the webhook could have denied.
 
 ### Added
 
@@ -38,6 +41,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Async event-webhook deliveries no longer accumulate one finished task handle per event for the life of the server, and their delivery-duration metric now measures the actual delivery instead of the task spawn.
 - A configuration reload now applies `query_timeout` and `query_timeout_grace_period` changes to the non-TLS listener; previously only the TLS listener picked them up without a restart.
 - Delete and reclaim decisions no longer treat a failed blob-index read as an absent index: a corrupt shard fails the transaction and a prune revision whose index read errors is skipped, instead of either green-lighting deletion.
+- A replication or cache-fill job whose downstream or upstream returns `403` is now dead-lettered immediately as a terminal denial instead of retrying until its budget is exhausted, since retrying cannot clear a permission failure.
+- A transient backend failure while retiring an orphaned job dedup index is now surfaced instead of being swallowed as a miss, so the lingering index can no longer make an enqueue collide on its `PutIfAbsent` and silently drop a distinct job as a false duplicate.
+- A job claim now re-reads the pending file after acquiring the execution lock, so a job completed by another worker in the gap between the first read and the lock is skipped instead of being re-run and possibly dead-lettered a second time.
+- The S3 client's `User-Agent` now advertises the angos release version instead of the internal transport crate's `0.1.0`.
+- A blob `HEAD` now returns `500` for a transient or internal storage fault instead of reporting the blob absent with a `404`, matching the `GET` path; only a genuine miss is a `404`.
+- A `prune = true` reconcile no longer enqueues a delete for a downstream tag on the strength of a stale local snapshot; each prune candidate is re-checked against live local state, so a tag pushed mid-reconcile is not reaped.
+- Retention no longer treats content with an unknown push time (a migrated legacy link carries none) as pushed at the Unix epoch; an age rule like `image.pushed_at > now() - days(30)` now keeps it instead of deleting it, while never-pulled content stays eligible for pull-age deletion.
+- The web UI manifest tree no longer hides a manifest that lists itself as a parent or referrer; the self-reference is ignored so the manifest still renders.
+- Navigating the web UI quickly between manifests or namespaces no longer lets a slow earlier response overwrite the current view; a superseded load is discarded.
 - A repository access policy written as `default = "deny"` with no rules now denies as configured; it was previously indistinguishable from an absent policy and silently ignored.
 - Concurrent pushes sharing a layer no longer strand a blob-index shard update as a permanent partial commit that the recovery loop logged "precondition failed" for on every sweep; shard updates are now idempotent merges that converge under contention.
 - The recovery loop now abandons a committed transaction that stays unreconcilable past a one-hour grace instead of replaying it forever, clearing legacy stranded intents after upgrade; the blob index is reconciled by `angos scrub`.

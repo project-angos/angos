@@ -11,33 +11,35 @@ use crate::{
 /// reads overlapped.
 const REFERRER_RESOLVE_CONCURRENCY: usize = 10;
 
+/// Default page size applied when a listing request omits `n`. Shared with the
+/// HTTP handlers so the pagination `Link` they build echoes the size actually
+/// used.
+pub const DEFAULT_PAGE_SIZE: u16 = 100;
+
 impl Registry {
+    /// Lists namespaces and returns the continuation cursor (the `last` value
+    /// for the next page), or `None` when the listing is exhausted. Building the
+    /// pagination URL from the cursor is the handler's concern.
     pub async fn list_catalog_entries(
         &self,
         n: Option<u16>,
         last: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        let n = n.unwrap_or(100);
-
-        let (namespaces, next_last) = self.metadata_store.list_namespaces(n, last).await?;
-        let link = next_last.map(|next_last| format!("/v2/_catalog?n={n}&last={next_last}"));
-
-        Ok((namespaces, link))
+        let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
+        self.metadata_store.list_namespaces(n, last).await
     }
 
+    /// Lists a namespace's tags and returns the continuation cursor (the `last`
+    /// value for the next page), or `None` when the listing is exhausted.
+    /// Building the pagination URL from the cursor is the handler's concern.
     pub async fn list_tag_entries(
         &self,
         namespace: &Namespace,
         n: Option<u16>,
         last: Option<String>,
     ) -> Result<(Vec<Tag>, Option<String>), Error> {
-        let n = n.unwrap_or(100);
-
-        let (tags, next_last) = self.metadata_store.list_tags(namespace, n, last).await?;
-        let link =
-            next_last.map(|next_last| format!("/v2/{namespace}/tags/list?n={n}&last={next_last}"));
-
-        Ok((tags, link))
+        let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
+        self.metadata_store.list_tags(namespace, n, last).await
     }
 
     /// Returns the referrer descriptors for a subject digest along with a flag
@@ -233,7 +235,7 @@ mod tests {
             assert_eq!(page1.len(), 2);
             assert!(token1.is_some());
 
-            let last_tag = token1.unwrap().split("last=").nth(1).unwrap().to_string();
+            let last_tag = token1.unwrap();
 
             let (page2, token2) = registry
                 .list_tag_entries(namespace, Some(2), Some(last_tag))
@@ -249,7 +251,7 @@ mod tests {
             assert_eq!(page1.len(), 1);
             assert!(token1.is_some());
 
-            let last_tag = token1.unwrap().split("last=").nth(1).unwrap().to_string();
+            let last_tag = token1.unwrap();
 
             let (page2, token2) = registry
                 .list_tag_entries(namespace, Some(1), Some(last_tag))
@@ -258,7 +260,7 @@ mod tests {
             assert_eq!(page2.len(), 1);
             assert!(token2.is_some());
 
-            let last_tag = token2.unwrap().split("last=").nth(1).unwrap().to_string();
+            let last_tag = token2.unwrap();
 
             let (page3, token3) = registry
                 .list_tag_entries(namespace, Some(1), Some(last_tag))
@@ -320,12 +322,10 @@ mod tests {
             let (page, token) = registry.list_catalog_entries(Some(2), last).await.unwrap();
             all_collected.extend(page);
 
+            // The token is the continuation cursor: feed it straight back as `last`.
             match token {
                 None => break,
-                Some(link) => {
-                    // The link is a URL fragment; extract the `last=` parameter.
-                    last = link.split("last=").nth(1).map(ToString::to_string);
-                }
+                Some(cursor) => last = Some(cursor),
             }
         }
 

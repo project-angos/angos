@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use super::*;
+use crate::jobs::{JobState, Queue};
 use crate::oci::{Digest, Namespace, Reference, Tag, UploadSessionId};
 
 const SHA256_EMPTY: &str =
@@ -18,8 +19,11 @@ fn reference() -> Reference {
     Reference::from_str("v1.0.0").unwrap()
 }
 
-/// Verify every `Action` variant serializes to the exact kebab-case action string
-/// that existing CEL policies depend on.
+/// Drift guard: the CEL action name is declared twice per variant (the
+/// `#[serde(rename)]` that drives the serialized `action` field, and the
+/// `action_name()` arm that drives the `X-Registry-Action` header). This asserts
+/// they agree for every variant; `assert_action_variant_covered` fails to compile
+/// if a new variant is added without a case here.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_action_serialization_cel_compatibility() {
@@ -146,9 +150,55 @@ fn test_action_serialization_cel_compatibility() {
                 repository: Namespace::new("test").unwrap(),
             },
         ),
+        (
+            "get-blob",
+            Action::HeadBlob {
+                namespace: ns(),
+                digest: digest(),
+            },
+        ),
+        (
+            "get-manifest",
+            Action::HeadManifest {
+                namespace: ns(),
+                reference: reference(),
+            },
+        ),
+        (
+            "list-jobs",
+            Action::ListJobs {
+                queue: Queue::Cache,
+                n: None,
+                after: None,
+            },
+        ),
+        (
+            "list-failed-jobs",
+            Action::ListFailedJobs {
+                queue: Queue::Cache,
+                n: None,
+                after: None,
+            },
+        ),
+        (
+            "retry-job",
+            Action::RetryJob {
+                queue: Queue::Cache,
+                storage_key: "0000018f-key".to_string(),
+            },
+        ),
+        (
+            "delete-job",
+            Action::DeleteJob {
+                queue: Queue::Cache,
+                state: JobState::Failed,
+                storage_key: "0000018f-key".to_string(),
+            },
+        ),
     ];
 
     for (expected_action_str, action) in cases {
+        assert_action_variant_covered(action);
         let json = serde_json::to_value(action).unwrap();
         assert_eq!(
             json["action"], *expected_action_str,
@@ -159,6 +209,44 @@ fn test_action_serialization_cel_compatibility() {
             *expected_action_str,
             "action_name() mismatch for {action:?}"
         );
+    }
+}
+
+/// Compile-time exhaustiveness guard for the drift check above: a new `Action`
+/// variant fails to compile here until it is added, a reminder to also add its
+/// case to `cases`.
+fn assert_action_variant_covered(action: &Action) {
+    match action {
+        Action::UiAsset { .. }
+        | Action::UiConfig
+        | Action::Healthz
+        | Action::Readyz
+        | Action::Metrics
+        | Action::ApiVersion
+        | Action::ListCatalog { .. }
+        | Action::ListTags { .. }
+        | Action::StartUpload { .. }
+        | Action::MountBlob { .. }
+        | Action::GetUpload { .. }
+        | Action::PatchUpload { .. }
+        | Action::PutUpload { .. }
+        | Action::DeleteUpload { .. }
+        | Action::GetBlob { .. }
+        | Action::HeadBlob { .. }
+        | Action::DeleteBlob { .. }
+        | Action::GetManifest { .. }
+        | Action::HeadManifest { .. }
+        | Action::PutManifest { .. }
+        | Action::DeleteManifest { .. }
+        | Action::GetReferrer { .. }
+        | Action::ListRevisions { .. }
+        | Action::ListUploads { .. }
+        | Action::ListRepositories
+        | Action::ListNamespaces { .. }
+        | Action::ListJobs { .. }
+        | Action::ListFailedJobs { .. }
+        | Action::RetryJob { .. }
+        | Action::DeleteJob { .. } => {}
     }
 }
 
