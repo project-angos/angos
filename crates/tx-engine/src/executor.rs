@@ -4,11 +4,14 @@ pub mod cas;
 pub mod common;
 pub mod locked;
 
-use std::future::Future;
+use std::{future::Future, time::Duration};
 
 use async_trait::async_trait;
+use tokio::time::sleep;
 use tracing::debug;
 use uuid::Uuid;
+
+use angos_backoff::Backoff;
 
 use crate::{error::Error, transaction::Transaction};
 
@@ -17,6 +20,13 @@ use crate::{error::Error, transaction::Transaction};
 /// Subsystems pass this value (or a custom one) to the retry helper instead
 /// of maintaining their own retry constants.
 pub const DEFAULT_RETRY_BUDGET: u32 = 10;
+
+/// Backoff between CAS contention retries (a lost `put_if_match`/`put_if_absent`
+/// race), jittered so concurrent writers on a shared key decorrelate instead of
+/// colliding in lockstep on every S3 round-trip. Shared by the whole-transaction
+/// retry loops and the blob-index shard merge loop.
+pub const CAS_RETRY_BACKOFF: Backoff =
+    Backoff::exponential(Duration::from_millis(25), Duration::from_millis(250)).with_jitter();
 
 /// The result of a successfully committed transaction.
 #[derive(Debug, Clone)]
@@ -94,6 +104,7 @@ where
             Ok(o) => return Ok((o, payload)),
             Err(e) if e.is_retriable() && attempts < max_attempts => {
                 debug!(attempts, max_attempts, "Transaction conflict, retrying");
+                sleep(CAS_RETRY_BACKOFF.delay(attempts)).await;
                 attempts += 1;
             }
             Err(e) => return Err(e),

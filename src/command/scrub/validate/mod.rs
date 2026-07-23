@@ -17,9 +17,10 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{Arc, Mutex, atomic::Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
+use angos_backoff::Backoff;
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::time::sleep;
 use tracing::warn;
@@ -45,12 +46,17 @@ use crate::{
 /// candidate repair.
 const INTENT_PAGE: u16 = 100;
 
-/// How long a candidate repair waits for in-flight transactions on its
-/// evidence keys to settle, and the pause between observations. Transactions
-/// settle in milliseconds; a candidate still covered at the deadline is left
-/// for the next run.
-const INTENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
-const INTENT_SETTLE_BACKOFF: Duration = Duration::from_millis(20);
+/// How many settle re-checks a candidate repair gets before it is left for a
+/// later run. Budgeting in attempts rather than wall-clock keeps the check
+/// S3-latency-independent: each intent-log scan runs to completion, so a slow
+/// scan over a large log no longer burns the whole budget before a single real
+/// re-check.
+const INTENT_SETTLE_ATTEMPTS: u32 = 8;
+/// Jittered backoff between settle re-checks, decorrelating scrub from the
+/// in-flight writers it is waiting on. Small because each re-check already
+/// includes a full intent-log scan, which dominates the wait on S3.
+const INTENT_SETTLE_BACKOFF: Backoff =
+    Backoff::exponential(Duration::from_millis(20), Duration::from_millis(200)).with_jitter();
 
 /// One of the three walk passes. Later passes rely on earlier repairs:
 /// links are healed and grants reconciled (M1) before shard entries are
@@ -189,10 +195,9 @@ impl Validator {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<bool, Error>>,
     {
-        let deadline = Instant::now() + INTENT_SETTLE_TIMEOUT;
-        while Instant::now() < deadline {
+        for attempt in 0..INTENT_SETTLE_ATTEMPTS {
             if self.live_intent_touches(evidence_keys).await? {
-                sleep(INTENT_SETTLE_BACKOFF).await;
+                sleep(INTENT_SETTLE_BACKOFF.delay(attempt)).await;
                 continue;
             }
             if !reverify().await? {
@@ -201,7 +206,7 @@ impl Validator {
             if !self.live_intent_touches(evidence_keys).await? {
                 return Ok(true);
             }
-            sleep(INTENT_SETTLE_BACKOFF).await;
+            sleep(INTENT_SETTLE_BACKOFF.delay(attempt)).await;
         }
         warn!("scrub: repair candidate on {evidence_keys:?} never settled; leaving to a later run");
         Ok(false)
