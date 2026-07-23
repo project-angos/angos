@@ -10,6 +10,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::oci::Error;
+use crate::oci::constants::{OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE};
 
 // RFC 6838 media type: `type/subtype` where each name is a `restricted-name`
 // (alphanumeric first char, then alphanumerics and `!#$&-^_.+`, max 127 chars),
@@ -42,6 +43,19 @@ impl MediaType {
         } else {
             Err(Error::InvalidMediaType(s.to_string()))
         }
+    }
+
+    /// The OCI image-manifest media type. Infallible: the value is a validated
+    /// compile-time constant needing no fallible re-validation. Serves as the
+    /// `Content-Type` fallback for a manifest whose link and body both lack one.
+    pub fn oci_manifest() -> Self {
+        Self(OCI_MANIFEST_MEDIA_TYPE.to_owned())
+    }
+
+    /// The OCI image-index (manifest list) media type, infallible like
+    /// [`Self::oci_manifest`].
+    pub fn oci_index() -> Self {
+        Self(OCI_INDEX_MEDIA_TYPE.to_owned())
     }
 }
 

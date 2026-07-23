@@ -369,6 +369,7 @@ jobs:
           ./scrub-gates healthy
           ./scrub-gates corruption
           ./scrub-gates chaos
+          ./scrub-gates manifest-content-type
 
           # Release port 8000 so the e2e scenarios can reuse the same backend.
           docker rm -f conformance-${{ matrix.variant }}-backend

@@ -213,13 +213,13 @@ angos replicate
 
 ### migrate
 
-Convert pre-JSON bare-digest link files to the current JSON format. Needed only for registries seeded from a raw Docker `distribution` on-disk layout, whose links the serving paths no longer read.
+Convert pre-JSON bare-digest link files to the current JSON format and backfill a served manifest link's `media_type`. Needed for registries seeded from a raw Docker `distribution` on-disk layout, or with manifest links written before `media_type` was stored.
 
 ```bash
 angos migrate [options]
 ```
 
-Walks every link object once and rewrites each bare-digest file as JSON, leaving already-JSON links and unrecognizable files untouched. It is idempotent, so an interrupted run can be re-run. See [Upgrade Guide](../how-to/upgrade.md#legacy-link-metadata-breaking-change).
+Walks every link object once, rewriting each bare-digest file as JSON and backfilling a missing tag or revision `media_type` from the manifest body, leaving already-current links and unrecognizable files untouched. It is idempotent, so an interrupted run can be re-run. See [Upgrade Guide](../how-to/upgrade.md#legacy-link-metadata-breaking-change).
 
 **Options:**
 

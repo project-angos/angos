@@ -450,6 +450,61 @@ pub async fn chaos(ctx: &GateContext) -> GateResult<()> {
     Ok(())
 }
 
+/// A manifest link with no stored media type (as a registry seeded before media
+/// types were stored carries) serves no Content-Type, which go-containerregistry
+/// clients (kaniko, crane) reject. `angos migrate` is the sole fix: it backfills
+/// the media type from the manifest body so a later HEAD advertises it.
+pub async fn manifest_content_type(ctx: &GateContext) -> GateResult<()> {
+    let namespace = "conformance/ct-legacy";
+    let pushed = ctx
+        .registry
+        .push_image(namespace, GATE_TAG, b"content-type-gate-layer")
+        .await?;
+
+    // A fresh tag whose link carries no media_type, the state migrate must repair.
+    let tag = "legacy-no-media-type";
+    let link_key = format!("v2/repositories/{namespace}/_manifests/tags/{tag}/current/link");
+    let link = format!(
+        r#"{{"target":"sha256:{}","created_at":null,"accessed_at":null}}"#,
+        pushed.manifest_digest
+    );
+    ctx.store.put(&link_key, link).await?;
+
+    // Before migrate the link has no media type, so HEAD serves no Content-Type.
+    let (_, before) = ctx.registry.head_manifest(namespace, tag).await?;
+    ensure(before.is_empty(), || {
+        format!("a media-type-less link already served a Content-Type ('{before}'); test is vacuous")
+    })?;
+
+    ctx.runner
+        .run_logged(&["migrate"], &ctx.state_path("migrate.log"))
+        .await?;
+
+    // Migrate rewrote the link with a media type recovered from the body ...
+    let rewritten = ctx
+        .store
+        .body(&link_key)
+        .await?
+        .ok_or_else(|| fail("migrate deleted the manifest link"))?;
+    ensure(
+        String::from_utf8_lossy(&rewritten).contains("media_type"),
+        || "migrate did not backfill the link's media type".to_string(),
+    )?;
+
+    // ... so HEAD now advertises the Content-Type go-containerregistry requires.
+    let (status, content_type) = ctx.registry.head_manifest(namespace, tag).await?;
+    ensure(status == StatusCode::OK, || {
+        format!("HEAD after migrate returned {status}")
+    })?;
+    ensure(!content_type.is_empty(), || {
+        "HEAD after migrate served no Content-Type".to_string()
+    })?;
+    println!(
+        "GATE manifest-content-type: PASS (migrate backfilled media type; HEAD serves '{content_type}')"
+    );
+    Ok(())
+}
+
 /// Push enough synthetic images through the API to clear the gate walk and
 /// audit floors, independently of how many manifests the conformance suite
 /// happens to leave. Run before the gates locally and in CI.

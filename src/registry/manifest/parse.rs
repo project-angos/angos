@@ -87,6 +87,24 @@ pub fn parse_and_validate_manifest(
     Ok(manifest)
 }
 
+/// Recovers the media type to serve for a stored manifest whose link carries no
+/// `media_type` (rebuilt by `angos migrate` from a pre-JSON layout, or filled
+/// from an upstream that sent no `Content-Type`). Prefers the body's own
+/// `mediaType`, else the OCI index type for a manifest list and the OCI manifest
+/// type otherwise, so a served manifest never lacks the `Content-Type` the OCI
+/// spec requires and go-containerregistry clients reject when absent.
+pub fn recover_media_type(body: &[u8]) -> MediaType {
+    let manifest = Manifest::from_slice(body).ok();
+    if let Some(media_type) = manifest.as_ref().and_then(|m| m.media_type.clone()) {
+        return media_type;
+    }
+    if manifest.is_some_and(|m| !m.manifests.is_empty()) {
+        MediaType::oci_index()
+    } else {
+        MediaType::oci_manifest()
+    }
+}
+
 pub fn parse_manifest_digests(
     body: &[u8],
     content_type: Option<&MediaType>,
@@ -117,4 +135,53 @@ pub fn parse_manifest_digests(
         layers,
         manifests,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::recover_media_type;
+    use crate::oci::MediaType;
+
+    const CHILD_DIGEST: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn recover_media_type_prefers_the_body_media_type() {
+        let body = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        }))
+        .unwrap();
+        assert_eq!(
+            recover_media_type(&body),
+            MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap()
+        );
+    }
+
+    #[test]
+    fn recover_media_type_defaults_a_typeless_image_to_oci_manifest() {
+        let body = serde_json::to_vec(&json!({ "schemaVersion": 2 })).unwrap();
+        assert_eq!(recover_media_type(&body), MediaType::oci_manifest());
+    }
+
+    #[test]
+    fn recover_media_type_defaults_a_typeless_list_to_oci_index() {
+        let body = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": CHILD_DIGEST,
+                "size": 512,
+            }],
+        }))
+        .unwrap();
+        assert_eq!(recover_media_type(&body), MediaType::oci_index());
+    }
+
+    #[test]
+    fn recover_media_type_falls_back_when_the_body_is_unparseable() {
+        assert_eq!(recover_media_type(b"not a manifest"), MediaType::oci_manifest());
+    }
 }
