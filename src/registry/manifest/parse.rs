@@ -182,6 +182,9 @@ mod tests {
 
     #[test]
     fn recover_media_type_falls_back_when_the_body_is_unparseable() {
-        assert_eq!(recover_media_type(b"not a manifest"), MediaType::oci_manifest());
+        assert_eq!(
+            recover_media_type(b"not a manifest"),
+            MediaType::oci_manifest()
+        );
     }
 }

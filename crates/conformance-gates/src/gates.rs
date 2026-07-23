@@ -473,7 +473,9 @@ pub async fn manifest_content_type(ctx: &GateContext) -> GateResult<()> {
     // Before migrate the link has no media type, so HEAD serves no Content-Type.
     let (_, before) = ctx.registry.head_manifest(namespace, tag).await?;
     ensure(before.is_empty(), || {
-        format!("a media-type-less link already served a Content-Type ('{before}'); test is vacuous")
+        format!(
+            "a media-type-less link already served a Content-Type ('{before}'); test is vacuous"
+        )
     })?;
 
     ctx.runner

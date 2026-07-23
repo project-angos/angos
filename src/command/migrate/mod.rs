@@ -30,8 +30,7 @@ use crate::{
     configuration::Configuration,
     oci::{Digest, MediaType},
     registry::{
-        self, blob_store::BlobStore, metadata_store::LinkMetadata, path_builder,
-        recover_media_type,
+        self, blob_store::BlobStore, metadata_store::LinkMetadata, path_builder, recover_media_type,
     },
 };
 
@@ -97,18 +96,16 @@ fn serves_manifest(key: &str) -> bool {
 /// The media type for a served-manifest link's target, recovered from its stored
 /// body. `None` for a non-manifest link (layer, config, referrer, index) or an
 /// unreadable body, in which case the serving path recovers it on each read.
-async fn link_media_type(
-    blob_store: &BlobStore,
-    key: &str,
-    target: &Digest,
-) -> Option<MediaType> {
+async fn link_media_type(blob_store: &BlobStore, key: &str, target: &Digest) -> Option<MediaType> {
     if !serves_manifest(key) {
         return None;
     }
     match blob_store.read(target).await {
         Ok(body) => Some(recover_media_type(&body)),
         Err(error) => {
-            warn!("Cannot read manifest {target} for link {key} to recover its media type: {error}");
+            warn!(
+                "Cannot read manifest {target} for link {key} to recover its media type: {error}"
+            );
             None
         }
     }
@@ -194,7 +191,8 @@ async fn migrate_one(
                 info!("Would migrate legacy link {key} -> {target}");
             } else {
                 let media_type = link_media_type(blob_store, key, &target).await;
-                let metadata = LinkMetadata::without_timestamp(target.clone()).with_media_type(media_type);
+                let metadata =
+                    LinkMetadata::without_timestamp(target.clone()).with_media_type(media_type);
                 write_link(object_store, key, &metadata).await?;
                 debug!("Migrated legacy link {key} -> {target}");
             }
@@ -226,7 +224,12 @@ async fn backfill_current(
     }
     match link_media_type(blob_store, key, &metadata.target).await {
         Some(media_type) => {
-            write_link(object_store, key, &metadata.with_media_type(Some(media_type))).await?;
+            write_link(
+                object_store,
+                key,
+                &metadata.with_media_type(Some(media_type)),
+            )
+            .await?;
             report.backfilled += 1;
             debug!("Backfilled media type for link {key}");
         }
@@ -237,7 +240,11 @@ async fn backfill_current(
 
 fn log_summary(report: &Report, dry_run: bool) {
     let verb = if dry_run { "would migrate" } else { "migrated" };
-    let backfill_verb = if dry_run { "would backfill" } else { "backfilled" };
+    let backfill_verb = if dry_run {
+        "would backfill"
+    } else {
+        "backfilled"
+    };
     info!(
         "Link migration complete: scanned {}, {verb} {}, {backfill_verb} media type on {}, already current {}, unrecognized {}",
         report.scanned, report.migrated, report.backfilled, report.current, report.unrecognized
@@ -273,7 +280,10 @@ mod tests {
     async fn seed_manifest_blob(blob_store: &BlobStore) -> Digest {
         let body = format!(r#"{{"schemaVersion":2,"mediaType":"{OCI_MANIFEST}"}}"#).into_bytes();
         let target = Digest::sha256_of_bytes(&body);
-        blob_store.put_blob(&target, Bytes::from(body)).await.unwrap();
+        blob_store
+            .put_blob(&target, Bytes::from(body))
+            .await
+            .unwrap();
         target
     }
 
@@ -346,7 +356,9 @@ mod tests {
         );
 
         let object_store = metadata_store.store().object_store().as_ref();
-        let report = migrate_links(object_store, &blob_store, false).await.unwrap();
+        let report = migrate_links(object_store, &blob_store, false)
+            .await
+            .unwrap();
         assert_eq!(report.migrated, 1);
         assert_eq!(report.scanned, 1);
 
@@ -383,7 +395,9 @@ mod tests {
         .await;
 
         let object_store = metadata_store.store().object_store().as_ref();
-        let report = migrate_links(object_store, &blob_store, false).await.unwrap();
+        let report = migrate_links(object_store, &blob_store, false)
+            .await
+            .unwrap();
         assert_eq!(report.migrated, 0);
         assert_eq!(report.backfilled, 1);
 
@@ -411,7 +425,9 @@ mod tests {
         .await;
 
         let object_store = metadata_store.store().object_store().as_ref();
-        let report = migrate_links(object_store, &blob_store, false).await.unwrap();
+        let report = migrate_links(object_store, &blob_store, false)
+            .await
+            .unwrap();
         assert_eq!(report.migrated, 1);
 
         let migrated = metadata_store.read_link(&namespace, &link).await.unwrap();
@@ -439,10 +455,14 @@ mod tests {
         .await;
 
         let object_store = metadata_store.store().object_store().as_ref();
-        migrate_links(object_store, &blob_store, false).await.unwrap();
+        migrate_links(object_store, &blob_store, false)
+            .await
+            .unwrap();
 
         // A second pass finds the link already current and rewrites nothing.
-        let report = migrate_links(object_store, &blob_store, false).await.unwrap();
+        let report = migrate_links(object_store, &blob_store, false)
+            .await
+            .unwrap();
         assert_eq!(report.migrated, 0);
         assert_eq!(report.backfilled, 0);
         assert_eq!(report.current, 1);
@@ -465,7 +485,9 @@ mod tests {
         .await;
 
         let object_store = metadata_store.store().object_store().as_ref();
-        let report = migrate_links(object_store, &blob_store, true).await.unwrap();
+        let report = migrate_links(object_store, &blob_store, true)
+            .await
+            .unwrap();
         assert_eq!(report.migrated, 1);
         assert!(
             metadata_store.read_link(&namespace, &link).await.is_err(),
