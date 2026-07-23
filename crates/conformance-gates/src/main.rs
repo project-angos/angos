@@ -45,6 +45,7 @@ enum Gate {
     Healthy(HealthyGate),
     Corruption(CorruptionGate),
     Chaos(ChaosGate),
+    ManifestContentType(ManifestContentTypeGate),
     Populate(PopulateCmd),
 }
 
@@ -64,6 +65,11 @@ struct CorruptionGate {}
 /// SIGKILL scrub mid-run three times, then require convergence and integrity.
 #[argh(subcommand, name = "chaos")]
 struct ChaosGate {}
+
+#[derive(FromArgs)]
+/// Seed a manifest link with no stored media type, then assert HEAD still serves a Content-Type.
+#[argh(subcommand, name = "manifest-content-type")]
+struct ManifestContentTypeGate {}
 
 #[derive(FromArgs)]
 /// Push synthetic images so a fresh local store clears the gate floors.
@@ -97,6 +103,7 @@ async fn run(gate: Gate) -> GateResult<()> {
         Gate::Healthy(_) => gates::healthy(&ctx).await,
         Gate::Corruption(_) => gates::corruption(&ctx).await,
         Gate::Chaos(_) => gates::chaos(&ctx).await,
+        Gate::ManifestContentType(_) => gates::manifest_content_type(&ctx).await,
         Gate::Populate(cmd) => gates::populate(&ctx, cmd.images).await,
     }
 }

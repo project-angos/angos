@@ -4,8 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.4.1 - UNRELEASED
 
-## 1.4.0 - UNRELEASED
+### Fixed
+
+- `angos migrate` now backfills a manifest link's `media_type` from the body, so a tag or revision served after migration advertises the `Content-Type` that go-containerregistry clients such as kaniko require and reject when absent.
+
+## 1.4.0
 
 ### Security
 

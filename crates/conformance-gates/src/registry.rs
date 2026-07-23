@@ -151,6 +151,25 @@ impl RegistryClient {
         Ok((body.to_vec(), served))
     }
 
+    /// HEAD a manifest, returning its status and `Content-Type` (empty when
+    /// absent). go-containerregistry (kaniko, crane) rejects a HEAD response
+    /// without a Content-Type, so a served manifest must always carry one.
+    pub async fn head_manifest(
+        &self,
+        repo: &str,
+        reference: &str,
+    ) -> GateResult<(StatusCode, String)> {
+        let response = self
+            .http
+            .head(format!("{}/v2/{repo}/manifests/{reference}", self.base))
+            .header(ACCEPT, ACCEPT_MANIFESTS)
+            .send()
+            .await?;
+        let status = response.status();
+        let content_type = header_value(&response, CONTENT_TYPE.as_str());
+        Ok((status, content_type))
+    }
+
     /// GET a blob by digest, following redirects, returning status and bytes.
     pub async fn blob(&self, repo: &str, digest: &str) -> GateResult<(StatusCode, Vec<u8>)> {
         let response = self

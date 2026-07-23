@@ -50,6 +50,7 @@ use blob_ownership::BlobOwnership;
 pub use error::Error;
 pub use manifest::{
     GetManifestResponse, ParsedManifestDigests, PutManifestRequest, parse_manifest_digests,
+    recover_media_type,
 };
 pub use repository::Repository;
 pub use upload::{BlobMount, CompleteUploadRequest, StartUploadResponse};

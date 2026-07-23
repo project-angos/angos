@@ -6,7 +6,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use parse::parse_and_validate_manifest;
-pub use parse::{ParsedManifestDigests, parse_manifest_digests};
+pub use parse::{ParsedManifestDigests, parse_manifest_digests, recover_media_type};
 pub use response::{GetManifestResponse, HeadManifestResponse, PutManifestResponse};
 use response::{ManifestBody, ManifestMeta};
 use tokio::io::{AsyncRead, AsyncReadExt};
