@@ -25,6 +25,7 @@
 use std::{fmt, future::Future, sync::Arc};
 
 use bytes::Bytes;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
@@ -35,7 +36,7 @@ use crate::lock::storage::redis::RedisLockStorage;
 use crate::{
     error::Error,
     executor::{
-        DEFAULT_RETRY_BUDGET, Outcome, TransactionExecutor, cas::CasExecutor,
+        CAS_RETRY_BACKOFF, DEFAULT_RETRY_BUDGET, Outcome, TransactionExecutor, cas::CasExecutor,
         locked::LockedExecutor,
     },
     janitor::{BodyJanitor, LockJanitor},
@@ -441,6 +442,7 @@ impl Store {
                 Ok(outcome) => return Ok((outcome, payload)),
                 Err(e) if e.is_retriable() && attempts < max_attempts => {
                     debug!(attempts, max_attempts, "Transaction conflict, retrying");
+                    sleep(CAS_RETRY_BACKOFF.delay(attempts)).await;
                     attempts += 1;
                 }
                 Err(e) => return Err(e),

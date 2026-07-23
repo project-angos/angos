@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - `angos migrate` now backfills a manifest link's `media_type` from the body, so a tag or revision served after migration advertises the `Content-Type` that go-containerregistry clients such as kaniko require and reject when absent.
+- Contended CAS transaction retries (blob-index shard merges and the whole-transaction retry loop) now back off with jitter instead of retrying in lockstep, so concurrent writers on a shared shard converge in-band on S3 rather than stranding partial commits for the recovery loop.
+- Scrub's repair-settle check is now budgeted by re-check attempts instead of a wall-clock deadline, so a slow intent-log scan on S3 no longer exhausts the budget before a single real re-check and defers every repair.
 
 ## 1.4.0
 

@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use tokio::time::sleep;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -29,7 +30,7 @@ use angos_storage::{ConditionalStore, Error as StorageError, Etag};
 use crate::{
     error::Error,
     executor::{
-        Outcome, TransactionExecutor, common,
+        CAS_RETRY_BACKOFF, Outcome, TransactionExecutor, common,
         common::{
             ApplyMode, build_intent, finish, rollback, stage_bodies, stamp_applied, stamp_progress,
             write_intent,
@@ -418,7 +419,7 @@ async fn apply_merge_set_cas(
     add: &[Value],
     remove: &[Value],
 ) -> Result<(), Error> {
-    for _ in 0..MERGE_SET_MAX_ATTEMPTS {
+    for attempt in 0..MERGE_SET_MAX_ATTEMPTS {
         let outcome = match store.get_with_etag(key).await {
             Ok((current, Some(etag))) => match common::merge_json_set(&current, add, remove)? {
                 Some(body) => store.put_if_match(key, &etag, body).await.map(|_| ()),
@@ -437,8 +438,11 @@ async fn apply_merge_set_cas(
         };
         match outcome {
             Ok(()) => return Ok(()),
-            // Lost the CAS race: re-read and recompute on the next iteration.
-            Err(StorageError::PreconditionFailed) => {}
+            // Lost the CAS race: back off (jittered, so concurrent mergers
+            // decorrelate) then re-read and recompute on the next iteration.
+            Err(StorageError::PreconditionFailed) => {
+                sleep(CAS_RETRY_BACKOFF.delay(attempt)).await;
+            }
             Err(e) => return Err(Error::Storage(e)),
         }
     }
