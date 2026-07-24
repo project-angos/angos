@@ -651,7 +651,7 @@ impl LockStorage for OwnershipLostLockStorage {
 /// remaining gated mutation land, otherwise the original owner could keep
 /// writing while a takeover replica also writes (split-brain).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
+async fn locked_executor_aborts_apply_on_lock_loss_partial_commit() {
     let inner = Arc::new(MemoryObjectStore::new());
     // Gate the SECOND mutation's canonical write. The first mutation lands
     // normally; the executor then parks on `gate/blocked`, holding the lock,
@@ -709,8 +709,12 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
         .expect("execute task joined");
 
     assert!(
-        matches!(result, Err(TxError::Conflict)),
-        "lock loss mid-apply must abort with Conflict, got: {result:?}"
+        matches!(result, Err(TxError::PartialCommit)),
+        "lock loss after a mutation applied must abort with PartialCommit, got: {result:?}"
+    );
+    assert!(
+        result.is_err_and(|e| !e.is_retriable()),
+        "the caller must not retry and commit state the recovery replay would overwrite"
     );
 
     // The gated mutation never landed: dropping the apply future cancelled the

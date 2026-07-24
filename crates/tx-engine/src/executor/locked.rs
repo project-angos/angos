@@ -18,7 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha256};
 use tokio::select;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use angos_storage::{Error as StorageError, ObjectStore};
@@ -43,6 +43,10 @@ use crate::{
 /// order (deadlock-free), writes the intent record, applies mutations under
 /// the lock with unconditional storage operations, stamps each mutation's
 /// progress slot to `Applied` as it succeeds, then reaps bodies and intent.
+///
+/// An abort once a mutation has applied is reported as
+/// [`Error::PartialCommit`] rather than a retriable error, because the intent
+/// stays behind for the recovery loop to replay forward.
 ///
 /// Constructed via [`LockedExecutor::builder`].
 pub struct LockedExecutor {
@@ -140,8 +144,10 @@ impl LockedExecutor {
 
     /// Apply all mutations under the pre-acquired lock.
     ///
-    /// Returns `Ok(())` on success or `Err` on the first hard error.
-    /// The caller is responsible for releasing the lock session in both cases.
+    /// Returns `Ok(())` on success or `Err` on the first hard error; `execute`
+    /// downgrades a retriable error to [`Error::PartialCommit`] when a mutation
+    /// already applied. The caller is responsible for releasing the lock session
+    /// in both cases.
     async fn apply_all(&self, intent: &mut IntentRecord) -> Result<(), Error> {
         for idx in 0..intent.mutations.len() {
             let mutation = intent.mutations[idx].clone();
@@ -196,10 +202,10 @@ impl TransactionExecutor for LockedExecutor {
         // or `max_hold_secs` is exceeded. Racing `apply_all` against the token
         // and dropping the future on cancellation stops any further mutations,
         // so the original owner cannot keep writing while a takeover replica
-        // also writes (split-brain). The abort is reported as `Error::Conflict`
-        // because the caller's retry loop (`execute_with_retry[_payload]`)
-        // retries on `Conflict | Precondition`, re-running the whole
-        // transaction under a freshly-acquired lock.
+        // also writes (split-brain). With nothing applied the abort is reported
+        // as `Error::Conflict`, so the caller's retry loop
+        // (`execute_with_retry[_payload]`) re-runs the whole transaction under a
+        // freshly-acquired lock; past the commit point it is downgraded below.
         //
         // (The CAS executor needs no such fence: it holds no working-set lock
         // and applies via conditional ops, so a lost lock cannot cause an
@@ -209,6 +215,23 @@ impl TransactionExecutor for LockedExecutor {
             biased;
             () = cancelled.cancelled() => Err(Error::Conflict),
             result = self.apply_all(&mut intent) => result,
+        };
+
+        // Past the commit point, an abort is not retriable. `finish` keeps the
+        // intent for the recovery loop to replay forward, so telling the caller
+        // to retry would let it commit fresh state that the replay overwrites
+        // on a later sweep. `PartialCommit` stops the retry loop and leaves
+        // convergence to recovery, as the CAS executor already does.
+        let apply_result = match apply_result {
+            Err(e) if e.is_retriable() && intent.any_applied() => {
+                warn!(
+                    tx_id = %intent.id,
+                    error = %e,
+                    "Locked executor: abort after a mutation applied; leaving intent for recovery loop"
+                );
+                Err(Error::PartialCommit)
+            }
+            result => result,
         };
 
         // Reap only when the transaction either fully committed or applied
@@ -234,6 +257,7 @@ mod tests {
         error::Error,
         executor::{Outcome, TransactionExecutor, locked::LockedExecutor},
         lock::{primitive::Lock, storage::memory::MemoryLockStorage},
+        test_util::list_count,
         transaction::{Mutation, Transaction},
     };
 
@@ -380,6 +404,48 @@ mod tests {
             .await
             .expect("existing key still present");
         assert_eq!(body.as_slice(), b"bytes", "original body must be untouched");
+    }
+
+    #[tokio::test]
+    async fn precondition_after_a_mutation_applied_is_a_non_retriable_partial_commit() {
+        // The first mutation lands, the second fails its precondition. Retrying
+        // would commit fresh state that the recovery loop's replay of the
+        // preserved intent would overwrite on a later sweep.
+        let store = Arc::new(MemoryObjectStore::new());
+        store
+            .put("taken", Bytes::from_static(b"held"))
+            .await
+            .unwrap();
+        let executor = make_executor(Arc::clone(&store));
+
+        let tx = Transaction::builder()
+            .mutation(Mutation::Put {
+                key: "first".to_string(),
+                body: Bytes::from_static(b"first-body"),
+                expected: None,
+            })
+            .mutation(Mutation::PutIfAbsent {
+                key: "taken".to_string(),
+                body: Bytes::from_static(b"loses"),
+            })
+            .build();
+
+        let result: Result<Outcome, Error> = executor.execute(tx).await;
+        assert!(
+            matches!(result, Err(Error::PartialCommit)),
+            "a mid-apply precondition past the commit point must not be retriable, got: {result:?}"
+        );
+
+        assert_eq!(
+            store.get("first").await.expect("first mutation applied"),
+            b"first-body",
+            "the mutation that landed before the abort stays applied"
+        );
+        assert_eq!(
+            list_count(store.as_ref(), ".tx-log/").await,
+            1,
+            "the intent must be preserved for the recovery loop to replay forward"
+        );
     }
 
     #[tokio::test]
