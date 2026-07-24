@@ -349,17 +349,11 @@ impl MetadataStore {
             return Err(Error::ManifestBlobUnknown);
         }
 
-        // Post-apply cleanup (best-effort, outside the engine lock)
-        for link in &result.deleted_links {
-            let container = path_builder::link_container_path(link, namespace);
-            let _ = self.store().object_store().delete_prefix(&container).await;
-            if matches!(link, LinkKind::Tag(_))
-                && let Some((parent, _)) = container.rsplit_once('/')
-            {
-                let _ = self.store().object_store().delete_prefix(parent).await;
-            }
-        }
-
+        // Post-apply cache maintenance. The committed transaction already
+        // removed the deleted link objects, and on FS the backend prunes the
+        // emptied parent directories on delete; no directory sweep runs here,
+        // because an unvalidated prefix delete could erase a link a concurrent
+        // push just re-created.
         for (link, metadata) in &result.written_links {
             self.cache_put(namespace, link, metadata).await;
         }
