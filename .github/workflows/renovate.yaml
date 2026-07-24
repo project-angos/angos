@@ -28,7 +28,7 @@ jobs:
         repositories: angos
     - uses: actions/checkout@v7
     - name: Run Renovate
-      uses: renovatebot/github-action@v46.1.19
+      uses: renovatebot/github-action@v46.1.20
       with:
         configurationFile: .github/renovate-global.json5
         token: ${{ steps.app-token.outputs.token }}
