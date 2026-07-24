@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The recovery loop now re-reads an intent after taking its lock, so a transaction its owner finished or advanced in that window is no longer replayed from a stale snapshot (which could delete an object a later transaction re-created) or rolled back after its first mutation committed.
 - Scrub now repairs a manifest's child links and grants only for digests the namespace already references, so with `allow_missing_manifest_references` enabled it can no longer hand a namespace the cross-namespace read access the push deliberately withheld.
 - A lock object whose body no longer parses is now reclaimed by the lock janitor once its object mtime ages past the longest permitted lock TTL, instead of blocking every acquire on that key until an operator deleted it by hand.
+- A job claim whose dedup index cannot be retired is now left for the next scan instead of running with that index live (which coalesced every same-`lock_key` enqueue into the running job and dropped its write), and a rescheduled retry no longer overwrites an index a concurrent enqueue just pointed at its own fresh job.
 
 ## 1.4.1
 

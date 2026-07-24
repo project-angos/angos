@@ -587,6 +587,88 @@ async fn claim_rechecks_pending_under_lock_and_skips_a_vanished_job() {
     );
 }
 
+/// Regression: the retire is what stops a same-`lock_key` enqueue coalescing
+/// into a job that is already running. When it fails, claiming anyway leaves
+/// that stale index in place for the whole execution, so the claim must be
+/// abandoned and retried by the next scan instead.
+#[tokio::test]
+async fn claim_is_skipped_when_the_dedup_index_cannot_be_retired() {
+    metrics_provider::init_for_tests();
+    let lock_key = "cache.ns:sha256:retire-fails";
+    let index_path = crate::jobs::store::job_lock_key_index_path("cache", lock_key);
+
+    let inner: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+    let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
+        inner.clone(),
+        FailIndexDelete {
+            index_path: index_path.clone(),
+        },
+    ));
+    let store = Arc::new(JobStore::new(build_store(hooked), "test-worker"));
+
+    store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue");
+
+    let outcome = store.claim_one(Queue::Cache).await.expect("claim");
+    assert!(
+        outcome.claimed.is_none(),
+        "a job whose dedup index could not be retired must not be claimed"
+    );
+    assert!(
+        inner.head(&index_path).await.is_ok(),
+        "the index the retire failed to remove is still there for the next scan"
+    );
+}
+
+/// Regression: the execution lock keeps other workers out but not producers,
+/// so a reschedule must not overwrite an index a concurrent enqueue just
+/// pointed at its own fresh job.
+#[tokio::test]
+async fn retry_leaves_a_concurrent_producers_index_alone() {
+    metrics_provider::init_for_tests();
+    let h = harness_memory();
+    let lock_key = "cache.ns:sha256:retry-vs-producer";
+
+    let mut env = dummy_envelope(lock_key);
+    env.max_attempts = 3;
+    h.store.enqueue(env).await.expect("enqueue");
+
+    let claimed = h
+        .store
+        .claim_one(Queue::Cache)
+        .await
+        .expect("claim")
+        .claimed
+        .expect("Some");
+
+    // The claim retired the index, so a producer enqueueing the same lock_key
+    // mid-execution indexes its own fresh pending file.
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("producer enqueue");
+    let index_path = crate::jobs::store::job_lock_key_index_path("cache", lock_key);
+    let produced = parse_lock_key_index(&h.raw.get(&index_path).await.expect("read index"))
+        .expect("parse")
+        .storage_key;
+
+    assert!(matches!(
+        h.store.fail(claimed, "boom").await.expect("fail"),
+        FailOutcome::Retried { .. }
+    ));
+
+    let after = parse_lock_key_index(&h.raw.get(&index_path).await.expect("read index"))
+        .expect("parse")
+        .storage_key;
+    assert_eq!(
+        after, produced,
+        "the reschedule clobbered the index of a job enqueued while it ran, \
+         stranding that job's pending file unindexed"
+    );
+}
+
 #[tokio::test]
 async fn retry_updates_lock_key_index_to_new_storage_key() {
     for_each_job_backend(run_retry_updates_lock_key_index_to_new_storage_key).await;

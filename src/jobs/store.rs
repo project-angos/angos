@@ -921,22 +921,31 @@ impl JobStore {
     /// The pending file stays as the crash-recovery record, and the delete is
     /// conditional plus fingerprint-guarded so a producer's newer index is
     /// never clobbered.
-    async fn retire_claimed_index(&self, queue: Queue, lock_key: &str, storage_key: &str) {
+    ///
+    /// Returns whether the index is known not to point at `storage_key` any
+    /// more: retired here, already absent, pointing elsewhere, or swung by a
+    /// producer between the read and the apply (the guard's `Conflict` /
+    /// `Precondition`). `false` means the claim must not proceed, since a stale
+    /// index left in place coalesces every same-`lock_key` enqueue into a job
+    /// that is already running.
+    async fn retire_claimed_index(&self, queue: Queue, lock_key: &str, storage_key: &str) -> bool {
         let mut tx = Transaction::builder().build();
         if let Err(e) = self
             .fold_index_cleanup(&mut tx, queue, lock_key, storage_key)
             .await
         {
             warn!(lock_key, error = %e, "Failed to read dedup index at claim");
-            return;
+            return false;
         }
         if tx.mutations.is_empty() {
-            return;
+            return true;
         }
-        if let Err(e) = self.store.execute(tx).await
-            && !matches!(e, TxError::Conflict | TxError::Precondition)
-        {
-            warn!(lock_key, error = %tx_error_to_job(e), "Failed to retire dedup index at claim");
+        match self.store.execute(tx).await {
+            Ok(_) | Err(TxError::Conflict | TxError::Precondition) => true,
+            Err(e) => {
+                warn!(lock_key, error = %tx_error_to_job(e), "Failed to retire dedup index at claim");
+                false
+            }
         }
     }
 
@@ -1093,13 +1102,22 @@ impl JobStore {
                         return Err(e);
                     }
                 };
+                // Claiming while the index still points at this job would let
+                // every same-`lock_key` enqueue coalesce into it for the whole
+                // execution and drop its write, so leave the job for the next
+                // scan instead.
+                if !self
+                    .retire_claimed_index(queue, &envelope.lock_key, &storage_key)
+                    .await
+                {
+                    session.release().await;
+                    continue;
+                }
                 debug!(
                     lock_key = envelope.lock_key.as_str(),
                     worker_id = self.worker_id.as_str(),
                     "Claimed job"
                 );
-                self.retire_claimed_index(queue, &envelope.lock_key, &storage_key)
-                    .await;
                 return Ok(ClaimOutcome {
                     claimed: Some(ClaimedJob {
                         envelope,
@@ -1144,37 +1162,45 @@ impl JobStore {
             expected: None,
         });
 
-        // We hold the execution lock, so no concurrent worker can swing the
-        // index. The conditional read is a belt-and-braces guard that costs
-        // one HEAD; if the index points elsewhere we leave it alone. A corrupt
-        // index cannot be matched or fingerprinted, so we delete it
-        // unconditionally: safe because we are the unique writer here.
+        // The execution lock keeps other workers off this `lock_key`, but not
+        // producers: `enqueue` writes the index without it. The read
+        // fingerprint is what makes the cleanup safe, not decoration, and an
+        // index pointing elsewhere is left alone. A corrupt index has no
+        // storage key to match, so it is deleted on the strength of its own
+        // bytes: a producer that replaces it in the window conflicts instead of
+        // losing its entry.
         match self.get_raw(&index_path).await {
-            Ok(body) => match parse_lock_key_index(&body) {
-                Ok(index) => {
-                    if let Some((read, delete)) = Self::conditional_index_delete(
+            Ok(body) => {
+                let cleanup = match parse_lock_key_index(&body) {
+                    Ok(index) => Self::conditional_index_delete(
                         index_path,
                         &body,
                         &index.storage_key,
                         &storage_key,
-                    ) {
-                        tx.reads.push(read);
-                        tx.mutations.push(delete);
-                    }
+                    ),
+                    Err(_) => Some((
+                        Read {
+                            key: index_path.clone(),
+                            fingerprint: Sha256::digest(&body).into(),
+                        },
+                        Mutation::Delete {
+                            key: index_path,
+                            expected: None,
+                        },
+                    )),
+                };
+                if let Some((read, delete)) = cleanup {
+                    tx.reads.push(read);
+                    tx.mutations.push(delete);
                 }
-                Err(_) => {
-                    tx.mutations.push(Mutation::Delete {
-                        key: index_path,
-                        expected: None,
-                    });
-                }
-            },
+            }
             Err(Error::NotFound) => {}
             Err(e) => {
                 // We could not read the dedup index to build the cleanup. Fail
                 // the job over rather than returning an error that would leave
                 // the pending file re-claimable in a hot loop; we still hold the
-                // lock, so `fail` remains the unique writer for this `lock_key`.
+                // execution lock, so no other worker can claim this `lock_key`
+                // while `fail` runs.
                 let claimed = ClaimedJob {
                     envelope,
                     storage_key,
@@ -1281,19 +1307,10 @@ impl JobStore {
         );
         let index_body = Bytes::from(serialize_lock_key_index(&new_storage_key)?);
 
-        // We hold the execution lock, so we are the unique writer for this
-        // lock_key. The index update is unconditional (no read fingerprint
-        // needed): no concurrent producer can swing the index while we hold the
-        // execution lock.
-        let tx = Transaction::builder()
+        let mut tx = Transaction::builder()
             .mutation(Mutation::Put {
                 key: new_pending_path,
                 body: pending_body,
-                expected: None,
-            })
-            .mutation(Mutation::Put {
-                key: index_path,
-                body: index_body,
                 expected: None,
             })
             .mutation(Mutation::Delete {
@@ -1301,6 +1318,38 @@ impl JobStore {
                 expected: None,
             })
             .build();
+
+        // The execution lock does not exclude producers: `enqueue` writes the
+        // index without ever taking it. Point the index at the rescheduled job
+        // only while the claim's retire has left it absent, under a read that
+        // fingerprints that absence. A producer that indexed a fresh job in the
+        // meantime keeps its entry, and this retry stays unindexed until an
+        // enqueue self-heals it: a missed dedup hit costs a duplicate job,
+        // clobbering the entry would strand that producer's pending file.
+        match self
+            .get_lock_key_index_raw(updated.queue, &updated.lock_key)
+            .await
+        {
+            Ok(None) => {
+                tx.reads.push(Read {
+                    key: index_path.clone(),
+                    fingerprint: Sha256::digest([]).into(),
+                });
+                tx.mutations.push(Mutation::Put {
+                    key: index_path,
+                    body: index_body,
+                    expected: None,
+                });
+            }
+            Ok(Some(_)) => {}
+            Err(e) => {
+                warn!(
+                    lock_key = updated.lock_key.as_str(),
+                    error = %e,
+                    "Failed to read dedup index while rescheduling; leaving it untouched"
+                );
+            }
+        }
 
         let result = self.store.execute(tx).await;
         session.release().await;
