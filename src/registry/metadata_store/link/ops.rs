@@ -470,11 +470,30 @@ impl MetadataStore {
     /// capturing the raw bytes (for the transaction read set) and the parsed
     /// metadata (for planning) together. A non-`NotFound` read error fails the
     /// attempt rather than being planned around as an absent link.
+    ///
+    /// Repeated operations are collapsed first: a manifest may legally list the
+    /// same digest twice, and planning that link twice would erase the referrers
+    /// the first mutation merged in and leave a second write to the same key
+    /// whose read precondition the first one already invalidated.
     async fn snapshot_links<'a>(
         &self,
         namespace: &Namespace,
         operations: &'a [LinkOperation],
     ) -> Result<LinksSnapshot<'a>, TxError> {
+        let mut seen_ops = HashSet::new();
+        let operations: Vec<&LinkOperation> = operations
+            .iter()
+            .filter(|op| match op {
+                LinkOperation::Create {
+                    link,
+                    target,
+                    referrer,
+                    ..
+                } => seen_ops.insert((link, Some(target), referrer)),
+                LinkOperation::Delete { link, referrer } => seen_ops.insert((link, None, referrer)),
+            })
+            .collect();
+
         let results = join_all(operations.iter().map(|op| async move {
             let link = match op {
                 LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,

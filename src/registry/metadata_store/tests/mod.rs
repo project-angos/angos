@@ -1436,6 +1436,77 @@ async fn test_tracked_delete_with_referrer() {
     .await;
 }
 
+pub async fn test_datastore_duplicated_layer_keeps_other_referrers(m: Arc<MetadataStore>) {
+    let namespace = &Namespace::new("tracked-duplicate-layer-ns").unwrap();
+
+    let layer_digest = put_blob_direct(m.store(), b"layer listed twice").await;
+    let first_manifest_digest = put_blob_direct(m.store(), b"manifest c content").await;
+    let second_manifest_digest = put_blob_direct(m.store(), b"manifest d content").await;
+
+    m.update_links(
+        namespace,
+        &[LinkOperation::create_with_referrer(
+            LinkKind::Layer(layer_digest.clone()),
+            layer_digest.clone(),
+            first_manifest_digest.clone(),
+        )],
+    )
+    .await
+    .unwrap();
+
+    // A manifest listing the same layer digest twice plans that layer's link
+    // twice in one transaction.
+    let duplicated_create = vec![
+        LinkOperation::create_with_referrer(
+            LinkKind::Layer(layer_digest.clone()),
+            layer_digest.clone(),
+            second_manifest_digest.clone(),
+        );
+        2
+    ];
+    m.update_links(namespace, &duplicated_create).await.unwrap();
+
+    let metadata = m
+        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
+        .await
+        .unwrap();
+    assert!(
+        metadata.referenced_by.contains(&first_manifest_digest),
+        "referenced_by should keep the first manifest after the duplicated push"
+    );
+    assert!(
+        metadata.referenced_by.contains(&second_manifest_digest),
+        "referenced_by should contain the second manifest after the duplicated push"
+    );
+
+    let duplicated_delete = vec![
+        LinkOperation::delete_with_referrer(
+            LinkKind::Layer(layer_digest.clone()),
+            second_manifest_digest.clone(),
+        );
+        2
+    ];
+    m.update_links(namespace, &duplicated_delete).await.unwrap();
+
+    let metadata = m
+        .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata.referenced_by,
+        HashSet::from([first_manifest_digest]),
+        "deleting the duplicating manifest should leave the first manifest's reference"
+    );
+}
+
+#[tokio::test]
+async fn test_duplicated_layer_keeps_other_referrers() {
+    for_each_backend(async |test_case| {
+        test_datastore_duplicated_layer_keeps_other_referrers(test_case.metadata_store()).await;
+    })
+    .await;
+}
+
 pub async fn test_datastore_tracked_delete_removes_when_no_referrers(m: Arc<MetadataStore>) {
     let namespace = &Namespace::new("tracked-delete-no-referrers-ns").unwrap();
 

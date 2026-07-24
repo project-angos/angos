@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The pull-through cache-fill grant path now checks byte presence inside the blob-data lock, so a reclaim racing the fill can no longer leave a dangling ownership grant on deleted bytes.
 - A committed link delete no longer sweeps its directory prefix afterwards (the transaction removes the link and the FS backend prunes emptied directories itself), so the sweep can no longer erase a tag or revision a concurrent push re-created after its 201.
 - Blob-index removals now re-check under the blob-data lock that the entry is still byteless or dangling before applying, and the delete path's reclaim decision now shares the commit-validated shard read, so a concurrent push, upload, or cache fill can no longer lose its just-written grant or have a referenced blob's bytes reclaimed.
+- A link transaction now plans one mutation per repeated operation, so pushing a manifest that lists the same layer digest twice no longer erases that layer's other referrers and drops its link when the manifest is deleted.
 
 ## 1.4.1
 
