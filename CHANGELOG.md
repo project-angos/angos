@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A link transaction now plans one mutation per repeated operation, so pushing a manifest that lists the same layer digest twice no longer erases that layer's other referrers and drops its link when the manifest is deleted.
 - A lock heartbeat or release that has to re-read the lock object now checks the body's writer nonce first and gives the lease up one tick before the TTL expires, so a holder whose refresh failed can no longer reclaim or delete the lock a peer took over after expiry.
 - A lock-coordinated transaction that aborts after one of its mutations applied now reports a non-retriable partial commit, so the caller's retry can no longer commit fresh state that the recovery loop later reverts by replaying the preserved intent.
+- A manifest delete by digest now resolves and plans its tag cascade inside the blob-data lock, so a tag pushed to that digest while the delete waits is deleted with it instead of surviving as a tag that serves a revision the delete removed.
 
 ## 1.4.1
 

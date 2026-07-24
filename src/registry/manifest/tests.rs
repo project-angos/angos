@@ -1020,6 +1020,93 @@ async fn delete_manifest_holds_blob_data_lock_against_concurrent_grant() {
     .await;
 }
 
+/// Regression: the pointing-tag scan and the link plan must run inside the
+/// `blob-data:{digest}` lock. Planned outside it, a tag pushed to the digest in
+/// the window is missed by the cascade, so the revision and child links go while
+/// the fresh tag survives and resolves to a manifest that 404s by digest.
+#[tokio::test]
+async fn delete_manifest_by_digest_cascades_a_tag_pushed_while_it_waits_for_the_lock() {
+    for_each_backend(async |test_case| {
+        use std::time::Duration;
+
+        use tokio::time::sleep;
+
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo").unwrap();
+
+        let (manifest_content, media_type) = create_test_manifest(registry, namespace).await;
+        let digest = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &manifest_content,
+            )
+            .await
+            .unwrap()
+            .digest;
+
+        // Hold the lock, then start the digest delete: it must park before it
+        // can resolve the pointing tags.
+        let session = registry
+            .metadata_store
+            .acquire_blob_data_lock(&digest)
+            .await
+            .unwrap();
+        let reference = Reference::Digest(digest.clone());
+        let delete = registry.delete_manifest(None, None, namespace, &reference);
+        tokio::pin!(delete);
+        tokio::select! {
+            result = &mut delete => {
+                panic!(
+                    "delete_manifest completed while blob-data lock was held (ok={})",
+                    result.is_ok()
+                );
+            }
+            () = sleep(Duration::from_millis(25)) => {}
+        }
+
+        // A push lands a second tag on the digest while the delete is parked.
+        // A same-digest push adds exactly this link; the revision and child
+        // links it re-creates are already there from the first push.
+        let fresh = Tag::new("fresh").unwrap();
+        registry
+            .metadata_store
+            .update_links(
+                namespace,
+                &[LinkOperation::create_with_media_type(
+                    LinkKind::Tag(fresh.clone()),
+                    digest.clone(),
+                    Some(media_type.clone()),
+                )],
+            )
+            .await
+            .unwrap();
+
+        session.release().await;
+        delete.await.unwrap();
+
+        let revision = registry
+            .metadata_store
+            .read_link(namespace, &LinkKind::Digest(digest.clone()))
+            .await;
+        assert!(
+            matches!(revision, Err(Error::NotFound)),
+            "the digest delete must remove the revision link, got: {revision:?}"
+        );
+        let tag_link = registry
+            .metadata_store
+            .read_link(namespace, &LinkKind::Tag(fresh))
+            .await;
+        assert!(
+            matches!(tag_link, Err(Error::NotFound)),
+            "a tag pushed while the delete waited for the lock must cascade with it, \
+             or it serves a digest that now 404s; got: {tag_link:?}"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn delete_manifest_then_delete_uploaded_blobs() {
     for_each_backend(async |test_case| {

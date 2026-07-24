@@ -577,31 +577,11 @@ impl Registry {
         let events = delete_events(namespace, repository, digest_str, reference, actor);
         self.dispatch_events(&events).await?;
 
-        // A digest delete cascades to every pointing tag; resolve them first
-        // for the suppression gate and the link plan. LWW guarding of a
+        // A digest delete cascades to every pointing tag; the scan, the plan and
+        // the commit run together under the blob-data lock. LWW guarding of a
         // replicated delete happens in the link transaction planner.
-        let pointing_tags = if let Reference::Digest(digest) = reference {
-            self.metadata_store
-                .find_tags_pointing_at(namespace, digest)
-                .await?
-        } else {
-            Vec::new()
-        };
-
         let existed_before = self
-            .manifest_delete_existed_before(
-                resolved_repository,
-                namespace,
-                reference,
-                &pointing_tags,
-            )
-            .await;
-
-        let ops = self
-            .plan_manifest_delete_ops(reference, &pointing_tags)
-            .await?;
-
-        self.commit_manifest_delete(namespace, reference, &ops, source_ts)
+            .commit_manifest_delete(resolved_repository, namespace, reference, source_ts)
             .await?;
 
         // For a tag delete the receiver keys off `payload.tag`, so no digest
@@ -686,39 +666,64 @@ impl Registry {
         ))
     }
 
-    /// Commits the delete transaction. A digest delete runs under the blob-data
-    /// lock so the unreferenced-check and byte reclaim cannot miss a concurrent
-    /// reference grant; a tag delete drops its links directly. Threading
-    /// `source_ts` into the transaction makes the deleted links part of its
-    /// validated read set, so a concurrent newer re-put aborts the delete rather
-    /// than being clobbered by an older replicated delete.
+    /// Commits the delete transaction, reporting whether the reference counted
+    /// as present beforehand (the replication-dispatch gate).
+    ///
+    /// A digest delete resolves its pointing tags, plans and commits inside the
+    /// blob-data lock, which the push path holds across its own link
+    /// transaction: a tag pushed to this digest therefore either lands before
+    /// the scan and cascades with the delete, or lands after it. Planning
+    /// outside the lock would let such a tag outlive the revision link it points
+    /// at. The lock equally keeps the unreferenced-check and byte reclaim from
+    /// missing a concurrent reference grant. A tag delete drops its link
+    /// directly. Threading `source_ts` into the transaction makes the deleted
+    /// links part of its validated read set, so a concurrent newer re-put aborts
+    /// the delete rather than being clobbered by an older replicated delete.
     async fn commit_manifest_delete(
         &self,
+        resolved_repository: Option<&Repository>,
         namespace: &Namespace,
         reference: &Reference,
-        ops: &[LinkOperation],
         source_ts: Option<DateTime<Utc>>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let Reference::Digest(digest) = reference else {
+            let existed_before = self
+                .manifest_delete_existed_before(resolved_repository, namespace, reference, &[])
+                .await;
+            let ops = self.plan_manifest_delete_ops(reference, &[]).await?;
             self.metadata_store
-                .delete_links(namespace, ops, source_ts)
+                .delete_links(namespace, &ops, source_ts)
                 .await?;
-            return Ok(());
+            return Ok(existed_before);
         };
 
         self.metadata_store
             .with_blob_data_lock(digest, async {
+                let pointing_tags = self
+                    .metadata_store
+                    .find_tags_pointing_at(namespace, digest)
+                    .await?;
+                let existed_before = self
+                    .manifest_delete_existed_before(
+                        resolved_repository,
+                        namespace,
+                        reference,
+                        &pointing_tags,
+                    )
+                    .await;
+                let ops = self
+                    .plan_manifest_delete_ops(reference, &pointing_tags)
+                    .await?;
                 if self
                     .metadata_store
-                    .delete_manifest(namespace, digest, ops, source_ts)
+                    .delete_manifest(namespace, digest, &ops, source_ts)
                     .await?
                 {
                     self.blob_store.delete_blob(digest).await?;
                 }
-                Ok::<_, Error>(())
+                Ok::<_, Error>(existed_before)
             })
-            .await?;
-        Ok(())
+            .await
     }
 
     /// Attempts to short-circuit a manifest GET into a presigned redirect using
