@@ -34,7 +34,7 @@ use crate::{
             ReferencePolicy,
             blob_index::shard::{
                 any_other_namespace_references_blob, append_shard_for_digest, append_shard_ops,
-                ops_for_digest, read_shard, shard_will_be_empty,
+                apply_blob_index_operations, read_shard,
             },
         },
         path_builder,
@@ -444,19 +444,17 @@ impl MetadataStore {
             ));
         }
 
-        // Reclaim check: decide whether this transaction leaves the manifest
-        // blob unreferenced (its shard becomes empty AND no other namespace
-        // references it). The blob-data itself lives in the blob store; the
-        // caller reclaims it under the blob-data lock.
-        let reclaim_blob =
-            blob_will_be_unreferenced(store.as_ref(), namespace, tx, &pending_blob_ops).await?;
-
-        // Shard merges: append blob-index shard mutations and finalize.
-        let builder = append_shard_merges(
+        // Shard merges plus the reclaim decision, sharing one read per shard so
+        // both the ownership and the reclaim decisions are validated at commit.
+        let reclaim_digest = tx
+            .blob_data_delete_if_unreferenced()
+            .filter(|digest| pending_blob_ops.contains_key(*digest));
+        let (builder, reclaim_blob) = append_shard_merges(
             store.as_ref(),
             namespace,
             &pending_blob_ops,
             &reference_shards,
+            reclaim_digest,
             builder,
         )
         .await?;
@@ -834,66 +832,59 @@ async fn preread_reference_shards(
     Ok(shards)
 }
 
-/// The shard-merge step: append each pending digest's blob-index shard
-/// mutation, reusing the pre-read state for digests in `reference_shards` so
-/// the ownership decision's read is the one the commit validates.
+/// The shard-merge step plus the reclaim decision: append each pending
+/// digest's blob-index shard mutation, reusing the pre-read state for digests
+/// in `reference_shards` so the ownership decision's read is the one the
+/// commit validates, and deciding for `reclaim_digest` on the same read
+/// whether this transaction leaves the blob unreferenced (its shard empties
+/// and no other namespace references it). Sharing each read with the merge
+/// joins the decisions to the transaction read set, so a racing write fails
+/// prepare instead of being green-lit away. The reclaimed blob's existence is
+/// not probed here (the reclaim is an idempotent blob-store delete).
 async fn append_shard_merges(
     store: &Store,
     namespace: &Namespace,
     pending_blob_ops: &HashMap<Digest, Vec<BlobIndexOperation>>,
     reference_shards: &ReferenceShards,
+    reclaim_digest: Option<&Digest>,
     mut builder: TransactionBuilder,
-) -> Result<TransactionBuilder, TxError> {
+) -> Result<(TransactionBuilder, bool), TxError> {
+    let mut reclaim_blob = false;
     for (digest, shard_ops) in pending_blob_ops {
-        builder = match reference_shards.get(digest) {
-            Some(state) => {
-                let shard_path = path_builder::blob_index_shard_path(digest, namespace);
-                let existing = state.as_ref().map(|(raw, _)| raw.clone());
-                append_shard_ops(shard_path, existing, shard_ops, builder)
-                    .map_err(TxError::Serde)?
-            }
-            None => append_shard_for_digest(store, namespace, digest, shard_ops, builder)
+        if reclaim_digest == Some(digest) {
+            let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+            let existing = read_shard(store, &shard_path)
                 .await
-                .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?,
-        };
+                .map_err(TxError::Storage)?;
+            let mut links = existing
+                .as_ref()
+                .map(|(_, links)| links.clone())
+                .unwrap_or_default();
+            apply_blob_index_operations(&mut links, shard_ops);
+            if links.is_empty() {
+                let refs_prefix = path_builder::blob_index_refs_dir(digest);
+                reclaim_blob = !any_other_namespace_references_blob(store, namespace, &refs_prefix)
+                    .await
+                    .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
+            }
+            builder =
+                append_shard_ops(shard_path, existing.map(|(raw, _)| raw), shard_ops, builder)
+                    .map_err(TxError::Serde)?;
+        } else {
+            builder = match reference_shards.get(digest) {
+                Some(state) => {
+                    let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+                    let existing = state.as_ref().map(|(raw, _)| raw.clone());
+                    append_shard_ops(shard_path, existing, shard_ops, builder)
+                        .map_err(TxError::Serde)?
+                }
+                None => append_shard_for_digest(store, namespace, digest, shard_ops, builder)
+                    .await
+                    .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?,
+            };
+        }
     }
-    Ok(builder)
-}
-
-/// The reclaim check: decide whether this transaction leaves the manifest blob
-/// unreferenced (its namespace shard becomes empty and no other namespace
-/// references it). The caller reclaims the blob-data from the blob store; the
-/// blob's existence is not probed here (the reclaim is an idempotent
-/// blob-store delete).
-async fn blob_will_be_unreferenced(
-    store: &Store,
-    namespace: &Namespace,
-    tx: &LinksTx<'_>,
-    pending_blob_ops: &HashMap<Digest, Vec<BlobIndexOperation>>,
-) -> Result<bool, TxError> {
-    let Some(digest) = tx.blob_data_delete_if_unreferenced() else {
-        return Ok(false);
-    };
-    if !pending_blob_ops.contains_key(digest) {
-        return Ok(false);
-    }
-
-    let shard_path_ns = path_builder::blob_index_shard_path(digest, namespace);
-    let our_shard_will_be_empty = shard_will_be_empty(
-        store,
-        ops_for_digest(pending_blob_ops, digest),
-        &shard_path_ns,
-    )
-    .await?;
-    if !our_shard_will_be_empty {
-        return Ok(false);
-    }
-
-    let refs_prefix = path_builder::blob_index_refs_dir(digest);
-    let other_refs_exist = any_other_namespace_references_blob(store, namespace, &refs_prefix)
-        .await
-        .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
-    Ok(!other_refs_exist)
+    Ok((builder, reclaim_blob))
 }
 
 /// Prior target per `Create` op, from this attempt's read-set-validated

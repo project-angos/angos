@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A manifest push now checks reference ownership inside the link transaction (strict rejects, permissive drops the link), so a delete or prune reclaiming a referenced blob mid-push can no longer slip a manifest whose layer bytes are gone past the pre-write validation.
 - The pull-through cache-fill grant path now checks byte presence inside the blob-data lock, so a reclaim racing the fill can no longer leave a dangling ownership grant on deleted bytes.
+- Blob-index removals now re-check under the blob-data lock that the entry is still byteless or dangling before applying, and the delete path's reclaim decision now shares the commit-validated shard read, so a concurrent push, upload, or cache fill can no longer lose its just-written grant or have a referenced blob's bytes reclaimed.
 
 ## 1.4.1
 
