@@ -822,3 +822,80 @@ async fn recovery_skips_an_intent_reaped_between_the_read_and_the_takeover() {
         "recovery replayed a reaped intent's delete over a re-created object"
     );
 }
+
+/// Hook that fails every write to the intent log after the first, so the
+/// commit-intent write lands but every later progress stamp is lost.
+struct FailStampWrites {
+    writes: AtomicUsize,
+}
+
+impl FailStampWrites {
+    fn new() -> Self {
+        Self {
+            writes: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl StoreHook for FailStampWrites {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        if let StoreOp::Put { key, .. } = op
+            && key.starts_with(".tx-log/")
+            && self.writes.fetch_add(1, Ordering::AcqRel) > 0
+        {
+            return Err(StorageError::Backend("injected stamp failure".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// Regression: a progress stamp is best-effort, so losing one must not make the
+/// transaction look untouched. If a later mutation then hard-errors, reaping the
+/// intent would strand the mutation that did apply with no record for recovery
+/// to converge from.
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_progress_stamp_still_preserves_the_intent_on_a_later_error() {
+    let inner = Arc::new(MemoryObjectStore::new());
+    // Occupies the second mutation's key so its PutIfAbsent hard-errors.
+    inner
+        .put("stamp/taken", Bytes::from_static(b"held"))
+        .await
+        .expect("seed taken key");
+
+    // The tx id is minted inside `execute`, so gate the whole intent-log
+    // prefix: this transaction is its only writer.
+    let hooked: Arc<HookedStore<Arc<dyn ObjectStore>, FailStampWrites>> =
+        Arc::new(HookedStore::new(inner.clone(), FailStampWrites::new()));
+
+    let executor = test_util::locked_executor(hooked.clone(), test_util::memory_lock());
+    let tx = Transaction::builder()
+        .mutation(Mutation::Put {
+            key: "stamp/first".to_owned(),
+            body: Bytes::from_static(b"first-body"),
+            expected: None,
+        })
+        .mutation(Mutation::PutIfAbsent {
+            key: "stamp/taken".to_owned(),
+            body: Bytes::from_static(b"loses"),
+        })
+        .build();
+
+    let result = executor.execute(tx).await;
+    assert!(result.is_err(), "the second mutation must fail the apply");
+
+    assert_eq!(
+        inner
+            .get("stamp/first")
+            .await
+            .expect("first mutation applied"),
+        b"first-body",
+        "the first mutation applied before the stamp was lost"
+    );
+    assert_eq!(
+        test_util::list_count(&*inner, ".tx-log/").await,
+        1,
+        "a transaction with an applied mutation must keep its intent for recovery, \
+         even when the stamp that recorded it was lost"
+    );
+}
