@@ -50,7 +50,9 @@ use crate::lock::{
 
 // constants
 
-const MAX_LOCK_TTL_SECS: u64 = 3600;
+/// Longest TTL a lock may declare. Also the grace the `LockJanitor` ages an
+/// unparseable lock body by, since such a body cannot state its own TTL.
+pub const MAX_LOCK_TTL_SECS: u64 = 3600;
 
 /// The heartbeat refreshes a held lock every `ttl_secs / HEARTBEAT_DIVISOR`,
 /// leaving two missed ticks of slack before the TTL expires.
