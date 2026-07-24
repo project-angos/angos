@@ -39,15 +39,17 @@ pub struct LockBody {
     pub refreshed_at: DateTime<Utc>,
     /// TTL in seconds declared by the holder.
     pub ttl_secs: u64,
-    /// Per-write random nonce that makes every serialized lock body globally
-    /// unique. After a conditional write returns an ambiguous (status-less)
-    /// transport error, [`S3LockStorage`](s3::S3LockStorage) reads the object
-    /// back and treats a byte-for-byte match as proof that *its own* write
-    /// landed despite the lost acknowledgement, rather than a competitor's
-    /// identical-looking body. The nonce is what makes that comparison
-    /// collision-free. `#[serde(default)]` keeps lock objects written before
-    /// this field existed readable: they deserialize to the nil UUID, which
-    /// never matches a freshly minted nonce.
+    /// Random nonce identifying the session that holds the lock, stable across
+    /// that session's refreshes. It serves two purposes. A holder that lost its
+    /// cached `ETag` re-reads the object and refuses to refresh or delete a body
+    /// carrying someone else's nonce, so it can never reclaim or remove a
+    /// successor's lock. And after a conditional write returns an ambiguous
+    /// (status-less) transport error, [`S3LockStorage`](s3::S3LockStorage) reads
+    /// the object back and treats a byte-for-byte match as proof that *its own*
+    /// write landed despite the lost acknowledgement, rather than a competitor's
+    /// identical-looking body. `#[serde(default)]` keeps lock objects written
+    /// before this field existed readable: they deserialize to the nil UUID,
+    /// which never matches a freshly minted nonce.
     #[serde(default)]
     pub writer_nonce: Uuid,
 }

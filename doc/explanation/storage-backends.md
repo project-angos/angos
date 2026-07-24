@@ -286,7 +286,7 @@ max_retries = 100           # Acquisition retry attempts
 retry_delay_ms = 50         # Delay between retries (minimum: 1)
 ```
 
-The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds. Transient heartbeat failures (connect errors, refresh timeouts) accumulate up to a small budget (roughly one TTL of slack) before cancelling the in-flight operation, so a short network blip does not kill in-progress work. Authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
+The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds. Transient heartbeat failures (connect errors, refresh timeouts) accumulate up to a small budget (one heartbeat tick short of the TTL, so the lease is dropped while still valid) before cancelling the in-flight operation, so a short network blip does not kill in-progress work. Authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
 :::note
 The S3 provider must support conditional writes and conditional deletes. Angos probes for this capability at startup: an explicit `lock_strategy.s3` fails fast when any operation is missing, while an unset lock strategy falls back to the in-process memory lock. Setting `conditional_operations = true|false` declares support explicitly and skips the probe; `false` also pins the unset-lock default to the memory lock.
@@ -326,7 +326,7 @@ Lock operations emit Prometheus metrics for observability. Key metrics to monito
 
 For multi-instance deployments, alert on:
 - **High `lock_retries_total` rate**: Rising retry rate during normal operation suggests lock contention and may indicate insufficient `max_retries` or `retry_delay_ms` tuning.
-- **`lock_invalidations_total{reason="heartbeat_failure"}`**: Heartbeat-side failures suggest network or backend issues between the registry and the lock store. Consider checking connectivity, network quality, and lock timeout settings. Heartbeat failures must accumulate past a budget (roughly one TTL of slack) before the in-flight operation is cancelled, so an isolated blip is absorbed rather than surfaced here.
+- **`lock_invalidations_total{reason="heartbeat_failure"}`**: Heartbeat-side failures suggest network or backend issues between the registry and the lock store. Consider checking connectivity, network quality, and lock timeout settings. Heartbeat failures must accumulate past a budget (one heartbeat tick short of the TTL) before the in-flight operation is cancelled, so an isolated blip is absorbed rather than surfaced here.
 - **High `lock_acquisition_duration_ms` p99**: Persistent p99 latency > expected S3 latency may indicate saturation or regional latency issues.
 
 See the [configuration reference](../reference/configuration.md#prometheus-metrics) for the full metrics list.
