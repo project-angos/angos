@@ -5,6 +5,24 @@ use crate::{
     registry::metadata_store::LinkKind,
 };
 
+/// How a manifest push treats newly-referenced digests the target namespace
+/// does not already own. Enforced inside the link transaction, where the
+/// ownership read is commit-validated, so the check cannot race a concurrent
+/// reclaim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferencePolicy {
+    /// Reject the push with `MANIFEST_BLOB_UNKNOWN`.
+    Strict,
+    /// Store the manifest but skip the ownership-granting links for unowned
+    /// references, so they stay dangling and resolve as unknown on a later pull
+    /// instead of handing the namespace read access to content it never pushed.
+    Permissive,
+    /// Trust every reference as owned. Used only by pull-through cache-fill,
+    /// where the referenced content is fetched from the upstream the namespace
+    /// mirrors.
+    Trusted,
+}
+
 /// A single link mutation submitted to [`crate::registry::metadata_store::MetadataStore::update_links`].
 /// `Create` carries the target digest and optional referrer / media-type /
 /// descriptor metadata; `Delete` carries an optional referrer qualification so

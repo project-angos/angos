@@ -15,6 +15,7 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
+use tracing::warn;
 
 use angos_tx_engine::{
     StorageError,
@@ -30,9 +31,10 @@ use crate::{
         Error,
         metadata_store::{
             BlobIndexOperation, LinkKind, LinkMetadata, LinkOperation, MetadataStore,
+            ReferencePolicy,
             blob_index::shard::{
-                any_other_namespace_references_blob, append_shard_for_digest, ops_for_digest,
-                shard_will_be_empty,
+                any_other_namespace_references_blob, append_shard_for_digest, append_shard_ops,
+                ops_for_digest, read_shard, shard_will_be_empty,
             },
         },
         path_builder,
@@ -56,8 +58,15 @@ pub enum LinksTx<'a> {
     /// `store_manifest`: the link writes for a manifest push. The manifest
     /// blob-data is written separately to the blob store by the registry before
     /// this runs. `created_at` stamps new link metadata; a replicated write
-    /// passes the author's `source_ts` for LWW.
-    StoreManifest { created_at: Option<DateTime<Utc>> },
+    /// passes the author's `source_ts` for LWW. `reference_policy` governs
+    /// newly-referenced digests the namespace does not own: Strict rejects the
+    /// push, Permissive drops the unowned link, Trusted grants blindly. The
+    /// ownership read happens here, inside the transaction, so it cannot race
+    /// a concurrent reclaim.
+    StoreManifest {
+        created_at: Option<DateTime<Utc>>,
+        reference_policy: ReferencePolicy,
+    },
     /// `delete_manifest`: removes the links and reports via `reclaim_blob`
     /// whether the blob became unreferenced (the shard is empty and no other
     /// namespace references it), leaving the blob-data reclaim to the caller.
@@ -106,6 +115,16 @@ impl<'a> LinksTx<'a> {
         }
     }
 
+    /// Reference policy of a manifest push; `None` for other transaction kinds.
+    fn reference_policy(&self) -> Option<ReferencePolicy> {
+        match self {
+            LinksTx::StoreManifest {
+                reference_policy, ..
+            } => Some(*reference_policy),
+            _ => None,
+        }
+    }
+
     /// Author timestamp of a replicated delete, gating each deleted tag via LWW.
     fn delete_source_ts(&self) -> Option<DateTime<Utc>> {
         match self {
@@ -139,6 +158,10 @@ struct LinksTxCaptured {
     /// write; the attempt committed an empty transaction and the caller maps
     /// this to [`Error::ReplicationSuperseded`].
     superseded: Option<String>,
+    /// `Some(digest)` when a strict push referenced a digest whose shard held
+    /// no entry at plan time; the attempt committed an empty transaction and
+    /// the caller maps this to [`Error::ManifestBlobUnknown`].
+    missing_reference: Option<Digest>,
     /// Whether this transaction left the manifest blob unreferenced, so the
     /// caller should reclaim its blob-data from the blob store under the
     /// blob-data lock it already holds.
@@ -208,11 +231,19 @@ struct LinksSnapshot<'a> {
 
 /// The link-derived part of a transaction: the in-progress builder plus the
 /// blob-index ops, written links and deleted links the later phases consume.
+/// Shard state pre-read for each newly-referenced digest of a policy-checked
+/// push: the raw bytes (reused by the shard merge, so the read joins the read
+/// set) plus the parsed links; `None` = the shard is absent.
+type ReferenceShards = HashMap<Digest, Option<(Bytes, HashSet<LinkKind>)>>;
+
 struct LinkMutations {
     builder: TransactionBuilder,
     pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
     written_links: Vec<(LinkKind, LinkMetadata)>,
     deleted_links: Vec<LinkKind>,
+    /// `Some(digest)` when a strict push referenced an unowned digest; the
+    /// attempt commits nothing and the caller reports a missing reference.
+    missing_reference: Option<Digest>,
 }
 
 impl LinkMutations {
@@ -303,77 +334,7 @@ impl MetadataStore {
     ) -> Result<LinksCommit, Error> {
         let (_, result) = execute_with_retry_payload(
             self.executor(),
-            || async {
-                // Snapshot: one read pass over every operation's link. The
-                // observed bytes join the transaction read set when mutations
-                // are built, so a racing write to any touched link aborts this
-                // attempt at prepare and the retry re-plans against fresh state.
-                let snapshot = self.snapshot_links(namespace, operations).await?;
-
-                // Empty no-op short-circuit: no creates, every delete target
-                // already missing, and no extras to apply.
-                if is_empty_noop(&snapshot.ops, &tx) {
-                    return Ok((Transaction::builder().build(), LinksTxCaptured::default()));
-                }
-
-                // LWW gate: reject replicated writes/deletes superseded locally.
-                if let Some(message) = lww_superseded(&snapshot, &tx) {
-                    return Ok((
-                        Transaction::builder().build(),
-                        LinksTxCaptured {
-                            superseded: Some(message),
-                            ..LinksTxCaptured::default()
-                        },
-                    ));
-                }
-
-                let LinksSnapshot {
-                    ops,
-                    mut link_cache,
-                    reads,
-                } = snapshot;
-
-                // Plan: build the link mutations over the snapshot state.
-                let LinkMutations {
-                    mut builder,
-                    pending_blob_ops,
-                    written_links,
-                    deleted_links,
-                } = build_link_mutations(namespace, &ops, &mut link_cache, &tx, reads)?;
-
-                // Reclaim check: decide whether this transaction leaves the
-                // manifest blob unreferenced (its shard becomes empty AND no
-                // other namespace references it). The blob-data itself lives in
-                // the blob store; the caller reclaims it under the blob-data lock.
-                let store = self.store_arc();
-                let reclaim_blob =
-                    blob_will_be_unreferenced(store.as_ref(), namespace, &tx, &pending_blob_ops)
-                        .await?;
-
-                // Shard merges: append blob-index shard mutations and finalize.
-                for (digest, shard_ops) in &pending_blob_ops {
-                    builder = append_shard_for_digest(
-                        store.as_ref(),
-                        namespace,
-                        digest,
-                        shard_ops,
-                        builder,
-                    )
-                    .await
-                    .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
-                }
-
-                Ok((
-                    builder.build(),
-                    LinksTxCaptured {
-                        written_links,
-                        deleted_links,
-                        prior_targets: capture_prior_targets(&ops),
-                        superseded: None,
-                        reclaim_blob,
-                    },
-                ))
-            },
+            || self.plan_links_attempt(namespace, operations, &tx),
             DEFAULT_RETRY_BUDGET,
         )
         .await
@@ -381,6 +342,11 @@ impl MetadataStore {
 
         if let Some(message) = result.superseded {
             return Err(Error::ReplicationSuperseded(message));
+        }
+
+        if let Some(digest) = result.missing_reference {
+            warn!("Strict manifest push references {digest} with no blob-index entry; rejecting");
+            return Err(Error::ManifestBlobUnknown);
         }
 
         // Post-apply cleanup (best-effort, outside the engine lock)
@@ -405,6 +371,107 @@ impl MetadataStore {
             prior_targets: result.prior_targets,
             reclaim_blob: result.reclaim_blob,
         })
+    }
+
+    /// One retry-loop attempt: snapshot the touched links, gate on no-op / LWW
+    /// / reference ownership, and build the transaction plus its captured
+    /// outcome.
+    async fn plan_links_attempt(
+        &self,
+        namespace: &Namespace,
+        operations: &[LinkOperation],
+        tx: &LinksTx<'_>,
+    ) -> Result<(Transaction, LinksTxCaptured), TxError> {
+        // Snapshot: one read pass over every operation's link. The observed
+        // bytes join the transaction read set when mutations are built, so a
+        // racing write to any touched link aborts this attempt at prepare and
+        // the retry re-plans against fresh state.
+        let snapshot = self.snapshot_links(namespace, operations).await?;
+
+        // Empty no-op short-circuit: no creates, every delete target
+        // already missing, and no extras to apply.
+        if is_empty_noop(&snapshot.ops, tx) {
+            return Ok((Transaction::builder().build(), LinksTxCaptured::default()));
+        }
+
+        // LWW gate: reject replicated writes/deletes superseded locally.
+        if let Some(message) = lww_superseded(&snapshot, tx) {
+            return Ok((
+                Transaction::builder().build(),
+                LinksTxCaptured {
+                    superseded: Some(message),
+                    ..LinksTxCaptured::default()
+                },
+            ));
+        }
+
+        let LinksSnapshot {
+            ops,
+            mut link_cache,
+            reads,
+        } = snapshot;
+
+        // Ownership pre-read: one shard read per newly-referenced digest of a
+        // policy-checked push, shared with the shard merge below so the
+        // ownership decision is commit-validated.
+        let store = self.store_arc();
+        let reference_shards =
+            preread_reference_shards(store.as_ref(), namespace, &ops, tx).await?;
+
+        // Plan: build the link mutations over the snapshot state.
+        let LinkMutations {
+            builder,
+            pending_blob_ops,
+            written_links,
+            deleted_links,
+            missing_reference,
+        } = build_link_mutations(
+            namespace,
+            &ops,
+            &mut link_cache,
+            tx,
+            reads,
+            &reference_shards,
+        )?;
+
+        if let Some(digest) = missing_reference {
+            return Ok((
+                Transaction::builder().build(),
+                LinksTxCaptured {
+                    missing_reference: Some(digest),
+                    ..LinksTxCaptured::default()
+                },
+            ));
+        }
+
+        // Reclaim check: decide whether this transaction leaves the manifest
+        // blob unreferenced (its shard becomes empty AND no other namespace
+        // references it). The blob-data itself lives in the blob store; the
+        // caller reclaims it under the blob-data lock.
+        let reclaim_blob =
+            blob_will_be_unreferenced(store.as_ref(), namespace, tx, &pending_blob_ops).await?;
+
+        // Shard merges: append blob-index shard mutations and finalize.
+        let builder = append_shard_merges(
+            store.as_ref(),
+            namespace,
+            &pending_blob_ops,
+            &reference_shards,
+            builder,
+        )
+        .await?;
+
+        Ok((
+            builder.build(),
+            LinksTxCaptured {
+                written_links,
+                deleted_links,
+                prior_targets: capture_prior_targets(&ops),
+                superseded: None,
+                missing_reference: None,
+                reclaim_blob,
+            },
+        ))
     }
 
     /// The snapshot pass: read each operation's link once, in parallel,
@@ -560,6 +627,7 @@ fn build_link_mutations(
     link_cache: &mut HashMap<LinkKind, LinkMetadata>,
     tx: &LinksTx<'_>,
     reads: Vec<(String, Bytes)>,
+    reference_shards: &ReferenceShards,
 ) -> Result<LinkMutations, TxError> {
     let mut builder = Transaction::builder();
     for (key, body) in reads {
@@ -582,8 +650,12 @@ fn build_link_mutations(
         pending_blob_ops,
         written_links: Vec::new(),
         deleted_links: Vec::new(),
+        missing_reference: None,
     };
-    let acc = build_create_mutations(namespace, ops, link_cache, tx, acc)?;
+    let acc = build_create_mutations(namespace, ops, link_cache, tx, reference_shards, acc)?;
+    if acc.missing_reference.is_some() {
+        return Ok(acc);
+    }
     let acc = build_delete_mutations(namespace, ops, acc)?;
     Ok(acc)
 }
@@ -596,6 +668,7 @@ fn build_create_mutations(
     ops: &[OpSnapshot<'_>],
     link_cache: &mut HashMap<LinkKind, LinkMetadata>,
     tx: &LinksTx<'_>,
+    reference_shards: &ReferenceShards,
     mut acc: LinkMutations,
 ) -> Result<LinkMutations, TxError> {
     for op in ops {
@@ -612,6 +685,20 @@ fn build_create_mutations(
         };
 
         if link.is_tracked() && referrer.is_some() {
+            // Ownership gate: a newly-referenced digest must already hold a
+            // shard entry. Strict rejects the push, Permissive drops the link
+            // so the namespace gains no access it did not have.
+            if old_target.is_none()
+                && let Some(state) = reference_shards.get(*target)
+                && state.as_ref().is_none_or(|(_, links)| links.is_empty())
+            {
+                if tx.reference_policy() == Some(ReferencePolicy::Strict) {
+                    acc.missing_reference = Some((*target).clone());
+                    return Ok(acc);
+                }
+                continue;
+            }
+
             // Tracked link: merge referrer into existing or new metadata.
             let mut metadata = link_cache.remove(*link).unwrap_or_else(|| {
                 LinkMetadata::from_digest_at(
@@ -701,6 +788,78 @@ fn build_delete_mutations(
     Ok(acc)
 }
 
+/// The ownership pre-read: one shard read per newly-referenced digest (a
+/// tracked Create whose link does not exist yet) of a policy-checked push.
+/// [`build_create_mutations`] decides ownership on this state and
+/// [`append_shard_merges`] reuses the same bytes for the merge, so the decision
+/// joins the read set and a racing reclaim fails the commit's prepare.
+async fn preread_reference_shards(
+    store: &Store,
+    namespace: &Namespace,
+    ops: &[OpSnapshot<'_>],
+    tx: &LinksTx<'_>,
+) -> Result<ReferenceShards, TxError> {
+    let mut shards = ReferenceShards::new();
+    if !matches!(
+        tx.reference_policy(),
+        Some(ReferencePolicy::Strict | ReferencePolicy::Permissive)
+    ) {
+        return Ok(shards);
+    }
+
+    for op in ops {
+        let OpSnapshot::Create {
+            link,
+            target,
+            old_target,
+            referrer,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        if !link.is_tracked()
+            || referrer.is_none()
+            || old_target.is_some()
+            || shards.contains_key(*target)
+        {
+            continue;
+        }
+        let shard_path = path_builder::blob_index_shard_path(target, namespace);
+        let existing = read_shard(store, &shard_path)
+            .await
+            .map_err(TxError::Storage)?;
+        shards.insert((*target).clone(), existing);
+    }
+    Ok(shards)
+}
+
+/// The shard-merge step: append each pending digest's blob-index shard
+/// mutation, reusing the pre-read state for digests in `reference_shards` so
+/// the ownership decision's read is the one the commit validates.
+async fn append_shard_merges(
+    store: &Store,
+    namespace: &Namespace,
+    pending_blob_ops: &HashMap<Digest, Vec<BlobIndexOperation>>,
+    reference_shards: &ReferenceShards,
+    mut builder: TransactionBuilder,
+) -> Result<TransactionBuilder, TxError> {
+    for (digest, shard_ops) in pending_blob_ops {
+        builder = match reference_shards.get(digest) {
+            Some(state) => {
+                let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+                let existing = state.as_ref().map(|(raw, _)| raw.clone());
+                append_shard_ops(shard_path, existing, shard_ops, builder)
+                    .map_err(TxError::Serde)?
+            }
+            None => append_shard_for_digest(store, namespace, digest, shard_ops, builder)
+                .await
+                .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?,
+        };
+    }
+    Ok(builder)
+}
+
 /// The reclaim check: decide whether this transaction leaves the manifest blob
 /// unreferenced (its namespace shard becomes empty and no other namespace
 /// references it). The caller reclaims the blob-data from the blob store; the
@@ -758,13 +917,23 @@ impl MetadataStore {
     /// is written separately to the blob store by the caller. Returns the
     /// [`LinksCommit`] carrying each created link's commit-validated prior
     /// target.
+    ///
+    /// `reference_policy` governs newly-referenced digests the namespace does
+    /// not own, checked inside the transaction so the decision cannot race a
+    /// concurrent reclaim: Strict fails the push with
+    /// [`Error::ManifestBlobUnknown`], Permissive drops the unowned link,
+    /// Trusted grants blindly.
     pub async fn store_manifest(
         &self,
         namespace: &Namespace,
         operations: &[LinkOperation],
         created_at: Option<DateTime<Utc>>,
+        reference_policy: ReferencePolicy,
     ) -> Result<LinksCommit, Error> {
-        let tx = LinksTx::StoreManifest { created_at };
+        let tx = LinksTx::StoreManifest {
+            created_at,
+            reference_policy,
+        };
         self.execute_links_tx(namespace, operations, tx).await
     }
 

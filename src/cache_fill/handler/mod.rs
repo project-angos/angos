@@ -133,14 +133,25 @@ impl CacheFillJobHandler {
         // those stores can be separate backends and a single executor cannot
         // commit across both. The work is idempotent, so it is safe to redo on a
         // retry even though it no longer commits atomically with job completion.
-        if self.blob_store.size(digest).await.is_ok() {
-            // Grant under the blob-data lock so it is serialized against a
-            // concurrent reclaim of the already-present bytes.
-            let ownership = BlobOwnership::new(self.metadata_store.as_ref());
-            self.metadata_store
-                .with_blob_data_lock(digest, ownership.grant(namespace, digest))
-                .await?;
-        } else {
+        //
+        // The presence check runs with the grant under the blob-data lock, so a
+        // concurrent reclaim cannot delete the bytes between the two; absent
+        // bytes fall through to the fetch path.
+        let granted = self
+            .metadata_store
+            .with_blob_data_lock(digest, async {
+                match self.blob_store.size(digest).await {
+                    Ok(_) => BlobOwnership::new(self.metadata_store.as_ref())
+                        .grant(namespace, digest)
+                        .await
+                        .map(|()| true),
+                    Err(RegistryError::BlobUnknown | RegistryError::NotFound) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })
+            .await?;
+
+        if !granted {
             let repository = self
                 .resolver
                 .resolve(namespace)

@@ -17,7 +17,7 @@ mod link;
 mod tests;
 
 pub use blob_index::{BlobIndex, BlobIndexOperation, shard::decode_blob_index_shard_namespace};
-pub use link::{LinkKind, LinkMetadata, LinkOperation, LinksCommit, LinksTx};
+pub use link::{LinkKind, LinkMetadata, LinkOperation, LinksCommit, LinksTx, ReferencePolicy};
 
 use access_time::{AccessTimeWriter, FlushHandle};
 

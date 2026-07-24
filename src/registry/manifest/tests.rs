@@ -9,6 +9,7 @@ use crate::{
     oci::{Algorithm, MediaType, Namespace, Tag},
     registry::{
         Error, Registry,
+        blob_ownership::BlobOwnership,
         metadata_store::{LinkKind, LinkMetadata, LinkOperation},
         path_builder::blob_path,
         test_utils::{
@@ -2389,6 +2390,7 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
             &namespace,
             &[LinkOperation::create(link.clone(), old_digest.clone())],
             None,
+            ReferencePolicy::Strict,
         )
         .await
         .expect("seed the tag and warm the cache");
@@ -2442,6 +2444,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
             &namespace,
             &[LinkOperation::create(link.clone(), newer_digest.clone())],
             Some(newer_ts),
+            ReferencePolicy::Strict,
         )
         .await
         .expect("seed the newer replicated write");
@@ -2453,6 +2456,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
             &namespace,
             &[LinkOperation::create(link.clone(), older_digest.clone())],
             Some(newer_ts - chrono::Duration::hours(1)),
+            ReferencePolicy::Strict,
         )
         .await
         .err();
@@ -2467,6 +2471,153 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
         .expect("the winning link must survive");
     assert_eq!(metadata.target, newer_digest);
     assert_eq!(metadata.created_at, Some(newer_ts));
+}
+
+/// A delete or prune can reclaim a referenced blob while a push is in flight.
+/// The link transaction owns the ownership check, so a strict push whose
+/// reference lost its shard entry must be rejected instead of committing a
+/// manifest whose layer bytes are gone.
+#[tokio::test]
+async fn store_manifest_strict_rejects_a_reference_whose_grant_was_reclaimed() {
+    let test_case = FSRegistryTestCase::new();
+    let store = test_case.metadata_store();
+    let namespace = Namespace::new("guard-repo").unwrap();
+
+    let manifest_digest = Digest::sha256_of_bytes(b"guard-manifest");
+    let layer_digest = Digest::sha256_of_bytes(b"guard-layer");
+    let ops = [
+        LinkOperation::create(
+            LinkKind::Digest(manifest_digest.clone()),
+            manifest_digest.clone(),
+        ),
+        LinkOperation::create_with_referrer(
+            LinkKind::Layer(layer_digest.clone()),
+            layer_digest.clone(),
+            manifest_digest.clone(),
+        ),
+    ];
+
+    let result = store
+        .store_manifest(&namespace, &ops, None, ReferencePolicy::Strict)
+        .await
+        .err();
+    assert!(
+        matches!(result, Some(Error::ManifestBlobUnknown)),
+        "a strict reference without a live grant must fail the push, got: {result:?}"
+    );
+    assert!(
+        store
+            .read_link_reference(&namespace, &LinkKind::Digest(manifest_digest))
+            .await
+            .is_err(),
+        "the rejected push must not commit any link"
+    );
+}
+
+#[tokio::test]
+async fn store_manifest_strict_accepts_a_reference_with_a_live_grant() {
+    let test_case = FSRegistryTestCase::new();
+    let store = test_case.metadata_store();
+    let namespace = Namespace::new("guard-repo").unwrap();
+
+    let manifest_digest = Digest::sha256_of_bytes(b"granted-manifest");
+    let layer_digest = Digest::sha256_of_bytes(b"granted-layer");
+    BlobOwnership::new(&store)
+        .grant(&namespace, &layer_digest)
+        .await
+        .expect("seed the layer's ownership grant");
+
+    let ops = [
+        LinkOperation::create(
+            LinkKind::Digest(manifest_digest.clone()),
+            manifest_digest.clone(),
+        ),
+        LinkOperation::create_with_referrer(
+            LinkKind::Layer(layer_digest.clone()),
+            layer_digest.clone(),
+            manifest_digest.clone(),
+        ),
+    ];
+
+    store
+        .store_manifest(&namespace, &ops, None, ReferencePolicy::Strict)
+        .await
+        .expect("a strict push with a live grant must commit");
+    store
+        .read_link_reference(&namespace, &LinkKind::Layer(layer_digest))
+        .await
+        .expect("the layer link must be written");
+}
+
+/// A Trusted (pull-through) push references content whose grants may not exist
+/// yet, so it must keep creating first grants on an absent shard.
+#[tokio::test]
+async fn store_manifest_trusted_creates_first_grant_without_prior_entry() {
+    let test_case = FSRegistryTestCase::new();
+    let store = test_case.metadata_store();
+    let namespace = Namespace::new("guard-repo").unwrap();
+
+    let manifest_digest = Digest::sha256_of_bytes(b"trusted-manifest");
+    let layer_digest = Digest::sha256_of_bytes(b"trusted-layer");
+    let ops = [
+        LinkOperation::create(
+            LinkKind::Digest(manifest_digest.clone()),
+            manifest_digest.clone(),
+        ),
+        LinkOperation::create_with_referrer(
+            LinkKind::Layer(layer_digest.clone()),
+            layer_digest.clone(),
+            manifest_digest.clone(),
+        ),
+    ];
+
+    store
+        .store_manifest(&namespace, &ops, None, ReferencePolicy::Trusted)
+        .await
+        .expect("a trusted push must commit without a prior grant");
+    store
+        .read_link_reference(&namespace, &LinkKind::Layer(layer_digest))
+        .await
+        .expect("the layer link must be written");
+}
+
+/// A permissive push must not grant access to an unowned reference: the link
+/// transaction drops the unowned tracked link and commits the rest.
+#[tokio::test]
+async fn store_manifest_permissive_drops_an_unowned_reference() {
+    let test_case = FSRegistryTestCase::new();
+    let store = test_case.metadata_store();
+    let namespace = Namespace::new("guard-repo").unwrap();
+
+    let manifest_digest = Digest::sha256_of_bytes(b"permissive-manifest");
+    let layer_digest = Digest::sha256_of_bytes(b"permissive-layer");
+    let ops = [
+        LinkOperation::create(
+            LinkKind::Digest(manifest_digest.clone()),
+            manifest_digest.clone(),
+        ),
+        LinkOperation::create_with_referrer(
+            LinkKind::Layer(layer_digest.clone()),
+            layer_digest.clone(),
+            manifest_digest.clone(),
+        ),
+    ];
+
+    store
+        .store_manifest(&namespace, &ops, None, ReferencePolicy::Permissive)
+        .await
+        .expect("a permissive push must commit without the unowned link");
+    store
+        .read_link_reference(&namespace, &LinkKind::Digest(manifest_digest))
+        .await
+        .expect("the digest self-link must be written");
+    assert!(
+        store
+            .read_link_reference(&namespace, &LinkKind::Layer(layer_digest))
+            .await
+            .is_err(),
+        "the unowned layer link must be dropped"
+    );
 }
 
 /// The pre-write delete gate in `delete_manifest` is also check-then-write: a
@@ -2488,6 +2639,7 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
             &namespace,
             &[LinkOperation::create(link.clone(), digest.clone())],
             Some(newer_ts),
+            ReferencePolicy::Strict,
         )
         .await
         .expect("seed the newer tag");

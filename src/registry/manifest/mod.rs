@@ -20,8 +20,7 @@ use crate::{
     oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag},
     registry::{
         Error, Registry, Repository,
-        blob_ownership::BlobOwnership,
-        metadata_store::{LinkKind, LinkMetadata, LinkOperation, LinksCommit},
+        metadata_store::{LinkKind, LinkMetadata, LinkOperation, LinksCommit, ReferencePolicy},
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
@@ -30,22 +29,6 @@ use crate::{
 };
 
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
-
-/// How a manifest push treats descriptors that reference content the target
-/// namespace does not already own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReferencePolicy {
-    /// Reject the push with `MANIFEST_BLOB_UNKNOWN`.
-    Strict,
-    /// Store the manifest but skip the ownership-granting links for unowned
-    /// references, so they stay dangling and resolve as unknown on a later pull
-    /// instead of handing the namespace read access to content it never pushed.
-    Permissive,
-    /// Trust every reference as owned. Used only by pull-through cache-fill,
-    /// where the referenced content is fetched from the upstream the namespace
-    /// mirrors.
-    Trusted,
-}
 
 /// The inputs to [`Registry::accept_put_manifest`]; the manifest body is passed
 /// separately as a stream. Shared with the HTTP handler that builds it, so the
@@ -486,7 +469,7 @@ impl Registry {
             .cloned()
             .or_else(|| manifest.media_type.clone());
 
-        let mut ops = link_plan::push(
+        let ops = link_plan::push(
             &mut manifest,
             &computed_digest,
             reference,
@@ -495,15 +478,11 @@ impl Registry {
             created_tags,
         );
 
-        match reference_policy {
-            ReferencePolicy::Strict => {
-                self.validate_manifest_references(namespace, &manifest)
-                    .await?;
-            }
-            ReferencePolicy::Permissive => {
-                ops = self.retain_owned_reference_links(namespace, ops).await?;
-            }
-            ReferencePolicy::Trusted => {}
+        // Ownership of the referenced digests is checked by the link
+        // transaction itself, per `reference_policy`; a strict push only
+        // pre-verifies that the referenced bytes exist.
+        if reference_policy == ReferencePolicy::Strict {
+            self.validate_manifest_references(&manifest).await?;
         }
 
         // Write the manifest blob-data to the blob store before the link
@@ -518,7 +497,7 @@ impl Registry {
                     .put_blob(&computed_digest, Bytes::copy_from_slice(body))
                     .await?;
                 self.metadata_store
-                    .store_manifest(namespace, &ops, created_at)
+                    .store_manifest(namespace, &ops, created_at, reference_policy)
                     .await
             })
             .await?;
@@ -544,69 +523,30 @@ impl Registry {
         })
     }
 
-    async fn validate_manifest_references(
-        &self,
-        namespace: &Namespace,
-        manifest: &Manifest,
-    ) -> Result<(), Error> {
-        let ownership = self.blob_ownership();
-
+    /// Verifies each referenced blob's bytes exist; ownership is checked by
+    /// the link transaction, where the read is commit-validated.
+    async fn validate_manifest_references(&self, manifest: &Manifest) -> Result<(), Error> {
         if let Some(config) = &manifest.config {
-            self.validate_manifest_reference(namespace, &ownership, &config.digest)
-                .await?;
+            self.validate_manifest_reference(&config.digest).await?;
         }
 
         for layer in &manifest.layers {
-            self.validate_manifest_reference(namespace, &ownership, &layer.digest)
-                .await?;
+            self.validate_manifest_reference(&layer.digest).await?;
         }
 
         for child in &manifest.manifests {
-            self.validate_manifest_reference(namespace, &ownership, &child.digest)
-                .await?;
+            self.validate_manifest_reference(&child.digest).await?;
         }
 
         Ok(())
     }
 
-    async fn validate_manifest_reference(
-        &self,
-        namespace: &Namespace,
-        ownership: &BlobOwnership<'_>,
-        digest: &Digest,
-    ) -> Result<(), Error> {
-        if !ownership.can_read(namespace, digest).await? {
-            return Err(Error::ManifestBlobUnknown);
-        }
-
+    async fn validate_manifest_reference(&self, digest: &Digest) -> Result<(), Error> {
         match self.blob_store.size(digest).await {
             Ok(_) => Ok(()),
             Err(Error::BlobUnknown | Error::NotFound) => Err(Error::ManifestBlobUnknown),
             Err(error) => Err(error),
         }
-    }
-
-    /// Drops the content-reference links (config, layer, child manifest) for
-    /// descriptors the namespace does not already own, leaving the manifest's
-    /// own digest, tag, and subject back-link untouched, so a permissive push
-    /// never grants read access to a digest the namespace did not upload.
-    async fn retain_owned_reference_links(
-        &self,
-        namespace: &Namespace,
-        ops: Vec<LinkOperation>,
-    ) -> Result<Vec<LinkOperation>, Error> {
-        let ownership = self.blob_ownership();
-        let mut retained = Vec::with_capacity(ops.len());
-        for op in ops {
-            if let LinkOperation::Create { link, target, .. } = &op
-                && link.is_tracked()
-                && !ownership.can_read(namespace, target).await?
-            {
-                continue;
-            }
-            retained.push(op);
-        }
-        Ok(retained)
     }
 
     /// Deletes a manifest or tag. The delete's initiator is read off the
