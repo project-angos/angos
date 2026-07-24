@@ -4,14 +4,13 @@
 //! transaction reads + mutations. Both the link-transaction planner and the
 //! standalone shard writers in [`super`] build on these.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use bytes::Bytes;
 use serde_json::Value;
 
 use angos_tx_engine::{
     StorageError,
-    error::Error as TxError,
     store::Store,
     transaction::{Mutation, TransactionBuilder},
 };
@@ -163,32 +162,6 @@ pub async fn append_shard_for_digest(
         Err(e) => return Err(Error::from(e)),
     };
     append_shard_ops(shard_path, existing, ops, builder).map_err(Error::from)
-}
-
-/// Return the ops slice for `digest` from the map, or an empty slice.
-pub fn ops_for_digest<'a>(
-    map: &'a HashMap<Digest, Vec<BlobIndexOperation>>,
-    digest: &Digest,
-) -> &'a [BlobIndexOperation] {
-    map.get(digest).map_or(&[] as &[_], Vec::as_slice)
-}
-
-/// Check whether the shard at `shard_path` will be empty after applying `ops`.
-pub async fn shard_will_be_empty(
-    store: &Store,
-    ops: &[BlobIndexOperation],
-    shard_path: &str,
-) -> Result<bool, TxError> {
-    match read_shard(store, shard_path)
-        .await
-        .map_err(TxError::Storage)?
-    {
-        Some((_, mut links)) => {
-            apply_blob_index_operations(&mut links, ops);
-            Ok(links.is_empty())
-        }
-        None => Ok(true),
-    }
 }
 
 /// Return `true` when any namespace other than `our_namespace` has a live

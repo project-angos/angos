@@ -6,6 +6,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use angos_storage::ObjectStore;
+use angos_tx_engine::StorageError;
 
 use crate::{
     command::maintenance::{
@@ -20,6 +21,7 @@ use crate::{
         Error as RegistryError, Registry,
         blob_store::{self, BlobStore, MultipartCleanup},
         metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
+        path_builder,
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
@@ -178,6 +180,11 @@ impl Executor {
             .await
     }
 
+    /// Remove a blob-index entry under the `blob-data:{blob}` lock, re-checking
+    /// at apply time that the removal is still justified: a byteless grant
+    /// (prune's sweep) or a dangling entry whose link file is gone (scrub's
+    /// shard pass). An entry re-legitimized since classification, by an upload
+    /// or cache fill landing the bytes or a push recreating the link, is kept.
     async fn remove_blob_index_link(
         &self,
         namespace: Namespace,
@@ -185,9 +192,48 @@ impl Executor {
         link: LinkKind,
     ) -> Result<(), Error> {
         self.metadata_store
-            .update_blob_index(&namespace, &blob, BlobIndexOperation::Remove(link))
-            .await?;
-        Ok(())
+            .with_blob_data_lock(&blob, async {
+                let bytes_exist = match self.blob_store.size(&blob).await {
+                    Ok(_) => true,
+                    Err(RegistryError::BlobUnknown | RegistryError::NotFound) => false,
+                    Err(e) => return Err(Error::from(e)),
+                };
+                if bytes_exist && self.entry_still_backed(&namespace, &link).await? {
+                    info!(
+                        "skipping blob-index removal: entry for '{namespace}/{blob}' is live again"
+                    );
+                    return Ok(());
+                }
+                self.metadata_store
+                    .update_blob_index(&namespace, &blob, BlobIndexOperation::Remove(link))
+                    .await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Whether the shard entry for `link` is still backed: a blob self-grant is
+    /// its own record, every other kind is backed by its link file.
+    async fn entry_still_backed(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+    ) -> Result<bool, Error> {
+        if matches!(link, LinkKind::Blob(_)) {
+            return Ok(true);
+        }
+        let link_key = path_builder::link_path(link, namespace);
+        match self
+            .metadata_store
+            .store()
+            .object_store()
+            .head(&link_key)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(e) => Err(Error::from(RegistryError::from(e))),
+        }
     }
 
     /// Re-add a blob-index grant the index is missing for a still-referenced
@@ -674,6 +720,173 @@ mod tests {
             assert!(
                 blob_store.read(&orphan_digest).await.is_err(),
                 "real-run must delete the blob"
+            );
+        })
+        .await;
+    }
+
+    /// A cache fill or upload can land bytes for a grant classified as
+    /// byteless; the apply-time re-check must then keep the grant.
+    #[tokio::test]
+    async fn executor_remove_blob_index_link_keeps_byteless_grant_after_bytes_land() {
+        for_each_backend(async |test_case| {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let namespace = Namespace::new("test-repo/app").unwrap();
+
+            // Grant first (as an upload does), then the bytes land before the
+            // prune-emitted removal is applied.
+            let digest = put_blob_direct(metadata_store.store(), b"bytes landed late").await;
+            metadata_store
+                .update_blob_index(
+                    &namespace,
+                    &digest,
+                    BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
+                )
+                .await
+                .unwrap();
+
+            let executor = Executor::new_for_test(blob_store, metadata_store.clone());
+            executor
+                .apply(Action::RemoveBlobIndexLink {
+                    namespace: namespace.clone(),
+                    blob: digest.clone(),
+                    link: LinkKind::Blob(digest.clone()),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &digest)
+                    .await
+                    .is_ok_and(|links| links.contains(&LinkKind::Blob(digest.clone()))),
+                "a grant whose bytes exist must survive the stale removal"
+            );
+        })
+        .await;
+    }
+
+    /// A genuinely byteless grant past the window is still removed.
+    #[tokio::test]
+    async fn executor_remove_blob_index_link_removes_byteless_grant() {
+        for_each_backend(async |test_case| {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let namespace = Namespace::new("test-repo/app").unwrap();
+
+            let digest = Digest::sha256_of_bytes(b"never uploaded");
+            metadata_store
+                .update_blob_index(
+                    &namespace,
+                    &digest,
+                    BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
+                )
+                .await
+                .unwrap();
+
+            let executor = Executor::new_for_test(blob_store, metadata_store.clone());
+            executor
+                .apply(Action::RemoveBlobIndexLink {
+                    namespace: namespace.clone(),
+                    blob: digest.clone(),
+                    link: LinkKind::Blob(digest.clone()),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &digest)
+                    .await
+                    .is_err(),
+                "a byteless grant must be removed"
+            );
+        })
+        .await;
+    }
+
+    /// A push can recreate the link file behind an entry scrub confirmed
+    /// dangling; the apply-time re-check must then keep the entry.
+    #[tokio::test]
+    async fn executor_remove_blob_index_link_keeps_entry_whose_link_reappeared() {
+        for_each_backend(async |test_case| {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let namespace = Namespace::new("test-repo/app").unwrap();
+
+            // A tracked layer link: file and shard entry both live, bytes present.
+            let digest = put_blob_direct(metadata_store.store(), b"layer re-pushed").await;
+            let parent = Digest::sha256_of_bytes(b"parent manifest");
+            metadata_store
+                .update_links(
+                    &namespace,
+                    &[LinkOperation::create_with_referrer(
+                        LinkKind::Layer(digest.clone()),
+                        digest.clone(),
+                        parent,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let executor = Executor::new_for_test(blob_store, metadata_store.clone());
+            executor
+                .apply(Action::RemoveBlobIndexLink {
+                    namespace: namespace.clone(),
+                    blob: digest.clone(),
+                    link: LinkKind::Layer(digest.clone()),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &digest)
+                    .await
+                    .is_ok_and(|links| links.contains(&LinkKind::Layer(digest.clone()))),
+                "an entry backed by a live link file must survive the stale removal"
+            );
+        })
+        .await;
+    }
+
+    /// A dangling entry (link file gone, bytes present) is still removed.
+    #[tokio::test]
+    async fn executor_remove_blob_index_link_removes_dangling_entry() {
+        for_each_backend(async |test_case| {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let namespace = Namespace::new("test-repo/app").unwrap();
+
+            // Shard entry without its link file: the dangling state scrub's
+            // shard pass confirms before emitting the removal.
+            let digest = put_blob_direct(metadata_store.store(), b"dangling entry").await;
+            metadata_store
+                .update_blob_index(
+                    &namespace,
+                    &digest,
+                    BlobIndexOperation::Insert(LinkKind::Layer(digest.clone())),
+                )
+                .await
+                .unwrap();
+
+            let executor = Executor::new_for_test(blob_store, metadata_store.clone());
+            executor
+                .apply(Action::RemoveBlobIndexLink {
+                    namespace: namespace.clone(),
+                    blob: digest.clone(),
+                    link: LinkKind::Layer(digest.clone()),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &digest)
+                    .await
+                    .is_err(),
+                "a dangling entry must be removed"
             );
         })
         .await;
