@@ -12,6 +12,6 @@ mod storage;
 
 pub use kind::LinkKind;
 pub use metadata::LinkMetadata;
-pub use operation::LinkOperation;
+pub use operation::{LinkOperation, ReferencePolicy};
 pub use ops::LinksCommit;
 pub use ops::LinksTx;

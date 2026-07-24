@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.4.2 - UNRELEASED
+
+### Fixed
+
+- A manifest push now checks reference ownership inside the link transaction (strict rejects, permissive drops the link), so a delete or prune reclaiming a referenced blob mid-push can no longer slip a manifest whose layer bytes are gone past the pre-write validation.
+- The pull-through cache-fill grant path now checks byte presence inside the blob-data lock, so a reclaim racing the fill can no longer leave a dangling ownership grant on deleted bytes.
+
 ## 1.4.1
 
 ### Fixed
