@@ -96,20 +96,15 @@ pub async fn put_intent(store: &dyn ObjectStore, intent: &IntentRecord) {
 /// fresh [`memory_lock`] so the sweep still exercises the production
 /// ownership-takeover path, uncontended.
 pub async fn sweep_once(store: Arc<dyn ObjectStore>, lock: Arc<Lock>) {
-    RecoveryLoop::builder(store)
-        .lock(lock)
-        .build()
-        .sweep()
-        .await;
+    RecoveryLoop::builder(store, lock).build().sweep().await;
 }
 
 /// Run a single recovery sweep over `store`, replaying through its
 /// conditional primitives (the CAS deployment shape, where one backend serves
 /// both store roles).
 pub async fn sweep_once_cas(store: Arc<dyn ConditionalStore>, lock: Arc<Lock>) {
-    RecoveryLoop::builder(store.clone())
+    RecoveryLoop::builder(store.clone(), lock)
         .conditional_store(store)
-        .lock(lock)
         .build()
         .sweep()
         .await;

@@ -6,10 +6,13 @@
 //! a [`LockSession`]; the session is released with [`LockSession::release`].
 //!
 //! A background heartbeat refreshes the TTL at `ttl_secs/3` intervals.
-//! When the heartbeat detects ownership loss (`ETag` mismatch on refresh) or
-//! exhausts its retry budget, it fires the session's [`CancellationToken`], so
-//! a caller racing its operation against [`LockSession::cancellation`] can
-//! observe the loss at its next await point.
+//! When the heartbeat detects ownership loss (`ETag` mismatch on refresh, or a
+//! foreign `writer_nonce` when the `ETag` had to be re-read) or exhausts its
+//! retry budget, it fires the session's [`CancellationToken`], so a caller
+//! racing its operation against [`LockSession::cancellation`] can observe the
+//! loss at its next await point. The nonce is minted once per session and
+//! rewritten unchanged by every refresh, so it identifies the holder across the
+//! whole session.
 //!
 //! ## Stale-lock recovery
 //!
@@ -47,7 +50,9 @@ use crate::lock::{
 
 // constants
 
-const MAX_LOCK_TTL_SECS: u64 = 3600;
+/// Longest TTL a lock may declare. Also the grace the `LockJanitor` ages an
+/// unparseable lock body by, since such a body cannot state its own TTL.
+pub const MAX_LOCK_TTL_SECS: u64 = 3600;
 
 /// The heartbeat refreshes a held lock every `ttl_secs / HEARTBEAT_DIVISOR`,
 /// leaving two missed ticks of slack before the TTL expires.
@@ -208,11 +213,11 @@ impl Lock {
         self.storage.is_process_shared()
     }
 
-    fn make_body(&self) -> Result<Vec<u8>, Error> {
+    fn make_body(&self, writer_nonce: Uuid) -> Result<Vec<u8>, Error> {
         let body = LockBody {
             refreshed_at: Utc::now(),
             ttl_secs: self.ttl_secs,
-            writer_nonce: Uuid::new_v4(),
+            writer_nonce,
         };
         serde_json::to_vec(&body)
             .map_err(|e| Error::InvalidData(format!("lock body serialization failed: {e}")))
@@ -220,8 +225,12 @@ impl Lock {
 
     /// Try once to acquire a single key. Returns `Ok(Some(etag))` on success,
     /// `Ok(None)` on contention, or `Err` on a hard storage error.
-    async fn try_acquire_one(&self, key: &str) -> Result<Option<String>, Error> {
-        let body = self.make_body()?;
+    async fn try_acquire_one(
+        &self,
+        key: &str,
+        writer_nonce: Uuid,
+    ) -> Result<Option<String>, Error> {
+        let body = self.make_body(writer_nonce)?;
         match self.storage.put_if_absent(key, body).await? {
             PutIfAbsentOutcome::Created(etag) => Ok(Some(etag)),
             PutIfAbsentOutcome::AlreadyExists => Ok(None),
@@ -231,7 +240,11 @@ impl Lock {
     /// Attempt to recover a stale lock at `key`. Returns `Ok(Some(etag))` when
     /// the stale lock was claimed, `Ok(None)` when the lock is still fresh or
     /// the race was lost, `Err` on a hard error.
-    async fn try_recover_stale(&self, key: &str) -> Result<Option<String>, Error> {
+    async fn try_recover_stale(
+        &self,
+        key: &str,
+        writer_nonce: Uuid,
+    ) -> Result<Option<String>, Error> {
         let (data, etag, last_modified) = match self.storage.get_with_etag(key).await {
             Ok(t) => t,
             Err(Error::NotFound) => return Ok(None),
@@ -251,7 +264,7 @@ impl Lock {
             "Lock: recovering stale lock"
         );
 
-        let new_body = self.make_body()?;
+        let new_body = self.make_body(writer_nonce)?;
         match self.storage.put_if_match(key, &etag, new_body).await? {
             PutIfMatchOutcome::Updated(new_etag) => {
                 lock_metrics().record_recovery(self.storage.label(), "success");
@@ -286,14 +299,15 @@ impl Lock {
         let label = self.storage.label();
         let mut retries = self.max_retries;
         let start = Instant::now();
+        let writer_nonce = Uuid::new_v4();
 
         loop {
-            match self.try_acquire_all_sequential(&sorted).await {
+            match self.try_acquire_all_sequential(&sorted, writer_nonce).await {
                 AcquireAllOutcome::Acquired(etags) => {
                     let metrics = lock_metrics();
                     metrics.observe_acquisition_duration(label, elapsed_ms(start));
                     metrics.record_acquisition(label, "success");
-                    return Ok(self.make_session(sorted, etags));
+                    return Ok(self.make_session(sorted, etags, writer_nonce));
                 }
                 AcquireAllOutcome::HardError(e) => {
                     lock_metrics().observe_acquisition_duration(label, elapsed_ms(start));
@@ -336,13 +350,14 @@ impl Lock {
 
         let label = self.storage.label();
         let start = Instant::now();
+        let writer_nonce = Uuid::new_v4();
 
-        match self.try_acquire_all_sequential(&sorted).await {
+        match self.try_acquire_all_sequential(&sorted, writer_nonce).await {
             AcquireAllOutcome::Acquired(etags) => {
                 let metrics = lock_metrics();
                 metrics.observe_acquisition_duration(label, elapsed_ms(start));
                 metrics.record_acquisition(label, "success");
-                Ok(Some(self.make_session(sorted, etags)))
+                Ok(Some(self.make_session(sorted, etags, writer_nonce)))
             }
             AcquireAllOutcome::HardError(e) => {
                 lock_metrics().observe_acquisition_duration(label, elapsed_ms(start));
@@ -361,35 +376,39 @@ impl Lock {
     /// Acquire every key in order, rolling back on failure: any non-acquired
     /// outcome releases the already-acquired paths here, so callers never own
     /// cleanup.
-    async fn try_acquire_all_sequential(&self, sorted_keys: &[String]) -> AcquireAllOutcome {
+    async fn try_acquire_all_sequential(
+        &self,
+        sorted_keys: &[String],
+        writer_nonce: Uuid,
+    ) -> AcquireAllOutcome {
         // Acquired (path, etag) pairs, in acquisition order, so a failed
         // multi-key attempt rolls back exactly what it wrote.
         let mut acquired: Vec<(String, String)> = Vec::new();
 
         for key in sorted_keys {
-            match self.try_acquire_one(key).await {
+            match self.try_acquire_one(key, writer_nonce).await {
                 Ok(Some(etag)) => {
                     acquired.push((key.clone(), etag));
                 }
                 Ok(None) => {
                     // Contended. Try stale-lock recovery.
-                    match self.try_recover_stale(key).await {
+                    match self.try_recover_stale(key, writer_nonce).await {
                         Ok(Some(new_etag)) => {
                             acquired.push((key.clone(), new_etag));
                         }
                         Ok(None) => {
                             // Still held or lost the recovery race.
-                            self.release_paths(&acquired).await;
+                            self.release_paths(&acquired, writer_nonce).await;
                             return AcquireAllOutcome::Retry;
                         }
                         Err(e) => {
-                            self.release_paths(&acquired).await;
+                            self.release_paths(&acquired, writer_nonce).await;
                             return AcquireAllOutcome::HardError(e);
                         }
                     }
                 }
                 Err(e) => {
-                    self.release_paths(&acquired).await;
+                    self.release_paths(&acquired, writer_nonce).await;
                     return AcquireAllOutcome::HardError(e);
                 }
             }
@@ -398,9 +417,9 @@ impl Lock {
         AcquireAllOutcome::Acquired(acquired.into_iter().collect())
     }
 
-    async fn release_paths(&self, acquired: &[(String, String)]) {
+    async fn release_paths(&self, acquired: &[(String, String)], writer_nonce: Uuid) {
         for (path, etag) in acquired {
-            release_single_path(self.storage.as_ref(), path, Some(etag)).await;
+            release_single_path(self.storage.as_ref(), path, Some(etag), writer_nonce).await;
         }
     }
 
@@ -408,11 +427,16 @@ impl Lock {
         &self,
         paths: Vec<String>,
         initial_etags: HashMap<String, String>,
+        writer_nonce: Uuid,
     ) -> LockSession {
         let cancellation = CancellationToken::new();
         let etag_cache = Arc::new(RwLock::new(initial_etags));
-        let heartbeat_handle =
-            self.spawn_heartbeat(paths.clone(), cancellation.clone(), etag_cache.clone());
+        let heartbeat_handle = self.spawn_heartbeat(
+            paths.clone(),
+            cancellation.clone(),
+            etag_cache.clone(),
+            writer_nonce,
+        );
         let storage = self.storage.clone();
         let cancellation_for_release = cancellation.clone();
 
@@ -423,6 +447,7 @@ impl Lock {
                     paths,
                     etag_cache,
                     storage,
+                    writer_nonce,
                 ))
             },
             cancellation,
@@ -435,6 +460,7 @@ impl Lock {
         paths: Vec<String>,
         cancellation: CancellationToken,
         etag_cache: Arc<RwLock<HashMap<String, String>>>,
+        writer_nonce: Uuid,
     ) -> JoinHandle<()> {
         let storage = self.storage.clone();
         let ttl_secs = self.ttl_secs;
@@ -470,6 +496,7 @@ impl Lock {
                     ttl_secs,
                     tick_interval,
                     &etag_cache,
+                    writer_nonce,
                     &mut consecutive_failures,
                 )
                 .await
@@ -499,6 +526,7 @@ async fn run_heartbeat_tick(
     ttl_secs: u64,
     tick_deadline: Duration,
     etag_cache: &Arc<RwLock<HashMap<String, String>>>,
+    writer_nonce: Uuid,
     consecutive_failures: &mut u32,
 ) -> HeartbeatOutcome {
     let mut had_failure = false;
@@ -518,7 +546,7 @@ async fn run_heartbeat_tick(
         |(path, cached_etag)| async move {
             match timeout(
                 tick_deadline,
-                heartbeat_tick_path(storage, path, ttl_secs, cached_etag),
+                heartbeat_tick_path(storage, path, ttl_secs, cached_etag, writer_nonce),
             )
             .await
             {
@@ -567,8 +595,11 @@ async fn run_heartbeat_tick(
 
     if had_failure {
         *consecutive_failures = consecutive_failures.saturating_add(1);
-        let ticks_per_ttl = ttl_secs / (ttl_secs / 3).max(1);
-        if u64::from(*consecutive_failures) >= ticks_per_ttl {
+        // One tick short of a full TTL of failures: the lease must be given up
+        // while it is still valid, or a peer recovers the expired lock while
+        // this session still believes it holds it.
+        let ticks_per_ttl = ttl_secs / (ttl_secs / HEARTBEAT_DIVISOR).max(1);
+        if u64::from(*consecutive_failures) >= ticks_per_ttl.saturating_sub(1) {
             warn!(
                 consecutive_failures,
                 "Lock: too many consecutive heartbeat failures, invalidating"
@@ -593,12 +624,13 @@ async fn heartbeat_tick_path(
     path: &str,
     ttl_secs: u64,
     cached_etag: Option<String>,
+    writer_nonce: Uuid,
 ) -> PathTickOutcome {
     let make_body = || -> Result<Vec<u8>, String> {
         let body = LockBody {
             refreshed_at: Utc::now(),
             ttl_secs,
-            writer_nonce: Uuid::new_v4(),
+            writer_nonce,
         };
         serde_json::to_vec(&body).map_err(|e| e.to_string())
     };
@@ -627,10 +659,10 @@ async fn heartbeat_tick_path(
         }
     }
 
-    // No cached ETag: re-read to recover the ETag and refresh via put_if_match.
-    // Ownership loss is detected authoritatively by the put_if_match below: a
-    // Mismatch means another holder replaced the object.
-    let (_data, etag, _) = match storage.get_with_etag(path).await {
+    // No cached ETag: re-read to recover it. The live ETag alone proves nothing
+    // about ownership, so the body must still carry this session's nonce.
+    // Refreshing a peer's body would leave both sessions holding the lock.
+    let (data, etag, _) = match storage.get_with_etag(path).await {
         Ok(t) => t,
         Err(Error::NotFound) => {
             warn!(path, "Lock: lock file disappeared");
@@ -641,6 +673,11 @@ async fn heartbeat_tick_path(
             return PathTickOutcome::Failure;
         }
     };
+
+    if !body_is_ours(&data, writer_nonce) {
+        warn!(path, "Lock: lock object reclaimed by another holder");
+        return PathTickOutcome::Invalidate("ownership_lost");
+    }
 
     let body = match make_body() {
         Ok(b) => b,
@@ -666,6 +703,13 @@ async fn heartbeat_tick_path(
     }
 }
 
+/// Whether a stored lock body was written by the session holding `writer_nonce`.
+/// A body that cannot be parsed proves nothing, so it counts as another
+/// holder's.
+fn body_is_ours(data: &[u8], writer_nonce: Uuid) -> bool {
+    serde_json::from_slice::<LockBody>(data).is_ok_and(|body| body.writer_nonce == writer_nonce)
+}
+
 // Release
 
 async fn release_session(
@@ -673,6 +717,7 @@ async fn release_session(
     paths: Vec<String>,
     etag_cache: Arc<RwLock<HashMap<String, String>>>,
     storage: Arc<dyn LockStorage>,
+    writer_nonce: Uuid,
 ) {
     if cancellation.is_cancelled() {
         debug!("Lock: ownership already lost, skipping release");
@@ -686,20 +731,32 @@ async fn release_session(
             .get(path)
             .cloned();
 
-        release_single_path(storage.as_ref(), path, cached_etag.as_ref()).await;
+        release_single_path(storage.as_ref(), path, cached_etag.as_ref(), writer_nonce).await;
     }
 }
 
 /// Release one lock path with a delete conditional on its `ETag`, so a
 /// successor that already replaced the object is never deleted. An unknown
 /// `ETag` (the heartbeat forgets it after an ambiguous refresh failure) is
-/// re-read first; any residual failure leaves the object to expire via TTL
-/// and the janitor.
-async fn release_single_path(storage: &dyn LockStorage, path: &str, cached_etag: Option<&String>) {
+/// re-read first, and the re-read body is released only while it still carries
+/// this session's nonce; any residual failure leaves the object to expire via
+/// TTL and the janitor.
+async fn release_single_path(
+    storage: &dyn LockStorage,
+    path: &str,
+    cached_etag: Option<&String>,
+    writer_nonce: Uuid,
+) {
     let etag = match cached_etag {
         Some(etag) => etag.clone(),
         None => match storage.get_with_etag(path).await {
-            Ok((_, etag, _)) => etag,
+            Ok((data, etag, _)) => {
+                if !body_is_ours(&data, writer_nonce) {
+                    debug!(path, "Lock: another holder owns the lock, skipping release");
+                    return;
+                }
+                etag
+            }
             Err(Error::NotFound) => {
                 debug!(path, "Lock: already deleted");
                 return;
@@ -811,6 +868,9 @@ mod tests {
         last_delete_etag: Mutex<Option<String>>,
         /// When set, `delete_if_match` reports a mismatch.
         delete_mismatch: Mutex<bool>,
+        /// Writer nonce embedded in the bodies `get_with_etag` returns; unset
+        /// mints a fresh one per read, i.e. a foreign holder's.
+        stored_nonce: Mutex<Option<Uuid>>,
     }
 
     impl std::fmt::Debug for FakeLockStorage {
@@ -848,7 +908,11 @@ mod tests {
                 .insert(key.to_string());
         }
 
-        fn body_bytes(expired: bool) -> Vec<u8> {
+        fn set_stored_nonce(&self, nonce: Uuid) {
+            *self.stored_nonce.lock().unwrap() = Some(nonce);
+        }
+
+        fn body_bytes(&self, expired: bool) -> Vec<u8> {
             let refreshed_at = if expired {
                 Utc::now() - ChronoDuration::seconds(120)
             } else {
@@ -857,7 +921,11 @@ mod tests {
             let body = LockBody {
                 refreshed_at,
                 ttl_secs: 30,
-                writer_nonce: Uuid::new_v4(),
+                writer_nonce: self
+                    .stored_nonce
+                    .lock()
+                    .unwrap()
+                    .unwrap_or_else(Uuid::new_v4),
             };
             serde_json::to_vec(&body).unwrap()
         }
@@ -908,8 +976,8 @@ mod tests {
             _key: &str,
         ) -> Result<(Vec<u8>, String, Option<chrono::DateTime<Utc>>), Error> {
             match self.get.lock().unwrap().expect("get script set") {
-                GetScript::Expired => Ok((Self::body_bytes(true), self.mint_etag(), None)),
-                GetScript::Fresh => Ok((Self::body_bytes(false), self.mint_etag(), None)),
+                GetScript::Expired => Ok((self.body_bytes(true), self.mint_etag(), None)),
+                GetScript::Fresh => Ok((self.body_bytes(false), self.mint_etag(), None)),
                 GetScript::NotFound => Err(Error::NotFound),
                 GetScript::Failure => {
                     Err(Error::StorageBackend("injected get_with_etag error".into()))
@@ -949,6 +1017,10 @@ mod tests {
             .expect("lock builder")
     }
 
+    fn cached_etag() -> String {
+        "\"cached\"".to_string()
+    }
+
     fn cache(entries: &[(&str, &str)]) -> Arc<RwLock<HashMap<String, String>>> {
         let map: HashMap<String, String> = entries
             .iter()
@@ -964,8 +1036,14 @@ mod tests {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Mismatch);
 
-        let outcome =
-            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+        let outcome = heartbeat_tick_path(
+            storage.as_ref(),
+            "k",
+            9,
+            Some(cached_etag()),
+            Uuid::new_v4(),
+        )
+        .await;
 
         assert!(
             matches!(outcome, PathTickOutcome::Invalidate("ownership_lost")),
@@ -978,8 +1056,14 @@ mod tests {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Updated);
 
-        let outcome =
-            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+        let outcome = heartbeat_tick_path(
+            storage.as_ref(),
+            "k",
+            9,
+            Some(cached_etag()),
+            Uuid::new_v4(),
+        )
+        .await;
 
         match outcome {
             PathTickOutcome::Updated(new_etag) => {
@@ -1001,7 +1085,7 @@ mod tests {
         storage.set_get(GetScript::NotFound);
 
         // No cached ETag → slow path re-reads via get_with_etag, which is NotFound.
-        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None).await;
+        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None, Uuid::new_v4()).await;
 
         assert!(
             matches!(outcome, PathTickOutcome::Invalidate("file_disappeared")),
@@ -1010,12 +1094,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tick_path_slow_path_foreign_nonce_invalidates_ownership_lost() {
+        // A peer reclaimed the lock after the TTL expired. Refreshing its body
+        // would leave two sessions believing they hold the lock.
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::Fresh);
+        storage.set_stored_nonce(Uuid::new_v4());
+        // A refresh would succeed here, so only the nonce check can stop it.
+        storage.set_put_match(PutMatchScript::Updated);
+
+        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None, Uuid::new_v4()).await;
+
+        assert!(
+            matches!(outcome, PathTickOutcome::Invalidate("ownership_lost")),
+            "a re-read body carrying another holder's nonce must invalidate as ownership_lost"
+        );
+        assert_eq!(
+            storage.put_match_calls.load(Ordering::Relaxed),
+            0,
+            "a foreign lock object must not be refreshed"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_path_slow_path_own_nonce_refreshes() {
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::Fresh);
+        storage.set_put_match(PutMatchScript::Updated);
+        let nonce = Uuid::new_v4();
+        storage.set_stored_nonce(nonce);
+
+        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None, nonce).await;
+
+        assert!(
+            matches!(outcome, PathTickOutcome::Updated(_)),
+            "a lock object still carrying this session's nonce must be refreshed"
+        );
+    }
+
+    #[tokio::test]
     async fn tick_path_fast_path_storage_error_is_failure() {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Failure);
 
-        let outcome =
-            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+        let outcome = heartbeat_tick_path(
+            storage.as_ref(),
+            "k",
+            9,
+            Some(cached_etag()),
+            Uuid::new_v4(),
+        )
+        .await;
 
         assert!(
             matches!(outcome, PathTickOutcome::Failure),
@@ -1046,6 +1175,7 @@ mod tests {
             9,
             Duration::from_secs(3),
             &etag_cache,
+            Uuid::new_v4(),
             &mut consecutive,
         )
         .await;
@@ -1063,15 +1193,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tick_failures_escalate_after_one_ttl() {
+    async fn run_tick_failures_escalate_before_the_ttl_expires() {
         let storage = FakeLockStorage::arc();
         storage.set_put_match(PutMatchScript::Failure);
         let etag_cache = cache(&[("k", "\"cached\"")]);
         let mut consecutive = 0u32;
 
-        // ttl=9, tick=3 ⇒ ticks_per_ttl = 9 / 3 = 3 consecutive failures escalate.
-        // The cache only holds a cached ETag on the first tick; thereafter the
-        // slow path re-reads via get_with_etag, so prime that script too.
+        // ttl=9, tick=3 ⇒ 3 ticks per TTL, so the 2nd consecutive failure
+        // escalates while the lease is still valid. The cache only holds a
+        // cached ETag on the first tick; thereafter the slow path re-reads via
+        // get_with_etag, so prime that script too.
         storage.set_get(GetScript::Failure);
 
         let paths = ["k".to_string()];
@@ -1083,6 +1214,7 @@ mod tests {
             9,
             tick,
             &etag_cache,
+            Uuid::new_v4(),
             &mut consecutive,
         )
         .await;
@@ -1093,23 +1225,14 @@ mod tests {
             9,
             tick,
             &etag_cache,
-            &mut consecutive,
-        )
-        .await;
-        assert!(matches!(o2, HeartbeatOutcome::Continue));
-        let o3 = run_heartbeat_tick(
-            &paths,
-            storage.as_ref(),
-            9,
-            tick,
-            &etag_cache,
+            Uuid::new_v4(),
             &mut consecutive,
         )
         .await;
 
         assert!(
-            matches!(o3, HeartbeatOutcome::Invalidate("heartbeat_failure")),
-            "consecutive failures spanning one TTL must escalate to heartbeat_failure"
+            matches!(o2, HeartbeatOutcome::Invalidate("heartbeat_failure")),
+            "the lease must be given up one tick short of a full TTL of failures"
         );
     }
 
@@ -1126,6 +1249,7 @@ mod tests {
             9,
             Duration::from_secs(3),
             &etag_cache,
+            Uuid::new_v4(),
             &mut consecutive,
         )
         .await;
@@ -1151,6 +1275,7 @@ mod tests {
             9,
             Duration::from_secs(3),
             &etag_cache,
+            Uuid::new_v4(),
             &mut consecutive,
         )
         .await;
@@ -1170,7 +1295,10 @@ mod tests {
         storage.set_put_match(PutMatchScript::Updated);
         let lock = lock_with(storage);
 
-        let result = lock.try_recover_stale("k").await.expect("no hard error");
+        let result = lock
+            .try_recover_stale("k", Uuid::new_v4())
+            .await
+            .expect("no hard error");
         assert!(
             result.is_some(),
             "an expired lock won via put_if_match must be claimed with a fresh ETag"
@@ -1183,7 +1311,10 @@ mod tests {
         storage.set_get(GetScript::Fresh);
         let lock = lock_with(storage.clone());
 
-        let result = lock.try_recover_stale("k").await.expect("no hard error");
+        let result = lock
+            .try_recover_stale("k", Uuid::new_v4())
+            .await
+            .expect("no hard error");
         assert!(result.is_none(), "a fresh lock must not be recovered");
         assert_eq!(
             storage.put_match_calls.load(Ordering::Relaxed),
@@ -1199,7 +1330,10 @@ mod tests {
         storage.set_put_match(PutMatchScript::Mismatch);
         let lock = lock_with(storage);
 
-        let result = lock.try_recover_stale("k").await.expect("no hard error");
+        let result = lock
+            .try_recover_stale("k", Uuid::new_v4())
+            .await
+            .expect("no hard error");
         assert!(
             result.is_none(),
             "losing the put_if_match race (another replica recovered first) returns None"
@@ -1212,7 +1346,10 @@ mod tests {
         storage.set_get(GetScript::NotFound);
         let lock = lock_with(storage);
 
-        let result = lock.try_recover_stale("k").await.expect("no hard error");
+        let result = lock
+            .try_recover_stale("k", Uuid::new_v4())
+            .await
+            .expect("no hard error");
         assert!(result.is_none(), "a vanished key has nothing to recover");
     }
 
@@ -1391,8 +1528,10 @@ mod tests {
         // the live one and still delete conditionally, never unconditionally.
         let storage = FakeLockStorage::arc();
         storage.set_get(GetScript::Fresh);
+        let nonce = Uuid::new_v4();
+        storage.set_stored_nonce(nonce);
 
-        release_single_path(storage.as_ref(), "k", None).await;
+        release_single_path(storage.as_ref(), "k", None, nonce).await;
 
         assert_eq!(
             storage.delete_if_match_calls.load(Ordering::Relaxed),
@@ -1403,6 +1542,24 @@ mod tests {
         assert!(
             used.is_some_and(|e| e.starts_with("\"etag-")),
             "the conditional delete must fence on the freshly-read ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_with_forgotten_etag_spares_a_successors_lock() {
+        // The lock was reclaimed by a peer after its TTL expired, so the re-read
+        // body carries the successor's nonce. Deleting it would hand the lock to
+        // a third party.
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::Fresh);
+        storage.set_stored_nonce(Uuid::new_v4());
+
+        release_single_path(storage.as_ref(), "k", None, Uuid::new_v4()).await;
+
+        assert_eq!(
+            storage.delete_if_match_calls.load(Ordering::Relaxed),
+            0,
+            "a lock object carrying another holder's nonce must not be deleted"
         );
     }
 
@@ -1518,6 +1675,7 @@ mod tests {
             // every path succeeds is genuine overlap.
             Duration::from_secs(3),
             &etag_cache,
+            Uuid::new_v4(),
             &mut consecutive,
         )
         .await;

@@ -19,6 +19,7 @@ use uuid::Uuid;
 use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 
 use crate::intent::{INTENT_BODIES_PREFIX, INTENT_LOG_PREFIX};
+use crate::lock::primitive::MAX_LOCK_TTL_SECS;
 use crate::lock::storage::{LOCK_OBJECTS_PREFIX, LockBody};
 use crate::periodic::run_periodic;
 
@@ -391,20 +392,35 @@ impl LockJanitor {
             }
         };
 
-        let body: LockBody = match serde_json::from_slice(&bytes) {
-            Ok(b) => b,
+        // An unparseable body carries no TTL or refresh time, so the
+        // server-assigned `last_modified` is the only liveness signal left. A
+        // holder refreshes every `ttl / HEARTBEAT_DIVISOR`, so an object
+        // untouched for the longest permitted TTL plus the orphan grace is held
+        // by nobody. Leaving it forever wedges the key: every acquire on a
+        // corrupt body hard-errors, and no other path reclaims it.
+        let (reference, ttl_secs) = match serde_json::from_slice::<LockBody>(&bytes) {
+            Ok(body) => (last_modified.unwrap_or(body.refreshed_at), body.ttl_secs),
             Err(e) => {
+                let Some(modified) = last_modified else {
+                    warn!(
+                        key,
+                        error = %e,
+                        "LockJanitor: lock body failed to deserialise and carries no \
+                         last-modified time; leaving in place"
+                    );
+                    return;
+                };
                 warn!(
                     key,
                     error = %e,
-                    "LockJanitor: lock body failed to deserialise; leaving in place"
+                    "LockJanitor: lock body failed to deserialise; reclaiming it once \
+                     it has aged out"
                 );
-                return;
+                (modified, MAX_LOCK_TTL_SECS)
             }
         };
 
-        let reference = last_modified.unwrap_or(body.refreshed_at);
-        let total_grace = ChronoDuration::seconds(body.ttl_secs.cast_signed())
+        let total_grace = ChronoDuration::seconds(ttl_secs.cast_signed())
             + ChronoDuration::from_std(self.orphan_age).unwrap_or(ChronoDuration::zero());
         if Utc::now() <= reference + total_grace {
             return;
@@ -451,6 +467,7 @@ mod tests {
 
     use crate::intent::{INTENT_BODIES_PREFIX, INTENT_LOG_PREFIX};
     use crate::janitor::{BodyJanitor, LockJanitor};
+    use crate::lock::primitive::MAX_LOCK_TTL_SECS;
     use crate::lock::storage::LockBody;
 
     fn body_janitor(store: Arc<dyn ObjectStore>) -> BodyJanitor {
@@ -594,6 +611,57 @@ mod tests {
 
         let after = store.head(&lock_key("00/cold-key")).await;
         assert!(matches!(after, Err(StorageError::NotFound)));
+    }
+
+    /// Write a lock object whose body is not valid `LockBody` JSON, dated
+    /// `age` ago.
+    async fn write_corrupt_lock(store: &MemoryObjectStore, suffix: &str, age: ChronoDuration) {
+        store
+            .put(&lock_key(suffix), Bytes::from_static(b"not-a-lock-body"))
+            .await
+            .expect("put");
+        store
+            .backdate(&lock_key(suffix), Utc::now() - age)
+            .expect("backdate");
+    }
+
+    /// Regression: an unparseable body cannot state its own TTL, and every
+    /// acquire on it hard-errors, so leaving it in place blocks the key for
+    /// good. Its object mtime is the liveness signal instead.
+    #[tokio::test]
+    async fn corrupt_lock_is_reclaimed_once_it_ages_out() {
+        let store = Arc::new(MemoryObjectStore::new());
+        write_corrupt_lock(
+            &store,
+            "00/corrupt-cold",
+            ChronoDuration::seconds(MAX_LOCK_TTL_SECS.cast_signed()) + ChronoDuration::hours(1),
+        )
+        .await;
+
+        let janitor = build_janitor(store.clone() as Arc<dyn ConditionalStore>);
+        janitor.sweep().await;
+
+        let after = store.head(&lock_key("00/corrupt-cold")).await;
+        assert!(
+            matches!(after, Err(StorageError::NotFound)),
+            "a corrupt lock older than the longest TTL plus the grace must be reclaimed"
+        );
+    }
+
+    /// The flip side: a corrupt body written moments ago may still belong to a
+    /// live holder, so the grace must protect it.
+    #[tokio::test]
+    async fn recently_written_corrupt_lock_is_preserved() {
+        let store = Arc::new(MemoryObjectStore::new());
+        write_corrupt_lock(&store, "00/corrupt-hot", ChronoDuration::seconds(30)).await;
+
+        let janitor = build_janitor(store.clone() as Arc<dyn ConditionalStore>);
+        janitor.sweep().await;
+
+        store
+            .head(&lock_key("00/corrupt-hot"))
+            .await
+            .expect("a freshly-written corrupt lock must survive the grace");
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -19,11 +20,12 @@ use crate::{
     oci::{Digest, Namespace, Reference, Tag},
     registry::{
         blob_store::BlobStore,
+        manifest::PutManifestRequest,
         metadata_store::{BlobIndexOperation, LinkKind, LinkMetadata, MetadataStore},
         path_builder,
         test_utils::{
-            RegistryTestCase, for_each_backend, media_type, put_blob_direct, put_link_raw,
-            upload_blob,
+            RegistryTestCase, create_test_registry_with, for_each_backend, media_type,
+            put_blob_direct, put_link_raw, upload_blob,
         },
     },
 };
@@ -380,6 +382,89 @@ async fn missing_blob_index_grant_is_regranted() {
             links.contains(&link),
             "the layer grant must be re-issued from the manifest"
         );
+    })
+    .await;
+}
+
+/// Regression: with `allow_missing_manifest_references` the push path drops the
+/// link and grant for a digest the namespace does not own, so it gains no
+/// cross-namespace read access. Scrub re-derives child links from the manifest
+/// body and must not hand back what the write path withheld.
+#[tokio::test]
+async fn withheld_cross_namespace_reference_is_not_regranted() {
+    for_each_backend(async |test_case| {
+        let owner = &Namespace::new("test-repo/withheld-owner").unwrap();
+        let borrower = &Namespace::new("test-repo/withheld-borrower").unwrap();
+        let blob_store = test_case.blob_store();
+        let metadata_store = test_case.metadata_store();
+
+        // `owner` uploads the layer and config; `borrower` never references
+        // either, so it holds no grant on them.
+        let (_, config_digest, layer_digest) = push_healthy_image(test_case, owner).await;
+
+        // A permissive push into `borrower` naming the same digests: the layer
+        // and config links are withheld, the revision link is written.
+        let permissive =
+            create_test_registry_with(blob_store.clone(), metadata_store.clone(), false);
+        let manifest = format!(
+            r#"{{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {{
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "{config_digest}",
+                "size": 16
+            }},
+            "layers": [{{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": "{layer_digest}",
+                "size": 19
+            }}]
+        }}"#
+        );
+        permissive
+            .accept_put_manifest(
+                PutManifestRequest {
+                    namespace: borrower,
+                    reference: Reference::Tag(Tag::new("borrowed").unwrap()),
+                    mime_type: media_type("application/vnd.oci.image.manifest.v1+json"),
+                    tags: vec![],
+                    actor: None,
+                    source_ts: None,
+                },
+                Cursor::new(manifest.into_bytes()),
+            )
+            .await
+            .expect("permissive push");
+
+        for digest in [&layer_digest, &config_digest] {
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(borrower, digest)
+                    .await
+                    .is_err(),
+                "the permissive push must withhold the grant on '{digest}'"
+            );
+        }
+
+        scrub_apply(test_case).await;
+
+        for digest in [&layer_digest, &config_digest] {
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(borrower, digest)
+                    .await
+                    .is_err(),
+                "scrub granted '{borrower}' read access to '{digest}' that the push withheld"
+            );
+            assert!(
+                metadata_store
+                    .read_link(borrower, &LinkKind::Layer(digest.clone()))
+                    .await
+                    .is_err(),
+                "scrub recreated a withheld link for '{digest}'"
+            );
+        }
     })
     .await;
 }

@@ -279,9 +279,8 @@ async fn recovery_abandons_unreconcilable_committed_intent_past_grace() {
 
     // The stale intent was created an hour ago; a one-second grace makes it
     // abandonment-eligible.
-    RecoveryLoop::builder(store.clone())
+    RecoveryLoop::builder(store.clone(), test_util::memory_lock())
         .conditional_store(store.clone())
-        .lock(test_util::memory_lock())
         .abandon_after_secs(1)
         .build()
         .sweep()

@@ -32,6 +32,7 @@ Before applying a cross-key repair, scrub confirms the inconsistency is settled 
 |---|---|
 | Manifest-derived links | Recreates every link a manifest implies (config, layer, sub-manifest, digest revision) and the `referenced_by` back-links |
 | Blob-index grants | Re-issues grants the index is missing relative to the manifests; removes entries whose link file is gone |
+| Withheld references | Left alone: a reference the namespace holds neither a link nor a grant for is never re-derived, so scrub cannot grant read access a permissive push refused |
 | Dangling references | Removes tags and revisions whose manifest blob is missing, and orphan referrer entries |
 | Invalid names | Deletes tag, namespace, and upload directories whose names violate the OCI grammar (nothing can address them) |
 | Corrupt content | Deletes links, job records, and index shards whose content does not parse |

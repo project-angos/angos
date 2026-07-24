@@ -13,6 +13,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A committed link delete no longer sweeps its directory prefix afterwards (the transaction removes the link and the FS backend prunes emptied directories itself), so the sweep can no longer erase a tag or revision a concurrent push re-created after its 201.
 - Blob-index removals now re-check under the blob-data lock that the entry is still byteless or dangling before applying, and the delete path's reclaim decision now shares the commit-validated shard read, so a concurrent push, upload, or cache fill can no longer lose its just-written grant or have a referenced blob's bytes reclaimed.
 - A link transaction now plans one mutation per repeated operation, so pushing a manifest that lists the same layer digest twice no longer erases that layer's other referrers and drops its link when the manifest is deleted.
+- A lock heartbeat or release that has to re-read the lock object now checks the body's writer nonce first and gives the lease up one tick before the TTL expires, so a holder whose refresh failed can no longer reclaim or delete the lock a peer took over after expiry.
+- A lock-coordinated transaction that aborts after one of its mutations applied now reports a non-retriable partial commit, so the caller's retry can no longer commit fresh state that the recovery loop later reverts by replaying the preserved intent.
+- A manifest delete by digest now resolves and plans its tag cascade inside the blob-data lock, so a tag pushed to that digest while the delete waits is deleted with it instead of surviving as a tag that serves a revision the delete removed.
+- The recovery loop now re-reads an intent after taking its lock, so a transaction its owner finished or advanced in that window is no longer replayed from a stale snapshot (which could delete an object a later transaction re-created) or rolled back after its first mutation committed.
+- Scrub now repairs a manifest's child links and grants only for digests the namespace already references, so with `allow_missing_manifest_references` enabled it can no longer hand a namespace the cross-namespace read access the push deliberately withheld.
+- A lock object whose body no longer parses is now reclaimed by the lock janitor once its object mtime ages past the longest permitted lock TTL, instead of blocking every acquire on that key until an operator deleted it by hand.
+- A job claim whose dedup index cannot be retired is now left for the next scan instead of running with that index live (which coalesced every same-`lock_key` enqueue into the running job and dropped its write), and a rescheduled retry no longer overwrites an index a concurrent enqueue just pointed at its own fresh job.
 
 ## 1.4.1
 

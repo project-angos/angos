@@ -237,8 +237,7 @@ impl Store {
         &self,
         cancellation: CancellationToken,
     ) -> impl Future<Output = ()> + Send + 'static {
-        let mut recovery = RecoveryLoop::builder(self.object.clone())
-            .lock(self.lock.clone())
+        let mut recovery = RecoveryLoop::builder(self.object.clone(), self.lock.clone())
             .abandon_after_secs(DEFAULT_ABANDON_AFTER_SECS)
             .cancellation(cancellation);
         if let Some(cs) = &self.conditional {

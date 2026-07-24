@@ -410,6 +410,20 @@ impl ConditionalStore for MemoryObjectStore {
             .ok_or(Error::NotFound)
     }
 
+    /// Surfaces the stored write time, like S3's `Last-Modified`, so age-gated
+    /// callers behave here as they do in a deployment. The trait default would
+    /// report no timestamp at all.
+    async fn get_with_metadata(
+        &self,
+        key: &str,
+    ) -> Result<(Vec<u8>, Option<Etag>, Option<DateTime<Utc>>), Error> {
+        self.lock()
+            .data
+            .get(key)
+            .map(|(b, e, t)| (b.to_vec(), Some(e.clone()), Some(*t)))
+            .ok_or(Error::NotFound)
+    }
+
     async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<Option<Etag>, Error> {
         let etag = self.next_etag();
         let mut guard = self.lock();

@@ -33,6 +33,8 @@ use crate::{
 ///    - Acquires the intent's lock set (so a still-alive owner cannot race the
 ///      recovery loop). If the lock cannot be taken right now, the intent is
 ///      left for the next sweep.
+///    - Re-reads the intent under the lock and decides from that copy; an
+///      intent its owner reaped in the meantime is left alone.
 ///    - If any entry in `progress` is `Applied`, the transaction is partially
 ///      (or fully) committed: re-apply every still-`Pending` mutation
 ///      idempotently (using conditional storage primitives when a
@@ -51,7 +53,7 @@ pub const DEFAULT_ABANDON_AFTER_SECS: u64 = 3600;
 pub struct RecoveryLoop {
     store: Arc<dyn ObjectStore>,
     conditional_store: Option<Arc<dyn ConditionalStore>>,
-    lock: Option<Arc<Lock>>,
+    lock: Arc<Lock>,
     interval: Duration,
     cancellation: CancellationToken,
     abandon_after_secs: Option<u64>,
@@ -61,7 +63,6 @@ impl std::fmt::Debug for RecoveryLoop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecoveryLoop")
             .field("interval", &self.interval)
-            .field("has_lock", &self.lock.is_some())
             .field("has_conditional_store", &self.conditional_store.is_some())
             .finish_non_exhaustive()
     }
@@ -71,25 +72,13 @@ impl std::fmt::Debug for RecoveryLoop {
 pub struct RecoveryLoopBuilder {
     store: Arc<dyn ObjectStore>,
     conditional_store: Option<Arc<dyn ConditionalStore>>,
-    lock: Option<Arc<Lock>>,
+    lock: Arc<Lock>,
     interval: Option<Duration>,
     cancellation: Option<CancellationToken>,
     abandon_after_secs: Option<u64>,
 }
 
 impl RecoveryLoopBuilder {
-    /// Provide the engine's lock primitive so recovery can take ownership of a
-    /// stale intent before replay or rollback.
-    ///
-    /// Omitting this is intended only for single-process tests and direct
-    /// in-process recovery scenarios; in any multi-replica deployment the lock
-    /// must be wired so a still-alive owner cannot race with the takeover.
-    #[must_use]
-    pub fn lock(mut self, lock: Arc<Lock>) -> Self {
-        self.lock = Some(lock);
-        self
-    }
-
     /// Provide the deployment's [`ConditionalStore`] so recovery's replay path
     /// can use the same conditional primitives (`put_if_match`,
     /// `put_if_absent`, `delete_if_match`) the CAS executor used on the
@@ -160,14 +149,16 @@ fn intent_lock_set(intent: &IntentRecord) -> Vec<String> {
 impl RecoveryLoop {
     /// Return a builder for constructing a `RecoveryLoop`.
     ///
-    /// `store` is a required argument; all other settings are optional fluent
-    /// setters on the returned builder.
+    /// `store` and `lock` are required: a sweep takes ownership of every stale
+    /// intent it acts on, so without the engine's lock primitive it would race
+    /// a still-alive owner. All other settings are optional fluent setters on
+    /// the returned builder.
     #[must_use]
-    pub fn builder(store: Arc<dyn ObjectStore>) -> RecoveryLoopBuilder {
+    pub fn builder(store: Arc<dyn ObjectStore>, lock: Arc<Lock>) -> RecoveryLoopBuilder {
         RecoveryLoopBuilder {
             store,
             conditional_store: None,
-            lock: None,
+            lock,
             interval: None,
             cancellation: None,
             abandon_after_secs: None,
@@ -211,25 +202,31 @@ impl RecoveryLoop {
         }
     }
 
-    async fn process_intent(&self, key: &str) {
+    /// Read and deserialise the intent at `key`. `None` when it is gone (reaped
+    /// by its owner or by a peer sweep between the list and the read) or
+    /// unreadable; both leave the intent for a later sweep.
+    async fn read_intent(&self, key: &str) -> Option<IntentRecord> {
         let body = match self.store.get(key).await {
             Ok(b) => b,
-            Err(StorageError::NotFound) => {
-                // Reaped between list and get: normal race, skip.
-                return;
-            }
+            Err(StorageError::NotFound) => return None,
             Err(e) => {
                 warn!(key, error = %e, "RecoveryLoop: failed to read intent");
-                return;
+                return None;
             }
         };
 
-        let mut intent: IntentRecord = match serde_json::from_slice(&body) {
-            Ok(i) => i,
+        match serde_json::from_slice(&body) {
+            Ok(intent) => Some(intent),
             Err(e) => {
                 warn!(key, error = %e, "RecoveryLoop: failed to deserialise intent");
-                return;
+                None
             }
+        }
+    }
+
+    async fn process_intent(&self, key: &str) {
+        let Some(intent) = self.read_intent(key).await else {
+            return;
         };
 
         let now = Utc::now();
@@ -245,39 +242,48 @@ impl RecoveryLoop {
 
         // Acquire ownership of the intent's lock set before any apply or
         // rollback so a still-alive owner cannot race the takeover.
-        let session = if let Some(lock) = &self.lock {
-            let keys = intent_lock_set(&intent);
-            match lock.try_acquire(&keys).await {
-                Ok(Some(session)) => Some(session),
-                Ok(None) => {
-                    debug!(
-                        tx_id = %intent.id,
-                        "RecoveryLoop: intent lock set contended, skipping until next sweep"
-                    );
-                    return;
-                }
-                Err(e) => {
-                    debug!(
-                        tx_id = %intent.id,
-                        error = %e,
-                        "RecoveryLoop: failed to acquire intent lock set, skipping until next sweep"
-                    );
-                    return;
-                }
+        let keys = intent_lock_set(&intent);
+        let session = match self.lock.try_acquire(&keys).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                debug!(
+                    tx_id = %intent.id,
+                    "RecoveryLoop: intent lock set contended, skipping until next sweep"
+                );
+                return;
             }
-        } else {
-            None
+            Err(e) => {
+                debug!(
+                    tx_id = %intent.id,
+                    error = %e,
+                    "RecoveryLoop: failed to acquire intent lock set, skipping until next sweep"
+                );
+                return;
+            }
         };
 
-        if intent.any_applied() {
-            self.replay_forward(&mut intent).await;
+        // Decide from the intent as it stands under the lock, never from the
+        // pre-lock snapshot: the owner may have finished and reaped it, or
+        // stamped another mutation, since it was read. Replaying that snapshot
+        // would re-apply committed mutations (an unconditional `Delete` would
+        // remove an object a later transaction re-created), and rolling it back
+        // would discard a transaction whose first mutation just committed. Only
+        // `progress` can have moved on; `created_at` is fixed for an intent's
+        // lifetime, so the staleness verdict still holds.
+        if let Some(mut fresh) = self.read_intent(key).await {
+            if fresh.any_applied() {
+                self.replay_forward(&mut fresh).await;
+            } else {
+                common::rollback(self.store.as_ref(), &fresh).await;
+            }
         } else {
-            common::rollback(self.store.as_ref(), &intent).await;
+            debug!(
+                tx_id = %intent.id,
+                "RecoveryLoop: intent completed by its owner before the takeover, nothing to recover"
+            );
         }
 
-        if let Some(session) = session {
-            session.release().await;
-        }
+        session.release().await;
     }
 
     /// Re-apply every still-`Pending` mutation of a committed transaction

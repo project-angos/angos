@@ -34,6 +34,11 @@ pub async fn write_intent(store: &dyn ObjectStore, intent: &IntentRecord) -> Res
 
 /// Mark mutation `idx` as `Applied` and re-PUT the intent record.
 ///
+/// The in-memory mark lands before the write and survives its failure, which
+/// [`finish`] depends on: a lost stamp must still leave the transaction looking
+/// committed to this process, or an error on a later mutation would reap the
+/// intent out from under a canonical write that already applied.
+///
 /// # Errors
 ///
 /// Propagates any error from [`write_intent`].
