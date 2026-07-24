@@ -3,7 +3,9 @@
 //! reconcile, tag digest links, referrer liveness, the invalid-tag gate, and
 //! the orphan-namespace clearing).
 
-use tracing::warn;
+use std::collections::HashSet;
+
+use tracing::{debug, warn};
 
 use angos_tx_engine::StorageError;
 
@@ -158,15 +160,58 @@ impl Validator {
         // The revision's own grant pins the manifest blob.
         self.ensure_grant(namespace, revision, &LinkKind::Digest(revision.clone()))
             .await?;
+
+        // Only repair references the namespace already holds. A permissive push
+        // withholds the link and the grant for a digest the namespace does not
+        // own, so re-deriving them from the manifest body would hand it exactly
+        // the cross-namespace read access the write path refused.
+        let mut held = HashSet::new();
         for (link, target) in manifest.links_for_revision(revision) {
+            if !self.holds_reference(namespace, &target, &link).await? {
+                debug!(
+                    "scrub: '{namespace}' holds no reference to '{target}'; \
+                     leaving the link from revision '{revision}' unrepaired"
+                );
+                continue;
+            }
             self.ensure_link(namespace, &link, &target).await?;
             self.ensure_grant(namespace, &target, &link).await?;
+            held.insert(link);
         }
         for (link, target) in manifest.referenced_links_for_revision(revision) {
+            if !held.contains(&link) {
+                continue;
+            }
             self.ensure_referenced_by(namespace, &link, &target, revision)
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether `namespace` already holds `target`: a live blob-index entry for
+    /// the digest, or this link already on disk. The blob index is what
+    /// authorizes a cross-namespace read, and a withheld reference leaves
+    /// neither behind, so this is what separates repairing a namespace's own
+    /// state from minting access it never had. Losing both for a reference it
+    /// did own leaves the manifest unrepaired (and unpullable) rather than
+    /// guessing in favour of access.
+    async fn holds_reference(
+        &self,
+        namespace: &Namespace,
+        target: &Digest,
+        link: &LinkKind,
+    ) -> Result<bool, Error> {
+        match self
+            .metadata_store
+            .read_blob_index_namespace(namespace, target)
+            .await
+        {
+            Ok(links) if !links.is_empty() => return Ok(true),
+            Ok(_) | Err(RegistryError::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let link_key = path_builder::link_path(link, namespace);
+        Ok(self.read_link_body(&link_key).await?.is_some())
     }
 
     /// A referrer link is live only while its referrer manifest is a current

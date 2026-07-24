@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A lock-coordinated transaction that aborts after one of its mutations applied now reports a non-retriable partial commit, so the caller's retry can no longer commit fresh state that the recovery loop later reverts by replaying the preserved intent.
 - A manifest delete by digest now resolves and plans its tag cascade inside the blob-data lock, so a tag pushed to that digest while the delete waits is deleted with it instead of surviving as a tag that serves a revision the delete removed.
 - The recovery loop now re-reads an intent after taking its lock, so a transaction its owner finished or advanced in that window is no longer replayed from a stale snapshot (which could delete an object a later transaction re-created) or rolled back after its first mutation committed.
+- Scrub now repairs a manifest's child links and grants only for digests the namespace already references, so with `allow_missing_manifest_references` enabled it can no longer hand a namespace the cross-namespace read access the push deliberately withheld.
 
 ## 1.4.1
 
