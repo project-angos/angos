@@ -741,3 +741,84 @@ async fn locked_executor_aborts_apply_on_lock_loss_partial_commit() {
     // valve.
     gated.hook().gate.notify_one();
 }
+
+/// Hook that reaps an intent the moment recovery re-reads it under the lock,
+/// standing in for the owner finishing and reaping it in that window. The first
+/// read (before the lock) is served normally, so recovery forms its pre-lock
+/// snapshot and only then finds the intent gone.
+struct ReapOnReRead {
+    log_key: String,
+    inner: Arc<MemoryObjectStore>,
+    reads: AtomicUsize,
+}
+
+impl ReapOnReRead {
+    fn new(log_key: String, inner: Arc<MemoryObjectStore>) -> Self {
+        Self {
+            log_key,
+            inner,
+            reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl StoreHook for ReapOnReRead {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        if let StoreOp::Get { key } = op
+            && key == self.log_key
+            && self.reads.fetch_add(1, Ordering::AcqRel) == 1
+        {
+            self.inner.delete(&self.log_key).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Regression: recovery must decide from the intent as it stands under the
+/// lock. Acting on the pre-lock snapshot replays mutations the owner has since
+/// committed and reaped, and an unconditional `Delete` among them removes an
+/// object a later transaction re-created.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_skips_an_intent_reaped_between_the_read_and_the_takeover() {
+    let inner = Arc::new(MemoryObjectStore::new());
+
+    // The delete already committed and a later transaction re-created the key.
+    inner
+        .put("reaped/key", Bytes::from_static(b"re-created"))
+        .await
+        .expect("seed re-created key");
+
+    let tx_id = Uuid::new_v4();
+    let sibling_ref =
+        test_util::stage_body(&*inner, tx_id, 0, Bytes::from_static(b"sibling")).await;
+    let intent = test_util::stale_intent(
+        tx_id,
+        vec![
+            // Applied sibling, so the intent takes the replay-forward path.
+            MutationRecord::PutIfAbsent {
+                key: "reaped/sibling".to_string(),
+                body_ref: sibling_ref,
+            },
+            MutationRecord::Delete {
+                key: "reaped/key".to_string(),
+                expected: None,
+            },
+        ],
+        vec![MutationProgress::Applied, MutationProgress::Pending],
+    );
+    test_util::put_intent(&*inner, &intent).await;
+
+    let hooked: Arc<HookedStore<Arc<dyn ObjectStore>, ReapOnReRead>> = Arc::new(HookedStore::new(
+        inner.clone(),
+        ReapOnReRead::new(intent.log_key(), inner.clone()),
+    ));
+
+    test_util::sweep_once(hooked, test_util::memory_lock()).await;
+
+    let body = inner.get("reaped/key").await;
+    assert!(
+        body.is_ok_and(|b| b == b"re-created"),
+        "recovery replayed a reaped intent's delete over a re-created object"
+    );
+}

@@ -33,6 +33,8 @@ use crate::{
 ///    - Acquires the intent's lock set (so a still-alive owner cannot race the
 ///      recovery loop). If the lock cannot be taken right now, the intent is
 ///      left for the next sweep.
+///    - Re-reads the intent under the lock and decides from that copy; an
+///      intent its owner reaped in the meantime is left alone.
 ///    - If any entry in `progress` is `Applied`, the transaction is partially
 ///      (or fully) committed: re-apply every still-`Pending` mutation
 ///      idempotently (using conditional storage primitives when a
@@ -211,25 +213,31 @@ impl RecoveryLoop {
         }
     }
 
-    async fn process_intent(&self, key: &str) {
+    /// Read and deserialise the intent at `key`. `None` when it is gone (reaped
+    /// by its owner or by a peer sweep between the list and the read) or
+    /// unreadable; both leave the intent for a later sweep.
+    async fn read_intent(&self, key: &str) -> Option<IntentRecord> {
         let body = match self.store.get(key).await {
             Ok(b) => b,
-            Err(StorageError::NotFound) => {
-                // Reaped between list and get: normal race, skip.
-                return;
-            }
+            Err(StorageError::NotFound) => return None,
             Err(e) => {
                 warn!(key, error = %e, "RecoveryLoop: failed to read intent");
-                return;
+                return None;
             }
         };
 
-        let mut intent: IntentRecord = match serde_json::from_slice(&body) {
-            Ok(i) => i,
+        match serde_json::from_slice(&body) {
+            Ok(intent) => Some(intent),
             Err(e) => {
                 warn!(key, error = %e, "RecoveryLoop: failed to deserialise intent");
-                return;
+                None
             }
+        }
+    }
+
+    async fn process_intent(&self, key: &str) {
+        let Some(intent) = self.read_intent(key).await else {
+            return;
         };
 
         let now = Utc::now();
@@ -269,10 +277,25 @@ impl RecoveryLoop {
             None
         };
 
-        if intent.any_applied() {
-            self.replay_forward(&mut intent).await;
+        // Decide from the intent as it stands under the lock, never from the
+        // pre-lock snapshot: the owner may have finished and reaped it, or
+        // stamped another mutation, since it was read. Replaying that snapshot
+        // would re-apply committed mutations (an unconditional `Delete` would
+        // remove an object a later transaction re-created), and rolling it back
+        // would discard a transaction whose first mutation just committed. Only
+        // `progress` can have moved on; `created_at` is fixed for an intent's
+        // lifetime, so the staleness verdict still holds.
+        if let Some(mut fresh) = self.read_intent(key).await {
+            if fresh.any_applied() {
+                self.replay_forward(&mut fresh).await;
+            } else {
+                common::rollback(self.store.as_ref(), &fresh).await;
+            }
         } else {
-            common::rollback(self.store.as_ref(), &intent).await;
+            debug!(
+                tx_id = %intent.id,
+                "RecoveryLoop: intent completed by its owner before the takeover, nothing to recover"
+            );
         }
 
         if let Some(session) = session {
