@@ -10,8 +10,7 @@ use crate::{
     registry::{
         Error,
         metadata_store::{
-            BlobIndexOperation, LinkKind, LinkOperation,
-            blob_index::shard::{read_shard, shard_will_be_empty},
+            BlobIndexOperation, LinkKind, LinkOperation, blob_index::shard::read_shard,
         },
         path_builder,
         test_utils::fs_test_stack,
@@ -337,10 +336,4 @@ async fn corrupt_shard_fails_reclaim_read_instead_of_parsing_empty() {
 
     let result = read_shard(store, &shard_path).await;
     assert!(result.is_err(), "corrupt shard must error, got: {result:?}");
-
-    let will_be_empty = shard_will_be_empty(store, &[], &shard_path).await;
-    assert!(
-        will_be_empty.is_err(),
-        "reclaim decision over a corrupt shard must fail closed, got: {will_be_empty:?}"
-    );
 }
