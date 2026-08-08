@@ -6,7 +6,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use http_body_util::BodyExt;
 use hyper::{
     Method, Request, StatusCode,
-    header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderValue, WWW_AUTHENTICATE},
 };
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
@@ -18,7 +18,10 @@ use crate::{
     command::server::{
         ServerContext,
         error::Error,
-        handlers::{content_discovery::handle_list_catalog, ext::handle_list_repositories},
+        handlers::{
+            content_discovery::handle_list_catalog, ext::handle_list_repositories,
+            token::handle_get_token,
+        },
         http_server::{
             connection::{current_trace_id, inject_peer_certificate},
             dispatch::{authenticate_and_authorize, handle_unknown_route},
@@ -43,7 +46,7 @@ fn test_error_to_response_unauthorized_with_request_id() {
     let error = Error::Unauthorized("Invalid credentials".to_string());
     let request_id = Some("req-123".to_string());
 
-    let response = error_to_response(&error, request_id.as_ref());
+    let response = error_to_response(&error, request_id.as_ref(), None);
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
@@ -62,7 +65,7 @@ async fn test_error_to_response_from_registry_error() {
     let error: Error = registry_error.into();
     let request_id = Some("req-blob".to_string());
 
-    let response = error_to_response(&error, request_id.as_ref());
+    let response = error_to_response(&error, request_id.as_ref(), None);
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
@@ -88,7 +91,7 @@ fn test_error_to_response_custom_error() {
     };
     let request_id = Some("req-custom".to_string());
 
-    let response = error_to_response(&error, request_id.as_ref());
+    let response = error_to_response(&error, request_id.as_ref(), None);
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
@@ -96,6 +99,32 @@ fn test_error_to_response_custom_error() {
         "application/json"
     );
     assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
+}
+
+/// A 401 relayed from a pull-through upstream is that registry's refusal, so
+/// answering it with our own realm costs the client a token round trip that
+/// cannot change the outcome.
+#[test]
+fn only_our_own_denial_carries_the_bearer_challenge() {
+    let challenge = HeaderValue::from_static(
+        r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#,
+    );
+    let upstream = Error::Custom {
+        status_code: StatusCode::UNAUTHORIZED,
+        code: "UNAUTHORIZED".to_string(),
+        msg: Some("upstream refused".to_string()),
+    };
+
+    let relayed = error_to_response(&upstream, None, Some(challenge.clone()));
+    assert_eq!(relayed.status(), StatusCode::UNAUTHORIZED);
+    assert!(relayed.headers().get(WWW_AUTHENTICATE).is_none());
+
+    let ours = error_to_response(
+        &Error::Unauthorized("no credentials".to_string()),
+        None,
+        Some(challenge.clone()),
+    );
+    assert_eq!(ours.headers().get(WWW_AUTHENTICATE), Some(&challenge));
 }
 
 #[test]
@@ -210,7 +239,7 @@ fn test_error_to_response_all_error_types() {
     ];
 
     for (error, expected_status, should_have_www_authenticate) in errors {
-        let response = error_to_response(&error, None);
+        let response = error_to_response(&error, None, None);
 
         assert_eq!(response.status(), expected_status);
         assert_eq!(
@@ -233,7 +262,7 @@ async fn test_error_to_response_body_contains_error_message() {
     let error = Error::BadRequest("Invalid manifest format".to_string());
     let request_id = Some("req-manifest".to_string());
 
-    let response = error_to_response(&error, request_id.as_ref());
+    let response = error_to_response(&error, request_id.as_ref(), None);
     let (_, body) = response.into_parts();
 
     let body_bytes = match body {
@@ -250,7 +279,7 @@ fn test_error_to_response_with_empty_message() {
     let error = Error::Internal(String::new());
     let request_id = None;
 
-    let response = error_to_response(&error, request_id.as_ref());
+    let response = error_to_response(&error, request_id.as_ref(), None);
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
@@ -333,13 +362,85 @@ async fn bad_basic_auth_returns_http_401() {
     let error = authenticate_and_authorize(&context, &Action::ApiVersion, &parts)
         .await
         .unwrap_err();
-    let response = error_to_response(&error, None);
+    let response = error_to_response(&error, None, None);
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         response.headers().get(WWW_AUTHENTICATE).unwrap(),
         r#"Basic realm="Angos", charset="UTF-8""#
     );
+}
+
+/// The token endpoint is a route like any other. It grants nothing on its own,
+/// but an operator who wants to refuse issuance must be able to say so.
+#[tokio::test]
+async fn the_token_endpoint_is_gated_by_the_access_policy() {
+    let config = load_config(
+        r#"
+        [global.access_policy]
+        default = "deny"
+        rules = []
+
+        [auth.token_service]
+        secret_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    "#,
+    );
+    let context = create_test_server_context_from_config(&config).await;
+    let request = Request::builder().uri("/token").body(()).unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let error = authenticate_and_authorize(&context, &Action::Token, &parts)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error_to_response(&error, None, None).status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+async fn token_service_context() -> ServerContext {
+    let config = load_config(
+        r#"
+        [global.access_policy]
+        default = "allow"
+        rules = []
+
+        [auth.token_service]
+        secret_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    "#,
+    );
+    create_test_server_context_from_config(&config).await
+}
+
+/// Renewal would let a token outlive the credential it was minted from for as
+/// long as the client keeps asking, so `ttl_secs` would bound nothing.
+#[tokio::test]
+async fn a_registry_token_cannot_be_exchanged_for_another() {
+    let context = token_service_context().await;
+    let identity = ClientIdentity {
+        username: Some("ci-bot".to_string()),
+        from_registry_token: true,
+        ..ClientIdentity::default()
+    };
+
+    let Err(error) = handle_get_token(&context, &identity) else {
+        panic!("a registry token must not be renewable");
+    };
+
+    assert!(matches!(error, Error::Unauthorized(_)));
+}
+
+/// The body is a bearer credential, and an anonymous exchange is a plain 200
+/// JSON GET that a shared cache would otherwise be free to store.
+#[tokio::test]
+async fn an_issued_token_is_never_cached() {
+    let context = token_service_context().await;
+
+    let response = handle_get_token(&context, &ClientIdentity::default()).unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
 }
 
 async fn create_test_context_with_allow_policy() -> ServerContext {

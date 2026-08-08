@@ -98,6 +98,35 @@ The username must match the provider name (`github-actions` in this example).
 
 ---
 
+## Long-Running Pushes
+
+A GitHub Actions OIDC token is valid for about ten minutes and that lifetime cannot be extended. The registry checks it on every request, so a push still running when the token expires fails part-way through.
+
+Enable the [token service](../reference/configuration.md#token-service-authtoken_service) to decouple the two. The exchange is reactive rather than up front: the client's first request is refused with a 401 carrying the challenge, the client follows it to `/token`, and it uses the token it gets back for the rest of the push. Under a deny-by-default policy that refused request is the `GET /v2/` ping, so the OIDC token only has to be valid at the start of the push instead of for its whole duration:
+
+```toml
+[auth.token_service]
+secret_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="  # openssl rand -base64 32
+ttl_secs = 3600
+```
+
+Under a default-deny policy, allow the exchange:
+
+```toml
+[global.access_policy]
+default = "deny"
+rules = [
+  "request.action == 'get-token' && identity.oidc != null",
+  "identity.oidc != null && identity.oidc.claims['repository'].startsWith('myorg/')",
+]
+```
+
+No workflow change is needed, and this is not Docker-specific: the exchange is the registry v2 bearer-token flow that every OCI client implements, so Docker, Podman, Buildah, Skopeo, containerd, BuildKit, Kaniko, crane and ORAS all discover the endpoint from the registry's `WWW-Authenticate` header on their own. Fetch the OIDC token close to the push rather than at the start of the job, so the ten minutes covers the build as well.
+
+A token that expires mid-push is answered with a fresh challenge and the client exchanges again, but only while the credential it started from is still valid, which here is the same ten minutes. Size `ttl_secs` to the longest push you expect rather than to the maximum allowed: a registry token cannot be revoked before it expires. A client whose credentials do not expire, such as basic auth, recovers from any expiry and is fine with a short one.
+
+---
+
 ## Policy Examples
 
 ### Allow Specific Repositories

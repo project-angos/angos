@@ -5,6 +5,7 @@ pub mod basic_auth;
 mod error;
 pub mod mtls;
 pub mod oidc;
+pub mod token_service;
 pub mod webhook;
 
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use hyper::http::request::Parts;
 pub use mtls::{MtlsValidator, PeerCertificate};
 pub use oidc::OidcValidator;
 use sha2::{Digest as Sha2Digest, Sha256};
+pub use token_service::{TokenIssuer, TokenValidator};
 
 use crate::identity::ClientIdentity;
 

@@ -16,6 +16,16 @@ fn test_parse_metrics() {
     assert!(matches!(route, Some(Action::Metrics)));
 }
 
+/// Without its own arm the token endpoint reaches the UI-asset arm and answers
+/// `index.html` with a 200.
+#[test]
+fn test_parse_token() {
+    let uri: Uri = "/token".parse().unwrap();
+    assert!(matches!(parse(&Method::GET, &uri), Some(Action::Token)));
+    assert!(parse(&Method::POST, &uri).is_none());
+    assert!(parse(&Method::HEAD, &uri).is_none());
+}
+
 #[test]
 fn test_parse_api_version() {
     let method = Method::GET;

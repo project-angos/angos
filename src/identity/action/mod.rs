@@ -52,6 +52,8 @@ pub enum Action {
     },
     #[serde(rename = "ui-config")]
     UiConfig,
+    #[serde(rename = "get-token")]
+    Token,
     Healthz,
     Readyz,
     Metrics,
@@ -285,6 +287,7 @@ impl Action {
         match self {
             Action::UiAsset { .. } => "ui-asset",
             Action::UiConfig => "ui-config",
+            Action::Token => "get-token",
             Action::Healthz => "healthz",
             Action::Readyz => "readyz",
             Action::Metrics => "metrics",
@@ -319,6 +322,7 @@ impl Action {
         match self {
             Action::UiAsset { .. }
             | Action::UiConfig
+            | Action::Token
             | Action::Healthz
             | Action::Readyz
             | Action::Metrics

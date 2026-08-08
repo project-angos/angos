@@ -112,6 +112,7 @@ Optional `request` fields are **omitted** when unset (only `request.action` is a
 | `list-tags`         | List tags                    |
 | `ui-asset`          | UI static assets             |
 | `ui-config`         | UI configuration             |
+| `get-token`         | Registry token exchange      |
 | `list-repositories` | Extension: list repositories |
 | `list-namespaces`   | Extension: list namespaces   |
 | `list-revisions`    | Extension: list revisions    |

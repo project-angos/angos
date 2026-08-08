@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hyper::http::request::Parts;
+use jsonwebtoken::Algorithm;
 pub use jwk::Jwk;
 pub use provider::OidcProvider;
 use reqwest::Client;
@@ -30,6 +31,13 @@ pub enum Config {
 }
 
 impl Config {
+    pub fn allowed_algorithms(&self) -> &[Algorithm] {
+        match self {
+            Config::Generic(config) => &config.allowed_algorithms,
+            Config::GitHub(config) => &config.allowed_algorithms,
+        }
+    }
+
     pub fn to_backend(&self) -> Arc<dyn OidcProvider + Send + Sync> {
         match self {
             Config::Generic(config) => Arc::new(generic::Provider::new(config.clone())),

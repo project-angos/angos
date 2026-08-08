@@ -57,6 +57,7 @@ async fn dispatch_route<'a>(
         Action::UiAsset { path } if context.enable_ui => ui::serve_asset(&path),
         Action::UiConfig if context.enable_ui => handle_ui_config(context),
         Action::UiAsset { .. } | Action::UiConfig => handle_unknown_route(parts),
+        Action::Token => handlers::token::handle_get_token(context, identity),
         Action::ApiVersion => Ok(handlers::version::handle_get_api_version()?),
         Action::StartUpload { namespace, digest } => {
             handlers::upload::handle_start_upload(context, &namespace, digest).await

@@ -29,6 +29,9 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
         "/readyz" if method == Method::GET => return Some(Action::Readyz),
         "/metrics" if method == Method::GET => return Some(Action::Metrics),
         "/_ui/config" if method == Method::GET => return Some(Action::UiConfig),
+        // Matched for every method: guarded by `if method == GET` a HEAD would
+        // fall through to the UI-asset arm below and answer with `index.html`.
+        "/token" => return (method == Method::GET).then_some(Action::Token),
         // HEAD as well as GET: the version check is the OCI conformance probe,
         // and without this it falls through to the UI-asset arm below and
         // answers with `index.html`.

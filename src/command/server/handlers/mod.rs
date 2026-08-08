@@ -17,6 +17,7 @@ pub mod blob;
 pub mod content_discovery;
 pub mod ext;
 pub mod manifest;
+pub mod token;
 pub mod upload;
 pub mod version;
 

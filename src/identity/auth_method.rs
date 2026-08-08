@@ -6,6 +6,7 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthMethod {
     Mtls,
+    Token,
     Oidc,
     Basic,
     /// No credential authenticated the request.
@@ -18,6 +19,7 @@ impl AuthMethod {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mtls => "mtls",
+            Self::Token => "token",
             Self::Oidc => "oidc",
             Self::Basic => "basic",
             Self::Anonymous => "anonymous",
@@ -34,6 +36,7 @@ mod tests {
     #[test]
     fn every_method_keeps_its_logged_label() {
         assert_eq!(AuthMethod::Mtls.as_str(), "mtls");
+        assert_eq!(AuthMethod::Token.as_str(), "token");
         assert_eq!(AuthMethod::Oidc.as_str(), "oidc");
         assert_eq!(AuthMethod::Basic.as_str(), "basic");
         assert_eq!(AuthMethod::Anonymous.as_str(), "anonymous");

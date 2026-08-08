@@ -162,6 +162,16 @@ OIDC tokens are fully verified:
 - Expiration enforced
 - Clock skew tolerance configurable
 
+### Registry Tokens
+
+Tokens the token service issues are HMAC-signed with a key of at least 32 bytes and their algorithm is pinned, so a token claiming another algorithm is never verified with the signing key. They carry the identity but never the client certificate or IP, which keeps a certificate-bound identity from becoming a replayable bearer credential.
+
+A token cannot be revoked before it expires: `ttl_secs`, capped at a day, is the window a stolen one stays usable. Nor can it be exchanged for a fresh one at `/token`, so that window never extends itself past the credential the token was minted from. Rotating `secret_key` or removing the OIDC provider a token names invalidates outstanding tokens. Authorization is unaffected, since policies are evaluated per request against live configuration rather than frozen into the token.
+
+The token is not scope-bound either. Where the registry v2 model narrows a token to one repository and a set of actions through an `access` claim, angos puts the identity in the token, so a stolen one reaches everything that identity reaches. What bounds it is the per-request policy evaluation above: the token grants no more than the credential it replaced, just over a wider surface than a scoped token would.
+
+That spec's claim set (`iss`, `sub`, `aud`, `nbf`, `jti`, `access`) and its `kid` header exist so a registry can verify tokens minted by a separate authorization server. Angos is both issuer and verifier, so its token is opaque to clients and carries only the identity it restores.
+
 ### TLS Configuration
 
 Server TLS with modern defaults:

@@ -451,7 +451,50 @@ Usernames must be unique across all `auth.identity` entries; a duplicate causes 
 | `http_request_timeout_secs` | u64 | `30`     | Timeout for a JWKS or discovery HTTP fetch (seconds) |
 | `jwks_refresh_timeout_secs` | u64 | `5`      | Timeout for the forced JWKS refetch on key rotation (seconds) |
 
-`allowed_algorithms` accepts JWT algorithm names such as `"RS256"`, `"RS384"`, `"RS512"`, `"ES256"`, and `"ES384"`. Angos rejects tokens whose header claims an algorithm outside the provider allowlist before signature verification to prevent algorithm-confusion attacks.
+`allowed_algorithms` accepts JWT algorithm names such as `"RS256"`, `"RS384"`, `"RS512"`, `"ES256"`, and `"ES384"`. Angos rejects tokens whose header claims an algorithm outside the provider allowlist before signature verification to prevent algorithm-confusion attacks. With `auth.token_service` configured, `HS256` is refused at startup: the token validator claims every bearer signed with it, so a provider allowing the same algorithm would have its own tokens rejected there instead of reaching it.
+
+### Token Service (`auth.token_service`)
+
+Issues registry-signed bearer tokens at `GET /token`, so a client holding a
+short-lived credential can exchange it once and keep pushing after that
+credential expires. Present the section to enable it.
+
+| Option       | Type   | Default  | Description                                                     |
+|--------------|--------|----------|-----------------------------------------------------------------|
+| `secret_key` | string | required | Base64 HMAC signing key, at least 32 bytes decoded               |
+| `realm`      | string | -        | Absolute token URL advertised to clients, path must end with `/token` |
+| `ttl_secs`   | u64    | `3600`   | Token lifetime in seconds, at most `86400`                      |
+
+With the section present, a `401` carries `WWW-Authenticate: Bearer` instead of
+`Basic`, for every client rather than only OIDC ones. Left unset, the challenge
+is built from each request's own `Host`, which is what a registry serving
+several hostnames wants; behind a TLS-terminating proxy, list the proxy in
+`global.trusted_proxies` so its `X-Forwarded-Proto` decides the scheme. Set
+`realm` when anything in front of the registry caches responses, so the
+challenge cannot follow a `Host` a client chose, and when a proxy strips a path
+prefix, so the advertised URL is the prefixed one clients must call.
+
+Generate `secret_key` with `openssl rand -base64 32`: it is decoded before use,
+so its strength is the randomness of those bytes and not the length of a
+passphrase. Rotating it invalidates every outstanding token; clients recover by
+fetching a new one. An issued token freezes the identity it was minted from but
+not its permissions: access policies are still evaluated per request. A token
+cannot otherwise be revoked before it expires, so `ttl_secs` is the window a
+stolen one stays usable. Removing or renaming an `auth.oidc` entry invalidates
+outstanding tokens minted from that provider. The section reloads without a
+restart, `secret_key` included, so rotating the key during an incident costs no
+downtime.
+
+`GET /token` is subject to the access policy like any other route. Under
+`default = "deny"`, add a rule for it:
+
+```toml
+[global.access_policy]
+default = "deny"
+rules = [
+  "request.action == 'get-token' && identity.oidc != null",
+]
+```
 
 ### Webhooks (`auth.webhook.<name>`)
 

@@ -31,8 +31,9 @@ sequenceDiagram
     Registry->>Auth: Authenticate
 
     Note over Auth: 1. Check mTLS certificate
-    Note over Auth: 2. Validate OIDC token
-    Note over Auth: 3. Verify Basic Auth
+    Note over Auth: 2. Validate registry token
+    Note over Auth: 3. Validate OIDC token
+    Note over Auth: 4. Verify Basic Auth
 
     Auth-->>Registry: Identity (or anonymous)
     Registry->>Registry: Authorize request
@@ -42,8 +43,12 @@ sequenceDiagram
 ### Processing Order
 
 1. **mTLS**: Extract certificate information if present
-2. **OIDC**: Validate Bearer tokens or OIDC-as-Basic-Auth
-3. **Basic Auth**: Validate username/password from configuration
+2. **Registry token**: Validate a token this registry issued
+3. **OIDC**: Validate Bearer tokens or OIDC-as-Basic-Auth
+4. **Basic Auth**: Validate username/password from configuration
+
+A valid registry token stops the chain: the OIDC middlewares claim any bearer
+header and reject what they cannot validate, so they must not see one.
 
 ### Credential Handling
 
@@ -52,6 +57,7 @@ Each method handles missing vs invalid credentials differently:
 | Method     | No Credentials | Invalid Credentials |
 |------------|----------------|---------------------|
 | mTLS       | Continue       | **TLS handshake fails** |
+| Registry token | Continue   | **Reject immediately** |
 | OIDC       | Continue       | **Reject immediately** |
 | Basic Auth | Continue       | **Reject immediately** |
 
@@ -129,6 +135,14 @@ password = "$argon2id$v=19$m=19456,t=2,p=1$..."  # Argon2 hash
 **Identity fields:**
 - `identity.id` (e.g., "alice")
 - `identity.username`
+
+### Registry Token
+
+With [`auth.token_service`](../reference/configuration.md#token-service-authtoken_service) configured, `GET /token` exchanges whatever credential authenticated the request for a registry-signed bearer token, advertised through the `WWW-Authenticate` header of a 401. OCI clients drive this on their own. It exists so a credential that expires faster than a push takes, such as a GitHub Actions OIDC token, only has to be valid when the push starts.
+
+The token carries `identity.id`, `identity.username` and `identity.oidc`, so policies decide exactly as they did for the original credential. It never carries `identity.certificate` or `identity.client_ip`: both are read from the live request, which keeps a certificate-bound identity from becoming a replayable bearer credential and lets mTLS compose with a token.
+
+The identity is frozen, the permissions are not: policies, repository rules and webhooks are still evaluated per request against live configuration. The reverse also holds, and is the cost of the feature: a token outlives the credential it was minted from and cannot be revoked before `ttl_secs` elapses. Rotating `secret_key`, or removing the OIDC provider a token names, invalidates outstanding tokens.
 
 ---
 
@@ -345,6 +359,8 @@ OIDC tokens are cryptographically verified:
 - Clock skew tolerance is configurable
 
 Bad OIDC tokens return 401. If Angos cannot reach or parse the configured provider discovery or JWKS endpoint, it returns 503 because the provider is temporarily unavailable rather than treating the credential as rejected.
+
+Registry tokens are HMAC-signed and their algorithm is pinned, so a token whose header claims another algorithm is treated as another scheme's bearer and left to the OIDC middlewares rather than verified with the signing key.
 
 ### Password Storage
 

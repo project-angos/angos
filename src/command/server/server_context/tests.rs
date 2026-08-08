@@ -1,4 +1,6 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc, time::Duration,
+};
 use tempfile::TempDir;
 
 use argon2::{
@@ -6,7 +8,10 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use base64::Engine;
-use hyper::{Request, header::HeaderMap};
+use hyper::{
+    Request,
+    header::{HOST, HeaderMap, HeaderValue},
+};
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
@@ -18,7 +23,7 @@ use crate::{
     command::server::server_context::{ServerContext, resolve_forwarded_ip},
     configuration::{Configuration, TrustedProxy},
     event_webhook::{config::EventWebhookConfig, dispatcher::EventDispatcher, event::Event},
-    identity::{Action, ClientIdentity},
+    identity::{Action, ClientIdentity, RequestScheme},
     metrics_provider,
     oci::{Digest, Namespace, Reference, Tag},
     policy::AccessPolicyConfig,
@@ -811,4 +816,96 @@ async fn dispatch_events_all_success_returns_ok() {
     assert!(result.is_ok());
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
+}
+
+/// `global` is appended to the minimal config's `[global]` table, so it must come
+/// before the token service's own table header.
+async fn token_service_context(global: &str, token_service: &str) -> ServerContext {
+    let config = load_config(&format!(
+        r#"{global}
+        [auth.token_service]
+        secret_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        {token_service}"#
+    ));
+    create_test_server_context_from_config(&config).await
+}
+
+fn challenge_request(scheme: RequestScheme, headers: &[(&str, &str)]) -> Request<()> {
+    let mut builder = Request::builder()
+        .uri("/v2/")
+        .header(HOST, "registry.example.com");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+
+    let mut request = builder.body(()).unwrap();
+    request.extensions_mut().insert(scheme);
+    request
+        .extensions_mut()
+        .insert("10.0.0.1:9999".parse::<SocketAddr>().unwrap());
+    request
+}
+
+/// The two halves the connection handler calls, one before dispatch and one on
+/// the denial path.
+fn challenge_for(context: &ServerContext, request: &Request<()>) -> Option<HeaderValue> {
+    let (scheme, host) = context.challenge_origin(request)?;
+    context.bearer_challenge(scheme, &host)
+}
+
+#[tokio::test]
+async fn no_bearer_challenge_without_a_token_service() {
+    let context = create_test_server_context().await;
+
+    assert!(challenge_for(&context, &challenge_request(RequestScheme::Https, &[])).is_none());
+}
+
+#[tokio::test]
+async fn the_bearer_challenge_falls_back_to_the_request_host() {
+    let context = token_service_context("", "").await;
+
+    assert_eq!(
+        challenge_for(&context, &challenge_request(RequestScheme::Https, &[])).unwrap(),
+        r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#
+    );
+}
+
+#[tokio::test]
+async fn a_configured_realm_wins_over_the_request_host() {
+    let context = token_service_context("", r#"realm = "https://public.example.com/token""#).await;
+
+    assert_eq!(
+        challenge_for(&context, &challenge_request(RequestScheme::Https, &[])).unwrap(),
+        r#"Bearer realm="https://public.example.com/token",service="public.example.com""#
+    );
+}
+
+/// A TLS-terminating proxy serves angos over plaintext, so without honouring its
+/// `X-Forwarded-Proto` the challenge would send credentials to an http realm.
+#[tokio::test]
+async fn a_trusted_proxy_decides_the_realm_scheme() {
+    let context = token_service_context(r#"trusted_proxies = ["10.0.0.0/8"]"#, "").await;
+
+    assert_eq!(
+        challenge_for(
+            &context,
+            &challenge_request(RequestScheme::Http, &[("X-Forwarded-Proto", "https")])
+        )
+        .unwrap(),
+        r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#
+    );
+}
+
+#[tokio::test]
+async fn an_untrusted_peer_cannot_change_the_realm_scheme() {
+    let context = token_service_context("", "").await;
+
+    assert_eq!(
+        challenge_for(
+            &context,
+            &challenge_request(RequestScheme::Http, &[("X-Forwarded-Proto", "https")])
+        )
+        .unwrap(),
+        r#"Bearer realm="http://registry.example.com/token",service="registry.example.com""#
+    );
 }

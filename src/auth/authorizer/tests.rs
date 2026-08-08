@@ -454,6 +454,7 @@ fn log_denial_uses_audit_identity_without_oidc_claims() {
         }),
         client_ip: Some("192.0.2.10".to_string()),
         auth_method: AuthMethod::Mtls,
+        from_registry_token: false,
     };
 
     tracing::subscriber::with_default(subscriber, || log_denial("test reason", &identity));

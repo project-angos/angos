@@ -35,6 +35,7 @@ fn test_action_serialization_cel_compatibility() {
             },
         ),
         ("ui-config", Action::UiConfig),
+        ("get-token", Action::Token),
         ("healthz", Action::Healthz),
         ("readyz", Action::Readyz),
         ("metrics", Action::Metrics),
@@ -219,6 +220,7 @@ fn assert_action_variant_covered(action: &Action) {
     match action {
         Action::UiAsset { .. }
         | Action::UiConfig
+        | Action::Token
         | Action::Healthz
         | Action::Readyz
         | Action::Metrics

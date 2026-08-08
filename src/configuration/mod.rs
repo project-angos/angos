@@ -8,6 +8,7 @@ use toml::{
 
 use angos_tx_engine::lock::LockStrategy;
 
+pub mod base64_string;
 mod error;
 pub mod global;
 pub mod listeners;
@@ -20,6 +21,7 @@ pub mod trusted_proxy;
 mod ui;
 pub mod watcher;
 
+pub use base64_string::Base64String;
 pub use error::Error;
 
 /// Deserialize a positive integer into a `NonZero` type, naming `field` in the

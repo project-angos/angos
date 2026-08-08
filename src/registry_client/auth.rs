@@ -73,7 +73,7 @@ struct BearerToken {
 
 impl BearerToken {
     fn default_expires_in() -> u64 {
-        3600
+        60
     }
 
     fn token(&self) -> Result<String, Error> {
@@ -231,14 +231,19 @@ impl RegistryClient {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::from_str;
     use url::Url;
 
-    use crate::registry_client::{
-        Error,
-        auth::{
-            BearerToken, authority_for_cache_key, parse_bearer_challenge, token_cache_key,
-            token_index_cache_key,
+    use crate::{
+        auth::{TokenIssuer, token_service::Config as TokenServiceConfig},
+        registry_client::{
+            Error,
+            auth::{
+                BearerToken, authority_for_cache_key, parse_bearer_challenge, token_cache_key,
+                token_index_cache_key,
+            },
         },
+        secret::Secret,
     };
 
     #[test]
@@ -285,6 +290,41 @@ mod tests {
         let result = bearer.token();
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Internal(_)));
+    }
+
+    /// Closes the loop on angos challenging angos: the server's own challenge
+    /// format must satisfy this parser, which needs the literal `Bearer ` prefix,
+    /// quoted values and an absolute realm.
+    #[test]
+    fn the_servers_own_challenge_parses_back() {
+        let config = TokenServiceConfig {
+            secret_key: Secret::new(vec![7; 32].into()),
+            realm: None,
+            ttl_secs: 3600,
+        };
+        let issuer = TokenIssuer::new(&config).unwrap();
+        let challenge = issuer.challenge("https", "registry.example.com").unwrap();
+
+        let parsed = parse_bearer_challenge(challenge.to_str().unwrap()).unwrap();
+
+        assert_eq!(parsed.realm, "https://registry.example.com/token");
+        // The path the router serves, so a client following the challenge lands
+        // on the token endpoint rather than the UI.
+        assert_eq!(parsed.token_url().unwrap().path(), "/token");
+        assert_eq!(parsed.param("service"), Some("registry.example.com"));
+        assert_eq!(
+            parsed.token_url().unwrap().query(),
+            Some("service=registry.example.com")
+        );
+    }
+
+    /// The spec's default when an upstream omits `expires_in`. Caching longer
+    /// than that keeps a token past the lifetime its issuer granted.
+    #[test]
+    fn an_omitted_expires_in_defaults_to_sixty_seconds() {
+        let bearer: BearerToken = from_str(r#"{"token":"t"}"#).unwrap();
+
+        assert_eq!(bearer.expires_in, 60);
     }
 
     #[test]

@@ -106,6 +106,7 @@ The `route` label uses action names from the OCI Distribution API:
 | `get-referrers`     | Get referrers      |
 | `ui-asset`          | UI static files    |
 | `ui-config`         | UI configuration   |
+| `get-token`         | Token service      |
 | `list-repositories` | Extension API      |
 | `list-namespaces`   | Extension API      |
 | `list-revisions`    | Extension API      |
@@ -129,7 +130,7 @@ Total number of authentication attempts.
 | Counter | `method`, `result` |
 
 **Labels:**
-- `method`: `basic`, `mtls`, `oidc`
+- `method`: `basic`, `mtls`, `oidc`, `token`
 - `result`: `success`, `failed`
 
 **Example:**

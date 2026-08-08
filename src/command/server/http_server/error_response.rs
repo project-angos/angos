@@ -9,7 +9,15 @@ use crate::command::server::{error::Error, response_body::ResponseBody};
 
 const BASIC_AUTH_CHALLENGE: &str = r#"Basic realm="Angos", charset="UTF-8""#;
 
-pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response<ResponseBody> {
+/// `challenge` is the token service's bearer challenge when one is configured.
+/// Only our own denial is challenged: a 401 relayed from a pull-through upstream
+/// is that registry's refusal, and answering it with our realm buys the client a
+/// token round trip that changes nothing.
+pub fn error_to_response(
+    error: &Error,
+    request_id: Option<&String>,
+    challenge: Option<HeaderValue>,
+) -> Response<ResponseBody> {
     let body = Bytes::from(error.as_json(request_id).to_string());
 
     let mut response = Response::builder()
@@ -22,7 +30,7 @@ pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response
     if matches!(error, Error::Unauthorized(_)) {
         response.headers_mut().insert(
             WWW_AUTHENTICATE,
-            HeaderValue::from_static(BASIC_AUTH_CHALLENGE),
+            challenge.unwrap_or(HeaderValue::from_static(BASIC_AUTH_CHALLENGE)),
         );
     }
 

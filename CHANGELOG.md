@@ -4,7 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 1.4.5 - UNRELEASED
+## 1.4.6 - UNRELEASED
+
+### Added
+
+- An optional token service exchanges a client's credential for a registry-signed bearer token at `GET /token`, so a short-lived CI credential no longer has to outlive the push it starts.
+
+### Fixed
+
+- An upstream token response that omits `expires_in` is now cached for the 60 seconds the spec defines as its default rather than an hour, so angos stops sending a token long after its issuer stopped honouring it.
+
+## 1.4.5
 
 ### Fixed
 

@@ -106,12 +106,23 @@ async fn handle_request(
     let route_action = action.as_ref().map_or("unknown", Action::action_name);
 
     let trace_id = current_trace_id(&Span::current());
+    // Captured before the request moves into the dispatch future, since the realm
+    // may be derived from the request's own host. A denial on the token endpoint
+    // itself is not challenged: the client would be sent to fetch a token from
+    // the endpoint that just refused it.
+    let challenge_origin = (!matches!(action, Some(Action::Token)))
+        .then(|| context.challenge_origin(&request))
+        .flatten();
 
     let dispatch: DispatchFuture =
         Box::pin(dispatch_request(Arc::clone(&context), request, action));
     let response = match dispatch.await {
         Ok(response) => response,
-        Err(error) => error_to_response(&error, trace_id.as_ref()),
+        Err(error) => {
+            let challenge =
+                challenge_origin.and_then(|(scheme, host)| context.bearer_challenge(scheme, &host));
+            error_to_response(&error, trace_id.as_ref(), challenge)
+        }
     };
 
     let elapsed = elapsed_ms(start_time);

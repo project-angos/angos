@@ -430,6 +430,7 @@ RUST_LOG=angos::policy=debug \
 | `delete-job`        | Extension: delete a pending/failed job |
 | `ui-asset`          | UI static assets                     |
 | `ui-config`         | UI configuration                     |
+| `get-token`         | Exchange a credential for a token    |
 
 - [CEL Expressions Reference](../reference/cel-expressions.md) - All variables and functions
 - [Configuration Reference](../reference/configuration.md) - Policy configuration options

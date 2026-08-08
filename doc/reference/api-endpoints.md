@@ -514,7 +514,26 @@ Returns UI configuration.
 
 ## Authentication
 
-Every route passes through the access policy, including `/healthz` and `/readyz` (actions `healthz` and `readyz`). A default-deny policy must allow those actions or health and readiness probes fail.
+Every route passes through the access policy, including `/healthz`, `/readyz` and `/token` (actions `healthz`, `readyz` and `get-token`). A default-deny policy must allow those actions or health probes and token exchange fail.
+
+### Token Service
+
+```
+GET /token
+```
+
+Exchanges the credential that authenticated the request for a registry-signed bearer token, so a client holding a short-lived credential can keep working after it expires. Returns `404` unless [`auth.token_service`](configuration.md#token-service-authtoken_service) is configured.
+
+The endpoint is advertised in the `WWW-Authenticate` header of a `401`, and OCI clients follow it on their own. A request with no credentials gets a token carrying no identity, which the access policy then evaluates as anonymous.
+
+**Success Response:**
+```json
+{"token":"<jwt>","expires_in":3600}
+```
+
+Present it as `Authorization: Bearer <jwt>` on subsequent requests. The token carries the identity, never the client certificate or IP: those are read from the live request, so an mTLS client keeps its certificate identity while using a token.
+
+The response is `Cache-Control: no-store`, and presenting a registry token here is refused with a `401`: renewing one would let a token outlive the credential it was minted from for as long as a client kept asking, and `ttl_secs` would bound nothing.
 
 ### Methods
 

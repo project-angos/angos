@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::identity::AuthMethod;
 
@@ -19,6 +19,11 @@ pub struct ClientIdentity {
     /// policies see the credential fields, not the label.
     #[serde(skip)]
     pub auth_method: AuthMethod,
+    /// Set when a registry token supplied this identity. `auth_method` cannot
+    /// answer that on its own: a stronger method outranks the token in the
+    /// label while the token still filled the identity fields.
+    #[serde(skip)]
+    pub from_registry_token: bool,
 }
 
 impl ClientIdentity {
@@ -43,7 +48,12 @@ pub struct ClientCertificate {
 /// All claims from the token are exposed as-is to allow maximum flexibility
 /// in policy expressions. Standard claims like sub, iss, aud are available
 /// along with any custom claims from the OIDC provider.
-#[derive(Clone, Debug, Default, Serialize)]
+///
+/// `Deserialize` exists so the token service can restore these claims from a
+/// registry-issued token. It is deliberately absent from `ClientIdentity` and
+/// `ClientCertificate`: certificate and client IP must come from the live
+/// request, never from a token.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct OidcClaims {
     pub provider_name: String,
     pub provider_type: String,
