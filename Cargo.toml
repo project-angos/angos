@@ -30,7 +30,7 @@ futures-util = { version = "0.3.34", default-features = false }
 hex = "0.4.3"
 hmac = "0.13.0"
 hyper = "1.11.0"
-redis = { version = "1.5.0", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -43,7 +43,7 @@ tokio-util = { version = "0.7.19", features = ["io-util"] }
 tracing = "0.1.44"
 tracing-opentelemetry = "0.33"
 url = "2.5.8"
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.24.1", features = ["v4"] }
 wiremock = "0.6.5"
 
 [package]
@@ -87,7 +87,7 @@ opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 # Stays on 0.5 in lockstep with argon2: this dep exists to enable the
 # `getrandom` feature on the password-hash instance argon2 re-exports, which
 # requires both to resolve to the same crate version.
-password-hash = { version = "0.5", features = ["getrandom"] }
+password-hash = { version = "0.6.1", features = ["getrandom"] }
 prometheus = "0.14"
 redis = { workspace = true }
 regex = { workspace = true }
