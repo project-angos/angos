@@ -31,19 +31,19 @@
     "@docusaurus/types": "^3.10.2"
   },
   "overrides": {
-    "serialize-javascript": "^7.1.0",
+    "serialize-javascript": "^7.1.1",
     "shell-quote": "^1.10.0",
     "ws": "^8.21.3",
-    "qs": "^6.15.3",
-    "uuid": "^14.0.1",
-    "dompurify": "^3.4.13",
+    "qs": "^6.16.0",
+    "uuid": "^14.0.2",
+    "dompurify": "^3.4.14",
     "http-proxy-middleware": "^4.2.0",
-    "joi": "^18.2.3",
+    "joi": "^18.2.5",
     "launch-editor": "^2.14.1",
-    "@babel/core": "^7.29.7",
+    "@babel/core": "^8.0.1",
     "webpack-dev-server": "^6.0.0",
     "gray-matter": {
-      "js-yaml": "^5.3.0"
+      "js-yaml": "^5.4.1"
     }
   },
   "browserslist": {
@@ -59,6 +59,6 @@
     ]
   },
   "engines": {
-    "node": ">=24.19.0"
+    "node": ">=24.20.0"
   }
 }
