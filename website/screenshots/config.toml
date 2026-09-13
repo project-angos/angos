@@ -1,0 +1,67 @@
+# Throwaway registry the documentation screenshots are taken from. generate.sh
+# runs `angos server` and `angos scanner` on it from an empty temporary
+# directory, so the data lands under ./data there and goes with it.
+[server]
+bind_address = "127.0.0.1"
+port = 8900
+
+[global]
+update_pull_time = true          # fills the Pull History tab
+shutdown_drain_secs = 1          # the in-flight replication jobs below would hold a shutdown for 30s
+
+[global.access_policy]
+default = "allow"
+
+[global.scan]
+url = "http://127.0.0.1:8901"    # the scanner service below
+
+[ui]
+enabled = true
+
+# The browser pulls as admin and generate.sh as ci-runner, so the Pull History
+# tab names its clients. Both passwords are "test".
+[auth.identity.admin]
+username = "admin"
+password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w"
+
+[auth.identity.ci]
+username = "ci-runner"
+password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w"
+
+[blob_store.fs]
+root_dir = "./data"
+
+# Hosted images: immutable tags, scanned and indexed as they land, so the
+# manifest pages show the vuln badges and the Filesystem tab at once.
+[repository."library"]
+immutable_tags = true
+immutable_tags_exclusions = ["^latest$", "^edge$"]
+scan = true
+index = true
+
+# ORAS artifacts, for the Files view.
+[repository."artifacts"]
+
+# The nginx images and the artifacts replicate to a downstream that accepts
+# the connection and never answers (an nc generate.sh runs), so their pushes
+# leave replication jobs pending and in flight for the Jobs page.
+[[repository."library".downstream]]
+name = "eu-mirror"
+url = "http://127.0.0.1:8902"
+namespace_filter = ["^library/nginx"]
+
+[[repository."artifacts".downstream]]
+name = "eu-mirror"
+url = "http://127.0.0.1:8902"
+
+# A pull-through cache, for the second table of the repositories page.
+[[repository."docker.io".upstream]]
+url = "https://registry-1.docker.io"
+
+# Read by `angos scanner` alone.
+[scanner]
+bind_address = "127.0.0.1"
+port = 8901
+
+[scanner.registry]
+url = "http://127.0.0.1:8900"

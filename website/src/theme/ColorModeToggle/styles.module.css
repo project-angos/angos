@@ -1,39 +1,39 @@
+/* Three quiet icon buttons in one ring, as in the web UI; the chosen one is tinted. */
 .themeSwitcher {
-  display: flex;
-  gap: 0;
-  border: 1px solid var(--ifm-toc-border-color);
-  border-radius: 8px;
+  display: inline-flex;
   overflow: hidden;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-ring);
 }
 
 .themeSwitcher button {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--ifm-background-color);
-  color: var(--ifm-font-color-secondary);
-  border: none;
-  padding: 0.5rem;
+  padding: 0.3rem 0.45rem;
+  border: 0;
+  background: var(--surface);
+  color: var(--muted);
   cursor: pointer;
-  transition: all 0.15s ease;
-  border-right: 1px solid var(--ifm-toc-border-color);
 }
 
-.themeSwitcher button:last-child {
-  border-right: none;
+.themeSwitcher button + button {
+  border-left: 1px solid var(--border);
 }
 
 .themeSwitcher button svg {
-  width: 16px;
-  height: 16px;
+  width: 0.875rem;
+  height: 0.875rem;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .themeSwitcher button:hover {
-  color: var(--ifm-font-color-base);
-  background: var(--ifm-background-surface-color);
+  background: var(--hover);
+  color: var(--text);
 }
 
 .themeSwitcher button.active {
-  color: var(--ifm-color-primary);
-  background: color-mix(in srgb, var(--ifm-color-primary) 10%, transparent);
+  background: var(--hover-strong);
+  color: var(--text);
 }

@@ -155,6 +155,8 @@ pub struct RevisionsBody {
 
 #[derive(Serialize, Debug)]
 pub struct UploadEntry {
+    /// `uuid` on the wire, the name the API reference and the web UI read.
+    #[serde(rename = "uuid")]
     session_id: UploadSessionId,
     size: u64,
     started_at: DateTime<Utc>,
@@ -1458,6 +1460,31 @@ mod tests {
         assert_eq!(namespaces[0]["name"], "test-repo/upload-only");
         assert_eq!(namespaces[0]["manifest_count"], 0);
         assert_eq!(namespaces[0]["upload_count"], 1);
+    }
+
+    /// The API reference and the web UI read an upload's identifier as `uuid`.
+    #[tokio::test]
+    async fn uploads_info_names_the_session_id_uuid() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+            let namespace = Namespace::new("test-repo/uploads").unwrap();
+            let session_id = UploadSessionId::generate();
+            registry
+                .blob_store
+                .create_upload(&namespace, &session_id, None)
+                .await
+                .unwrap();
+
+            let body = response_json(registry.get_uploads_info(&namespace).await.unwrap()).await;
+            let uploads = body["uploads"].as_array().unwrap();
+
+            assert_eq!(uploads.len(), 1, "got: {uploads:?}");
+            assert_eq!(
+                uploads[0]["uuid"],
+                serde_json::to_value(&session_id).unwrap()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]

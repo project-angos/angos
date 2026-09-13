@@ -499,6 +499,11 @@ button.link,
 	font-weight: 500;
 }
 
+/* Its narrow cell must never break the word across two lines. */
+.download-link {
+	white-space: nowrap;
+}
+
 button.link:hover,
 .download-link:hover {
 	background: none;
