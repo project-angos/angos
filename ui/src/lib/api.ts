@@ -76,6 +76,7 @@ export interface RepositoryInfo {
 	name: string;
 	namespace_count: number;
 	pull_through_cache: boolean;
+	upstream_urls: string[];
 	immutable_tags: boolean;
 }
 

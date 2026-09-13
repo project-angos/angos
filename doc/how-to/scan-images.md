@@ -114,6 +114,12 @@ oras discover registry.example.com/apps/web:1.0
 
 The web UI shows it on the manifest's Vulnerabilities tab, whichever scanner wrote it, listing every finding with its package, fixed version and advisory link, and badges the report in the tree with the severity counts.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-vulnerabilities-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-vulnerabilities-light.png" />
+  <img alt="Vulnerabilities tab showing a scan report" src="../images/ui-vulnerabilities-light.png" />
+</picture>
+
 ## Step 6: Scan What Was Already There
 
 Enabling `scan = true` covers pushes from then on. Give the images already in the repository a report with:

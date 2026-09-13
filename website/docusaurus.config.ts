@@ -105,7 +105,7 @@ const config: Config = {
       ],
     },
     footer: {
-      style: 'dark',
+      style: 'light',
       links: [
         {
           title: 'Learn',
@@ -145,7 +145,7 @@ const config: Config = {
     },
     prism: {
       theme: prismThemes.github,
-      darkTheme: prismThemes.dracula,
+      darkTheme: prismThemes.vsDark,
       additionalLanguages: ['bash', 'toml', 'yaml', 'rust', 'json'],
     },
     mermaid: {

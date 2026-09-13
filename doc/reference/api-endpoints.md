@@ -292,6 +292,7 @@ List all configured repositories with their namespace counts.
       "name": "library",
       "namespace_count": 15,
       "pull_through_cache": true,
+      "upstream_urls": ["https://registry-1.docker.io"],
       "immutable_tags": true
     }
   ]

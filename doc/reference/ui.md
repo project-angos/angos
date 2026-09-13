@@ -134,12 +134,11 @@ rules = [
   <img alt="Repository List" src="../images/ui-repositories-light.png" />
 </picture>
 
-Displays all configured repositories with:
+Displays the configured repositories in two tables, the hosted ones first and the pull-through caches, when any are configured, after them, each with:
 - Repository name
+- Upstream registry, for a cache
+- **Immutable** badge, when immutable tags are enabled
 - Namespace count
-- Feature badges:
-  - **Pull-through**: Has upstream configuration
-  - **Immutable**: Immutable tags enabled
 
 ### Namespace List
 
@@ -174,18 +173,71 @@ Tree view of all manifests:
 
 ### Manifest Details
 
+The page opens with a **title**, the full name it was addressed by (`namespace:tag` or `namespace@digest`) with a copy button, and splits the detail into tabs. Each tab has its own URL, the anchor naming it (`#history`, `#vulnerabilities`, `#filesystem`) and none for OCI, so a tab can be linked to; an anchor naming a tab the manifest lacks opens OCI. On a multi-platform index the platform shown follows, as in `#vulnerabilities/linux/arm64`.
+
+#### OCI
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../images/ui-manifest-details-dark.png" />
   <source media="(prefers-color-scheme: light)" srcset="../images/ui-manifest-details-light.png" />
-  <img alt="Manifest Details" src="../images/ui-manifest-details-light.png" />
+  <img alt="Manifest Details, OCI tab" src="../images/ui-manifest-details-light.png" />
 </picture>
 
-The page opens with a **title**, the full name it was addressed by (`namespace:tag` or `namespace@digest`) with a copy button, and splits the detail into tabs. Each tab has its own URL, the anchor naming it (`#history`, `#vulnerabilities`, `#filesystem`) and none for OCI, so a tab can be linked to; an anchor naming a tab the manifest lacks opens OCI. On a multi-platform index the platform shown follows, as in `#vulnerabilities/linux/arm64`.
+The manifest (digest, tags with delete buttons, media type, artifact type, subject, expandable annotations, a delete action), the config, the layers (or, for an ORAS artifact, its files with download links), an index's platform manifests, the referrers (signatures, SBOMs, reports), and what references the manifest. Referrers load the first 100 with the view; a "Load more referrers" control fetches the next page, which needs the `get-referrers` action.
 
-- **OCI**: the manifest (digest, tags with delete buttons, media type, artifact type, subject, expandable annotations, a delete action), the config, the layers (or, for an ORAS artifact, its files with download links), an index's platform manifests, the referrers (signatures, SBOMs, reports), and what references the manifest. Referrers load the first 100 with the view; a "Load more referrers" control fetches the next page, which needs the `get-referrers` action.
-- **Pull History**: the newest 100 recorded pulls of the reference the view was addressed by, a tag and a digest recorded separately. The heading states the configured retention, since superseded entries are collected past it; recording happens only when `update_pull_time` is enabled.
-- **Vulnerabilities** (only when a report is attached, with the total finding count in a grey square on the tab): the report shown inline, its findings filterable by severity, each with the package, installed and fixed versions and a link to the advisory, and the scanner named. A multi-platform index gets a sub-tab per platform manifest that has a report. The counts also appear next to the `vuln` badge in the manifest tree and in referrer lists, as count pills coloured by severity with the severity named on hover.
-- **Filesystem** (only for an image with tar layers): the layers merged into one tree, the way a runtime applies them, whiteouts removing what lower layers put there, and every entry carrying the layer that last set it, shown as a tree in the list view or as tiles walked folder by folder in the icon view. The layers menu narrows the tree to what the checked layers added, changed or removed, a path filter to matching names. Opening a file shows it inline up to 512 KiB, or offers it for download, and a symlink is followed to its target; both go through the registry's layer endpoints, which need the `get-blob` action. The first visit to an image nobody indexed shows "Indexing" until the registry's index jobs have walked its layers.
+For a multi-platform index, the platform manifests are listed with their referrers nested beneath, each attestation carrying its `SBOM`, `SLSA` or `vuln` badge:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-manifest-index-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-manifest-index-light.png" />
+  <img alt="Manifest details for a multi-platform index" src="../images/ui-manifest-index-light.png" />
+</picture>
+
+#### Pull History
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-pull-history-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-pull-history-light.png" />
+  <img alt="Pull History tab" src="../images/ui-pull-history-light.png" />
+</picture>
+
+The newest 100 recorded pulls of the reference the view was addressed by, a tag and a digest recorded separately, each naming the client that pulled. The heading states the configured retention, since superseded entries are collected past it; recording happens only when `update_pull_time` is enabled.
+
+#### Vulnerabilities
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-vulnerabilities-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-vulnerabilities-light.png" />
+  <img alt="Vulnerabilities tab" src="../images/ui-vulnerabilities-light.png" />
+</picture>
+
+Shown only when a report is attached, with the total finding count in a grey square on the tab: the report inline, its findings filterable by severity, each with the package, installed and fixed versions and a link to the advisory, and the scanner named. A multi-platform index gets a sub-tab per platform manifest that has a report. The counts also appear next to the `vuln` badge in the manifest tree and in referrer lists, as count pills coloured by severity with the severity named on hover.
+
+#### Filesystem
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-light.png" />
+  <img alt="Filesystem tab, list view" src="../images/ui-filesystem-light.png" />
+</picture>
+
+Shown only for an image with tar layers: the layers merged into one tree, the way a runtime applies them, whiteouts removing what lower layers put there, and every entry carrying the layer that last set it. Opening a file shows it inline up to 512 KiB, or offers it for download, and a symlink is followed to its target; both go through the registry's layer endpoints, which need the `get-blob` action. The first visit to an image nobody indexed shows "Indexing" until the registry's index jobs have walked its layers.
+
+The **icon view** walks the tree folder by folder as tiles:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-icons-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-icons-light.png" />
+  <img alt="Filesystem tab, icon view" src="../images/ui-filesystem-icons-light.png" />
+</picture>
+
+The **layers menu** narrows the tree to what the checked layers added, changed or removed, and a path filter narrows it to matching names:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-layers-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-layers-light.png" />
+  <img alt="Filesystem tab, layers menu" src="../images/ui-filesystem-layers-light.png" />
+</picture>
 
 ### Uploads
 
@@ -200,6 +252,19 @@ Shows in-progress blob uploads:
 - Current size
 - Start time
 - Cancel button
+
+### Jobs
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-jobs-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-jobs-light.png" />
+  <img alt="Jobs" src="../images/ui-jobs-light.png" />
+</picture>
+
+Lists the durable background work of each queue, one URL per queue (`/jobs/cache`, `/jobs/replication`, `/jobs/scan`, `/jobs/index`), selected by the tabs at the top; `/jobs` opens the cache queue. Two tables:
+
+- **Pending & In-flight**: the kind, lock key, attempt count and queued time of each job, with a `backoff` badge on one waiting out a retry delay, and a delete action.
+- **Failed**: the jobs that exhausted their attempts and dead-lettered, with the last error, a **retry** that re-queues one and a delete that discards it.
 
 ---
 

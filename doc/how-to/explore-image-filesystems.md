@@ -31,6 +31,12 @@ Open any image manifest in the web UI. Its page ends with a Filesystem panel. An
 
 Folders open on click, as a tree in the list view or as tiles walked with the folder path in the icon view. The layer column names the layer that last set each entry, `L1` being the lowest. Check one or more layers in the layers menu to see only what those layers added, changed or removed, the removed paths struck through, or type in the filter to narrow the tree to matching paths.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-light.png" />
+  <img alt="Filesystem tab, with a file open" src="../images/ui-filesystem-light.png" />
+</picture>
+
 ## Step 3: Open a File
 
 Click a file to read it under the tree, up to 512 KiB, or download it whatever its size. A hard link opens its target. A symlink shows where it points and, clicked, is followed there, through any links on the way; one that leads out of the image says so.

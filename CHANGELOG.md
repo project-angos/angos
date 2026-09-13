@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The repositories page lists pull-through caches in their own table, with each cache's upstream, below the hosted repositories.
 - Orphan-job clearing, the deletion of queued jobs whose downstream or repository is no longer configured, moved from `angos prune` to `angos scrub`, next to the other derivable state scrub reclaims; prune keeps retention, upload leftovers and orphan namespaces.
 - The manifest view splits its detail into tabs, OCI, Pull History, Vulnerabilities (with the finding count) and Filesystem, the last two only when available, each but OCI addressed by a `#` anchor, the platform shown on an index's report following it, so a tab can be linked to; the standalone vulnerability report page was folded into the tab and removed.
 - The web UI was redesigned around a calmer, document-like look: a single top bar carries the registry name, the breadcrumb trail, the page links and the theme switcher, pages open with a title, panels and tables use hairline rules and soft tag colours, and the bundled fonts gave way to the system UI font.
