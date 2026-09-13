@@ -74,6 +74,7 @@ pub struct RepositoryInfo {
     name: String,
     namespace_count: usize,
     pull_through_cache: bool,
+    upstream_urls: Vec<String>,
     immutable_tags: bool,
 }
 
@@ -356,6 +357,7 @@ impl Registry {
                 name: name.to_string(),
                 namespace_count,
                 pull_through_cache: config.pull_through_cache,
+                upstream_urls: config.upstream_urls,
                 immutable_tags: config.immutable_tags,
             });
         }
