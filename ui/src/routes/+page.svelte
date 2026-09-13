@@ -5,6 +5,7 @@
 	import { getRegistryName } from '$lib/config.svelte';
 	import { fetchRepositories, type RepositoryInfo } from '$lib/api';
 	import { isInteractiveTarget, pathUrl } from '$lib/utils';
+	import Card from '$lib/components/Card.svelte';
 	import LoadingState from '$lib/components/LoadingState.svelte';
 	import ErrorState from '$lib/components/ErrorState.svelte';
 	import Breadcrumb from '$lib/components/Breadcrumb.svelte';
@@ -22,6 +23,13 @@
 		}
 		loading = false;
 	});
+
+	const hosted = $derived(repositories.filter((repo) => !repo.pull_through_cache));
+	const caches = $derived(repositories.filter((repo) => repo.pull_through_cache));
+
+	function open(event: MouseEvent, name: string) {
+		if (!isInteractiveTarget(event)) goto(pathUrl(name));
+	}
 </script>
 
 <svelte:head>
@@ -38,38 +46,65 @@
 {:else if error}
 	<ErrorState message={error} />
 {:else}
-	<table>
-		<thead>
-			<tr>
-				<th>Name</th>
-				<th>Features</th>
-				<th class="col-medium">Namespaces</th>
-			</tr>
-		</thead>
-		<tbody>
-			{#if repositories.length === 0}
+	<Card title="Hosted" count={hosted.length}>
+		<table>
+			<thead>
 				<tr>
-					<td colspan="3" class="empty">No repositories found</td>
+					<th>Name</th>
+					<th>Features</th>
+					<th class="col-medium">Namespaces</th>
 				</tr>
-			{:else}
-				{#each repositories as repo}
-					<tr class="clickable" onclick={(event) => { if (!isInteractiveTarget(event)) goto(pathUrl(repo.name)); }}>
+			</thead>
+			<tbody>
+				{#each hosted as repo (repo.name)}
+					<tr class="clickable" onclick={(event) => open(event, repo.name)}>
 						<td><a class="row-link" href={pathUrl(repo.name)}>{repo.name}</a></td>
 						<td>
-							{#if repo.pull_through_cache}
-								<span class="badge pull-through">Cache</span>
-							{/if}
 							{#if repo.immutable_tags}
 								<span class="badge immutable">Immutable</span>
-							{/if}
-							{#if !repo.pull_through_cache && !repo.immutable_tags}
+							{:else}
 								<span class="no-features">-</span>
 							{/if}
 						</td>
 						<td>{repo.namespace_count > 0 ? repo.namespace_count : '-'}</td>
 					</tr>
+				{:else}
+					<tr>
+						<td colspan="3" class="empty">No hosted repositories</td>
+					</tr>
 				{/each}
-			{/if}
-		</tbody>
-	</table>
+			</tbody>
+		</table>
+	</Card>
+
+	{#if caches.length > 0}
+		<Card title="Pull-through caches" count={caches.length}>
+			<table>
+				<thead>
+					<tr>
+						<th>Name</th>
+						<th>Upstream</th>
+						<th>Features</th>
+						<th class="col-medium">Namespaces</th>
+					</tr>
+				</thead>
+				<tbody>
+					{#each caches as repo (repo.name)}
+						<tr class="clickable" onclick={(event) => open(event, repo.name)}>
+							<td><a class="row-link" href={pathUrl(repo.name)}>{repo.name}</a></td>
+							<td class="mono">{repo.upstream_urls.join(', ')}</td>
+							<td>
+								{#if repo.immutable_tags}
+									<span class="badge immutable">Immutable</span>
+								{:else}
+									<span class="no-features">-</span>
+								{/if}
+							</td>
+							<td>{repo.namespace_count > 0 ? repo.namespace_count : '-'}</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+		</Card>
+	{/if}
 {/if}

@@ -134,12 +134,11 @@ rules = [
   <img alt="Repository List" src="../images/ui-repositories-light.png" />
 </picture>
 
-Displays all configured repositories with:
+Displays the configured repositories in two tables, the hosted ones first and the pull-through caches, when any are configured, after them, each with:
 - Repository name
+- Upstream registry, for a cache
+- **Immutable** badge, when immutable tags are enabled
 - Namespace count
-- Feature badges:
-  - **Pull-through**: Has upstream configuration
-  - **Immutable**: Immutable tags enabled
 
 ### Namespace List
 
