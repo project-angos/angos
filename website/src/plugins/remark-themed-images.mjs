@@ -1,5 +1,10 @@
 import {visit} from 'unist-util-visit';
 
+// Turns a `<picture>` with light and dark sources, which GitHub renders as
+// is, into two markdown images the theme shows one of. Emitting markdown
+// image nodes rather than `<img>` tags matters: Docusaurus bundles the
+// former as assets and leaves the latter's relative paths untouched, so
+// this must run before its default plugins.
 export default function remarkThemedImages() {
   return (tree) => {
     visit(tree, (node) => {
@@ -38,26 +43,14 @@ function transformPicture(node) {
   node.attributes = [
     {type: 'mdxJsxAttribute', name: 'className', value: 'themed-image'}
   ];
-  node.children = [
-    {
-      type: 'mdxJsxFlowElement',
-      name: 'img',
-      attributes: [
-        {type: 'mdxJsxAttribute', name: 'src', value: lightSrc},
-        {type: 'mdxJsxAttribute', name: 'alt', value: alt},
-        {type: 'mdxJsxAttribute', name: 'className', value: 'light-only'},
-      ],
-      children: [],
-    },
-    {
-      type: 'mdxJsxFlowElement',
-      name: 'img',
-      attributes: [
-        {type: 'mdxJsxAttribute', name: 'src', value: darkSrc},
-        {type: 'mdxJsxAttribute', name: 'alt', value: alt},
-        {type: 'mdxJsxAttribute', name: 'className', value: 'dark-only'},
-      ],
-      children: [],
-    },
-  ];
+  node.children = [themed('light-only', lightSrc, alt), themed('dark-only', darkSrc, alt)];
+}
+
+function themed(className, url, alt) {
+  return {
+    type: 'mdxJsxFlowElement',
+    name: 'span',
+    attributes: [{type: 'mdxJsxAttribute', name: 'className', value: className}],
+    children: [{type: 'image', url, alt}],
+  };
 }

@@ -46,7 +46,7 @@ const config: Config = {
           path: '../doc',
           sidebarPath: './sidebars.ts',
           editUrl: 'https://github.com/project-angos/angos/tree/main/doc/',
-          remarkPlugins: [remarkThemedImages],
+          beforeDefaultRemarkPlugins: [remarkThemedImages],
         },
         pages: {},
         blog: false,
