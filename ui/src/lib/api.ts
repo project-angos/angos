@@ -144,8 +144,8 @@ interface FailedJobsResponse {
 
 export type JobState = 'pending' | 'failed';
 
-export type JobQueue = 'cache' | 'replication' | 'scan';
-export const JOB_QUEUES: JobQueue[] = ['cache', 'replication', 'scan'];
+export type JobQueue = 'cache' | 'replication' | 'scan' | 'index';
+export const JOB_QUEUES: JobQueue[] = ['cache', 'replication', 'scan', 'index'];
 
 const MANIFEST_ACCEPT_HEADER = [
 	'application/vnd.oci.image.manifest.v1+json',
@@ -331,6 +331,56 @@ export async function cancelUpload(namespace: string, uuid: string): Promise<str
 
 export function blobUrl(namespace: string, digest: string): string {
 	return `/v2/${namespace}/blobs/${digest}`;
+}
+
+// ---- Layer filesystems ----
+
+export type LayerEntryKind = 'file' | 'dir' | 'symlink' | 'hardlink' | 'whiteout' | 'opaque' | 'other';
+
+export interface LayerEntry {
+	path: string;
+	kind: LayerEntryKind;
+	size: number;
+	mode: number;
+	uid: number;
+	gid: number;
+	mtime: number;
+	link?: string;
+	offset: number;
+}
+
+export interface LayerListing {
+	compressed: boolean;
+	uncompressed_size: number;
+	entries: LayerEntry[];
+}
+
+export interface LayerEntriesResult {
+	listing: LayerListing | null;
+	/** The registry is indexing the layer; ask again shortly. */
+	pending: boolean;
+	error: string | null;
+}
+
+export async function fetchLayerEntries(namespace: string, digest: string): Promise<LayerEntriesResult> {
+	try {
+		const response = await fetch(`/v2/${namespace}/_angos/layers/${digest}/entries`);
+		if (response.status === 202) {
+			return { listing: null, pending: true, error: null };
+		}
+		if (!response.ok) {
+			return { listing: null, pending: false, error: `HTTP ${response.status}` };
+		}
+		return { listing: await response.json(), pending: false, error: null };
+	} catch (e) {
+		return { listing: null, pending: false, error: e instanceof Error ? e.message : 'Request failed' };
+	}
+}
+
+export function layerFileUrl(namespace: string, digest: string, path: string, download = false): string {
+	const query = new URLSearchParams({ path });
+	if (download) query.set('download', '1');
+	return `/v2/${namespace}/_angos/layers/${digest}/file?${query}`;
 }
 
 // A blob body as JSON, served by the registry itself rather than by a

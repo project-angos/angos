@@ -15,6 +15,7 @@ use crate::{
         runner::claim_loop,
         store::{self as job_store, ClaimMode, JobHandler, JobStore, QueueDepthRefresh},
     },
+    layer::IndexLayerJobHandler,
     registry::{
         Registry, RegistryConfig, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -88,16 +89,29 @@ impl InProcessLoops {
 /// Spawn `cache_loops` and `replication_loops` claim loops draining
 /// `job_store`. Replication drains only when a downstream is configured: an
 /// always-empty queue would just storm the object store with `LIST`s.
+/// How many in-process loops each queue gets.
+struct LoopCounts {
+    cache: NonZeroUsize,
+    replication: NonZeroUsize,
+    index: NonZeroUsize,
+}
+
 fn spawn_in_process_loops(
     job_store: &Arc<JobStore>,
     resolver: &Arc<RepositoryResolver>,
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     event_dispatcher: Option<Arc<EventDispatcher>>,
-    cache_loops: NonZeroUsize,
-    replication_loops: NonZeroUsize,
+    counts: &LoopCounts,
 ) -> InProcessLoops {
     let loops = InProcessLoops::none();
+
+    // Any image may be indexed on demand, so the queue always drains.
+    let index_handler: Arc<dyn JobHandler> = Arc::new(IndexLayerJobHandler::new(
+        blob_store.clone(),
+        metadata_store.clone(),
+    ));
+    loops.spawn(job_store, &index_handler, Queue::Index, counts.index);
 
     let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheFillJobHandler::new(
         resolver.clone(),
@@ -105,7 +119,7 @@ fn spawn_in_process_loops(
         metadata_store.clone(),
         event_dispatcher,
     ));
-    loops.spawn(job_store, &cache_handler, Queue::Cache, cache_loops);
+    loops.spawn(job_store, &cache_handler, Queue::Cache, counts.cache);
 
     let any_downstream = resolver
         .keys()
@@ -123,7 +137,7 @@ fn spawn_in_process_loops(
             job_store,
             &replication_handler,
             Queue::Replication,
-            replication_loops,
+            counts.replication,
         );
     }
 
@@ -201,8 +215,11 @@ pub async fn build_registry(
                 &blob_backend,
                 &metadata_store,
                 event_dispatcher.clone(),
-                config.global.max_concurrent_cache_jobs,
-                config.global.max_concurrent_replication_jobs,
+                &LoopCounts {
+                    cache: config.global.max_concurrent_cache_jobs,
+                    replication: config.global.max_concurrent_replication_jobs,
+                    index: config.global.max_concurrent_index_jobs,
+                },
             );
             (job_store, None, loops)
         };
@@ -267,10 +284,11 @@ mod tests {
     use angos_oci::header::DOCKER_CONTENT_DIGEST;
     use angos_oci::{Namespace, Tag};
 
-    use super::{InProcessLoops, spawn_in_process_loops};
+    use super::{InProcessLoops, LoopCounts, spawn_in_process_loops};
     use crate::{
         configuration::global::{
-            DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
+            DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
+            DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
         },
         jobs::{
             Queue,
@@ -323,8 +341,11 @@ mod tests {
             &blob_store,
             &metadata_store,
             None,
-            DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
-            DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
+            &LoopCounts {
+                cache: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
+                replication: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
+                index: DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
+            },
         );
         let registry = Registry::new(
             blob_store,

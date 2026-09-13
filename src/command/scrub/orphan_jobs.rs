@@ -68,6 +68,7 @@ fn classify(
                 )
             }))
         }
+        Queue::Index => Ok(None),
         Queue::Cache => {
             let payload: CacheFetchBlobPayload = serde_json::from_value(payload)?;
             let configured = resolver
@@ -94,7 +95,7 @@ pub struct OrphanJobChecker {
 }
 
 impl OrphanJobChecker {
-    /// `payload_read_concurrency` is the prune command's `--concurrency`.
+    /// `payload_read_concurrency` is the scrub command's `--concurrency`.
     #[must_use]
     pub fn new(
         job_store: Arc<JobStore>,
@@ -174,7 +175,7 @@ impl OrphanJobChecker {
                 let Some(payload) = payload else {
                     continue;
                 };
-                // A payload that fails to decode is skipped: prune must not
+                // A payload that fails to decode is skipped: scrub must not
                 // delete what it cannot attribute.
                 let reason = match classify(self.queue, &self.resolver, payload) {
                     Ok(reason) => reason,
@@ -213,7 +214,7 @@ impl OrphanJobChecker {
         let pending = self.scan_partition(JobState::Pending, sink).await?;
         let failed = self.scan_partition(JobState::Failed, sink).await?;
         info!(
-            "prune: found {pending} orphan pending and {failed} orphan dead-lettered {} job(s)",
+            "scrub: found {pending} orphan pending and {failed} orphan dead-lettered {} job(s)",
             self.queue
         );
         Ok(())
@@ -228,7 +229,7 @@ pub async fn sweep_orphan_jobs(
     sink: &dyn ActionSink,
     concurrency: usize,
 ) -> Result<(), Error> {
-    for queue in [Queue::Replication, Queue::Cache, Queue::Scan] {
+    for queue in [Queue::Replication, Queue::Cache, Queue::Scan, Queue::Index] {
         OrphanJobChecker::new(job_store.clone(), resolver.clone(), queue, concurrency)
             .check_all(sink)
             .await?;
@@ -251,7 +252,7 @@ mod tests {
                 action::Action,
                 executor::{ActionSink, DryRunSink, Executor},
             },
-            prune::orphan_jobs::{OrphanJobChecker, classify},
+            scrub::orphan_jobs::{OrphanJobChecker, classify},
         },
         jobs::{
             JobState, Queue,
@@ -320,6 +321,7 @@ mod tests {
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
             scan: false,
+            index: false,
         }
     }
 
@@ -564,7 +566,7 @@ mod tests {
 
         assert!(
             sink.lock().unwrap().is_empty(),
-            "a payload prune cannot attribute must be skipped, got {} action(s)",
+            "a payload scrub cannot attribute must be skipped, got {} action(s)",
             sink.lock().unwrap().len()
         );
         assert_eq!(
@@ -798,7 +800,7 @@ mod tests {
 
         assert!(
             sink.lock().unwrap().is_empty(),
-            "a payload prune cannot attribute must be skipped, got {} action(s)",
+            "a payload scrub cannot attribute must be skipped, got {} action(s)",
             sink.lock().unwrap().len()
         );
         assert_eq!(

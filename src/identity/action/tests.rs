@@ -162,6 +162,22 @@ fn test_action_serialization_cel_compatibility() {
             },
         ),
         (
+            "get-blob",
+            Action::ListLayerEntries {
+                namespace: ns(),
+                digest: digest(),
+            },
+        ),
+        (
+            "get-blob",
+            Action::GetLayerFile {
+                namespace: ns(),
+                digest: digest(),
+                path: "etc/os-release".to_string(),
+                download: false,
+            },
+        ),
+        (
             "get-manifest",
             Action::HeadManifest {
                 namespace: ns(),
@@ -238,6 +254,8 @@ fn assert_action_variant_covered(action: &Action) {
         | Action::DeleteUpload { .. }
         | Action::GetBlob { .. }
         | Action::HeadBlob { .. }
+        | Action::ListLayerEntries { .. }
+        | Action::GetLayerFile { .. }
         | Action::DeleteBlob { .. }
         | Action::GetManifest { .. }
         | Action::HeadManifest { .. }

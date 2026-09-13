@@ -23,6 +23,8 @@ pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4)
 pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 /// Worker concurrency for the scan queue; a scan is minutes of scanner work.
 pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+/// One layer inflates at a time per process by default: it is CPU-bound.
+pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
 // A config struct is naturally flag-heavy; the bool count is not an API smell.
 #[allow(clippy::struct_excessive_bools)]
@@ -37,6 +39,8 @@ pub struct GlobalConfig {
     pub max_concurrent_replication_jobs: NonZeroUsize,
     #[serde(default = "default_max_concurrent_scan_jobs")]
     pub max_concurrent_scan_jobs: NonZeroUsize,
+    #[serde(default = "default_max_concurrent_index_jobs")]
+    pub max_concurrent_index_jobs: NonZeroUsize,
     #[serde(default = "default_max_manifest_size")]
     pub max_manifest_size: ByteSize,
     #[serde(default = "default_max_blob_size")]
@@ -131,6 +135,10 @@ fn default_max_concurrent_scan_jobs() -> NonZeroUsize {
     DEFAULT_MAX_CONCURRENT_SCAN_JOBS
 }
 
+fn default_max_concurrent_index_jobs() -> NonZeroUsize {
+    DEFAULT_MAX_CONCURRENT_INDEX_JOBS
+}
+
 fn default_max_concurrent_replication_jobs() -> NonZeroUsize {
     DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS
 }
@@ -166,6 +174,7 @@ impl Default for GlobalConfig {
             max_concurrent_cache_jobs: default_max_concurrent_cache_jobs(),
             max_concurrent_replication_jobs: default_max_concurrent_replication_jobs(),
             max_concurrent_scan_jobs: default_max_concurrent_scan_jobs(),
+            max_concurrent_index_jobs: default_max_concurrent_index_jobs(),
             max_manifest_size: default_max_manifest_size(),
             max_blob_size: default_max_blob_size(),
             blob_stream_frame_size: default_blob_stream_frame_size(),

@@ -3,9 +3,11 @@
 
 	interface Props {
 		annotations?: Record<string, string>;
+		/** Counts alone, the severity in a tooltip, where a row is short of room. */
+		compact?: boolean;
 	}
 
-	let { annotations }: Props = $props();
+	let { annotations, compact = false }: Props = $props();
 	const summary = $derived(parseScanSummary(annotations));
 </script>
 
@@ -16,7 +18,9 @@
 		{:else}
 			{#each SEVERITIES as severity}
 				{#if summary.counts[severity] > 0}
-					<span class="severity severity-{severity}">{summary.counts[severity]} {severity}</span>
+					<span class="severity severity-{severity}" title={compact ? `${summary.counts[severity]} ${severity}` : undefined}
+						>{compact ? summary.counts[severity] : `${summary.counts[severity]} ${severity}`}</span
+					>
 				{/if}
 			{/each}
 		{/if}

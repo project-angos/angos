@@ -36,6 +36,7 @@ URLs follow Docker reference format:
 | `/{repository}/{namespace}`          | Manifest list    | All manifests for an image  |
 | `/{repository}/{namespace}:{tag}`    | Manifest details | Manifest by tag             |
 | `/{repository}/{namespace}@{digest}` | Manifest details | Manifest by digest          |
+| `...#history`, `...#vulnerabilities`, `...#filesystem` | Manifest details | A manifest's Pull History, Vulnerabilities or Filesystem tab; no anchor opens the OCI tab, and `...#vulnerabilities/linux/arm64` one platform's report of an index |
 | `/jobs/{queue}`                      | Jobs             | Pending and failed jobs of the `cache`, `replication` or `scan` queue; `/jobs` opens the cache queue |
 
 **Examples:**
@@ -179,16 +180,12 @@ Tree view of all manifests:
   <img alt="Manifest Details" src="../images/ui-manifest-details-light.png" />
 </picture>
 
-Complete manifest information:
-- **Title**: the full name the page was opened by, `namespace:tag` or `namespace@digest`, with a copy button
-- **Tags**: List with delete buttons
-- **Layers/Children**: For images or indexes
-- **Annotations**: Expandable metadata
-- **Files**: For ORAS artifacts with download links
-- **Vulnerabilities**: an image with a scan report, and the report manifest itself, show a table beside the manifest with the findings by severity, the scanner and the scan time; a multi-platform index shows the same table with one tab per platform manifest that has a report. The rows open the report page, which links back to the scanned manifest with its tags and to the report manifest, and lists every finding, filterable by severity, with the package, installed and fixed versions and a link to the advisory. The counts also appear next to the `vuln` badge in the tree and in referrer lists.
-- **Referrers**: Linked signatures, SBOMs, etc. The first 100 per manifest load with the view; a "Load more referrers" control fetches the next page from the referrers endpoint, so browsing past the first page needs the `get-referrers` action.
-- **Parent**: Link to parent index if applicable
-- **Pull history**: Collapsed by default and fetched on expand, listing the newest 100 recorded pulls of the reference the view was addressed by (a tag and a digest are recorded separately). The heading states the configured retention, since superseded entries are collected past it; recording happens only when `update_pull_time` is enabled.
+The page opens with a **title**, the full name it was addressed by (`namespace:tag` or `namespace@digest`) with a copy button, and splits the detail into tabs. Each tab has its own URL, the anchor naming it (`#history`, `#vulnerabilities`, `#filesystem`) and none for OCI, so a tab can be linked to; an anchor naming a tab the manifest lacks opens OCI. On a multi-platform index the platform shown follows, as in `#vulnerabilities/linux/arm64`.
+
+- **OCI**: the manifest (digest, tags with delete buttons, media type, artifact type, subject, expandable annotations, a delete action), the config, the layers (or, for an ORAS artifact, its files with download links), an index's platform manifests, the referrers (signatures, SBOMs, reports), and what references the manifest. Referrers load the first 100 with the view; a "Load more referrers" control fetches the next page, which needs the `get-referrers` action.
+- **Pull History**: the newest 100 recorded pulls of the reference the view was addressed by, a tag and a digest recorded separately. The heading states the configured retention, since superseded entries are collected past it; recording happens only when `update_pull_time` is enabled.
+- **Vulnerabilities** (only when a report is attached, with the total finding count in a grey square on the tab): the report shown inline, its findings filterable by severity, each with the package, installed and fixed versions and a link to the advisory, and the scanner named. A multi-platform index gets a sub-tab per platform manifest that has a report. The counts also appear next to the `vuln` badge in the manifest tree and in referrer lists, as count pills coloured by severity with the severity named on hover.
+- **Filesystem** (only for an image with tar layers): the layers merged into one tree, the way a runtime applies them, whiteouts removing what lower layers put there, and every entry carrying the layer that last set it, shown as a tree in the list view or as tiles walked folder by folder in the icon view. The layers menu narrows the tree to what the checked layers added, changed or removed, a path filter to matching names. Opening a file shows it inline up to 512 KiB, or offers it for download, and a symlink is followed to its target; both go through the registry's layer endpoints, which need the `get-blob` action. The first visit to an image nobody indexed shows "Indexing" until the registry's index jobs have walked its layers.
 
 ### Uploads
 
@@ -222,7 +219,7 @@ Delete buttons require double-click confirmation:
 
 ### Copy to Clipboard
 
-The manifest page's title carries a copy button; it copies the full name, `namespace:tag` or `namespace@sha256:…`, so what is copied can be pulled as is.
+The manifest page's title carries a copy button; it copies the full name, `namespace:tag` or `namespace@sha256:...`, so what is copied can be pulled as is.
 
 ### Theme Toggle
 

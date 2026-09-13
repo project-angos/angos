@@ -26,7 +26,10 @@ use crate::{
     event_webhook::event::EventActor,
     http_response::ResponseBody,
     identity::{Action, ClientIdentity},
-    registry::{self, DeleteJobRequest, ListJobsRequest, ListPullsRequest, RetryJobRequest},
+    registry::{
+        self, DeleteJobRequest, ListJobsRequest, ListPullsRequest, RetryJobRequest,
+        layers::{LayerEntriesRequest, LayerFileRequest},
+    },
 };
 
 #[instrument(skip(context, req, action))]
@@ -276,6 +279,22 @@ async fn dispatch_route<'a>(
             .list_tag_entries(ListTagsRequest { namespace, n, last })
             .await?),
         Action::ListRevisions { namespace } => Ok(registry.get_revisions_info(&namespace).await?),
+        Action::ListLayerEntries { namespace, digest } => Ok(registry
+            .get_layer_entries(LayerEntriesRequest { namespace, digest })
+            .await?),
+        Action::GetLayerFile {
+            namespace,
+            digest,
+            path,
+            download,
+        } => Ok(registry
+            .get_layer_file(LayerFileRequest {
+                namespace,
+                digest,
+                path,
+                download,
+            })
+            .await?),
         Action::ListUploads { namespace } => Ok(registry.get_uploads_info(&namespace).await?),
         Action::ListPulls {
             namespace,

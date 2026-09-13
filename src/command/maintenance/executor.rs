@@ -24,6 +24,7 @@ use crate::{
     event_webhook::event::EventActor,
     jobs::store::{ClaimMode, Error as JobStoreError, JobEnvelope, JobStore, job_pending_path},
     jobs::{JobState, Queue},
+    layer::{self, IndexLayerPayload},
     registry::{
         Error as RegistryError, Registry,
         blob_store::BlobStore,
@@ -228,6 +229,16 @@ impl Executor {
         if let Err(e) = self.metadata_store.delete_blob_references(&digest).await {
             let _ = self.metadata_store.gc_release(claim).await;
             return Err(Error::from(e));
+        }
+        // The layer listing is derived from the bytes and goes with them.
+        if let Err(e) = self
+            .metadata_store
+            .object_store()
+            .delete_prefix(&digest.layer_dir())
+            .await
+        {
+            let _ = self.metadata_store.gc_release(claim).await;
+            return Err(Error::from(RegistryError::from(e)));
         }
         self.metadata_store
             .gc_release(claim)
@@ -529,6 +540,28 @@ impl Executor {
             .map_err(|e| Error::JobQueue(format!("failed to enqueue scan job: {e}")))
     }
 
+    async fn ensure_catalog_index(&self, namespace: Namespace) -> Result<(), Error> {
+        self.metadata_store.ensure_catalog_index(&namespace).await;
+        Ok(())
+    }
+
+    async fn enqueue_index(&self, index: IndexLayerPayload) -> Result<(), Error> {
+        let envelope = layer::build_envelope(&index)
+            .map_err(|e| Error::JobQueue(format!("failed to build index envelope: {e}")))?;
+        self.job_store
+            .enqueue(envelope)
+            .await
+            .map_err(|e| Error::JobQueue(format!("failed to enqueue index job: {e}")))
+    }
+
+    async fn reclaim_listing(&self, digest: Digest) -> Result<(), Error> {
+        self.metadata_store
+            .object_store()
+            .delete_prefix(&digest.layer_dir())
+            .await
+            .map_err(|e| Error::from(RegistryError::from(e)))
+    }
+
     async fn enqueue_replication_delete(
         &self,
         downstream: String,
@@ -655,10 +688,7 @@ impl ActionSink for Executor {
                 blob,
                 link,
             } => self.grant_blob_index_link(namespace, blob, link).await,
-            Action::EnsureCatalogIndex { namespace } => {
-                self.metadata_store.ensure_catalog_index(&namespace).await;
-                Ok(())
-            }
+            Action::EnsureCatalogIndex { namespace } => self.ensure_catalog_index(namespace).await,
             Action::RemoveOrphanBlobGrant { namespace, blob } => {
                 self.remove_orphan_blob_grant(namespace, blob).await
             }
@@ -718,6 +748,8 @@ impl ActionSink for Executor {
                     .await
             }
             Action::EnqueueScan(scan) => self.enqueue_scan(scan).await,
+            Action::EnqueueIndex(index) => self.enqueue_index(index).await,
+            Action::ReclaimListing(digest) => self.reclaim_listing(digest).await,
             Action::EnqueueReplicationDelete {
                 downstream,
                 namespace,
@@ -825,6 +857,29 @@ mod tests {
                 blob_store.read(&orphan_digest).await.is_err(),
                 "real-run must delete the blob"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn executor_reclaim_listing_deletes_the_layer_directory() {
+        for_each_backend(async |test_case| {
+            let metadata_store = test_case.metadata_store();
+            let store = metadata_store.object_store();
+            let layer = Digest::sha256_of_bytes(b"listed layer");
+            for key in [layer.layer_entries_path(), layer.layer_checkpoints_path()] {
+                store.put(&key, Bytes::from_static(b"{}")).await.unwrap();
+            }
+
+            let executor = Executor::new_for_test(test_case.blob_store(), metadata_store.clone());
+            executor
+                .apply(Action::ReclaimListing(layer.clone()))
+                .await
+                .unwrap();
+
+            for key in [layer.layer_entries_path(), layer.layer_checkpoints_path()] {
+                assert!(store.get(&key).await.is_err(), "{key} must be gone");
+            }
         })
         .await;
     }

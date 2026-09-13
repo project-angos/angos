@@ -96,7 +96,7 @@ impl Command {
             let tracker = TaskTracker::new();
             // Queue depth is read off the shared store, so the replication
             // gauges are published here even though `angos worker` drains it.
-            for queue in [Queue::Cache, Queue::Replication, Queue::Scan] {
+            for queue in [Queue::Cache, Queue::Replication, Queue::Scan, Queue::Index] {
                 tracker.spawn(queue_depth_refresh_loop(
                     Arc::clone(&refresh),
                     queue,

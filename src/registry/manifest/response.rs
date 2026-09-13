@@ -47,5 +47,8 @@ pub struct PutManifestResponse {
     /// A plain image manifest, the only kind a `scan = true` repository
     /// sends to the scanner.
     pub scan_subject: bool,
+    /// The walkable layers of a plain image, for the filesystem indexer;
+    /// empty for anything else.
+    pub layers: Vec<Digest>,
     pub headers: HeaderMap,
 }

@@ -1,5 +1,5 @@
 import { base } from '$app/paths';
-import type { ManifestEntry, Platform, Manifest, Descriptor, ReferrerInfo } from './api';
+import type { ManifestEntry, Platform, Manifest, Descriptor, ReferrerInfo, LayerEntry, LayerEntryKind, LayerListing } from './api';
 
 export type AttestationType = 'slsa' | 'sbom' | 'signature' | 'vuln' | 'artifact';
 
@@ -180,10 +180,6 @@ export function manifestUrl(path: string, reference: string): string {
 }
 
 /** The page rendering the vulnerability report stored at `digest`. */
-export function scanUrl(path: string, digest: string): string {
-	return `${base}/scan/${path}@${digest}`;
-}
-
 export function digestConfirmKey(digest: string): string {
 	return `digest:${digest}`;
 }
@@ -415,6 +411,164 @@ export function resolveRepository(names: string[], path: string): string | null 
 		}
 	}
 	return owner;
+}
+
+// ---- Layer filesystems ----
+
+/** A tar stream the indexer can walk: plain or gzipped, not zstd. */
+export function isFilesystemLayer(mediaType: string): boolean {
+	return mediaType.includes('.tar') && !mediaType.endsWith('+zstd') && !mediaType.endsWith('.zst');
+}
+
+export interface FsNode {
+	name: string;
+	path: string;
+	kind: LayerEntryKind;
+	/** Absent for a directory no layer listed but a path implies. */
+	entry: LayerEntry | null;
+	/** Index of the layer that last set this node. */
+	layer: number;
+	children: Map<string, FsNode>;
+}
+
+export interface FsDeletion {
+	path: string;
+	/** Index of the layer whose whiteout removed it. */
+	layer: number;
+}
+
+export interface FsTree {
+	root: FsNode;
+	deletions: FsDeletion[];
+}
+
+function fsDir(name: string, path: string, layer: number): FsNode {
+	return { name, path, kind: 'dir', entry: null, layer, children: new Map() };
+}
+
+/**
+ * Applies the layers in order the way a runtime does: an entry replaces the
+ * lower layers' one, a whiteout removes a path and everything under it, an
+ * opaque marker empties a directory of what the lower layers put there.
+ */
+export function mergeLayers(listings: LayerListing[]): FsTree {
+	const root = fsDir('', '', -1);
+	const deletions: FsDeletion[] = [];
+	const parentOf = (path: string, layer: number): FsNode => {
+		let node = root;
+		const parts = path.split('/');
+		for (const part of parts.slice(0, -1)) {
+			let child = node.children.get(part);
+			if (!child) {
+				child = fsDir(part, node.path ? `${node.path}/${part}` : part, layer);
+				node.children.set(part, child);
+			}
+			node = child;
+		}
+		return node;
+	};
+	listings.forEach((listing, layer) => {
+		for (const entry of listing.entries) {
+			const name = entry.path.split('/').pop() ?? entry.path;
+			if (entry.kind === 'opaque') {
+				const dir = parentOf(`${entry.path}/x`, layer);
+				for (const child of dir.children.values()) {
+					deletions.push({ path: child.path, layer });
+				}
+				dir.children.clear();
+				continue;
+			}
+			const parent = parentOf(entry.path, layer);
+			if (entry.kind === 'whiteout') {
+				if (parent.children.delete(name)) deletions.push({ path: entry.path, layer });
+				continue;
+			}
+			const existing = parent.children.get(name);
+			parent.children.set(name, {
+				name,
+				path: entry.path,
+				kind: entry.kind,
+				entry,
+				layer,
+				// A directory listed again keeps what lower layers put in it.
+				children: entry.kind === 'dir' && existing?.kind === 'dir' ? existing.children : new Map()
+			});
+		}
+	});
+	return { root, deletions };
+}
+
+/** `0o755` as `rwxr-xr-x`. */
+export function formatMode(mode: number): string {
+	const bits = 'rwxrwxrwx';
+	return bits
+		.split('')
+		.map((bit, i) => ((mode >> (8 - i)) & 1 ? bit : '-'))
+		.join('');
+}
+
+/** The children of a node, directories first, each group by name. */
+export function sortedChildren(node: FsNode): FsNode[] {
+	return [...node.children.values()].sort((a, b) => {
+		const dirs = Number(b.kind === 'dir') - Number(a.kind === 'dir');
+		return dirs || a.name.localeCompare(b.name);
+	});
+}
+
+/** What a tree is narrowed to: a set of layers to focus, and a path fragment. */
+export interface FsMatcher {
+	layers: Set<number>;
+	text: string;
+}
+
+export function fsMatches(matcher: FsMatcher, node: FsNode): boolean {
+	return (
+		(matcher.layers.size === 0 || matcher.layers.has(node.layer)) &&
+		(matcher.text === '' || node.path.toLowerCase().includes(matcher.text))
+	);
+}
+
+/** A node stays in a narrowed tree when it or anything under it matches. */
+export function fsVisible(matcher: FsMatcher, node: FsNode): boolean {
+	return fsMatches(matcher, node) || [...node.children.values()].some((c) => fsVisible(matcher, c));
+}
+
+/** The parent folder's path, `''` at the top. */
+export function fsParent(path: string): string {
+	return path.slice(0, Math.max(path.lastIndexOf('/'), 0));
+}
+
+/**
+ * Where a symlink leads, through further links on the way, or null when it
+ * leaves the image or loops. Anything but a symlink is its own target.
+ */
+export function fsResolve(root: FsNode, node: FsNode, hops = 16): FsNode | null {
+	if (node.kind !== 'symlink' || !node.entry?.link) return node;
+	if (hops === 0) return null;
+	const link = node.entry.link;
+	const parts = [...(link.startsWith('/') ? [] : fsParent(node.path).split('/')), ...link.split('/')];
+	let current: FsNode | null = root;
+	for (const part of parts) {
+		if (!current || part === '' || part === '.') continue;
+		if (part === '..') {
+			current = fsNodeAt(root, fsParent(current.path));
+			continue;
+		}
+		const child: FsNode | undefined = current.children.get(part);
+		current = child ? fsResolve(root, child, hops - 1) : null;
+	}
+	return current;
+}
+
+/** The node at `path` under `root`, or the root when nothing is there. */
+export function fsNodeAt(root: FsNode, path: string): FsNode {
+	let node = root;
+	for (const name of path.split('/').filter(Boolean)) {
+		const child = node.children.get(name);
+		if (!child) return root;
+		node = child;
+	}
+	return node;
 }
 
 // ---- Vulnerability reports ----

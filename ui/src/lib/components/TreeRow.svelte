@@ -68,7 +68,7 @@
 		{:else if node.attestationType}
 			<span class="nowrap">
 				<AttestationBadge type={node.attestationType} />
-				<ScanSummary annotations={node.annotations} />
+				<ScanSummary annotations={node.annotations} compact />
 			</span>
 		{/if}
 	</td>

@@ -125,7 +125,27 @@ function HomepageFeatures() {
               </svg>
             </div>
             <h3>Web UI</h3>
-            <p>Browse repositories, view manifest hierarchy, download ORAS artifacts, inspect signatures and SBOMs.</p>
+            <p>Browse repositories, view manifest hierarchy, download ORAS artifacts, inspect signatures, SBOMs and pull history.</p>
+          </div>
+
+          <div className={styles.featureCard}>
+            <div className={styles.featureIconWrapper}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285Z" />
+              </svg>
+            </div>
+            <h3>Vulnerability Scanning</h3>
+            <p>Scan every push with Trivy or Grype through a durable job queue, and keep the report next to the image as an OCI referrer, browsable in the UI.</p>
+          </div>
+
+          <div className={styles.featureCard}>
+            <div className={styles.featureIconWrapper}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 0 0-1.883 2.542l.857 6a2.25 2.25 0 0 0 2.227 1.932H19.05a2.25 2.25 0 0 0 2.227-1.932l.857-6a2.25 2.25 0 0 0-1.883-2.542m-16.5 0V6A2.25 2.25 0 0 1 6 3.75h3.879a1.5 1.5 0 0 1 1.06.44l2.122 2.12a1.5 1.5 0 0 0 1.06.44H18A2.25 2.25 0 0 1 20.25 9v.776" />
+              </svg>
+            </div>
+            <h3>Filesystem Explorer</h3>
+            <p>Walk an image's merged filesystem layer by layer, see what each layer added or removed, and open or download any file.</p>
           </div>
         </div>
       </div>

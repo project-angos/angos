@@ -19,8 +19,8 @@ A delete removes records immediately and answers `202 Accepted`; the freed blob 
 
 The `scrub` and `prune` commands run as **separate periodic processes** that operate alongside the live server (no shutdown required). The split is:
 
-- **scrub is structural.** It walks every object key, validates it, repairs derivable state, and quarantines anything that does not belong in an angos store. It takes no age thresholds and no configuration-relative decisions.
-- **prune is config and time.** It enforces retention policies, clears namespaces no configured repository owns, reclaims upload-lifecycle leftovers older than the `-u` window, and deletes queued jobs whose configuration is gone.
+- **scrub deletes only what is dead or derivable.** It walks every object key, validates it, repairs derivable state, and quarantines anything that does not belong in an angos store. Its configuration-relative decisions, which filesystem listings to keep and which queued jobs still resolve, concern state that comes back on its own. It takes no age thresholds.
+- **prune deletes live content by policy.** It enforces retention policies, clears namespaces no configured repository owns, and reclaims upload-lifecycle leftovers older than the `-u` window.
 
 ## What Scrub Does
 
@@ -37,6 +37,8 @@ Before applying a cross-key repair, scrub confirms the inconsistency is settled 
 | Invalid names | Deletes upload directories whose namespace violates the OCI grammar (nothing can address them) |
 | Corrupt content | Deletes job records and access entries whose content does not parse |
 | Orphan blobs | Reclaims blobs with no live references, past a grace period and fenced by a `v2/gc/` run marker at apply time |
+| Filesystem listings | Reclaims the listings of layers no `index = true` repository uses, as `reconcile index` does; an image opened outside those repositories indexes again |
+| Orphan jobs | Deletes queued jobs, pending or dead-lettered, whose downstream or repository is no longer configured; `reconcile` re-issues the work if the configuration returns |
 | Unrecognized keys | Moves them to `_lost_and_found/` in the same store, preserving their bytes. This covers every retired shape, including the pre-1.7 link files and the transaction engine's `.tx-*` keys |
 
 | Option | Short | Description |
@@ -68,7 +70,6 @@ Prune first enforces retention policies (see [Configure Retention Policies](conf
 | Grant-only blob ownership | Retention policies decide, like any untagged content (no tag, `pushed_at` = upload time); the `-u` window only shields in-flight pushes, and with no policies configured the grant is retained |
 | Byteless index entries | Removes blob-index entries whose blob bytes never landed |
 | Orphan namespaces | Clears revisions, tags, in-flight uploads, and blob grants of every namespace not owned by any configured repository (always on; see below) |
-| Orphan jobs | Deletes queued replication/cache jobs whose downstream or repository is not configured (always on) |
 
 These need an age threshold because a structural check cannot distinguish an in-flight push (blob uploaded, manifest seconds away) from an abandoned one; the `-u` window is exactly that upload-lifecycle age. A revision is left alone while its record is younger than `gc_grace_secs`, for the same reason: a multi-arch push writes its platform manifests by digest before the index that names them, so a manifest with no tag may simply be mid-push. The `-u` window must exceed the longest push you expect, since a deleting retention policy revokes grant-only blobs older than it. Run prune against the same configuration file the servers use.
 

@@ -50,7 +50,7 @@ enum Gate {
 
 #[derive(FromArgs)]
 /// Prove a healthy store is left byte-identical: dry-run purity, zero-action
-/// floors, prune sweep proofs, full-catalog digest audit.
+/// floors, scrub and prune sweep proofs, full-catalog digest audit.
 #[argh(subcommand, name = "healthy")]
 struct HealthyGate {}
 

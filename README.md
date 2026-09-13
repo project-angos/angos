@@ -23,7 +23,8 @@ A fully OCI-compliant and Docker-compatible container registry.
 - Token service exchanging a client credential for a registry-signed bearer token
 - Webhook authorization for external policy decisions
 - Event webhooks with required, optional, or async delivery
-- Web UI for browsing and managing images
+- Vulnerability scanning on push with Trivy or Grype, the report kept as an OCI referrer
+- Web UI for browsing and managing images, with each image's merged filesystem explorable layer by layer
 
 ## Properties
 
@@ -85,6 +86,7 @@ The complete documentation index lives in [doc/index.md](doc/index.md).
 - [Configure Webhook Authorization](doc/how-to/configure-webhook-authorization.md)
 - [Configure Event Webhooks](doc/how-to/configure-event-webhooks.md)
 - [Scan Images with an External Scanner](doc/how-to/scan-images.md)
+- [Explore Image Filesystems](doc/how-to/explore-image-filesystems.md)
 - [Configure Replication](doc/how-to/configure-replication.md)
 - [Run Storage Maintenance](doc/how-to/run-storage-maintenance.md)
 - [Enable Durable Cache Jobs](doc/how-to/durable-cache-jobs.md)

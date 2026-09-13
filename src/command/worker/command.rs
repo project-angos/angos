@@ -19,6 +19,7 @@ use crate::{
     jobs::Queue,
     jobs::runner::execute_one,
     jobs::store::{self as job_store, ClaimMode, JobHandler, JobRetryPolicy, JobStore},
+    layer::IndexLayerJobHandler,
     registry::{
         Registry, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -70,6 +71,7 @@ fn queue_concurrency(config: &Configuration, queue: Queue) -> NonZeroUsize {
         Queue::Replication => config.global.max_concurrent_replication_jobs,
         Queue::Cache => config.global.max_concurrent_cache_jobs,
         Queue::Scan => config.global.max_concurrent_scan_jobs,
+        Queue::Index => config.global.max_concurrent_index_jobs,
     }
 }
 
@@ -78,7 +80,7 @@ fn queue_concurrency(config: &Configuration, queue: Queue) -> NonZeroUsize {
 /// unknown name or a scan queue with no scanner service configured.
 fn resolve_queues(requested: &[String], scan_configured: bool) -> Result<Vec<Queue>, Error> {
     if requested.is_empty() {
-        let mut queues = vec![Queue::Cache, Queue::Replication];
+        let mut queues = vec![Queue::Cache, Queue::Replication, Queue::Index];
         if scan_configured {
             queues.push(Queue::Scan);
         }
@@ -315,6 +317,10 @@ impl WorkerContext {
                     .map_err(Error::JobQueue)?,
                 )
             }
+            Queue::Index => Arc::new(IndexLayerJobHandler::new(
+                self.blob_store.clone(),
+                self.metadata_store.clone(),
+            )),
         };
 
         Ok(Components {
@@ -349,10 +355,10 @@ mod tests {
     };
 
     #[test]
-    fn resolve_queues_defaults_to_cache_and_replication() {
+    fn resolve_queues_defaults_to_cache_replication_and_index() {
         assert_eq!(
             resolve_queues(&[], false).unwrap(),
-            vec![Queue::Cache, Queue::Replication]
+            vec![Queue::Cache, Queue::Replication, Queue::Index]
         );
     }
 
@@ -377,7 +383,7 @@ mod tests {
     fn resolve_queues_drains_scan_only_when_a_scanner_is_configured() {
         assert_eq!(
             resolve_queues(&[], true).unwrap(),
-            vec![Queue::Cache, Queue::Replication, Queue::Scan]
+            vec![Queue::Cache, Queue::Replication, Queue::Index, Queue::Scan]
         );
         let Err(err) = resolve_queues(&["scan".to_string()], false) else {
             panic!("an explicit scan queue needs a scanner service");

@@ -107,6 +107,7 @@ listener.
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`). With `[global.job_queue]` enabled, also bounds the number of jobs each `angos worker` processes in parallel. |
 | `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes are handled in parallel by each `angos worker`, the server's in-process drain, and the `angos reconcile replication` end-of-run drain. |
 | `max_concurrent_scan_jobs` | usize | `2` | Worker concurrency for the scan queue |
+| `max_concurrent_index_jobs` | usize | `1` | Worker concurrency for the layer index queue; a job inflates one layer, CPU-bound |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `max_blob_size`             | string   | `"100GiB"` | Maximum total size of a single blob upload; a larger upload is rejected with `BLOB_UPLOAD_INVALID` (HTTP 413) |
 | `blob_stream_frame_size`    | string   | `"128KiB"` | Read buffer each frame of a streamed blob response is filled from; larger frames cost fewer allocations and body writes per blob served, at one buffer per in-flight response |
@@ -115,7 +116,6 @@ listener.
 | `enable_manifest_redirect`  | bool     | `true`   | Allow HTTP 307 redirects for manifest downloads. Manifest bodies served via `response-content-type` to preserve the media type across redirects. |
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
 | `immutable_tags_exclusions` | [string] | `[]`     | Regex patterns for mutable tags             |
-| `scan` | bool | `false` | Send each image manifest pushed here, or stored by a cache miss in a pull-through repository, to the scanner service |
 | `allow_missing_manifest_references` | bool | `true` | When `true` (default), accept a manifest push whose referenced blobs or child manifests are not yet present/owned in the namespace; the missing references stay unreadable until their content is pushed. Set to `false` to reject such pushes with `MANIFEST_BLOB_UNKNOWN`. See note below. |
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
 | `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
@@ -445,6 +445,8 @@ Repository namespace keys must not overlap: a key like `team` and a key like `te
 | `namespace`                 | string   | none     | Registry namespace this repository mirrors (`docker.io`), as a client names it in the `?ns=` proxy parameter. A request naming it is served from this repository whatever path it asks for; see [Upstream Selection](../explanation/pull-through-caching.md#upstream-selection-and-the-ns-parameter) |
 | `immutable_tags`            | bool     | `false`  | Enable immutable tags for this repository. The effective flag is this value OR `global.immutable_tags`, so a repository can add immutability but never opt out of a global `true` |
 | `immutable_tags_exclusions` | [string] | inherits | Replaces the global exclusion list when non-empty |
+| `scan` | bool | `false` | Send each image manifest pushed here, or stored by a cache miss in a pull-through repository, to the scanner service |
+| `index` | bool | `false` | Index the filesystem of each image manifest pushed here, or stored by a cache miss, as it lands, so the web UI browses it at once; without the flag an image is indexed the first time someone opens its filesystem |
 | `authorization_webhook`     | string   | inherits | Webhook name (empty to disable) |
 | `event_webhooks`            | [string] | inherits | Event webhook names              |
 

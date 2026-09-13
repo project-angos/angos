@@ -368,8 +368,7 @@ tfoot td {
 	color: var(--muted);
 }
 
-.subject-meta,
-.scan-meta {
+.subject-meta {
 	color: var(--muted);
 	font-size: 0.8125rem;
 }
@@ -598,6 +597,50 @@ table button.danger:hover,
 	background: var(--surface);
 }
 
+/* ===== TABS ===== */
+/* The manifest view's sections. A row of underlined buttons; the active one
+   takes the accent, and a count rides in a grey square. */
+.tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem;
+	margin: 0 0 1.25rem;
+	border-bottom: 1px solid var(--border);
+}
+
+.tabs a {
+	display: inline-flex;
+	align-items: center;
+	padding: 0.4rem 0.75rem;
+	color: var(--muted);
+	font-size: 0.875rem;
+	font-weight: 500;
+	text-decoration: none;
+	border-bottom: 2px solid transparent;
+	margin-bottom: -1px;
+}
+
+.tabs a:hover {
+	background: var(--hover);
+	color: var(--text);
+	text-decoration: none;
+}
+
+.tabs a.active {
+	color: var(--text);
+	border-bottom-color: var(--accent);
+}
+
+.tab-badge {
+	margin-left: 0.4rem;
+	padding: 0.05rem 0.4rem;
+	border-radius: var(--radius-sm);
+	background: var(--chip-gray-bg);
+	color: var(--chip-gray-fg);
+	font-size: 0.75rem;
+	font-weight: 500;
+}
+
 /* ===== FIELDS ===== */
 input[type='checkbox'] {
 	appearance: none;
@@ -629,6 +672,288 @@ input[type='checkbox']:focus-visible {
 	outline-offset: 1px;
 }
 
+input[type='text'],
+input[type='search'],
+select {
+	font: inherit;
+	font-size: 0.875rem;
+	color: inherit;
+	padding: 0.3rem 0.5rem;
+	border: 0;
+	border-radius: var(--radius);
+	background: var(--field);
+	box-shadow: var(--shadow-well);
+}
+
+input[type='text']:focus-visible,
+input[type='search']:focus-visible,
+select:focus-visible {
+	outline: none;
+	background: var(--surface);
+	box-shadow: var(--focus);
+}
+
+/* ===== MENU ===== */
+/* A button that drops a panel of checkable items; closes on a click outside. */
+.menu {
+	position: relative;
+}
+
+.menu summary {
+	list-style: none;
+	padding: 0.3rem 0.625rem;
+	font-size: 0.8125rem;
+	user-select: none;
+}
+
+.menu summary::-webkit-details-marker {
+	display: none;
+}
+
+.menu summary span[aria-hidden] {
+	color: var(--muted);
+	font-size: 0.7rem;
+}
+
+/* The card scrolls sideways for wide tables, which would clip an open menu. */
+.card:has(.menu[open]) {
+	overflow: visible;
+}
+
+.menu-panel {
+	position: absolute;
+	z-index: 10;
+	top: calc(100% + 0.25rem);
+	left: 0;
+	min-width: 15rem;
+	padding: 0.25rem;
+	border-radius: var(--radius);
+	background: var(--surface);
+	box-shadow: var(--shadow-lg);
+}
+
+.menu-panel label {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.35rem 0.5rem;
+	border-radius: var(--radius-sm);
+	font-size: 0.8125rem;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+.menu-panel label:hover {
+	background: var(--hover);
+}
+
+.menu-clear {
+	width: 100%;
+	justify-content: flex-start;
+	margin-top: 0.25rem;
+	padding: 0.4rem 0.5rem;
+	border-top: 1px solid var(--border);
+	border-radius: 0;
+	background: none;
+	color: var(--muted);
+	font-size: 0.8125rem;
+	font-weight: 400;
+	box-shadow: none;
+}
+
+.menu-clear:hover {
+	background: var(--hover);
+	color: var(--text);
+}
+
+/* ===== FILESYSTEM ===== */
+.fs-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.5rem 0.875rem;
+	border-bottom: 1px solid var(--border);
+	background: var(--subtle);
+}
+
+.fs-toolbar input[type='search'] {
+	flex: 1;
+	min-width: 8rem;
+}
+
+/* Tree rows: guide lines hang in the indent, drawn on the cell itself. */
+.fs-name {
+	position: relative;
+	white-space: nowrap;
+	padding-left: calc(var(--depth, 0) * 1.25rem + 0.75rem);
+}
+
+.fs-guide,
+.fs-elbow,
+.fs-spine {
+	position: absolute;
+	left: calc(var(--col) * 1.25rem + 1.3rem);
+	border-left: 1px solid var(--border);
+	pointer-events: none;
+}
+
+.fs-guide {
+	top: 0;
+	bottom: 0;
+}
+
+.fs-elbow {
+	top: 0;
+	bottom: 50%;
+	width: 0.6rem;
+	border-bottom: 1px solid var(--border);
+}
+
+.fs-elbow:not(.last)::after {
+	content: '';
+	position: absolute;
+	left: -1px;
+	top: 0;
+	height: 200%;
+	border-left: 1px solid var(--border);
+}
+
+.fs-spine {
+	top: calc(50% + 0.6rem);
+	bottom: 0;
+}
+
+.fs-icon {
+	width: 1.1rem;
+	height: 1.1rem;
+	margin-right: 0.35rem;
+	vertical-align: -0.25rem;
+	stroke-width: 1.6;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+	flex: none;
+}
+
+.fs-icon.dir {
+	color: var(--accent);
+	fill: var(--accent-soft);
+}
+
+.fs-icon.file,
+.fs-icon.symlink {
+	color: var(--muted);
+}
+
+.fs-link {
+	margin-left: 0.4rem;
+	color: var(--muted);
+}
+
+.fs-deleted {
+	text-decoration: line-through;
+	color: var(--muted);
+}
+
+/* Icon view: the folder's path as steps, then its entries as tiles. */
+.fs-crumbs {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.15rem;
+	padding: 0.4rem 0.875rem;
+	border-bottom: 1px solid var(--border);
+	font-size: 0.8125rem;
+	color: var(--muted);
+}
+
+.fs-crumbs button {
+	padding: 0.1rem 0.35rem;
+	background: none;
+	color: var(--accent);
+	font-size: inherit;
+	box-shadow: none;
+}
+
+.fs-crumbs button:hover {
+	background: var(--hover);
+}
+
+.fs-crumbs button:disabled {
+	color: var(--text);
+	cursor: default;
+}
+
+.fs-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr));
+	gap: 0.5rem;
+	padding: 0.875rem;
+}
+
+.fs-grid > .muted {
+	grid-column: 1 / -1;
+	margin: 0;
+}
+
+.fs-tile {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 0.3rem;
+	min-width: 0;
+	padding: 0.75rem 0.5rem;
+	background: none;
+	color: var(--text);
+	font-weight: 400;
+	text-align: center;
+	box-shadow: none;
+	white-space: normal;
+}
+
+.fs-tile:hover {
+	background: var(--hover);
+}
+
+.fs-tile.selected {
+	background: var(--accent-soft);
+}
+
+.fs-tile.dim {
+	opacity: 0.5;
+}
+
+.fs-tile .fs-icon {
+	width: 2.5rem;
+	height: 2.5rem;
+	margin: 0;
+	stroke-width: 1.2;
+}
+
+.fs-tile-name {
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 0.8125rem;
+}
+
+.fs-tile-meta {
+	font-size: 0.7rem;
+	color: var(--muted);
+}
+
+.fs-content pre {
+	max-height: 32rem;
+	border-radius: 0;
+}
+
+/* A note in place of the file's text keeps the panel's padding. */
+.fs-content p {
+	margin: 0;
+	padding: 0.75rem 0.875rem;
+}
+
 /* ===== STATES ===== */
 .loading {
 	display: flex;
@@ -637,6 +962,15 @@ input[type='checkbox']:focus-visible {
 	padding: 1.5rem 0;
 	color: var(--muted);
 	font-size: 0.875rem;
+}
+
+/* Inside a panel, a state keeps the panel's padding off the border. */
+.card .loading {
+	padding: 1.5rem 0.875rem;
+}
+
+.card .error {
+	margin: 0.75rem 0.875rem;
 }
 
 .loading::before {
@@ -839,22 +1173,6 @@ a.tag-standalone:hover {
 .severity-clean {
 	background: var(--chip-green-bg);
 	color: var(--chip-green-fg);
-}
-
-/* ===== MANIFEST PAGE ===== */
-.manifest-header {
-	display: grid;
-	grid-template-columns: minmax(0, 1fr) auto;
-	gap: 1rem;
-	align-items: start;
-}
-
-.scan-card {
-	min-width: 16rem;
-}
-
-.scan-card .card-header {
-	gap: 1.5rem;
 }
 
 /* Repository settings, as a definition list above the listing. */
@@ -1120,10 +1438,6 @@ a.tag-standalone:hover {
 }
 
 @media (max-width: 48rem) {
-	.manifest-header {
-		grid-template-columns: 1fr;
-	}
-
 	table {
 		font-size: 0.8125rem;
 	}

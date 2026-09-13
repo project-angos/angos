@@ -15,6 +15,7 @@ mod error;
 #[cfg(test)]
 mod event_emission_tests;
 pub mod keys;
+pub mod layers;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;

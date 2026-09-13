@@ -29,6 +29,7 @@ pub mod http_client;
 mod http_response;
 mod identity;
 mod jobs;
+mod layer;
 mod metrics_provider;
 mod policy;
 mod registry;

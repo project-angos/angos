@@ -22,16 +22,19 @@ pub enum Queue {
     Cache,
     Replication,
     Scan,
+    Index,
 }
 
 impl Queue {
-    /// The on-disk / metric-label name (`"cache"`, `"replication"` or `"scan"`).
+    /// The on-disk / metric-label name (`"cache"`, `"replication"`, `"scan"`
+    /// or `"index"`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Queue::Cache => "cache",
             Queue::Replication => "replication",
             Queue::Scan => "scan",
+            Queue::Index => "index",
         }
     }
 }
@@ -50,8 +53,9 @@ impl FromStr for Queue {
             "cache" => Ok(Queue::Cache),
             "replication" => Ok(Queue::Replication),
             "scan" => Ok(Queue::Scan),
+            "index" => Ok(Queue::Index),
             other => Err(format!(
-                "unknown queue '{other}'; expected 'cache', 'replication' or 'scan'"
+                "unknown queue '{other}'; expected 'cache', 'replication', 'scan' or 'index'"
             )),
         }
     }

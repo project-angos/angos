@@ -10,6 +10,8 @@ use std::sync::Arc;
 use argh::FromArgs;
 use tracing::info;
 
+use super::orphan_jobs;
+
 use crate::{
     command::{
         bootstrap,
@@ -18,10 +20,15 @@ use crate::{
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
             walk::{self, WalkStats},
         },
+        reconcile,
         scrub::validate::{Pass, Validator},
     },
     configuration::Configuration,
-    registry::{Registry, blob_store::BlobStore, keys::REF_ROOT, metadata_store::MetadataStore},
+    jobs::store::{ClaimMode, JobStore},
+    registry::{
+        Registry, blob_store::BlobStore, keys::REF_ROOT, metadata_store::MetadataStore,
+        repository_resolver::RepositoryResolver,
+    },
 };
 
 /// Default per-pass concurrency, shared by the scrub walk and the prune
@@ -59,6 +66,8 @@ pub struct Command {
     /// Held so the end of the run can drain in-flight async webhook
     /// deliveries the delete actions triggered.
     registry: Option<Arc<Registry>>,
+    sink: Arc<dyn ActionSink>,
+    repositories: Arc<RepositoryResolver>,
 }
 
 impl Command {
@@ -95,7 +104,7 @@ impl Command {
         let validator = Arc::new(Validator::new(
             blob_store.clone(),
             metadata_store.clone(),
-            sink,
+            sink.clone(),
             stats.clone(),
             options.delete_unknown,
         ));
@@ -108,6 +117,8 @@ impl Command {
             concurrency: options.concurrency,
             delete_unknown: options.delete_unknown,
             registry,
+            sink,
+            repositories,
         })
     }
 
@@ -119,6 +130,26 @@ impl Command {
         self.walk_pass(Pass::MetadataLinks, "").await?;
         self.walk_pass(Pass::MetadataReferences, REF_ROOT).await?;
         self.walk_pass(Pass::Blob, "").await?;
+        // Listings and queued jobs are derived state the walk leaves alone;
+        // which of them still resolve is decided against the configuration.
+        reconcile::index::reclaim_unused_listings(
+            self.blob_store.clone(),
+            &self.metadata_store,
+            self.repositories.clone(),
+            self.sink.as_ref(),
+        )
+        .await?;
+        orphan_jobs::sweep_orphan_jobs(
+            &Arc::new(JobStore::new(
+                self.metadata_store.object_store().clone(),
+                "scrub-orphans",
+                ClaimMode::Atomic,
+            )),
+            &self.repositories,
+            self.sink.as_ref(),
+            self.concurrency,
+        )
+        .await?;
 
         if let Some(registry) = &self.registry {
             registry.shutdown().await;

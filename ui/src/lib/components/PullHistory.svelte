@@ -1,5 +1,6 @@
 <script lang="ts">
 	// Aliased: the component's own generated type owns the `PullHistory` name here.
+	import { untrack } from 'svelte';
 	import { fetchPullHistory, type PullHistory as PullHistoryBody } from '$lib/api';
 	import { formatRetention, formatTimeAgo } from '$lib/utils';
 	import Card from './Card.svelte';
@@ -11,25 +12,26 @@
 		namespace: string;
 		/** The reference this view was addressed by, which is how pulls are keyed. */
 		target: string;
+		/** Load at once and drop the toggle, for a dedicated tab. */
+		open?: boolean;
 	}
 
-	let { namespace, target }: Props = $props();
+	let { namespace, target, open = false }: Props = $props();
 
 	// The registry caps the listing; at exactly the cap, older pulls exist that
 	// the response does not carry.
 	const CAP = 100;
 
-	let expanded = $state(false);
+	let expanded = $state(untrack(() => open));
 	let loading = $state(false);
 	let error: string | null = $state(null);
 	let history: PullHistoryBody | null = $state(null);
 
-	// Listing a namespace renders one of these per manifest, so the request waits
-	// for the first expand rather than fanning out on load. The result is then
-	// kept: the section is an audit view, not a live one.
-	async function toggle() {
-		expanded = !expanded;
-		if (!expanded || history || loading) return;
+	// Listing a namespace renders one of these per manifest, so the request is
+	// held until it is asked for, rather than fanning out on load. The result
+	// is then kept: the section is an audit view, not a live one.
+	async function load() {
+		if (history || loading) return;
 		loading = true;
 		error = null;
 		const result = await fetchPullHistory(namespace, target);
@@ -40,6 +42,16 @@
 			history = result.data;
 		}
 	}
+
+	function toggle() {
+		expanded = !expanded;
+		if (expanded) load();
+	}
+
+	// In its own tab it is the reason the tab was opened, so it loads at once.
+	$effect(() => {
+		if (open) load();
+	});
 
 	// The retention is only known once the registry has answered, so the label
 	// states it from the response rather than from a compiled-in assumption.
@@ -52,7 +64,7 @@
 	<AnnotationToggle {expanded} label="pull history" ontoggle={toggle} />
 {/snippet}
 
-<Card {title} headerActions={toggleAction}>
+<Card {title} headerActions={open ? undefined : toggleAction}>
 	{#if expanded}
 		{#if loading}
 			<LoadingState message="Loading pull history" />

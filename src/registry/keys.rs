@@ -18,6 +18,8 @@ pub const REF_ROOT: &str = "v2/ref";
 pub const NS_ROOT: &str = "v2/ns";
 pub const CAT_ROOT: &str = "v2/cat";
 pub const GC_ROOT: &str = "v2/gc";
+/// Layer listings and inflater checkpoints, by layer digest, in the metadata store.
+pub const LAYERS_ROOT: &str = "v2/layers";
 
 /// Every current-shape storage key addressed by a blob's digest.
 pub trait DigestKeys {
@@ -26,6 +28,15 @@ pub trait DigestKeys {
 
     /// The blob's content.
     fn blob_path(&self) -> String;
+
+    /// Directory holding what the filesystem indexer derived from the layer.
+    fn layer_dir(&self) -> String;
+
+    /// The layer's entry listing, whose presence marks the layer indexed.
+    fn layer_entries_path(&self) -> String;
+
+    /// The inflater's checkpoints into the layer.
+    fn layer_checkpoints_path(&self) -> String;
 
     /// Directory holding every reference key for the digest, one key per
     /// (namespace, link), rooted outside the blob store's `v2/blobs/` tree.
@@ -68,6 +79,23 @@ impl DigestKeys for Digest {
 
     fn blob_path(&self) -> String {
         format!("{}/data", self.blob_dir())
+    }
+
+    fn layer_dir(&self) -> String {
+        format!(
+            "{LAYERS_ROOT}/{}/{}/{}",
+            self.algorithm(),
+            self.hash_prefix(),
+            self.hash()
+        )
+    }
+
+    fn layer_entries_path(&self) -> String {
+        format!("{}/entries", self.layer_dir())
+    }
+
+    fn layer_checkpoints_path(&self) -> String {
+        format!("{}/checkpoints", self.layer_dir())
     }
 
     fn blob_ref_dir(&self) -> String {
@@ -135,6 +163,14 @@ impl DigestKeys for Digest {
 fn parse_ref_digest(s: &str) -> Option<Digest> {
     let (algorithm, hash) = s.split_once('.')?;
     Digest::with_algorithm(Algorithm::from_str(algorithm).ok()?, hash).ok()
+}
+
+/// The layer a listing key names, `v2/layers/<algorithm>/<prefix>/<hash>/...`.
+pub fn parse_layer_key(key: &str) -> Option<Digest> {
+    let mut parts = key.strip_prefix(LAYERS_ROOT)?.strip_prefix('/')?.split('/');
+    let algorithm = Algorithm::from_str(parts.next()?).ok()?;
+    let _prefix = parts.next()?;
+    Digest::with_algorithm(algorithm, parts.next()?).ok()
 }
 
 /// Every current-shape storage key addressed by a namespace.

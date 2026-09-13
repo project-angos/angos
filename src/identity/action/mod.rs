@@ -125,6 +125,21 @@ pub enum Action {
         namespace: Namespace,
         digest: Digest,
     },
+    /// The filesystem listing of a layer, derived from the blob and read under
+    /// the blob's own action name and ownership check.
+    #[serde(rename = "get-blob")]
+    ListLayerEntries {
+        namespace: Namespace,
+        digest: Digest,
+    },
+    /// One file out of a layer, by its path in the listing.
+    #[serde(rename = "get-blob")]
+    GetLayerFile {
+        namespace: Namespace,
+        digest: Digest,
+        path: String,
+        download: bool,
+    },
     #[serde(rename = "delete-blob")]
     DeleteBlob {
         namespace: Namespace,
@@ -333,7 +348,9 @@ impl Action {
             | Action::ListJobs { .. }
             | Action::ListFailedJobs { .. }
             | Action::RetryJob { .. }
-            | Action::DeleteJob { .. } => None,
+            | Action::DeleteJob { .. }
+            | Action::ListLayerEntries { .. }
+            | Action::GetLayerFile { .. } => None,
         }
     }
 
@@ -355,7 +372,10 @@ impl Action {
             Action::PatchUpload { .. } => "update-upload",
             Action::PutUpload { .. } => "complete-upload",
             Action::DeleteUpload { .. } => "cancel-upload",
-            Action::GetBlob { .. } | Action::HeadBlob { .. } => "get-blob",
+            Action::GetBlob { .. }
+            | Action::HeadBlob { .. }
+            | Action::ListLayerEntries { .. }
+            | Action::GetLayerFile { .. } => "get-blob",
             Action::DeleteBlob { .. } => "delete-blob",
             Action::GetManifest { .. } | Action::HeadManifest { .. } => "get-manifest",
             Action::PutManifest { .. } => "put-manifest",
@@ -436,6 +456,10 @@ impl Action {
 
             Action::GetBlob { namespace, digest }
             | Action::HeadBlob { namespace, digest }
+            | Action::ListLayerEntries { namespace, digest }
+            | Action::GetLayerFile {
+                namespace, digest, ..
+            }
             | Action::DeleteBlob { namespace, digest }
             | Action::GetReferrer {
                 namespace, digest, ..

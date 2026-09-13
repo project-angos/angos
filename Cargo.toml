@@ -2,6 +2,7 @@
 members = [
     "contrib/kubelet-credential-provider",
     "crates/backoff",
+    "crates/inflate",
     "crates/conformance-gates",
     "crates/oci",
     "crates/s3-client",
@@ -14,6 +15,7 @@ members = [
 # used by a single member stay in that member's manifest.
 [workspace.dependencies]
 angos-backoff = { path = "crates/backoff" }
+angos-inflate = { path = "crates/inflate" }
 angos-oci = { path = "crates/oci" }
 angos-s3-client = { path = "crates/s3-client" }
 angos-storage = { path = "crates/storage" }
@@ -47,7 +49,7 @@ wiremock = "0.6.5"
 
 [package]
 name = "angos"
-version = "1.7.2"
+version = "1.8.0"
 edition = "2024"
 
 [profile.release]
@@ -57,6 +59,7 @@ lto = "fat"
 
 [dependencies]
 angos-backoff = { workspace = true }
+angos-inflate = { workspace = true }
 angos-oci = { workspace = true }
 angos-s3-client = { workspace = true }
 angos-storage = { workspace = true }
@@ -99,6 +102,7 @@ serde = { workspace = true }
 serde_html_form = "0.4.1"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tar = "0.4.44"
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
@@ -115,6 +119,7 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 
 [dev-dependencies]
 angos-oci = { workspace = true, features = ["test-util"] }
+flate2 = "1.1"
 angos-s3-client = { workspace = true, features = ["test-util"] }
 angos-storage = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }

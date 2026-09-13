@@ -1,5 +1,4 @@
 mod checker;
-pub mod orphan_jobs;
 mod orphan_namespaces;
 mod uploads;
 
@@ -23,7 +22,6 @@ use crate::{
         scrub::default_concurrency,
     },
     configuration::Configuration,
-    jobs::store::{ClaimMode, JobStore},
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
 };
 
@@ -94,8 +92,7 @@ pub fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Ret
 }
 
 /// Applies the retention policies to every namespace, then reclaims aged
-/// upload-lifecycle leftovers within the `-u` window and queued jobs whose
-/// configuration is gone.
+/// upload-lifecycle leftovers within the `-u` window.
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
     ensure_pull_time_rules_are_recorded(config)?;
     let window = Duration::from_std(options.uploads.into())
@@ -169,17 +166,6 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             &blob_backend,
             &metadata_store,
             window,
-            sink.as_ref(),
-            options.concurrency,
-        )
-        .await,
-        orphan_jobs::sweep_orphan_jobs(
-            &Arc::new(JobStore::new(
-                metadata_store.object_store().clone(),
-                "prune-orphans",
-                ClaimMode::Atomic,
-            )),
-            &repositories,
             sink.as_ref(),
             options.concurrency,
         )

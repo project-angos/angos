@@ -411,6 +411,50 @@ this is a bounded audit window, not a complete pull history.
 This endpoint is gated by the same `list-revisions` CEL action as
 [List Revisions](#list-revisions).
 
+### Layer Entries
+
+```
+GET /v2/{namespace}/_angos/layers/{algorithm}:{hex}/entries
+```
+
+The filesystem listing of one layer: every tar entry in order, with its kind, size, mode,
+owner, modification time, link target and the offset of its data in the uncompressed stream.
+The first request for a layer that was never indexed enqueues the index job and answers
+`202 Accepted` with `{"status": "indexing"}`; ask again once it ran. A layer the namespace
+does not own is `404`, like the blob itself.
+
+**Response:**
+```json
+{
+  "compressed": true,
+  "uncompressed_size": 7340032,
+  "entries": [
+    { "path": "etc", "kind": "dir", "size": 0, "mode": 493, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 512 },
+    { "path": "etc/os-release", "kind": "file", "size": 164, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 1536 },
+    { "path": "etc/motd", "kind": "whiteout", "size": 0, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 2560 }
+  ]
+}
+```
+
+`kind` is one of `file`, `dir`, `symlink`, `hardlink`, `whiteout`, `opaque` or `other`; a
+whiteout names the path the layer removes from the ones below it, an opaque marker the
+directory it empties. Paths are normalised without a leading `./` or trailing `/`.
+
+### Layer File
+
+```
+GET /v2/{namespace}/_angos/layers/{algorithm}:{hex}/file?path={path}
+GET /v2/{namespace}/_angos/layers/{algorithm}:{hex}/file?path={path}&download
+```
+
+The bytes of one file of the layer, `path` as the listing spells it; a hard link serves its
+target. The content type is guessed from the name, and `download` adds a
+`Content-Disposition: attachment` header. A gzipped layer is decoded from the nearest of the
+checkpoints the index job recorded, every 4 MiB of output, rather than from its start. A path
+that is not a file, or a layer not yet indexed, is `404`.
+
+Both endpoints are gated by the `get-blob` CEL action of the layer's namespace.
+
 ### List Uploads
 
 ```

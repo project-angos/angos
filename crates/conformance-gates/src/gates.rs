@@ -59,8 +59,8 @@ impl GateContext {
     }
 }
 
-/// Dry-run purity (snapshot-identical), zero-action floors, prune sweep
-/// proofs, real-run byte-identity outside engine prefixes, and a
+/// Dry-run purity (snapshot-identical), zero-action floors, scrub and prune
+/// sweep proofs, real-run byte-identity outside engine prefixes, and a
 /// full-catalog digest audit.
 pub async fn healthy(ctx: &GateContext) -> GateResult<()> {
     // A healthy store carries no quarantined leftovers: anything under
@@ -101,18 +101,22 @@ pub async fn healthy(ctx: &GateContext) -> GateResult<()> {
         )
     })?;
 
-    ensure(!prune_dry.contains("DRY RUN: would"), || {
-        "prune proposed actions on a healthy store".to_string()
-    })?;
     for proof in [
-        "prune: found 0 orphan multipart",
         "found 0 orphan pending and 0 orphan dead-lettered replication",
         "found 0 orphan pending and 0 orphan dead-lettered cache",
     ] {
-        ensure(prune_dry.contains(proof), || {
-            format!("prune sweep proof missing from dry-run log: '{proof}'")
+        ensure(dry_output.contains(proof), || {
+            format!("scrub sweep proof missing from dry-run log: '{proof}'")
         })?;
     }
+
+    ensure(!prune_dry.contains("DRY RUN: would"), || {
+        "prune proposed actions on a healthy store".to_string()
+    })?;
+    ensure(
+        prune_dry.contains("prune: found 0 orphan multipart"),
+        || "prune sweep proof missing from dry-run log".to_string(),
+    )?;
 
     // A real scrub on a healthy store may touch only leftover `.tx-` keys of
     // the removed transaction engine (reclaimed as garbage); everything else
@@ -156,7 +160,11 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
     )?;
 
     // Run 1: every independent defect class must be counted exactly.
-    let run1 = ctx.scrub_logged("scrub-1.log").await?;
+    let run1_log = ctx
+        .runner
+        .run_logged(&["scrub"], &ctx.state_path("scrub-1.log"))
+        .await?;
+    let run1 = ScrubSummary::parse(&run1_log)?;
     println!("{run1}");
     ensure(run1.quarantined == EXPECTED_QUARANTINED, || {
         format!(
@@ -182,6 +190,25 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
             run1.repairs
         )
     })?;
+
+    // The always-on job sweep must have classified and reaped exactly the two
+    // config orphans on the first run.
+    for proof in [
+        "found 1 orphan pending and 0 orphan dead-lettered replication",
+        "found 0 orphan pending and 1 orphan dead-lettered cache",
+    ] {
+        ensure(run1_log.contains(proof), || {
+            format!("scrub job sweep proof missing: '{proof}'")
+        })?;
+    }
+    for (key, what) in [
+        (ORPHAN_PENDING_JOB_KEY, "config-orphan pending job"),
+        (ORPHAN_FAILED_JOB_KEY, "config-orphan dead letter"),
+    ] {
+        ensure(!ctx.store.exists(key).await?, || {
+            format!("{what} survived the always-on scrub sweep")
+        })?;
+    }
 
     // Cascading repairs (a recreated link derives more state) must reach a
     // fixpoint within a bounded number of runs.
@@ -228,14 +255,6 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
         (probes.grant_only_data(), "grant-only blob bytes"),
         (probes.grant_only_ref(), "grant-only blob grant"),
         (probes.byteless_ref(), "byteless index entry"),
-        (
-            ORPHAN_PENDING_JOB_KEY.to_string(),
-            "config-orphan pending job",
-        ),
-        (
-            ORPHAN_FAILED_JOB_KEY.to_string(),
-            "config-orphan dead letter",
-        ),
     ] {
         ensure(ctx.store.exists(&key).await?, || {
             format!("scrub crossed into prune's domain: {what} gone ({key})")
@@ -306,8 +325,7 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
             "stale upload bytes",
         )
         .await?;
-    let prune_log = ctx
-        .runner
+    ctx.runner
         .run_logged(&["prune"], &ctx.state_path("prune.log"))
         .await?;
     ensure(!ctx.store.exists(&session_json).await?, || {
@@ -321,24 +339,7 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
         format!("prune reaped a fresh in-flight upload (status {decoy})")
     })?;
 
-    // The always-on job sweep must have classified and reaped exactly the two
-    // config orphans, while the window still shields every age-gated sweep.
-    for proof in [
-        "found 1 orphan pending and 0 orphan dead-lettered replication",
-        "found 0 orphan pending and 1 orphan dead-lettered cache",
-    ] {
-        ensure(prune_log.contains(proof), || {
-            format!("prune job sweep proof missing: '{proof}'")
-        })?;
-    }
-    for (key, what) in [
-        (ORPHAN_PENDING_JOB_KEY, "config-orphan pending job"),
-        (ORPHAN_FAILED_JOB_KEY, "config-orphan dead letter"),
-    ] {
-        ensure(!ctx.store.exists(key).await?, || {
-            format!("{what} survived the always-on prune sweep")
-        })?;
-    }
+    // The window still shields every age-gated sweep.
     for (key, what) in [
         (probes.grant_only_data(), "grant-only blob bytes"),
         (probes.grant_only_ref(), "grant-only blob grant"),

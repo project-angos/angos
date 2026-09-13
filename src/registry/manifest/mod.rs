@@ -21,6 +21,7 @@ use crate::{
     event_webhook::event::{Event, EventActor},
     http_response::{ResponseBody, build_response},
     jobs::Queue,
+    layer,
     metrics_provider::metrics_provider,
     registry::{
         Error, Registry, Repository,
@@ -348,6 +349,11 @@ impl Registry {
         if stored.changed && stored.scan_subject && repository.scan {
             self.dispatch_scan(namespace, &stored.digest).await;
         }
+        if stored.changed && repository.index {
+            for layer in &stored.layers {
+                self.dispatch_index(namespace, layer).await;
+            }
+        }
 
         Ok(ManifestBody {
             media_type,
@@ -559,6 +565,7 @@ impl Registry {
                 .any(|tag| commit.changed(&LinkKind::Tag(tag.clone()), &computed_digest));
 
         let scan_subject = scan::is_scan_subject(&manifest);
+        let layers = layer::filesystem_layers(&manifest);
 
         let subject = manifest.subject.map(|s| s.digest);
 
@@ -573,6 +580,7 @@ impl Registry {
             digest: computed_digest,
             changed,
             scan_subject,
+            layers,
         })
     }
 
@@ -1129,6 +1137,11 @@ impl Registry {
             .await;
             if response.scan_subject && resolved_repository.is_some_and(|r| r.scan) {
                 self.dispatch_scan(&namespace, &response.digest).await;
+            }
+            if resolved_repository.is_some_and(|r| r.index) {
+                for layer in &response.layers {
+                    self.dispatch_index(&namespace, layer).await;
+                }
             }
         }
 

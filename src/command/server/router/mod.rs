@@ -249,6 +249,25 @@ fn repository_extension(
         return None;
     }
 
+    // `layers/<digest>/entries` and `layers/<digest>/file?path=`.
+    if let Some(rest) = path.strip_prefix("layers/") {
+        let (digest, module) = rest.split_once('/')?;
+        let digest: Digest = digest.parse().ok()?;
+        return match module {
+            "entries" => Some(Action::ListLayerEntries { namespace, digest }),
+            "file" => {
+                let LayerFileQuery { path, download } = parse_query(params)?;
+                Some(Action::GetLayerFile {
+                    namespace,
+                    digest,
+                    path: path?,
+                    download: download.is_some(),
+                })
+            }
+            _ => None,
+        };
+    }
+
     match path {
         "revisions/list" => Some(Action::ListRevisions { namespace }),
         "uploads/list" => Some(Action::ListUploads { namespace }),
@@ -258,6 +277,14 @@ fn repository_extension(
         }),
         _ => None,
     }
+}
+
+/// A file in a layer: `?path=` names it, a `download` parameter, whatever its
+/// value, asks for it as an attachment.
+#[derive(Deserialize)]
+struct LayerFileQuery {
+    path: Option<String>,
+    download: Option<String>,
 }
 
 /// The pull-history target, named by exactly one of `?tag=` or `?digest=`.

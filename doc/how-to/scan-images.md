@@ -112,7 +112,7 @@ The job appears under `GET /v2/_angos/jobs/list?queue=scan`, and under the `scan
 oras discover registry.example.com/apps/web:1.0
 ```
 
-The web UI shows it on the manifest with a `vuln` badge and the severity counts, whichever scanner wrote it; the summary opens a report page listing every finding with its package, fixed version and advisory link.
+The web UI shows it on the manifest's Vulnerabilities tab, whichever scanner wrote it, listing every finding with its package, fixed version and advisory link, and badges the report in the tree with the severity counts.
 
 ## Step 6: Scan What Was Already There
 

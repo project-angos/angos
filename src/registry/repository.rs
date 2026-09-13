@@ -220,6 +220,10 @@ pub struct Config {
     /// Whether each image manifest pushed here is sent to the scanner service.
     #[serde(default)]
     pub scan: bool,
+    /// Whether the filesystem of each image manifest pushed here is indexed
+    /// right away, rather than the first time someone browses it.
+    #[serde(default)]
+    pub index: bool,
 }
 
 impl Config {
@@ -245,6 +249,7 @@ pub struct Repository {
     pub immutable_tags: bool,
     pub immutable_tags_exclusions: Vec<RegexPattern>,
     pub scan: bool,
+    pub index: bool,
 }
 
 impl Repository {
@@ -310,6 +315,7 @@ impl Repository {
             immutable_tags: config.immutable_tags,
             immutable_tags_exclusions: config.immutable_tags_exclusions.clone(),
             scan: config.scan,
+            index: config.index,
         })
     }
 

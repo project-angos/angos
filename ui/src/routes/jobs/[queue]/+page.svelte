@@ -139,7 +139,7 @@
 		{/each}
 	</nav>
 	<button class="secondary" onclick={refresh} disabled={loading}>
-		{loading ? 'Refreshing…' : 'Refresh'}
+		{loading ? 'Refreshing...' : 'Refresh'}
 	</button>
 </div>
 

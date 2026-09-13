@@ -73,11 +73,13 @@ Scrub streams every object key in both stores (blob and metadata), categorizes i
 
 - Repairs every revision and referrer record a manifest implies, and re-issues missing blob-index grants.
 - Removes tags whose target manifest blob is missing, revisions whose manifest blob is missing, orphan referrer records, and stale blob-index entries.
+- Reclaims the filesystem listings of layers no `index = true` repository uses, the same pass as [`reconcile index`](#reconcile-index); images outside those repositories index again when opened.
+- Deletes queued jobs, pending or dead-lettered, whose downstream or repository is no longer configured; [`reconcile`](#reconcile) re-issues the work if the configuration returns.
 - Deletes objects whose content is unreadable (a job record or access entry that does not parse).
 - Reclaims blobs with no references, past the reclamation grace period and fenced by a `v2/gc/` run marker at apply time, so it is safe alongside a live server.
 - Moves any key that matches no known angos layout to `_lost_and_found/` in the same store, preserving its bytes for inspection. This covers every retired shape, including the pre-1.7 link files and the transaction engine's `.tx-*` keys. Emptying that prefix is the operator's job. With `--delete-unknown` such keys are deleted outright instead.
 
-Scrub is purely structural: it takes no age thresholds and no configuration-relative decisions. Time-based reclamation and orphan-namespace clearing belong to [`angos prune`](#prune).
+Scrub deletes only what is dead or derivable: it takes no age thresholds, and its configuration-relative decisions, which listings to keep and which queued jobs still resolve, concern state that comes back on its own. Retention, time-based reclamation and orphan-namespace clearing, which delete live content by policy, belong to [`angos prune`](#prune).
 
 Because a repair can create new derivable state, a heavily damaged store may need more than one run to fully converge; run scrub until it reports zero changes.
 
@@ -150,10 +152,7 @@ Applies the global and per-repository retention policies to every namespace (see
 
 Grant-only blob ownership (a blob uploaded whose manifest never landed) is decided by the **retention policies** like any other untagged content: the subject carries no tag and `pushed_at` is the upload time, the `-u` window only shields in-flight pushes from consideration, and with no policies configured the grant is retained.
 
-It also performs the configuration-relative cleanup, always on:
-
-- **Orphan namespaces**: every namespace not owned by any configured `[repository]` loses its revisions, tags, in-flight uploads, and blob-ownership grants. The blast radius is every namespace whose owning repository is not in your config, so run `--dry-run` after config changes. Refused when no repositories are configured, so an emptied config can never wipe the registry.
-- **Orphan jobs**: queued replication and cache jobs whose downstream or repository is not configured.
+It also clears **orphan namespaces**, always on: every namespace not owned by any configured `[repository]` loses its revisions, tags, in-flight uploads, and blob-ownership grants. The blast radius is every namespace whose owning repository is not in your config, so run `--dry-run` after config changes. Refused when no repositories are configured, so an emptied config can never wipe the registry.
 
 Prune is the config-and-time command: run it against the same configuration file the servers use. It refuses to start when a retention rule uses `image.last_pulled_at` or `top_pulled` while `update_pull_time` is disabled: pull times would never be recorded, so those rules would match nothing and actively pulled images would be deleted.
 
@@ -191,6 +190,7 @@ path's retry, backoff and coalescing.
 ```bash
 angos reconcile replication [options]
 angos reconcile scan [options]
+angos reconcile index [options]
 ```
 
 #### reconcile replication
@@ -212,6 +212,15 @@ Enqueue a scan job for every image manifest of a `scan = true` repository that c
 | `--dry-run` | `-d`  | Preview what would be enqueued without changes           |
 | `--force`   |       | Scan every image again, attaching a fresh report to each |
 
+#### reconcile index
+
+Enqueue a filesystem index job for every tar layer of the images of an `index = true` repository that has no listing yet, so the web UI opens them without an "Indexing" wait, and reclaim the listings of every other layer. A layer shared by several images is enqueued once, and kept while any `index = true` repository uses it. Any image indexes itself the first time its filesystem is opened, so this is for having the listings ready ahead of that, or, with `--force`, for walking every layer again; the reclaim drops what those on-demand opens left behind in repositories without the flag, which index again when opened. The running server or a worker drains the jobs; the command returns once they are enqueued and the listings reclaimed. See [Explore Image Filesystems](../how-to/explore-image-filesystems.md).
+
+| Option      | Short | Description                                                 |
+|-------------|-------|-------------------------------------------------------------|
+| `--dry-run` | `-d`  | Preview what would be enqueued and reclaimed without changes |
+| `--force`   |       | Walk every layer again, rewriting its listing               |
+
 **Examples:**
 
 ```bash
@@ -226,6 +235,10 @@ angos reconcile scan
 
 # Re-scan everything after a scanner database update
 angos reconcile scan --force
+
+# Index the layers of every image nobody has opened yet, and reclaim the
+# listings of repositories that no longer index
+angos reconcile index
 ```
 
 ---
@@ -233,10 +246,10 @@ angos reconcile scan --force
 ### worker
 
 Process durable background jobs from the job queue. With no `--queue` argument
-the worker drains the pull-through cache queue, the replication queue and,
-when `[global.scan]` is configured, the scan queue, each on its own worker
-pool. Pass `--queue` (repeatable) to drain specific queues instead, e.g.
-`angos worker --queue replication`.
+the worker drains the pull-through cache queue, the replication queue, the
+layer index queue and, when `[global.scan]` is configured, the scan queue,
+each on its own worker pool. Pass `--queue` (repeatable) to drain specific
+queues instead, e.g. `angos worker --queue replication`.
 
 ```bash
 angos worker [options]

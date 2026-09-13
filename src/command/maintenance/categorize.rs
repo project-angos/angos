@@ -14,7 +14,7 @@ use crate::{
     jobs::{JobState, Queue, store::JOBS_ROOT},
     registry::{
         keys::DigestKeys,
-        keys::{BLOBS_ROOT, CAT_ROOT, GC_ROOT, NS_ROOT, REF_ROOT, REPOS_ROOT},
+        keys::{BLOBS_ROOT, CAT_ROOT, GC_ROOT, LAYERS_ROOT, NS_ROOT, REF_ROOT, REPOS_ROOT},
         metadata_store::{LinkKind, parse_atime_entry, parse_tag_entry},
     },
 };
@@ -24,6 +24,9 @@ use crate::{
 pub enum KeyCategory {
     /// `v2/blobs/{alg}/{prefix}/{hash}/data` (blob store).
     BlobData { digest: Digest },
+    /// `v2/layers/{alg}/{prefix}/{hash}/entries` or `/checkpoints` (metadata
+    /// store): a layer's filesystem listing, derived from its blob.
+    LayerListing { digest: Digest },
     /// `v2/ref/{alg}/{prefix}/{hash}/{ns}!own` or `.../{ns}!r/{entry}`
     /// (metadata store); the namespace is raw, its validity being a validation
     /// concern.
@@ -130,6 +133,9 @@ pub fn categorize(key: &str) -> KeyCategory {
     if let Some(rest) = strip_prefix_dir(key, BLOBS_ROOT) {
         return categorize_blob(rest);
     }
+    if let Some(rest) = strip_prefix_dir(key, LAYERS_ROOT) {
+        return categorize_layer(rest);
+    }
     if let Some(rest) = strip_prefix_dir(key, REF_ROOT) {
         return categorize_ref(rest);
     }
@@ -170,6 +176,22 @@ fn categorize_blob(rest: &str) -> KeyCategory {
 
     match *tail {
         ["data"] => KeyCategory::BlobData { digest },
+        _ => KeyCategory::Unknown,
+    }
+}
+
+/// `{alg}/{prefix}/{hash}/entries` or `{alg}/{prefix}/{hash}/checkpoints`.
+fn categorize_layer(rest: &str) -> KeyCategory {
+    let segments: Vec<&str> = rest.split('/').collect();
+    let [algorithm, prefix, hash, tail @ ..] = segments.as_slice() else {
+        return KeyCategory::Unknown;
+    };
+    let Some(digest) = parse_sharded(algorithm, prefix, hash) else {
+        return KeyCategory::Unknown;
+    };
+
+    match *tail {
+        ["entries" | "checkpoints"] => KeyCategory::LayerListing { digest },
         _ => KeyCategory::Unknown,
     }
 }
@@ -708,6 +730,27 @@ mod tests {
         for key in unknown {
             assert_eq!(categorize(key), KeyCategory::Unknown, "key {key:?}");
         }
+    }
+
+    #[test]
+    fn layer_listings_are_recognized_and_other_layer_keys_are_not() {
+        let digest = Digest::sha256_of_bytes(b"layer");
+        for key in [digest.layer_entries_path(), digest.layer_checkpoints_path()] {
+            assert_eq!(
+                categorize(&key),
+                KeyCategory::LayerListing {
+                    digest: digest.clone()
+                }
+            );
+        }
+        assert_eq!(
+            categorize(&format!("{}/other", digest.layer_dir())),
+            KeyCategory::Unknown
+        );
+        assert_eq!(
+            categorize("v2/layers/sha256/ab/short/entries"),
+            KeyCategory::Unknown
+        );
     }
 
     #[test]
