@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::{
-    cache,
-    cache::{Cache, Error},
-};
+use crate::{Cache, Error, memory, redis_backend};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub enum Config {
@@ -13,17 +10,20 @@ pub enum Config {
     #[serde(rename = "memory")]
     Memory,
     #[serde(rename = "redis")]
-    Redis(cache::redis::BackendConfig),
+    Redis(redis_backend::BackendConfig),
 }
 
 impl Config {
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the Redis backend cannot be constructed.
     pub fn to_backend(&self) -> Result<Arc<Cache>, Error> {
         match self {
             Config::Redis(config) => {
-                let backend = cache::redis::Backend::new(config)?;
+                let backend = redis_backend::Backend::new(config)?;
                 Ok(Arc::new(Cache::Redis(Box::new(backend))))
             }
-            Config::Memory => Ok(Arc::new(Cache::Memory(cache::memory::Backend::new()))),
+            Config::Memory => Ok(Arc::new(Cache::Memory(memory::Backend::new()))),
         }
     }
 }
@@ -31,7 +31,9 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cache::redis::BackendConfig, secret::Secret};
+    use angos_secret::Secret;
+
+    use crate::redis_backend::BackendConfig;
 
     #[tokio::test]
     async fn test_memory_backend() {

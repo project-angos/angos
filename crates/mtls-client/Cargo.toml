@@ -1,0 +1,13 @@
+[package]
+name = "angos-mtls-client"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+reqwest = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

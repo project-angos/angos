@@ -26,7 +26,6 @@ use angos_storage::{
 use crate::http_response::ResponseBody;
 use crate::registry::keys::DigestKeys;
 use crate::{
-    cache,
     configuration::{GlobalConfig, RegexPattern},
     jobs::Queue,
     jobs::store::{ClaimMode, JobStore},
@@ -42,8 +41,8 @@ use crate::{
     },
     registry_client::RegistryClient,
     replication::{ReplicationDownstream, ReplicationJob},
-    secret::Secret,
 };
+use angos_secret::Secret;
 
 /// Connection to the live S3 test backend, single-sourced from the s3-client
 /// fixtures so credentials, bucket, and the endpoint override live in one place.
@@ -120,7 +119,11 @@ pub fn metadata_store_over_cached(
 ) -> Arc<MetadataStore> {
     Arc::new(
         MetadataStore::builder(object)
-            .cache(cache::Config::Memory.to_backend().expect("memory cache"))
+            .cache(
+                angos_cache::Config::Memory
+                    .to_backend()
+                    .expect("memory cache"),
+            )
             .link_cache_ttl(link_cache_ttl_secs)
             // Tests exercise reclamation immediately; the race tests needing
             // the grace protection set their own.
@@ -544,7 +547,7 @@ impl RegistryTestCase for S3RegistryTestCase {
 /// A `RegistryClient` pointed at `uri` with a fresh in-memory cache; callers
 /// pass a placeholder URI when the client is never dialed.
 pub fn downstream_client(uri: &str) -> Arc<RegistryClient> {
-    let backend = cache::Config::Memory.to_backend().unwrap();
+    let backend = angos_cache::Config::Memory.to_backend().unwrap();
     Arc::new(RegistryClient::new(
         uri.to_string(),
         reqwest::Client::new(),

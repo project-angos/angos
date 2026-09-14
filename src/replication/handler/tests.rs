@@ -13,7 +13,6 @@ use angos_oci::{Digest, Namespace, Tag};
 use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
 use crate::{
-    cache,
     jobs::Queue,
     jobs::store::{Error, JobEnvelope, JobHandler},
     metrics_provider,
@@ -455,7 +454,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
     let store = object;
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
-            .cache(cache::Config::Memory.to_backend().unwrap())
+            .cache(angos_cache::Config::Memory.to_backend().unwrap())
             .link_cache_ttl(300)
             .build(),
     );

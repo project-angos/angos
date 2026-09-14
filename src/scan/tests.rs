@@ -24,8 +24,8 @@ use crate::{
         SARIF_MEDIA_TYPE, ScanConfig, ScanImagePayload, ScanJobHandler, ScanSummary,
         build_envelope, is_scan_subject,
     },
-    secret::Secret,
 };
+use angos_secret::Secret;
 
 const SARIF: &[u8] = br#"{"version":"2.1.0","runs":[]}"#;
 
@@ -230,7 +230,6 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
     use angos_oci::{MediaRange, MediaType, Reference, Tag};
 
     use crate::{
-        cache,
         registry::repository::{Config as RepositoryConfig, Repository},
         test_fixtures::client::test_client_config,
     };
@@ -266,7 +265,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
             scan: true,
             ..Default::default()
         },
-        &cache::Config::Memory.to_backend().unwrap(),
+        &angos_cache::Config::Memory.to_backend().unwrap(),
         crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     )
     .await

@@ -25,7 +25,9 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{configuration::ObservabilityConfig, scan::ScanImagePayload, secret::Secret};
+use angos_secret::Secret;
+
+use crate::{configuration::ObservabilityConfig, scan::ScanImagePayload};
 
 /// A scan request names one image; cap the read well above that so a hostile
 /// body cannot exhaust memory.

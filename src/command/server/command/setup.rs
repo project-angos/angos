@@ -5,7 +5,6 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{info, warn};
 
 use crate::{
-    cache::Cache,
     cache_fill::CacheFillJobHandler,
     command::{bootstrap, server::error::Error},
     configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig},
@@ -23,6 +22,7 @@ use crate::{
     replication::ReplicationJobHandler,
     scan::ScanJobHandler,
 };
+use angos_cache::Cache;
 
 /// A built registry and what the server owns around it: the handle its
 /// queue-depth gauges refresh from when `[global.job_queue]` is configured,

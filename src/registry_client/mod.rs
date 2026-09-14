@@ -36,9 +36,11 @@ use angos_oci::response::{ManifestHeadResponse, ManifestResponse, TagsListRespon
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaRange, MediaType, Tag};
 
 pub use crate::registry_client::{error::Error, write::UploadSession};
-use crate::{
-    cache::Cache, http_client::apply_tls_files, registry::blob_store::BoxedReader, secret::Secret,
-};
+use angos_cache::Cache;
+use angos_mtls_client::MtlsClientBuilder;
+use angos_secret::Secret;
+
+use crate::registry::blob_store::BoxedReader;
 use auth::token_index_cache_key;
 
 /// Header carrying the originating event timestamp (RFC 3339) of a replication
@@ -257,22 +259,19 @@ impl RegistryClient {
     fn resolve_config_fields(
         config: &RegistryClientConfig,
     ) -> Result<(Client, Option<BasicAuth>), Error> {
-        let builder = Client::builder()
-            .use_rustls_tls()
-            .redirect(Policy::limited(config.max_redirect as usize))
-            // No whole-transfer deadline: a connect bound plus a per-read stall
-            // bound so replicating a large blob is not capped by total time.
-            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .read_timeout(Duration::from_secs(config.read_timeout_secs));
-        let client = apply_tls_files(
-            builder,
-            config.server_ca_bundle.as_deref(),
-            config.mtls.as_ref().map(|m| m.client_certificate.as_path()),
-            config.mtls.as_ref().map(|m| m.client_private_key.as_path()),
-        )
-        .map_err(Error::Initialization)?
-        .build()
-        .map_err(|e| Error::Initialization(format!("Failed to create HTTP client: {e}")))?;
+        // No whole-transfer deadline: a connect bound plus a per-read stall
+        // bound so replicating a large blob is not capped by total time.
+        let client = MtlsClientBuilder::new()
+            .with_redirect_policy(Policy::limited(config.max_redirect as usize))
+            .with_connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .with_read_timeout(Duration::from_secs(config.read_timeout_secs))
+            .with_server_ca_bundle(config.server_ca_bundle.as_deref())
+            .with_client_certificate((
+                config.mtls.as_ref().map(|m| m.client_certificate.as_path()),
+                config.mtls.as_ref().map(|m| m.client_private_key.as_path()),
+            ))
+            .build()
+            .map_err(Error::Initialization)?;
 
         let basic_auth = match (&config.username, &config.password) {
             (Some(username), Some(password)) => Some(BasicAuth {

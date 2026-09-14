@@ -19,7 +19,6 @@ use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome};
 use angos_oci::{Digest, MediaType, Namespace, Reference, Tag};
 
 use crate::{
-    cache,
     registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     registry_client::{
         Error, MtlsIdentity, REPLICATION_SUPERSEDED_CODE, RegistryClient, RegistryClientConfig,
@@ -27,9 +26,9 @@ use crate::{
         auth::{token_cache_key, token_index_cache_key},
         without_query,
     },
-    secret::Secret,
     test_fixtures::{client::test_client_config, logging::LogCapture},
 };
+use angos_secret::Secret;
 
 /// The blob the scope-cache test fetches; its URL is also what the cache keys
 /// are derived from, so both sides read the digest from here.
@@ -47,7 +46,7 @@ fn source_ts() -> DateTime<Utc> {
 /// Builds a no-auth client pointed at `mock_server`.
 fn client_for(mock_server: &MockServer) -> RegistryClient {
     let config = test_client_config(mock_server.uri());
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
 }
 
@@ -58,7 +57,7 @@ fn test_new_with_username_only() {
         ..test_client_config("https://example.com")
     };
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     assert!(client.basic_auth.is_none());
@@ -71,7 +70,7 @@ fn test_new_with_password_only() {
         ..test_client_config("https://example.com")
     };
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     assert!(client.basic_auth.is_none());
@@ -85,7 +84,7 @@ fn test_new_with_both_credentials() {
         ..test_client_config("https://example.com")
     };
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     assert!(client.basic_auth.is_some());
@@ -101,7 +100,7 @@ fn debug_output_redacts_basic_auth_password() {
         ..test_client_config("https://example.com")
     };
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
@@ -426,7 +425,7 @@ async fn test_get_manifest_rejects_oversized_body() {
 
     let config = test_client_config(mock_server.uri());
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let client = RegistryClient::from_config(&config, cache, 7).unwrap();
 
     let result = client
@@ -509,7 +508,7 @@ async fn a_scope_cache_hit_indexes_the_url_it_served() {
     let registry_url = mock_server.uri();
     let location = format!("{registry_url}/v2/test/blobs/{SCOPE_CACHE_DIGEST}");
     let url = Url::parse(&location).unwrap();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     // The scope token is cached, but this URL has never been indexed: the
     // state left behind when some other URL triggered the exchange.
@@ -572,7 +571,7 @@ async fn test_cached_bearer_token_is_used() {
     let mock_server = MockServer::start().await;
     let registry_url = mock_server.uri();
     let location = format!("{registry_url}/v2/test/manifests/latest");
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let url = Url::parse(&location).unwrap();
     let cache_key = token_cache_key(
         &url,
@@ -740,7 +739,7 @@ async fn test_expired_bearer_token_is_refetched() {
     let auth_server = MockServer::start().await;
     let registry_url = mock_server.uri();
     let location = format!("{registry_url}/v2/test/manifests/latest");
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let url = Url::parse(&location).unwrap();
     let cache_key = token_cache_key(
         &url,
@@ -924,7 +923,7 @@ async fn test_basic_authentication() {
         ..test_client_config(mock_server.uri())
     };
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
@@ -1144,7 +1143,7 @@ fn test_new_with_invalid_ca_bundle() {
         ..test_client_config("https://example.com")
     };
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let result = RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
 
     assert!(result.is_err());
@@ -1191,7 +1190,7 @@ fn test_new_with_both_certificate_and_key_invalid_files() {
         ..test_client_config("https://example.com")
     };
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let result = RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
 
     assert!(result.is_err());
@@ -1450,7 +1449,7 @@ async fn test_blob_upload_reuses_basic_credentials_on_patch() {
         password: Some(Secret::new("pass".to_string())),
         ..test_client_config(mock_server.uri())
     };
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 

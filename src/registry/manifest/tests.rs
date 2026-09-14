@@ -29,7 +29,6 @@ use angos_storage::{
 use crate::registry::keys::{DigestKeys, NamespaceKeys};
 use crate::registry::manifest::*;
 use crate::{
-    cache,
     command::server::Error as ServerError,
     metrics_provider,
     registry::{
@@ -827,7 +826,7 @@ async fn permissive_push_of_owned_references_yields_a_pullable_manifest() {
 }
 
 async fn pull_through_repository(server: &MockServer) -> Repository {
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let config = RepositoryConfig {
         upstream: vec![test_client_config(server.uri())],
         ..Default::default()
@@ -917,7 +916,7 @@ async fn pull_through_counts_a_miss_then_a_hit_then_a_refresh() {
         .mount(&upstream)
         .await;
 
-    let cache_backend = cache::Config::Memory.to_backend().unwrap();
+    let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
     let repository = Repository::new(
         REPOSITORY,
         &RepositoryConfig {

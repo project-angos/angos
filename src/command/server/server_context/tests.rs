@@ -16,7 +16,6 @@ use angos_oci::{Digest, Namespace, Reference, Tag};
 use crate::registry::test_utils::test_job_store;
 
 use crate::{
-    cache::{self, Cache},
     command::bootstrap,
     command::server::server_context::{ServerContext, resolve_forwarded_ip},
     configuration::{Configuration, TrustedProxy},
@@ -30,6 +29,7 @@ use crate::{
     },
     test_fixtures::configuration::{load_config, minimal_config},
 };
+use angos_cache::Cache;
 
 #[derive(Default)]
 pub struct TestConfigOptions<'a> {
@@ -83,7 +83,9 @@ pub async fn create_test_server_context_with(options: TestConfigOptions<'_>) -> 
 /// The in-memory cache a test context shares with its authenticator and
 /// authorizer.
 fn test_cache() -> Arc<Cache> {
-    cache::Config::Memory.to_backend().expect("memory cache")
+    angos_cache::Config::Memory
+        .to_backend()
+        .expect("memory cache")
 }
 
 pub async fn create_test_server_context_from_config(config: &Configuration) -> ServerContext {

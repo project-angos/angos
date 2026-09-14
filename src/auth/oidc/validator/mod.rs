@@ -13,9 +13,9 @@ use crate::{
         oidc::{Config, Jwk},
         sha256_hex,
     },
-    cache::Cache,
     identity::OidcClaims,
 };
+use angos_cache::Cache;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct OpenIdConfiguration {

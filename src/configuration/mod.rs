@@ -35,7 +35,6 @@ mod tests;
 
 use crate::{
     auth::{authenticator, webhook},
-    cache,
     event_webhook::config::EventWebhookConfig,
     registry::{blob_store, repository},
 };
@@ -50,7 +49,7 @@ pub struct Configuration {
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
-    pub cache: cache::Config,
+    pub cache: angos_cache::Config,
     /// Required: a registry with no configured storage would otherwise default
     /// to the filesystem backend rooted at the process working directory.
     pub blob_store: blob_store::BlobStoreConfig,

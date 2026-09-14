@@ -31,9 +31,12 @@ name = "angos"
 version = "1.8.0"
 dependencies = [
  "angos-backoff",
+ "angos-cache",
  "angos-inflate",
+ "angos-mtls-client",
  "angos-oci",
  "angos-s3-client",
+ "angos-secret",
  "angos-storage",
  "arc-swap",
  "argh",
@@ -63,7 +66,6 @@ dependencies = [
  "password-hash",
  "prometheus",
  "rcgen",
- "redis",
  "regex",
  "reqwest",
  "rpassword",
@@ -96,10 +98,35 @@ name = "angos-backoff"
 version = "0.1.0"
 
 [[package]]
+name = "angos-cache"
+version = "0.1.0"
+dependencies = [
+ "angos-secret",
+ "redis",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "angos-inflate"
 version = "0.1.0"
 dependencies = [
  "flate2",
+]
+
+[[package]]
+name = "angos-mtls-client"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "reqwest",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -142,6 +169,14 @@ dependencies = [
  "tracing",
  "url",
  "wiremock",
+]
+
+[[package]]
+name = "angos-secret"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "zeroize",
 ]
 
 [[package]]

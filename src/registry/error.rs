@@ -7,7 +7,7 @@ use tracing::warn;
 use angos_oci::{Error as OciError, http_range};
 use angos_storage::Error as StorageError;
 
-use crate::{configuration, jobs::store as job_store, policy, registry::cache, registry_client};
+use crate::{configuration, jobs::store as job_store, policy, registry_client};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -76,7 +76,7 @@ pub enum Error {
     #[error("configuration error during operations: {0}")]
     Configuration(#[from] configuration::Error),
     #[error("cache error during operations: {0}")]
-    Cache(#[from] cache::Error),
+    Cache(#[from] angos_cache::Error),
     #[error("I/O error during operations: {0}")]
     Io(#[from] std::io::Error),
     #[error("HTTP error during operations: {0}")]
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn from_cache_preserves_source() {
-        let cache_err = cache::Error::Execution("cache miss".to_string());
+        let cache_err = angos_cache::Error::Execution("cache miss".to_string());
         let err: Error = cache_err.into();
         assert!(matches!(err, Error::Cache(_)));
         assert!(StdError::source(&err).is_some());

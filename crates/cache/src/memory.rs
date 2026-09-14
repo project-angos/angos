@@ -7,7 +7,7 @@ use std::{
 use tokio::{sync::RwLock, time::Instant};
 use tracing::info;
 
-use crate::cache::Error;
+use crate::Error;
 
 /// Ceiling on an entry's TTL. `Instant + Duration` panics past what the clock
 /// can represent, and a TTL reaches here straight from an upstream token
@@ -21,7 +21,14 @@ pub struct Backend {
     counter: AtomicUsize,
 }
 
+impl Default for Backend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Backend {
+    #[must_use]
     pub fn new() -> Self {
         info!("Using in-memory cache store");
         Backend {
@@ -43,6 +50,9 @@ impl Backend {
         }
     }
 
+    /// # Errors
+    ///
+    /// Never errors; the `Result` mirrors the fallible backends [`crate::Cache`] dispatches to.
     pub async fn store_value(&self, key: &str, value: &str, ttl: u64) -> Result<(), Error> {
         self.maybe_cleanup().await;
         let mut store = self.store.write().await;
@@ -56,6 +66,9 @@ impl Backend {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Never errors; the `Result` mirrors the fallible backends [`crate::Cache`] dispatches to.
     pub async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error> {
         self.maybe_cleanup().await;
         let store = self.store.read().await;
@@ -68,6 +81,9 @@ impl Backend {
         Ok(None)
     }
 
+    /// # Errors
+    ///
+    /// Never errors; the `Result` mirrors the fallible backends [`crate::Cache`] dispatches to.
     pub async fn delete_value(&self, key: &str) -> Result<(), Error> {
         let mut store = self.store.write().await;
         store.remove(key);

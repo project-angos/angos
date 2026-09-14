@@ -6,10 +6,8 @@ use std::{
 use angos_oci::Namespace;
 use angos_storage::ObjectStore;
 
-use crate::{
-    cache::Cache,
-    registry::{Error, keys::REPOS_ROOT, pagination},
-};
+use crate::registry::{Error, keys::REPOS_ROOT, pagination};
+use angos_cache::Cache;
 
 pub mod access_time;
 mod blob_index;

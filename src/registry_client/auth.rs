@@ -267,8 +267,8 @@ mod tests {
                 token_cache_key, token_index_cache_key,
             },
         },
-        secret::Secret,
     };
+    use angos_secret::Secret;
 
     #[test]
     fn test_token_from_token_field() {

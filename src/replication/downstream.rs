@@ -115,14 +115,13 @@ mod tests {
     use regex::Regex;
 
     use crate::{
-        cache,
         registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         registry_client::RegistryClient,
         replication::{ReplicationDownstream, ReplicationMode},
     };
 
     fn test_client() -> Arc<RegistryClient> {
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         Arc::new(RegistryClient::new(
             "https://example.test".to_string(),
             reqwest::Client::new(),

@@ -14,13 +14,13 @@ use angos_oci::{Descriptor, Digest, Error as OciError, MediaRange, Namespace, Re
 
 pub use crate::registry_client::RegistryClientConfig;
 use crate::{
-    cache::Cache,
     configuration::RegexPattern,
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::Error,
     registry_client::{Error as ClientError, FetchedBlob, RegistryClient},
     replication::{ReplicationDownstream, ReplicationDownstreamConfig},
 };
+use angos_cache::Cache;
 
 /// Fallback per-manifest blob-push concurrency when a downstream omits
 /// `max_concurrent_pushes`.
@@ -446,7 +446,6 @@ mod tests {
     use angos_oci::{Digest, Namespace, Reference, Tag};
 
     use crate::{
-        cache,
         registry::{
             Error,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -518,7 +517,7 @@ mod tests {
     }
 
     async fn repository_with_upstreams(first_url: String, second_url: String) -> Repository {
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![
                 test_client_config(first_url),
@@ -568,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_pull_through_empty() {
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config::default();
         let repo = Repository::new("test", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .await
@@ -579,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_downstream_name_is_rejected() {
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             downstream: vec![downstream_config("eu"), downstream_config("eu")],
             ..Default::default()
@@ -602,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_downstream_name_is_rejected() {
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             downstream: vec![downstream_config("")],
             ..Default::default()
@@ -625,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_pull_through_with_upstreams() {
         let mock_server = MockServer::start().await;
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
@@ -644,7 +643,7 @@ mod tests {
         let ca_bundle_path = tmp_dir.path().join("ca.pem");
         fs::write(&ca_bundle_path, ca_bundle_pem()).unwrap();
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![RegistryClientConfig {
                 server_ca_bundle: Some(ca_bundle_path.clone()),
@@ -680,7 +679,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -820,7 +819,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -855,7 +854,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -884,7 +883,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -918,7 +917,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -951,7 +950,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -982,7 +981,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -1021,7 +1020,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
