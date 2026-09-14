@@ -89,7 +89,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26.5'
+          go-version: '1.27.1'
 
       - name: Build conformance tool
         run: |
@@ -517,7 +517,7 @@ jobs:
           docker rm -f angos-cache
 
       - name: Install oras
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
 
       - name: E2E - scan a push through the scan queue and the ${{ matrix.scanner }} scanner image
         run: |
@@ -671,7 +671,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: '24.19.0'
+          node-version: '24.21.0'
 
       - name: Build release binary
         env:
