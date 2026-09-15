@@ -15,10 +15,12 @@ use angos_oci::header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID};
 use angos_oci::http_range::RequestRange;
 use angos_oci::request::{CompleteUploadRequest, GetReferrersRequest};
 use angos_oci::{Digest, MediaRange, MediaType, Namespace, Tag, UploadSessionId};
+use angos_oci_client::RegistryClient;
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_s3_client::test_util::{
     TEST_ACCESS_KEY, TEST_BUCKET, TEST_REGION, TEST_SECRET_KEY, test_endpoint,
 };
+use angos_secret::Secret;
 use angos_storage::{
     ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
@@ -39,10 +41,8 @@ use crate::{
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
     },
-    registry_client::RegistryClient,
     replication::{ReplicationDownstream, ReplicationJob},
 };
-use angos_secret::Secret;
 
 /// Connection to the live S3 test backend, single-sourced from the s3-client
 /// fixtures so credentials, bucket, and the endpoint override live in one place.

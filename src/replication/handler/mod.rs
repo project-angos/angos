@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use angos_oci::{Digest, Namespace, Reference, Tag};
+use angos_oci_client::Error as RegistryClientError;
 
 use crate::{
     jobs::Queue,
@@ -21,7 +22,6 @@ use crate::{
         metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
-    registry_client::Error as RegistryClientError,
     replication::{
         Error as ReplicationError, REPLICATION_DELETE_MANIFEST_KIND,
         REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,

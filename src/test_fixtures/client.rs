@@ -1,6 +1,6 @@
 //! Fixtures for [`RegistryClientConfig`]-based tests.
 
-use crate::registry_client::RegistryClientConfig;
+use angos_oci_client::RegistryClientConfig;
 
 /// The modal test client config: `url` plus defaults everywhere (no TLS
 /// material, no credentials, `max_redirect` 5). Tests needing a variant

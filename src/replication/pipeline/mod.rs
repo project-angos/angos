@@ -20,6 +20,7 @@ use angos_oci::request::{
 };
 use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome};
 use angos_oci::{Content, Digest, Manifest, Namespace, Reference, Tag};
+use angos_oci_client::{RegistryClient, UploadSession};
 
 use crate::{
     registry::{
@@ -27,7 +28,6 @@ use crate::{
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, MetadataStore},
     },
-    registry_client::{RegistryClient, UploadSession},
     replication::Error,
     replication::ReplicationDownstream,
 };

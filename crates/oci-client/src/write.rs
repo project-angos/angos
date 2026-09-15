@@ -23,7 +23,7 @@ use angos_oci::request::{
 use angos_oci::response::{DeleteManifestOutcome, ErrorResponse, PutManifestOutcome};
 use angos_oci::{Digest, MediaType};
 
-use crate::registry_client::{
+use crate::{
     Error, REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP, parse_header,
     without_query,
 };

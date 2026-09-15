@@ -1,6 +1,7 @@
 use hyper::StatusCode;
 
 use angos_oci::response::ErrorCode;
+use angos_oci_client::REPLICATION_SUPERSEDED_CODE;
 
 use crate::{
     auth,
@@ -11,7 +12,6 @@ use crate::{
     configuration, event_webhook,
     jobs::store as job_store,
     metrics_provider, registry,
-    registry_client::REPLICATION_SUPERSEDED_CODE,
 };
 
 fn oci_error(status_code: StatusCode, code: ErrorCode, msg: Option<String>) -> Error {

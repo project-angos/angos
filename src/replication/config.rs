@@ -2,10 +2,9 @@ use std::num::NonZeroUsize;
 
 use serde::Deserialize;
 
-use crate::{
-    configuration::RegexPattern, registry_client::RegistryClientConfig,
-    replication::ReplicationMode,
-};
+use angos_oci_client::RegistryClientConfig;
+
+use crate::{configuration::RegexPattern, replication::ReplicationMode};
 
 /// Parse-time DTO for one per-repository replication downstream; the runtime
 /// counterpart is [`crate::replication::ReplicationDownstream`].

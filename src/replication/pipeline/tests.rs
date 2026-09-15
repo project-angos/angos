@@ -17,6 +17,9 @@ use angos_oci::{
     Reference, Tag,
     constants::{DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE},
 };
+use angos_oci_client::{
+    REPLICATION_SUPERSEDED_CODE, RegistryClient, UploadSession, X_ANGOS_SOURCE_TIMESTAMP,
+};
 use angos_storage::ObjectStore;
 
 use crate::{
@@ -26,9 +29,6 @@ use crate::{
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
         test_utils::{FsTestStack, downstream_client, fs_test_stack, media_type, put_blob_direct},
-    },
-    registry_client::{
-        REPLICATION_SUPERSEDED_CODE, RegistryClient, UploadSession, X_ANGOS_SOURCE_TIMESTAMP,
     },
     replication::pipeline::{
         MAX_INDEX_DEPTH, PushContext, PushOutcome, delete_manifest, push_blobs, push_manifest,

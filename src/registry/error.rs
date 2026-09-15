@@ -7,7 +7,7 @@ use tracing::warn;
 use angos_oci::{Error as OciError, http_range};
 use angos_storage::Error as StorageError;
 
-use crate::{configuration, jobs::store as job_store, policy, registry_client};
+use crate::{configuration, jobs::store as job_store, policy};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -144,20 +144,20 @@ impl From<job_store::Error> for Error {
 
 // Variant for variant, so the pull-through path surfaces a remote miss as the
 // matching local OCI code.
-impl From<registry_client::Error> for Error {
-    fn from(error: registry_client::Error) -> Self {
+impl From<angos_oci_client::Error> for Error {
+    fn from(error: angos_oci_client::Error) -> Self {
         match error {
-            registry_client::Error::Initialization(msg) => Error::Initialization(msg),
-            registry_client::Error::Unauthorized(msg) => Error::Unauthorized(msg),
-            registry_client::Error::Denied(msg) => Error::Denied(msg),
-            registry_client::Error::BlobUnknown => Error::BlobUnknown,
-            registry_client::Error::ManifestUnknown => Error::ManifestUnknown,
-            registry_client::Error::ManifestBodyTooLarge { limit } => {
+            angos_oci_client::Error::Initialization(msg) => Error::Initialization(msg),
+            angos_oci_client::Error::Unauthorized(msg) => Error::Unauthorized(msg),
+            angos_oci_client::Error::Denied(msg) => Error::Denied(msg),
+            angos_oci_client::Error::BlobUnknown => Error::BlobUnknown,
+            angos_oci_client::Error::ManifestUnknown => Error::ManifestUnknown,
+            angos_oci_client::Error::ManifestBodyTooLarge { limit } => {
                 Error::ManifestBodyTooLarge { limit }
             }
-            registry_client::Error::Unsupported => Error::Unsupported,
-            registry_client::Error::RangeNotSatisfiable => Error::RangeNotSatisfiable,
-            registry_client::Error::Internal(msg) => Error::Internal(msg),
+            angos_oci_client::Error::Unsupported => Error::Unsupported,
+            angos_oci_client::Error::RangeNotSatisfiable => Error::RangeNotSatisfiable,
+            angos_oci_client::Error::Internal(msg) => Error::Internal(msg),
         }
     }
 }

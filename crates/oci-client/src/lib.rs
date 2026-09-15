@@ -35,12 +35,12 @@ use angos_oci::request::{
 use angos_oci::response::{ManifestHeadResponse, ManifestResponse, TagsListResponse};
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaRange, MediaType, Tag};
 
-pub use crate::registry_client::{error::Error, write::UploadSession};
+pub use crate::{error::Error, write::UploadSession};
 use angos_cache::Cache;
 use angos_mtls_client::MtlsClientBuilder;
 use angos_secret::Secret;
 
-use crate::registry::blob_store::BoxedReader;
+use angos_storage::BoxedReader;
 use auth::token_index_cache_key;
 
 /// Header carrying the originating event timestamp (RFC 3339) of a replication

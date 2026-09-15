@@ -35,6 +35,7 @@ dependencies = [
  "angos-inflate",
  "angos-mtls-client",
  "angos-oci",
+ "angos-oci-client",
  "angos-s3-client",
  "angos-secret",
  "angos-storage",
@@ -143,6 +144,32 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "angos-oci-client"
+version = "0.1.0"
+dependencies = [
+ "angos-cache",
+ "angos-mtls-client",
+ "angos-oci",
+ "angos-secret",
+ "angos-storage",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "wiremock",
 ]
 
 [[package]]

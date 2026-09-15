@@ -31,7 +31,6 @@ mod layer;
 mod metrics_provider;
 mod policy;
 mod registry;
-pub mod registry_client;
 mod replication;
 mod scan;
 

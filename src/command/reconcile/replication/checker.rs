@@ -12,6 +12,7 @@ use angos_oci::manifest_accept_types;
 use angos_oci::request::{HeadManifestRequest, ListTagsRequest};
 use angos_oci::response::ManifestHeadResponse;
 use angos_oci::{Digest, Namespace, Reference, Tag};
+use angos_oci_client::Error as ClientError;
 
 use crate::{
     command::maintenance::{Error, action::Action, check::NamespaceChecker, executor::ActionSink},
@@ -20,7 +21,6 @@ use crate::{
         metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
-    registry_client::Error as ClientError,
     replication::{ReplicationDownstream, record_reconcile_outcome},
 };
 
@@ -356,9 +356,9 @@ mod tests {
                 put_blob_direct, repository_with_replication, seed_manifest,
             },
         },
-        registry_client::RegistryClient,
         replication::{ReplicationDownstream, ReplicationJobHandler, ReplicationMode},
     };
+    use angos_oci_client::RegistryClient;
 
     const NAMESPACE: &str = "nginx";
     const REPO: &str = "nginx";

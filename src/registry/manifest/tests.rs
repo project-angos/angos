@@ -21,6 +21,7 @@ use wiremock::{
 use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_TAG};
 use angos_oci::request::{DeleteBlobRequest, PutManifestRequest};
 use angos_oci::{Algorithm, MediaType, Namespace, Tag};
+use angos_oci_client::REPLICATION_SUPERSEDED_CODE;
 use angos_storage::{
     Error as StorageError, ObjectStore,
     test_util::{HookedStore, StoreHook, StoreOp},
@@ -42,7 +43,6 @@ use crate::{
             upload_blob,
         },
     },
-    registry_client::REPLICATION_SUPERSEDED_CODE,
     test_fixtures::client::test_client_config,
 };
 

@@ -7,6 +7,7 @@ members = [
     "crates/conformance-gates",
     "crates/mtls-client",
     "crates/oci",
+    "crates/oci-client",
     "crates/s3-client",
     "crates/secret",
     "crates/storage",
@@ -22,6 +23,7 @@ angos-cache = { path = "crates/cache" }
 angos-inflate = { path = "crates/inflate" }
 angos-mtls-client = { path = "crates/mtls-client" }
 angos-oci = { path = "crates/oci" }
+angos-oci-client = { path = "crates/oci-client" }
 angos-s3-client = { path = "crates/s3-client" }
 angos-secret = { path = "crates/secret" }
 angos-storage = { path = "crates/storage" }
@@ -71,6 +73,7 @@ angos-cache = { workspace = true }
 angos-inflate = { workspace = true }
 angos-mtls-client = { workspace = true }
 angos-oci = { workspace = true }
+angos-oci-client = { workspace = true }
 angos-s3-client = { workspace = true }
 angos-secret = { workspace = true }
 angos-storage = { workspace = true }

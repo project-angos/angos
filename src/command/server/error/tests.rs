@@ -1,12 +1,13 @@
 use std::io;
 
-use angos_oci::response::ErrorCode;
 use hyper::StatusCode;
+
+use angos_oci::response::ErrorCode;
+use angos_oci_client::REPLICATION_SUPERSEDED_CODE;
 
 use crate::{
     command::server::{Error, error::RECLAMATION_IN_PROGRESS_CODE},
     configuration, event_webhook, registry,
-    registry_client::REPLICATION_SUPERSEDED_CODE,
 };
 
 /// Whether this error's `code` must come from the set the spec fixes for a 4XX.

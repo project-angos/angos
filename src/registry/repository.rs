@@ -5,22 +5,22 @@ use serde::Deserialize;
 use tokio::task;
 use tracing::{instrument, warn};
 
+use angos_cache::Cache;
 use angos_oci::http_range::RequestRange;
 use angos_oci::request::{
     GetBlobRequest, GetManifestRequest, GetReferrersRequest, HeadBlobRequest, HeadManifestRequest,
 };
 use angos_oci::response::{ManifestHeadResponse, ManifestResponse};
 use angos_oci::{Descriptor, Digest, Error as OciError, MediaRange, Namespace, Reference};
+pub use angos_oci_client::RegistryClientConfig;
+use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient};
 
-pub use crate::registry_client::RegistryClientConfig;
 use crate::{
     configuration::RegexPattern,
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::Error,
-    registry_client::{Error as ClientError, FetchedBlob, RegistryClient},
     replication::{ReplicationDownstream, ReplicationDownstreamConfig},
 };
-use angos_cache::Cache;
 
 /// Fallback per-manifest blob-push concurrency when a downstream omits
 /// `max_concurrent_pushes`.

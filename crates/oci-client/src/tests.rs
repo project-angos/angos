@@ -19,16 +19,59 @@ use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome};
 use angos_oci::{Digest, MediaType, Namespace, Reference, Tag};
 
 use crate::{
-    registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-    registry_client::{
-        Error, MtlsIdentity, REPLICATION_SUPERSEDED_CODE, RegistryClient, RegistryClientConfig,
-        X_ANGOS_SOURCE_TIMESTAMP,
-        auth::{token_cache_key, token_index_cache_key},
-        without_query,
-    },
-    test_fixtures::{client::test_client_config, logging::LogCapture},
+    Error, MtlsIdentity, REPLICATION_SUPERSEDED_CODE, RegistryClient, RegistryClientConfig,
+    X_ANGOS_SOURCE_TIMESTAMP,
+    auth::{token_cache_key, token_index_cache_key},
+    without_query,
 };
 use angos_secret::Secret;
+
+/// The registry's default; inlined so the client crate's tests do not reach
+/// into the server-side manifest module.
+const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
+fn test_client_config(url: impl Into<String>) -> RegistryClientConfig {
+    RegistryClientConfig {
+        url: url.into(),
+        max_redirect: 5,
+        connect_timeout_secs: 30,
+        read_timeout_secs: 300,
+        server_ca_bundle: None,
+        mtls: None,
+        username: None,
+        password: None,
+    }
+}
+
+/// Collects tracing output into a shared buffer; every clone appends to the
+/// same buffer, so a clone passed to `with_writer` is read back via `contents`.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// The blob the scope-cache test fetches; its URL is also what the cache keys
 /// are derived from, so both sides read the digest from here.

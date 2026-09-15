@@ -283,6 +283,7 @@ mod tests {
 
     use angos_oci::header::DOCKER_CONTENT_DIGEST;
     use angos_oci::{Namespace, Tag};
+    use angos_oci_client::RegistryClient;
 
     use super::{InProcessLoops, LoopCounts, spawn_in_process_loops};
     use crate::{
@@ -304,7 +305,6 @@ mod tests {
                 repository_with_replication, seed_manifest, single_repo_resolver,
             },
         },
-        registry_client::RegistryClient,
         replication::REPLICATION_PUSH_MANIFEST_KIND,
     };
 
