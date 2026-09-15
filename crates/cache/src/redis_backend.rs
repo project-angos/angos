@@ -5,7 +5,9 @@ use serde::{Deserialize, Deserializer};
 use tokio::sync::OnceCell;
 use tracing::info;
 
-use crate::{cache::Error, secret::Secret};
+use angos_secret::Secret;
+
+use crate::Error;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct BackendConfig {

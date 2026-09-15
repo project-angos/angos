@@ -412,7 +412,6 @@ mod tests {
     use crate::metrics_provider::init_for_tests;
     use crate::registry::blob::*;
     use crate::{
-        cache,
         registry::{
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{BlobIndexOperation, LinkOperation},
@@ -955,7 +954,7 @@ mod tests {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
-        let cache_backend = cache::Config::Memory.to_backend().unwrap();
+        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
         let repository = Repository::new(
             "local",
             &config,

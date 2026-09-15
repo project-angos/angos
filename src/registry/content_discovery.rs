@@ -348,7 +348,6 @@ mod tests {
     };
 
     use crate::{
-        cache,
         registry::{
             Error,
             content_discovery::{
@@ -746,7 +745,7 @@ mod tests {
             upstream: vec![test_client_config(upstream)],
             ..Default::default()
         };
-        let cache_backend = cache::Config::Memory.to_backend().unwrap();
+        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
         Repository::new(
             "mirror",
             &config,

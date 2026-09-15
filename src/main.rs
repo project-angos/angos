@@ -20,12 +20,10 @@ use crate::{
 };
 
 mod auth;
-mod cache;
 mod cache_fill;
 mod command;
 mod configuration;
 mod event_webhook;
-pub mod http_client;
 mod http_response;
 mod identity;
 mod jobs;
@@ -33,10 +31,8 @@ mod layer;
 mod metrics_provider;
 mod policy;
 mod registry;
-pub mod registry_client;
 mod replication;
 mod scan;
-mod secret;
 
 #[cfg(test)]
 pub mod test_fixtures;

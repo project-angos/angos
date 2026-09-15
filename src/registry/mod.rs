@@ -30,7 +30,6 @@ use angos_oci::server;
 use angos_oci::{Namespace, Reference, Tag};
 
 use crate::{
-    cache,
     configuration::RegexPattern,
     event_webhook::{dispatcher::EventDispatcher, event::Event},
     http_response::{ResponseBody, build_response},

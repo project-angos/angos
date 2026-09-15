@@ -14,8 +14,9 @@ use tokio_util::io::StreamReader;
 use angos_oci::http_range::{ByteWindow, RequestRange};
 use angos_oci::server;
 use angos_oci::{MediaRange, MediaType};
+use angos_oci_client::X_ANGOS_SOURCE_TIMESTAMP;
 
-use crate::{command::server::error::Error, registry_client::X_ANGOS_SOURCE_TIMESTAMP};
+use crate::command::server::error::Error;
 
 /// Set by the web UI to force an inline body instead of a presigned S3
 /// redirect: a browser `fetch` cannot follow the cross-origin redirect (the

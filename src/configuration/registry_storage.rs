@@ -86,10 +86,8 @@ impl ResolvedStorageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        registry::{blob_store, s3_connection::S3ConnectionConfig},
-        secret::Secret,
-    };
+    use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
+    use angos_secret::Secret;
 
     #[test]
     fn test_from_blob_store_fs_copies_paths_and_sync() {

@@ -10,10 +10,10 @@ use crate::{
         config::Config,
         headers::{build_cache_key, build_headers},
     },
-    cache::Cache,
     identity::{Action, ClientIdentity},
     metrics_provider::metrics_provider,
 };
+use angos_cache::Cache;
 
 pub async fn lookup_cached_decision(cache: &Cache, name: &str, cache_key: &str) -> Option<bool> {
     match cache.retrieve::<bool>(cache_key).await {
@@ -164,10 +164,8 @@ impl WebhookAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::lookup_cached_decision;
-    use crate::{
-        cache::{Cache, Config, stub},
-        metrics_provider,
-    };
+    use crate::metrics_provider;
+    use angos_cache::{Cache, Config, stub};
 
     #[tokio::test]
     async fn lookup_cached_decision_unwraps_hit_to_some_value() {

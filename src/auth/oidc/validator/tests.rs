@@ -18,7 +18,6 @@ use crate::{
             issuer_key, validate_oidc_token, verify_jwt_with_header,
         },
     },
-    cache,
     identity::OidcClaims,
     test_fixtures::{
         mocks::{mount_jwks, static_jwks_response},
@@ -77,7 +76,7 @@ async fn test_fetch_jwks_with_explicit_uri() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
 
@@ -121,7 +120,7 @@ async fn test_fetch_jwks_with_discovery() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
 
@@ -158,7 +157,7 @@ async fn test_fetch_jwks_uses_cache() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result1 = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
     assert!(result1.is_ok());
@@ -184,7 +183,7 @@ async fn test_fetch_jwks_http_error() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
 
@@ -218,7 +217,7 @@ async fn test_fetch_oidc_configuration_success() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
@@ -254,7 +253,7 @@ async fn test_fetch_oidc_configuration_uses_cache() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result1 = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
     assert!(result1.is_ok());
@@ -285,7 +284,7 @@ async fn test_fetch_oidc_configuration_issuer_mismatch() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
@@ -321,7 +320,7 @@ async fn test_fetch_oidc_configuration_http_error() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
@@ -347,7 +346,7 @@ async fn test_fetch_jwks_network_error_returns_provider_unavailable() {
         .timeout(Duration::from_millis(200))
         .build()
         .unwrap();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
 
@@ -372,7 +371,7 @@ async fn test_fetch_jwks_silence_is_remembered_for_the_cooldown() {
         ..build_test_provider_config(&url)
     };
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let first = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
     assert!(
@@ -405,7 +404,7 @@ async fn test_fetch_jwks_refusal_is_not_remembered() {
         ..build_test_provider_config(&mock_server.uri())
     };
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     for _ in 0..2 {
         let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
@@ -429,7 +428,7 @@ async fn test_validate_oidc_token_success() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -453,7 +452,7 @@ async fn test_validate_oidc_token_refreshes_jwks_once_when_cached_kid_is_missing
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let stale_jwks = Jwks {
         keys: vec![Jwk::Ec {
             key_use: Some("sig".to_string()),
@@ -503,7 +502,7 @@ async fn unknown_kids_cost_one_jwks_fetch_per_cooldown_not_one_per_request() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let stale_jwks = Jwks {
         keys: vec![Jwk::Ec {
             key_use: Some("sig".to_string()),
@@ -554,7 +553,7 @@ async fn test_validate_oidc_token_returns_unauthorized_when_refreshed_jwks_still
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let stale_jwks = Jwks { keys: Vec::new() };
     cache
         .store(&issuer_key(&provider, "jwks"), &stale_jwks, 3600)
@@ -591,7 +590,7 @@ async fn test_validate_oidc_token_invalid_signature() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -621,7 +620,7 @@ async fn test_validate_oidc_token_rejects_disallowed_algorithm() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -648,7 +647,7 @@ async fn test_validate_oidc_token_accepts_multi_family_algorithm_list() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let claims = validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref())
         .await
@@ -676,7 +675,7 @@ async fn test_validate_oidc_token_expired() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -702,7 +701,7 @@ async fn test_validate_oidc_token_wrong_issuer() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -722,7 +721,7 @@ async fn test_validate_oidc_token_wrong_audience() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -744,7 +743,7 @@ async fn test_validate_oidc_token_missing_audience_is_rejected() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -767,7 +766,7 @@ async fn test_validate_oidc_token_missing_issuer_is_rejected() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -792,7 +791,7 @@ async fn test_validate_oidc_token_missing_kid() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -823,7 +822,7 @@ async fn test_validate_oidc_token_no_audience_validation() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -844,7 +843,7 @@ async fn test_validate_oidc_token_invalid_jwt_format() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let result = validate_oidc_token(
         "test-provider",
@@ -1336,7 +1335,7 @@ async fn the_bearer_token_reaches_an_issuer_that_requires_it() {
     };
 
     let client = Client::new();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     assert!(
         fetch_jwks(&anonymous, &client, cache.as_ref(), true)

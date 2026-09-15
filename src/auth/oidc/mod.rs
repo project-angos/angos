@@ -16,9 +16,9 @@ use crate::{
         AuthMiddleware, AuthResult, Error,
         authorization::{basic_credentials, bearer_token},
     },
-    cache::Cache,
     identity::{ClientIdentity, OidcClaims},
 };
+use angos_cache::Cache;
 
 /// An OIDC provider: the issuer to trust, and how tokens it signed are validated.
 ///
@@ -223,7 +223,6 @@ mod tests {
     use super::*;
     use crate::{
         auth::oidc::validator::tests::{build_test_provider_config, make_token, valid_claims},
-        cache,
         identity::ClientIdentity,
         test_fixtures::{
             mocks::{mount_jwks, static_jwks_response},
@@ -323,7 +322,7 @@ mod tests {
     fn test_oidc_validator_new() {
         let config = build_test_provider_config("https://auth.example.com");
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let client = test_http_client();
         let validator =
             OidcValidator::new("test-provider".to_string(), &config, client.clone(), cache);
@@ -340,7 +339,7 @@ mod tests {
         mount_jwks(&mock_server, static_jwks_response()).await;
 
         let config = build_config(&mock_server.uri());
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
             &config,
@@ -361,7 +360,7 @@ mod tests {
     async fn test_validate_token_invalid() {
         let config = build_config("https://auth.example.com");
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
             &config,
@@ -381,7 +380,7 @@ mod tests {
         mount_jwks(&mock_server, static_jwks_response()).await;
 
         let config = build_config(&mock_server.uri());
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
             &config,
@@ -410,7 +409,7 @@ mod tests {
         mount_jwks(&mock_server, static_jwks_response()).await;
 
         let config = build_config(&mock_server.uri());
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let validator =
             OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
@@ -429,7 +428,7 @@ mod tests {
     async fn test_authenticate_with_basic_auth_non_matching_provider() {
         let config = build_config("https://auth.example.com");
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let validator =
             OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
@@ -447,7 +446,7 @@ mod tests {
     async fn test_authenticate_no_credentials() {
         let config = build_config("https://auth.example.com");
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
             &config,
@@ -469,7 +468,7 @@ mod tests {
     async fn test_authenticate_with_invalid_token() {
         let config = build_config("https://auth.example.com");
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
             &config,
@@ -493,7 +492,7 @@ mod tests {
         mount_jwks(&mock_server, static_jwks_response()).await;
 
         let config = build_config(&mock_server.uri());
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "my-provider".to_string(),
             &config,

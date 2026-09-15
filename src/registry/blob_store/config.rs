@@ -138,7 +138,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::secret::Secret;
+    use angos_secret::Secret;
 
     #[tokio::test]
     async fn fs_backend_builds() {

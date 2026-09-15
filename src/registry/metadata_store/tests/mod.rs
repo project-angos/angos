@@ -17,8 +17,6 @@ use angos_storage::Page;
 use angos_storage::{ObjectStore, s3::Backend as StorageS3Backend};
 
 use crate::{
-    cache::Cache,
-    cache::memory::Backend as CacheMemoryBackend,
     metrics_provider,
     registry::{
         Error, Registry,
@@ -29,6 +27,8 @@ use crate::{
         },
     },
 };
+use angos_cache::Cache;
+use angos_cache::memory::Backend as CacheMemoryBackend;
 
 #[derive(Clone)]
 pub struct TestS3Config {

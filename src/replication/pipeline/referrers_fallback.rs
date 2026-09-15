@@ -16,12 +16,9 @@ use tracing::warn;
 use angos_oci::manifest_accept_types;
 use angos_oci::request::{DeleteManifestRequest, GetManifestRequest, PutManifestRequest};
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, Reference};
+use angos_oci_client::{Error as ClientError, RegistryClient};
 
-use crate::{
-    registry::Error as RegistryError,
-    registry_client::{Error as ClientError, RegistryClient},
-    replication::Error,
-};
+use crate::{registry::Error as RegistryError, replication::Error};
 
 /// Upper bound on each downstream HTTP call inside the referrers-merge
 /// critical section, so a hung downstream cannot hold the per-subject merge

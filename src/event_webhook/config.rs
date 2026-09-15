@@ -1,7 +1,9 @@
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use url::Url;
 
-use crate::{configuration::RegexPattern, event_webhook::event::EventKind, secret::Secret};
+use angos_secret::Secret;
+
+use crate::{configuration::RegexPattern, event_webhook::event::EventKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

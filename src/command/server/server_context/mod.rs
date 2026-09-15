@@ -15,12 +15,12 @@ use angos_oci::{Namespace, namespace_belongs_to};
 
 use crate::{
     auth::{Authenticator, Authorizer, TokenIssuer},
-    cache::Cache,
     command::server::{error::Error, router},
     configuration::{Configuration, TrustedProxy},
     identity::{Action, ClientIdentity, RequestScheme},
     registry::{self, Registry},
 };
+use angos_cache::Cache;
 
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,

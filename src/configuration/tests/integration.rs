@@ -1,7 +1,6 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use crate::{
-    cache,
     configuration::listeners::ClientAuth,
     configuration::{Configuration, Error, ResolvedStorageConfig, ServerConfig},
     policy::AccessMode,
@@ -37,7 +36,7 @@ fn test_load_minimal_config() {
     assert_eq!(server_config.query_timeout.get(), 3600);
     assert_eq!(server_config.query_timeout_grace_period.get(), 60);
 
-    assert_eq!(config.cache, cache::Config::Memory);
+    assert_eq!(config.cache, angos_cache::Config::Memory);
     assert_eq!(
         config.blob_store,
         blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
@@ -259,10 +258,10 @@ fn test_cache_config_redis() {
 
     let config = Configuration::load_from_str(config).unwrap();
     match config.cache {
-        cache::Config::Redis(redis_config) => {
+        angos_cache::Config::Redis(redis_config) => {
             assert_eq!(redis_config.url.expose(), "redis://localhost:6379");
         }
-        cache::Config::Memory => panic!("Expected Redis cache config"),
+        angos_cache::Config::Memory => panic!("Expected Redis cache config"),
     }
 }
 

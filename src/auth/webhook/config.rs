@@ -4,7 +4,9 @@ use reqwest::{RequestBuilder, header::AUTHORIZATION};
 use serde::Deserialize;
 use url::Url;
 
-use crate::{auth::webhook::headers::build_header_name, secret::Secret};
+use angos_secret::Secret;
+
+use crate::auth::webhook::headers::build_header_name;
 
 /// The DTO always parses; [`Config::validate`] runs in
 /// [`WebhookAuthorizer::new`](super::WebhookAuthorizer), the single

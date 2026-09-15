@@ -244,6 +244,7 @@ mod tests {
     use serde_json::json;
 
     use angos_oci::{Namespace, Tag};
+    use angos_oci_client::RegistryClient;
 
     use crate::{
         cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
@@ -266,7 +267,6 @@ mod tests {
             repository_resolver::RepositoryResolver,
             test_utils::{FsTestStack, downstream_client, fs_test_stack},
         },
-        registry_client::RegistryClient,
         replication::{
             REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream, ReplicationJob,
             ReplicationTarget, build_envelope,

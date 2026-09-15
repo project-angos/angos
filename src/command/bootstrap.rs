@@ -7,8 +7,9 @@ use angos_storage::{
     ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
 
+use angos_cache::Cache;
+
 use crate::{
-    cache::{self, Cache},
     configuration::{Configuration, ResolvedStorageConfig},
     event_webhook::{self, dispatcher::EventDispatcher},
     jobs::store::{self as job_store, JobStore},
@@ -27,7 +28,7 @@ pub enum Error {
     #[error("storage backend failed: {0}")]
     StorageBackend(String),
     #[error("failed to initialize cache: {0}")]
-    Cache(#[from] cache::Error),
+    Cache(#[from] angos_cache::Error),
     #[error("failed to initialize repository '{name}': {source}")]
     Repository {
         name: String,
@@ -184,7 +185,6 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        cache,
         command::bootstrap::{Error, repositories},
         command::maintenance::Error as MaintenanceError,
         command::server::Error as ServerError,
@@ -201,7 +201,7 @@ mod tests {
             }),
             ..repository::Config::default()
         };
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let configs = HashMap::from([("test-repo".to_string(), repo_config)]);
         let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
         assert!(result.is_ok());
@@ -211,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn repositories_empty_map_succeeds() {
         let configs = HashMap::new();
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
@@ -240,7 +240,7 @@ mod tests {
                 ..repository::Config::default()
             },
         );
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Overlap(_)));
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn error_into_maintenance_error_cache_variant() {
-        let bootstrap_err: Error = cache::Error::Execution("x".to_string()).into();
+        let bootstrap_err: Error = angos_cache::Error::Execution("x".to_string()).into();
         let maintenance_err: MaintenanceError = bootstrap_err.into();
         assert!(matches!(maintenance_err, MaintenanceError::Cache(_)));
     }

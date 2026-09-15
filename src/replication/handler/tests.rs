@@ -10,10 +10,10 @@ use wiremock::{
 
 use angos_oci::header::DOCKER_CONTENT_DIGEST;
 use angos_oci::{Digest, Namespace, Tag};
+use angos_oci_client::{REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP};
 use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
 use crate::{
-    cache,
     jobs::Queue,
     jobs::store::{Error, JobEnvelope, JobHandler},
     metrics_provider,
@@ -26,7 +26,6 @@ use crate::{
             repository_with_replication, seed_manifest, single_repo_resolver,
         },
     },
-    registry_client::{REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP},
     replication::{
         Error as ReplicationError, REPLICATION_DELETE_MANIFEST_KIND,
         REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
@@ -455,7 +454,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
     let store = object;
     let metadata_store = Arc::new(
         MetadataStore::builder(store.clone())
-            .cache(cache::Config::Memory.to_backend().unwrap())
+            .cache(angos_cache::Config::Memory.to_backend().unwrap())
             .link_cache_ttl(300)
             .build(),
     );

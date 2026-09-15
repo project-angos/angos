@@ -5,7 +5,6 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{info, warn};
 
 use crate::{
-    cache::Cache,
     cache_fill::CacheFillJobHandler,
     command::{bootstrap, server::error::Error},
     configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig},
@@ -23,6 +22,7 @@ use crate::{
     replication::ReplicationJobHandler,
     scan::ScanJobHandler,
 };
+use angos_cache::Cache;
 
 /// A built registry and what the server owns around it: the handle its
 /// queue-depth gauges refresh from when `[global.job_queue]` is configured,
@@ -283,6 +283,7 @@ mod tests {
 
     use angos_oci::header::DOCKER_CONTENT_DIGEST;
     use angos_oci::{Namespace, Tag};
+    use angos_oci_client::RegistryClient;
 
     use super::{InProcessLoops, LoopCounts, spawn_in_process_loops};
     use crate::{
@@ -304,7 +305,6 @@ mod tests {
                 repository_with_replication, seed_manifest, single_repo_resolver,
             },
         },
-        registry_client::RegistryClient,
         replication::REPLICATION_PUSH_MANIFEST_KIND,
     };
 

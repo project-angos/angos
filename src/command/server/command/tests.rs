@@ -8,7 +8,6 @@ use tempfile::TempDir;
 use crate::metrics_provider::init_for_tests;
 use crate::registry::content_discovery::ListCatalogRequest;
 use crate::{
-    cache,
     command::{
         bootstrap,
         server::{
@@ -26,9 +25,9 @@ use crate::{
         repository,
         test_utils::{response_json, test_job_store},
     },
-    secret::Secret,
     test_fixtures::client::test_client_config,
 };
+use angos_secret::Secret;
 
 static CRYPTO_INIT: Once = Once::new();
 
@@ -100,7 +99,7 @@ async fn test_build_repository_with_upstream() {
         }],
         ..repository::Config::default()
     };
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let configs = HashMap::from([("cached-repo".to_string(), repo_config)]);
     let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
 
@@ -121,7 +120,7 @@ async fn test_build_repositories_multiple() {
     configs.insert("repo2".to_string(), repo_config.clone());
     configs.insert("repo3".to_string(), repo_config);
 
-    let cache_config = cache::Config::Memory;
+    let cache_config = angos_cache::Config::Memory;
     let cache = cache_config.to_backend().unwrap();
 
     let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
