@@ -266,10 +266,12 @@ impl RegistryClient {
             .with_connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .with_read_timeout(Duration::from_secs(config.read_timeout_secs))
             .with_server_ca_bundle(config.server_ca_bundle.as_deref())
-            .with_client_certificate((
-                config.mtls.as_ref().map(|m| m.client_certificate.as_path()),
-                config.mtls.as_ref().map(|m| m.client_private_key.as_path()),
-            ))
+            .with_client_certificate(config.mtls.as_ref().map(|m| {
+                (
+                    m.client_certificate.as_path(),
+                    m.client_private_key.as_path(),
+                )
+            }))
             .build()
             .map_err(Error::Initialization)?;
 

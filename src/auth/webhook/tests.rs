@@ -257,10 +257,12 @@ fn build_test_client(config: &Config) -> Result<Client, String> {
         .with_redirect_policy(Policy::none())
         .with_timeout(Duration::from_millis(config.timeout_ms))
         .with_server_ca_bundle(config.server_ca_bundle.as_deref())
-        .with_client_certificate((
-            config.client_certificate_bundle.as_deref(),
-            config.client_private_key.as_deref(),
-        ))
+        .with_client_certificate(
+            config
+                .client_certificate_bundle
+                .as_deref()
+                .zip(config.client_private_key.as_deref()),
+        )
         .build()
 }
 

@@ -14,8 +14,7 @@ use reqwest::{Certificate, Client, ClientBuilder, Identity, redirect::Policy};
 pub struct MtlsClientBuilder {
     builder: ClientBuilder,
     server_ca_bundle: Option<PathBuf>,
-    client_certificate: Option<PathBuf>,
-    client_private_key: Option<PathBuf>,
+    client_identity: Option<(PathBuf, PathBuf)>,
 }
 
 impl Default for MtlsClientBuilder {
@@ -30,8 +29,7 @@ impl MtlsClientBuilder {
         Self {
             builder: Client::builder().use_rustls_tls(),
             server_ca_bundle: None,
-            client_certificate: None,
-            client_private_key: None,
+            client_identity: None,
         }
     }
 
@@ -72,16 +70,12 @@ impl MtlsClientBuilder {
         self
     }
 
-    /// Presents the PEM client certificate and its private key. Both halves are
-    /// required together; passing one without the other yields no identity and a
-    /// build error surfaces only if the files are unreadable.
+    /// Presents the PEM client certificate and its private key, which are
+    /// required together; `None` presents no client identity.
     #[must_use]
-    pub fn with_client_certificate(
-        mut self,
-        (certificate, private_key): (Option<&Path>, Option<&Path>),
-    ) -> Self {
-        self.client_certificate = certificate.map(Path::to_path_buf);
-        self.client_private_key = private_key.map(Path::to_path_buf);
+    pub fn with_client_certificate(mut self, identity: Option<(&Path, &Path)>) -> Self {
+        self.client_identity =
+            identity.map(|(certificate, key)| (certificate.to_path_buf(), key.to_path_buf()));
         self
     }
 
@@ -99,8 +93,9 @@ impl MtlsClientBuilder {
             }
         }
         if let Some(identity) = load_identity(
-            self.client_certificate.as_deref(),
-            self.client_private_key.as_deref(),
+            self.client_identity
+                .as_ref()
+                .map(|(certificate, key)| (certificate.as_path(), key.as_path())),
         )? {
             builder = builder.identity(identity);
         }
@@ -117,11 +112,8 @@ fn load_certificate_bundle(path: &Path) -> Result<Vec<Certificate>, String> {
         .map_err(|e| format!("Failed to parse server CA bundle: {e}"))
 }
 
-fn load_identity(
-    cert_path: Option<&Path>,
-    key_path: Option<&Path>,
-) -> Result<Option<Identity>, String> {
-    let (Some(cert_path), Some(key_path)) = (cert_path, key_path) else {
+fn load_identity(identity: Option<(&Path, &Path)>) -> Result<Option<Identity>, String> {
+    let Some((cert_path, key_path)) = identity else {
         return Ok(None);
     };
 
@@ -251,14 +243,14 @@ mod tests {
         let key_file_path = tmp_dir.path().join("private-key.pem");
         fs::write(&key_file_path, client_key_pem()).unwrap();
 
-        let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
+        let identity = load_identity(Some((cert_file_path.as_path(), key_file_path.as_path())));
         assert!(matches!(identity, Ok(Some(_))));
 
         fs::write(&key_file_path, ca_bundle_pem()).unwrap();
-        let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
+        let identity = load_identity(Some((cert_file_path.as_path(), key_file_path.as_path())));
         assert!(identity.is_err());
 
-        let identity = load_identity(None, None);
+        let identity = load_identity(None);
         assert!(matches!(identity, Ok(None)));
     }
 
@@ -274,7 +266,7 @@ mod tests {
         let key_file_path = tmp_dir.path().join("private-key.pem");
         fs::write(&key_file_path, client_key_pem()).unwrap();
 
-        let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
+        let identity = load_identity(Some((cert_file_path.as_path(), key_file_path.as_path())));
         assert!(
             matches!(identity, Ok(Some(_))),
             "an unterminated certificate must not lose the key: {identity:?}"

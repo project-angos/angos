@@ -328,10 +328,12 @@ fn build_oidc_client(name: &str, config: &oidc::Config) -> Result<Arc<Client>, E
     // provider config (`http_request_timeout_secs`, `jwks_refresh_timeout_secs`).
     MtlsClientBuilder::new()
         .with_server_ca_bundle(config.server_ca_bundle.as_deref())
-        .with_client_certificate((
-            config.client_certificate_bundle.as_deref(),
-            config.client_private_key.as_deref(),
-        ))
+        .with_client_certificate(
+            config
+                .client_certificate_bundle
+                .as_deref()
+                .zip(config.client_private_key.as_deref()),
+        )
         .build()
         .map(Arc::new)
         .map_err(initialization_error)
