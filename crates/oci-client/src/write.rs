@@ -1,6 +1,6 @@
 //! Write methods for [`RegistryClient`].
 //!
-//! Byte-bodied requests reuse [`RegistryClient::send_with_auth_retry`]'s
+//! Byte-bodied requests reuse [`RegistryClient::send_with_auth_retry_capturing`]'s
 //! cached-token-then-single-refresh orchestration. The single-use stream in
 //! [`RegistryClient::patch_upload`] cannot be replayed, so it reuses the auth
 //! header resolved when the session was opened ([`UploadSession::auth`]) and
@@ -24,8 +24,8 @@ use angos_oci::response::{DeleteManifestOutcome, ErrorResponse, PutManifestOutco
 use angos_oci::{Digest, MediaType};
 
 use crate::{
-    Error, REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP, parse_header,
-    without_query,
+    Error, REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP,
+    denied_if_forbidden, parse_header, without_query,
 };
 
 /// An open downstream blob-upload session: the server-assigned continuation
@@ -175,9 +175,7 @@ impl RegistryClient {
                     .to_string(),
             ));
         }
-        if response.status() == StatusCode::FORBIDDEN {
-            return Err(Error::Denied("Access forbidden".to_string()));
-        }
+        denied_if_forbidden(&response)?;
 
         Ok(response)
     }

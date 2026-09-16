@@ -46,6 +46,29 @@ use crate::{
     test_fixtures::client::test_client_config,
 };
 
+/// The content arm of a manifest read. These tests never enable redirects, so
+/// a read always resolves to bytes.
+struct ManifestParts {
+    digest: Digest,
+    media_type: Option<MediaType>,
+    bytes: Vec<u8>,
+}
+
+fn expect_content(read: ManifestGet) -> ManifestParts {
+    match read {
+        ManifestGet::Content {
+            digest,
+            media_type,
+            bytes,
+        } => ManifestParts {
+            digest,
+            media_type,
+            bytes,
+        },
+        ManifestGet::Redirect { .. } => panic!("expected manifest content, got a redirect"),
+    }
+}
+
 const IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
 const CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
 const LAYER_MEDIA_TYPE: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
@@ -229,7 +252,7 @@ async fn an_unconfigured_namespace_round_trips() {
             .unwrap();
 
         let stored = registry
-            .resolve_get_manifest(
+            .get_manifest_served(
                 None,
                 GetManifestRequest {
                     namespace: namespace.clone(),
@@ -239,6 +262,8 @@ async fn an_unconfigured_namespace_round_trips() {
                 false,
             )
             .await
+            .unwrap()
+            .into_response()
             .unwrap();
 
         assert_eq!(response_body(stored).await, content);
@@ -275,8 +300,9 @@ async fn test_put_manifest() {
             )
             .await
             .unwrap();
+        let stored_manifest = expect_content(stored_manifest);
 
-        assert_eq!(stored_manifest.content, content);
+        assert_eq!(stored_manifest.bytes, content);
         assert_eq!(stored_manifest.media_type.unwrap(), media_type);
         assert_eq!(stored_manifest.digest, response.digest);
 
@@ -321,7 +347,9 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
             Cursor::new(content.clone()),
         )
         .await
-        .expect("by-digest push with tag params must succeed");
+        .expect("by-digest push with tag params must succeed")
+        .into_response()
+        .unwrap();
 
     assert_eq!(
         *response_header(&response, &OCI_TAG),
@@ -332,7 +360,7 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
 
     for tag in ["1.2.3", "latest"] {
         let head = registry
-            .head_manifest(
+            .head_manifest_served(
                 None,
                 HeadManifestRequest {
                     namespace: namespace.clone(),
@@ -341,7 +369,9 @@ async fn accept_put_manifest_by_sha512_digest_with_tag_params_creates_tags() {
                 },
             )
             .await
-            .expect("each created tag must resolve");
+            .expect("each created tag must resolve")
+            .into_response()
+            .unwrap();
         assert_eq!(
             response_digest(&head),
             digest,
@@ -372,7 +402,9 @@ async fn accept_put_manifest_by_tag_ignores_tag_params() {
             Cursor::new(content.clone()),
         )
         .await
-        .expect("by-tag push must succeed");
+        .expect("by-tag push must succeed")
+        .into_response()
+        .unwrap();
 
     assert!(
         !response.headers().contains_key(&OCI_TAG),
@@ -380,7 +412,7 @@ async fn accept_put_manifest_by_tag_ignores_tag_params() {
     );
 
     let ignored = registry
-        .head_manifest(
+        .head_manifest_served(
             None,
             HeadManifestRequest {
                 namespace: namespace.clone(),
@@ -540,8 +572,7 @@ async fn put_manifest_rejects_a_foreign_schema_version() {
             &body,
         )
         .await
-        .err()
-        .expect("a schemaVersion other than 2 must not be stored");
+        .expect_err("a schemaVersion other than 2 must not be stored");
 
     let Error::ManifestInvalid(message) = error else {
         panic!("expected ManifestInvalid, got {error:?}");
@@ -877,8 +908,9 @@ async fn pull_through_computes_the_digest_when_the_upstream_omits_the_header() {
         )
         .await
         .expect("an upstream omitting Docker-Content-Digest must not fail the pull");
+    let manifest = expect_content(manifest);
 
-    assert_eq!(manifest.content, content);
+    assert_eq!(manifest.bytes, content);
     assert_eq!(
         manifest.digest,
         Digest::sha256_of_bytes(&content),
@@ -1012,6 +1044,7 @@ async fn pull_through_recomputes_under_the_requested_digest_algorithm() {
         )
         .await
         .expect("a by-digest pull must survive a missing Docker-Content-Digest");
+    let manifest = expect_content(manifest);
 
     assert_eq!(
         manifest.digest, requested,
@@ -1128,8 +1161,7 @@ async fn a_backend_fault_is_not_reported_as_a_missing_manifest() {
             "test-client",
         )
         .await
-        .err()
-        .expect("a failing metadata store must not read as a successful lookup");
+        .expect_err("a failing metadata store must not read as a successful lookup");
 
     assert!(
         !matches!(error, Error::ManifestUnknown),
@@ -1166,8 +1198,9 @@ async fn test_get_manifest() {
             )
             .await
             .unwrap();
+        let manifest = expect_content(manifest);
 
-        assert_eq!(manifest.content, content);
+        assert_eq!(manifest.bytes, content);
         assert_eq!(manifest.media_type.unwrap(), media_type);
         assert_eq!(manifest.digest, response.digest.clone());
 
@@ -1182,8 +1215,9 @@ async fn test_get_manifest() {
             )
             .await
             .unwrap();
+        let manifest = expect_content(manifest);
 
-        assert_eq!(manifest.content, content);
+        assert_eq!(manifest.bytes, content);
         assert_eq!(manifest.media_type.unwrap(), media_type);
         assert_eq!(manifest.digest, response.digest.clone());
     })
@@ -1210,7 +1244,7 @@ async fn test_head_manifest() {
         let pushed_digest = response.digest.clone();
 
         let manifest = registry
-            .head_manifest(
+            .head_manifest_served(
                 None,
                 HeadManifestRequest {
                     namespace: namespace.clone(),
@@ -1219,6 +1253,8 @@ async fn test_head_manifest() {
                 },
             )
             .await
+            .unwrap()
+            .into_response()
             .unwrap();
 
         assert_eq!(
@@ -1232,7 +1268,7 @@ async fn test_head_manifest() {
         );
 
         let manifest = registry
-            .head_manifest(
+            .head_manifest_served(
                 None,
                 HeadManifestRequest {
                     namespace: namespace.clone(),
@@ -1241,6 +1277,8 @@ async fn test_head_manifest() {
                 },
             )
             .await
+            .unwrap()
+            .into_response()
             .unwrap();
 
         assert_eq!(
@@ -1312,7 +1350,7 @@ async fn a_served_request_records_exactly_one_pull() {
     assert_eq!(stamps.load(Ordering::SeqCst), 0, "a push is not a pull");
 
     registry
-        .resolve_get_manifest(
+        .get_manifest_served(
             None,
             GetManifestRequest {
                 namespace: namespace.clone(),
@@ -1322,11 +1360,13 @@ async fn a_served_request_records_exactly_one_pull() {
             true,
         )
         .await
+        .unwrap()
+        .into_response()
         .unwrap();
     assert_eq!(stamps.load(Ordering::SeqCst), 1, "one GET records one pull");
 
     registry
-        .head_manifest(
+        .head_manifest_served(
             None,
             HeadManifestRequest {
                 namespace: namespace.clone(),
@@ -1335,6 +1375,8 @@ async fn a_served_request_records_exactly_one_pull() {
             },
         )
         .await
+        .unwrap()
+        .into_response()
         .unwrap();
     assert_eq!(
         stamps.load(Ordering::SeqCst),
@@ -1782,8 +1824,7 @@ async fn test_malformed_json_yields_same_error_shape() {
             malformed,
         )
         .await
-        .err()
-        .expect("expected Err from put_manifest");
+        .expect_err("expected Err from put_manifest");
     match put_err {
         crate::registry::Error::ManifestInvalid(s) => {
             assert!(
@@ -1812,8 +1853,7 @@ async fn put_manifest_media_type_mismatch_returns_manifest_invalid() {
             &content,
         )
         .await
-        .err()
-        .expect("expected error on media type mismatch");
+        .expect_err("expected error on media type mismatch");
     assert!(
         matches!(err, Error::ManifestInvalid(_)),
         "expected ManifestInvalid for media type mismatch, got: {err:?}"
@@ -1943,7 +1983,7 @@ async fn test_handle_get_manifest() {
             .unwrap();
 
         let response = registry
-            .resolve_get_manifest(
+            .get_manifest_served(
                 None,
                 GetManifestRequest {
                     namespace: namespace.clone(),
@@ -1953,6 +1993,8 @@ async fn test_handle_get_manifest() {
                 true,
             )
             .await
+            .unwrap()
+            .into_response()
             .unwrap();
 
         // Inline or redirect, the response names the same manifest and type.
@@ -1990,7 +2032,9 @@ async fn test_handle_put_manifest() {
                 manifest_stream,
             )
             .await
-            .expect("put manifest failed");
+            .expect("put manifest failed")
+            .into_response()
+            .unwrap();
 
         assert_eq!(
             *response_header(&response, &LOCATION),
@@ -2011,8 +2055,9 @@ async fn test_handle_put_manifest() {
             )
             .await
             .expect("get manifest failed");
+        let stored_manifest = expect_content(stored_manifest);
 
-        assert_eq!(stored_manifest.content, content);
+        assert_eq!(stored_manifest.bytes, content);
         assert_eq!(stored_manifest.media_type.unwrap(), media_type);
         assert_eq!(stored_manifest.digest, response_digest(&response));
     })
@@ -4565,7 +4610,9 @@ async fn backdated_source_ts_loses_to_newer_local_tag() {
             Cursor::new(manifest_b),
         )
         .await
-        .expect("seeding the newer local tag must succeed");
+        .expect("seeding the newer local tag must succeed")
+        .into_response()
+        .unwrap();
     let kept_digest = response_digest(&seeded);
 
     let result = registry
@@ -4590,7 +4637,7 @@ async fn backdated_source_ts_loses_to_newer_local_tag() {
     // Kill criterion: the tag must still point at the manifest seeded above. If
     // the source_ts were dropped, the backdated put would have overwritten it.
     let head = registry
-        .head_manifest(
+        .head_manifest_served(
             None,
             HeadManifestRequest {
                 namespace: namespace.clone(),
@@ -4599,7 +4646,9 @@ async fn backdated_source_ts_loses_to_newer_local_tag() {
             },
         )
         .await
-        .expect("tag must still resolve");
+        .expect("tag must still resolve")
+        .into_response()
+        .unwrap();
     assert_eq!(
         response_digest(&head),
         kept_digest,
@@ -4715,7 +4764,10 @@ async fn an_excluded_tag_remains_writable() {
         )
         .await;
 
-    let response = response.expect("an excluded tag must stay writable");
+    let response = response
+        .expect("an excluded tag must stay writable")
+        .into_response()
+        .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(
         *response_header(&response, &LOCATION),

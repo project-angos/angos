@@ -214,7 +214,9 @@ async fn digest_push_suppresses_tag_create_event() {
             Cursor::new(manifest_bytes.clone()),
         )
         .await
-        .expect("seed push");
+        .expect("seed push")
+        .into_response()
+        .unwrap();
     let seed_event_count = received_events(&server).await.len();
 
     let digest = response_digest(&tag_response);
@@ -323,7 +325,9 @@ async fn digest_delete_suppresses_tag_delete_event() {
             Cursor::new(manifest_bytes),
         )
         .await
-        .expect("put manifest");
+        .expect("put manifest")
+        .into_response()
+        .unwrap();
     let push_event_count = received_events(&server).await.len();
 
     let digest = response_digest(&push);
@@ -586,6 +590,8 @@ async fn mount_emits_blob_push_event() {
             Some(source.clone()),
         )
         .await
+        .unwrap()
+        .into_response()
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -627,6 +633,8 @@ async fn mount_fallback_still_emits_intent_event() {
             Some(source.clone()),
         )
         .await
+        .unwrap()
+        .into_response()
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -951,7 +959,9 @@ async fn get_blob_emits_pull_event() {
             true,
         )
         .await
-        .expect("the pull must succeed");
+        .expect("the pull must succeed")
+        .into_response(fixture.registry.blob_stream_frame_size())
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let events = received_events(&server).await;
@@ -987,12 +997,14 @@ async fn get_manifest_emits_pull_event() {
             Cursor::new(manifest_bytes),
         )
         .await
-        .expect("seeding the manifest must succeed");
+        .expect("seeding the manifest must succeed")
+        .into_response()
+        .unwrap();
     let digest = response_digest(&seeded);
 
     let response = fixture
         .registry
-        .resolve_get_manifest(
+        .get_manifest_served(
             None,
             GetManifestRequest {
                 namespace: namespace.clone(),
@@ -1002,7 +1014,9 @@ async fn get_manifest_emits_pull_event() {
             true,
         )
         .await
-        .expect("the pull must succeed");
+        .expect("the pull must succeed")
+        .into_response()
+        .unwrap();
 
     let events = received_events(&server).await;
     assert_eq!(events.len(), 1, "exactly one pull event must be posted");

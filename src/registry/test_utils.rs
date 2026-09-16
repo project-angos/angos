@@ -24,8 +24,8 @@ use angos_secret::Secret;
 use angos_storage::{
     ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
+use angos_transport::ResponseBody;
 
-use crate::http_response::ResponseBody;
 use crate::registry::keys::DigestKeys;
 use crate::{
     configuration::{GlobalConfig, RegexPattern},
@@ -290,7 +290,7 @@ pub async fn get_blob(
         .metadata_store()
         .can_read(namespace, digest)
         .await?;
-    registry
+    Ok(registry
         .get_blob_with_access(
             Some(repository),
             accepted_types,
@@ -299,7 +299,8 @@ pub async fn get_blob(
             range,
             has_access,
         )
-        .await
+        .await?
+        .into_response(registry.blob_stream_frame_size())?)
 }
 
 pub async fn create_test_blob(

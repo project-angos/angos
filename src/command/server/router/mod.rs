@@ -1,80 +1,89 @@
-use std::{collections::BTreeSet, str::FromStr};
-
 use hyper::{Method, Uri};
-use serde::{Deserialize, de::DeserializeOwned};
 
-use angos_oci::path::{API_PREFIX, TAGS_LIST, UPLOADS};
-use angos_oci::server;
-use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, Tag, UploadSessionId};
+use angos_docker_extension_service::{Endpoint as DockerEndpoint, parse as parse_docker};
+use angos_extension_service::{Endpoint as AngosEndpoint, parse as parse_angos};
+use angos_oci::Namespace;
+use angos_oci::path::API_PREFIX;
+use angos_oci_service::{Endpoint as OciEndpoint, parse as parse_oci};
 
-use crate::{
-    identity::{Action, ManifestPutTarget},
-    jobs::{JobState, Queue},
-};
+use crate::{identity::Action, jobs};
 
 /// The token service's endpoint. Shared with the dispatcher, which answers a
 /// method this route does not serve rather than letting it fall through to the
 /// catch-all.
 pub const TOKEN_PATH: &str = "/token";
 
-/// Angos's extension name and the two forms it is reached under. The spec fixes
-/// the `_<extension>` shape; the name itself is ours.
-const EXTENSION: &str = "_angos/";
-const REPOSITORY_EXTENSION: &str = "/_angos/";
+/// The `_angos/` path the host's UI reads its configuration from. Served by the
+/// binary, not by any service crate, so it is matched here before the extension
+/// parser is consulted.
+const UI_CONFIG_PATH: &str = "/v2/_angos/ui/config";
 
-/// Deserializes a query string, returning `None` when a value fails to
-/// deserialize so the caller can reject the route. An absent query is an empty
-/// one, so every field takes its default.
-fn parse_query<T: DeserializeOwned>(params: Option<&str>) -> Option<T> {
-    serde_html_form::from_str(params.unwrap_or_default()).ok()
+/// A parsed request: an operation of one of the service surfaces
+/// ([`Route::Oci`], [`Route::Docker`], [`Route::Angos`]), or one of the routes
+/// the binary itself serves (health, metrics, token, UI). Each surface's crate
+/// owns the parsing of its own paths; this only sequences them and adds the
+/// binary's own routes.
+#[derive(Clone, Debug)]
+pub enum Route {
+    /// A static UI asset by path.
+    UiAsset {
+        path: String,
+    },
+    /// The UI's runtime configuration document.
+    UiConfig,
+    /// The bearer-token service.
+    Token,
+    Healthz,
+    Readyz,
+    Metrics,
+    /// An OCI Distribution operation.
+    Oci(OciEndpoint),
+    /// A Docker V2 extension operation (the catalog).
+    Docker(DockerEndpoint),
+    /// An `_angos/` extension operation.
+    Angos(AngosEndpoint),
 }
 
-/// Parses the HTTP method and URI into a registry `Action`.
+/// Parses the HTTP method and URI into a [`Route`].
 ///
-/// Returns `None` for paths that do not match any known route. Callers should
-/// return 404 for `None` without running authentication or authorization.
-pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
+/// Returns `None` for paths that match no known route; callers should return a
+/// `404` for `None` without running authentication or authorization. Each
+/// service surface is tried in turn; a path one surface declines is offered to
+/// the next, and only a path under `/v2` that every surface declines (or a
+/// non-GET UI path) is a miss rather than a UI asset.
+pub fn parse(method: &Method, uri: &Uri) -> Option<Route> {
     let path = uri.path();
-    let params = uri.query();
+    let query = uri.query();
 
     match path {
-        // Matched for every method: guarded by `if method == GET` a HEAD would
-        // fall through to the UI-asset arm below and answer `index.html` with a
-        // 200, so a probe reads a replica as healthy while `/readyz` is
-        // answering 503.
-        "/healthz" => return (method == Method::GET).then_some(Action::Healthz),
-        "/readyz" => return (method == Method::GET).then_some(Action::Readyz),
-        "/metrics" => return (method == Method::GET).then_some(Action::Metrics),
-        TOKEN_PATH => return (method == Method::GET).then_some(Action::Token),
-        // HEAD as well as GET: the version check is the OCI conformance probe,
-        // and without this it falls through to the UI-asset arm below and
-        // answers with `index.html`.
-        "/v2/" if method == Method::GET || method == Method::HEAD => {
-            return Some(Action::ApiVersion);
-        }
-        // end-1 is `/v2/`; the same path without its slash is not the version
-        // endpoint, and must not reach the UI-asset arm below either.
-        "/v2" => return None,
-        // A Docker Registry V2 endpoint the OCI spec does not define. It keeps
-        // its long-standing path, which clients already call.
-        "/v2/_catalog" if method == Method::GET => {
-            let PaginationQuery { n, last } = parse_query(params)?;
-            return Some(Action::ListCatalog { n, last });
-        }
+        // Guarded by GET so a HEAD does not fall through to the UI-asset arm
+        // and answer `index.html` with a 200 while `/readyz` answers 503.
+        "/healthz" => return (method == Method::GET).then_some(Route::Healthz),
+        "/readyz" => return (method == Method::GET).then_some(Route::Readyz),
+        "/metrics" => return (method == Method::GET).then_some(Route::Metrics),
+        TOKEN_PATH => return (method == Method::GET).then_some(Route::Token),
+        UI_CONFIG_PATH if method == Method::GET => return Some(Route::UiConfig),
         _ => {}
     }
 
-    if let Some(api_path) = path.strip_prefix(API_PREFIX) {
-        return try_parse_extension(method, api_path, params)
-            .or_else(|| try_parse_upload(method, api_path, params))
-            .or_else(|| try_find_blobs(method, api_path))
-            .or_else(|| try_find_manifests(method, api_path, params))
-            .or_else(|| try_find_referrers(method, api_path, params))
-            .or_else(|| try_find_tags(method, api_path, params));
+    if let Some(endpoint) = parse_oci(method, path, query) {
+        return Some(Route::Oci(endpoint));
+    }
+    if let Some(endpoint) = parse_docker(method, path, query) {
+        return Some(Route::Docker(endpoint));
+    }
+    if let Some(endpoint) = parse_angos(method, path, query) {
+        return Some(Route::Angos(endpoint));
+    }
+
+    // Anything under the API prefix that no surface claimed is a miss, not a UI
+    // asset: `/v2` without its slash, and any unmatched `/v2/...` path.
+    if path == "/v2" || path.starts_with(API_PREFIX) {
+        return None;
     }
 
     if method == Method::GET || method == Method::HEAD {
-        return Some(Action::UiAsset {
+        return Some(Route::UiAsset {
             path: path.to_string(),
         });
     }
@@ -82,382 +91,223 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
     None
 }
 
-/// The proxy `ns` parameter: the registry namespace a mirroring client believes
-/// it is addressing. Parsed here with every other query value; resolving it to a
-/// repository needs the configuration and happens at the server context.
-#[derive(Deserialize, Default)]
-struct NamespaceQuery {
-    ns: Option<String>,
-}
-
-/// The `?ns=` a request names, if any.
-pub fn proxy_namespace(uri: &Uri) -> Option<String> {
-    parse_query::<NamespaceQuery>(uri.query())?
-        .ns
-        .filter(|ns| !ns.is_empty())
-}
-
-#[derive(Deserialize, Default)]
-struct DigestQuery {
-    digest: Option<Digest>,
-}
-
-fn digest_from_params(params: Option<&str>) -> Option<Digest> {
-    parse_query::<DigestQuery>(params)?.digest
-}
-
-/// Repeated `tag` query parameters for the distribution-spec tag-on-push
-/// feature. Each value deserializes through `Tag`, so an invalid tag fails the
-/// parse and rejects the route. The `BTreeSet` drops duplicate values so a
-/// repeated tag is linked, echoed in `OCI-Tag`, and event-emitted only once.
-#[derive(Deserialize, Default)]
-struct TagQuery {
-    #[serde(default)]
-    tag: BTreeSet<Tag>,
-}
-
-#[derive(Deserialize, Default)]
-struct MountQuery {
-    mount: Option<Digest>,
-    from: Option<Namespace>,
-    digest: Option<Digest>,
-    /// The algorithm the client will close the upload with, so a chunked
-    /// session hashes under that one alone instead of every supported one.
-    #[serde(rename = "digest-algorithm")]
-    digest_algorithm: Option<Algorithm>,
-}
-
-/// The referrers `?artifactType=` filter. The value is a media type per the
-/// image spec, so it deserializes through [`MediaType`] and a malformed one
-/// rejects the route instead of silently filtering nothing.
-#[derive(Deserialize, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-struct ArtifactTypeQuery {
-    artifact_type: Option<MediaType>,
-}
-
-#[derive(Deserialize, Default)]
-struct PaginationQuery {
-    n: Option<u16>,
-    last: Option<String>,
-}
-
-/// The cursor alone, for the referrers listing: the spec pages it through the
-/// `Link` header and defines no page size, so `?n=` is not part of it.
-#[derive(Deserialize)]
-struct CursorQuery {
-    last: Option<String>,
-}
-
-/// The angos repository whose namespaces are listed. A repository is angos's
-/// own grouping, not an OCI name, so it cannot sit in the `<name>` slot of the
-/// path without claiming a scoping the registry does not have.
-#[derive(Deserialize)]
-struct NamespacesQuery {
-    repository: Namespace,
-}
-
-#[derive(Deserialize)]
-struct JobsQuery {
-    n: Option<u16>,
-    after: Option<String>,
-    #[serde(default = "default_jobs_queue")]
-    queue: Queue,
-    /// The job a retry or a delete addresses. An extension path ends at its
-    /// module, so the storage key rides in the query rather than the path.
-    key: Option<String>,
-}
-
-fn default_jobs_queue() -> Queue {
-    Queue::Cache
-}
-
-/// Angos's own endpoints, under the extension namespace the distribution spec
-/// reserves: `_<extension>/<component>/<module>` for the registry and
-/// `<name>/_<extension>/<component>/<module>` for one repository. `api_path` is
-/// the path after the API prefix.
-/// REF: <https://github.com/opencontainers/distribution-spec/blob/main/extensions/README.md>
-fn try_parse_extension(method: &Method, api_path: &str, params: Option<&str>) -> Option<Action> {
-    if let Some(rest) = api_path.strip_prefix(EXTENSION) {
-        return registry_extension(method, rest, params);
+impl Route {
+    /// The metrics label for this route: the binary's own routes named here,
+    /// each service surface named by the crate that owns it.
+    #[must_use]
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Route::UiAsset { .. } => "ui-asset",
+            Route::UiConfig => "ui-config",
+            Route::Token => "get-token",
+            Route::Healthz => "healthz",
+            Route::Readyz => "readyz",
+            Route::Metrics => "metrics",
+            Route::Oci(endpoint) => endpoint.endpoint_name(),
+            Route::Docker(endpoint) => endpoint.endpoint_name(),
+            Route::Angos(endpoint) => endpoint.endpoint_name(),
+        }
     }
 
-    // The marker is a whole path segment, so a namespace may hold the name.
-    let (namespace, rest) = api_path.split_once(REPOSITORY_EXTENSION)?;
-
-    repository_extension(method, Namespace::new(namespace).ok()?, rest, params)
-}
-
-/// `_angos/<component>/<module>`: what the registry as a whole answers. The
-/// path ends at the module, so a mutation names its job in `?key=`.
-fn registry_extension(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    match *method {
-        Method::GET => match path {
-            "ui/config" => Some(Action::UiConfig),
-            "repositories/list" => Some(Action::ListRepositories),
-            "namespaces/list" => {
-                let NamespacesQuery { repository } = parse_query(params)?;
-                Some(Action::ListNamespaces { repository })
-            }
-            "jobs/list" => {
-                let JobsQuery {
-                    n, after, queue, ..
-                } = parse_query(params)?;
-                Some(Action::ListJobs { queue, n, after })
-            }
-            "jobs/failed" => {
-                let JobsQuery {
-                    n, after, queue, ..
-                } = parse_query(params)?;
-                Some(Action::ListFailedJobs { queue, n, after })
-            }
+    /// The namespace a pull addresses, mutably, so the proxy `?ns=` parameter
+    /// can resolve it to the mirroring repository before authorization reads
+    /// it. `None` for everything else: a write naming `?ns=` is left addressing
+    /// the namespace it spelled out.
+    pub fn pull_namespace_mut(&mut self) -> Option<&mut Namespace> {
+        match self {
+            Route::Oci(
+                OciEndpoint::GetBlob { namespace, .. }
+                | OciEndpoint::HeadBlob { namespace, .. }
+                | OciEndpoint::GetManifest { namespace, .. }
+                | OciEndpoint::HeadManifest { namespace, .. }
+                | OciEndpoint::ListTags { namespace, .. }
+                | OciEndpoint::GetReferrers { namespace, .. },
+            ) => Some(namespace),
             _ => None,
-        },
-        Method::POST if path == "jobs/failed" => {
-            let JobsQuery { queue, key, .. } = parse_query(params)?;
-            Some(Action::RetryJob {
-                queue,
-                storage_key: key.filter(|key| is_job_key(key))?,
-            })
         }
-        Method::DELETE => {
-            let state = match path {
-                "jobs/failed" => JobState::Failed,
-                "jobs/pending" => JobState::Pending,
-                _ => return None,
-            };
-            let JobsQuery { queue, key, .. } = parse_query(params)?;
-            Some(Action::DeleteJob {
-                queue,
-                state,
-                storage_key: key.filter(|key| is_job_key(key))?,
-            })
-        }
-        _ => None,
     }
 }
 
-/// `<name>/_angos/<component>/<module>`: what one namespace answers, `<name>`
-/// being the OCI repository name.
-fn repository_extension(
-    method: &Method,
-    namespace: Namespace,
-    path: &str,
-    params: Option<&str>,
-) -> Option<Action> {
-    if *method != Method::GET {
-        return None;
-    }
+impl From<&Route> for Action {
+    #[allow(clippy::too_many_lines)]
+    fn from(route: &Route) -> Self {
+        match route {
+            Route::UiAsset { path } => Action::UiAsset { path: path.clone() },
+            Route::UiConfig => Action::UiConfig,
+            Route::Token => Action::Token,
+            Route::Healthz => Action::Healthz,
+            Route::Readyz => Action::Readyz,
+            Route::Metrics => Action::Metrics,
 
-    // `layers/<digest>/entries` and `layers/<digest>/file?path=`.
-    if let Some(rest) = path.strip_prefix("layers/") {
-        let (digest, module) = rest.split_once('/')?;
-        let digest: Digest = digest.parse().ok()?;
-        return match module {
-            "entries" => Some(Action::ListLayerEntries { namespace, digest }),
-            "file" => {
-                let LayerFileQuery { path, download } = parse_query(params)?;
-                Some(Action::GetLayerFile {
+            Route::Oci(endpoint) => match endpoint {
+                OciEndpoint::CheckVersion => Action::ApiVersion,
+                OciEndpoint::GetManifest {
+                    namespace,
+                    reference,
+                } => Action::GetManifest {
+                    namespace: namespace.clone(),
+                    reference: reference.clone(),
+                },
+                OciEndpoint::HeadManifest {
+                    namespace,
+                    reference,
+                } => Action::HeadManifest {
+                    namespace: namespace.clone(),
+                    reference: reference.clone(),
+                },
+                OciEndpoint::PutManifest { namespace, target } => Action::PutManifest {
+                    namespace: namespace.clone(),
+                    target: target.clone(),
+                },
+                OciEndpoint::DeleteManifest {
+                    namespace,
+                    reference,
+                } => Action::DeleteManifest {
+                    namespace: namespace.clone(),
+                    reference: reference.clone(),
+                },
+                OciEndpoint::GetBlob { namespace, digest } => Action::GetBlob {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                },
+                OciEndpoint::HeadBlob { namespace, digest } => Action::HeadBlob {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                },
+                OciEndpoint::DeleteBlob { namespace, digest } => Action::DeleteBlob {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                },
+                OciEndpoint::StartUpload {
                     namespace,
                     digest,
-                    path: path?,
-                    download: download.is_some(),
-                })
-            }
-            _ => None,
-        };
-    }
-
-    match path {
-        "revisions/list" => Some(Action::ListRevisions { namespace }),
-        "uploads/list" => Some(Action::ListUploads { namespace }),
-        "pulls/list" => Some(Action::ListPulls {
-            namespace,
-            reference: parse_pulls_reference(params)?,
-        }),
-        _ => None,
-    }
-}
-
-/// A file in a layer: `?path=` names it, a `download` parameter, whatever its
-/// value, asks for it as an attachment.
-#[derive(Deserialize)]
-struct LayerFileQuery {
-    path: Option<String>,
-    download: Option<String>,
-}
-
-/// The pull-history target, named by exactly one of `?tag=` or `?digest=`.
-#[derive(Deserialize)]
-struct PullsQuery {
-    tag: Option<Tag>,
-    digest: Option<Digest>,
-}
-
-/// Parses `?tag=`/`?digest=` strictly: an unparseable or ambiguous target is
-/// refused rather than silently narrowed to one of the two.
-fn parse_pulls_reference(params: Option<&str>) -> Option<Reference> {
-    let PullsQuery { tag, digest } = parse_query(params)?;
-    match (tag, digest) {
-        (Some(tag), None) => Some(Reference::Tag(tag)),
-        (None, Some(digest)) => Some(Reference::Digest(digest)),
-        _ => None,
-    }
-}
-
-/// The job a mutation addresses. A storage key is one path-free token
-/// (`<hex-millis>-<uuid>`), so one holding a `/` is refused.
-fn is_job_key(key: &str) -> bool {
-    !key.is_empty() && !key.contains('/')
-}
-
-fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    if let Some(namespace_str) = server::split_uploads_start_path(path) {
-        let namespace = Namespace::new(namespace_str).ok()?;
-
-        if *method != Method::POST {
-            return None;
-        }
-        // The OCI fall-back-to-session rule covers unsatisfiable mounts, not
-        // syntactically invalid ones, so a malformed query is a 400.
-        let query: MountQuery = parse_query(params)?;
-
-        if let Some(digest) = query.mount {
-            return Some(Action::MountBlob {
-                namespace,
-                digest,
-                from: query.from,
-            });
-        }
-
-        return Some(Action::StartUpload {
-            namespace,
-            digest: query.digest,
-            digest_algorithm: query.digest_algorithm,
-        });
-    }
-
-    let (namespace_str, session_id) = path.rsplit_once(UPLOADS)?;
-    let namespace = Namespace::new(namespace_str).ok()?;
-    let session_id = UploadSessionId::from_str(session_id).ok()?;
-
-    match *method {
-        Method::GET => Some(Action::GetUpload {
-            namespace,
-            session_id,
-        }),
-        Method::PATCH => Some(Action::PatchUpload {
-            namespace,
-            session_id,
-        }),
-        Method::PUT => {
-            let digest = digest_from_params(params)?;
-            Some(Action::PutUpload {
-                namespace,
-                session_id,
-                digest,
-            })
-        }
-        Method::DELETE => Some(Action::DeleteUpload {
-            namespace,
-            session_id,
-        }),
-        _ => None,
-    }
-}
-
-fn try_find_blobs(method: &Method, path: &str) -> Option<Action> {
-    let (namespace_str, digest) = server::split_blob_path(path)?;
-    let namespace = Namespace::new(namespace_str).ok()?;
-    let digest = Digest::from_str(digest).ok()?;
-
-    match *method {
-        Method::GET => Some(Action::GetBlob { namespace, digest }),
-        Method::HEAD => Some(Action::HeadBlob { namespace, digest }),
-        Method::DELETE => Some(Action::DeleteBlob { namespace, digest }),
-        _ => None,
-    }
-}
-
-fn try_find_manifests(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    let (namespace_str, reference) = server::split_manifest_path(path)?;
-    let namespace = Namespace::new(namespace_str).ok()?;
-    let reference = Reference::from_str(reference).ok()?;
-
-    match *method {
-        Method::GET => Some(Action::GetManifest {
-            namespace,
-            reference,
-        }),
-        Method::HEAD => Some(Action::HeadManifest {
-            namespace,
-            reference,
-        }),
-        Method::PUT => {
-            // `?tag=` applies only to a by-digest push; a by-tag push ignores it.
-            // Strict parse: a single invalid tag rejects the PUT (generic 400)
-            // rather than silently dropping every requested tag.
-            let target = match reference {
-                Reference::Tag(tag) => ManifestPutTarget::Tag(tag),
-                Reference::Digest(digest) => ManifestPutTarget::Digest {
-                    digest,
-                    tags: parse_query::<TagQuery>(params)?.tag.into_iter().collect(),
+                    digest_algorithm,
+                } => Action::StartUpload {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                    digest_algorithm: *digest_algorithm,
                 },
-            };
-            Some(Action::PutManifest { namespace, target })
+                OciEndpoint::MountBlob {
+                    namespace,
+                    digest,
+                    from,
+                } => Action::MountBlob {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                    from: from.clone(),
+                },
+                OciEndpoint::GetUpload {
+                    namespace,
+                    session_id,
+                } => Action::GetUpload {
+                    namespace: namespace.clone(),
+                    session_id: session_id.clone(),
+                },
+                OciEndpoint::PatchUpload {
+                    namespace,
+                    session_id,
+                } => Action::PatchUpload {
+                    namespace: namespace.clone(),
+                    session_id: session_id.clone(),
+                },
+                OciEndpoint::PutUpload {
+                    namespace,
+                    session_id,
+                    digest,
+                } => Action::PutUpload {
+                    namespace: namespace.clone(),
+                    session_id: session_id.clone(),
+                    digest: digest.clone(),
+                },
+                OciEndpoint::DeleteUpload {
+                    namespace,
+                    session_id,
+                } => Action::DeleteUpload {
+                    namespace: namespace.clone(),
+                    session_id: session_id.clone(),
+                },
+                OciEndpoint::ListTags { namespace, n, last } => Action::ListTags {
+                    namespace: namespace.clone(),
+                    n: *n,
+                    last: last.clone(),
+                },
+                OciEndpoint::GetReferrers {
+                    namespace,
+                    digest,
+                    artifact_type,
+                    last,
+                } => Action::GetReferrer {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                    artifact_type: artifact_type.clone(),
+                    last: last.clone(),
+                },
+            },
+
+            Route::Docker(DockerEndpoint::ListCatalog { n, last }) => Action::ListCatalog {
+                n: *n,
+                last: last.clone(),
+            },
+
+            Route::Angos(endpoint) => match endpoint {
+                AngosEndpoint::ListRepositories => Action::ListRepositories,
+                AngosEndpoint::ListNamespaces { repository } => Action::ListNamespaces {
+                    repository: repository.clone(),
+                },
+                AngosEndpoint::ListRevisions { namespace } => Action::ListRevisions {
+                    namespace: namespace.clone(),
+                },
+                AngosEndpoint::ListUploads { namespace } => Action::ListUploads {
+                    namespace: namespace.clone(),
+                },
+                AngosEndpoint::ListPulls {
+                    namespace,
+                    reference,
+                } => Action::ListPulls {
+                    namespace: namespace.clone(),
+                    reference: reference.clone(),
+                },
+                AngosEndpoint::ListLayerEntries { namespace, digest } => Action::ListLayerEntries {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                },
+                AngosEndpoint::GetLayerFile {
+                    namespace,
+                    digest,
+                    path,
+                    download,
+                } => Action::GetLayerFile {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                    path: path.clone(),
+                    download: *download,
+                },
+                AngosEndpoint::ListJobs { queue, n, after } => Action::ListJobs {
+                    queue: jobs::Queue::from(*queue),
+                    n: *n,
+                    after: after.clone(),
+                },
+                AngosEndpoint::ListFailedJobs { queue, n, after } => Action::ListFailedJobs {
+                    queue: jobs::Queue::from(*queue),
+                    n: *n,
+                    after: after.clone(),
+                },
+                AngosEndpoint::RetryJob { queue, storage_key } => Action::RetryJob {
+                    queue: jobs::Queue::from(*queue),
+                    storage_key: storage_key.clone(),
+                },
+                AngosEndpoint::DeleteJob {
+                    queue,
+                    state,
+                    storage_key,
+                } => Action::DeleteJob {
+                    queue: jobs::Queue::from(*queue),
+                    state: jobs::JobState::from(*state),
+                    storage_key: storage_key.clone(),
+                },
+            },
         }
-        Method::DELETE => Some(Action::DeleteManifest {
-            namespace,
-            reference,
-        }),
-        _ => None,
     }
-}
-
-/// Whether a request [`parse`] refused was a referrers read owing a `400`: a
-/// registry serving the API must answer an invalid one that way and never with
-/// a `404`. Reaching here means [`try_find_referrers`] declined a `GET` on this
-/// path, and on a parsable namespace it declines only over the digest or the
-/// `?artifactType=` filter, so the namespace is the whole test: one that does
-/// not parse addresses no repository and keeps the `404` every route gives.
-/// REF: <https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md#listing-referrers>
-pub fn is_invalid_referrers_request(method: &Method, uri: &Uri) -> bool {
-    *method == Method::GET
-        && uri
-            .path()
-            .strip_prefix(API_PREFIX)
-            .and_then(server::split_referrers_path)
-            .is_some_and(|(namespace, _)| Namespace::new(namespace).is_ok())
-}
-
-fn try_find_referrers(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    let (namespace_str, digest) = server::split_referrers_path(path)?;
-    if *method != Method::GET {
-        return None;
-    }
-    let namespace = Namespace::new(namespace_str).ok()?;
-    let digest = Digest::from_str(digest).ok()?;
-
-    // Strict parse: a malformed `?artifactType=` is a bad filter, not an
-    // absent one, so it must not degrade into an unfiltered listing. The spec
-    // defines no page size here, so only the cursor the registry minted in its
-    // own `Link` is read back.
-    Some(Action::GetReferrer {
-        namespace,
-        digest,
-        artifact_type: parse_query::<ArtifactTypeQuery>(params)?.artifact_type,
-        last: parse_query::<CursorQuery>(params)?.last,
-    })
-}
-
-fn try_find_tags(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    let namespace_str = path.strip_suffix(TAGS_LIST)?;
-    if *method != Method::GET {
-        return None;
-    }
-    let namespace = Namespace::new(namespace_str).ok()?;
-    let PaginationQuery { n, last } = parse_query(params)?;
-    Some(Action::ListTags { namespace, n, last })
 }
 
 #[cfg(test)]

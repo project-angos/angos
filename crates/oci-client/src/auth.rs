@@ -15,9 +15,6 @@ fn authority_for_cache_key(url: &Url) -> Result<&str, Error> {
         .ok_or_else(|| Error::Internal("Response URL is missing host authority".to_string()))
 }
 
-/// The credential a cached token was minted for. Clients share one cache, so
-/// without this two of them configured against the same registry and scope
-/// would serve each other's bearer tokens and act as the wrong identity.
 /// TTL for a URL index entry written on a scope-cache hit, where the token's
 /// own remaining lifetime is not observable. Overshooting is harmless: a
 /// dangling entry costs one cache read before the normal challenge path.

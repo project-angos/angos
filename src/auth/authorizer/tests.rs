@@ -1,3 +1,4 @@
+use angos_oci::request::ManifestPutTarget;
 use std::{str::FromStr, sync::Arc};
 
 use serde_json::json;
@@ -13,7 +14,7 @@ use crate::{
     command::bootstrap,
     configuration::Configuration,
     configuration::RegexPattern,
-    identity::{AuthMethod, ClientCertificate, ManifestPutTarget, OidcClaims},
+    identity::{AuthMethod, ClientCertificate, OidcClaims},
     registry::{
         RegistryConfig, Repository,
         metadata_store::MetadataStore,

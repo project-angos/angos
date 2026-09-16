@@ -9,8 +9,8 @@ use reqwest::{Certificate, Client, ClientBuilder, Identity, redirect::Policy};
 /// Decorates a [`reqwest::ClientBuilder`] with an optional server CA bundle and
 /// client certificate loaded from files, then builds the [`Client`].
 ///
-/// The caller supplies a builder already carrying its own TLS/redirect/timeout
-/// policy; this only layers the mTLS material on top.
+/// Starts from a rustls builder; redirect and timeout policy are set through
+/// the `with_*` methods, and the mTLS material is layered on at [`Self::build`].
 pub struct MtlsClientBuilder {
     builder: ClientBuilder,
     server_ca_bundle: Option<PathBuf>,
@@ -141,8 +141,6 @@ fn load_identity(
 mod tests {
     use std::fs;
 
-    use reqwest::Client;
-
     use std::sync::LazyLock;
 
     use rcgen::{
@@ -232,7 +230,7 @@ mod tests {
 
     #[test]
     fn rustls_tls_builds_with_and_without_ca_bundle() {
-        assert!(Client::builder().use_rustls_tls().build().is_ok());
+        assert!(MtlsClientBuilder::new().build().is_ok());
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let file_path = tmp_dir.path().join("bundle.pem");

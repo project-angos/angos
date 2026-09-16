@@ -13,13 +13,11 @@ use rust_embed::Embed;
 use serde::Serialize;
 use tracing::warn;
 
+use angos_transport::{ResponseBody, build_response, json_headers, json_response};
+
 use crate::{
-    auth::TokenIssuer,
-    command::server::error::Error,
-    http_response::{ResponseBody, build_response, json_headers, json_response},
-    identity::ClientIdentity,
-    metrics_provider::metrics_provider,
-    registry::Registry,
+    auth::TokenIssuer, command::server::error::Error, identity::ClientIdentity,
+    metrics_provider::metrics_provider, registry::Registry,
 };
 
 /// The response field names are the ones OCI clients read.

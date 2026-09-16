@@ -24,7 +24,6 @@ mod cache_fill;
 mod command;
 mod configuration;
 mod event_webhook;
-mod http_response;
 mod identity;
 mod jobs;
 mod layer;

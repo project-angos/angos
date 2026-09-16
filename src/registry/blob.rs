@@ -1,16 +1,14 @@
-use http::{HeaderMap, Response, StatusCode};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
 
 use angos_oci::http_range::RequestRange;
 use angos_oci::request::{DeleteBlobRequest, GetBlobRequest, HeadBlobRequest};
-use angos_oci::server;
 use angos_oci::{Digest, MediaRange, Namespace, UploadSessionId};
+use angos_oci_service::{Accepted, BlobDescriptor, BlobGet, BlobStream};
 
 use crate::{
     cache_fill::build_envelope,
     event_webhook::event::{Event, EventActor},
-    http_response::{ResponseBody, build_response},
     jobs::Queue,
     metrics_provider::metrics_provider,
     registry::{
@@ -27,19 +25,18 @@ use crate::{
 /// frames per GiB served.
 pub const DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES: usize = 128 * 1024;
 
-/// `200 OK` serving a blob in full, whether read locally or streamed from an
-/// upstream.
+/// A whole-blob (`200`) stream, read locally or streamed from an upstream.
 fn whole_blob_response(
     digest: &Digest,
     total_length: u64,
     body: BoxedReader,
-    frame_size: usize,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(build_response(
-        StatusCode::OK,
-        server::blob_headers(digest, total_length)?,
-        ResponseBody::streaming(body, frame_size),
-    )?)
+) -> BlobStream<BoxedReader> {
+    BlobStream {
+        digest: digest.clone(),
+        total_length,
+        range: None,
+        reader: body,
+    }
 }
 
 /// Cache a pull-through blob: stage and finalize its bytes through the blob
@@ -130,10 +127,8 @@ async fn fill_cache_session(
 
 impl Registry {
     #[instrument]
-    pub async fn head_blob(
-        &self,
-        request: HeadBlobRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    /// `HEAD /v2/<name>/blobs/<digest>`: the blob's descriptor, no body.
+    pub async fn head_blob(&self, request: HeadBlobRequest) -> Result<BlobDescriptor, Error> {
         let has_access = self
             .metadata_store()
             .can_read(&request.namespace, &request.digest)
@@ -152,11 +147,11 @@ impl Registry {
             match self.blob_store.size(&request.digest).await {
                 Ok(size) => {
                     record_pull_through(cache_of, "blob", "hit");
-                    return Ok(build_response(
-                        StatusCode::OK,
-                        server::blob_headers(&request.digest, size)?,
-                        ResponseBody::empty(),
-                    )?);
+                    return Ok(BlobDescriptor {
+                        digest: request.digest,
+                        size,
+                        media_type: None,
+                    });
                 }
                 // As on GET, a genuine miss re-heads upstream while every
                 // other error propagates instead of masquerading as a 404.
@@ -173,11 +168,11 @@ impl Registry {
             .head_blob(&request.accepted_types, &request.namespace, &request.digest)
             .await?;
 
-        Ok(build_response(
-            StatusCode::OK,
-            server::blob_headers(&digest, size)?,
-            ResponseBody::empty(),
-        )?)
+        Ok(BlobDescriptor {
+            digest,
+            size,
+            media_type: None,
+        })
     }
 
     /// Serve the blob locally when `has_access`, else fall back to the
@@ -191,15 +186,15 @@ impl Registry {
         digest: &Digest,
         range: Option<RequestRange>,
         has_access: bool,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<BlobStream<BoxedReader>, Error> {
         let upstream = repository.filter(|repository| repository.is_pull_through());
         let cache_of = pull_through_name(repository);
 
         if has_access {
             match self.get_local_blob(digest, range).await {
-                Ok(response) => {
+                Ok(stream) => {
                     record_pull_through(cache_of, "blob", "hit");
-                    return Ok(response);
+                    return Ok(stream);
                 }
                 // Owned but the bytes are gone: a pull-through repo re-fetches.
                 Err(Error::BlobUnknown) if upstream.is_some() => {}
@@ -222,19 +217,15 @@ impl Registry {
         // An upstream is free to ignore `Range` and answer the whole blob,
         // which stays a valid answer; only its `206` becomes partial content.
         let Some(content_range) = fetched.content_range else {
-            return whole_blob_response(
-                digest,
-                fetched.length,
-                fetched.reader,
-                self.blob_stream_frame_size,
-            );
+            return Ok(whole_blob_response(digest, fetched.length, fetched.reader));
         };
 
-        Ok(build_response(
-            StatusCode::PARTIAL_CONTENT,
-            server::partial_blob_headers(digest, fetched.length, content_range)?,
-            ResponseBody::streaming(fetched.reader, self.blob_stream_frame_size),
-        )?)
+        Ok(BlobStream {
+            digest: digest.clone(),
+            total_length: fetched.length,
+            range: Some(content_range),
+            reader: fetched.reader,
+        })
     }
 
     /// Fire-and-forget enqueue of a pull-through cache-fill job. A failure is
@@ -263,32 +254,32 @@ impl Registry {
         &self,
         digest: &Digest,
         range: Option<RequestRange>,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<BlobStream<BoxedReader>, Error> {
         let Some(requested_range) = range else {
             let (reader, total_length) = self.blob_store.reader(digest, None).await?;
-            return whole_blob_response(digest, total_length, reader, self.blob_stream_frame_size);
+            return Ok(whole_blob_response(digest, total_length, reader));
         };
 
         let total_length = self.blob_store.size(digest).await?;
         let Some(served) = requested_range.resolve(total_length)? else {
             let (reader, _) = self.blob_store.reader(digest, None).await?;
-            return whole_blob_response(digest, total_length, reader, self.blob_stream_frame_size);
+            return Ok(whole_blob_response(digest, total_length, reader));
         };
         let (reader, _) = self.blob_store.reader(digest, Some(served.start)).await?;
-        let reader = Box::new(reader.take(served.length()));
+        let reader: BoxedReader = Box::new(reader.take(served.length()));
 
-        Ok(build_response(
-            StatusCode::PARTIAL_CONTENT,
-            server::partial_blob_headers(digest, served.length(), served)?,
-            ResponseBody::streaming(reader, self.blob_stream_frame_size),
-        )?)
+        Ok(BlobStream {
+            digest: digest.clone(),
+            total_length: served.length(),
+            range: Some(served),
+            reader,
+        })
     }
 
     #[instrument]
-    pub async fn delete_blob(
-        &self,
-        request: DeleteBlobRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    /// `DELETE /v2/<name>/blobs/<digest>`: revokes ownership; the collector
+    /// reclaims the bytes once every reference is stale.
+    pub async fn delete_blob(&self, request: DeleteBlobRequest) -> Result<Accepted, Error> {
         let ownership = self.metadata_store();
         let links = ownership
             .references(&request.namespace, &request.digest)
@@ -320,11 +311,7 @@ impl Registry {
             .revoke_blob_ownership(&request.namespace, &request.digest)
             .await?;
 
-        Ok(build_response(
-            StatusCode::ACCEPTED,
-            HeaderMap::new(),
-            ResponseBody::empty(),
-        )?)
+        Ok(Accepted)
     }
 
     /// Resolves a blob GET to either a presigned redirect URL or a stream,
@@ -337,7 +324,7 @@ impl Registry {
         actor: Option<EventActor>,
         request: GetBlobRequest,
         allow_redirect: bool,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<BlobGet<BoxedReader>, Error> {
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
 
         let has_access = self
@@ -358,21 +345,22 @@ impl Registry {
             && let Ok(Some(presigned_url)) =
                 self.blob_store.presigned_url(&request.digest, None).await
         {
-            build_response(
-                StatusCode::TEMPORARY_REDIRECT,
-                server::blob_redirect_headers(&presigned_url, &request.digest)?,
-                ResponseBody::empty(),
-            )?
+            BlobGet::Redirect {
+                digest: request.digest.clone(),
+                location: presigned_url,
+            }
         } else {
-            self.get_blob_with_access(
-                repository,
-                &request.accepted_types,
-                &request.namespace,
-                &request.digest,
-                request.range,
-                has_access,
+            BlobGet::Content(
+                self.get_blob_with_access(
+                    repository,
+                    &request.accepted_types,
+                    &request.namespace,
+                    &request.digest,
+                    request.range,
+                    has_access,
+                )
+                .await?,
             )
-            .await?
         };
 
         let event = Event::pull_blob(
@@ -393,7 +381,10 @@ mod tests {
     use std::{io::Cursor, sync::Arc};
 
     use async_trait::async_trait;
-    use http::header::{CONTENT_LENGTH, CONTENT_RANGE};
+    use http::{
+        StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_RANGE},
+    };
     use tempfile::TempDir;
 
     use wiremock::{
@@ -440,6 +431,8 @@ mod tests {
                     accepted_types: Vec::new(),
                 })
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(response_digest(&response), digest);
@@ -979,6 +972,8 @@ mod tests {
         let response = registry
             .get_blob_with_access(Some(&repository), &[], namespace, &digest, range, false)
             .await
+            .unwrap()
+            .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
@@ -1153,7 +1148,12 @@ mod tests {
 
             let (digest, _) = create_test_blob(registry, namespace, content).await;
 
-            let response = registry.get_local_blob(&digest, None).await.unwrap();
+            let response = registry
+                .get_local_blob(&digest, None)
+                .await
+                .unwrap()
+                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
                 *response_header(&response, &CONTENT_LENGTH),
@@ -1165,7 +1165,12 @@ mod tests {
                 start: 5,
                 end: Some(15),
             }));
-            let response = registry.get_local_blob(&digest, range).await.unwrap();
+            let response = registry
+                .get_local_blob(&digest, range)
+                .await
+                .unwrap()
+                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
+                .unwrap();
             assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
             assert_eq!(
                 *response_header(&response, &CONTENT_RANGE),
@@ -1194,6 +1199,8 @@ mod tests {
                     })),
                 )
                 .await
+                .unwrap()
+                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
@@ -1228,6 +1235,8 @@ mod tests {
             let response = registry
                 .get_local_blob(&digest, Some(RequestRange::Suffix(suffix_length as u64)))
                 .await
+                .unwrap()
+                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
@@ -1260,6 +1269,8 @@ mod tests {
             let response = registry
                 .get_local_blob(&digest, Some(RequestRange::Suffix(10_000)))
                 .await
+                .unwrap()
+                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
@@ -1298,6 +1309,8 @@ mod tests {
                     })),
                 )
                 .await
+                .unwrap()
+                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
@@ -1358,6 +1371,8 @@ mod tests {
                     })),
                 )
                 .await
+                .unwrap()
+                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
                 .unwrap();
 
             // An empty blob has no satisfiable window, so the range is ignored.
@@ -1383,6 +1398,8 @@ mod tests {
                     accepted_types: Vec::new(),
                 })
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             assert_eq!(response_digest(&head_response), digest);
             let head_length = response_header(&head_response, &CONTENT_LENGTH);

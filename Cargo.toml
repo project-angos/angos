@@ -2,15 +2,19 @@
 members = [
     "contrib/kubelet-credential-provider",
     "crates/backoff",
+    "crates/docker-extension-service",
     "crates/cache",
     "crates/inflate",
     "crates/conformance-gates",
     "crates/mtls-client",
     "crates/oci",
     "crates/oci-client",
+    "crates/oci-service",
+    "crates/angos-extension-service",
     "crates/s3-client",
     "crates/secret",
     "crates/storage",
+    "crates/transport",
 ]
 
 # Policy: every dependency used by two or more workspace members is declared
@@ -19,14 +23,19 @@ members = [
 # used by a single member stay in that member's manifest.
 [workspace.dependencies]
 angos-backoff = { path = "crates/backoff" }
+angos-docker-extension-service = { path = "crates/docker-extension-service" }
+angos-extension-service = { path = "crates/angos-extension-service" }
 angos-cache = { path = "crates/cache" }
 angos-inflate = { path = "crates/inflate" }
 angos-mtls-client = { path = "crates/mtls-client" }
 angos-oci = { path = "crates/oci" }
+serde_html_form = "0.4.1"
 angos-oci-client = { path = "crates/oci-client" }
+angos-oci-service = { path = "crates/oci-service" }
 angos-s3-client = { path = "crates/s3-client" }
 angos-secret = { path = "crates/secret" }
 angos-storage = { path = "crates/storage" }
+angos-transport = { path = "crates/transport" }
 arc-swap = "1.9.2"
 argh = "0.1.19"
 async-trait = "0.1.92"
@@ -39,6 +48,7 @@ hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
 hyper = "1.11.0"
+http-body-util = "0.1.5"
 redis = { version = "1.5.0", features = ["tokio-comp", "connection-manager"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
@@ -74,6 +84,10 @@ angos-inflate = { workspace = true }
 angos-mtls-client = { workspace = true }
 angos-oci = { workspace = true }
 angos-oci-client = { workspace = true }
+angos-oci-service = { workspace = true, features = ["hyper"] }
+angos-docker-extension-service = { workspace = true, features = ["hyper"] }
+angos-extension-service = { workspace = true, features = ["hyper"] }
+angos-transport = { workspace = true }
 angos-s3-client = { workspace = true }
 angos-secret = { workspace = true }
 angos-storage = { workspace = true }
@@ -89,7 +103,7 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
-http-body-util = "0.1.5"
+http-body-util = { workspace = true }
 humantime = "2.4.0"
 http = { workspace = true }
 hyper = { workspace = true, features = ["full"] }
@@ -112,7 +126,7 @@ rust-embed = "8.12.0"
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 serde = { workspace = true }
-serde_html_form = "0.4.1"
+serde_html_form = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tar = "0.4.44"

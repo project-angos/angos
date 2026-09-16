@@ -5,58 +5,29 @@ use std::{collections::HashMap, future::Future};
 
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
-use http::{HeaderMap, Response, StatusCode};
-use serde::Serialize;
 use tokio::try_join;
 use tracing::{instrument, warn};
 
+use angos_extension_service::{
+    AccessEntry, DEFAULT_JOBS_PAGE, DeleteJobRequest, FailedJobEntry, FailedJobsBody, JobEntry,
+    JobsBody, ListJobsRequest, ListPullsRequest, ManifestEntry, NamespaceInfo, NamespacesBody,
+    NoContent, ParentRef, PullsBody, ReferrerInfo, RepositoriesBody, RepositoryInfo,
+    RetryJobRequest, RevisionsBody, UploadEntry, UploadsBody,
+};
 use angos_oci::request::GetReferrersRequest;
 use angos_oci::{
-    Content, DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest,
-    MediaType, Namespace, Platform, Reference, Tag, UploadSessionId, namespace_belongs_to,
+    Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace, Platform, Reference,
+    Tag, UploadSessionId, namespace_belongs_to,
 };
 
 use crate::{
     configuration::RegexPattern,
-    http_response::{ResponseBody, build_response, json_response},
     jobs::store as job_store,
     jobs::{JobState, Queue},
     registry::{
-        Error, Registry,
-        keys::NamespaceKeys,
-        manifest::read_manifest,
-        metadata_store::{AccessEntry, LinkKind},
+        Error, Registry, keys::NamespaceKeys, manifest::read_manifest, metadata_store::LinkKind,
     },
 };
-
-#[derive(Debug)]
-pub struct ListPullsRequest {
-    pub namespace: Namespace,
-    pub reference: Reference,
-}
-
-#[derive(Debug)]
-pub struct ListJobsRequest {
-    pub queue: Queue,
-    pub n: Option<u16>,
-    pub after: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct RetryJobRequest {
-    pub queue: Queue,
-    pub storage_key: String,
-}
-
-#[derive(Debug)]
-pub struct DeleteJobRequest {
-    pub queue: Queue,
-    pub state: JobState,
-    pub storage_key: String,
-}
-
-/// Page size for the durable job-queue listings when the client sends no `?n=`.
-const DEFAULT_JOBS_PAGE: u16 = 100;
 
 /// Most pull-history entries one listing returns; the directory is unbounded,
 /// so the newest page is all the UI gets.
@@ -68,156 +39,6 @@ const NAMESPACE_STAT_CONCURRENCY: usize = 32;
 
 /// Fan-out for the per-item reads behind the info endpoints.
 const ADMIN_READ_CONCURRENCY: usize = 16;
-
-#[derive(Serialize, Debug)]
-pub struct RepositoryInfo {
-    name: String,
-    namespace_count: usize,
-    pull_through_cache: bool,
-    upstream_urls: Vec<String>,
-    immutable_tags: bool,
-}
-
-#[derive(Serialize, Debug)]
-pub struct RepositoriesBody {
-    repositories: Vec<RepositoryInfo>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct NamespaceInfo {
-    name: String,
-    tag_count: usize,
-    manifest_count: usize,
-    upload_count: usize,
-}
-
-#[derive(Serialize, Debug)]
-pub struct NamespacesBody {
-    repository: String,
-    namespaces: Vec<NamespaceInfo>,
-    pull_through_cache: bool,
-    upstream_urls: Vec<String>,
-    immutable_tags: bool,
-    immutable_tags_exclusions: Vec<RegexPattern>,
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct ParentRef {
-    digest: String,
-    tags: Vec<Tag>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    platform: Option<Platform>,
-}
-
-#[derive(Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ReferrerInfo {
-    digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    artifact_type: Option<MediaType>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    annotations: HashMap<String, String>,
-}
-
-impl From<Descriptor> for ReferrerInfo {
-    fn from(descriptor: Descriptor) -> Self {
-        Self {
-            digest: descriptor.digest.to_string(),
-            artifact_type: descriptor.artifact_type,
-            annotations: descriptor.annotations,
-        }
-    }
-}
-
-#[derive(Serialize, Debug)]
-pub struct ManifestEntry {
-    digest: String,
-    tags: Vec<Tag>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    parents: Vec<ParentRef>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    referrers: Vec<ReferrerInfo>,
-    /// Where the OCI referrers listing continues, absent once exhausted; the UI
-    /// feeds it back to `/v2/{namespace}/referrers/{digest}?last=`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    referrers_next: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pushed_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_pulled_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct RevisionsBody {
-    name: String,
-    manifests: Vec<ManifestEntry>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct UploadEntry {
-    /// `uuid` on the wire, the name the API reference and the web UI read.
-    #[serde(rename = "uuid")]
-    session_id: UploadSessionId,
-    size: u64,
-    started_at: DateTime<Utc>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct UploadsBody {
-    name: String,
-    uploads: Vec<UploadEntry>,
-}
-
-/// One target's recorded pulls, newest first. `window_secs` is the configured
-/// retention, so the UI can state how far back the list can reach.
-#[derive(Serialize, Debug)]
-pub struct PullsBody {
-    target: String,
-    window_secs: u64,
-    entries: Vec<AccessEntry>,
-}
-
-/// A pending or in-flight durable job. `not_before` is decoded from the
-/// storage key's time prefix so the UI can label backed-off retries.
-#[derive(Serialize, Debug)]
-pub struct JobEntry {
-    storage_key: String,
-    id: String,
-    kind: String,
-    lock_key: String,
-    attempts: u32,
-    max_attempts: u32,
-    created_at: DateTime<Utc>,
-    not_before: DateTime<Utc>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct JobsBody {
-    jobs: Vec<JobEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next: Option<String>,
-}
-
-/// A dead-letter job, carrying the failure reason and instant.
-#[derive(Serialize, Debug)]
-pub struct FailedJobEntry {
-    storage_key: String,
-    id: String,
-    kind: String,
-    lock_key: String,
-    attempts: u32,
-    max_attempts: u32,
-    created_at: DateTime<Utc>,
-    failed_at: DateTime<Utc>,
-    last_error: String,
-}
-
-#[derive(Serialize, Debug)]
-pub struct FailedJobsBody {
-    failed: Vec<FailedJobEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next: Option<String>,
-}
 
 struct RepositoryConfig {
     pull_through_cache: bool,
@@ -239,27 +60,11 @@ struct DockerReferrerCandidate {
 /// The Docker-style referrer `descriptor` carries, or `None` when it has no
 /// reference digest annotation or the annotation does not parse as a digest.
 fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCandidate> {
-    let subject_str = descriptor.annotations.get(DOCKER_REFERENCE_DIGEST)?;
-    let subject = subject_str.parse::<Digest>().ok()?;
     Some(DockerReferrerCandidate {
-        subject,
+        subject: descriptor.docker_reference_subject()?,
         child_digest: descriptor.digest.clone(),
-        info: ReferrerInfo {
-            digest: descriptor.digest.to_string(),
-            artifact_type: descriptor.artifact_type.clone(),
-            annotations: descriptor.annotations.clone(),
-        },
+        info: descriptor.into(),
     })
-}
-
-/// The in-toto predicate type annotation from the first layer carrying one.
-fn extract_in_toto_predicate(child_manifest: &Manifest) -> Option<String> {
-    let Content::Image { layers, .. } = &child_manifest.content else {
-        return None;
-    };
-    layers
-        .iter()
-        .find_map(|layer| layer.annotations.get(IN_TOTO_PREDICATE_TYPE).cloned())
 }
 
 struct ManifestAnalysis {
@@ -343,7 +148,7 @@ fn parent_refs_for(
 
 impl Registry {
     #[instrument(skip(self))]
-    pub async fn get_repositories_info(&self) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_repositories_info(&self) -> Result<RepositoriesBody, Error> {
         // One walk bucketed in memory: listing per repository would re-scan the
         // whole store once per configured repository.
         let all_namespaces = self.collect_namespaces(None).await?;
@@ -366,14 +171,14 @@ impl Registry {
 
         repositories.sort_by(|a, b| a.name.cmp(&b.name));
 
-        json_response(StatusCode::OK, &RepositoriesBody { repositories })
+        Ok(RepositoriesBody { repositories })
     }
 
     #[instrument(skip(self))]
     pub async fn get_namespaces_info(
         &self,
         repository: &Namespace,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<NamespacesBody, Error> {
         let repository = repository.as_ref();
         let namespace_names = self.list_repository_namespaces(repository).await?;
 
@@ -407,24 +212,22 @@ impl Registry {
 
         let config = self.get_repository_config(repository);
 
-        json_response(
-            StatusCode::OK,
-            &NamespacesBody {
-                repository: repository.to_string(),
-                namespaces,
-                pull_through_cache: config.pull_through_cache,
-                upstream_urls: config.upstream_urls,
-                immutable_tags: config.immutable_tags,
-                immutable_tags_exclusions: config.immutable_tags_exclusions,
-            },
-        )
+        Ok(NamespacesBody {
+            repository: repository.to_string(),
+            namespaces,
+            pull_through_cache: config.pull_through_cache,
+            upstream_urls: config.upstream_urls,
+            immutable_tags: config.immutable_tags,
+            immutable_tags_exclusions: config
+                .immutable_tags_exclusions
+                .iter()
+                .map(|pattern| pattern.as_source().to_string())
+                .collect(),
+        })
     }
 
     #[instrument(skip(self))]
-    pub async fn get_revisions_info(
-        &self,
-        namespace: &Namespace,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_revisions_info(&self, namespace: &Namespace) -> Result<RevisionsBody, Error> {
         // Materialized once: every step below needs the full revision set.
         let all_revisions: Vec<Digest> = self
             .metadata_store
@@ -444,23 +247,17 @@ impl Registry {
             )
             .await;
 
-        json_response(
-            StatusCode::OK,
-            &RevisionsBody {
-                name: namespace.to_string(),
-                manifests,
-            },
-        )
+        Ok(RevisionsBody {
+            name: namespace.to_string(),
+            manifests,
+        })
     }
 
     /// The newest recorded pulls of one tag or revision, newest first. The
     /// entry directory is append-only, so an entry deleted or corrupted
     /// mid-listing is skipped rather than failing the request.
     #[instrument(skip(self))]
-    pub async fn get_pull_history(
-        &self,
-        request: ListPullsRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_pull_history(&self, request: ListPullsRequest) -> Result<PullsBody, Error> {
         let ListPullsRequest {
             namespace,
             reference,
@@ -489,21 +286,15 @@ impl Registry {
             .collect()
             .await;
 
-        json_response(
-            StatusCode::OK,
-            &PullsBody {
-                target: reference.to_string(),
-                window_secs: self.metadata_store.atime_audit_window_secs(),
-                entries,
-            },
-        )
+        Ok(PullsBody {
+            target: reference.to_string(),
+            window_secs: self.metadata_store.atime_audit_window_secs(),
+            entries,
+        })
     }
 
     #[instrument(skip(self))]
-    pub async fn get_uploads_info(
-        &self,
-        namespace: &Namespace,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_uploads_info(&self, namespace: &Namespace) -> Result<UploadsBody, Error> {
         let mut session_ids: Vec<UploadSessionId> = self
             .blob_store
             .stream_uploads(namespace)
@@ -531,24 +322,19 @@ impl Registry {
             .collect()
             .await;
 
-        json_response(
-            StatusCode::OK,
-            &UploadsBody {
-                name: namespace.to_string(),
-                uploads: all_uploads,
-            },
-        )
+        Ok(UploadsBody {
+            name: namespace.to_string(),
+            uploads: all_uploads,
+        })
     }
 
     /// One keyset page of pending or in-flight durable jobs on `queue`, where
     /// `after` is the plain storage key from a previous page's `next`. A row
     /// deleted mid-scan is silently skipped.
     #[instrument(skip(self))]
-    pub async fn get_jobs_info(
-        &self,
-        request: ListJobsRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_jobs_info(&self, request: ListJobsRequest) -> Result<JobsBody, Error> {
         let ListJobsRequest { queue, n, after } = request;
+        let queue = Queue::from(queue);
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
         let page = self
             .job_queue
@@ -572,13 +358,10 @@ impl Registry {
         })
         .await?;
 
-        json_response(
-            StatusCode::OK,
-            &JobsBody {
-                jobs,
-                next: page.next_token,
-            },
-        )
+        Ok(JobsBody {
+            jobs,
+            next: page.next_token,
+        })
     }
 
     /// One keyset page of dead-letter jobs on `queue`; see
@@ -587,8 +370,9 @@ impl Registry {
     pub async fn get_failed_jobs_info(
         &self,
         request: ListJobsRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<FailedJobsBody, Error> {
         let ListJobsRequest { queue, n, after } = request;
+        let queue = Queue::from(queue);
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
         let page = self
             .job_queue
@@ -611,49 +395,36 @@ impl Registry {
         })
         .await?;
 
-        json_response(
-            StatusCode::OK,
-            &FailedJobsBody {
-                failed,
-                next: page.next_token,
-            },
-        )
+        Ok(FailedJobsBody {
+            failed,
+            next: page.next_token,
+        })
     }
 
     /// Requeue a dead-letter job on `queue` with its attempts reset to zero; a
     /// stale key surfaces as [`Error::NotFound`].
     #[instrument(skip(self))]
-    pub async fn retry_failed_job(
-        &self,
-        request: RetryJobRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn retry_failed_job(&self, request: RetryJobRequest) -> Result<NoContent, Error> {
         self.job_queue
-            .retry_failed(request.queue, &request.storage_key)
+            .retry_failed(Queue::from(request.queue), &request.storage_key)
             .await?;
 
-        Ok(build_response(
-            StatusCode::NO_CONTENT,
-            HeaderMap::new(),
-            ResponseBody::empty(),
-        )?)
+        Ok(NoContent)
     }
 
     /// Delete a job on `queue` in the given partition; a stale key surfaces as
     /// [`Error::NotFound`].
     #[instrument(skip(self))]
-    pub async fn delete_job(
-        &self,
-        request: DeleteJobRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn delete_job(&self, request: DeleteJobRequest) -> Result<NoContent, Error> {
         self.job_queue
-            .delete_job(request.queue, request.state, &request.storage_key)
+            .delete_job(
+                Queue::from(request.queue),
+                JobState::from(request.state),
+                &request.storage_key,
+            )
             .await?;
 
-        Ok(build_response(
-            StatusCode::NO_CONTENT,
-            HeaderMap::new(),
-            ResponseBody::empty(),
-        )?)
+        Ok(NoContent)
     }
 
     fn get_repository_config(&self, name: &str) -> RepositoryConfig {
@@ -742,10 +513,10 @@ impl Registry {
         child_digest: &Digest,
     ) -> ReferrerInfo {
         if let Ok(Some(child_manifest)) = read_manifest(&self.blob_store, child_digest).await
-            && let Some(predicate) = extract_in_toto_predicate(&child_manifest)
+            && let Some(predicate) = child_manifest.in_toto_predicate_type()
         {
             info.annotations
-                .insert(IN_TOTO_PREDICATE_TYPE.to_string(), predicate);
+                .insert(IN_TOTO_PREDICATE_TYPE.to_string(), predicate.to_string());
         }
         info
     }
@@ -790,7 +561,7 @@ impl Registry {
                 };
                 let mut referrers_next = None;
                 if let Ok(page) = self.list_referrers(None, &listing).await {
-                    referrers.extend(page.items.into_iter().map(ReferrerInfo::from));
+                    referrers.extend(page.items.iter().map(ReferrerInfo::from));
                     referrers_next = page.next_token;
                 }
 
@@ -952,15 +723,13 @@ mod tests {
     };
 
     use angos_oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace,
-        Platform, Reference, Tag, UploadSessionId,
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, Platform, Reference, Tag,
+        UploadSessionId,
     };
 
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
-    use crate::registry::admin::{
-        analyze_manifest, extract_docker_referrer, extract_in_toto_predicate, parent_refs_for,
-    };
+    use crate::registry::admin::{analyze_manifest, extract_docker_referrer, parent_refs_for};
     use serde_json::Value;
 
     use crate::registry::admin::ListPullsRequest;
@@ -1080,69 +849,6 @@ mod tests {
             artifact_type: None,
             platform: None,
         }
-    }
-
-    fn manifest_with_layers(layer_annotations: Vec<HashMap<String, String>>) -> Manifest {
-        let layers: Vec<Descriptor> = layer_annotations
-            .into_iter()
-            .map(|ann| Descriptor {
-                media_type: media_type("application/vnd.oci.image.layer.v1.tar+gzip"),
-                digest: test_digest(),
-                size: 0,
-                annotations: ann,
-                artifact_type: None,
-                platform: None,
-            })
-            .collect();
-        Manifest::image(None, layers)
-    }
-
-    #[test]
-    fn extract_in_toto_predicate_returns_none_for_no_layers() {
-        let manifest = manifest_with_layers(vec![]);
-        assert_eq!(extract_in_toto_predicate(&manifest), None);
-    }
-
-    #[test]
-    fn extract_in_toto_predicate_returns_none_when_annotation_absent() {
-        let manifest = manifest_with_layers(vec![HashMap::from([(
-            "some.other.key".to_string(),
-            "value".to_string(),
-        )])]);
-        assert_eq!(extract_in_toto_predicate(&manifest), None);
-    }
-
-    #[test]
-    fn extract_in_toto_predicate_returns_first_match_across_layers() {
-        let manifest = manifest_with_layers(vec![
-            HashMap::from([(
-                IN_TOTO_PREDICATE_TYPE.to_string(),
-                "https://slsa.dev/provenance/v0.2".to_string(),
-            )]),
-            HashMap::from([(
-                IN_TOTO_PREDICATE_TYPE.to_string(),
-                "https://slsa.dev/provenance/v1".to_string(),
-            )]),
-        ]);
-        assert_eq!(
-            extract_in_toto_predicate(&manifest),
-            Some("https://slsa.dev/provenance/v0.2".to_string()),
-        );
-    }
-
-    #[test]
-    fn extract_docker_referrer_returns_none_when_annotation_absent() {
-        let descriptor = descriptor_with_annotations(HashMap::new());
-        assert!(extract_docker_referrer(&descriptor).is_none());
-    }
-
-    #[test]
-    fn extract_docker_referrer_returns_none_when_annotation_not_a_valid_digest() {
-        let descriptor = descriptor_with_annotations(HashMap::from([(
-            DOCKER_REFERENCE_DIGEST.to_string(),
-            "not-a-valid-digest".to_string(),
-        )]));
-        assert!(extract_docker_referrer(&descriptor).is_none());
     }
 
     #[test]
@@ -1351,6 +1057,8 @@ mod tests {
             let response = registry
                 .get_namespaces_info(&Namespace::new("test-repo").unwrap())
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             let body = response_json(response).await;
             let namespaces = body["namespaces"].as_array().unwrap();
@@ -1378,7 +1086,12 @@ mod tests {
                 "a namespace with manifests and uploads must be listed once; got: {entries:?}"
             );
 
-            let response = registry.get_repositories_info().await.unwrap();
+            let response = registry
+                .get_repositories_info()
+                .await
+                .unwrap()
+                .into_response()
+                .unwrap();
             let body = response_json(response).await;
             let count = body["repositories"][0]["namespace_count"].as_u64().unwrap();
             assert_eq!(
@@ -1413,6 +1126,8 @@ mod tests {
             let response = registry
                 .get_namespaces_info(&Namespace::new("test-repo").unwrap())
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             let body = response_json(response).await;
             let entry = body["namespaces"]
@@ -1448,6 +1163,8 @@ mod tests {
         let response = registry
             .get_namespaces_info(&Namespace::new("test-repo").unwrap())
             .await
+            .unwrap()
+            .into_response()
             .unwrap();
         let body = response_json(response).await;
         let namespaces = body["namespaces"].as_array().unwrap();
@@ -1475,7 +1192,15 @@ mod tests {
                 .await
                 .unwrap();
 
-            let body = response_json(registry.get_uploads_info(&namespace).await.unwrap()).await;
+            let body = response_json(
+                registry
+                    .get_uploads_info(&namespace)
+                    .await
+                    .unwrap()
+                    .into_response()
+                    .unwrap(),
+            )
+            .await;
             let uploads = body["uploads"].as_array().unwrap();
 
             assert_eq!(uploads.len(), 1, "got: {uploads:?}");
@@ -1501,6 +1226,8 @@ mod tests {
             let response = registry
                 .get_namespaces_info(&Namespace::new("test-repo").unwrap())
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             let body = response_json(response).await;
             let names: Vec<&str> = body["namespaces"]
@@ -1544,7 +1271,9 @@ mod tests {
         let response = registry
             .get_namespaces_info(&Namespace::new("test-repo").unwrap())
             .await
-            .expect("one invalid directory must not fail the listing");
+            .expect("one invalid directory must not fail the listing")
+            .into_response()
+            .unwrap();
         let body = response_json(response).await;
         let names: Vec<&str> = body["namespaces"]
             .as_array()
@@ -1604,6 +1333,8 @@ mod tests {
                     reference: Reference::Tag(tag.clone()),
                 })
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             let body = response_json(response).await;
 
@@ -1652,6 +1383,8 @@ mod tests {
         let response = registry
             .get_revisions_info(&namespace.clone())
             .await
+            .unwrap()
+            .into_response()
             .unwrap();
         let body = response_json(response).await;
         body["manifests"]
@@ -1806,6 +1539,8 @@ mod tests {
                     reference: Reference::Digest(target.clone()),
                 })
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             let body = response_json(response).await;
 
@@ -1828,6 +1563,8 @@ mod tests {
                     reference: Reference::Tag(Tag::new("never").unwrap()),
                 })
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             let body = response_json(response).await;
 

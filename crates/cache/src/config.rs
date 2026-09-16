@@ -62,14 +62,15 @@ mod tests {
     // connecting (construction is lazy: no network call at `to_backend()`).
     #[test]
     fn redis_config_to_backend_constructs_without_connecting() {
-        let result = Config::Redis(BackendConfig {
+        let backend = Config::Redis(BackendConfig {
             url: Secret::new("redis://localhost:6379/0".to_string()),
             key_prefix: "test:".to_string(),
         })
-        .to_backend();
+        .to_backend()
+        .expect("Redis backend construction must succeed without a live server");
         assert!(
-            result.is_ok(),
-            "Redis backend construction must succeed without a live server, got: {result:?}"
+            matches!(&*backend, Cache::Redis(_)),
+            "Config::Redis must construct the Redis backend variant, got: {backend:?}"
         );
     }
 }

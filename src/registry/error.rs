@@ -90,6 +90,15 @@ pub enum Error {
 // A raw storage outcome carries no domain context: a call site that knows a
 // miss means a specific blob/upload/manifest 404 must intercept
 // `StorageError::NotFound` before `?` reaches this impl.
+impl From<angos_transport::RenderError> for Error {
+    fn from(error: angos_transport::RenderError) -> Self {
+        match error {
+            angos_transport::RenderError::Header(e) => Error::Http(e),
+            angos_transport::RenderError::Serialize(e) => Error::Serde(e),
+        }
+    }
+}
+
 impl From<StorageError> for Error {
     fn from(error: StorageError) -> Self {
         match error {

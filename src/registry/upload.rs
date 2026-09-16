@@ -1,4 +1,3 @@
-use http::{HeaderMap, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncReadExt, copy, sink};
 use tracing::{instrument, warn};
 
@@ -7,12 +6,11 @@ use angos_oci::request::{
     BlobMount, CompleteUploadRequest, DeleteUploadRequest, GetUploadRequest, MountBlobRequest,
     PatchUploadRequest, StartUploadRequest,
 };
-use angos_oci::server;
 use angos_oci::{Algorithm, Digest, Namespace, UploadSessionId};
+use angos_oci_service::{BlobWritten, NoContent, StartUpload, UploadSession};
 
 use crate::{
     event_webhook::event::{Event, EventActor},
-    http_response::{ResponseBody, build_response},
     registry::{
         Error, Registry,
         blob_ownership::{GrantOutcome, promote_and_grant},
@@ -98,16 +96,15 @@ impl Registry {
         namespace: &Namespace,
         session_id: &UploadSessionId,
         digest: &Digest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<BlobWritten, Error> {
         if let Err(error) = self.blob_store.delete_upload(namespace, session_id).await {
             warn!("Failed to delete completed upload state: {error}");
         }
 
-        Ok(build_response(
-            StatusCode::CREATED,
-            server::blob_location_headers(namespace, digest)?,
-            ResponseBody::empty(),
-        )?)
+        Ok(BlobWritten {
+            namespace: namespace.clone(),
+            digest: digest.clone(),
+        })
     }
 
     /// Grants `namespace` a reference to `mount.digest`, re-checked against the
@@ -170,23 +167,23 @@ impl Registry {
         Ok(candidates)
     }
 
-    /// Opens a fresh resumable upload session and returns its `202` headers;
-    /// `digest_algorithm` fixes what each chunk is hashed under.
+    /// Opens a fresh resumable upload session; `digest_algorithm` fixes what
+    /// each chunk is hashed under.
     async fn open_upload_session(
         &self,
         namespace: &Namespace,
         digest_algorithm: Option<Algorithm>,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<UploadSession, Error> {
         let session_id = UploadSessionId::generate();
         self.blob_store
             .create_upload(namespace, &session_id, digest_algorithm)
             .await?;
 
-        Ok(build_response(
-            StatusCode::ACCEPTED,
-            server::upload_session_headers(namespace, &session_id)?,
-            ResponseBody::empty(),
-        )?)
+        Ok(UploadSession {
+            namespace: namespace.clone(),
+            session_id,
+            received: 0,
+        })
     }
 
     /// Starts a blob upload: `201` when the namespace already owns `digest` or
@@ -198,14 +195,15 @@ impl Registry {
         actor: Option<EventActor>,
         request: StartUploadRequest,
         stream: S,
-    ) -> Result<Response<ResponseBody>, Error>
+    ) -> Result<StartUpload, Error>
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
         let Some(target) = request.target else {
-            return self
-                .open_upload_session(&request.namespace, request.digest_algorithm)
-                .await;
+            return Ok(StartUpload::Session(
+                self.open_upload_session(&request.namespace, request.digest_algorithm)
+                    .await?,
+            ));
         };
         let digest = target.digest;
 
@@ -215,20 +213,20 @@ impl Registry {
                 .can_read(&request.namespace, &digest)
                 .await?
         {
-            return Ok(build_response(
-                StatusCode::CREATED,
-                server::blob_location_headers(&request.namespace, &digest)?,
-                ResponseBody::empty(),
-            )?);
+            return Ok(StartUpload::Completed(Box::new(BlobWritten {
+                namespace: request.namespace.clone(),
+                digest,
+            })));
         }
 
         // A `?digest=` POST carrying the blob is the single-request upload, a
         // declared zero being the empty blob; only an undeclared length falls
         // back to a session.
         let Some(content_length) = target.content_length else {
-            return self
-                .open_upload_session(&request.namespace, Some(digest.algorithm()))
-                .await;
+            return Ok(StartUpload::Session(
+                self.open_upload_session(&request.namespace, Some(digest.algorithm()))
+                    .await?,
+            ));
         };
 
         let session_id = UploadSessionId::generate();
@@ -236,18 +234,20 @@ impl Registry {
             .create_upload(&request.namespace, &session_id, Some(digest.algorithm()))
             .await?;
 
-        self.complete_upload(
-            actor,
-            CompleteUploadRequest {
-                namespace: request.namespace.clone(),
-                session_id: session_id.clone(),
-                digest: digest.clone(),
-                content_range: None,
-                content_length: Some(content_length),
-            },
-            stream,
-        )
-        .await
+        Ok(StartUpload::Completed(Box::new(
+            self.complete_upload(
+                actor,
+                CompleteUploadRequest {
+                    namespace: request.namespace.clone(),
+                    session_id: session_id.clone(),
+                    digest: digest.clone(),
+                    content_range: None,
+                    content_length: Some(content_length),
+                },
+                stream,
+            )
+            .await?,
+        )))
     }
 
     /// Starts a cross-repository blob mount from `source`, the namespace the
@@ -263,7 +263,7 @@ impl Registry {
         actor: Option<EventActor>,
         request: MountBlobRequest,
         source: Option<Namespace>,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<StartUpload, Error> {
         let repository = self.repository_name_for(&request.namespace);
         let event = Event::push_blob(
             &request.namespace,
@@ -276,21 +276,24 @@ impl Registry {
         // An unsatisfiable mount degrades to an ordinary upload session, so the
         // caller is never told whether the blob exists.
         let Some(source) = &source else {
-            return self.open_upload_session(&request.namespace, None).await;
+            return Ok(StartUpload::Session(
+                self.open_upload_session(&request.namespace, None).await?,
+            ));
         };
 
         if let Some(digest) = self
             .try_cross_repo_mount(&request.namespace, &request.mount, source)
             .await?
         {
-            return Ok(build_response(
-                StatusCode::CREATED,
-                server::blob_location_headers(&request.namespace, &digest)?,
-                ResponseBody::empty(),
-            )?);
+            return Ok(StartUpload::Completed(Box::new(BlobWritten {
+                namespace: request.namespace.clone(),
+                digest,
+            })));
         }
 
-        self.open_upload_session(&request.namespace, None).await
+        Ok(StartUpload::Session(
+            self.open_upload_session(&request.namespace, None).await?,
+        ))
     }
 
     /// Early-reject a known-length body whose declared length would push the
@@ -384,7 +387,7 @@ impl Registry {
         &self,
         request: PatchUploadRequest,
         stream: S,
-    ) -> Result<Response<ResponseBody>, Error>
+    ) -> Result<UploadSession, Error>
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
@@ -438,16 +441,11 @@ impl Registry {
         )
         .await?;
 
-        Ok(build_response(
-            StatusCode::ACCEPTED,
-            server::upload_progress_headers(
-                &request.namespace,
-                &request.session_id,
-                size,
-                Some(0),
-            )?,
-            ResponseBody::empty(),
-        )?)
+        Ok(UploadSession {
+            namespace: request.namespace,
+            session_id: request.session_id,
+            received: size,
+        })
     }
 
     #[instrument(
@@ -463,7 +461,7 @@ impl Registry {
         actor: Option<EventActor>,
         request: CompleteUploadRequest,
         stream: S,
-    ) -> Result<Response<ResponseBody>, Error>
+    ) -> Result<BlobWritten, Error>
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
@@ -578,41 +576,29 @@ impl Registry {
     }
 
     #[instrument]
-    pub async fn delete_upload(
-        &self,
-        request: DeleteUploadRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn delete_upload(&self, request: DeleteUploadRequest) -> Result<NoContent, Error> {
         self.blob_store
             .delete_upload(&request.namespace, &request.session_id)
             .await?;
 
-        Ok(build_response(
-            StatusCode::NO_CONTENT,
-            HeaderMap::new(),
-            ResponseBody::empty(),
-        )?)
+        Ok(NoContent)
     }
 
     #[instrument]
     pub async fn get_upload_status(
         &self,
         request: GetUploadRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<UploadSession, Error> {
         let summary = self
             .blob_store
             .upload_summary(&request.namespace, &request.session_id)
             .await?;
 
-        Ok(build_response(
-            StatusCode::NO_CONTENT,
-            server::upload_progress_headers(
-                &request.namespace,
-                &request.session_id,
-                summary.size,
-                None,
-            )?,
-            ResponseBody::empty(),
-        )?)
+        Ok(UploadSession {
+            namespace: request.namespace,
+            session_id: request.session_id,
+            received: summary.size,
+        })
     }
 }
 
@@ -704,6 +690,8 @@ mod tests {
                     Cursor::new(Vec::new()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::ACCEPTED);
             assert_eq!(
@@ -729,6 +717,8 @@ mod tests {
                     Cursor::new(Vec::new()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             assert_eq!(
                 response.status(),
@@ -756,6 +746,8 @@ mod tests {
                     Cursor::new(Vec::new()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
             assert_eq!(response_digest(&response), digest);
@@ -796,6 +788,8 @@ mod tests {
                     Some(source.clone()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -843,6 +837,8 @@ mod tests {
                     Some(source.clone()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(
@@ -896,6 +892,8 @@ mod tests {
                     Some(source.clone()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(
@@ -936,6 +934,8 @@ mod tests {
                     Some(owner.clone()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(
@@ -980,6 +980,8 @@ mod tests {
                     Some(source.clone()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(
@@ -1023,6 +1025,8 @@ mod tests {
                     Some(authorized.clone()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(
@@ -1126,6 +1130,8 @@ mod tests {
                     stream,
                 )
                 .await
+                .unwrap()
+                .into_open_response()
                 .unwrap();
             assert_eq!(
                 *response_header(&response, &RANGE),
@@ -1148,6 +1154,8 @@ mod tests {
                     stream,
                 )
                 .await
+                .unwrap()
+                .into_open_response()
                 .unwrap();
             assert_eq!(
                 *response_header(&response, &RANGE),
@@ -1264,6 +1272,8 @@ mod tests {
                     empty_stream,
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(response_digest(&response), expected_digest);
@@ -1313,6 +1323,8 @@ mod tests {
                         Cursor::new(content.to_vec()),
                     )
                     .await
+                    .unwrap()
+                    .into_response()
                     .unwrap();
 
                 assert_eq!(response_digest(&response), expected_digest);
@@ -1379,7 +1391,9 @@ mod tests {
                 Cursor::new(content.to_vec()),
             )
             .await
-            .expect("retrying a completed PUT must stay idempotent");
+            .expect("retrying a completed PUT must stay idempotent")
+            .into_response()
+            .unwrap();
 
         assert_eq!(response_digest(&response), digest);
     }
@@ -1441,6 +1455,8 @@ mod tests {
                     Cursor::new(Vec::new()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(response_digest(&response), expected_digest);
@@ -1592,7 +1608,9 @@ mod tests {
                     Cursor::new(content.to_vec()),
                 )
                 .await
-                .expect("a chunk matching its window must commit");
+                .expect("a chunk matching its window must commit")
+                .into_open_response()
+                .unwrap();
 
             assert_eq!(response.status(), StatusCode::ACCEPTED);
         })
@@ -1622,7 +1640,9 @@ mod tests {
                     Cursor::new(Vec::new()),
                 )
                 .await
-                .expect("an empty single-POST body must close the upload");
+                .expect("an empty single-POST body must close the upload")
+                .into_response()
+                .unwrap();
 
             assert_eq!(response.status(), StatusCode::CREATED);
             assert!(registry.blob_store.read(&digest).await.unwrap().is_empty());
@@ -1654,6 +1674,8 @@ mod tests {
                     Cursor::new(content.to_vec()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -1742,6 +1764,8 @@ mod tests {
                     Cursor::new(Vec::new()),
                 )
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
 
             assert_eq!(response_digest(&response), expected_digest);
@@ -1893,6 +1917,8 @@ mod tests {
                 Cursor::new(Vec::new()),
             )
             .await
+            .unwrap()
+            .into_response()
             .unwrap();
 
         assert_eq!(response_digest(&response), expected_digest);
@@ -2097,6 +2123,8 @@ mod tests {
                     session_id: session_id.clone(),
                 })
                 .await
+                .unwrap()
+                .into_status_response()
                 .unwrap();
             assert_eq!(*response_header(&response, &RANGE), "0-0");
 
@@ -2120,6 +2148,8 @@ mod tests {
                     session_id: session_id.clone(),
                 })
                 .await
+                .unwrap()
+                .into_status_response()
                 .unwrap();
             assert_eq!(
                 *response_header(&response, &RANGE),

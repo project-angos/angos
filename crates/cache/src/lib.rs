@@ -3,7 +3,7 @@ use serde::{Serialize, de::DeserializeOwned};
 mod config;
 mod error;
 pub mod memory;
-mod redis_backend;
+pub mod redis_backend;
 #[cfg(any(test, feature = "test-util"))]
 pub mod stub;
 

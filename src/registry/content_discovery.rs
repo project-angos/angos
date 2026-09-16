@@ -1,33 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
-use http::{Response, StatusCode};
 use tracing::{instrument, warn};
 
+use angos_docker_extension_service::{Catalog, CatalogRequest, NamespaceVisibility};
+use angos_oci::client;
 use angos_oci::request::{GetReferrersRequest, ListTagsRequest};
 use angos_oci::response::TagsListResponse;
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace};
-use angos_oci::{client, server};
+use angos_oci_service::{Referrers, Tags};
 use angos_storage::Page;
-use serde::{Deserialize, Serialize};
 
-use crate::{
-    http_response::{ResponseBody, build_response},
-    registry::{Error, Registry, Repository, metadata_store::LinkKind, pagination},
-};
-
-/// The catalog is a Docker Registry V2 endpoint the OCI distribution spec does
-/// not define, so its shapes live here rather than in the protocol crate.
-#[derive(Debug)]
-pub struct ListCatalogRequest {
-    pub n: Option<u16>,
-    pub last: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CatalogResponse {
-    pub repositories: Vec<Namespace>,
-}
+use crate::registry::{Error, Registry, Repository, metadata_store::LinkKind, pagination};
 
 /// Whether `referrer` passes a listing's `artifactType` filter.
 fn matches_filter(referrer: &Descriptor, artifact_type: Option<&MediaType>) -> bool {
@@ -43,40 +27,34 @@ pub const DEFAULT_PAGE_SIZE: u16 = 100;
 
 impl Registry {
     /// One page of namespaces the caller may list, advertising the next through
-    /// the `Link` header while the listing is not exhausted. `keep` drops the
-    /// entries the caller's access policy hides.
+    /// the `Link` header while the listing is not exhausted. `visibility` drops
+    /// the entries the caller's access policy hides.
     pub async fn list_catalog_entries(
         &self,
-        request: ListCatalogRequest,
-        keep: impl Fn(&Namespace) -> bool,
-    ) -> Result<Response<ResponseBody>, Error> {
+        request: CatalogRequest,
+        visibility: &dyn NamespaceVisibility,
+    ) -> Result<Catalog, Error> {
         let n = request.n.unwrap_or(DEFAULT_PAGE_SIZE);
         let page = self.metadata_store.list_namespaces(n, request.last).await?;
         // The `Link` cursor tracks the raw page, so a page filtered below `n`
         // (or to empty) while entries remain still advances; the client follows
         // `Link` until it is absent.
-        let link = page
+        let next = page
             .next_token
             .as_ref()
             .map(|last| format!("/v2/_catalog?n={n}&last={last}"));
+        let repositories = page
+            .items
+            .into_iter()
+            .filter(|ns| visibility.allows(ns))
+            .collect();
 
-        let body = CatalogResponse {
-            repositories: page.items.into_iter().filter(|ns| keep(ns)).collect(),
-        };
-
-        Ok(build_response(
-            StatusCode::OK,
-            server::paginated_json_headers(link.as_deref())?,
-            ResponseBody::fixed(serde_json::to_vec(&body)?),
-        )?)
+        Ok(Catalog { repositories, next })
     }
 
     /// One page of a namespace's tags, advertising the next through the `Link`
     /// header while the listing is not exhausted.
-    pub async fn list_tag_entries(
-        &self,
-        request: ListTagsRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn list_tag_entries(&self, request: ListTagsRequest) -> Result<Tags, Error> {
         let n = request.n.unwrap_or(DEFAULT_PAGE_SIZE);
         let page = self
             .metadata_store
@@ -105,16 +83,12 @@ impl Registry {
             )
         });
 
-        let body = TagsListResponse {
+        let list = TagsListResponse {
             name: Some(request.namespace.clone()),
             tags: page.items.iter().map(ToString::to_string).collect(),
         };
 
-        Ok(build_response(
-            StatusCode::OK,
-            server::paginated_json_headers(link.as_deref())?,
-            ResponseBody::fixed(serde_json::to_vec(&body)?),
-        )?)
+        Ok(Tags { list, next: link })
     }
 
     /// One page of a subject's referrers, served as the OCI image index that
@@ -123,7 +97,7 @@ impl Registry {
     pub async fn get_referrers(
         &self,
         mut request: GetReferrersRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<Referrers, Error> {
         let upstream = self
             .get_repository_for_namespace(&request.namespace)
             .ok()
@@ -133,18 +107,18 @@ impl Registry {
 
         // The request carries its filter into the next page: dropping it would
         // answer a different question halfway through a client's walk.
-        let link = page.next_token.map(|last| {
+        let next = page.next_token.map(|last| {
             request.last = Some(last);
             client::referrers_path("", &request)
         });
 
-        let body = Manifest::oci_index(page.items);
+        let index = Manifest::oci_index(page.items);
 
-        Ok(build_response(
-            StatusCode::OK,
-            server::referrers_headers(filtered, link.as_deref())?,
-            ResponseBody::fixed(serde_json::to_vec(&body)?),
-        )?)
+        Ok(Referrers {
+            index,
+            filtered,
+            next,
+        })
     }
 
     /// One page of the request's subject referrers as a sorted descriptor list,
@@ -341,18 +315,19 @@ mod tests {
         matchers::{method, path},
     };
 
+    use angos_docker_extension_service::CatalogRequest;
     use angos_oci::client::next_page_target;
     use angos_oci::request::{GetReferrersRequest, ListTagsRequest};
     use angos_oci::{
         Descriptor, Digest, Manifest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE, Reference, Tag,
     };
+    use angos_transport::ResponseBody;
+    use http::Response;
 
     use crate::{
         registry::{
             Error,
-            content_discovery::{
-                DEFAULT_PAGE_SIZE, ListCatalogRequest, Repository, Response, ResponseBody,
-            },
+            content_discovery::{DEFAULT_PAGE_SIZE, Repository},
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{LinkKind, LinkOperation, MetadataStore},
             repository::Config,
@@ -422,14 +397,16 @@ mod tests {
             let response = test_case
                 .registry()
                 .list_catalog_entries(
-                    ListCatalogRequest {
+                    CatalogRequest {
                         n: None,
                         last: None,
                     },
-                    |_| true,
+                    &|_: &Namespace| true,
                 )
                 .await
-                .expect("an empty registry must serve a catalog, not a miss");
+                .expect("an empty registry must serve a catalog, not a miss")
+                .into_response()
+                .unwrap();
 
             assert!(next_cursor(&response).is_none());
             assert!(catalog(response).await.is_empty());
@@ -469,6 +446,8 @@ mod tests {
                         last,
                     })
                     .await
+                    .unwrap()
+                    .into_response()
                     .unwrap()
             };
 
@@ -546,8 +525,10 @@ mod tests {
 
         loop {
             let response = registry
-                .list_catalog_entries(ListCatalogRequest { n: Some(2), last }, |_| true)
+                .list_catalog_entries(CatalogRequest { n: Some(2), last }, &|_: &Namespace| true)
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             let cursor = next_cursor(&response);
             all_collected.extend(catalog(response).await);
@@ -621,7 +602,9 @@ mod tests {
                 last: None,
             })
             .await
-            .expect("a namespace holding a revision must be served");
+            .expect("a namespace holding a revision must be served")
+            .into_response()
+            .unwrap();
 
         assert!(next_cursor(&response).is_none());
         assert!(
@@ -1164,6 +1147,8 @@ mod tests {
                     last,
                 })
                 .await
+                .unwrap()
+                .into_response()
                 .unwrap();
             let cursor = next_cursor(&response);
             let page = json_strings_at(response, "manifests", "digest").await;

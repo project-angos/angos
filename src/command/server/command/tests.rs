@@ -6,7 +6,6 @@ use std::{
 use tempfile::TempDir;
 
 use crate::metrics_provider::init_for_tests;
-use crate::registry::content_discovery::ListCatalogRequest;
 use crate::{
     command::{
         bootstrap,
@@ -27,6 +26,7 @@ use crate::{
     },
     test_fixtures::client::test_client_config,
 };
+use angos_docker_extension_service::CatalogRequest;
 use angos_secret::Secret;
 
 static CRYPTO_INIT: Once = Once::new();
@@ -221,13 +221,15 @@ async fn test_build_registry_components_integration() {
 
     let response = registry
         .list_catalog_entries(
-            ListCatalogRequest {
+            CatalogRequest {
                 n: None,
                 last: None,
             },
-            |_| true,
+            &|_: &angos_oci::Namespace| true,
         )
         .await
+        .unwrap()
+        .into_response()
         .unwrap();
     let body = response_json(response).await;
     assert!(

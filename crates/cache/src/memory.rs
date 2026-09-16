@@ -15,6 +15,9 @@ use crate::Error;
 /// from one that never expires.
 const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// The map is swept for expired entries every this many operations.
+const CLEANUP_INTERVAL: usize = 1000;
+
 #[derive(Debug)]
 pub struct Backend {
     store: RwLock<HashMap<String, (String, Instant)>>,
@@ -45,7 +48,7 @@ impl Backend {
 
     async fn maybe_cleanup(&self) {
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
-        if count.is_multiple_of(1000) {
+        if count.is_multiple_of(CLEANUP_INTERVAL) {
             self.cleanup_expired().await;
         }
     }
@@ -132,12 +135,11 @@ mod tests {
         assert_eq!(cache.retrieve_value("key").await, Ok(None));
     }
 
-    /// `maybe_cleanup` sweeps the map every 1000th operation. Retrieval already
+    /// `maybe_cleanup` sweeps the map every `CLEANUP_INTERVAL` operations. Retrieval already
     /// filters expired entries, so only the map's own length shows that the
     /// sweep evicted anything rather than the read hiding it.
     #[tokio::test(start_paused = true)]
     async fn test_cleanup_on_counter() {
-        const SWEEP_INTERVAL: usize = 1000;
         const SHORT: usize = 500;
         const LONG: usize = 5;
 
@@ -163,7 +165,7 @@ mod tests {
         );
 
         // Operations so far, one per store; drive the counter to the sweep.
-        for i in 0..(SWEEP_INTERVAL - SHORT - LONG) {
+        for i in 0..(CLEANUP_INTERVAL - SHORT - LONG) {
             let _ = cache.retrieve_value(&format!("nonexistent_{i}")).await;
         }
         assert_eq!(

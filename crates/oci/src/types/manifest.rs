@@ -2,6 +2,7 @@ use std::{collections::HashMap, mem};
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::constants::IN_TOTO_PREDICATE_TYPE;
 use crate::types::{Descriptor, Digest, Error, MediaType};
 
 /// OCI image-spec manifest `schemaVersion`. Pinned on ingress by
@@ -250,12 +251,27 @@ fn declares_both_shapes(raw: &serde_json::Value) -> bool {
     image && non_empty_array("manifests")
 }
 
+impl Manifest {
+    /// The in-toto predicate type annotation from the first layer carrying
+    /// one; `None` for an index, or an image whose layers carry none.
+    #[must_use]
+    pub fn in_toto_predicate_type(&self) -> Option<&str> {
+        let Content::Image { layers, .. } = &self.content else {
+            return None;
+        };
+        layers
+            .iter()
+            .find_map(|layer| layer.annotations.get(IN_TOTO_PREDICATE_TYPE))
+            .map(String::as_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
     use crate::types::Digest;
-    use crate::types::constants::OCI_INDEX_MEDIA_TYPE;
+    use crate::types::constants::{IN_TOTO_PREDICATE_TYPE, OCI_INDEX_MEDIA_TYPE};
     use crate::types::manifest::*;
 
     const VALID_HASH: &str = "99c9d5e2bdc7ef0223f56c845a695ea0f8f11f5b55ea6f74e1f7df0d4f90026c";
@@ -717,5 +733,67 @@ mod tests {
         .unwrap();
         let manifest = Manifest::from_pushed(&body, None).expect("a config-less image must parse");
         assert!(matches!(manifest.content, Content::Image { .. }));
+    }
+
+    #[test]
+    fn in_toto_predicate_type_is_none_for_an_index() {
+        let manifest = manifest_with_layer_annotations(None);
+        assert_eq!(manifest.in_toto_predicate_type(), None);
+    }
+
+    #[test]
+    fn in_toto_predicate_type_is_none_when_no_layer_carries_one() {
+        let manifest = manifest_with_layer_annotations(Some(vec![HashMap::from([(
+            "some.other.key".to_string(),
+            "value".to_string(),
+        )])]));
+        assert_eq!(manifest.in_toto_predicate_type(), None);
+    }
+
+    #[test]
+    fn in_toto_predicate_type_takes_the_first_layer_carrying_one() {
+        let manifest = manifest_with_layer_annotations(Some(vec![
+            HashMap::from([(
+                IN_TOTO_PREDICATE_TYPE.to_string(),
+                "https://slsa.dev/provenance/v0.2".to_string(),
+            )]),
+            HashMap::from([(
+                IN_TOTO_PREDICATE_TYPE.to_string(),
+                "https://slsa.dev/provenance/v1".to_string(),
+            )]),
+        ]));
+        assert_eq!(
+            manifest.in_toto_predicate_type(),
+            Some("https://slsa.dev/provenance/v0.2"),
+        );
+    }
+
+    /// `None` builds an index, `Some` an image with one layer per annotation map.
+    fn manifest_with_layer_annotations(layers: Option<Vec<HashMap<String, String>>>) -> Manifest {
+        let content = match layers {
+            None => Content::Index { manifests: vec![] },
+            Some(layers) => Content::Image {
+                config: None,
+                layers: layers
+                    .into_iter()
+                    .map(|annotations| Descriptor {
+                        media_type: MediaType::new(MEDIA_TYPE_CONFIG).unwrap(),
+                        digest: valid_digest(),
+                        size: 1,
+                        annotations,
+                        artifact_type: None,
+                        platform: None,
+                    })
+                    .collect(),
+            },
+        };
+        Manifest {
+            schema_version: OCI_MANIFEST_SCHEMA_VERSION,
+            media_type: None,
+            subject: None,
+            annotations: HashMap::new(),
+            artifact_type: None,
+            content,
+        }
     }
 }
