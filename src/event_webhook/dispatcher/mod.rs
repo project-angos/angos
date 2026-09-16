@@ -28,8 +28,8 @@ use crate::{
         event::{Event, EventKind},
     },
     metrics_provider::metrics_provider,
-    secret::Secret,
 };
+use angos_secret::Secret;
 
 pub struct EventDispatcher {
     endpoints: HashMap<String, WebhookEndpoint>,

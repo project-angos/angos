@@ -7,11 +7,68 @@
 //! operations names a session by [`UploadSessionId`].
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
+use serde::ser::{SerializeMap, Serializer};
 
 use crate::types::http_range::{ByteWindow, RequestRange};
 use crate::types::{
     Algorithm, Digest, MediaRange, MediaType, Namespace, Reference, Tag, UploadSessionId,
 };
+
+/// What a manifest PUT writes: a by-tag push targets a single tag, while a
+/// by-digest push targets the digest and may create extra tags via `?tag=`
+/// query parameters. Modeling both as one enum keeps the illegal "tag reference
+/// with extra tags" state unrepresentable.
+#[derive(Clone, Debug)]
+pub enum ManifestPutTarget {
+    Tag(Tag),
+    Digest { digest: Digest, tags: Vec<Tag> },
+}
+
+impl ManifestPutTarget {
+    /// The reference this push addresses.
+    #[must_use]
+    pub fn reference(&self) -> Reference {
+        match self {
+            Self::Tag(tag) => Reference::Tag(tag.clone()),
+            Self::Digest { digest, .. } => Reference::Digest(digest.clone()),
+        }
+    }
+
+    /// Every tag this push creates: the path tag for a by-tag push, or the
+    /// `?tag=` query parameters for a by-digest push.
+    #[must_use]
+    pub fn created_tags(&self) -> &[Tag] {
+        match self {
+            Self::Tag(tag) => std::slice::from_ref(tag),
+            Self::Digest { tags, .. } => tags,
+        }
+    }
+
+    /// Decompose into the addressed reference and the extra `?tag=` tags (empty
+    /// for a by-tag push, whose only tag is the reference itself).
+    #[must_use]
+    pub fn into_parts(self) -> (Reference, Vec<Tag>) {
+        match self {
+            Self::Tag(tag) => (Reference::Tag(tag), Vec::new()),
+            Self::Digest { digest, tags } => (Reference::Digest(digest), tags),
+        }
+    }
+}
+
+impl Serialize for ManifestPutTarget {
+    /// Project the push target onto the policy input: `tags` always lists every
+    /// tag the push creates (empty for a bare by-digest push), and `digest` is
+    /// added for a by-digest push.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Self::Digest { digest, .. } = self {
+            map.serialize_entry("digest", digest)?;
+        }
+        map.serialize_entry("tags", self.created_tags())?;
+        map.end()
+    }
+}
 
 #[derive(Debug)]
 pub struct ListTagsRequest {

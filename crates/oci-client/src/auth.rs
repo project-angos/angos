@@ -8,16 +8,13 @@ use reqwest::{
 use serde::Deserialize;
 use url::Url;
 
-use crate::registry_client::{Error, RegistryClient, parse_header};
+use crate::{Error, RegistryClient, parse_header};
 
 fn authority_for_cache_key(url: &Url) -> Result<&str, Error> {
     url.host_str()
         .ok_or_else(|| Error::Internal("Response URL is missing host authority".to_string()))
 }
 
-/// The credential a cached token was minted for. Clients share one cache, so
-/// without this two of them configured against the same registry and scope
-/// would serve each other's bearer tokens and act as the wrong identity.
 /// TTL for a URL index entry written on a scope-cache hit, where the token's
 /// own remaining lifetime is not observable. Overshooting is harmless: a
 /// dangling entry costs one cache read before the normal challenge path.
@@ -259,15 +256,11 @@ mod tests {
     use url::Url;
 
     use crate::{
-        auth::{TokenIssuer, token_service::Config as TokenServiceConfig},
-        registry_client::{
-            Error,
-            auth::{
-                BearerToken, authority_for_cache_key, parse_bearer_challenge, realm_scheme_ok,
-                token_cache_key, token_index_cache_key,
-            },
+        Error,
+        auth::{
+            BearerToken, authority_for_cache_key, parse_bearer_challenge, realm_scheme_ok,
+            token_cache_key, token_index_cache_key,
         },
-        secret::Secret,
     };
 
     #[test]
@@ -321,15 +314,13 @@ mod tests {
     /// quoted values and an absolute realm.
     #[test]
     fn the_servers_own_challenge_parses_back() {
-        let config = TokenServiceConfig {
-            secret_key: Secret::new(vec![7; 32].into()),
-            realm: None,
-            ttl_secs: 3600,
-        };
-        let issuer = TokenIssuer::new(&config).unwrap();
-        let challenge = issuer.challenge("https", "registry.example.com").unwrap();
+        // The exact WWW-Authenticate the server's token issuer emits (see its
+        // `build_challenge`): realm and service rebuilt from the parsed parts,
+        // both quoted. This closes the loop that the client parser accepts it.
+        let challenge =
+            r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#;
 
-        let parsed = parse_bearer_challenge(challenge.to_str().unwrap()).unwrap();
+        let parsed = parse_bearer_challenge(challenge).unwrap();
 
         assert_eq!(parsed.realm, "https://registry.example.com/token");
         // The path the router serves, so a client following the challenge lands

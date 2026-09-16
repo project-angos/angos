@@ -25,8 +25,8 @@ use crate::{
     auth::{AuthMiddleware, AuthResult, Error, authorization::bearer_token},
     configuration::Base64String,
     identity::{ClientIdentity, OidcClaims},
-    secret::Secret,
 };
+use angos_secret::Secret;
 
 /// Shortest HMAC key accepted, in decoded bytes, matching the HS256 hash output
 /// RFC 7518 requires. Every issued token is a public value handed to a CI job,

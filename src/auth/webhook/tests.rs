@@ -11,6 +11,8 @@ use wiremock::{
 use angos_oci::{Namespace, Reference, Tag};
 
 use crate::metrics_provider::init_for_tests;
+use angos_cache::Cache;
+
 use crate::{
     auth::Error,
     auth::webhook::{
@@ -18,15 +20,14 @@ use crate::{
         config::WebhookAuth,
         headers::{build_header_name, build_header_value, build_headers},
     },
-    cache::{self, Cache},
-    http_client::apply_tls_files,
     identity::{Action, ClientIdentity, RequestScheme},
-    secret::Secret,
     test_fixtures::{
         requests::parts_with_uri,
         webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
     },
 };
+use angos_mtls_client::MtlsClientBuilder;
+use angos_secret::Secret;
 
 #[test]
 fn test_config_deserialize() {
@@ -252,17 +253,17 @@ fn build_test_config(
 }
 
 fn build_test_client(config: &Config) -> Result<Client, String> {
-    apply_tls_files(
-        Client::builder()
-            .use_rustls_tls()
-            .redirect(Policy::none())
-            .timeout(Duration::from_millis(config.timeout_ms)),
-        config.server_ca_bundle.as_deref(),
-        config.client_certificate_bundle.as_deref(),
-        config.client_private_key.as_deref(),
-    )?
-    .build()
-    .map_err(|e| format!("Failed to create HTTP client: {e}"))
+    MtlsClientBuilder::new()
+        .with_redirect_policy(Policy::none())
+        .with_timeout(Duration::from_millis(config.timeout_ms))
+        .with_server_ca_bundle(config.server_ca_bundle.as_deref())
+        .with_client_certificate(
+            config
+                .client_certificate_bundle
+                .as_deref()
+                .zip(config.client_private_key.as_deref()),
+        )
+        .build()
 }
 
 fn build_test_webhook(
@@ -296,7 +297,7 @@ fn test_new_invalid_mtls() {
     let webhook = build_test_webhook(
         "test".to_string(),
         config,
-        cache::Config::Memory.to_backend().unwrap(),
+        angos_cache::Config::Memory.to_backend().unwrap(),
     );
 
     assert!(matches!(webhook, Err(Error::Initialization(_))));
@@ -313,7 +314,7 @@ fn test_new_rejects_incomplete_mtls_config() {
     let webhook = build_test_webhook(
         "test".to_string(),
         config,
-        cache::Config::Memory.to_backend().unwrap(),
+        angos_cache::Config::Memory.to_backend().unwrap(),
     );
 
     assert!(
@@ -342,7 +343,7 @@ fn test_new_mtls() {
     let webhook = build_test_webhook(
         "test".to_string(),
         config,
-        cache::Config::Memory.to_backend().unwrap(),
+        angos_cache::Config::Memory.to_backend().unwrap(),
     );
 
     assert!(webhook.is_ok());
@@ -354,7 +355,7 @@ fn test_new_simple() {
     let webhook = build_test_webhook(
         "test".to_string(),
         config,
-        cache::Config::Memory.to_backend().unwrap(),
+        angos_cache::Config::Memory.to_backend().unwrap(),
     );
 
     assert!(webhook.is_ok());
@@ -372,7 +373,7 @@ async fn test_authorize_success() {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
@@ -395,7 +396,7 @@ async fn test_authorize_denied() {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
@@ -421,7 +422,7 @@ async fn test_authorize_with_bearer_token() {
         "test-token".to_string(),
     )));
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
@@ -448,7 +449,7 @@ async fn test_authorize_with_basic_auth() {
         password: Secret::new("testpass".to_string()),
     });
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
@@ -471,7 +472,7 @@ async fn test_authorize_sends_correct_headers() {
         .await;
 
     let config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
@@ -500,7 +501,7 @@ async fn test_authorize_uses_cache() {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
@@ -517,7 +518,7 @@ async fn test_authorize_returns_err_on_unreachable_url() {
     let mut config = build_test_config(Url::parse("http://127.0.0.1:1").unwrap(), None, None, None);
     config.auth = None;
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
@@ -552,7 +553,7 @@ async fn test_authorize_does_not_cache_transport_errors() {
     let mut unreachable_config =
         build_test_config(Url::parse("http://127.0.0.1:1").unwrap(), None, None, None);
     unreachable_config.auth = None;
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let unreachable_webhook =
         build_test_webhook("test".to_string(), unreachable_config, cache.clone()).unwrap();
 
@@ -584,7 +585,7 @@ async fn test_authorize_does_not_cache_transport_errors() {
 fn build_webhook_against(mock_server: &MockServer) -> WebhookAuthorizer {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     build_test_webhook("test".to_string(), config, cache).unwrap()
 }
 
@@ -702,7 +703,7 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
-    let failing_backend = cache::stub::Backend::new();
+    let failing_backend = angos_cache::stub::Backend::new();
     failing_backend.set_store_error(Some("injected store failure".to_string()));
     let failing_cache = Arc::new(Cache::Stub(failing_backend.clone()));
     let webhook = build_test_webhook("test".to_string(), config, failing_cache.clone()).unwrap();
@@ -734,7 +735,7 @@ async fn test_authorize_timeout_does_not_cache_and_retries() {
         .mount(&slow_server)
         .await;
 
-    let shared_cache = cache::Config::Memory.to_backend().unwrap();
+    let shared_cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     // First call: very short timeout causes a transport error.
     let slow_webhook = build_test_webhook(
@@ -795,7 +796,7 @@ async fn test_authorize_cache_entry_expires_and_refetches() {
         .mount(&mock_server)
         .await;
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let webhook = build_test_webhook(
         "test".to_string(),
         build_test_config_with(Url::parse(&mock_server.uri()).unwrap(), 1000, 1),

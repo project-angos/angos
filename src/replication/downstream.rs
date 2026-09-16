@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use angos_oci::{Error, Namespace};
 
-use crate::registry_client::RegistryClient;
+use angos_oci_client::RegistryClient;
 
 /// Whether a downstream participates in the event-driven push path, the scrub
 /// reconciliation path, or both.
@@ -115,14 +115,13 @@ mod tests {
     use regex::Regex;
 
     use crate::{
-        cache,
         registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        registry_client::RegistryClient,
         replication::{ReplicationDownstream, ReplicationMode},
     };
+    use angos_oci_client::RegistryClient;
 
     fn test_client() -> Arc<RegistryClient> {
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         Arc::new(RegistryClient::new(
             "https://example.test".to_string(),
             reqwest::Client::new(),

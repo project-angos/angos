@@ -1,16 +1,14 @@
 use std::{fmt, sync::Arc};
 
-use http::{
-    Response, StatusCode,
-    header::{HeaderName, HeaderValue},
-};
 use tracing::instrument;
 
 pub mod admin;
+mod angos_extension;
 pub mod blob;
 pub mod blob_ownership;
 pub mod blob_store;
 pub mod content_discovery;
+mod docker_extension;
 mod error;
 #[cfg(test)]
 mod event_emission_tests;
@@ -18,6 +16,7 @@ pub mod keys;
 pub mod layers;
 pub mod manifest;
 pub mod metadata_store;
+mod oci_service;
 pub mod pagination;
 pub mod repository;
 pub mod repository_resolver;
@@ -26,14 +25,11 @@ pub mod s3_connection;
 pub mod test_utils;
 pub mod upload;
 
-use angos_oci::server;
 use angos_oci::{Namespace, Reference, Tag};
 
 use crate::{
-    cache,
     configuration::RegexPattern,
     event_webhook::{dispatcher::EventDispatcher, event::Event},
-    http_response::{ResponseBody, build_response},
     jobs::store::JobStore,
     metrics_provider::metrics_provider,
     registry::{
@@ -41,13 +37,8 @@ use crate::{
         repository_resolver::RepositoryResolver,
     },
 };
-pub use admin::{DeleteJobRequest, ListJobsRequest, ListPullsRequest, RetryJobRequest};
 pub use error::Error;
 pub use repository::Repository;
-
-/// Angos's own response header, alongside the distribution API's own names in
-/// [`angos_oci::header`].
-pub const X_POWERED_BY: HeaderName = HeaderName::from_static("x-powered-by");
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
@@ -123,16 +114,13 @@ impl fmt::Debug for Registry {
     }
 }
 
-/// The OCI API version this registry speaks, served on `/v2/`.
-pub fn api_version() -> Result<Response<ResponseBody>, Error> {
-    let mut headers = server::api_version_headers();
-    headers.insert(X_POWERED_BY, HeaderValue::from_static("Angos"));
-
-    Ok(build_response(
-        StatusCode::OK,
-        headers,
-        ResponseBody::empty(),
-    )?)
+/// The OCI API version this registry speaks, served on `/v2/`, branded with
+/// `X-Powered-By: Angos`.
+#[must_use]
+pub fn api_version() -> angos_oci_service::ApiVersion {
+    angos_oci_service::ApiVersion {
+        powered_by: Some("Angos".to_string()),
+    }
 }
 
 impl Registry {
@@ -174,6 +162,13 @@ impl Registry {
     /// registry's own operations.
     pub fn metadata_store(&self) -> &MetadataStore {
         &self.metadata_store
+    }
+
+    /// The read-buffer size each frame of a streamed blob body is filled from,
+    /// which the transport passes when rendering a [`BlobGet`](angos_oci_service::BlobGet).
+    #[must_use]
+    pub fn blob_stream_frame_size(&self) -> usize {
+        self.blob_stream_frame_size
     }
 
     #[instrument(skip(blob_store, metadata_store, resolver, config))]
@@ -415,17 +410,18 @@ mod immutable_tag_tests {
 mod api_version_tests {
     use angos_oci::header::DOCKER_DISTRIBUTION_API_VERSION;
 
+    use crate::registry::api_version;
     use crate::registry::test_utils::response_header;
-    use crate::registry::{X_POWERED_BY, api_version};
 
     #[test]
     fn api_version_announces_the_v2_protocol() {
-        let response = api_version().unwrap();
+        let response = api_version().into_response().unwrap();
 
         assert_eq!(
             *response_header(&response, &DOCKER_DISTRIBUTION_API_VERSION),
             "registry/2.0"
         );
-        assert_eq!(*response_header(&response, &X_POWERED_BY), "Angos");
+        let powered_by = http::header::HeaderName::from_static("x-powered-by");
+        assert_eq!(*response_header(&response, &powered_by), "Angos");
     }
 }

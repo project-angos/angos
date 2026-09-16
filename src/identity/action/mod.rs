@@ -1,8 +1,7 @@
-use std::slice;
+use serde::Serialize;
 
-use serde::{Serialize, Serializer, ser::SerializeMap};
-
-use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, Tag, UploadSessionId};
+use angos_oci::request::ManifestPutTarget;
+use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, UploadSessionId};
 
 use crate::jobs::{JobState, Queue};
 
@@ -239,58 +238,6 @@ pub enum Action {
     },
 }
 
-/// What a manifest PUT writes: a by-tag push targets a single tag, while a
-/// by-digest push targets the digest and may create extra tags via `?tag=`
-/// query parameters. Modeling both as one enum keeps the illegal "tag reference
-/// with extra tags" state unrepresentable.
-#[derive(Clone, Debug)]
-pub enum ManifestPutTarget {
-    Tag(Tag),
-    Digest { digest: Digest, tags: Vec<Tag> },
-}
-
-impl ManifestPutTarget {
-    /// The reference this push addresses.
-    pub fn reference(&self) -> Reference {
-        match self {
-            Self::Tag(tag) => Reference::Tag(tag.clone()),
-            Self::Digest { digest, .. } => Reference::Digest(digest.clone()),
-        }
-    }
-
-    /// Every tag this push creates: the path tag for a by-tag push, or the
-    /// `?tag=` query parameters for a by-digest push.
-    pub fn created_tags(&self) -> &[Tag] {
-        match self {
-            Self::Tag(tag) => slice::from_ref(tag),
-            Self::Digest { tags, .. } => tags,
-        }
-    }
-
-    /// Decompose into the addressed reference and the extra `?tag=` tags (empty
-    /// for a by-tag push, whose only tag is the reference itself).
-    pub fn into_parts(self) -> (Reference, Vec<Tag>) {
-        match self {
-            Self::Tag(tag) => (Reference::Tag(tag), Vec::new()),
-            Self::Digest { digest, tags } => (Reference::Digest(digest), tags),
-        }
-    }
-}
-
-impl Serialize for ManifestPutTarget {
-    /// Project the push target onto the CEL policy input: `tags` always lists
-    /// every tag the push creates (empty for a bare by-digest push), and
-    /// `digest` is added for a by-digest push.
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        if let Self::Digest { digest, .. } = self {
-            map.serialize_entry("digest", digest)?;
-        }
-        map.serialize_entry("tags", self.created_tags())?;
-        map.end()
-    }
-}
-
 struct ActionData<'a> {
     namespace: Option<&'a Namespace>,
     digest: Option<&'a Digest>,
@@ -308,52 +255,6 @@ impl ActionData<'_> {
 }
 
 impl Action {
-    /// The namespace a pull addresses, mutably, so the proxy `?ns=` parameter
-    /// can resolve it to the repository mirroring that registry before
-    /// authorization reads it.
-    ///
-    /// `None` for everything else: the spec defines the parameter on pull
-    /// operations, so a write naming one is left addressing the namespace it
-    /// spelled out.
-    pub fn pull_namespace_mut(&mut self) -> Option<&mut Namespace> {
-        match self {
-            Action::GetBlob { namespace, .. }
-            | Action::HeadBlob { namespace, .. }
-            | Action::GetManifest { namespace, .. }
-            | Action::HeadManifest { namespace, .. }
-            | Action::ListTags { namespace, .. }
-            | Action::GetReferrer { namespace, .. } => Some(namespace),
-            Action::UiAsset { .. }
-            | Action::UiConfig
-            | Action::Token
-            | Action::Healthz
-            | Action::Readyz
-            | Action::Metrics
-            | Action::ApiVersion
-            | Action::ListCatalog { .. }
-            | Action::StartUpload { .. }
-            | Action::MountBlob { .. }
-            | Action::GetUpload { .. }
-            | Action::PatchUpload { .. }
-            | Action::PutUpload { .. }
-            | Action::DeleteUpload { .. }
-            | Action::DeleteBlob { .. }
-            | Action::PutManifest { .. }
-            | Action::DeleteManifest { .. }
-            | Action::ListRevisions { .. }
-            | Action::ListUploads { .. }
-            | Action::ListPulls { .. }
-            | Action::ListRepositories
-            | Action::ListNamespaces { .. }
-            | Action::ListJobs { .. }
-            | Action::ListFailedJobs { .. }
-            | Action::RetryJob { .. }
-            | Action::DeleteJob { .. }
-            | Action::ListLayerEntries { .. }
-            | Action::GetLayerFile { .. } => None,
-        }
-    }
-
     /// Returns the action name string as used in CEL policies and webhook headers.
     pub fn action_name(&self) -> &'static str {
         match self {

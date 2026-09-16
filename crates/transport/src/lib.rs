@@ -1,6 +1,8 @@
-//! Response construction shared by the registry, which builds the responses to
-//! its own operations, and the server surface, which builds the ones that never
-//! reach the registry (errors, tokens, UI assets, probes).
+//! The HTTP transport layer: the hyper response body and its builders, the one
+//! place in the workspace allowed to own hyper. Every HTTP surface renders
+//! through it, the OCI service and extension crates that answer the protocol's
+//! own operations as much as the server surface that answers the ones which
+//! never reach the registry (errors, tokens, UI assets, probes).
 
 use std::{
     fmt, io,
@@ -8,10 +10,9 @@ use std::{
     task::{Context, Poll},
 };
 
-use angos_oci::header::APPLICATION_JSON;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use http::{HeaderMap, Response, StatusCode, header::CONTENT_TYPE};
+use http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE};
 use http_body_util::{Full, StreamBody};
 use hyper::body::{Body, Frame};
 use serde::Serialize;
@@ -20,17 +21,58 @@ use tokio_util::io::ReaderStream;
 
 type BytesFrameStream = Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, io::Error>> + Send>>;
 
+/// A rendering failure: a header value the spec would carry cannot be built, or
+/// a JSON body cannot be serialized. Both are internal faults the transport
+/// answers `500` for. Shared by every response builder, in the registry and the
+/// service and extension crates alike.
+#[derive(Debug)]
+pub enum RenderError {
+    Header(http::Error),
+    Serialize(serde_json::Error),
+}
+
+impl From<http::header::InvalidHeaderValue> for RenderError {
+    fn from(e: http::header::InvalidHeaderValue) -> Self {
+        RenderError::Header(e.into())
+    }
+}
+
+impl From<http::Error> for RenderError {
+    fn from(e: http::Error) -> Self {
+        RenderError::Header(e)
+    }
+}
+
+impl From<serde_json::Error> for RenderError {
+    fn from(e: serde_json::Error) -> Self {
+        RenderError::Serialize(e)
+    }
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RenderError::Header(e) => write!(f, "response headers: {e}"),
+            RenderError::Serialize(e) => write!(f, "response body: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RenderError {}
+
 /// The headers of a plain JSON response, the shape most non-OCI endpoints
 /// serve.
 pub fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, APPLICATION_JSON);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
     headers
 }
 
 /// A JSON response under [`json_headers`]. Generic over the caller's error so
 /// the registry and the server surface share one builder.
+/// # Errors
+/// Propagates serialization and response-build failures via `E`.
 pub fn json_response<T, E>(status: StatusCode, body: &T) -> Result<Response<ResponseBody>, E>
 where
     T: Serialize,
@@ -50,10 +92,12 @@ pub enum ResponseBody {
 }
 
 impl ResponseBody {
+    #[must_use]
     pub fn empty() -> Self {
         ResponseBody::Empty
     }
 
+    #[must_use]
     pub fn fixed(data: Vec<u8>) -> Self {
         let data = Bytes::from(data);
         ResponseBody::Fixed(Full::new(data))
@@ -98,6 +142,8 @@ impl Body for ResponseBody {
     }
 }
 
+/// # Errors
+/// Fails when the status/headers cannot form a valid response.
 pub fn build_response(
     status: StatusCode,
     headers: HeaderMap,

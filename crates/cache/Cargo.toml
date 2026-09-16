@@ -1,0 +1,23 @@
+[package]
+name = "angos-cache"
+version = "0.1.0"
+edition = "2024"
+
+
+[features]
+# Exposes the failure-injecting stub backend to dependents' tests.
+test-util = []
+
+[dependencies]
+angos-secret = { workspace = true }
+redis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+toml = "1.1.4"

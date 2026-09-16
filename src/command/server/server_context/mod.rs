@@ -8,19 +8,22 @@ use hyper::{
     header::{HOST, HeaderMap, HeaderValue},
     http::{request::Parts, uri::Authority},
 };
+use serde::Deserialize;
 use tracing::instrument;
 
 use angos_oci::request::BlobMount;
 use angos_oci::{Namespace, namespace_belongs_to};
 
+use crate::command::server::router::Route;
+
 use crate::{
     auth::{Authenticator, Authorizer, TokenIssuer},
-    cache::Cache,
-    command::server::{error::Error, router},
+    command::server::error::Error,
     configuration::{Configuration, TrustedProxy},
     identity::{Action, ClientIdentity, RequestScheme},
     registry::{self, Registry},
 };
+use angos_cache::Cache;
 
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,
@@ -81,16 +84,27 @@ impl ServerContext {
     /// repository breaks the namespace length cap.
     pub fn apply_proxy_namespace(
         &self,
-        action: Option<&mut Action>,
+        route: Option<&mut Route>,
         uri: &Uri,
     ) -> Result<Option<String>, Error> {
-        let Some(ns) = router::proxy_namespace(uri) else {
+        // The registry namespace a mirroring client believes it is addressing;
+        // resolving it to a repository needs the configuration, so it happens here.
+        #[derive(Deserialize)]
+        struct NamespaceQuery {
+            ns: Option<String>,
+        }
+
+        let Some(ns) = serde_html_form::from_str::<NamespaceQuery>(uri.query().unwrap_or_default())
+            .ok()
+            .and_then(|query| query.ns)
+            .filter(|ns| !ns.is_empty())
+        else {
             return Ok(None);
         };
         let Some(repository) = self.registry.repository_for_ns(&ns) else {
             return Ok(None);
         };
-        let Some(namespace) = action.and_then(Action::pull_namespace_mut) else {
+        let Some(namespace) = route.and_then(Route::pull_namespace_mut) else {
             return Ok(None);
         };
 

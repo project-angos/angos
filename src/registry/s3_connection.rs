@@ -1,11 +1,11 @@
 //! The S3 connection fields shared by `blob_store`, `metadata_store`, and
-//! `job_store`. Credentials are wrapped in [`crate::secret::Secret`] for
+//! `job_store`. Credentials are wrapped in [`angos_secret::Secret`] for
 //! debug-redaction and zeroize-on-drop.
 
 use serde::Deserialize;
 
-use crate::secret::Secret;
 use angos_s3_client::BackendConfig as S3TransportConfig;
+use angos_secret::Secret;
 
 /// `User-Agent` the S3 transport advertises
 const USER_AGENT: &str = concat!("angos/", env!("CARGO_PKG_VERSION"));

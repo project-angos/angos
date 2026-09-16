@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use crate::cache::Error;
+use crate::Error;
 
 /// Test-only cache backend with controllable failure injection and call counts.
 ///
@@ -20,6 +20,12 @@ struct Storage {
     data: Option<String>,
     retrieve_error: Option<String>,
     store_error: Option<String>,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Backend {

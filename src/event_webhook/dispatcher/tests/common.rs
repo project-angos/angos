@@ -13,8 +13,8 @@ use crate::{
         event::{Event, EventKind},
     },
     metrics_provider,
-    secret::Secret,
 };
+use angos_secret::Secret;
 
 const TEST_DIGEST: &str = "sha256:abc1230000000000000000000000000000000000000000000000000000000000";
 

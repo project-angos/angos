@@ -2,11 +2,19 @@
 members = [
     "contrib/kubelet-credential-provider",
     "crates/backoff",
+    "crates/docker-extension-service",
+    "crates/cache",
     "crates/inflate",
     "crates/conformance-gates",
+    "crates/mtls-client",
     "crates/oci",
+    "crates/oci-client",
+    "crates/oci-service",
+    "crates/angos-extension-service",
     "crates/s3-client",
+    "crates/secret",
     "crates/storage",
+    "crates/transport",
 ]
 
 # Policy: every dependency used by two or more workspace members is declared
@@ -15,10 +23,19 @@ members = [
 # used by a single member stay in that member's manifest.
 [workspace.dependencies]
 angos-backoff = { path = "crates/backoff" }
+angos-docker-extension-service = { path = "crates/docker-extension-service" }
+angos-extension-service = { path = "crates/angos-extension-service" }
+angos-cache = { path = "crates/cache" }
 angos-inflate = { path = "crates/inflate" }
+angos-mtls-client = { path = "crates/mtls-client" }
 angos-oci = { path = "crates/oci" }
+serde_html_form = "0.4.1"
+angos-oci-client = { path = "crates/oci-client" }
+angos-oci-service = { path = "crates/oci-service" }
 angos-s3-client = { path = "crates/s3-client" }
+angos-secret = { path = "crates/secret" }
 angos-storage = { path = "crates/storage" }
+angos-transport = { path = "crates/transport" }
 arc-swap = "1.9.2"
 argh = "0.1.19"
 async-trait = "0.1.92"
@@ -31,6 +48,7 @@ hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
 hyper = "1.11.0"
+http-body-util = "0.1.5"
 redis = { version = "1.5.0", features = ["tokio-comp", "connection-manager"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
@@ -45,7 +63,9 @@ tracing = "0.1.44"
 tracing-opentelemetry = "0.33"
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4"] }
+rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring"] }
 wiremock = "0.6.5"
+zeroize = { version = "1.9.0", features = ["derive"] }
 
 [package]
 name = "angos"
@@ -59,9 +79,17 @@ lto = "fat"
 
 [dependencies]
 angos-backoff = { workspace = true }
+angos-cache = { workspace = true }
 angos-inflate = { workspace = true }
+angos-mtls-client = { workspace = true }
 angos-oci = { workspace = true }
+angos-oci-client = { workspace = true }
+angos-oci-service = { workspace = true, features = ["hyper"] }
+angos-docker-extension-service = { workspace = true, features = ["hyper"] }
+angos-extension-service = { workspace = true, features = ["hyper"] }
+angos-transport = { workspace = true }
 angos-s3-client = { workspace = true }
+angos-secret = { workspace = true }
 angos-storage = { workspace = true }
 arc-swap = { workspace = true }
 argh = { workspace = true }
@@ -75,7 +103,7 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
-http-body-util = "0.1.5"
+http-body-util = { workspace = true }
 humantime = "2.4.0"
 http = { workspace = true }
 hyper = { workspace = true, features = ["full"] }
@@ -91,7 +119,6 @@ opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 # requires both to resolve to the same crate version.
 password-hash = { version = "0.5", features = ["getrandom"] }
 prometheus = "0.14"
-redis = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rpassword = "7.5.4"
@@ -99,7 +126,7 @@ rust-embed = "8.12.0"
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 serde = { workspace = true }
-serde_html_form = "0.4.1"
+serde_html_form = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tar = "0.4.44"
@@ -115,9 +142,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["serde"] }
 x509-parser = "0.18.1"
-zeroize = { version = "1.9.0", features = ["derive"] }
+zeroize = { workspace = true }
 
 [dev-dependencies]
+angos-cache = { workspace = true, features = ["test-util"] }
 angos-oci = { workspace = true, features = ["test-util"] }
 flate2 = "1.1"
 angos-s3-client = { workspace = true, features = ["test-util"] }
@@ -125,5 +153,5 @@ angos-storage = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
 p256 = { version = "0.14.0", features = ["ecdsa", "pem"] }
-rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring"] }
+rcgen = { workspace = true }
 wiremock = { workspace = true }

@@ -7,6 +7,7 @@ use flate2::{Compression, write::GzEncoder};
 use http::StatusCode;
 use http_body_util::BodyExt;
 
+use angos_extension_service::{LayerEntriesRequest, LayerFileRequest};
 use angos_oci::{Digest, Namespace};
 
 use crate::{
@@ -19,7 +20,6 @@ use crate::{
     },
     registry::{
         Registry, RegistryConfig,
-        layers::{LayerEntriesRequest, LayerFileRequest},
         test_utils::{
             fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
         },
@@ -256,14 +256,14 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
         .await
         .unwrap();
 
-    let response = entries(&namespace).await.unwrap();
+    let response = entries(&namespace).await.unwrap().into_response().unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(job_store.count_pending(Queue::Index, 0).await.unwrap(), 1);
     IndexLayerJobHandler::new(stack.blob_store.clone(), stack.metadata_store.clone())
         .index(&digest, false)
         .await
         .unwrap();
-    let response = entries(&namespace).await.unwrap();
+    let response = entries(&namespace).await.unwrap().into_response().unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let listing: crate::layer::Listing = serde_json::from_slice(&body).unwrap();
@@ -277,7 +277,11 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
             download: true,
         })
     };
-    let response = file("usr/bin/hello").await.unwrap();
+    let response = file("usr/bin/hello")
+        .await
+        .unwrap()
+        .into_response(registry.blob_stream_frame_size())
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers()["content-disposition"],
@@ -288,6 +292,8 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
 
     let body = file("usr/bin/hello-again")
         .await
+        .unwrap()
+        .into_response(registry.blob_stream_frame_size())
         .unwrap()
         .into_body()
         .collect()

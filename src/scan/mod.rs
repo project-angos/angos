@@ -28,8 +28,8 @@ use crate::{
         manifest::read_manifest,
         metadata_store::{LinkKind, MetadataStore},
     },
-    secret::Secret,
 };
+use angos_secret::Secret;
 
 pub const SCAN_IMAGE_KIND: &str = "scan.image";
 pub const SARIF_MEDIA_TYPE: &str = "application/sarif+json";

@@ -10,13 +10,13 @@ use angos_oci::request::BlobMount;
 use crate::{
     auth::Error,
     auth::webhook::{self, WebhookAuthorizer},
-    cache::Cache,
     configuration::Configuration,
-    http_client::apply_tls_files,
     identity::{Action, ClientIdentity},
     policy::{AccessPolicy, PolicyDecision},
     registry::{Registry, Repository},
 };
+use angos_cache::Cache;
+use angos_mtls_client::MtlsClientBuilder;
 
 const ACCESS_DENIED: &str = "Access denied";
 
@@ -260,14 +260,16 @@ fn build_webhooks(
 }
 
 fn build_webhook_client(config: &webhook::Config) -> Result<Client, String> {
-    apply_tls_files(
-        Client::builder().use_rustls_tls().redirect(Policy::none()),
-        config.server_ca_bundle.as_deref(),
-        config.client_certificate_bundle.as_deref(),
-        config.client_private_key.as_deref(),
-    )?
-    .build()
-    .map_err(|e| format!("Failed to create HTTP client: {e}"))
+    MtlsClientBuilder::new()
+        .with_redirect_policy(Policy::none())
+        .with_server_ca_bundle(config.server_ca_bundle.as_deref())
+        .with_client_certificate(
+            config
+                .client_certificate_bundle
+                .as_deref()
+                .zip(config.client_private_key.as_deref()),
+        )
+        .build()
 }
 
 fn build_repositories(

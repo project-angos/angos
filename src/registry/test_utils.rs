@@ -15,18 +15,19 @@ use angos_oci::header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID};
 use angos_oci::http_range::RequestRange;
 use angos_oci::request::{CompleteUploadRequest, GetReferrersRequest};
 use angos_oci::{Digest, MediaRange, MediaType, Namespace, Tag, UploadSessionId};
+use angos_oci_client::RegistryClient;
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_s3_client::test_util::{
     TEST_ACCESS_KEY, TEST_BUCKET, TEST_REGION, TEST_SECRET_KEY, test_endpoint,
 };
+use angos_secret::Secret;
 use angos_storage::{
     ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
+use angos_transport::ResponseBody;
 
-use crate::http_response::ResponseBody;
 use crate::registry::keys::DigestKeys;
 use crate::{
-    cache,
     configuration::{GlobalConfig, RegexPattern},
     jobs::Queue,
     jobs::store::{ClaimMode, JobStore},
@@ -40,9 +41,7 @@ use crate::{
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
     },
-    registry_client::RegistryClient,
     replication::{ReplicationDownstream, ReplicationJob},
-    secret::Secret,
 };
 
 /// Connection to the live S3 test backend, single-sourced from the s3-client
@@ -120,7 +119,11 @@ pub fn metadata_store_over_cached(
 ) -> Arc<MetadataStore> {
     Arc::new(
         MetadataStore::builder(object)
-            .cache(cache::Config::Memory.to_backend().expect("memory cache"))
+            .cache(
+                angos_cache::Config::Memory
+                    .to_backend()
+                    .expect("memory cache"),
+            )
             .link_cache_ttl(link_cache_ttl_secs)
             // Tests exercise reclamation immediately; the race tests needing
             // the grace protection set their own.
@@ -287,7 +290,7 @@ pub async fn get_blob(
         .metadata_store()
         .can_read(namespace, digest)
         .await?;
-    registry
+    Ok(registry
         .get_blob_with_access(
             Some(repository),
             accepted_types,
@@ -296,7 +299,8 @@ pub async fn get_blob(
             range,
             has_access,
         )
-        .await
+        .await?
+        .into_response(registry.blob_stream_frame_size())?)
 }
 
 pub async fn create_test_blob(
@@ -544,7 +548,7 @@ impl RegistryTestCase for S3RegistryTestCase {
 /// A `RegistryClient` pointed at `uri` with a fresh in-memory cache; callers
 /// pass a placeholder URI when the client is never dialed.
 pub fn downstream_client(uri: &str) -> Arc<RegistryClient> {
-    let backend = cache::Config::Memory.to_backend().unwrap();
+    let backend = angos_cache::Config::Memory.to_backend().unwrap();
     Arc::new(RegistryClient::new(
         uri.to_string(),
         reqwest::Client::new(),

@@ -7,7 +7,7 @@ use tracing::warn;
 use angos_oci::{Error as OciError, http_range};
 use angos_storage::Error as StorageError;
 
-use crate::{configuration, jobs::store as job_store, policy, registry::cache, registry_client};
+use crate::{configuration, jobs::store as job_store, policy};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -76,7 +76,7 @@ pub enum Error {
     #[error("configuration error during operations: {0}")]
     Configuration(#[from] configuration::Error),
     #[error("cache error during operations: {0}")]
-    Cache(#[from] cache::Error),
+    Cache(#[from] angos_cache::Error),
     #[error("I/O error during operations: {0}")]
     Io(#[from] std::io::Error),
     #[error("HTTP error during operations: {0}")]
@@ -90,6 +90,15 @@ pub enum Error {
 // A raw storage outcome carries no domain context: a call site that knows a
 // miss means a specific blob/upload/manifest 404 must intercept
 // `StorageError::NotFound` before `?` reaches this impl.
+impl From<angos_transport::RenderError> for Error {
+    fn from(error: angos_transport::RenderError) -> Self {
+        match error {
+            angos_transport::RenderError::Header(e) => Error::Http(e),
+            angos_transport::RenderError::Serialize(e) => Error::Serde(e),
+        }
+    }
+}
+
 impl From<StorageError> for Error {
     fn from(error: StorageError) -> Self {
         match error {
@@ -144,20 +153,20 @@ impl From<job_store::Error> for Error {
 
 // Variant for variant, so the pull-through path surfaces a remote miss as the
 // matching local OCI code.
-impl From<registry_client::Error> for Error {
-    fn from(error: registry_client::Error) -> Self {
+impl From<angos_oci_client::Error> for Error {
+    fn from(error: angos_oci_client::Error) -> Self {
         match error {
-            registry_client::Error::Initialization(msg) => Error::Initialization(msg),
-            registry_client::Error::Unauthorized(msg) => Error::Unauthorized(msg),
-            registry_client::Error::Denied(msg) => Error::Denied(msg),
-            registry_client::Error::BlobUnknown => Error::BlobUnknown,
-            registry_client::Error::ManifestUnknown => Error::ManifestUnknown,
-            registry_client::Error::ManifestBodyTooLarge { limit } => {
+            angos_oci_client::Error::Initialization(msg) => Error::Initialization(msg),
+            angos_oci_client::Error::Unauthorized(msg) => Error::Unauthorized(msg),
+            angos_oci_client::Error::Denied(msg) => Error::Denied(msg),
+            angos_oci_client::Error::BlobUnknown => Error::BlobUnknown,
+            angos_oci_client::Error::ManifestUnknown => Error::ManifestUnknown,
+            angos_oci_client::Error::ManifestBodyTooLarge { limit } => {
                 Error::ManifestBodyTooLarge { limit }
             }
-            registry_client::Error::Unsupported => Error::Unsupported,
-            registry_client::Error::RangeNotSatisfiable => Error::RangeNotSatisfiable,
-            registry_client::Error::Internal(msg) => Error::Internal(msg),
+            angos_oci_client::Error::Unsupported => Error::Unsupported,
+            angos_oci_client::Error::RangeNotSatisfiable => Error::RangeNotSatisfiable,
+            angos_oci_client::Error::Internal(msg) => Error::Internal(msg),
         }
     }
 }
@@ -241,7 +250,7 @@ mod tests {
 
     #[test]
     fn from_cache_preserves_source() {
-        let cache_err = cache::Error::Execution("cache miss".to_string());
+        let cache_err = angos_cache::Error::Execution("cache miss".to_string());
         let err: Error = cache_err.into();
         assert!(matches!(err, Error::Cache(_)));
         assert!(StdError::source(&err).is_some());

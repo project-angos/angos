@@ -6,11 +6,9 @@ use hyper::{
 };
 
 use angos_oci::response::ErrorCode;
+use angos_transport::ResponseBody;
 
-use crate::{
-    command::server::error::{Error, RECLAMATION_IN_PROGRESS_CODE},
-    http_response::ResponseBody,
-};
+use crate::command::server::error::{Error, RECLAMATION_IN_PROGRESS_CODE};
 
 const BASIC_AUTH_CHALLENGE: &str = r#"Basic realm="Angos", charset="UTF-8""#;
 

@@ -1,3 +1,4 @@
+use angos_oci::request::ManifestPutTarget;
 use std::{str::FromStr, sync::Arc};
 
 use serde_json::json;
@@ -10,11 +11,10 @@ use angos_oci::{Digest, Namespace, Reference, Tag};
 use crate::auth::authorizer::*;
 use crate::{
     auth::Error as AuthError,
-    cache,
     command::bootstrap,
     configuration::Configuration,
     configuration::RegexPattern,
-    identity::{AuthMethod, ClientCertificate, ManifestPutTarget, OidcClaims},
+    identity::{AuthMethod, ClientCertificate, OidcClaims},
     registry::{
         RegistryConfig, Repository,
         metadata_store::MetadataStore,
@@ -31,7 +31,7 @@ use crate::{
 #[test]
 fn test_authorizer_new_minimal() {
     let config = minimal_config();
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let authorizer = Authorizer::new(&config, &cache);
 
@@ -52,7 +52,7 @@ fn test_authorizer_new_with_repository_config() {
         "#,
     );
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let authorizer = Authorizer::new(&config, &cache);
 
@@ -74,7 +74,7 @@ fn empty_repository_webhook_reference_builds_without_a_webhook() {
             authorization_webhook = ""
         "#,
     );
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
     let authorizer = Authorizer::new(&config, &cache).expect("blank webhook ref must build");
     let repo = authorizer
@@ -319,7 +319,7 @@ async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
 
 /// Builds the authorizer and registry pair every `authorize_request` test needs.
 async fn authorizer_and_registry(config: &Configuration) -> (Authorizer, Arc<Registry>) {
-    let cache = cache::Config::Memory.to_backend().unwrap();
+    let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let authorizer = Authorizer::new(config, &cache).unwrap();
     let registry = create_pull_through_registry(config).await;
     (authorizer, registry)
@@ -790,7 +790,7 @@ async fn authorize_mount_source_requires_read_on_the_source() {
                 default = "allow"
             "#,
         );
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
 
         let parts = parts_with_uri("/v2/");

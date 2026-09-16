@@ -2,6 +2,7 @@ use hyper::StatusCode;
 use serde_json::json;
 
 use angos_oci::response::{ErrorCode, ErrorInfo, ErrorResponse};
+use angos_transport::RenderError;
 
 mod conversions;
 
@@ -35,6 +36,15 @@ pub enum Error {
         code: String,
         msg: Option<String>,
     },
+}
+
+impl From<RenderError> for Error {
+    fn from(error: RenderError) -> Self {
+        match error {
+            RenderError::Header(e) => Error::HttpBuild(e),
+            RenderError::Serialize(e) => Error::Serialization(e),
+        }
+    }
 }
 
 /// Codes the spec does not define, which angos serves on failures the OCI set

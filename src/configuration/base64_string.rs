@@ -7,7 +7,7 @@ use zeroize::Zeroize;
 /// Key material belongs here rather than in a plain string: the strength is then
 /// the randomness of the decoded bytes instead of whatever entropy a passphrase
 /// happens to carry. It has no `Debug`, so it cannot reach a log by accident;
-/// wrap it in [`Secret`](crate::secret::Secret) to have it zeroized on drop.
+/// wrap it in [`Secret`](angos_secret::Secret) to have it zeroized on drop.
 #[derive(Clone, Zeroize)]
 pub struct Base64String(Vec<u8>);
 

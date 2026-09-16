@@ -6,13 +6,11 @@ use hyper::{
 
 use angos_oci::http_range::{ByteWindow, RequestRange};
 use angos_oci::{MediaRange, MediaType};
+use angos_oci_client::X_ANGOS_SOURCE_TIMESTAMP;
 
-use crate::{
-    command::server::{
-        error::Error,
-        request::{RequestHeaders, X_ANGOS_NO_REDIRECT},
-    },
-    registry_client::X_ANGOS_SOURCE_TIMESTAMP,
+use crate::command::server::{
+    error::Error,
+    request::{RequestHeaders, X_ANGOS_NO_REDIRECT},
 };
 
 /// end-5 spells a chunk's window `<start>-<end>`. The `bytes=` unit is the

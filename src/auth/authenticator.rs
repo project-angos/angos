@@ -12,12 +12,12 @@ use crate::{
         TokenValidator, authorization::bearer_token, basic_auth, oidc, oidc::unverified_issuer,
         token_service, webhook,
     },
-    cache::Cache,
     configuration::Configuration,
-    http_client::apply_tls_files,
     identity::{AuthMethod, ClientIdentity},
     metrics_provider::metrics_provider,
 };
+use angos_cache::Cache;
+use angos_mtls_client::MtlsClientBuilder;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AuthConfig {
@@ -326,16 +326,17 @@ fn build_oidc_client(name: &str, config: &oidc::Config) -> Result<Arc<Client>, E
 
     // No client-level timeout: each fetch carries a per-request timeout from the
     // provider config (`http_request_timeout_secs`, `jwks_refresh_timeout_secs`).
-    apply_tls_files(
-        Client::builder(),
-        config.server_ca_bundle.as_deref(),
-        config.client_certificate_bundle.as_deref(),
-        config.client_private_key.as_deref(),
-    )
-    .map_err(initialization_error)?
-    .build()
-    .map(Arc::new)
-    .map_err(|e| initialization_error(e.to_string()))
+    MtlsClientBuilder::new()
+        .with_server_ca_bundle(config.server_ca_bundle.as_deref())
+        .with_client_certificate(
+            config
+                .client_certificate_bundle
+                .as_deref()
+                .zip(config.client_private_key.as_deref()),
+        )
+        .build()
+        .map(Arc::new)
+        .map_err(initialization_error)
 }
 
 /// A Basic credential whose username names a provider is read as that provider's
@@ -370,11 +371,9 @@ mod tests {
     use super::*;
     use crate::{
         auth::{PeerCertificate, TokenIssuer, oidc::validator::tests::make_token},
-        cache,
         configuration::Configuration,
         identity::OidcClaims,
         metrics_provider,
-        secret::Secret,
         test_fixtures::{
             configuration::{load_config, minimal_config},
             mtls::cert_der,
@@ -383,6 +382,7 @@ mod tests {
             webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
         },
     };
+    use angos_secret::Secret;
 
     fn create_minimal_config() -> Configuration {
         metrics_provider::init_for_tests();
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn test_authenticator_new_minimal() {
         let config = create_minimal_config();
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let authenticator = Authenticator::new(&config, &cache);
 
@@ -458,7 +458,7 @@ mod tests {
         "#,
         );
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let authenticator = Authenticator::new(&config, &cache);
 
@@ -480,7 +480,7 @@ mod tests {
         "#,
         );
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let Err(error) = Authenticator::new(&config, &cache) else {
             panic!("a colliding name must be refused at startup");
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn test_build_oidc_validators_empty() {
         let auth_config = AuthConfig::default();
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&auth_config, &cache).unwrap();
 
@@ -511,7 +511,7 @@ mod tests {
         "#,
         );
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
 
@@ -528,7 +528,7 @@ mod tests {
         "#,
         );
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
 
@@ -553,7 +553,7 @@ mod tests {
             bundle_path.display()
         ));
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         assert_eq!(
             config.auth.oidc["kube"].server_ca_bundle.as_deref(),
@@ -584,7 +584,7 @@ mod tests {
             key_path.display()
         ));
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         assert!(Authenticator::build_oidc_validators(&config.auth, &cache).is_ok());
     }
@@ -604,7 +604,7 @@ mod tests {
             certificate_path.display()
         ));
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let Err(error) = Authenticator::build_oidc_validators(&config.auth, &cache) else {
             panic!("half a client identity must be refused rather than fetch anonymously");
@@ -645,7 +645,7 @@ mod tests {
             unnamed = unnamed.uri(),
             named = named.uri(),
         ));
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator {
             mtls_validator: MtlsValidator,
             token_validator: None,
@@ -688,7 +688,7 @@ mod tests {
             token_path.display()
         ));
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         assert!(Authenticator::build_oidc_validators(&config.auth, &cache).is_ok());
     }
@@ -703,7 +703,7 @@ mod tests {
         "#,
         );
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let Err(error) = Authenticator::build_oidc_validators(&config.auth, &cache) else {
             panic!("an unreadable bearer token file must be refused");
@@ -724,7 +724,7 @@ mod tests {
         "#,
         );
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let Err(error) = Authenticator::build_oidc_validators(&config.auth, &cache) else {
             panic!("an unreadable CA bundle must be refused");
@@ -738,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn test_authenticate_request_no_credentials() {
         let config = create_minimal_config();
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
         let parts = empty_parts();
@@ -767,7 +767,7 @@ mod tests {
         "#,
         ));
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
         let parts = parts_with_basic_auth("testuser", "testpass");
@@ -796,7 +796,7 @@ mod tests {
         "#,
         ));
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
         let parts = parts_with_basic_auth("testuser", "wrongpass");
@@ -809,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn test_authenticate_request_preserves_client_ip() {
         let config = create_minimal_config();
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
         let parts = empty_parts();
@@ -838,7 +838,7 @@ mod tests {
         "#,
         );
 
-        let cache = cache::Config::Memory.to_backend().unwrap();
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
 

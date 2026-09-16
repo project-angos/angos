@@ -11,12 +11,13 @@ use hyper::{
 };
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
+use crate::command::server::router::Route;
 use angos_oci::{Digest, Namespace, Reference, Tag};
+use angos_oci_service::Endpoint as OciEndpoint;
 
 use crate::registry::test_utils::test_job_store;
 
 use crate::{
-    cache::{self, Cache},
     command::bootstrap,
     command::server::server_context::{ServerContext, resolve_forwarded_ip},
     configuration::{Configuration, TrustedProxy},
@@ -30,6 +31,7 @@ use crate::{
     },
     test_fixtures::configuration::{load_config, minimal_config},
 };
+use angos_cache::Cache;
 
 #[derive(Default)]
 pub struct TestConfigOptions<'a> {
@@ -83,7 +85,9 @@ pub async fn create_test_server_context_with(options: TestConfigOptions<'_>) -> 
 /// The in-memory cache a test context shares with its authenticator and
 /// authorizer.
 fn test_cache() -> Arc<Cache> {
-    cache::Config::Memory.to_backend().expect("memory cache")
+    angos_cache::Config::Memory
+        .to_backend()
+        .expect("memory cache")
 }
 
 pub async fn create_test_server_context_from_config(config: &Configuration) -> ServerContext {
@@ -292,18 +296,18 @@ async fn proxy_namespace_resolves_to_the_mirroring_repository() {
     let uri: Uri = "/v2/library/nginx/manifests/latest?ns=docker.io"
         .parse()
         .unwrap();
-    let mut action = Action::GetManifest {
+    let mut route = Route::Oci(OciEndpoint::GetManifest {
         namespace: Namespace::new("library/nginx").unwrap(),
         reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
+    });
 
     let served = context
-        .apply_proxy_namespace(Some(&mut action), &uri)
+        .apply_proxy_namespace(Some(&mut route), &uri)
         .expect("a mapped namespace must apply");
 
     assert_eq!(served.as_deref(), Some("docker.io"));
     assert_eq!(
-        action
+        route
             .pull_namespace_mut()
             .map(|namespace| namespace.to_string()),
         Some("docker-hub/library/nginx".to_string()),
@@ -329,19 +333,19 @@ async fn proxy_namespace_leaves_an_already_prefixed_request() {
     let uri: Uri = "/v2/docker-hub/library/nginx/tags/list?ns=docker.io"
         .parse()
         .unwrap();
-    let mut action = Action::ListTags {
+    let mut route = Route::Oci(OciEndpoint::ListTags {
         namespace: Namespace::new("docker-hub/library/nginx").unwrap(),
         n: None,
         last: None,
-    };
+    });
 
     let served = context
-        .apply_proxy_namespace(Some(&mut action), &uri)
+        .apply_proxy_namespace(Some(&mut route), &uri)
         .expect("a mapped namespace must apply");
 
     assert_eq!(served.as_deref(), Some("docker.io"));
     assert_eq!(
-        action
+        route
             .pull_namespace_mut()
             .map(|namespace| namespace.to_string()),
         Some("docker-hub/library/nginx".to_string())
@@ -364,20 +368,20 @@ async fn an_unclaimed_proxy_namespace_is_ignored() {
     let context = create_test_server_context_from_config(&config).await;
 
     let uri: Uri = "/v2/library/nginx/tags/list?ns=quay.io".parse().unwrap();
-    let mut action = Action::ListTags {
+    let mut route = Route::Oci(OciEndpoint::ListTags {
         namespace: Namespace::new("library/nginx").unwrap(),
         n: None,
         last: None,
-    };
+    });
 
     assert!(
         context
-            .apply_proxy_namespace(Some(&mut action), &uri)
+            .apply_proxy_namespace(Some(&mut route), &uri)
             .expect("an ignored ns is not a failure")
             .is_none()
     );
     assert_eq!(
-        action
+        route
             .pull_namespace_mut()
             .map(|namespace| namespace.to_string()),
         Some("library/nginx".to_string())
@@ -402,19 +406,19 @@ async fn proxy_namespace_leaves_a_write_alone() {
     let uri: Uri = "/v2/library/nginx/manifests/latest?ns=docker.io"
         .parse()
         .unwrap();
-    let mut action = Action::DeleteManifest {
+    let mut route = Route::Oci(OciEndpoint::DeleteManifest {
         namespace: Namespace::new("library/nginx").unwrap(),
         reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
+    });
 
     assert!(
         context
-            .apply_proxy_namespace(Some(&mut action), &uri)
+            .apply_proxy_namespace(Some(&mut route), &uri)
             .expect("an ignored ns is not a failure")
             .is_none(),
         "a write must not be scoped by ns, so nothing is echoed"
     );
-    let Action::DeleteManifest { namespace, .. } = &action else {
+    let Route::Oci(OciEndpoint::DeleteManifest { namespace, .. }) = &route else {
         panic!("the action must be untouched");
     };
     assert_eq!(namespace.as_ref(), "library/nginx");
@@ -441,18 +445,18 @@ async fn proxy_namespace_refuses_a_name_it_cannot_map() {
     let uri: Uri = format!("/v2/{long}/tags/list?ns=docker.io")
         .parse()
         .unwrap();
-    let mut action = Action::ListTags {
+    let mut route = Route::Oci(OciEndpoint::ListTags {
         namespace: Namespace::new(&long).unwrap(),
         n: None,
         last: None,
-    };
+    });
 
     let error = context
-        .apply_proxy_namespace(Some(&mut action), &uri)
+        .apply_proxy_namespace(Some(&mut route), &uri)
         .expect_err("a namespace that cannot be mapped must fail the request");
 
     assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
-    let Action::ListTags { namespace, .. } = &action else {
+    let Route::Oci(OciEndpoint::ListTags { namespace, .. }) = &route else {
         panic!("the action must keep its shape");
     };
     assert_eq!(

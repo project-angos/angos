@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 
 use serde::Deserialize;
 
-use crate::secret::Secret;
+use angos_secret::Secret;
 
 const DEFAULT_MAX_CONCURRENT_SCANS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 

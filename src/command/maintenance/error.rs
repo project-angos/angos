@@ -1,4 +1,4 @@
-use crate::{cache, command::bootstrap::Error as BootstrapError, policy, registry};
+use crate::{command::bootstrap::Error as BootstrapError, policy, registry};
 
 /// Errors raised by the maintenance machinery shared by `scrub`, `prune`, and
 /// `replicate`. `Display` stays command-neutral: the logging call sites and the
@@ -23,7 +23,7 @@ pub enum Error {
     Registry(#[from] registry::Error),
 
     #[error("cache error: {0}")]
-    Cache(#[from] cache::Error),
+    Cache(#[from] angos_cache::Error),
 }
 
 impl From<policy::Error> for Error {
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn cache_from_conversion() {
-        let inner = cache::Error::Execution("connection refused".to_string());
+        let inner = angos_cache::Error::Execution("connection refused".to_string());
         let error: Error = inner.into();
         assert!(matches!(error, Error::Cache(_)));
         assert!(error.source().is_some());

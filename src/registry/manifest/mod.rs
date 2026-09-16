@@ -1,25 +1,21 @@
 pub mod link_plan;
-mod response;
 
 use std::{iter::once, slice};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
-use http::{HeaderMap, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, error, instrument, warn};
 
 use angos_oci::request::{
     DeleteManifestRequest, GetManifestRequest, HeadManifestRequest, PutManifestRequest,
 };
-use angos_oci::server;
 use angos_oci::{Content, Digest, Manifest, MediaRange, MediaType, Namespace, Reference, Tag};
 
 use crate::{
     cache_fill::CACHE_ACTOR,
     event_webhook::event::{Event, EventActor},
-    http_response::{ResponseBody, build_response},
     jobs::Queue,
     layer,
     metrics_provider::metrics_provider,
@@ -32,7 +28,7 @@ use crate::{
     replication::{ReplicationDownstream, ReplicationJob, ReplicationTarget, build_envelope},
     scan,
 };
-use response::{GetManifestResponse, ManifestBody, ManifestMeta, PutManifestResponse};
+use angos_oci_service::{Accepted, ManifestDescriptor, ManifestGet, ManifestWritten};
 
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
@@ -46,6 +42,7 @@ struct StoreManifest<'a> {
     created_tags: &'a [Tag],
     reference_policy: ReferencePolicy,
     created_at: Option<DateTime<Utc>>,
+    repository: Option<&'a Repository>,
 }
 
 /// What a replication job addresses, each variant carrying only the
@@ -126,11 +123,13 @@ impl<T> ServeLocal<T> {
 
 impl Registry {
     #[instrument(skip(actor))]
-    pub async fn head_manifest(
+    /// The typed manifest-HEAD the [`angos_oci_service::OciService`] trait
+    /// serves.
+    pub async fn head_manifest_served(
         &self,
         actor: Option<EventActor>,
         request: HeadManifestRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<ManifestDescriptor, Error> {
         let client = actor.as_ref().map_or("anonymous", EventActor::audit_name);
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
         let cache_of = pull_through_name(repository);
@@ -167,11 +166,7 @@ impl Registry {
                 client,
             )
             .await;
-            return Ok(build_response(
-                StatusCode::OK,
-                server::manifest_headers(meta.media_type.as_ref(), &meta.digest, meta.size)?,
-                ResponseBody::empty(),
-            )?);
+            return Ok(meta);
         }
 
         let body = self
@@ -185,13 +180,21 @@ impl Registry {
             )
             .await?;
 
-        let size = body.content.len() as u64;
+        let ManifestGet::Content {
+            digest,
+            media_type,
+            bytes,
+        } = body
+        else {
+            // A HEAD resolves without redirecting, so the read is always content.
+            return Err(Error::ManifestUnknown);
+        };
 
-        Ok(build_response(
-            StatusCode::OK,
-            server::manifest_headers(body.media_type.as_ref(), &body.digest, size)?,
-            ResponseBody::empty(),
-        )?)
+        Ok(ManifestDescriptor {
+            digest,
+            media_type,
+            length: bytes.len() as u64,
+        })
     }
 
     /// Read a manifest/tag link for a client pull, recording its access time
@@ -231,7 +234,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<ManifestMeta, Error> {
+    ) -> Result<ManifestDescriptor, Error> {
         let blob_link = LinkKind::from_reference(reference);
         // Stamped by the caller once the metadata is actually served: a HEAD
         // that falls through to an upstream refresh is stamped by that path.
@@ -256,10 +259,10 @@ impl Registry {
                 }
             })?;
 
-        Ok(ManifestMeta {
-            media_type: revision.map_or(link.media_type, |r| r.media_type),
+        Ok(ManifestDescriptor {
             digest: link.target,
-            size,
+            media_type: revision.map_or(link.media_type, |r| r.media_type),
+            length: size,
         })
     }
 
@@ -272,7 +275,7 @@ impl Registry {
         reference: Reference,
         is_tag_immutable: bool,
         client: &str,
-    ) -> Result<ManifestBody, Error> {
+    ) -> Result<ManifestGet, Error> {
         let cache_of = pull_through_name(repository);
         let local = self.get_local_manifest(namespace, &reference, client).await;
         let serveable = self
@@ -288,7 +291,7 @@ impl Registry {
                         namespace,
                         &reference,
                         is_tag_immutable,
-                        &body.digest,
+                        body.digest(),
                     )
                     .await
                 },
@@ -331,34 +334,24 @@ impl Registry {
             warn!("Cache-fill event delivery failed: {error}");
         }
 
-        let stored = self
-            .store_manifest(
-                &StoreManifest {
-                    namespace,
-                    reference: &reference,
-                    content_type: media_type.as_ref(),
-                    created_tags: &[],
-                    reference_policy: ReferencePolicy::Trusted,
-                    created_at: None,
-                },
-                &content,
-            )
-            .await?;
-        // A fill is a write like a push: an image landing in a scanning cache
-        // repository gets its scan, a refresh to the same digest does not.
-        if stored.changed && stored.scan_subject && repository.scan {
-            self.dispatch_scan(namespace, &stored.digest).await;
-        }
-        if stored.changed && repository.index {
-            for layer in &stored.layers {
-                self.dispatch_index(namespace, layer).await;
-            }
-        }
+        self.store_manifest(
+            &StoreManifest {
+                namespace,
+                reference: &reference,
+                content_type: media_type.as_ref(),
+                created_tags: &[],
+                reference_policy: ReferencePolicy::Trusted,
+                created_at: None,
+                repository: Some(repository),
+            },
+            &content,
+        )
+        .await?;
 
-        Ok(ManifestBody {
-            media_type,
+        Ok(ManifestGet::Content {
             digest,
-            content,
+            media_type,
+            bytes: content,
         })
     }
 
@@ -423,7 +416,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
         client: &str,
-    ) -> Result<ManifestBody, Error> {
+    ) -> Result<ManifestGet, Error> {
         let blob_link = LinkKind::from_reference(reference);
         let link = self
             .read_manifest_link(namespace, &blob_link, client)
@@ -436,10 +429,10 @@ impl Registry {
             self.probe_revision_for_tag(namespace, reference, &link.target),
             self.blob_store.read(&link.target),
         );
-        Ok(ManifestBody {
-            media_type: revision?.map_or(link.media_type, |r| r.media_type),
+        Ok(ManifestGet::Content {
             digest: link.target,
-            content: content?,
+            media_type: revision?.map_or(link.media_type, |r| r.media_type),
+            bytes: content?,
         })
     }
 
@@ -475,7 +468,7 @@ impl Registry {
         reference: &Reference,
         content_type: Option<&MediaType>,
         body: &[u8],
-    ) -> Result<PutManifestResponse, Error> {
+    ) -> Result<ManifestWritten, Error> {
         self.store_manifest(
             &StoreManifest {
                 namespace,
@@ -484,6 +477,7 @@ impl Registry {
                 created_tags: &[],
                 reference_policy: ReferencePolicy::Strict,
                 created_at: None,
+                repository: None,
             },
             body,
         )
@@ -494,7 +488,7 @@ impl Registry {
         &self,
         write: &StoreManifest<'_>,
         body: &[u8],
-    ) -> Result<PutManifestResponse, Error> {
+    ) -> Result<ManifestWritten, Error> {
         let StoreManifest {
             namespace,
             reference,
@@ -502,6 +496,7 @@ impl Registry {
             created_tags,
             reference_policy,
             created_at,
+            repository,
         } = *write;
         let mut manifest =
             Manifest::from_pushed(body, content_type).map_err(|e| Error::manifest_invalid(&e))?;
@@ -564,23 +559,27 @@ impl Registry {
                 .iter()
                 .any(|tag| commit.changed(&LinkKind::Tag(tag.clone()), &computed_digest));
 
-        let scan_subject = scan::is_scan_subject(&manifest);
-        let layers = layer::filesystem_layers(&manifest);
+        // A write dispatches its own follow-up work, so a cache fill and a
+        // client push behave alike; a refresh to the same digest changes
+        // nothing and so dispatches nothing.
+        if changed {
+            if scan::is_scan_subject(&manifest) && repository.is_some_and(|r| r.scan) {
+                self.dispatch_scan(namespace, &computed_digest).await;
+            }
+            if repository.is_some_and(|r| r.index) {
+                for layer in layer::filesystem_layers(&manifest) {
+                    self.dispatch_index(namespace, &layer).await;
+                }
+            }
+        }
 
-        let subject = manifest.subject.map(|s| s.digest);
-
-        Ok(PutManifestResponse {
-            headers: server::put_manifest_headers(
-                namespace,
-                reference,
-                &computed_digest,
-                subject.as_ref(),
-                created_tags,
-            )?,
+        Ok(ManifestWritten {
+            namespace: namespace.clone(),
+            reference: reference.clone(),
             digest: computed_digest,
+            subject: manifest.subject.map(|s| s.digest),
+            created_tags: created_tags.to_vec(),
             changed,
-            scan_subject,
-            layers,
         })
     }
 
@@ -620,7 +619,7 @@ impl Registry {
         &self,
         actor: Option<EventActor>,
         request: DeleteManifestRequest,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<Accepted, Error> {
         self.delete_manifest(
             actor,
             request.source_ts,
@@ -629,11 +628,7 @@ impl Registry {
         )
         .await?;
 
-        Ok(build_response(
-            StatusCode::ACCEPTED,
-            HeaderMap::new(),
-            ResponseBody::empty(),
-        )?)
+        Ok(Accepted)
     }
 
     /// Deletes a manifest or tag. The delete's initiator is read off the
@@ -811,7 +806,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
         client: &str,
-    ) -> Option<GetManifestResponse> {
+    ) -> Option<ManifestGet> {
         let blob_link = LinkKind::from_reference(reference);
         // Read without stamping: this probe abandons the redirect on a backend
         // that presigns nothing, and an abandoned probe is not a pull.
@@ -829,14 +824,10 @@ impl Registry {
         self.record_manifest_pull(namespace, &blob_link, client)
             .await;
 
-        Some(GetManifestResponse::Redirect {
-            headers: server::manifest_redirect_headers(
-                &presigned_url,
-                &link.target,
-                Some(&media_type),
-            )
-            .ok()?,
+        Some(ManifestGet::Redirect {
             digest: link.target,
+            media_type: Some(media_type),
+            location: presigned_url,
         })
     }
 
@@ -846,12 +837,14 @@ impl Registry {
     /// `X-Angos-No-Redirect`) and an authoritative target, so a mutable tag on
     /// a pull-through cache falls through to `get_manifest` to refresh.
     #[instrument(skip(self, request))]
-    pub async fn resolve_get_manifest(
+    /// The typed manifest-GET the [`angos_oci_service::OciService`] trait
+    /// serves.
+    pub async fn get_manifest_served(
         &self,
         actor: Option<EventActor>,
         request: GetManifestRequest,
         allow_redirect: bool,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<ManifestGet, Error> {
         let client = actor.as_ref().map_or("anonymous", EventActor::audit_name);
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
         let repository_name = repository_name(repository);
@@ -877,16 +870,7 @@ impl Registry {
         );
         self.dispatch_events(&[event]).await?;
 
-        Ok(match response {
-            GetManifestResponse::Redirect { headers, .. } => build_response(
-                StatusCode::TEMPORARY_REDIRECT,
-                headers,
-                ResponseBody::empty(),
-            )?,
-            GetManifestResponse::Body {
-                content, headers, ..
-            } => build_response(StatusCode::OK, headers, ResponseBody::fixed(content))?,
-        })
+        Ok(response)
     }
 
     async fn resolve_get_manifest_response(
@@ -897,7 +881,7 @@ impl Registry {
         mime_types: &[MediaRange],
         allow_redirect: bool,
         client: &str,
-    ) -> Result<GetManifestResponse, Error> {
+    ) -> Result<ManifestGet, Error> {
         let is_tag_immutable = self.is_reference_immutable(repository, &reference);
         let redirect_is_authoritative = !repository.is_some_and(Repository::is_pull_through)
             || matches!(reference, Reference::Digest(_))
@@ -913,26 +897,15 @@ impl Registry {
             return Ok(resp);
         }
 
-        let manifest = self
-            .get_manifest(
-                repository,
-                mime_types,
-                namespace,
-                reference,
-                is_tag_immutable,
-                client,
-            )
-            .await?;
-
-        Ok(GetManifestResponse::Body {
-            headers: server::manifest_headers(
-                manifest.media_type.as_ref(),
-                &manifest.digest,
-                manifest.content.len() as u64,
-            )?,
-            digest: manifest.digest,
-            content: manifest.content,
-        })
+        self.get_manifest(
+            repository,
+            mime_types,
+            namespace,
+            reference,
+            is_tag_immutable,
+            client,
+        )
+        .await
     }
 
     /// Advisory last-writer-wins fast-fail for a replication-originated tag
@@ -1047,7 +1020,7 @@ impl Registry {
         actor: Option<EventActor>,
         request: PutManifestRequest,
         body_stream: S,
-    ) -> Result<Response<ResponseBody>, Error>
+    ) -> Result<ManifestWritten, Error>
     where
         S: AsyncRead + Unpin + Send,
     {
@@ -1109,7 +1082,7 @@ impl Registry {
         } else {
             ReferencePolicy::Permissive
         };
-        let response = self
+        let written = self
             .store_manifest(
                 &StoreManifest {
                     namespace: &namespace,
@@ -1118,6 +1091,7 @@ impl Registry {
                     created_tags: &created_tags,
                     reference_policy,
                     created_at: source_ts,
+                    repository: resolved_repository,
                 },
                 &request_body,
             )
@@ -1126,30 +1100,18 @@ impl Registry {
         // No-op suppression: re-dispatching a converged replay would keep a
         // mesh cycle alive, so only a write that changed local state (per
         // the commit) is replicated. Webhook events fire unconditionally.
-        if response.changed {
+        if written.changed {
             self.replicate_manifest_push(
                 resolved_repository,
                 &namespace,
                 &reference,
                 &created_tags,
-                &response.digest,
+                &written.digest,
             )
             .await;
-            if response.scan_subject && resolved_repository.is_some_and(|r| r.scan) {
-                self.dispatch_scan(&namespace, &response.digest).await;
-            }
-            if resolved_repository.is_some_and(|r| r.index) {
-                for layer in &response.layers {
-                    self.dispatch_index(&namespace, layer).await;
-                }
-            }
         }
 
-        Ok(build_response(
-            StatusCode::CREATED,
-            response.headers,
-            ResponseBody::empty(),
-        )?)
+        Ok(written)
     }
 
     /// Fire-and-forget enqueue of the scan job for an image that just landed;

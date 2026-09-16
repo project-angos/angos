@@ -15,6 +15,8 @@ use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use serde_json::{Value, from_slice};
 use tracing_subscriber::{layer::SubscriberExt, registry::Registry as TracingRegistry};
 
+use angos_transport::ResponseBody;
+
 use crate::{
     auth::PeerCertificate,
     command::server::{
@@ -31,7 +33,6 @@ use crate::{
             create_test_server_context_with,
         },
     },
-    http_response::ResponseBody,
     identity::{Action, ClientIdentity},
     metrics_provider,
     policy::{AccessMode, AccessPolicyConfig},

@@ -1,4 +1,4 @@
-pub use action::{Action, ManifestPutTarget};
+pub use action::Action;
 pub use auth_method::AuthMethod;
 pub use client_identity::{ClientCertificate, ClientIdentity, OidcClaims};
 pub use request_scheme::RequestScheme;

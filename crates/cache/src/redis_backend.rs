@@ -1,11 +1,13 @@
 use std::fmt;
 
-use redis::AsyncCommands;
+use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Deserializer};
 use tokio::sync::OnceCell;
 use tracing::info;
 
-use crate::{cache::Error, secret::Secret};
+use angos_secret::Secret;
+
+use crate::Error;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct BackendConfig {
@@ -24,20 +26,20 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    redis::Client::open(s.as_str())
+    Client::open(s.as_str())
         .map_err(|e| serde::de::Error::custom(format!("invalid Redis URL: {e}")))?;
     Ok(Secret::new(s))
 }
 
 pub struct Backend {
-    client: redis::Client,
+    client: Client,
     /// Reconnects on its own, so a Redis restart does not disable the cache.
     connection: OnceCell<redis::aio::ConnectionManager>,
     key_prefix: String,
 }
 
 impl fmt::Debug for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Backend")
             .field("key_prefix", &self.key_prefix)
             .finish_non_exhaustive()
@@ -47,7 +49,7 @@ impl fmt::Debug for Backend {
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         info!("Using Redis cache store");
-        let client = redis::Client::open(config.url.expose().as_str())?;
+        let client = Client::open(config.url.expose().as_str())?;
         Ok(Backend {
             client,
             connection: OnceCell::new(),

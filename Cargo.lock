@@ -31,10 +31,18 @@ name = "angos"
 version = "1.8.0"
 dependencies = [
  "angos-backoff",
+ "angos-cache",
+ "angos-docker-extension-service",
+ "angos-extension-service",
  "angos-inflate",
+ "angos-mtls-client",
  "angos-oci",
+ "angos-oci-client",
+ "angos-oci-service",
  "angos-s3-client",
+ "angos-secret",
  "angos-storage",
+ "angos-transport",
  "arc-swap",
  "argh",
  "argon2",
@@ -63,7 +71,6 @@ dependencies = [
  "password-hash",
  "prometheus",
  "rcgen",
- "redis",
  "regex",
  "reqwest",
  "rpassword",
@@ -96,10 +103,63 @@ name = "angos-backoff"
 version = "0.1.0"
 
 [[package]]
+name = "angos-cache"
+version = "0.1.0"
+dependencies = [
+ "angos-secret",
+ "redis",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "angos-docker-extension-service"
+version = "0.1.0"
+dependencies = [
+ "angos-oci",
+ "angos-transport",
+ "async-trait",
+ "http",
+ "serde",
+ "serde_html_form",
+ "serde_json",
+]
+
+[[package]]
+name = "angos-extension-service"
+version = "0.1.0"
+dependencies = [
+ "angos-oci",
+ "angos-transport",
+ "async-trait",
+ "chrono",
+ "http",
+ "serde",
+ "serde_html_form",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "angos-inflate"
 version = "0.1.0"
 dependencies = [
  "flate2",
+]
+
+[[package]]
+name = "angos-mtls-client"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "reqwest",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -116,6 +176,46 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "angos-oci-client"
+version = "0.1.0"
+dependencies = [
+ "angos-cache",
+ "angos-mtls-client",
+ "angos-oci",
+ "angos-secret",
+ "angos-storage",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "angos-oci-service"
+version = "0.1.0"
+dependencies = [
+ "angos-oci",
+ "angos-transport",
+ "async-trait",
+ "http",
+ "serde",
+ "serde_html_form",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -145,6 +245,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "angos-secret"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "angos-storage"
 version = "0.1.0"
 dependencies = [
@@ -163,6 +271,21 @@ dependencies = [
  "tokio-util",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "angos-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

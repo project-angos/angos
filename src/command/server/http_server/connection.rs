@@ -20,6 +20,7 @@ use tracing::{Span, debug, error, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use angos_oci::header::OCI_NAMESPACE;
+use angos_transport::ResponseBody;
 
 use crate::{
     auth::PeerCertificate,
@@ -30,8 +31,7 @@ use crate::{
         listeners::RequestTimeouts,
         router,
     },
-    http_response::ResponseBody,
-    identity::{Action, RequestScheme},
+    identity::RequestScheme,
     metrics_provider::{InFlightGuard, metrics_provider},
 };
 
@@ -129,19 +129,22 @@ async fn handle_request(
     // realm and the auth webhook both read this one extension.
     let scheme = context.resolve_scheme(&request);
     request.extensions_mut().insert(scheme);
-    let mut action = router::parse(request.method(), request.uri());
+    let mut route = router::parse(request.method(), request.uri());
     // A mirroring client names the registry it believes it is addressing in
     // `?ns=`; serving it from the repository mirroring that namespace is what
     // lets such a client use angos without prefixing the paths it requests.
-    let proxy_namespace = context.apply_proxy_namespace(action.as_mut(), request.uri());
-    let route_action = action.as_ref().map_or("unknown", Action::action_name);
+    let proxy_namespace = context.apply_proxy_namespace(route.as_mut(), request.uri());
+    // Labels both HTTP metrics below.
+    let route_label = route
+        .as_ref()
+        .map_or("unknown", router::Route::metric_label);
 
     let trace_id = current_trace_id(&Span::current());
     // Captured before the request moves into the dispatch future, since the realm
     // may be derived from the request's own host. A denial on the token endpoint
     // itself is not challenged: the client would be sent to fetch a token from
     // the endpoint that just refused it.
-    let challenge_origin = (!matches!(action, Some(Action::Token)))
+    let challenge_origin = (!matches!(route, Some(router::Route::Token)))
         .then(|| context.challenge_origin(&request))
         .flatten();
 
@@ -150,7 +153,7 @@ async fn handle_request(
     let dispatched = match proxy_namespace {
         Ok(served) => {
             let dispatch: DispatchFuture =
-                Box::pin(dispatch_request(Arc::clone(&context), request, action));
+                Box::pin(dispatch_request(Arc::clone(&context), request, route));
             dispatch.await.map(|response| (response, served))
         }
         Err(error) => Err(error),
@@ -180,11 +183,11 @@ async fn handle_request(
 
     metrics_provider()
         .metric_http_request_total
-        .with_label_values(&[method_label(&method), route_action, status.as_str()])
+        .with_label_values(&[method_label(&method), route_label, status.as_str()])
         .inc();
     metrics_provider()
         .metric_http_request_duration
-        .with_label_values(&[method_label(&method), route_action])
+        .with_label_values(&[method_label(&method), route_label])
         .observe(elapsed);
 
     let log = if let Some(trace_id) = trace_id {
