@@ -14,6 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** a reference key of the per-role shape an angos before 1.8.0 wrote (`r/layer`, `r/config`, `r/idx.*`) is no longer recognised, so `angos scrub` quarantines it like any unknown key; such a key has pinned nothing since 1.8.0, which pins each referenced digest through its referring manifest.
 - **Breaking:** `namespace_walk_concurrency = 0` is refused when the configuration loads instead of being silently read as 1.
 
+### Fixed
+
+- A tag push or delete landing in the same millisecond as the entry it supersedes now wins resolution, where the entry key's millisecond precision left the two tied and the tag decided by digest order instead: a re-point could leave the tag on the older digest, and a delete could answer `202` with the tag still live.
+
 ## 1.8.0
 
 ### Added

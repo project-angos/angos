@@ -19,14 +19,18 @@ use crate::registry::{
 };
 
 /// The timestamp a locally authored entry carries: this replica's clock,
-/// floored one millisecond above the entry it supersedes.
+/// truncated to the millisecond its key encodes and floored one millisecond
+/// above the entry it supersedes.
 ///
 /// Entry order is the tag's order, and two replicas sharing a backend can have
 /// skewed clocks. Without the floor a push or delete stamped below the current
 /// winner lands as the loser: the tag does not move, and the client is told it
-/// did. A replicated write keeps its author's timestamp instead, since that is
-/// what the last-writer-wins gate compares.
+/// did. The truncation is part of that floor, since a stamp landing later
+/// inside the superseded millisecond encodes the very same ordinal. A
+/// replicated write keeps its author's timestamp instead, since that is what
+/// the last-writer-wins gate compares.
 fn local_entry_ts(now: DateTime<Utc>, superseded: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    let now = DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap_or(now);
     match superseded {
         // Equal counts: a same-ordinal tie resolves on the digest, not on who
         // wrote last.
@@ -215,6 +219,20 @@ mod tests {
         metadata_store::LinkKind,
         test_utils::{FSRegistryTestCase, RegistryTestCase, drop_links, metadata_store_over},
     };
+
+    /// The entry key carries only the millisecond, so a stamp landing later
+    /// inside the superseded millisecond must still be floored above it: it
+    /// would otherwise encode the same ordinal, leaving the group tie-break
+    /// rather than the clock to decide the tag.
+    #[test]
+    fn a_stamp_inside_the_superseded_millisecond_is_floored_above_it() {
+        let entry = DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
+        let later_same_ms = entry + TimeDelta::microseconds(700);
+        assert_eq!(
+            local_entry_ts(later_same_ms, Some(entry)),
+            entry + TimeDelta::milliseconds(1)
+        );
+    }
 
     #[test]
     fn a_local_entry_is_floored_above_the_one_it_supersedes() {
