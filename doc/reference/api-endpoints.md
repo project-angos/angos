@@ -242,7 +242,7 @@ Query parameters:
 
 The returned names are derived directly from stored content: a namespace is listed exactly when it holds at least one revision or tag, and stops being listed as soon as the last one is deleted.
 
-The listing is filtered by access policy: a namespace is included only when the caller could list its tags under the global policy and the covering repository's policy, so a repository a caller cannot read is hidden from its catalog. Filtering runs per page, so a page may return fewer than `n` names while more remain; follow the `Link` header until it is absent. The authorization webhook is not consulted for this filtering.
+The listing is filtered by access policy: a namespace is included only when the caller could list its tags under the global policy and the covering repository's policy, so a repository a caller cannot read is hidden from its catalog. The walk applies that filter as it goes rather than trimming a finished page, so a page holds `n` names whenever that many admitted ones remain, crossing a hidden stretch to fill itself; follow the `Link` header until it is absent. The authorization webhook is not consulted for this filtering.
 
 ### Referrers
 
@@ -262,7 +262,7 @@ Referrers a client recorded under the fallback tag (`<algorithm>-<hex>`, an inde
 
 On a pull-through repository the listing merges the upstream's referrers with the cached ones, since nothing fills a referrer index on its own and an uncached subject would otherwise report none. An upstream that cannot be reached is left out rather than failing the request, so the cached referrers are still served. The `artifactType` filter is applied to both.
 
-A subject with more referrers than the page size is served one page at a time, with the next page advertised in a `Link` header carrying `rel="next"`; the link repeats the `artifactType` filter so following it keeps the listing filtered, percent-encoding it so a `+json` suffix survives the round trip. A filtered page may hold fewer than 100 entries, since the filter is applied after the page is cut.
+A subject with more referrers than the page size is served one page at a time, with the next page advertised in a `Link` header carrying `rel="next"`; the link repeats the `artifactType` filter so following it keeps the listing filtered, percent-encoding it so a `+json` suffix survives the round trip. A page holds 100 entries whenever that many matches remain: the candidates resolve until it is filled, so a filter that drops a long stretch makes a page cost more reads rather than answer short.
 
 Merging a pull-through listing needs both sides whole, so each page re-reads the upstream's referrers in full: paginating a widely referenced subject on a mirror costs one upstream enumeration per page.
 
@@ -284,7 +284,7 @@ GET /v2/_angos/repositories/list
 
 List the configured repositories with their namespace counts.
 
-The listing is filtered by access policy, as the catalog is. Visible content is the criterion: a
+The listing takes no `n` or `last`: it serves every repository in one response. It is filtered by access policy, as the catalog is. Visible content is the criterion: a
 repository is listed only while it holds at least one namespace the caller could list tags under,
 and `namespace_count` counts those alone. A repository holding nothing, holding nothing the caller
 may see, or not configured at all are therefore one answer, so the listing tells no one what exists
@@ -313,8 +313,8 @@ GET /v2/_angos/namespaces/list?repository={repository}
 
 List namespaces within a repository, with the repository's effective configuration.
 
-The listing is filtered by access policy: only the namespaces the caller could list tags under are
-returned. A repository holding none of them answers `404 NAME_UNKNOWN`, exactly as one that holds
+The listing takes no `n` or `last` either, serving a repository's namespaces in one response. It is
+filtered by access policy: only the namespaces the caller could list tags under are returned. A repository holding none of them answers `404 NAME_UNKNOWN`, exactly as one that holds
 nothing or is not configured at all, so neither its existence nor its upstreams and tag rules are
 revealed. A configured repository is therefore not listable until it holds content the caller may
 see; pushing to it does not depend on that. The authorization webhook is not consulted for this

@@ -130,78 +130,9 @@ pub fn slice_page<T: Clone + ToString>(items: &[T], start_idx: usize, n: u16) ->
     }
 }
 
-pub fn paginate_sorted<T: Clone + ToString + Ord>(
-    items: &[T],
-    n: u16,
-    last: Option<&str>,
-) -> Page<T> {
-    let start_idx = last.map_or(0, |last_item| {
-        items
-            .iter()
-            .position(|item| item.to_string().as_str() > last_item)
-            .unwrap_or(items.len())
-    });
-    slice_page(items, start_idx, n)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::registry::pagination::*;
-
-    #[test]
-    fn test_paginate_sorted_empty() {
-        let items: Vec<String> = vec![];
-        let Page {
-            items: result,
-            next_token: token,
-        } = paginate_sorted(&items, 10, None);
-        assert!(result.is_empty());
-        assert!(token.is_none());
-    }
-
-    #[test]
-    fn test_paginate_sorted_all_items() {
-        let items = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let Page {
-            items: result,
-            next_token: token,
-        } = paginate_sorted(&items, 10, None);
-        assert_eq!(result.len(), 3);
-        assert!(token.is_none());
-    }
-
-    #[test]
-    fn test_paginate_sorted_first_page() {
-        let items = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let Page {
-            items: result,
-            next_token: token,
-        } = paginate_sorted(&items, 2, None);
-        assert_eq!(result, vec!["a", "b"]);
-        assert_eq!(token, Some("b".to_string()));
-    }
-
-    #[test]
-    fn test_paginate_sorted_second_page() {
-        let items = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let Page {
-            items: result,
-            next_token: token,
-        } = paginate_sorted(&items, 2, Some("b"));
-        assert_eq!(result, vec!["c"]);
-        assert!(token.is_none());
-    }
-
-    #[test]
-    fn test_paginate_sorted_with_greater_than_semantics() {
-        let items = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let Page {
-            items: result,
-            next_token: token,
-        } = paginate_sorted(&items, 10, Some("a"));
-        assert_eq!(result, vec!["b", "c"]);
-        assert!(token.is_none());
-    }
 
     #[test]
     fn test_slice_page_empty_input() {
