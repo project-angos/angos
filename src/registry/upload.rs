@@ -15,7 +15,8 @@ use crate::{
         Error, Registry,
         blob_ownership::{GrantOutcome, grant_existing, promote_and_grant},
         blob_store::{
-            hashing_reader::HashingReader, resumable_hasher::Hasher, upload_session::HashStart,
+            hashing::{Hasher, HashingReader},
+            upload_session::HashStart,
         },
     },
 };

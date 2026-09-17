@@ -6,9 +6,8 @@
 //! store.
 
 mod config;
-pub mod hashing_reader;
+pub mod hashing;
 mod multipart_cleanup;
-pub mod resumable_hasher;
 pub mod upload_session;
 
 use std::{
@@ -40,6 +39,15 @@ pub use config::{FsBackendConfig, S3BackendConfig, TransportFields};
 pub use multipart_cleanup::OrphanMultipartUpload;
 
 pub use angos_storage::BoxedReader;
+
+/// A missing object is an unknown blob to every reader below; any other
+/// storage failure surfaces as itself.
+fn blob_error(error: StorageError) -> Error {
+    match error {
+        StorageError::NotFound => Error::BlobUnknown,
+        backend @ StorageError::Backend(_) => backend.into(),
+    }
+}
 
 /// Fan-out for the per-shard page chains behind [`BlobStore::stream_blobs`].
 const BLOB_LIST_CONCURRENCY: usize = 32;
@@ -99,13 +107,6 @@ impl BlobStore {
     #[must_use]
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object
-    }
-
-    /// Whether a presign backend is wired.
-    #[cfg(test)]
-    #[must_use]
-    pub fn supports_presign(&self) -> bool {
-        self.presign.is_some()
     }
 
     /// Streams every stored blob digest, unordered. Blobs are sharded by the
@@ -173,22 +174,19 @@ impl BlobStore {
 
     #[instrument(skip(self))]
     pub async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
-        let path = digest.blob_path();
-        match self.object.get(&path).await {
-            Ok(data) => Ok(data),
-            Err(StorageError::NotFound) => Err(Error::BlobUnknown),
-            Err(e) => Err(e.into()),
-        }
+        self.object
+            .get(&digest.blob_path())
+            .await
+            .map_err(blob_error)
     }
 
     #[instrument(skip(self))]
     pub async fn size(&self, digest: &Digest) -> Result<u64, Error> {
-        let path = digest.blob_path();
-        match self.object.head(&path).await {
-            Ok(meta) => Ok(meta.size),
-            Err(StorageError::NotFound) => Err(Error::BlobUnknown),
-            Err(e) => Err(e.into()),
-        }
+        self.object
+            .head(&digest.blob_path())
+            .await
+            .map(|meta| meta.size)
+            .map_err(blob_error)
     }
 
     /// The blob bytes' last-modified time, or `None` when the backend records
@@ -196,12 +194,11 @@ impl BlobStore {
     /// ownership before linking the manifest, is never reaped.
     #[instrument(skip(self))]
     pub async fn last_modified(&self, digest: &Digest) -> Result<Option<DateTime<Utc>>, Error> {
-        let path = digest.blob_path();
-        match self.object.head(&path).await {
-            Ok(meta) => Ok(meta.last_modified),
-            Err(StorageError::NotFound) => Err(Error::BlobUnknown),
-            Err(e) => Err(e.into()),
-        }
+        self.object
+            .head(&digest.blob_path())
+            .await
+            .map(|meta| meta.last_modified)
+            .map_err(blob_error)
     }
 
     #[instrument(skip(self))]
@@ -210,12 +207,10 @@ impl BlobStore {
         digest: &Digest,
         start_offset: Option<u64>,
     ) -> Result<(BoxedReader, u64), Error> {
-        let path = digest.blob_path();
-        match self.object.get_stream(&path, start_offset).await {
-            Ok((reader, total)) => Ok((reader, total)),
-            Err(StorageError::NotFound) => Err(Error::BlobUnknown),
-            Err(e) => Err(e.into()),
-        }
+        self.object
+            .get_stream(&digest.blob_path(), start_offset)
+            .await
+            .map_err(blob_error)
     }
 
     #[instrument(skip(self))]

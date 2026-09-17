@@ -25,8 +25,7 @@ use crate::registry::{
     Error,
     blob_store::{
         BlobStore, UploadSummary,
-        hashing_reader::{HashingReader, hashing_stream},
-        resumable_hasher::{HashState, Hasher},
+        hashing::{HashState, Hasher, HashingReader, hashing_stream},
     },
     keys::{DigestKeys, NamespaceKeys, REPOS_ROOT},
     pagination,

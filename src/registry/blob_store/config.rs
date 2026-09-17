@@ -2,8 +2,7 @@
 //! write under `[blob_store.fs]` or `[blob_store.s3]`, and the wiring of the
 //! storage handles it selects.
 
-use std::path::PathBuf;
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use bytesize::ByteSize;
 use serde::Deserialize;
@@ -137,8 +136,10 @@ impl BlobStoreConfig {
 mod tests {
     use tempfile::TempDir;
 
-    use super::*;
+    use angos_oci::Digest;
     use angos_secret::Secret;
+
+    use super::*;
 
     #[tokio::test]
     async fn fs_backend_builds() {
@@ -148,11 +149,18 @@ mod tests {
             sync_to_disk: false,
         });
         let backend = config.build_backend().unwrap();
-        assert!(!backend.supports_presign());
+        assert_eq!(
+            backend
+                .presigned_url(&Digest::sha256_of_bytes(b"blob"), None)
+                .await
+                .unwrap(),
+            None,
+            "a filesystem store signs no URLs"
+        );
     }
 
-    #[test]
-    fn s3_backend_builds_with_presign() {
+    #[tokio::test]
+    async fn s3_backend_builds_with_presign() {
         let config = BlobStoreConfig::S3(S3BackendConfig {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("root".to_string()),
@@ -165,7 +173,14 @@ mod tests {
             ..S3BackendConfig::default()
         });
         let backend = config.build_backend().unwrap();
-        assert!(backend.supports_presign());
+        assert!(
+            backend
+                .presigned_url(&Digest::sha256_of_bytes(b"blob"), None)
+                .await
+                .unwrap()
+                .is_some(),
+            "an S3 store signs a download URL"
+        );
     }
 
     /// Flat TOML must deserialise into both the embedded `S3ConnectionConfig`

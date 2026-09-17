@@ -9,8 +9,11 @@ use tracing::warn;
 
 use angos_oci::{Namespace, UploadSessionId};
 
-use crate::registry::keys::NamespaceKeys;
-use crate::registry::{Error, blob_store::BlobStore, keys::REPOS_ROOT};
+use crate::registry::{
+    Error,
+    blob_store::BlobStore,
+    keys::{NamespaceKeys, REPOS_ROOT},
+};
 
 /// Fan-out for the per-upload session-marker probes.
 const ORPHAN_PROBE_CONCURRENCY: usize = 16;
@@ -136,74 +139,46 @@ mod tests {
     use crate::registry::blob_store::multipart_cleanup::*;
 
     #[test]
-    fn test_is_orphan_recent_upload_is_not_orphan() {
-        let now = Utc::now();
-        let initiated = now - Duration::minutes(5);
-        let timeout = Duration::hours(1);
-        assert!(!is_orphan(initiated, now, timeout));
-    }
-
-    #[test]
-    fn test_is_orphan_old_upload_is_orphan() {
-        let now = Utc::now();
-        let initiated = now - Duration::hours(2);
-        let timeout = Duration::hours(1);
-        assert!(is_orphan(initiated, now, timeout));
-    }
-
-    /// At the exact boundary the upload is orphaned: the check uses `>=`.
-    #[test]
-    fn test_is_orphan_at_exact_timeout_boundary() {
+    fn an_upload_orphans_once_its_age_reaches_the_timeout() {
         let now = Utc::now();
         let timeout = Duration::hours(1);
-        let initiated = now - timeout;
-        assert!(is_orphan(initiated, now, timeout));
-    }
-
-    /// Clock skew putting `initiated` in the future must never orphan.
-    #[test]
-    fn test_is_orphan_future_initiated_is_not_orphan() {
-        let now = Utc::now();
-        let initiated = now + Duration::minutes(10);
-        let timeout = Duration::hours(1);
-        assert!(!is_orphan(initiated, now, timeout));
-    }
-
-    #[test]
-    fn test_parse_upload_key_valid() {
-        let result = parse_upload_key("v2/repositories/my-repo/_uploads/abc-123-def/data");
-        assert_eq!(result, Some(("my-repo", "abc-123-def")));
+        for (age, orphan, case) in [
+            (Duration::minutes(5), false, "younger than the timeout"),
+            (Duration::hours(2), true, "older than the timeout"),
+            (timeout, true, "at the boundary, since the check uses `>=`"),
+            (
+                -Duration::minutes(10),
+                false,
+                "initiated in the future by clock skew",
+            ),
+        ] {
+            assert_eq!(is_orphan(now - age, now, timeout), orphan, "{case}");
+        }
     }
 
     #[test]
-    fn test_parse_upload_key_coalesce_scratch() {
-        let result =
-            parse_upload_key("v2/repositories/my-repo/_uploads/abc-123-def/staged/coalesce");
-        assert_eq!(result, Some(("my-repo", "abc-123-def")));
-    }
-
-    #[test]
-    fn test_parse_upload_key_nested_namespace() {
-        let result = parse_upload_key("v2/repositories/org/project/image/_uploads/uuid-here/data");
-        assert_eq!(result, Some(("org/project/image", "uuid-here")));
-    }
-
-    #[test]
-    fn test_parse_upload_key_invalid_prefix() {
-        let result = parse_upload_key("invalid/prefix/_uploads/uuid/data");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_parse_upload_key_invalid_suffix() {
-        let result = parse_upload_key("v2/repositories/repo/_uploads/uuid/staged");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_parse_upload_key_missing_uploads() {
-        let result = parse_upload_key("v2/repositories/repo/blobs/sha256/abc/data");
-        assert_eq!(result, None);
+    fn an_upload_key_parses_to_its_namespace_and_session() {
+        for (key, parsed) in [
+            (
+                "v2/repositories/my-repo/_uploads/abc-123-def/data",
+                Some(("my-repo", "abc-123-def")),
+            ),
+            // The coalesce scratch names the same session, so one stranded by
+            // a crash is reclaimable.
+            (
+                "v2/repositories/my-repo/_uploads/abc-123-def/staged/coalesce",
+                Some(("my-repo", "abc-123-def")),
+            ),
+            (
+                "v2/repositories/org/project/image/_uploads/uuid-here/data",
+                Some(("org/project/image", "uuid-here")),
+            ),
+            ("invalid/prefix/_uploads/uuid/data", None),
+            ("v2/repositories/repo/_uploads/uuid/staged", None),
+            ("v2/repositories/repo/blobs/sha256/abc/data", None),
+        ] {
+            assert_eq!(parse_upload_key(key), parsed, "key {key:?}");
+        }
     }
 
     /// Reports one long-abandoned multipart upload and answers every `head`
