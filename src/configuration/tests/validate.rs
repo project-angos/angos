@@ -225,3 +225,49 @@ fn event_webhook_bad_repo_reference_fails_load() {
         "Error must identify the repository as the source: {msg}"
     );
 }
+
+#[test]
+fn ui_sign_in_provider_must_be_a_configured_oidc_provider() {
+    let config = config_toml(
+        r#"
+    [ui]
+    enabled = true
+
+    [ui.oidc]
+    provider = "dex"
+    client_id = "angos-ui"
+
+    [auth.oidc.okta]
+    issuer = "https://org.okta.com"
+    "#,
+    );
+
+    let result = Configuration::load_from_str(&config);
+    match result {
+        Err(Error::InvalidFormat(msg)) => {
+            assert!(msg.contains("ui.oidc.provider 'dex' has no matching auth.oidc provider"));
+        }
+        other => panic!("Expected InvalidFormat error, got {other:?}"),
+    }
+}
+
+#[test]
+fn ui_sign_in_accepts_a_configured_oidc_provider() {
+    let config = config_toml(
+        r#"
+    [ui]
+    enabled = true
+
+    [ui.oidc]
+    provider = "dex"
+    client_id = "angos-ui"
+
+    [auth.oidc.dex]
+    issuer = "https://dex.example.com"
+    "#,
+    );
+
+    let configuration = Configuration::load_from_str(&config).unwrap();
+
+    assert_eq!(configuration.ui.oidc.unwrap().client_id, "angos-ui");
+}

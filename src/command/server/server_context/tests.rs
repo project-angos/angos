@@ -20,7 +20,7 @@ use crate::{
         bootstrap,
         server::{
             router::Route,
-            server_context::{ServerContext, resolve_forwarded_ip},
+            server_context::{ServerContext, build_ui_config, resolve_forwarded_ip},
         },
     },
     configuration::{Configuration, TrustedProxy},
@@ -896,4 +896,36 @@ async fn an_untrusted_peer_cannot_change_the_realm_scheme() {
         .unwrap(),
         r#"Bearer realm="http://registry.example.com/token",service="registry.example.com""#
     );
+}
+
+#[test]
+fn the_ui_config_carries_the_sign_in_provider_issuer() {
+    let config = load_config(
+        r#"
+    [ui]
+    enabled = true
+    name = "my-registry"
+
+    [ui.oidc]
+    provider = "dex"
+    client_id = "angos-ui"
+    scopes = "openid groups"
+
+    [auth.oidc.dex]
+    issuer = "https://dex.example.com"
+    "#,
+    );
+
+    let body = build_ui_config(&config);
+    let oidc = body.oidc.unwrap();
+
+    assert_eq!(body.name, "my-registry");
+    assert_eq!(oidc.issuer, "https://dex.example.com");
+    assert_eq!(oidc.client_id, "angos-ui");
+    assert_eq!(oidc.scopes, "openid groups");
+}
+
+#[test]
+fn the_ui_config_omits_sign_in_when_none_is_configured() {
+    assert!(build_ui_config(&minimal_config()).oidc.is_none());
 }

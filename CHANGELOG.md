@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.9.0 - UNRELEASED
 
+### Added
+
+- The web UI signs users in against an OIDC provider: `[ui.oidc]` names one of the configured `auth.oidc` providers and a public client id, and the browser runs the authorization code flow with PKCE and sends the resulting ID token as a bearer on every registry call. Sign-in starts on its own when the registry refuses a request, so a private registry needs no click and a public one is still browsed anonymously.
+
 ### Changed
 
 - The link-metadata cache is gone and `link_cache_ttl` is ignored: every tag, revision and referrer read goes to the metadata store, so a replica never serves a tag a peer has already moved, and a shared Redis cache is no longer what makes replicas agree.
@@ -16,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The `_angos/repositories/list` and `_angos/namespaces/list` listings are now filtered by access policy, as the catalog already was: each serves a repository only while it holds a namespace the caller could list tags under, and `namespace_count` counts those alone, so a repository whose policy denies the caller is neither listed nor distinguishable from an empty or unconfigured one, which both now answer `404 NAME_UNKNOWN` as well. A global rule allowing `list-` actions previously exposed every repository, its namespace names and their tag and manifest counts to any caller it admitted. A configured repository is no longer listed before it holds content the caller may see.
 - A tag push or delete landing in the same millisecond as the entry it supersedes now wins resolution, where the entry key's millisecond precision left the two tied and the tag decided by digest order instead: a re-point could leave the tag on the older digest, and a delete could answer `202` with the tag still live.
 
 ## 1.8.0

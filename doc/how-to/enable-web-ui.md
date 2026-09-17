@@ -77,6 +77,75 @@ Repositories → Namespaces → Manifests → Details
 
 ---
 
+## Sign In with OIDC
+
+The UI signs a browser in against one of the registry's own OIDC providers and
+sends the resulting ID token as a bearer on every call it makes.
+
+### Step 1: Register a Public Client
+
+At the provider, create a public client (no secret, PKCE required) with:
+
+- **Redirect URI**: the registry's root, such as `https://registry.example.com/`
+- **CORS / web origins**: the same origin, since the browser reads the provider's
+  discovery document and calls its token endpoint directly
+
+### Step 2: Point the UI at a Provider
+
+```toml
+[auth.oidc.dex]
+issuer = "https://dex.example.com"
+required_audience = "angos-ui"
+
+[ui]
+enabled = true
+
+[ui.oidc]
+provider = "dex"
+client_id = "angos-ui"
+scopes = "openid profile email"      # default
+```
+
+`provider` names the `[auth.oidc.<name>]` section above it, so the browser is
+sent to the issuer the registry validates tokens from; the registry refuses to
+start when the name matches no provider.
+
+An ID token's `aud` is the client id, so `required_audience = "angos-ui"` binds
+the tokens the UI sends to this client. The registry accepts a JWT only, which
+is what an ID token always is.
+
+### Step 3: Let Signed-In Users Browse
+
+```toml
+[global.access_policy]
+default = "deny"
+rules = [
+  "request.action == 'ui-asset' || request.action == 'ui-config'",
+  "identity.oidc != null && identity.oidc.claims['email'].endsWith('@example.com')"
+]
+```
+
+### How It Behaves
+
+- A **Sign in** button sits in the top bar, next to the theme switcher.
+- Sign-in also starts on its own the first time the registry refuses a request,
+  so a private registry needs no click, while a registry readable anonymously is
+  still browsed without signing in. It starts once per page load, so a token the
+  registry keeps refusing cannot bounce the browser back and forth.
+- The token lives in the tab's session storage and is dropped when it expires or
+  when the tab closes. There is no refresh: an expired session means signing in
+  again.
+- **Sign out** clears the token here only. It does not end the session at the
+  provider, so signing in again may not prompt for credentials.
+- Download links (ORAS artifact files, layer file downloads) are followed by the
+  browser rather than fetched, so they carry no token and work only where the
+  policy allows the `get-blob` action anonymously.
+
+Leave `[ui.oidc]` out and the UI offers no sign-in and sends no credentials,
+which is what a registry fronted by an authenticating proxy wants.
+
+---
+
 ## Access Control
 
 The UI uses the same access policies as the API:
@@ -180,6 +249,8 @@ Returns:
 curl -u admin:password http://localhost:8000/
 ```
 
+Open the UI and use **Sign in** to check an OIDC setup end to end.
+
 ---
 
 ## Troubleshooting
@@ -194,6 +265,15 @@ curl -u admin:password http://localhost:8000/
 
 - Add `list-*` actions to access policy
 - Check authentication is working
+
+### Sign-In Fails
+
+- Check the provider allows the registry's origin (CORS) on its discovery and
+  token endpoints; the browser calls both directly.
+- Check the redirect URI registered at the provider is the registry's root.
+- A 401 that persists after signing in is the registry refusing the token: check
+  `required_audience` against the client id, and that the provider's `issuer`
+  matches the `iss` its tokens carry.
 
 ### Can't Delete
 

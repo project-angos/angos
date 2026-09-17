@@ -4,15 +4,20 @@
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
 	import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
+	import SignIn from '$lib/components/SignIn.svelte';
+	import ErrorState from '$lib/components/ErrorState.svelte';
 	import { loadConfig, getRegistryName } from '$lib/config.svelte';
+	import { completeSignIn } from '$lib/auth.svelte';
 	import { trail } from '$lib/trail.svelte';
 
 	let { children } = $props();
 	let registryName = $state('Angos');
+	let signInError: string | null = $state(null);
 
 	onMount(async () => {
 		await loadConfig();
 		registryName = getRegistryName();
+		signInError = await completeSignIn();
 	});
 
 	const pathname = $derived(page.url.pathname.slice(base.length));
@@ -44,11 +49,15 @@
 		<a href="{base}/jobs" aria-current={pathname.startsWith('/jobs') ? 'page' : undefined}>Jobs</a>
 	</nav>
 	<div class="theme">
+		<SignIn />
 		<ThemeSwitcher />
 	</div>
 </header>
 
 <main>
+	{#if signInError}
+		<ErrorState message={signInError} />
+	{/if}
 	{@render children()}
 </main>
 
@@ -132,6 +141,8 @@
 	.theme {
 		flex: none;
 		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 	}
 	.pages a {
 		padding: 0.25rem 0.5rem;

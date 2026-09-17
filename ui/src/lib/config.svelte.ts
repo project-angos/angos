@@ -1,5 +1,13 @@
+export interface OidcConfig {
+	issuer: string;
+	client_id: string;
+	/** The OAuth `scope` parameter, verbatim. */
+	scopes: string;
+}
+
 interface UiConfig {
 	name: string;
+	oidc?: OidcConfig;
 }
 
 let config: UiConfig = $state({ name: 'angos' });
@@ -22,4 +30,8 @@ export async function loadConfig(): Promise<void> {
 
 export function getRegistryName(): string {
 	return config.name;
+}
+
+export function getOidcConfig(): OidcConfig | null {
+	return config.oidc ?? null;
 }

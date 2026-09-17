@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Descriptor, LayerListing } from '$lib/api';
-	import { fetchLayerEntries, layerFileUrl } from '$lib/api';
+	import { authedFetch, fetchLayerEntries, layerFileUrl } from '$lib/api';
 	import {
 		formatSize,
 		fsMatches,
@@ -154,7 +154,9 @@
 			return;
 		}
 		try {
-			const response = await fetch(layerFileUrl(namespace, layers[node.layer].digest, node.path));
+			const response = await authedFetch(
+				layerFileUrl(namespace, layers[node.layer].digest, node.path)
+			);
 			if (!response.ok) {
 				contentError = `HTTP ${response.status}`;
 				return;

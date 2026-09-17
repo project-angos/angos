@@ -1,3 +1,5 @@
+import { authHeaders, signInOnUnauthorized } from './auth.svelte';
+
 export interface Platform {
 	os: string;
 	architecture: string;
@@ -160,9 +162,25 @@ interface FetchResult<T> {
 	error: string | null;
 }
 
+/**
+ * A registry request carrying the signed-in user's bearer, if any. A refusal
+ * starts sign-in rather than surfacing as a bare 401, so a private registry
+ * asks for credentials on its own.
+ */
+export async function authedFetch(url: string, options?: RequestInit): Promise<Response> {
+	const response = await fetch(url, {
+		...options,
+		headers: { ...options?.headers, ...authHeaders() }
+	});
+	if (response.status === 401) {
+		await signInOnUnauthorized();
+	}
+	return response;
+}
+
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<FetchResult<T>> {
 	try {
-		const response = await fetch(url, options);
+		const response = await authedFetch(url, options);
 		if (!response.ok) {
 			return { data: null, error: `HTTP ${response.status}` };
 		}
@@ -175,7 +193,7 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<FetchRe
 
 async function deleteResource(url: string): Promise<string | null> {
 	try {
-		const response = await fetch(url, { method: 'DELETE' });
+		const response = await authedFetch(url, { method: 'DELETE' });
 		if (!response.ok) {
 			return `HTTP ${response.status}`;
 		}
@@ -187,7 +205,7 @@ async function deleteResource(url: string): Promise<string | null> {
 
 async function postAction(url: string): Promise<string | null> {
 	try {
-		const response = await fetch(url, { method: 'POST' });
+		const response = await authedFetch(url, { method: 'POST' });
 		if (!response.ok) {
 			return `HTTP ${response.status}`;
 		}
@@ -274,7 +292,7 @@ export interface ManifestResult {
 
 export async function fetchManifest(namespace: string, reference: string): Promise<ManifestResult> {
 	try {
-		const response = await fetch(`/v2/${namespace}/manifests/${reference}`, {
+		const response = await authedFetch(`/v2/${namespace}/manifests/${reference}`, {
 			headers: { 'Accept': MANIFEST_ACCEPT_HEADER, 'X-Angos-No-Redirect': '1' }
 		});
 		if (!response.ok) {
@@ -306,7 +324,7 @@ export async function fetchReferrers(
 ): Promise<FetchResult<ReferrersPage>> {
 	const params = new URLSearchParams(last ? { last } : {});
 	try {
-		const response = await fetch(`/v2/${namespace}/referrers/${digest}?${params}`);
+		const response = await authedFetch(`/v2/${namespace}/referrers/${digest}?${params}`);
 		if (!response.ok) {
 			return { data: null, error: `HTTP ${response.status}` };
 		}
@@ -330,6 +348,10 @@ export async function cancelUpload(namespace: string, uuid: string): Promise<str
 	return deleteResource(`/v2/${namespace}/blobs/uploads/${uuid}`);
 }
 
+// A plain URL, followed by the browser rather than fetched, so it carries no
+// bearer: a download works only where the policy allows `get-blob` anonymously.
+// Fetching it with the header and handing over an object URL would lift that,
+// at the cost of buffering the whole blob in memory.
 export function blobUrl(namespace: string, digest: string): string {
 	return `/v2/${namespace}/blobs/${digest}`;
 }
@@ -365,7 +387,7 @@ export interface LayerEntriesResult {
 
 export async function fetchLayerEntries(namespace: string, digest: string): Promise<LayerEntriesResult> {
 	try {
-		const response = await fetch(`/v2/${namespace}/_angos/layers/${digest}/entries`);
+		const response = await authedFetch(`/v2/${namespace}/_angos/layers/${digest}/entries`);
 		if (response.status === 202) {
 			return { listing: null, pending: true, error: null };
 		}
@@ -378,6 +400,7 @@ export async function fetchLayerEntries(namespace: string, digest: string): Prom
 	}
 }
 
+// Carries no bearer either, for the reason `blobUrl` gives.
 export function layerFileUrl(namespace: string, digest: string, path: string, download = false): string {
 	const query = new URLSearchParams({ path });
 	if (download) query.set('download', '1');
