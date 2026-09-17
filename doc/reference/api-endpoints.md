@@ -282,7 +282,13 @@ These sit in the extension namespace the distribution spec reserves, whose shape
 GET /v2/_angos/repositories/list
 ```
 
-List all configured repositories with their namespace counts.
+List the configured repositories with their namespace counts.
+
+The listing is filtered by access policy, as the catalog is. Visible content is the criterion: a
+repository is listed only while it holds at least one namespace the caller could list tags under,
+and `namespace_count` counts those alone. A repository holding nothing, holding nothing the caller
+may see, or not configured at all are therefore one answer, so the listing tells no one what exists
+beyond what they may read. The authorization webhook is not consulted for this filtering.
 
 **Response:**
 ```json
@@ -306,6 +312,13 @@ GET /v2/_angos/namespaces/list?repository={repository}
 ```
 
 List namespaces within a repository, with the repository's effective configuration.
+
+The listing is filtered by access policy: only the namespaces the caller could list tags under are
+returned. A repository holding none of them answers `404 NAME_UNKNOWN`, exactly as one that holds
+nothing or is not configured at all, so neither its existence nor its upstreams and tag rules are
+revealed. A configured repository is therefore not listable until it holds content the caller may
+see; pushing to it does not depend on that. The authorization webhook is not consulted for this
+filtering.
 
 Names are served from the `v2/cat` index alone, reading only the repository's own key range. A
 namespace emptied since its last write can therefore still be listed, with zero counts, until

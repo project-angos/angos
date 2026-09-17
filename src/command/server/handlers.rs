@@ -27,9 +27,20 @@ pub struct TokenBody {
     expires_in: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct UiConfigBody {
-    name: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<UiOidcBody>,
+}
+
+/// What a browser needs to run the authorization code flow itself. Every field
+/// is public by nature: the client is a public one, holding no secret.
+#[derive(Clone, Serialize)]
+pub struct UiOidcBody {
+    pub issuer: String,
+    pub client_id: String,
+    pub scopes: String,
 }
 
 #[derive(Serialize)]
@@ -73,12 +84,8 @@ pub fn handle_get_token(
     )?)
 }
 
-pub fn handle_ui_config(ui_name: &str) -> Result<Response<ResponseBody>, Error> {
-    let body = UiConfigBody {
-        name: ui_name.to_string(),
-    };
-
-    json_response(StatusCode::OK, &body)
+pub fn handle_ui_config(ui_config: &UiConfigBody) -> Result<Response<ResponseBody>, Error> {
+    json_response(StatusCode::OK, ui_config)
 }
 
 pub fn handle_ui_asset(path: &str) -> Result<Response<ResponseBody>, Error> {

@@ -10,9 +10,9 @@ use tracing::{instrument, warn};
 
 use angos_extension_service::{
     AccessEntry, DEFAULT_JOBS_PAGE, DeleteJobRequest, FailedJobEntry, FailedJobsBody, JobEntry,
-    JobsBody, ListJobsRequest, ListPullsRequest, ManifestEntry, NamespaceInfo, NamespacesBody,
-    NoContent, ParentRef, PullsBody, ReferrerInfo, RepositoriesBody, RepositoryInfo,
-    RetryJobRequest, RevisionsBody, UploadEntry, UploadsBody,
+    JobsBody, ListJobsRequest, ListPullsRequest, ManifestEntry, NamespaceInfo, NamespaceVisibility,
+    NamespacesBody, NoContent, ParentRef, PullsBody, ReferrerInfo, RepositoriesBody,
+    RepositoryInfo, RetryJobRequest, RevisionsBody, UploadEntry, UploadsBody,
 };
 use angos_oci::{
     Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace, Platform, Tag,
@@ -143,8 +143,11 @@ fn parent_refs_for(
 }
 
 impl Registry {
-    #[instrument(skip(self))]
-    pub async fn get_repositories_info(&self) -> Result<RepositoriesBody, Error> {
+    #[instrument(skip(self, visibility))]
+    pub async fn get_repositories_info(
+        &self,
+        visibility: &dyn NamespaceVisibility,
+    ) -> Result<RepositoriesBody, Error> {
         // One walk bucketed in memory: listing per repository would re-scan the
         // whole store once per configured repository.
         let all_namespaces = self.collect_namespaces(None).await?;
@@ -153,8 +156,16 @@ impl Registry {
         for name in self.resolver.keys() {
             let namespace_count = all_namespaces
                 .iter()
-                .filter(|ns| namespace_belongs_to(ns, name))
+                .filter(|ns| namespace_belongs_to(ns, name) && visibility.allows(ns))
                 .count();
+            // Content the caller may see is the whole criterion, so a repository
+            // that does not exist, holds nothing, or holds nothing visible are
+            // one answer. Testing the repository's name instead would read a
+            // policy written about its namespaces against a name that is none of
+            // them, and hide a repository whose content the caller can read.
+            if namespace_count == 0 {
+                continue;
+            }
             let config = self.get_repository_config(name);
             repositories.push(RepositoryInfo {
                 name: name.to_string(),
@@ -170,43 +181,55 @@ impl Registry {
         Ok(RepositoriesBody { repositories })
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, visibility))]
     pub async fn get_namespaces_info(
         &self,
         repository: &Namespace,
+        visibility: &dyn NamespaceVisibility,
     ) -> Result<NamespacesBody, Error> {
         let repository = repository.as_ref();
         let namespace_names = self.list_repository_namespaces(repository).await?;
 
         // A directory whose name is not a valid namespace is a storage artifact
         // scrub removes; dropping it keeps one bad name from failing the listing.
-        let mut namespaces: Vec<NamespaceInfo> = stream::iter(
-            namespace_names
-                .into_iter()
-                .filter_map(|name| Namespace::new(&name).ok()),
-        )
-        .map(|name| async move {
-            // The three counts read disjoint prefixes, so they go out together
-            // rather than paying one round trip after another per namespace.
-            let (tag_count, manifest_count, upload_count) = try_join!(
-                self.metadata_store
-                    .stream_live_tags(&name, None)
-                    .try_fold(0usize, |count, _| async move { Ok(count + 1) }),
-                self.metadata_store
-                    .stream_revisions(&name)
-                    .try_fold(0usize, |count, _| async move { Ok(count + 1) }),
-                self.count_uploads(&name),
-            )?;
-            Ok::<_, Error>(NamespaceInfo {
-                name: name.to_string(),
-                tag_count,
-                manifest_count,
-                upload_count,
+        // Filtering here rather than after the counts keeps a namespace the
+        // caller may not see from costing three reads.
+        let visible: Vec<Namespace> = namespace_names
+            .into_iter()
+            .filter_map(|name| Namespace::new(&name).ok())
+            .filter(|name| visibility.allows(name))
+            .collect();
+
+        // Nothing visible answers as an absent repository, so an empty listing
+        // cannot tell a repository that holds nothing from one held back, and
+        // the upstreams and tag rules below stay with the content they describe.
+        if visible.is_empty() {
+            return Err(Error::NameUnknown);
+        }
+
+        let mut namespaces: Vec<NamespaceInfo> = stream::iter(visible)
+            .map(|name| async move {
+                // The three counts read disjoint prefixes, so they go out together
+                // rather than paying one round trip after another per namespace.
+                let (tag_count, manifest_count, upload_count) = try_join!(
+                    self.metadata_store
+                        .stream_live_tags(&name, None)
+                        .try_fold(0usize, |count, _| async move { Ok(count + 1) }),
+                    self.metadata_store
+                        .stream_revisions(&name)
+                        .try_fold(0usize, |count, _| async move { Ok(count + 1) }),
+                    self.count_uploads(&name),
+                )?;
+                Ok::<_, Error>(NamespaceInfo {
+                    name: name.to_string(),
+                    tag_count,
+                    manifest_count,
+                    upload_count,
+                })
             })
-        })
-        .buffer_unordered(NAMESPACE_STAT_CONCURRENCY)
-        .try_collect()
-        .await?;
+            .buffer_unordered(NAMESPACE_STAT_CONCURRENCY)
+            .try_collect()
+            .await?;
 
         namespaces.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -684,6 +707,9 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
+    /// Listing tests that are not about visibility admit every namespace.
+    const ALL_VISIBLE: fn(&Namespace) -> bool = |_| true;
+
     use std::{
         collections::HashMap,
         sync::{
@@ -708,7 +734,7 @@ mod tests {
     };
 
     use crate::registry::{
-        Registry,
+        Error as RegistryError, Registry,
         admin::{ListPullsRequest, analyze_manifest, extract_docker_referrer, parent_refs_for},
         keys::NamespaceKeys,
         metadata_store::{AccessEntry, LinkKind, MetadataStore},
@@ -791,7 +817,7 @@ mod tests {
         let registry = create_test_registry(case.blob_store(), metadata_store_over(hooked));
 
         registry
-            .get_namespaces_info(&Namespace::new("test-repo").unwrap())
+            .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
             .await
             .unwrap();
 
@@ -1025,7 +1051,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .get_namespaces_info(&Namespace::new("test-repo").unwrap())
+                .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1057,7 +1083,7 @@ mod tests {
             );
 
             let response = registry
-                .get_repositories_info()
+                .get_repositories_info(&ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1067,6 +1093,84 @@ mod tests {
             assert_eq!(
                 count, 2,
                 "the repository namespace count must include the upload-only namespace"
+            );
+        })
+        .await;
+    }
+
+    /// Visible content is the whole listing criterion: a repository is served
+    /// when the caller may see something in it, and answers as an absent one
+    /// otherwise, so nothing tells a hidden repository from a missing one.
+    #[tokio::test]
+    async fn listings_serve_only_what_holds_visible_content() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+
+            let namespace = Namespace::new("test-repo/private").unwrap();
+            let (digest, _) = create_test_blob(registry, &namespace, b"private content").await;
+            seed_links(
+                &registry.metadata_store,
+                &namespace,
+                &[(LinkKind::Tag(Tag::new("v1").unwrap()), digest.clone())],
+            )
+            .await
+            .unwrap();
+
+            let repository = Namespace::new("test-repo").unwrap();
+            let hide_all: fn(&Namespace) -> bool = |_| false;
+            // Admits the namespaces but not the repository's own name, which is
+            // how a policy written about namespaces reads: the repository must
+            // still be served, since its content is readable.
+            let namespaces_only: fn(&Namespace) -> bool = |ns| ns.as_ref() != "test-repo";
+
+            assert!(
+                matches!(
+                    registry.get_namespaces_info(&repository, &hide_all).await,
+                    Err(RegistryError::NameUnknown)
+                ),
+                "a repository with nothing visible must answer as unknown"
+            );
+            let body = response_json(
+                registry
+                    .get_repositories_info(&hide_all)
+                    .await
+                    .unwrap()
+                    .into_response()
+                    .unwrap(),
+            )
+            .await;
+            assert!(
+                body["repositories"].as_array().unwrap().is_empty(),
+                "a repository with nothing visible must not be listed; got: {body}"
+            );
+
+            let body = response_json(
+                registry
+                    .get_namespaces_info(&repository, &namespaces_only)
+                    .await
+                    .unwrap()
+                    .into_response()
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                body["namespaces"][0]["name"], "test-repo/private",
+                "readable content must list even when the repository name is not \
+                 itself an admitted namespace; got: {body}"
+            );
+
+            let body = response_json(
+                registry
+                    .get_repositories_info(&namespaces_only)
+                    .await
+                    .unwrap()
+                    .into_response()
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                body["repositories"][0]["name"], "test-repo",
+                "the repository holding that content must list too; got: {body}"
             );
         })
         .await;
@@ -1090,7 +1194,7 @@ mod tests {
             .unwrap();
 
             let response = registry
-                .get_namespaces_info(&Namespace::new("test-repo").unwrap())
+                .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1127,7 +1231,7 @@ mod tests {
             .unwrap();
 
         let response = registry
-            .get_namespaces_info(&Namespace::new("test-repo").unwrap())
+            .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
             .await
             .unwrap()
             .into_response()
@@ -1190,7 +1294,7 @@ mod tests {
             create_test_blob(registry, &other, b"hidden content").await;
 
             let response = registry
-                .get_namespaces_info(&Namespace::new("test-repo").unwrap())
+                .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1235,7 +1339,7 @@ mod tests {
             .unwrap();
 
         let response = registry
-            .get_namespaces_info(&Namespace::new("test-repo").unwrap())
+            .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
             .await
             .expect("one invalid directory must not fail the listing")
             .into_response()

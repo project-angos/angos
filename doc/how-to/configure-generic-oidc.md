@@ -269,3 +269,4 @@ Subject: user@example.com
 - [Set Up Access Control](set-up-access-control.md) for comprehensive policies
 - [Configure GitHub Actions OIDC](configure-github-actions-oidc.md) for CI/CD
 - [Configure Kubernetes OIDC](configure-kubernetes-oidc.md) for service-account tokens and image pulls
+- [Enable the Web UI](enable-web-ui.md) to sign browsers in against a provider configured here

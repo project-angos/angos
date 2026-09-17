@@ -34,7 +34,7 @@ pub use ui::UiConfig;
 mod tests;
 
 use crate::{
-    auth::{authenticator, webhook},
+    auth::{authenticator, oidc, webhook},
     event_webhook::config::EventWebhookConfig,
     registry::{blob_store, repository},
 };
@@ -129,6 +129,7 @@ impl Configuration {
                 "event_webhook.{name} must have at least one event"
             )));
         }
+        validate_ui(&self.ui, &self.auth.oidc)?;
         validate_global(&self.global, &self.auth.webhook, &self.event_webhook)?;
         validate_blob_store(&self.blob_store)?;
         validate_repositories(
@@ -139,6 +140,22 @@ impl Configuration {
         )?;
         Ok(self)
     }
+}
+
+/// Refuses a UI sign-in pointed at an OIDC provider that is not configured,
+/// which would otherwise send the browser to an issuer no token is accepted from.
+fn validate_ui(ui: &UiConfig, oidc: &HashMap<String, oidc::Config>) -> Result<(), Error> {
+    let Some(sign_in) = &ui.oidc else {
+        return Ok(());
+    };
+
+    if !oidc.contains_key(&sign_in.provider) {
+        return Err(Error::InvalidFormat(format!(
+            "ui.oidc.provider '{}' has no matching auth.oidc provider",
+            sign_in.provider
+        )));
+    }
+    Ok(())
 }
 
 /// Reads every configuration file, refusing an empty list.

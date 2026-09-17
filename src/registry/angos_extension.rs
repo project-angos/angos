@@ -81,12 +81,19 @@ impl ext::AngosExtensionService for Registry {
     type Body = LayerFileReader;
     type Error = Error;
 
-    async fn list_repositories(&self) -> Result<ext::RepositoriesBody, Error> {
-        self.get_repositories_info().await
+    async fn list_repositories(
+        &self,
+        visibility: &dyn ext::NamespaceVisibility,
+    ) -> Result<ext::RepositoriesBody, Error> {
+        self.get_repositories_info(visibility).await
     }
 
-    async fn list_namespaces(&self, repository: Namespace) -> Result<ext::NamespacesBody, Error> {
-        self.get_namespaces_info(&repository).await
+    async fn list_namespaces(
+        &self,
+        repository: Namespace,
+        visibility: &dyn ext::NamespaceVisibility,
+    ) -> Result<ext::NamespacesBody, Error> {
+        self.get_namespaces_info(&repository, visibility).await
     }
 
     async fn list_revisions(&self, namespace: Namespace) -> Result<ext::RevisionsBody, Error> {

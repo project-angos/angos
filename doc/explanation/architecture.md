@@ -327,5 +327,5 @@ Notify external systems on registry operations:
 
 Support for any number of identity providers:
 - GitHub Actions
-- Google, Okta, Auth0, Keycloak
+- Google, Okta, Auth0, Keycloak, dex, etc.
 - Custom OIDC providers

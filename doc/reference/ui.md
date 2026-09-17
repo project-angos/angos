@@ -23,6 +23,27 @@ name = "My Registry"
 | `enabled` | bool   | `false`             | Enable the web interface              |
 | `name`    | string | `"Angos"` | Registry name displayed in the top bar |
 
+### Sign-in
+
+```toml
+[ui.oidc]
+provider = "dex"
+client_id = "angos-ui"
+```
+
+| Option      | Type   | Default                  | Description                                          |
+|-------------|--------|--------------------------|------------------------------------------------------|
+| `provider`  | string | required                 | The `auth.oidc` provider to sign in against          |
+| `client_id` | string | required                 | The provider's public client, holding no secret      |
+| `scopes`    | string | `"openid profile email"` | The OAuth `scope` parameter, verbatim                |
+
+`provider` names a configured `[auth.oidc.<name>]` section and the registry refuses
+to start when no such provider exists. The issuer is read from it, so the browser
+can only be sent to an issuer the registry validates tokens from.
+
+Without this section the UI offers no sign-in and sends no credentials, which is
+what a registry readable anonymously or fronted by an authenticating proxy wants.
+
 ---
 
 ## URL Structure
@@ -61,9 +82,18 @@ Returns the UI configuration.
 **Response:**
 ```json
 {
-  "name": "My Registry"
+  "name": "My Registry",
+  "oidc": {
+    "issuer": "https://dex.example.com",
+    "client_id": "angos-ui",
+    "scopes": "openid profile email"
+  }
 }
 ```
+
+The `oidc` object is present only when `[ui.oidc]` is configured. Every field in
+it is public by nature: the client holds no secret. The endpoint itself needs no
+credentials, since the UI reads it before anyone has signed in.
 
 ### Static Assets
 
@@ -83,6 +113,13 @@ UI-specific actions for access policies:
 | `list-namespaces`   | Namespace list view                       |
 | `list-revisions`    | Manifest list view                        |
 | `list-uploads`      | Active uploads view                       |
+
+Allowing `list-repositories` and `list-namespaces` does not expose every
+repository: both listings serve a repository only while it holds a namespace the
+caller could list tags under. A repository whose `access_policy` denies them
+stays out of the UI and answers as an absent one when opened directly, and so
+does a repository that is simply empty, which is what keeps the two apart from
+being told apart.
 
 ### Minimal Policy for UI Access
 
@@ -344,7 +381,7 @@ Multi-platform images show platform information:
 |--------------|--------------------------------------|
 | Loading      | Spinner animation                    |
 | Not found    | 404 message with navigation          |
-| Unauthorized | Login prompt or 401 message          |
+| Unauthorized | Sign-in starts, or a 401 message when already signed in |
 | Forbidden    | 403 message explaining access denied |
 | Server error | 500 message with retry option        |
 

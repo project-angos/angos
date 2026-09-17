@@ -311,21 +311,48 @@ pub struct FailedJobsBody {
 
 // ---- The service ----------------------------------------------------------
 
+/// Whether a caller may see a namespace in a listing.
+///
+/// Listing authorization is the transport's, not the service's: the transport
+/// implements this over its authorizer and the service consults it per entry.
+/// Blanket-implemented for any `Fn(&Namespace) -> bool`, so a caller may pass a
+/// closure where a `&dyn NamespaceVisibility` is expected.
+pub trait NamespaceVisibility: Send + Sync {
+    fn allows(&self, namespace: &Namespace) -> bool;
+}
+
+impl<F: Fn(&Namespace) -> bool + Send + Sync> NamespaceVisibility for F {
+    fn allows(&self, namespace: &Namespace) -> bool {
+        self(namespace)
+    }
+}
+
 /// Angos's `_angos/` registry API.
 ///
-/// These endpoints are authorized at the route (a caller reaching them may see
-/// the whole registry), so the service takes no actor and does no per-entry
-/// filtering. `Body` is the reader a layer-file response streams from.
+/// Most endpoints are authorized at the route alone, so the service takes no
+/// actor. The two listings that span repositories are the exception: a route
+/// check cannot speak for entries the caller may not see, so they take a
+/// [`NamespaceVisibility`] and drop those. `Body` is the reader a layer-file
+/// response streams from.
 #[async_trait]
 pub trait AngosExtensionService: Send + Sync {
     type Body: AsyncRead + Send + 'static;
     type Error;
 
-    /// `GET /v2/_angos/repositories/list`.
-    async fn list_repositories(&self) -> Result<RepositoriesBody, Self::Error>;
+    /// `GET /v2/_angos/repositories/list`. Serves the repositories `visibility`
+    /// admits, each counting only the namespaces it admits.
+    async fn list_repositories(
+        &self,
+        visibility: &dyn NamespaceVisibility,
+    ) -> Result<RepositoriesBody, Self::Error>;
 
-    /// `GET /v2/_angos/namespaces/list?repository=`.
-    async fn list_namespaces(&self, repository: Namespace) -> Result<NamespacesBody, Self::Error>;
+    /// `GET /v2/_angos/namespaces/list?repository=`. Serves the namespaces
+    /// `visibility` admits.
+    async fn list_namespaces(
+        &self,
+        repository: Namespace,
+        visibility: &dyn NamespaceVisibility,
+    ) -> Result<NamespacesBody, Self::Error>;
 
     /// `GET /v2/<name>/_angos/revisions/list`.
     async fn list_revisions(&self, namespace: Namespace) -> Result<RevisionsBody, Self::Error>;

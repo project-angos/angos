@@ -91,7 +91,7 @@ async fn dispatch_route<'a>(
 
     match route {
         Route::UiAsset { path } if context.enable_ui => handlers::handle_ui_asset(&path),
-        Route::UiConfig if context.enable_ui => handlers::handle_ui_config(&context.ui_name),
+        Route::UiConfig if context.enable_ui => handlers::handle_ui_config(&context.ui_config),
         Route::UiAsset { .. } | Route::UiConfig => handle_unknown_route(parts),
         Route::Token => {
             let Some(token_issuer) = context.token_issuer() else {
@@ -359,12 +359,18 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListRepositories) => {
-            Ok(angos.list_repositories().await?.into_response()?)
-        }
-        Route::Angos(AngosEndpoint::ListNamespaces { repository }) => {
-            Ok(angos.list_namespaces(repository).await?.into_response()?)
-        }
+        Route::Angos(AngosEndpoint::ListRepositories) => Ok(angos
+            .list_repositories(&|namespace: &Namespace| {
+                context.catalog_lists_namespace(namespace, identity)
+            })
+            .await?
+            .into_response()?),
+        Route::Angos(AngosEndpoint::ListNamespaces { repository }) => Ok(angos
+            .list_namespaces(repository, &|namespace: &Namespace| {
+                context.catalog_lists_namespace(namespace, identity)
+            })
+            .await?
+            .into_response()?),
         Route::Angos(AngosEndpoint::ListJobs { queue, n, after }) => Ok(angos
             .list_jobs(ListJobsRequest { queue, n, after })
             .await?

@@ -14,6 +14,7 @@ use tracing::instrument;
 use angos_oci::request::BlobMount;
 use angos_oci::{Namespace, namespace_belongs_to};
 
+use crate::command::server::handlers::{UiConfigBody, UiOidcBody};
 use crate::command::server::router::Route;
 
 use crate::{
@@ -32,7 +33,7 @@ pub struct ServerContext {
     trusted_proxies: Vec<TrustedProxy>,
     pub registry: Arc<Registry>,
     pub enable_ui: bool,
-    pub ui_name: String,
+    pub ui_config: UiConfigBody,
 }
 
 impl ServerContext {
@@ -59,7 +60,7 @@ impl ServerContext {
             trusted_proxies: config.global.trusted_proxies.clone(),
             registry,
             enable_ui: config.ui.enabled,
-            ui_name: config.ui.name.clone(),
+            ui_config: build_ui_config(config),
         })
     }
 
@@ -235,6 +236,25 @@ impl ServerContext {
 
     pub async fn shutdown(&self) {
         self.registry.shutdown().await;
+    }
+}
+
+/// The document the UI reads at startup, with the sign-in provider's issuer
+/// resolved from `auth.oidc`. Configuration validation rejects a provider name
+/// with no such provider, so an unresolved one leaves the UI without sign-in.
+fn build_ui_config(config: &Configuration) -> UiConfigBody {
+    let oidc = config.ui.oidc.as_ref().and_then(|sign_in| {
+        let provider = config.auth.oidc.get(&sign_in.provider)?;
+        Some(UiOidcBody {
+            issuer: provider.issuer.clone(),
+            client_id: sign_in.client_id.clone(),
+            scopes: sign_in.scopes.clone(),
+        })
+    });
+
+    UiConfigBody {
+        name: config.ui.name.clone(),
+        oidc,
     }
 }
 

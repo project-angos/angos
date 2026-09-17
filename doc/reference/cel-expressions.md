@@ -271,6 +271,17 @@ rules = ["identity.oidc.claims['repository'] == 'myorg/website-frontend'"]
 
 The global rules admit a request only when the repository covering it declares rules of its own, which then decide; every other namespace is left to the global default.
 
+Keep a broad global grant off the actions that carry a namespace once repositories deny on their own. A rule such as `request.action.startsWith('list-')` also grants `list-revisions`, `list-uploads` and `list-tags` on namespaces no repository covers, which answer with an empty listing, while the same request under a denying repository answers `401`: the difference names the repositories that exist. Grant the listings that carry no namespace (`list-catalog`, `list-repositories`, `list-namespaces`, `list-jobs`, `list-failed-jobs`) by name instead, and leave the namespaced ones to `has_repository_policy()`, so a hidden repository and an unconfigured path answer alike:
+
+```toml
+rules = [
+  "request.action in ['list-catalog', 'list-repositories', 'list-namespaces']",
+  "has_repository_policy()"
+]
+```
+
+Those listings need no such grant to stay safe: each filters its own entries by what the caller may read.
+
 ### Read-Only for Guests
 
 ```toml
