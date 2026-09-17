@@ -1,4 +1,4 @@
-//! Link-key validation: one visit per link file covers manifest link repair,
+//! Link-key validation: one visit per key covers manifest reference repair,
 //! `referenced_by` back-links, blob-index grant reconciliation, tag targets,
 //! referrer liveness, and the invalid-name gates.
 
@@ -8,8 +8,7 @@ use tracing::{debug, warn};
 use angos_oci::{Digest, Manifest, Namespace, Tag};
 use angos_storage::Error as StorageError;
 
-use crate::registry::keys::NamespaceKeys;
-use crate::registry::metadata_store::{parse_atime_entry, parse_tag_entry, tag_ord_ts};
+use crate::registry::keys::{NamespaceKeys, TagEntry, parse_atime_entry};
 use crate::{
     command::{
         maintenance::{
@@ -20,7 +19,7 @@ use crate::{
     },
     registry::{
         Error as RegistryError,
-        manifest::link_plan,
+        manifest::referenced_digests,
         metadata_store::{AccessEntry, LinkKind},
     },
 };
@@ -53,7 +52,7 @@ impl Validator {
         self.demote_superseded_entries(&namespace, &tag).await?;
         let metadata = match self
             .metadata_store
-            .read_link_reference(&namespace, &LinkKind::Tag(tag.clone()))
+            .read_link(&namespace, &LinkKind::Tag(tag.clone()))
             .await
         {
             Ok(metadata) => metadata,
@@ -85,13 +84,13 @@ impl Validator {
                 .await
                 .map_err(RegistryError::from)?;
             for name in &page.items {
-                let Some((ord, _, _)) = parse_tag_entry(name) else {
+                let Ok(entry) = name.parse::<TagEntry>() else {
                     continue;
                 };
                 // The listing sorts newest first, so the first parseable
                 // ordinal is the winner group's.
-                let winner = *winner_ord.get_or_insert(ord);
-                if ord <= winner {
+                let winner = *winner_ord.get_or_insert(entry.ord());
+                if entry.ord() <= winner {
                     continue;
                 }
                 if self.younger_than_grace(&format!("{dir}/{name}")).await? {
@@ -145,8 +144,7 @@ impl Validator {
         if !self.claim(format!("atime-entries:{dir}")) {
             return Ok(());
         }
-        let window =
-            i64::try_from(self.metadata_store.atime_audit_window_secs()).unwrap_or(i64::MAX);
+        let window = i64::try_from(self.metadata_store.atime_audit_window_secs).unwrap_or(i64::MAX);
         let mut kept_newest = false;
         let mut token = None;
         loop {
@@ -157,7 +155,7 @@ impl Validator {
                 .await
                 .map_err(RegistryError::from)?;
             for name in &page.items {
-                let Some(ord) = parse_atime_entry(name) else {
+                let Some(at) = parse_atime_entry(name) else {
                     continue;
                 };
                 let key = format!("{dir}/{name}");
@@ -178,9 +176,7 @@ impl Validator {
                     kept_newest = true;
                     continue;
                 }
-                let old = tag_ord_ts(ord)
-                    .is_some_and(|at| Utc::now().signed_duration_since(at).num_seconds() >= window);
-                if old {
+                if Utc::now().signed_duration_since(at).num_seconds() >= window {
                     self.emit(Action::RetireAtimeKey { key }).await?;
                 }
             }
@@ -205,7 +201,7 @@ impl Validator {
     ) -> Result<(), Error> {
         self.ensure_catalog(namespace).await?;
         if let Some(created_at) = entry_created_at {
-            let grace = i64::try_from(self.metadata_store.gc_grace_secs()).unwrap_or(i64::MAX);
+            let grace = i64::try_from(self.metadata_store.gc_grace_secs).unwrap_or(i64::MAX);
             if Utc::now().signed_duration_since(created_at).num_seconds() < grace {
                 return Ok(());
             }
@@ -291,25 +287,44 @@ impl Validator {
         // withholds the link and grant for a digest it does not own, and
         // re-deriving them from the manifest body would hand back exactly the
         // cross-namespace read access the write path refused.
-        for (link, target) in link_plan::revision_links(&manifest, revision) {
-            if !self.holds_reference(namespace, &target, &link).await? {
+
+        // A referenced digest is pinned by this revision's per-referrer entry,
+        // never by a key of its own, so ownership of the target is the whole
+        // gate and the repair is that entry.
+        for target in referenced_digests(&manifest) {
+            if !self.metadata_store.can_read(namespace, &target).await? {
                 debug!(
                     "scrub: '{namespace}' holds no reference to '{target}'; \
                      leaving the link from revision '{revision}' unrepaired"
                 );
                 continue;
             }
-            // A tracked reference is pinned by its per-referrer entry alone.
-            if link.is_tracked() {
-                self.ensure_grant(
-                    namespace,
-                    &target,
-                    &LinkKind::ReferencedBy(revision.clone()),
-                )
-                .await?;
+            self.ensure_grant(
+                namespace,
+                &target,
+                &LinkKind::ReferencedBy(revision.clone()),
+            )
+            .await?;
+        }
+
+        // A subject-bearing manifest also links the referrer back to its
+        // subject, which carries a referrer record of its own.
+        if let Some(subject) = &manifest.subject {
+            let back_link = LinkKind::Referrer {
+                subject: subject.digest.clone(),
+                referrer: revision.clone(),
+            };
+            if self
+                .holds_reference(namespace, revision, &back_link)
+                .await?
+            {
+                self.ensure_link(namespace, &back_link, revision).await?;
+                self.ensure_grant(namespace, revision, &back_link).await?;
             } else {
-                self.ensure_link(namespace, &link, &target).await?;
-                self.ensure_grant(namespace, &target, &link).await?;
+                debug!(
+                    "scrub: '{namespace}' holds no reference to '{revision}'; \
+                     leaving its subject back-link unrepaired"
+                );
             }
         }
         Ok(true)
@@ -359,27 +374,8 @@ impl Validator {
         target: &Digest,
         link: &LinkKind,
     ) -> Result<bool, Error> {
-        match self
-            .metadata_store
-            .read_blob_index_namespace(namespace, target)
-            .await
-        {
-            Ok(links) => {
-                if links.contains(&LinkKind::Blob(target.clone())) {
-                    return Ok(true);
-                }
-                for entry in &links {
-                    if self
-                        .metadata_store
-                        .reference_backed(namespace, entry, target)
-                        .await?
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
-            Err(RegistryError::NotFound) => {}
-            Err(e) => return Err(e.into()),
+        if self.metadata_store.can_read(namespace, target).await? {
+            return Ok(true);
         }
         Ok(self
             .metadata_store

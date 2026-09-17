@@ -5,14 +5,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::TryStreamExt;
 use tracing::warn;
 
 use angos_oci::Namespace;
 
 use crate::{
     command::maintenance::{error::Error, executor::ActionSink},
-    registry::metadata_store::MetadataStore,
+    registry::{
+        content_discovery::holds_manifest_content,
+        metadata_store::{LIST_PAGE, MetadataStore},
+    },
 };
 
 /// A checker that operates on a single namespace at a time.
@@ -35,16 +38,16 @@ pub async fn check_namespaces(
     sink: &dyn ActionSink,
     concurrency: usize,
 ) -> Result<(), Error> {
-    let namespaces = metadata_store
-        .collect_namespaces(None)
-        .await
-        .map_err(Error::from)?;
-    stream::iter(namespaces)
-        .for_each_concurrent(concurrency, |namespace| async move {
+    metadata_store
+        .stream_namespaces(None, LIST_PAGE, &|_| true, |namespace| {
+            holds_manifest_content(metadata_store, namespace)
+        })
+        .try_for_each_concurrent(concurrency, |namespace| async move {
             if let Err(e) = checker.check(&namespace, sink).await {
                 warn!("Check failed for namespace '{namespace}': {e}");
             }
+            Ok(())
         })
-        .await;
-    Ok(())
+        .await
+        .map_err(Error::from)
 }

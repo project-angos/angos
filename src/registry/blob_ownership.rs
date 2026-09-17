@@ -1,16 +1,14 @@
-use std::collections::HashSet;
+//! The two-store blob-ownership flows. The reference-index reads and writes
+//! themselves belong to the metadata store; what lives here needs the blob
+//! store's bytes in the same breath.
 
 use angos_oci::{Digest, Namespace, UploadSessionId};
 
-use crate::registry::{
-    Error,
-    blob_store::BlobStore,
-    metadata_store::{BlobIndex, BlobIndexOperation, LinkKind, MetadataStore},
-};
+use crate::registry::{Error, blob_store::BlobStore, metadata_store::MetadataStore};
 
 /// Promote the upload session's staged bytes to the canonical blob path and
 /// grant `namespace` its reference. No lock is needed: fresh bytes and a fresh
-/// `_own` key sit inside the collector's grace period, and both steps are
+/// `own` key sit inside the collector's grace period, and both steps are
 /// idempotent.
 pub async fn promote_and_grant(
     blob_store: &BlobStore,
@@ -24,10 +22,7 @@ pub async fn promote_and_grant(
         Ok(_) => {
             // The bytes may be old, so the guarded grant catches a mid-flight
             // reclaim; only vanished bytes fall back to a fresh promotion.
-            match metadata_store
-                .grant_existing(blob_store, namespace, digest)
-                .await?
-            {
+            match grant_existing(blob_store, metadata_store, namespace, digest).await? {
                 GrantOutcome::Granted => return Ok(()),
                 GrantOutcome::BytesAbsent => {}
                 GrantOutcome::ReclaimBlocked => {
@@ -46,14 +41,6 @@ pub async fn promote_and_grant(
     metadata_store.grant(namespace, digest).await
 }
 
-/// A missing entry read as `default`; any other failure stands.
-fn absent_as<T>(result: Result<T, Error>, default: T) -> Result<T, Error> {
-    match result {
-        Err(Error::NotFound) => Ok(default),
-        other => other,
-    }
-}
-
 /// Outcome of a guarded grant against pre-existing bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantOutcome {
@@ -66,93 +53,23 @@ pub enum GrantOutcome {
     ReclaimBlocked,
 }
 
-impl MetadataStore {
-    /// Insert `namespace`'s blob ownership reference with one idempotent put.
-    /// Correct on its own only for freshly written bytes, which the grace
-    /// period covers; pre-existing bytes need [`Self::grant_existing`].
-    pub async fn grant(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
-        self.update_blob_index(
-            namespace,
-            digest,
-            BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
-        )
-        .await
+/// Grant a reference to bytes that already exist (a mount, a cache fill, a
+/// re-upload). The grant must land before the collector check and the
+/// re-probe, so any reclaim that could still take the bytes is seen here;
+/// anything but [`GrantOutcome::Granted`] must not be relied on.
+pub async fn grant_existing(
+    blob_store: &BlobStore,
+    metadata_store: &MetadataStore,
+    namespace: &Namespace,
+    digest: &Digest,
+) -> Result<GrantOutcome, Error> {
+    metadata_store.grant(namespace, digest).await?;
+    if !metadata_store.gc_clear(&[digest]).await? {
+        return Ok(GrantOutcome::ReclaimBlocked);
     }
-
-    /// Grant a reference to bytes that already exist (a mount, a cache fill, a
-    /// re-upload). The grant must land before the collector check and the
-    /// re-probe, so any reclaim that could still take the bytes is seen here;
-    /// anything but [`GrantOutcome::Granted`] must not be relied on.
-    pub async fn grant_existing(
-        &self,
-        blob_store: &BlobStore,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<GrantOutcome, Error> {
-        self.grant(namespace, digest).await?;
-        if !self.gc_clear(&[digest]).await? {
-            return Ok(GrantOutcome::ReclaimBlocked);
-        }
-        match blob_store.size(digest).await {
-            Ok(_) => Ok(GrantOutcome::Granted),
-            Err(Error::BlobUnknown | Error::NotFound) => Ok(GrantOutcome::BytesAbsent),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub async fn can_read(&self, namespace: &Namespace, digest: &Digest) -> Result<bool, Error> {
-        // The own key grants directly, so one head answers the common case
-        // before the fuller reference listing.
-        if self.has_own_grant(namespace, digest).await? {
-            return Ok(true);
-        }
-        // Writers never remove reference entries, so a non-own entry counts
-        // only while its backing link still resolves: a stale manifest
-        // reference must not resurrect a blob the namespace deleted.
-        let links = self.references(namespace, digest).await?;
-        for link in &links {
-            if matches!(link, LinkKind::Blob(link_digest) if link_digest == digest) {
-                return Ok(true);
-            }
-            if self.reference_backed(namespace, link, digest).await? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    pub async fn references(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<HashSet<LinkKind>, Error> {
-        match self.read_blob_index_namespace(namespace, digest).await {
-            Ok(links) => Ok(links),
-            Err(Error::NotFound) => Ok(HashSet::new()),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Every local namespace referencing `digest`, per the blob index; empty
-    /// when none do, a missing index entry included.
-    pub async fn referencing_namespaces(&self, digest: &Digest) -> Result<Vec<Namespace>, Error> {
-        let index = absent_as(self.read_blob_index(digest).await, BlobIndex::default())?;
-        Ok(index.namespace.into_keys().collect())
-    }
-
-    /// The lexicographically-smallest namespace referencing `digest`, excluding
-    /// `exclude`; `None` when no other namespace references it.
-    pub async fn smallest_referencing_namespace(
-        &self,
-        digest: &Digest,
-        exclude: &str,
-    ) -> Result<Option<Namespace>, Error> {
-        let index = absent_as(self.read_blob_index(digest).await, BlobIndex::default())?;
-        Ok(index
-            .namespace
-            .into_keys()
-            .filter(|key| key != exclude)
-            .filter_map(|key| Namespace::new(&key).ok())
-            .min())
+    match blob_store.size(digest).await {
+        Ok(_) => Ok(GrantOutcome::Granted),
+        Err(Error::BlobUnknown | Error::NotFound) => Ok(GrantOutcome::BytesAbsent),
+        Err(error) => Err(error),
     }
 }

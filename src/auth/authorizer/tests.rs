@@ -1,23 +1,22 @@
-use angos_oci::request::ManifestPutTarget;
 use std::{str::FromStr, sync::Arc};
 
 use serde_json::json;
 use tracing::Level;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-use angos_oci::request::BlobMount;
-use angos_oci::{Digest, Namespace, Reference, Tag};
+use angos_oci::{
+    Digest, Namespace, Reference, Tag,
+    request::{BlobMount, ManifestPutTarget},
+};
 
-use crate::auth::authorizer::*;
 use crate::{
-    auth::Error as AuthError,
+    auth::{Error as AuthError, authorizer::*},
     command::bootstrap,
-    configuration::Configuration,
-    configuration::RegexPattern,
+    configuration::{Configuration, RegexPattern},
     identity::{AuthMethod, ClientCertificate, OidcClaims},
     registry::{
         RegistryConfig, Repository,
-        metadata_store::MetadataStore,
+        metadata_store::{MetadataStore, Settings},
         repository_resolver::RepositoryResolver,
         test_utils::{for_each_backend, put_blob_direct, test_job_store},
     },
@@ -285,7 +284,7 @@ async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
     let handles = bootstrap::build_object_store(&storage_config).unwrap();
-    let metadata_store = Arc::new(MetadataStore::builder(handles).build());
+    let metadata_store = Arc::new(MetadataStore::new(handles, Settings::default()));
 
     let mut repositories_map = HashMap::new();
     for (name, repo_config) in &config.repository {

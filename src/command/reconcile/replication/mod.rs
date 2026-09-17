@@ -106,11 +106,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         repositories,
     } = bootstrap::maintenance_context(config).await?;
 
-    let checker = ReplicationChecker::new(
-        metadata_store.clone(),
-        repositories.clone(),
-        config.global.max_concurrent_replication_jobs.get(),
-    );
+    let checker = ReplicationChecker::new(metadata_store.clone(), repositories.clone());
 
     let mut drain = None;
     let sink: Box<dyn ActionSink> = if options.dry_run {

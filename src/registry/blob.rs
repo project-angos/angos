@@ -1,9 +1,11 @@
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
 
-use angos_oci::http_range::RequestRange;
-use angos_oci::request::{DeleteBlobRequest, GetBlobRequest, HeadBlobRequest};
-use angos_oci::{Digest, MediaRange, Namespace, UploadSessionId};
+use angos_oci::{
+    Digest, MediaRange, Namespace, UploadSessionId,
+    http_range::RequestRange,
+    request::{DeleteBlobRequest, GetBlobRequest, HeadBlobRequest},
+};
 use angos_oci_service::{Accepted, BlobDescriptor, BlobGet, BlobStream};
 
 use crate::{
@@ -281,13 +283,14 @@ impl Registry {
     /// reclaims the bytes once every reference is stale.
     pub async fn delete_blob(&self, request: DeleteBlobRequest) -> Result<Accepted, Error> {
         let ownership = self.metadata_store();
-        let links = ownership
-            .references(&request.namespace, &request.digest)
-            .await?;
-
-        if links.is_empty() {
-            return Err(Error::BlobUnknown);
-        }
+        let links = match ownership
+            .read_blob_index_namespace(&request.namespace, &request.digest)
+            .await
+        {
+            Ok(links) => links,
+            Err(Error::NotFound) => return Err(Error::BlobUnknown),
+            Err(error) => return Err(error),
+        };
 
         // Writers never remove reference entries, so only an entry whose
         // backing link still resolves counts: a stale one must not block the
@@ -305,7 +308,7 @@ impl Registry {
             }
         }
 
-        // One delete of the `_own` key; the bytes are the collector's to
+        // One delete of the `own` key; the bytes are the collector's to
         // reclaim once every reference is stale.
         self.metadata_store
             .revoke_blob_ownership(&request.namespace, &request.digest)
@@ -377,7 +380,6 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use crate::registry::keys::{DigestKeys, NamespaceKeys};
     use std::{io::Cursor, sync::Arc};
 
     use async_trait::async_trait;
@@ -386,31 +388,29 @@ mod tests {
         header::{CONTENT_LENGTH, CONTENT_RANGE},
     };
     use tempfile::TempDir;
-
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
 
-    use angos_oci::http_range::ByteWindow;
-    use angos_oci::{Namespace, Tag};
+    use angos_oci::{Namespace, Tag, http_range::ByteWindow};
     use angos_storage::{
         Error as StorageError, ObjectStore,
         fs::Backend as StorageFsBackend,
         test_util::{HookedStore, StoreHook, StoreOp},
     };
 
-    use crate::metrics_provider::init_for_tests;
-    use crate::registry::blob::*;
     use crate::{
+        metrics_provider::init_for_tests,
         registry::{
+            blob::*,
+            keys::{DigestKeys, NamespaceKeys},
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::{BlobIndexOperation, LinkOperation},
             repository::Config,
             test_utils::{
-                RegistryTestCase, create_test_blob, create_test_registry, for_each_backend,
-                get_blob, metadata_store_over, put_blob_direct, response_body, response_digest,
-                response_header,
+                RegistryTestCase, create_test_blob, create_test_registry, drop_links,
+                for_each_backend, get_blob, metadata_store_over, put_blob_direct, response_body,
+                response_digest, response_header, seed_links,
             },
         },
         test_fixtures::client::test_client_config,
@@ -592,8 +592,8 @@ mod tests {
                 .read_blob_index(&digest)
                 .await
                 .unwrap();
-            assert!(blob_index.namespace.contains_key(namespace));
-            let namespace_links = blob_index.namespace.get(namespace).unwrap();
+            assert!(blob_index.contains_key(namespace));
+            let namespace_links = blob_index.get(namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             registry
@@ -624,24 +624,23 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"referenced blob content";
             let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
-            let link = LinkKind::Config(digest.clone());
 
             // A live referring revision, whose per-referrer entry is what pins
             // the blob against the delete.
             let manifest =
                 put_blob_direct(registry.metadata_store.object_store(), b"manifest").await;
+            seed_links(
+                &registry.metadata_store,
+                namespace,
+                &[(LinkKind::Digest(manifest.clone()), manifest.clone())],
+            )
+            .await
+            .unwrap();
             registry
                 .metadata_store
-                .update_links(
+                .pin_references(
                     namespace,
-                    &[
-                        LinkOperation::create(LinkKind::Digest(manifest.clone()), manifest.clone()),
-                        LinkOperation::create_with_referrer(
-                            link.clone(),
-                            digest.clone(),
-                            manifest.clone(),
-                        ),
-                    ],
+                    &[(digest.clone(), LinkKind::ReferencedBy(manifest.clone()))],
                 )
                 .await
                 .unwrap();
@@ -681,22 +680,19 @@ mod tests {
             let ownership = registry.metadata_store();
             ownership.grant(namespace, &digest).await.unwrap();
 
-            let link = LinkKind::Config(digest.clone());
+            let link = LinkKind::ReferencedBy(Digest::sha256_of_bytes(b"manifest"));
             registry
                 .metadata_store
-                .update_links(
+                .pin_references(
                     namespace,
-                    &[LinkOperation::create_with_referrer(
-                        link.clone(),
+                    &[(
                         digest.clone(),
-                        Digest::sha256_of_bytes(b"manifest"),
+                        LinkKind::ReferencedBy(Digest::sha256_of_bytes(b"manifest")),
                     )],
                 )
                 .await
                 .unwrap();
-            registry
-                .metadata_store
-                .update_links(namespace, &[LinkOperation::delete(link)])
+            drop_links(&registry.metadata_store, namespace, &[link])
                 .await
                 .unwrap();
 
@@ -730,28 +726,19 @@ mod tests {
                 put_blob_direct(registry.metadata_store.object_store(), b"index manifest").await;
             // Every kind is backed only while a referring manifest's revision
             // resolves, so each case names `parent`.
-            registry
-                .metadata_store
-                .update_links(
-                    namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Digest(parent.clone()),
-                        parent.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &registry.metadata_store,
+                namespace,
+                &[(LinkKind::Digest(parent.clone()), parent.clone())],
+            )
+            .await
+            .unwrap();
             let subject = Digest::sha256_of_bytes(b"subject manifest");
 
             let cases = [
                 LinkKind::Digest(Digest::sha256_of_bytes(b"digest reference")),
                 LinkKind::Tag(Tag::new("latest").unwrap()),
-                LinkKind::Layer(Digest::sha256_of_bytes(b"layer reference")),
-                LinkKind::Config(Digest::sha256_of_bytes(b"config reference")),
-                LinkKind::Manifest {
-                    index: parent.clone(),
-                    child: Digest::sha256_of_bytes(b"child manifest"),
-                },
+                LinkKind::ReferencedBy(parent.clone()),
                 LinkKind::Referrer {
                     subject,
                     referrer: Digest::sha256_of_bytes(b"referrer manifest"),
@@ -769,21 +756,26 @@ mod tests {
                     .unwrap();
 
                 let retargeted = retarget_link(&link, &digest);
-                let op = match &link {
-                    LinkKind::Layer(_) | LinkKind::Config(_) | LinkKind::Manifest { .. } => {
-                        LinkOperation::create_with_referrer(
-                            retargeted,
-                            digest.clone(),
-                            parent.clone(),
-                        )
+                match &link {
+                    LinkKind::ReferencedBy(_) => {
+                        registry
+                            .metadata_store
+                            .pin_references(
+                                namespace,
+                                &[(digest.clone(), LinkKind::ReferencedBy(parent.clone()))],
+                            )
+                            .await
                     }
-                    _ => LinkOperation::create(retargeted, digest.clone()),
-                };
-                registry
-                    .metadata_store
-                    .update_links(namespace, &[op])
-                    .await
-                    .unwrap();
+                    _ => {
+                        seed_links(
+                            &registry.metadata_store,
+                            namespace,
+                            &[(retargeted, digest.clone())],
+                        )
+                        .await
+                    }
+                }
+                .unwrap();
 
                 let result = registry
                     .delete_blob(DeleteBlobRequest {
@@ -801,15 +793,6 @@ mod tests {
     fn retarget_link(link: &LinkKind, digest: &Digest) -> LinkKind {
         match link {
             LinkKind::Digest(_) => LinkKind::Digest(digest.clone()),
-            LinkKind::Layer(_) => LinkKind::Layer(digest.clone()),
-            LinkKind::Config(_) => LinkKind::Config(digest.clone()),
-            LinkKind::Manifest {
-                index: parent,
-                child: _,
-            } => LinkKind::Manifest {
-                index: parent.clone(),
-                child: digest.clone(),
-            },
             LinkKind::Referrer {
                 subject,
                 referrer: _,
@@ -909,7 +892,7 @@ mod tests {
                 .read_blob_index(&digest)
                 .await
                 .unwrap();
-            let namespace_links = blob_index.namespace.get(&namespace).unwrap();
+            let namespace_links = blob_index.get(&namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             let repository = registry.get_repository_for_namespace(&namespace).unwrap();
@@ -1105,12 +1088,12 @@ mod tests {
         let content = b"layer bytes";
         let digest = Digest::sha256_of_bytes(content);
 
-        // A prior manifest pull already recorded the layer's ownership link.
+        // A prior manifest pull already pinned the layer to its manifest.
         metadata_store
-            .update_blob_index(
+            .insert_reference(
                 &namespace,
                 &digest,
-                BlobIndexOperation::Insert(LinkKind::Layer(digest.clone())),
+                &LinkKind::ReferencedBy(Digest::sha256_of_bytes(b"manifest")),
             )
             .await
             .unwrap();
@@ -1132,7 +1115,7 @@ mod tests {
             "the blob bytes must land in the blob store"
         );
         let blob_index = metadata_store.read_blob_index(&digest).await.unwrap();
-        let links = blob_index.namespace.get(&namespace).unwrap();
+        let links = blob_index.get(&namespace).unwrap();
         assert!(
             links.contains(&LinkKind::Blob(digest.clone())),
             "the namespace must hold a blob ownership reference after caching"

@@ -11,14 +11,16 @@ use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use angos_oci::header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID};
-use angos_oci::http_range::RequestRange;
-use angos_oci::request::{CompleteUploadRequest, GetReferrersRequest};
-use angos_oci::{Digest, MediaRange, MediaType, Namespace, Tag, UploadSessionId};
+use angos_oci::{
+    Digest, MediaRange, MediaType, Namespace, Tag, UploadSessionId,
+    header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID},
+    http_range::RequestRange,
+    request::{CompleteUploadRequest, GetReferrersRequest},
+};
 use angos_oci_client::RegistryClient;
-use angos_s3_client::Backend as S3HttpBackend;
-use angos_s3_client::test_util::{
-    TEST_ACCESS_KEY, TEST_BUCKET, TEST_REGION, TEST_SECRET_KEY, test_endpoint,
+use angos_s3_client::{
+    Backend as S3HttpBackend,
+    test_util::{TEST_ACCESS_KEY, TEST_BUCKET, TEST_REGION, TEST_SECRET_KEY, test_endpoint},
 };
 use angos_secret::Secret;
 use angos_storage::{
@@ -26,18 +28,20 @@ use angos_storage::{
 };
 use angos_transport::ResponseBody;
 
-use crate::registry::keys::DigestKeys;
 use crate::{
     configuration::{GlobalConfig, RegexPattern},
-    jobs::Queue,
-    jobs::store::{ClaimMode, JobStore},
+    jobs::{
+        Queue,
+        store::{ClaimMode, JobStore},
+    },
     metrics_provider,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        Error, Registry, RegistryConfig, Repository, blob_store,
-        blob_store::{BlobStore, BlobStoreConfig},
+        Error, Registry, RegistryConfig, Repository,
+        blob_store::{self, BlobStore, BlobStoreConfig},
+        keys::{DigestKeys, NamespaceKeys},
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        metadata_store::{LinkKind, LinkOperation, MetadataStore},
+        metadata_store::{LinkKind, MetadataStore, Settings},
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
     },
@@ -71,11 +75,7 @@ pub fn fs_test_stack() -> FsTestStack {
     metrics_provider::init_for_tests();
     let dir = TempDir::new().expect("temp dir for fs test stack");
     let store: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .link_cache_ttl(0)
-            .build(),
-    );
+    let metadata_store = Arc::new(MetadataStore::new(store.clone(), Settings::default()));
     let blob_store = Arc::new(BlobStore::new(store.clone(), None));
     FsTestStack {
         dir,
@@ -106,30 +106,19 @@ where
     }
 }
 
-/// A [`MetadataStore`] over `object` with the link cache disabled.
+/// A [`MetadataStore`] over `object`.
 pub fn metadata_store_over(object: Arc<dyn ObjectStore>) -> Arc<MetadataStore> {
-    metadata_store_over_cached(object, 0)
-}
-
-/// Like [`metadata_store_over`] but with a memory-backed link cache at
-/// `link_cache_ttl_secs`, where `0` keeps it disabled.
-pub fn metadata_store_over_cached(
-    object: Arc<dyn ObjectStore>,
-    link_cache_ttl_secs: u64,
-) -> Arc<MetadataStore> {
-    Arc::new(
-        MetadataStore::builder(object)
-            .cache(
-                angos_cache::Config::Memory
-                    .to_backend()
-                    .expect("memory cache"),
-            )
-            .link_cache_ttl(link_cache_ttl_secs)
-            // Tests exercise reclamation immediately; the race tests needing
-            // the grace protection set their own.
-            .gc_grace_secs(0)
-            .build(),
-    )
+    // Tests exercise reclamation immediately; the race tests needing the grace
+    // protection set their own.
+    Arc::new(MetadataStore::new(
+        object,
+        Settings {
+            gc_grace_secs: 0,
+            // Tests sleep this out; the real linger would stall every run.
+            release_linger_ms: 100,
+            ..Settings::default()
+        },
+    ))
 }
 
 /// The queue a test registry enqueues into. Nothing drains it unless the test
@@ -267,6 +256,72 @@ pub async fn put_blob_body(blob_store: &BlobStore, content: &[u8]) -> Digest {
 
 /// Write `content` at the canonical blob path through the raw `ObjectStore`,
 /// with no upload state machine and no namespace.
+/// Test seeding: make each `(link, target)` exist, through the same write the
+/// repair path uses. Batching is a fixture convenience; the store itself only
+/// ever writes one key at a time.
+pub async fn seed_links(
+    metadata_store: &MetadataStore,
+    namespace: &Namespace,
+    links: &[(LinkKind, Digest)],
+) -> Result<(), Error> {
+    for (link, target) in links {
+        metadata_store.write_link(namespace, link, target).await?;
+    }
+    Ok(())
+}
+
+/// Test teardown: take each link's records away. A tag loses its entries
+/// outright rather than gaining a tombstone, since the tombstone is the delete
+/// path's write and a fixture copying it would be a second definition of its
+/// format. Every other kind lives as a reference key alone, which only the
+/// collector removes.
+pub async fn drop_links(
+    metadata_store: &MetadataStore,
+    namespace: &Namespace,
+    links: &[LinkKind],
+) -> Result<(), Error> {
+    let store = metadata_store.object_store();
+    for link in links {
+        match link {
+            LinkKind::Tag(tag) => store.delete_prefix(&namespace.tag_entry_dir(tag)).await?,
+            LinkKind::Digest(digest) => {
+                store
+                    .delete(&namespace.revision_record_path(digest))
+                    .await?;
+            }
+            LinkKind::Referrer { subject, referrer } => {
+                store
+                    .delete(&namespace.referrer_record_path(subject, referrer))
+                    .await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub async fn create_link(
+    m: &Arc<MetadataStore>,
+    namespace: &str,
+    link: &LinkKind,
+    digest: &Digest,
+) {
+    let namespace = Namespace::new(namespace).unwrap();
+    seed_links(m, &namespace, &[(link.clone(), digest.clone())])
+        .await
+        .unwrap();
+}
+
+/// A metadata store of its own over the live S3 test backend, under a key
+/// prefix no other test shares.
+pub fn s3_metadata_store() -> Arc<MetadataStore> {
+    metrics_provider::init_for_tests();
+    let connection = s3_test_connection(format!("test-backend-{}", Uuid::new_v4()));
+    let http =
+        Arc::new(S3HttpBackend::new(&connection.to_client_config()).expect("s3 http client"));
+    metadata_store_over(Arc::new(StorageS3Backend::builder(http).build()))
+}
+
 pub async fn put_blob_direct(store: &Arc<dyn ObjectStore>, content: &[u8]) -> Digest {
     let digest = Digest::sha256_of_bytes(content);
     store
@@ -311,26 +366,25 @@ pub async fn create_test_blob(
     let digest = put_blob_body(registry.blob_store.as_ref(), content).await;
 
     let tag_link = LinkKind::Tag(Tag::new("latest").unwrap());
-    let layer_link = LinkKind::Layer(digest.clone());
-    registry
-        .metadata_store
-        .update_links(
-            namespace,
-            &[
-                LinkOperation::create(tag_link.clone(), digest.clone()),
-                LinkOperation::create(layer_link.clone(), digest.clone()),
-            ],
-        )
-        .await
-        .unwrap();
+    let layer_link = LinkKind::ReferencedBy(digest.clone());
+    seed_links(
+        &registry.metadata_store,
+        namespace,
+        &[
+            (tag_link.clone(), digest.clone()),
+            (layer_link.clone(), digest.clone()),
+        ],
+    )
+    .await
+    .unwrap();
 
     let blob_index = registry
         .metadata_store
         .read_blob_index(&digest)
         .await
         .unwrap();
-    assert!(blob_index.namespace.contains_key(namespace));
-    let namespace_links = blob_index.namespace.get(namespace).unwrap();
+    assert!(blob_index.contains_key(namespace));
+    let namespace_links = blob_index.get(namespace).unwrap();
     assert!(namespace_links.contains(&layer_link));
 
     let repository = repository_with_replication("test-repo", Vec::new());
@@ -363,12 +417,6 @@ pub struct FSRegistryTestCase {
 
 impl FSRegistryTestCase {
     pub fn new() -> Self {
-        Self::with_link_cache_ttl(0)
-    }
-
-    /// Like [`Self::new`] but with the per-process link cache enabled at
-    /// `link_cache_ttl_secs`, for tests pinning which reads must bypass it.
-    pub fn with_link_cache_ttl(link_cache_ttl_secs: u64) -> Self {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
         let path = temp_dir.path().to_path_buf();
 
@@ -380,7 +428,7 @@ impl FSRegistryTestCase {
 
         let meta_storage: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
-        let metadata_store = metadata_store_over_cached(meta_storage, link_cache_ttl_secs);
+        let metadata_store = metadata_store_over(meta_storage);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
@@ -431,7 +479,7 @@ impl FSRegistryTestCase {
                 .sync_to_disk(false)
                 .build(),
         );
-        let metadata_store = metadata_store_over_cached(meta_storage, 0);
+        let metadata_store = metadata_store_over(meta_storage);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
@@ -644,23 +692,26 @@ pub async fn seed_manifest(
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let manifest_digest = put_blob_direct(store, &manifest_bytes).await;
 
-    metadata_store
-        .update_links(
-            namespace,
-            &[
-                LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest_digest.clone(),
-                ),
-                LinkOperation::create(
-                    LinkKind::Config(config_digest.clone()),
-                    config_digest.clone(),
-                ),
-                LinkOperation::create(LinkKind::Layer(layer_digest.clone()), layer_digest.clone()),
-            ],
-        )
-        .await
-        .unwrap();
+    seed_links(
+        metadata_store,
+        namespace,
+        &[
+            (
+                LinkKind::Tag(Tag::new("v1").unwrap()),
+                manifest_digest.clone(),
+            ),
+            (
+                LinkKind::ReferencedBy(manifest_digest.clone()),
+                config_digest.clone(),
+            ),
+            (
+                LinkKind::ReferencedBy(manifest_digest.clone()),
+                layer_digest.clone(),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
 
     (manifest_digest, config_digest, layer_digest)
 }

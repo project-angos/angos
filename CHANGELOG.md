@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.9.0 - UNRELEASED
+
+### Changed
+
+- The link-metadata cache is gone and `link_cache_ttl` is ignored: every tag, revision and referrer read goes to the metadata store, so a replica never serves a tag a peer has already moved, and a shared Redis cache is no longer what makes replicas agree.
+- A manifest pull whose access-time record cannot be written now fails instead of being served unrecorded, on the pull-through and redirect paths as it already did on the local one, since retention reclaims by that record.
+- A tag entry's body is now empty: its key name already carries the ordinal, the kind and the digest, and no read path served the media type, size and annotations it held.
+- **Breaking:** a reference key of the per-role shape an angos before 1.8.0 wrote (`r/layer`, `r/config`, `r/idx.*`) is no longer recognised, so `angos scrub` quarantines it like any unknown key; such a key has pinned nothing since 1.8.0, which pins each referenced digest through its referring manifest.
+- **Breaking:** `namespace_walk_concurrency = 0` is refused when the configuration loads instead of being silently read as 1.
+
 ## 1.8.0
 
 ### Added

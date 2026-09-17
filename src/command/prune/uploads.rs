@@ -10,7 +10,6 @@ use tracing::{debug, error, info, warn};
 
 use angos_oci::{Digest, Namespace, UploadSessionId};
 
-use crate::registry::keys::DigestKeys;
 use crate::{
     command::maintenance::{
         Error,
@@ -22,7 +21,7 @@ use crate::{
     registry::{
         Error as RegistryError,
         blob_store::{BlobStore, UploadSummary},
-        keys::REF_ROOT,
+        keys::{DigestKeys, REF_ROOT},
         metadata_store::MetadataStore,
     },
 };
@@ -194,7 +193,7 @@ async fn sweep_one_ref(
         .await?;
     for link in links {
         // The walked key's age gate does not cover its siblings: a fresh
-        // `_own` granted before its bytes land is normal, so each entry is
+        // `own` granted before its bytes land is normal, so each entry is
         // gated on its own reference key, a gone one reading as old.
         let entry_key = blob.blob_ref_path(&namespace, &link);
         if object_younger_than_grace(store, &entry_key, ctx.window_secs)
@@ -217,10 +216,9 @@ async fn sweep_one_ref(
 
 #[cfg(test)]
 mod tests {
-    use crate::registry::keys::NamespaceKeys;
     use chrono::TimeZone;
 
-    use crate::command::prune::uploads::*;
+    use crate::{command::prune::uploads::*, registry::keys::NamespaceKeys};
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap()
@@ -283,8 +281,7 @@ mod tests {
         assert!(matches!(verdict, UploadVerdict::Keep));
     }
 
-    use std::sync::Mutex;
-    use std::time::Duration as StdDuration;
+    use std::{sync::Mutex, time::Duration as StdDuration};
 
     use bytes::Bytes;
     use tokio::time::sleep;
@@ -293,10 +290,7 @@ mod tests {
 
     use crate::{
         command::maintenance::executor::Executor,
-        registry::{
-            metadata_store::{BlobIndexOperation, LinkKind},
-            test_utils::for_each_backend,
-        },
+        registry::{metadata_store::LinkKind, test_utils::for_each_backend},
     };
 
     #[tokio::test]
@@ -423,7 +417,7 @@ mod tests {
         .await;
     }
 
-    /// An `_own` grant landed after the sweep's cutoff must survive the purge
+    /// An `own` grant landed after the sweep's cutoff must survive the purge
     /// its old sibling entry triggers.
     #[tokio::test]
     async fn byteless_purge_keeps_young_sibling_own_key() {
@@ -433,25 +427,17 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             let ghost = Digest::sha256_of_bytes(b"byteless with fresh own");
-            let stale = LinkKind::Layer(ghost.clone());
+            let stale = LinkKind::ReferencedBy(ghost.clone());
             metadata_store
-                .update_blob_index(
-                    &namespace,
-                    &ghost,
-                    BlobIndexOperation::Insert(stale.clone()),
-                )
+                .insert_reference(&namespace, &ghost, &stale)
                 .await
                 .unwrap();
             // A two-second window puts the cutoff between the two puts: the
-            // layer entry reads old, the later `_own` grant young. The sleeps
+            // reference entry reads old, the later `own` grant young. The sleeps
             // keep both clear of it on second-granularity store timestamps.
             sleep(StdDuration::from_millis(3000)).await;
             metadata_store
-                .update_blob_index(
-                    &namespace,
-                    &ghost,
-                    BlobIndexOperation::Insert(LinkKind::Blob(ghost.clone())),
-                )
+                .insert_reference(&namespace, &ghost, &LinkKind::Blob(ghost.clone()))
                 .await
                 .unwrap();
 
@@ -482,7 +468,7 @@ mod tests {
                         ..
                     }
                 )),
-                "a young sibling `_own` grant must survive the purge"
+                "a young sibling `own` grant must survive the purge"
             );
         })
         .await;
@@ -498,11 +484,7 @@ mod tests {
             // An index entry whose blob bytes never landed.
             let ghost = Digest::sha256_of_bytes(b"bytes-never-landed");
             metadata_store
-                .update_blob_index(
-                    &namespace,
-                    &ghost,
-                    BlobIndexOperation::Insert(LinkKind::Blob(ghost.clone())),
-                )
+                .insert_reference(&namespace, &ghost, &LinkKind::Blob(ghost.clone()))
                 .await
                 .unwrap();
 

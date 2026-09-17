@@ -79,7 +79,6 @@ endpoint = "https://s3.amazonaws.com"
 region = "us-east-1"
 access_key_id = "YOUR_ACCESS_KEY"
 secret_key = "YOUR_SECRET_KEY"
-link_cache_ttl = 30
 
 [ui]
 enabled = true

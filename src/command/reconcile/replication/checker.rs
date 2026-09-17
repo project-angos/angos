@@ -8,10 +8,11 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, warn};
 
-use angos_oci::manifest_accept_types;
-use angos_oci::request::{HeadManifestRequest, ListTagsRequest};
-use angos_oci::response::ManifestHeadResponse;
-use angos_oci::{Digest, Namespace, Reference, Tag};
+use angos_oci::{
+    Digest, Namespace, Reference, Tag, manifest_accept_types,
+    request::{HeadManifestRequest, ListTagsRequest},
+    response::ManifestHeadResponse,
+};
 use angos_oci_client::Error as ClientError;
 
 use crate::{
@@ -30,22 +31,14 @@ use crate::{
 pub struct ReplicationChecker {
     metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
-    tag_resolve_concurrency: usize,
 }
 
 impl ReplicationChecker {
-    /// `tag_resolve_concurrency` bounds the local tag-digest link reads
-    /// collected before reconciling a namespace's downstreams.
     #[must_use]
-    pub fn new(
-        metadata_store: Arc<MetadataStore>,
-        resolver: Arc<RepositoryResolver>,
-        tag_resolve_concurrency: usize,
-    ) -> Self {
+    pub fn new(metadata_store: Arc<MetadataStore>, resolver: Arc<RepositoryResolver>) -> Self {
         Self {
             metadata_store,
             resolver,
-            tag_resolve_concurrency: tag_resolve_concurrency.max(1),
         }
     }
 
@@ -54,32 +47,16 @@ impl ReplicationChecker {
             && downstream.matches_namespace(namespace.as_ref())
     }
 
-    /// Re-checks a prune candidate against live state, since the reconcile tag
-    /// snapshot is stale by the time the downstream listing returns. A read
-    /// error counts as present, so uncertainty never deletes.
+    /// Re-checks a prune candidate against live state, since the local tag
+    /// walk is stale by the time the downstream listing returns. A read error
+    /// counts as present, so uncertainty never deletes.
     async fn tag_absent_locally(&self, namespace: &Namespace, tag: &Tag) -> bool {
         matches!(
             self.metadata_store
-                .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
+                .read_link(namespace, &LinkKind::Tag(tag.clone()))
                 .await,
             Err(RegistryError::NotFound)
         )
-    }
-
-    /// Resolves the current local digest for `tag` in `namespace`, bypassing
-    /// the link cache so a reconcile never enqueues a stale digest.
-    async fn local_digest(&self, namespace: &Namespace, tag: &Tag) -> Option<Digest> {
-        match self
-            .metadata_store
-            .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
-            .await
-        {
-            Ok(link) => Some(link.target),
-            Err(e) => {
-                warn!("Failed to read local tag '{namespace}:{tag}' during reconcile: {e}");
-                None
-            }
-        }
     }
 
     /// A push for every diverging or downstream-missing tag, and for a
@@ -88,7 +65,7 @@ impl ReplicationChecker {
         &self,
         downstream: &ReplicationDownstream,
         namespace: &Namespace,
-        local_tags: &[(Tag, Option<Digest>)],
+        local_tags: &[(Tag, Digest)],
         sink: &dyn ActionSink,
     ) {
         reconcile_push_step(downstream, namespace, local_tags, sink).await;
@@ -130,14 +107,12 @@ impl ReplicationChecker {
             }
         };
 
-        // An unresolved tag still counts as local: prune must never delete a
-        // tag that exists locally.
         let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_ref()).collect();
         for tag in downstream_tags {
             if local_set.contains(tag.as_ref()) {
                 continue;
             }
-            // A tag pushed locally after the snapshot was taken is absent here
+            // A tag pushed locally after the walk is absent here
             // yet present downstream, so re-read live state before reaping it.
             if !self.tag_absent_locally(namespace, &tag).await {
                 continue;
@@ -166,7 +141,7 @@ impl ReplicationChecker {
 async fn reconcile_push_step(
     downstream: &ReplicationDownstream,
     namespace: &Namespace,
-    local_tags: &[(Tag, Option<Digest>)],
+    local_tags: &[(Tag, Digest)],
     sink: &dyn ActionSink,
 ) {
     enum Probe {
@@ -188,11 +163,7 @@ async fn reconcile_push_step(
     };
     let remote = &remote;
 
-    let candidates: Vec<(Tag, Digest)> = local_tags
-        .iter()
-        .filter_map(|(tag, digest)| Some((tag.clone(), digest.clone()?)))
-        .collect();
-    let probes = stream::iter(candidates)
+    let probes = stream::iter(local_tags.to_vec())
         .map(|(tag, local)| async move {
             let reference = Reference::Tag(tag.clone());
             // Only a 404 means absence; any other HEAD failure skips the tag
@@ -292,18 +263,13 @@ impl NamespaceChecker for ReplicationChecker {
             return Ok(());
         }
 
-        // Resolved once, not per downstream, to avoid O(downstreams x tags)
-        // metadata reads. A tag whose link read failed keeps a `None` digest:
-        // it still counts as local for prune, and only a resolved one pushes.
-        let local_tags: Vec<(Tag, Option<Digest>)> = self
+        // Walked once, not per downstream, to avoid O(downstreams x tags)
+        // listings; the walk resolves each tag, so no tag costs a read.
+        let local_tags: Vec<(Tag, Digest)> = self
             .metadata_store
-            .stream_tags(namespace)
+            .stream_live_tags(namespace, None)
             .err_into::<Error>()
-            .map_ok(|tag| async move {
-                let digest = self.local_digest(namespace, &tag).await;
-                Ok((tag, digest))
-            })
-            .try_buffered(self.tag_resolve_concurrency)
+            .map_ok(|(tag, metadata)| (tag, metadata.target))
             .try_collect()
             .await?;
 
@@ -326,21 +292,22 @@ mod tests {
         matchers::{method, path},
     };
 
-    use angos_oci::header::DOCKER_CONTENT_DIGEST;
-    use angos_oci::{Digest, Namespace, Tag};
+    use angos_oci::{Digest, Namespace, Tag, header::DOCKER_CONTENT_DIGEST};
+    use angos_oci_client::RegistryClient;
     use angos_storage::{
         Error as StorageError, ObjectStore,
         test_util::{HookedStore, StoreHook, StoreOp},
     };
 
-    use crate::command::reconcile::replication::checker::ReplicationChecker;
-    use crate::registry::keys::NamespaceKeys;
     use crate::{
-        command::maintenance::{
-            Error,
-            action::Action,
-            check::NamespaceChecker,
-            executor::{ActionSink, Executor},
+        command::{
+            maintenance::{
+                Error,
+                action::Action,
+                check::NamespaceChecker,
+                executor::{ActionSink, Executor},
+            },
+            reconcile::replication::checker::ReplicationChecker,
         },
         jobs::{
             Queue,
@@ -349,16 +316,16 @@ mod tests {
         },
         registry::{
             Repository,
-            metadata_store::{LinkKind, LinkOperation},
+            keys::NamespaceKeys,
+            metadata_store::LinkKind,
             repository_resolver::RepositoryResolver,
             test_utils::{
                 FsTestStack, downstream_client, fs_test_stack, metadata_store_over,
-                put_blob_direct, repository_with_replication, seed_manifest,
+                put_blob_direct, repository_with_replication, seed_links, seed_manifest,
             },
         },
         replication::{ReplicationDownstream, ReplicationJobHandler, ReplicationMode},
     };
-    use angos_oci_client::RegistryClient;
 
     const NAMESPACE: &str = "nginx";
     const REPO: &str = "nginx";
@@ -415,16 +382,13 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -437,7 +401,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -464,16 +428,13 @@ mod tests {
 
         let content = Namespace::new("nginx/app").unwrap();
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
-        metadata_store
-            .update_links(
-                &content,
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &content,
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         Mock::given(method("HEAD"))
             .and(path("/v2/mirror/app/manifests/v1"))
@@ -487,7 +448,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&content, &sink).await.unwrap();
@@ -521,16 +482,13 @@ mod tests {
         let content = Namespace::new("nginx/app").unwrap();
         // `v1` converges; `stray` is downstream-only and must be pruned.
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
-        metadata_store
-            .update_links(
-                &content,
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &content,
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         Mock::given(method("HEAD"))
             .and(path("/v2/mirror/app/manifests/v1"))
@@ -567,7 +525,7 @@ mod tests {
             ClaimMode::Atomic,
         ));
 
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone(), 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
         let mut executor: Box<dyn ActionSink> = Box::new(Executor::new(
             blob_store.clone(),
@@ -616,16 +574,13 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest,
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest)],
+        )
+        .await
+        .unwrap();
 
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -638,7 +593,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         // Metrics are process-global and shared across tests: assert a delta.
         let skipped_before = crate::metrics_provider::metrics_provider()
@@ -697,16 +652,13 @@ mod tests {
         for tag in ["v1", "v2"] {
             let body = format!("manifest-{tag}");
             let manifest = put_blob_direct(&store, body.as_bytes()).await;
-            metadata_store
-                .update_links(
-                    &namespace(),
-                    &[LinkOperation::create(
-                        LinkKind::Tag(Tag::new(tag).unwrap()),
-                        manifest,
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &metadata_store,
+                &namespace(),
+                &[(LinkKind::Tag(Tag::new(tag).unwrap()), manifest)],
+            )
+            .await
+            .unwrap();
         }
 
         Mock::given(method("HEAD"))
@@ -719,7 +671,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink = FlakySink {
             attempted: std::sync::Mutex::new(Vec::new()),
@@ -764,7 +716,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             true,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink = FlakySink {
             attempted: std::sync::Mutex::new(Vec::new()),
@@ -797,16 +749,13 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -823,7 +772,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -845,16 +794,13 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"new-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         let stale =
             Digest::sha256("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
@@ -874,7 +820,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -898,17 +844,17 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"new-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[
-                    LinkOperation::create(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone()),
-                    LinkOperation::create(LinkKind::Tag(Tag::new("v2").unwrap()), manifest.clone()),
-                    LinkOperation::create(LinkKind::Tag(Tag::new("v3").unwrap()), manifest.clone()),
-                ],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[
+                (LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone()),
+                (LinkKind::Tag(Tag::new("v2").unwrap()), manifest.clone()),
+                (LinkKind::Tag(Tag::new("v3").unwrap()), manifest.clone()),
+            ],
+        )
+        .await
+        .unwrap();
 
         for tag in ["v1", "v2", "v3"] {
             Mock::given(method("HEAD"))
@@ -923,7 +869,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -955,16 +901,13 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -988,7 +931,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             true,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -1006,7 +949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_rechecks_live_state_and_spares_a_tag_pushed_after_snapshot() {
+    async fn prune_rechecks_live_state_and_spares_a_tag_pushed_after_the_walk() {
         let FsTestStack {
             dir: _dir,
             store,
@@ -1015,18 +958,15 @@ mod tests {
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        // `fresh` was pushed locally after the reconcile snapshot was captured.
+        // `fresh` was pushed locally after the reconcile walk read the tags.
         let manifest = put_blob_direct(&store, b"fresh-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("fresh").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("fresh").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         // The downstream carries the fresh tag plus a genuinely-gone one.
         Mock::given(method("GET"))
@@ -1050,10 +990,9 @@ mod tests {
                 ReplicationMode::EventReconcile,
                 true,
             )),
-            16,
         );
 
-        // The empty snapshot stands in for one taken before `fresh` existed.
+        // The empty list stands in for a walk that ran before `fresh` existed.
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker
             .reconcile_downstream(downstream, &namespace(), &[], &sink)
@@ -1082,16 +1021,13 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -1117,7 +1053,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -1176,7 +1112,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             true,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -1199,16 +1135,13 @@ mod tests {
         } = fs_test_stack();
 
         let manifest = put_blob_direct(&store, b"event-only-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         // Unreachable URL: an event-only downstream must never be contacted.
         let resolver = resolver_for(repository(
@@ -1216,7 +1149,7 @@ mod tests {
             ReplicationMode::EventOnly,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -1238,16 +1171,13 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let manifest = put_blob_direct(&store, b"reconcile-only-bytes").await;
-        metadata_store
-            .update_links(
-                &namespace(),
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v1").unwrap()),
-                    manifest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            &namespace(),
+            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+        )
+        .await
+        .unwrap();
 
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -1260,7 +1190,7 @@ mod tests {
             ReplicationMode::ReconcileOnly,
             false,
         ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver, 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
@@ -1369,7 +1299,7 @@ mod tests {
             ClaimMode::Atomic,
         ));
 
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone(), 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
         let captured: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
         checker.check(&namespace(), &captured).await.unwrap();
@@ -1492,7 +1422,7 @@ mod tests {
             ClaimMode::Atomic,
         ));
 
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone(), 16);
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
         let mut executor: Box<dyn ActionSink> = Box::new(Executor::new(
             blob_store.clone(),

@@ -27,7 +27,7 @@ use crate::{
     registry::{
         blob_store::BlobStore,
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
+        metadata_store::{LinkKind, MetadataStore},
         test_utils::{FsTestStack, downstream_client, fs_test_stack, media_type, put_blob_direct},
     },
     replication::pipeline::{
@@ -696,10 +696,10 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
     // Record the sibling's ownership so a mount `from` exists.
     for blob in [&config, &layer] {
         metadata_store
-            .update_blob_index(
+            .insert_reference(
                 &Namespace::new(SIBLING).unwrap(),
                 blob,
-                BlobIndexOperation::Insert(LinkKind::Blob((*blob).clone())),
+                &LinkKind::Blob((*blob).clone()),
             )
             .await
             .unwrap();
@@ -760,10 +760,10 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
     let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
     metadata_store
-        .update_blob_index(
+        .insert_reference(
             &Namespace::new(SIBLING).unwrap(),
             &config,
-            BlobIndexOperation::Insert(LinkKind::Blob(config.clone())),
+            &LinkKind::Blob(config.clone()),
         )
         .await
         .unwrap();
@@ -1345,15 +1345,11 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
     // the original push's `Content-Type`.
     let media_type = "application/vnd.oci.image.manifest.v1+json";
     metadata_store
-        .update_links(
+        .put_revision(
             &Namespace::new(NAMESPACE).unwrap(),
-            &[LinkOperation::create_with_media_type(
-                LinkKind::Digest(manifest_digest.clone()),
-                manifest_digest.clone(),
-                Some(MediaType::new(media_type).unwrap()),
-                None,
-                None,
-            )],
+            &manifest_digest.clone(),
+            Some(MediaType::new(media_type).unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -1404,15 +1400,11 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
 
     // Seed only the child's revision link with its stored media type.
     metadata_store
-        .update_links(
+        .put_revision(
             &Namespace::new(NAMESPACE).unwrap(),
-            &[LinkOperation::create_with_media_type(
-                LinkKind::Digest(child_digest.clone()),
-                child_digest.clone(),
-                Some(media_type(OCI_MANIFEST_MEDIA_TYPE)),
-                None,
-                None,
-            )],
+            &child_digest.clone(),
+            Some(media_type(OCI_MANIFEST_MEDIA_TYPE)),
+            None,
         )
         .await
         .unwrap();

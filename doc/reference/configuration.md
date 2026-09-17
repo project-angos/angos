@@ -120,7 +120,7 @@ listener.
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
 | `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
 | `shutdown_drain_secs`       | u64      | `30`     | Seconds to keep draining in-flight work on shutdown before forcing exit: the server stops accepting, lets the requests in flight finish, then drains the queued webhook deliveries. |
-| `namespace_walk_concurrency`| usize    | `128`    | Concurrent directory scans a catalog / upload-namespace walk keeps in flight, hiding per-request backend latency on S3. |
+| `namespace_walk_concurrency`| usize > 0| `128`    | Concurrent directory scans a catalog / upload-namespace walk keeps in flight, hiding per-request backend latency on S3. Zero is refused. |
 | `gc_grace_secs`             | u64      | `300`    | Reclamation grace period, used by the serving process and scrub alike: young keys read as live, the push path re-checks the collector after this long, and gc run markers derive their TTL from it. Lower it only in a maintenance config for offline runs against a store with no live traffic; the serving processes must keep a value that exceeds clock skew plus the longest write stall. |
 | `atime_audit_window_secs`   | u64      | `3600`   | How long superseded access entries are retained as pull history, which the admin pull-history endpoint serves and scrub collects past. Raising it grows the number of keys under `!atime/` in proportion to pull volume. |
 | `trusted_proxies`           | [string] | `[]`     | Proxy IPs or CIDR networks (e.g. `"10.0.0.1"`, `"10.0.0.0/8"`) whose `X-Forwarded-For`/`X-Real-IP` headers are honored as the client IP. From any other peer those headers are ignored and the socket address is used. The set must name proxies only: a range that also covers clients lets them spoof the forwarded header. |
@@ -275,7 +275,8 @@ Optional. Defaults to same backend as blob store.
 
 Unknown keys under any section are ignored, so configs carrying knobs of
 removed subsystems (`lock_strategy`, `conditional_operations`,
-`access_time_debounce_secs`) keep loading. Remove them at your convenience.
+`access_time_debounce_secs`, `link_cache_ttl`) keep loading. Remove them at
+your convenience.
 
 ### Filesystem (`metadata_store.fs`)
 
@@ -286,13 +287,7 @@ removed subsystems (`lock_strategy`, `conditional_operations`,
 
 ### S3 (`metadata_store.s3`)
 
-Same connection options as `blob_store.s3`, plus:
-
-| Option                      | Type         | Default    | Description                                                                 |
-|-----------------------------|--------------|------------|-----------------------------------------------------------------------------|
-| `link_cache_ttl`            | u64          | `30`       | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
-
-The link cache reduces S3 round-trips for repeated tag/layer reads.
+The same connection options as `blob_store.s3`, and no others.
 
 > **Warning:** With `update_pull_time` enabled, every stamped manifest pull adds one storage write (the append-only access entry). At scale with many concurrent pulls this adds latency and API costs; disable access time tracking if it is not needed for retention policies.
 

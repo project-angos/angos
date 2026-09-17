@@ -13,6 +13,7 @@ pub mod upload_session;
 
 use std::{
     fmt::{self, Debug, Formatter},
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
@@ -62,7 +63,7 @@ pub struct BlobStore {
     /// which streams instead.
     presign: Option<(Arc<dyn PresignedStore>, Duration)>,
     /// Concurrent directory scans an upload-namespace walk keeps in flight.
-    namespace_walk_concurrency: usize,
+    namespace_walk_concurrency: NonZeroUsize,
 }
 
 impl Debug for BlobStore {
@@ -88,8 +89,8 @@ impl BlobStore {
 
     /// Set the concurrent directory-scan fan-out for upload-namespace walks.
     #[must_use]
-    pub fn with_namespace_walk_concurrency(mut self, concurrency: usize) -> Self {
-        self.namespace_walk_concurrency = concurrency.max(1);
+    pub fn with_namespace_walk_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
+        self.namespace_walk_concurrency = concurrency;
         self
     }
 

@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use std::collections::VecDeque;
 use std::future::Future;
 
@@ -9,7 +11,7 @@ use angos_storage::Page;
 /// Fan-out for the concurrent namespace walk: up to this many directories are
 /// scanned at once, refilled from the backlog as scans complete, to hide
 /// per-request backend latency, which dominates on S3.
-pub const NAMESPACE_WALK_CONCURRENCY: usize = 128;
+pub const NAMESPACE_WALK_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 
 /// One scanned directory: its namespace name when it holds the `marker` child,
 /// and the sub-directories to descend into.
@@ -61,7 +63,7 @@ where
         };
         let scan = scan?;
         // A directory whose name is not a namespace is dropped rather than
-        // surfaced, as `stream_tags` does for tags: scrub reports and reclaims
+        // surfaced, as the tag walk does for tags: scrub reports and reclaims
         // such directories, so the drop is silent.
         if let Some(namespace) = scan.namespace.and_then(|name| Namespace::new(&name).ok()) {
             namespaces.push(namespace);

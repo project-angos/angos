@@ -1,13 +1,12 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
 use tracing::info;
 
+use angos_cache::Cache;
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{
     ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
-
-use angos_cache::Cache;
 
 use crate::{
     configuration::{Configuration, ResolvedStorageConfig},
@@ -16,7 +15,7 @@ use crate::{
     registry::{
         self, Registry, RegistryConfig, Repository,
         blob_store::BlobStore,
-        metadata_store::MetadataStore,
+        metadata_store::{MetadataStore, Settings},
         repository,
         repository_resolver::{OverlapError, RepositoryResolver},
     },
@@ -79,27 +78,23 @@ pub fn build_object_store(config: &ResolvedStorageConfig) -> Result<Arc<dyn Obje
 
 pub fn metadata_store(
     config: &ResolvedStorageConfig,
-    auth_cache: &Arc<Cache>,
-    namespace_walk_concurrency: usize,
+    namespace_walk_concurrency: NonZeroUsize,
     gc_grace_secs: u64,
     atime_audit_window_secs: u64,
 ) -> Result<Arc<MetadataStore>, Error> {
     let store = build_object_store(config)?;
 
-    let link_cache_ttl = if let ResolvedStorageConfig::S3(s3_cfg) = config {
-        s3_cfg.link_cache_ttl
-    } else {
-        0
-    };
-
-    let builder = MetadataStore::builder(store)
-        .link_cache_ttl(link_cache_ttl)
-        .namespace_walk_concurrency(namespace_walk_concurrency)
-        .gc_grace_secs(gc_grace_secs)
-        .atime_audit_window_secs(atime_audit_window_secs)
-        .cache(auth_cache.clone());
-
-    Ok(Arc::new(builder.build()))
+    Ok(Arc::new(MetadataStore::new(
+        store,
+        Settings {
+            namespace_walk_concurrency,
+            gc_grace_secs,
+            atime_audit_window_secs,
+            // No configuration knob: the linger is bounded by the writer
+            // backoff the store itself defines.
+            ..Settings::default()
+        },
+    )))
 }
 
 /// The storage and repository handles every maintenance command boots with.
@@ -121,7 +116,6 @@ pub async fn maintenance_context(config: &Configuration) -> Result<MaintenanceCo
     );
     let metadata_store = metadata_store(
         &config.resolve_registry_storage(),
-        &auth_cache,
         config.global.namespace_walk_concurrency,
         config.global.gc_grace_secs,
         config.global.atime_audit_window_secs,

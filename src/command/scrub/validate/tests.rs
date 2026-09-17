@@ -1,20 +1,18 @@
-use std::io::Cursor;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::{
+    io::Cursor,
+    sync::{Arc, Mutex, atomic::Ordering},
+};
 
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
-use angos_oci::request::{DeleteBlobRequest, PutManifestRequest};
-use angos_oci::{Digest, Namespace, Reference, Tag};
-
-use crate::registry::keys::{DigestKeys, NamespaceKeys};
-use crate::registry::metadata_store::{
-    access_time::{atime_client_suffix, atime_entry_name},
-    tag_ord,
+use angos_oci::{
+    Digest, Namespace, Reference, Tag,
+    request::{DeleteBlobRequest, PutManifestRequest},
 };
+
 use crate::{
     command::{
         maintenance::{
@@ -31,8 +29,8 @@ use crate::{
     registry::{
         Error as RegistryError,
         blob_store::BlobStore,
-        keys::REF_ROOT,
-        metadata_store::{AccessEntry, BlobIndexOperation, LinkKind, MetadataStore},
+        keys::{DigestKeys, NamespaceKeys, REF_ROOT},
+        metadata_store::{AccessEntry, LinkKind, MetadataStore, Settings},
         test_utils::{
             RegistryTestCase, create_test_registry_with, for_each_backend, fs_test_stack,
             media_type, put_blob_direct, upload_blob,
@@ -173,7 +171,7 @@ async fn healthy_registry_emits_zero_actions() {
     .await;
 }
 
-/// A referrer lives as a record and is given no link file, so its link check
+/// A referrer lives as a record of its own, so its link check
 /// has to consult the record. Judged by the legacy path alone, every
 /// attestation in the store was recreated on every run: the repair writes the
 /// record it already has and never the file it was judged by, so the next run
@@ -257,7 +255,7 @@ async fn scrub_regrants_missing_per_referrer_entries() {
         let entry = LinkKind::ReferencedBy(manifest_digest.clone());
         for digest in [&config_digest, &layer_digest] {
             metadata_store
-                .update_blob_index(namespace, digest, BlobIndexOperation::Remove(entry.clone()))
+                .remove_reference(namespace, digest, &entry)
                 .await
                 .unwrap();
         }
@@ -314,7 +312,7 @@ async fn tag_targeting_missing_blob_is_removed() {
         let ghost_digest = Digest::sha256_of_bytes(b"never-uploaded");
         let key = namespace.tag_entry_path(
             &Tag::new("dangling").unwrap(),
-            tag_ord(Some(Utc::now())),
+            Utc::now(),
             false,
             &ghost_digest,
         );
@@ -353,8 +351,8 @@ async fn withheld_cross_namespace_reference_is_not_regranted() {
         // either, so it holds no grant on them.
         let (_, config_digest, layer_digest) = push_healthy_image(test_case, owner).await;
 
-        // A permissive push into `borrower` naming the same digests: the layer
-        // and config links are withheld, the revision link is written.
+        // A permissive push into `borrower` naming the same digests: the pins
+        // on them are withheld, the revision record is written.
         let permissive =
             create_test_registry_with(blob_store.clone(), metadata_store.clone(), false);
         let manifest = format!(
@@ -408,13 +406,6 @@ async fn withheld_cross_namespace_reference_is_not_regranted() {
                     .is_err(),
                 "scrub granted '{borrower}' read access to '{digest}' that the push withheld"
             );
-            assert!(
-                metadata_store
-                    .read_link(borrower, &LinkKind::Layer(digest.clone()))
-                    .await
-                    .is_err(),
-                "scrub recreated a withheld link for '{digest}'"
-            );
         }
     })
     .await;
@@ -431,11 +422,7 @@ async fn stale_reference_entry_is_removed() {
         // nothing, so the phantom names a tag instead.
         let phantom = LinkKind::Tag(Tag::new("phantom-tag").unwrap());
         metadata_store
-            .update_blob_index(
-                namespace,
-                &layer_digest,
-                BlobIndexOperation::Insert(phantom.clone()),
-            )
+            .insert_reference(namespace, &layer_digest, &phantom)
             .await
             .unwrap();
 
@@ -447,7 +434,7 @@ async fn stale_reference_entry_is_removed() {
             .unwrap();
         assert!(
             !links.contains(&phantom),
-            "an index entry with no link file must be removed"
+            "a reference entry whose referring revision is gone must be removed"
         );
     })
     .await;
@@ -464,20 +451,18 @@ async fn young_dangling_ref_entry_is_kept() {
 
         let phantom = LinkKind::Tag(Tag::new("phantom-tag").unwrap());
         metadata_store
-            .update_blob_index(
-                namespace,
-                &layer_digest,
-                BlobIndexOperation::Insert(phantom.clone()),
-            )
+            .insert_reference(namespace, &layer_digest, &phantom)
             .await
             .unwrap();
 
         // Same stores, but a scrub whose grace period is real.
-        let graced = Arc::new(
-            MetadataStore::builder(metadata_store.object_store().clone())
-                .gc_grace_secs(300)
-                .build(),
-        );
+        let graced = Arc::new(MetadataStore::new(
+            metadata_store.object_store().clone(),
+            Settings {
+                gc_grace_secs: 300,
+                ..Settings::default()
+            },
+        ));
         let blob_store = test_case.blob_store();
         let sink: Arc<dyn ActionSink> =
             Arc::new(Executor::new_for_test(blob_store.clone(), graced.clone()));
@@ -506,19 +491,17 @@ async fn young_revision_defers_link_repairs() {
 
         let entry = LinkKind::ReferencedBy(manifest_digest.clone());
         metadata_store
-            .update_blob_index(
-                namespace,
-                &layer_digest,
-                BlobIndexOperation::Remove(entry.clone()),
-            )
+            .remove_reference(namespace, &layer_digest, &entry)
             .await
             .unwrap();
 
-        let graced = Arc::new(
-            MetadataStore::builder(metadata_store.object_store().clone())
-                .gc_grace_secs(300)
-                .build(),
-        );
+        let graced = Arc::new(MetadataStore::new(
+            metadata_store.object_store().clone(),
+            Settings {
+                gc_grace_secs: 300,
+                ..Settings::default()
+            },
+        ));
         let blob_store = test_case.blob_store();
         let sink = Arc::new(Mutex::new(Vec::new()));
         run_passes(&blob_store, &graced, sink.clone() as Arc<dyn ActionSink>).await;
@@ -555,11 +538,13 @@ async fn young_tag_defers_target_repairs() {
         let record = namespace.revision_record_path(&manifest_digest);
         metadata_store.object_store().delete(&record).await.unwrap();
 
-        let graced = Arc::new(
-            MetadataStore::builder(metadata_store.object_store().clone())
-                .gc_grace_secs(300)
-                .build(),
-        );
+        let graced = Arc::new(MetadataStore::new(
+            metadata_store.object_store().clone(),
+            Settings {
+                gc_grace_secs: 300,
+                ..Settings::default()
+            },
+        ));
         let blob_store = test_case.blob_store();
         let sink = Arc::new(Mutex::new(Vec::new()));
         run_passes(&blob_store, &graced, sink.clone() as Arc<dyn ActionSink>).await;
@@ -1046,18 +1031,18 @@ async fn convergence_second_run_emits_zero_actions() {
         // Mixed corruption: a missing pin, a phantom index entry, and an
         // alien key.
         metadata_store
-            .update_blob_index(
+            .remove_reference(
                 namespace,
                 &config_digest,
-                BlobIndexOperation::Remove(LinkKind::ReferencedBy(manifest_digest.clone())),
+                &LinkKind::ReferencedBy(manifest_digest.clone()),
             )
             .await
             .unwrap();
         metadata_store
-            .update_blob_index(
+            .insert_reference(
                 namespace,
                 &layer_digest,
-                BlobIndexOperation::Insert(LinkKind::Layer(Digest::sha256_of_bytes(b"phantom"))),
+                &LinkKind::ReferencedBy(Digest::sha256_of_bytes(b"phantom")),
             )
             .await
             .unwrap();
@@ -1094,13 +1079,9 @@ async fn dangling_grant_entry_is_removed() {
             .put(&dangling.blob_path(), Bytes::from_static(b"dangling-layer"))
             .await
             .unwrap();
-        let phantom = LinkKind::Layer(dangling.clone());
+        let phantom = LinkKind::ReferencedBy(dangling.clone());
         metadata_store
-            .update_blob_index(
-                namespace,
-                &dangling,
-                BlobIndexOperation::Insert(phantom.clone()),
-            )
+            .insert_reference(namespace, &dangling, &phantom)
             .await
             .unwrap();
 
@@ -1129,7 +1110,7 @@ async fn put_tag_entry(
     body: &'static [u8],
 ) -> String {
     let ts = DateTime::from_timestamp_millis(ts_millis).unwrap();
-    let key = namespace.tag_entry_path(tag, tag_ord(Some(ts)), deletion, digest);
+    let key = namespace.tag_entry_path(tag, ts, deletion, digest);
     metadata_store
         .object_store()
         .put(&key, Bytes::from_static(body))
@@ -1187,7 +1168,7 @@ async fn superseded_tag_entries_are_demoted_to_hist() {
             );
         }
         let resolved = metadata_store
-            .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
+            .read_link(namespace, &LinkKind::Tag(tag.clone()))
             .await
             .unwrap();
         assert_eq!(resolved.target, manifest_digest);
@@ -1286,11 +1267,13 @@ async fn young_superseded_entry_is_kept() {
         .await;
 
         // Same stores, but a scrub whose grace period is real.
-        let graced = Arc::new(
-            MetadataStore::builder(metadata_store.object_store().clone())
-                .gc_grace_secs(300)
-                .build(),
-        );
+        let graced = Arc::new(MetadataStore::new(
+            metadata_store.object_store().clone(),
+            Settings {
+                gc_grace_secs: 300,
+                ..Settings::default()
+            },
+        ));
         let blob_store = test_case.blob_store();
         let sink: Arc<dyn ActionSink> =
             Arc::new(Executor::new_for_test(blob_store.clone(), graced.clone()));
@@ -1378,8 +1361,8 @@ async fn demoted_entries_leave_the_listing_and_keep_their_bodies() {
     .await;
 }
 
-/// Pushes write no legacy layer/config link files; serving, `can_read`, and
-/// the blob delete gate run on records and reference keys alone.
+/// A referenced blob is pinned by its per-referrer entry alone; serving,
+/// `can_read`, and the blob delete gate run on records and reference keys.
 #[tokio::test]
 async fn a_tracked_reference_is_pinned_by_its_entry_alone() {
     for_each_backend(async |test_case| {
@@ -1406,7 +1389,7 @@ async fn a_tracked_reference_is_pinned_by_its_entry_alone() {
                 .can_read(namespace, &layer_digest)
                 .await
                 .unwrap(),
-            "the layer must be readable without its link file"
+            "the layer must be readable through its per-referrer entry"
         );
         let refused = registry
             .delete_blob(DeleteBlobRequest {
@@ -1416,15 +1399,20 @@ async fn a_tracked_reference_is_pinned_by_its_entry_alone() {
             .await;
         assert!(
             matches!(refused, Err(RegistryError::BlobReferenced)),
-            "the delete gate must refuse a referenced blob without its link file"
+            "the delete gate must refuse a blob a manifest still references"
         );
     })
     .await;
 }
 
 /// Craft one access entry at `at` in `dir`, as a replica's stamp would land.
-async fn put_atime_entry(store: &Arc<MetadataStore>, dir: &str, client: &str, at: DateTime<Utc>) {
-    let name = atime_entry_name(tag_ord(Some(at)), &atime_client_suffix(client));
+async fn put_atime_entry(
+    store: &Arc<MetadataStore>,
+    namespace: &Namespace,
+    link: &LinkKind,
+    client: &str,
+    at: DateTime<Utc>,
+) {
     let body = serde_json::to_vec(&AccessEntry {
         client: client.to_string(),
         at,
@@ -1432,7 +1420,10 @@ async fn put_atime_entry(store: &Arc<MetadataStore>, dir: &str, client: &str, at
     .expect("entry body");
     store
         .object_store()
-        .put(&format!("{dir}/{name}"), Bytes::from(body))
+        .put(
+            &namespace.atime_entry_path(link, at, client).unwrap(),
+            Bytes::from(body),
+        )
         .await
         .expect("entry put");
 }
@@ -1448,14 +1439,36 @@ async fn the_atime_collector_keeps_the_newest_and_prunes_old_superseded_entries(
 
         // Tag side: a newest entry, a superseded one inside the audit window,
         // and a superseded one past it.
+        let tag_link = LinkKind::Tag(tag.clone());
         let dir = namespace.tag_atime_entry_dir(&tag);
-        put_atime_entry(&metadata_store, &dir, "alice", now).await;
-        put_atime_entry(&metadata_store, &dir, "bob", now - Duration::minutes(10)).await;
-        put_atime_entry(&metadata_store, &dir, "carol", now - Duration::hours(2)).await;
+        put_atime_entry(&metadata_store, &namespace, &tag_link, "alice", now).await;
+        put_atime_entry(
+            &metadata_store,
+            &namespace,
+            &tag_link,
+            "bob",
+            now - Duration::minutes(10),
+        )
+        .await;
+        put_atime_entry(
+            &metadata_store,
+            &namespace,
+            &tag_link,
+            "carol",
+            now - Duration::hours(2),
+        )
+        .await;
 
         // Revision side: an ancient newest entry alone stays forever.
         let rev_dir = namespace.revision_atime_entry_dir(&manifest_digest);
-        put_atime_entry(&metadata_store, &rev_dir, "alice", now - Duration::days(30)).await;
+        put_atime_entry(
+            &metadata_store,
+            &namespace,
+            &LinkKind::Digest(manifest_digest.clone()),
+            "alice",
+            now - Duration::days(30),
+        )
+        .await;
 
         scrub_apply(test_case).await;
 
@@ -1492,16 +1505,25 @@ async fn an_undecodable_atime_entry_is_deleted() {
         let dir = namespace.tag_atime_entry_dir(&Tag::new("v1").unwrap());
         let now = Utc::now();
 
-        let corrupt_name = atime_entry_name(tag_ord(Some(now)), &atime_client_suffix("mallory"));
+        let tag_link = LinkKind::Tag(Tag::new("v1").unwrap());
         metadata_store
             .object_store()
             .put(
-                &format!("{dir}/{corrupt_name}"),
+                &namespace
+                    .atime_entry_path(&tag_link, now, "mallory")
+                    .unwrap(),
                 Bytes::from_static(b"not json"),
             )
             .await
             .unwrap();
-        put_atime_entry(&metadata_store, &dir, "alice", now - Duration::hours(5)).await;
+        put_atime_entry(
+            &metadata_store,
+            &namespace,
+            &tag_link,
+            "alice",
+            now - Duration::hours(5),
+        )
+        .await;
 
         scrub_apply(test_case).await;
 
@@ -1515,8 +1537,12 @@ async fn an_undecodable_atime_entry_is_deleted() {
             1,
             "the undecodable entry goes; the surviving decodable one is the kept newest"
         );
-        assert!(
-            !page.items.contains(&corrupt_name),
+        let corrupt = namespace
+            .atime_entry_path(&tag_link, now, "mallory")
+            .unwrap();
+        let surviving = format!("{dir}/{}", page.items[0]);
+        assert_ne!(
+            surviving, corrupt,
             "the corrupt entry must be the one deleted"
         );
     })

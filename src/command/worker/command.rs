@@ -16,9 +16,11 @@ use crate::{
     cache_fill::CacheFillJobHandler,
     command::bootstrap::{self, Error},
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
-    jobs::Queue,
-    jobs::runner::execute_one,
-    jobs::store::{self as job_store, ClaimMode, JobHandler, JobRetryPolicy, JobStore},
+    jobs::{
+        Queue,
+        runner::execute_one,
+        store::{self as job_store, ClaimMode, JobHandler, JobRetryPolicy, JobStore},
+    },
     layer::IndexLayerJobHandler,
     registry::{
         Registry, blob_store::BlobStore, metadata_store::MetadataStore,
@@ -348,7 +350,9 @@ mod tests {
         },
         metrics_provider,
         registry::{
-            Registry, RegistryConfig, blob_store::BlobStore, metadata_store::MetadataStore,
+            Registry, RegistryConfig,
+            blob_store::BlobStore,
+            metadata_store::{MetadataStore, Settings},
             repository_resolver::RepositoryResolver,
         },
         replication::REPLICATION_PUSH_MANIFEST_KIND,
@@ -410,11 +414,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
 
         let storage: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-        let metadata_store = Arc::new(
-            MetadataStore::builder(storage.clone())
-                .link_cache_ttl(0)
-                .build(),
-        );
+        let metadata_store = Arc::new(MetadataStore::new(storage.clone(), Settings::default()));
         let blob_store = Arc::new(BlobStore::new(storage.clone(), None));
         let repositories = Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());
 

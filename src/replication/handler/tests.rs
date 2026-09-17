@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
-use serde_json::json;
+use chrono::{DateTime, Utc};
 use tempfile::TempDir;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -11,7 +10,6 @@ use wiremock::{
 use angos_oci::header::DOCKER_CONTENT_DIGEST;
 use angos_oci::{Digest, Namespace, Tag};
 use angos_oci_client::{REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP};
-use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
 use crate::{
     jobs::Queue,
@@ -19,11 +17,10 @@ use crate::{
     metrics_provider,
     registry::{
         Repository,
-        blob_store::BlobStore,
-        metadata_store::{LinkKind, LinkOperation, MetadataStore},
+        metadata_store::LinkKind,
         test_utils::{
-            FsTestStack, downstream_client, fs_test_stack, put_blob_direct,
-            repository_with_replication, seed_manifest, single_repo_resolver,
+            FsTestStack, downstream_client, fs_test_stack, repository_with_replication,
+            seed_manifest, single_repo_resolver,
         },
     },
     replication::{
@@ -227,10 +224,6 @@ fn repository_with_named_downstream(name: &str, client: Arc<RegistryClient>) -> 
         REPO,
         vec![ReplicationDownstream::new(name.to_string(), client, 4)],
     )
-}
-
-async fn put_blob(store: &Arc<dyn ObjectStore>, content: &[u8]) -> Digest {
-    put_blob_direct(store, content).await
 }
 
 #[tokio::test]
@@ -443,131 +436,6 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
 /// cache: a worker's cache can lag a sibling's write by up to its TTL, and a
 /// stale resolve would replicate the old digest and complete the job.
 #[allow(clippy::too_many_lines)]
-#[tokio::test]
-async fn execute_push_resolves_tag_past_the_link_cache() {
-    metrics_provider::init_for_tests();
-    let mock_server = MockServer::start().await;
-
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
-    let store = object;
-    let metadata_store = Arc::new(
-        MetadataStore::builder(store.clone())
-            .cache(angos_cache::Config::Memory.to_backend().unwrap())
-            .link_cache_ttl(300)
-            .build(),
-    );
-    let blob_store = Arc::new(BlobStore::new(store.clone(), None));
-
-    // Two manifests sharing the same blobs; the tag starts on `stale`.
-    let config_bytes = br#"{"config":true}"#.to_vec();
-    let layer_bytes = b"layer-bytes".to_vec();
-    let config_digest = put_blob(&store, &config_bytes).await;
-    let layer_digest = put_blob(&store, &layer_bytes).await;
-    let manifest_json = |rev: &str| {
-        json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest.to_string(),
-                "size": config_bytes.len(),
-            },
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                "digest": layer_digest.to_string(),
-                "size": layer_bytes.len(),
-            }],
-            "annotations": {"rev": rev},
-        })
-    };
-    let stale_bytes = serde_json::to_vec(&manifest_json("stale")).unwrap();
-    let stale_digest = put_blob(&store, &stale_bytes).await;
-    let current_bytes = serde_json::to_vec(&manifest_json("current")).unwrap();
-    let current_digest = put_blob(&store, &current_bytes).await;
-
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let link = LinkKind::Tag(Tag::new("v1").unwrap());
-    metadata_store
-        .update_links(
-            &namespace,
-            &[
-                LinkOperation::create(link.clone(), stale_digest.clone()),
-                LinkOperation::create(
-                    LinkKind::Config(config_digest.clone()),
-                    config_digest.clone(),
-                ),
-                LinkOperation::create(LinkKind::Layer(layer_digest.clone()), layer_digest.clone()),
-            ],
-        )
-        .await
-        .unwrap();
-
-    // Warm this process's cache, then re-point the tag behind it as a sibling
-    // process would.
-    metadata_store.read_link(&namespace, &link).await.unwrap();
-    assert_eq!(
-        metadata_store
-            .cache_get(&namespace, &link)
-            .await
-            .expect("the resolve under test must start from a warm cache")
-            .target,
-        stale_digest
-    );
-    let mut sibling = metadata_store
-        .read_link_reference(&namespace, &link)
-        .await
-        .unwrap();
-    sibling.target = current_digest.clone();
-    sibling.created_at = sibling.created_at.map(|ts| ts + Duration::milliseconds(1));
-    metadata_store
-        .write_tag_state(&namespace, &Tag::new("v1").unwrap(), &sibling)
-        .await
-        .unwrap();
-
-    // Both blobs already present downstream; unmatched manifest HEAD 404s
-    // so the converged skip never fires and the PUT body is observable.
-    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, current_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let resolver = single_repo_resolver(
-        REPO,
-        repository_with_downstream(downstream_client(&mock_server.uri())),
-    );
-
-    let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
-
-    let payload = ReplicationJob::Push {
-        target: ReplicationTarget {
-            digest: Some(stale_digest.clone()),
-            ..sample_target()
-        },
-    };
-    let envelope = build_envelope(&payload).unwrap();
-    handler.execute(&envelope).await.unwrap();
-
-    let manifest_path = format!("/v2/{NAMESPACE}/manifests/v1");
-    let received = mock_server.received_requests().await.unwrap_or_default();
-    let put = received
-        .iter()
-        .find(|r| r.method.as_str() == "PUT" && r.url.path() == manifest_path)
-        .expect("the push must PUT the manifest");
-    assert_eq!(
-        put.body, current_bytes,
-        "the resolve must read the backend link, not the stale cached one"
-    );
-    drop(mock_server);
-}
-
 #[tokio::test]
 async fn execute_skips_blob_present_on_downstream() {
     metrics_provider::init_for_tests();

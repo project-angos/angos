@@ -1,12 +1,11 @@
 use std::{cmp::Reverse, collections::VecDeque, pin::pin, sync::Arc};
 
 use async_trait::async_trait;
-use chrono::Duration;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures_util::{StreamExt, TryStreamExt};
 use tracing::{debug, error};
 
-use angos_oci::{Digest, Namespace, Tag};
+use angos_oci::{Content, Digest, Namespace, Tag};
 
 use crate::{
     command::maintenance::{
@@ -20,7 +19,7 @@ use crate::{
         Error as RegistryError, Repository,
         blob_store::BlobStore,
         keys::DigestKeys,
-        manifest::{link_plan, read_manifest},
+        manifest::read_manifest,
         metadata_store::{BlobIndex, LinkKind, LinkMetadata, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
@@ -202,7 +201,7 @@ async fn sweep_grants_for_blob(ctx: &GrantSweep<'_>, blob: &Digest) -> Result<()
     };
     let subject = ManifestImage::new(None, Some(last_modified), None, Utc::now());
     let grant = LinkKind::Blob(blob.clone());
-    for (namespace, links) in index.namespace {
+    for (namespace, links) in index {
         // An unresolved namespace is being cleared by the orphan-namespace
         // sweep, so revoke its grants outright; the executor's re-check still
         // spares a blob a not-yet-cascaded manifest references.
@@ -218,7 +217,11 @@ async fn sweep_grants_for_blob(ctx: &GrantSweep<'_>, blob: &Digest) -> Result<()
         }
         // A tracked link means a manifest references the blob, so the grant is
         // live; only a grant-only namespace is a retention subject.
-        if !links.contains(&grant) || links.iter().any(LinkKind::is_tracked) {
+        if !links.contains(&grant)
+            || links
+                .iter()
+                .any(|link| matches!(link, LinkKind::ReferencedBy(_)))
+        {
             continue;
         }
         // A cross-repository mount grants ownership of bytes that may be weeks
@@ -290,17 +293,14 @@ impl RetentionChecker {
         &self,
         namespace: &Namespace,
     ) -> Result<Vec<TagWithMetadata>, Error> {
+        // The listing resolves each tag, so only the pull history is read.
         self.metadata_store
-            .stream_tags(namespace)
+            .stream_live_tags(namespace, None)
             .err_into::<Error>()
-            .map_ok(|tag| async move {
-                let metadata = self
-                    .metadata_store
-                    .read_link(namespace, &LinkKind::Tag(tag.clone()))
-                    .await?;
+            .map_ok(|(tag, metadata)| async move {
                 let pulled_at = self
                     .metadata_store
-                    .read_tag_access_time(namespace, &tag)
+                    .read_access_time(namespace, &LinkKind::Tag(tag.clone()))
                     .await?;
                 Ok(TagWithMetadata {
                     name: tag,
@@ -500,7 +500,7 @@ impl RetentionChecker {
                 Ok(metadata) => {
                     let pulled_at = self
                         .metadata_store
-                        .read_revision_access_time(namespace, digest)
+                        .read_access_time(namespace, &LinkKind::Digest(digest.clone()))
                         .await?;
                     Some(ManifestImage::new(
                         None,
@@ -536,11 +536,23 @@ impl RetentionChecker {
         match fate {
             Fate::Skip | Fate::Retain => Ok(Vec::new()),
             Fate::Delete => {
-                // Read before the delete reclaims the body naming them.
-                let mut unpinned = match read_manifest(&self.blob_store, digest).await? {
-                    Some(manifest) => link_plan::unpinned_by_delete(&manifest),
-                    None => Vec::new(),
-                };
+                // Read before the delete reclaims the body naming them: an
+                // index's children and a subject lose the pin it held.
+                let mut unpinned: Vec<Digest> =
+                    match read_manifest(&self.blob_store, digest).await? {
+                        Some(manifest) => {
+                            let children = match &manifest.content {
+                                Content::Index { manifests } => manifests.as_slice(),
+                                Content::Image { .. } => &[],
+                            };
+                            children
+                                .iter()
+                                .chain(manifest.subject.as_ref())
+                                .map(|descriptor| descriptor.digest.clone())
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
                 // Its referrers lose their subject and are judged in this run.
                 let referrers: Vec<Digest> = self
                     .metadata_store
@@ -569,25 +581,23 @@ impl RetentionChecker {
     ) -> Result<bool, Error> {
         if self
             .has_backed_link(namespace, digest, blob_index, |link| {
-                matches!(link, LinkKind::Manifest { .. } | LinkKind::ReferencedBy(_))
+                matches!(link, LinkKind::ReferencedBy(_))
             })
             .await?
         {
             return Ok(true);
         }
 
-        let Some(links) = blob_index.and_then(|index| index.namespace.get(namespace)) else {
+        let Some(links) = blob_index.and_then(|index| index.get(namespace)) else {
             return Ok(false);
         };
         for link in links {
             let LinkKind::Referrer { subject, .. } = link else {
                 continue;
             };
-            // Bypasses the link cache like `reference_backed`, so a subject
-            // deleted elsewhere cannot keep its referrers skipped.
             match self
                 .metadata_store
-                .read_link_reference(namespace, &LinkKind::Digest(subject.clone()))
+                .read_link(namespace, &LinkKind::Digest(subject.clone()))
                 .await
             {
                 Ok(_) => return Ok(true),
@@ -608,7 +618,7 @@ impl RetentionChecker {
         blob_index: Option<&BlobIndex>,
         predicate: impl Fn(&LinkKind) -> bool,
     ) -> Result<bool, Error> {
-        let Some(refs) = blob_index.and_then(|index| index.namespace.get(namespace)) else {
+        let Some(refs) = blob_index.and_then(|index| index.get(namespace)) else {
             return Ok(false);
         };
         for link in refs {
@@ -646,11 +656,13 @@ mod tests {
         test_util::{HookedStore, StoreHook, StoreOp},
     };
 
-    use crate::command::prune::checker::*;
     use crate::{
-        command::maintenance::{
-            action::Action,
-            executor::{Executor, RETENTION_ACTOR},
+        command::{
+            maintenance::{
+                action::Action,
+                executor::{Executor, RETENTION_ACTOR},
+            },
+            prune::checker::*,
         },
         event_webhook::{
             config::{DeliveryPolicy, EventWebhookConfig},
@@ -662,11 +674,10 @@ mod tests {
         registry::{
             Registry, RegistryConfig,
             blob_store::BlobStore,
-            metadata_store::{BlobIndexOperation, LinkOperation},
             repository_resolver::RepositoryResolver,
             test_utils::{
-                self, FSRegistryTestCase, RegistryTestCase, for_each_backend, metadata_store_over,
-                put_blob_direct,
+                self, FSRegistryTestCase, RegistryTestCase, drop_links, for_each_backend,
+                metadata_store_over, put_blob_direct, seed_links,
             },
         },
     };
@@ -703,31 +714,27 @@ mod tests {
         index_digest: &Digest,
         child_digest: &Digest,
     ) {
+        seed_links(
+            metadata_store,
+            namespace,
+            &[
+                (LinkKind::Digest(child_digest.clone()), child_digest.clone()),
+                (LinkKind::Digest(index_digest.clone()), index_digest.clone()),
+                (
+                    LinkKind::Tag(Tag::new("latest").unwrap()),
+                    index_digest.clone(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
         metadata_store
-            .update_links(
+            .pin_references(
                 namespace,
-                &[
-                    LinkOperation::create(
-                        LinkKind::Digest(child_digest.clone()),
-                        child_digest.clone(),
-                    ),
-                    LinkOperation::create(
-                        LinkKind::Digest(index_digest.clone()),
-                        index_digest.clone(),
-                    ),
-                    LinkOperation::create(
-                        LinkKind::Tag(Tag::new("latest").unwrap()),
-                        index_digest.clone(),
-                    ),
-                    LinkOperation::create_with_referrer(
-                        LinkKind::Manifest {
-                            index: index_digest.clone(),
-                            child: child_digest.clone(),
-                        },
-                        child_digest.clone(),
-                        index_digest.clone(),
-                    ),
-                ],
+                &[(
+                    child_digest.clone(),
+                    LinkKind::ReferencedBy(index_digest.clone()),
+                )],
             )
             .await
             .unwrap();
@@ -737,22 +744,18 @@ mod tests {
         metadata_store: &Arc<MetadataStore>,
         namespace: &Namespace,
         index_digest: Digest,
-        child_digest: &Digest,
     ) {
-        metadata_store
-            .update_links(
-                namespace,
-                &[
-                    LinkOperation::delete(LinkKind::Tag(Tag::new("latest").unwrap())),
-                    LinkOperation::delete(LinkKind::Manifest {
-                        index: index_digest.clone(),
-                        child: child_digest.clone(),
-                    }),
-                    LinkOperation::delete(LinkKind::Digest(index_digest)),
-                ],
-            )
-            .await
-            .unwrap();
+        drop_links(
+            metadata_store,
+            namespace,
+            &[
+                LinkKind::Tag(Tag::new("latest").unwrap()),
+                LinkKind::ReferencedBy(index_digest.clone()),
+                LinkKind::Digest(index_digest),
+            ],
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -861,16 +864,16 @@ mod tests {
             let (blob_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
-            metadata_store
-                .update_links(
-                    namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Tag(Tag::new("v1.0.0").unwrap()),
-                        blob_digest.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &metadata_store,
+                namespace,
+                &[(
+                    LinkKind::Tag(Tag::new("v1.0.0").unwrap()),
+                    blob_digest.clone(),
+                )],
+            )
+            .await
+            .unwrap();
 
             let retention_config = RetentionPolicyConfig {
                 rules: vec![CelRule::compile("top_pushed(10)").unwrap()],
@@ -914,16 +917,16 @@ mod tests {
             let (blob_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
-            metadata_store
-                .update_links(
-                    namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Tag(Tag::new("any-tag").unwrap()),
-                        blob_digest.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &metadata_store,
+                namespace,
+                &[(
+                    LinkKind::Tag(Tag::new("any-tag").unwrap()),
+                    blob_digest.clone(),
+                )],
+            )
+            .await
+            .unwrap();
 
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
@@ -956,16 +959,13 @@ mod tests {
 
             let digest = put_blob_direct(metadata_store.object_store(), TEST_MANIFEST).await;
 
-            metadata_store
-                .update_links(
-                    &namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Digest(digest.clone()),
-                        digest.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &metadata_store,
+                &namespace,
+                &[(LinkKind::Digest(digest.clone()), digest.clone())],
+            )
+            .await
+            .unwrap();
 
             let policy = Arc::new(RetentionPolicy::new(
                 &RetentionPolicyConfig {
@@ -1007,16 +1007,13 @@ mod tests {
 
             let digest = put_blob_direct(metadata_store.object_store(), TEST_MANIFEST).await;
 
-            metadata_store
-                .update_links(
-                    &namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Digest(digest.clone()),
-                        digest.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &metadata_store,
+                &namespace,
+                &[(LinkKind::Digest(digest.clone()), digest.clone())],
+            )
+            .await
+            .unwrap();
 
             let executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
@@ -1083,7 +1080,7 @@ mod tests {
                     .is_ok()
             );
 
-            teardown_index_scenario(&metadata_store, &namespace, index_digest, &child_digest).await;
+            teardown_index_scenario(&metadata_store, &namespace, index_digest).await;
 
             let executor2 = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver2 = Arc::new(
@@ -1203,9 +1200,9 @@ mod tests {
         tag: Option<(&str, &Digest)>,
     ) {
         let mut ops = vec![
-            LinkOperation::create(LinkKind::Digest(subject.clone()), subject.clone()),
-            LinkOperation::create(LinkKind::Digest(referrer.clone()), referrer.clone()),
-            LinkOperation::create(
+            (LinkKind::Digest(subject.clone()), subject.clone()),
+            (LinkKind::Digest(referrer.clone()), referrer.clone()),
+            (
                 LinkKind::Referrer {
                     subject: subject.clone(),
                     referrer: referrer.clone(),
@@ -1214,12 +1211,9 @@ mod tests {
             ),
         ];
         if let Some((tag, target)) = tag {
-            ops.push(LinkOperation::create(
-                LinkKind::Tag(Tag::new(tag).unwrap()),
-                target.clone(),
-            ));
+            ops.push((LinkKind::Tag(Tag::new(tag).unwrap()), target.clone()));
         }
-        metadata_store.update_links(namespace, &ops).await.unwrap();
+        seed_links(metadata_store, namespace, &ops).await.unwrap();
     }
 
     fn keep_tagged_checker(test_case: &dyn RegistryTestCase) -> RetentionChecker {
@@ -1386,16 +1380,16 @@ mod tests {
         let (blob_digest, _) =
             test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
-        metadata_store
-            .update_links(
-                namespace,
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v0.0.1").unwrap()),
-                    blob_digest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            namespace,
+            &[(
+                LinkKind::Tag(Tag::new("v0.0.1").unwrap()),
+                blob_digest.clone(),
+            )],
+        )
+        .await
+        .unwrap();
 
         let policy = Arc::new(RetentionPolicy::new(
             &RetentionPolicyConfig {
@@ -1466,16 +1460,16 @@ mod tests {
         let (blob_digest, _) =
             test_utils::create_test_blob(test_case.registry(), namespace, b"retained content")
                 .await;
-        metadata_store
-            .update_links(
-                namespace,
-                &[LinkOperation::create(
-                    LinkKind::Tag(Tag::new("v0.0.1").unwrap()),
-                    blob_digest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &metadata_store,
+            namespace,
+            &[(
+                LinkKind::Tag(Tag::new("v0.0.1").unwrap()),
+                blob_digest.clone(),
+            )],
+        )
+        .await
+        .unwrap();
 
         let resolver = Arc::new(
             RepositoryResolver::new(test_utils::create_test_repositories())
@@ -1554,29 +1548,29 @@ mod tests {
             // First revision: deleted blob, so the executor hits a missing one.
             let digest_missing =
                 put_blob_direct(metadata_store.object_store(), TEST_MANIFEST).await;
-            metadata_store
-                .update_links(
-                    &namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Digest(digest_missing.clone()),
-                        digest_missing.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &metadata_store,
+                &namespace,
+                &[(
+                    LinkKind::Digest(digest_missing.clone()),
+                    digest_missing.clone(),
+                )],
+            )
+            .await
+            .unwrap();
             blob_store.delete_blob(&digest_missing).await.unwrap();
 
             let digest_healthy = put_blob_direct(metadata_store.object_store(), TEST_INDEX).await;
-            metadata_store
-                .update_links(
-                    &namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Digest(digest_healthy.clone()),
-                        digest_healthy.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &metadata_store,
+                &namespace,
+                &[(
+                    LinkKind::Digest(digest_healthy.clone()),
+                    digest_healthy.clone(),
+                )],
+            )
+            .await
+            .unwrap();
 
             let policy = Arc::new(RetentionPolicy::new(
                 &RetentionPolicyConfig {
@@ -1807,11 +1801,7 @@ mod tests {
         let blob =
             put_blob_direct(metadata_store.object_store(), b"granted-but-unreferenced").await;
         metadata_store
-            .update_blob_index(
-                namespace,
-                &blob,
-                BlobIndexOperation::Insert(LinkKind::Blob(blob.clone())),
-            )
+            .insert_reference(namespace, &blob, &LinkKind::Blob(blob.clone()))
             .await
             .unwrap();
         blob
@@ -2014,16 +2004,15 @@ mod tests {
     async fn tag_metadata_reads_stay_within_the_fixed_fan_out() {
         let case = FSRegistryTestCase::new();
         let namespace = Namespace::new("test-repo/fanout").unwrap();
-        let links: Vec<LinkOperation> = (0..TAG_METADATA_CONCURRENCY * 3)
+        let links: Vec<(LinkKind, Digest)> = (0..TAG_METADATA_CONCURRENCY * 3)
             .map(|i| {
-                LinkOperation::create(
+                (
                     LinkKind::Tag(Tag::new(&format!("v{i}")).unwrap()),
                     dummy_digest(),
                 )
             })
             .collect();
-        case.metadata_store()
-            .update_links(&namespace, &links)
+        seed_links(case.metadata_store().as_ref(), &namespace, &links)
             .await
             .unwrap();
 

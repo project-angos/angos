@@ -1,17 +1,44 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::pin,
+};
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
+use futures_util::{
+    future::BoxFuture,
+    stream::{self, StreamExt, TryStreamExt},
+};
 use tracing::{instrument, warn};
 
 use angos_docker_extension_service::{Catalog, CatalogRequest, NamespaceVisibility};
-use angos_oci::client;
-use angos_oci::request::{GetReferrersRequest, ListTagsRequest};
-use angos_oci::response::TagsListResponse;
-use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace};
+use angos_oci::{
+    Content, Descriptor, Digest, Manifest, MediaType, Namespace, client,
+    request::{GetReferrersRequest, ListTagsRequest},
+    response::TagsListResponse,
+};
 use angos_oci_service::{Referrers, Tags};
 use angos_storage::Page;
 
-use crate::registry::{Error, Registry, Repository, metadata_store::LinkKind, pagination};
+use crate::registry::{
+    Error, Registry, Repository,
+    metadata_store::{LinkKind, MetadataStore},
+    pagination,
+};
+
+/// Whether the catalog names `namespace` as a repository: it holds at least
+/// one manifest revision, or one tag that resolves live. A namespace holding
+/// nothing but tombstones or in-progress uploads is not a repository.
+pub fn holds_manifest_content(
+    metadata_store: &MetadataStore,
+    namespace: Namespace,
+) -> BoxFuture<'_, Result<bool, Error>> {
+    Box::pin(async move {
+        if metadata_store.any_revision(&namespace).await? {
+            return Ok(true);
+        }
+        let mut tags = pin!(metadata_store.stream_live_tags(&namespace, None));
+        Ok(tags.try_next().await?.is_some())
+    })
+}
 
 /// Whether `referrer` passes a listing's `artifactType` filter.
 fn matches_filter(referrer: &Descriptor, artifact_type: Option<&MediaType>) -> bool {
@@ -35,21 +62,27 @@ impl Registry {
         visibility: &dyn NamespaceVisibility,
     ) -> Result<Catalog, Error> {
         let n = request.n.unwrap_or(DEFAULT_PAGE_SIZE);
-        let page = self.metadata_store.list_namespaces(n, request.last).await?;
-        // The `Link` cursor tracks the raw page, so a page filtered below `n`
-        // (or to empty) while entries remain still advances; the client follows
-        // `Link` until it is absent.
+        // The walk drops what the caller may not see before it probes a name,
+        // so the page holds `n` visible entries whenever that many remain and
+        // its cursor is the last one served.
+        let page = self
+            .metadata_store
+            .list_namespaces(
+                n,
+                request.last,
+                &|namespace| visibility.allows(namespace),
+                |namespace| holds_manifest_content(&self.metadata_store, namespace),
+            )
+            .await?;
         let next = page
             .next_token
             .as_ref()
             .map(|last| format!("/v2/_catalog?n={n}&last={last}"));
-        let repositories = page
-            .items
-            .into_iter()
-            .filter(|ns| visibility.allows(ns))
-            .collect();
 
-        Ok(Catalog { repositories, next })
+        Ok(Catalog {
+            repositories: page.items,
+            next,
+        })
     }
 
     /// One page of a namespace's tags, advertising the next through the `Link`
@@ -64,10 +97,7 @@ impl Registry {
         // existence here must be able to tell the two apart. A repository whose
         // tags were all deleted still holds revisions, so it stays a `200`.
         if page.items.is_empty()
-            && !self
-                .metadata_store
-                .has_manifest_content(&request.namespace)
-                .await?
+            && !holds_manifest_content(&self.metadata_store, request.namespace.clone()).await?
         {
             return Err(Error::NameUnknown);
         }
@@ -265,7 +295,7 @@ impl Registry {
 
         if let Ok(metadata) = self
             .metadata_store
-            .read_link_reference(namespace, &referrer_link)
+            .read_link(namespace, &referrer_link)
             .await
             && let Some(desc) = metadata.descriptor
         {
@@ -307,7 +337,7 @@ impl Registry {
 mod tests {
     use std::collections::HashMap;
 
-    use http::header::LINK;
+    use http::{Response, header::LINK};
     use serde_json::json;
     use url::form_urlencoded;
     use wiremock::{
@@ -316,29 +346,27 @@ mod tests {
     };
 
     use angos_docker_extension_service::CatalogRequest;
-    use angos_oci::client::next_page_target;
-    use angos_oci::request::{GetReferrersRequest, ListTagsRequest};
     use angos_oci::{
         Descriptor, Digest, Manifest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE, Reference, Tag,
+        client::next_page_target,
+        request::{GetReferrersRequest, ListTagsRequest},
     };
     use angos_transport::ResponseBody;
-    use http::Response;
 
     use crate::{
         registry::{
             Error,
             content_discovery::{DEFAULT_PAGE_SIZE, Repository},
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::{LinkKind, LinkOperation, MetadataStore},
+            metadata_store::{LinkKind, MetadataStore},
             repository::Config,
             test_utils::{
-                FSRegistryTestCase, create_test_blob, for_each_backend, media_type,
-                put_blob_direct, referrers_request, response_json, upload_blob,
+                FSRegistryTestCase, create_link, create_test_blob, for_each_backend, media_type,
+                put_blob_direct, referrers_request, response_json, seed_links, upload_blob,
             },
         },
         test_fixtures::client::test_client_config,
     };
-
     /// The repository names a catalog response served.
     async fn catalog(response: Response<ResponseBody>) -> Vec<String> {
         json_strings(response, "repositories").await
@@ -423,18 +451,11 @@ mod tests {
             let test_content = b"test content";
             let test_digest =
                 put_blob_direct(registry.metadata_store.object_store(), test_content).await;
-            let ops: Vec<LinkOperation> = ["latest", "v1.0", "v2.0"]
+            let ops: Vec<(LinkKind, Digest)> = ["latest", "v1.0", "v2.0"]
                 .iter()
-                .map(|&tag| {
-                    LinkOperation::create(
-                        LinkKind::Tag(Tag::new(tag).unwrap()),
-                        test_digest.clone(),
-                    )
-                })
+                .map(|&tag| (LinkKind::Tag(Tag::new(tag).unwrap()), test_digest.clone()))
                 .collect();
-            registry
-                .metadata_store
-                .update_links(&namespace, &ops)
+            seed_links(&registry.metadata_store, &namespace, &ops)
                 .await
                 .unwrap();
 
@@ -488,6 +509,65 @@ mod tests {
         .await;
     }
 
+    /// A page holds `n` entries the caller may see, not `n` candidates minus
+    /// the ones it may not: the visibility filter runs inside the walk, so a
+    /// caller who sees one namespace in ten still gets full pages.
+    #[tokio::test]
+    async fn a_filtered_catalog_page_serves_a_full_page_of_visible_entries() {
+        // FS only: this pins the walk's filtering, not backend specifics.
+        let test_case = FSRegistryTestCase::new();
+        let registry = test_case.registry();
+        let digest = put_blob_direct(registry.metadata_store.object_store(), b"visible").await;
+        for i in 0..10 {
+            let namespace = Namespace::new(&format!("vis-{i:02}")).unwrap();
+            seed_links(
+                &registry.metadata_store,
+                &namespace,
+                &[(LinkKind::Tag(Tag::new("latest").unwrap()), digest.clone())],
+            )
+            .await
+            .unwrap();
+        }
+
+        // Every third namespace is visible, so a page of two must walk past
+        // the ones it hides instead of serving a short page.
+        let visible = |namespace: &Namespace| {
+            namespace
+                .as_ref()
+                .rsplit_once('-')
+                .and_then(|(_, i)| i.parse::<u32>().ok())
+                .is_some_and(|i| i % 3 == 0)
+        };
+        let response = registry
+            .list_catalog_entries(
+                CatalogRequest {
+                    n: Some(2),
+                    last: None,
+                },
+                &visible,
+            )
+            .await
+            .unwrap()
+            .into_response()
+            .unwrap();
+        let cursor = next_cursor(&response);
+        assert_eq!(catalog(response).await, ["vis-00", "vis-03"]);
+
+        let response = registry
+            .list_catalog_entries(
+                CatalogRequest {
+                    n: Some(2),
+                    last: cursor,
+                },
+                &visible,
+            )
+            .await
+            .unwrap()
+            .into_response()
+            .unwrap();
+        assert_eq!(catalog(response).await, ["vis-06", "vis-09"]);
+    }
+
     #[tokio::test]
     async fn list_catalog_entries_continuation_token_round_trip() {
         // FS only: this pins pagination logic, not backend specifics.
@@ -507,17 +587,13 @@ mod tests {
 
         for ns_str in &namespaces {
             let ns = Namespace::new(ns_str).unwrap();
-            registry
-                .metadata_store
-                .update_links(
-                    &ns,
-                    &[LinkOperation::create(
-                        LinkKind::Tag(Tag::new("latest").unwrap()),
-                        digest.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &registry.metadata_store,
+                &ns,
+                &[(LinkKind::Tag(Tag::new("latest").unwrap()), digest.clone())],
+            )
+            .await
+            .unwrap();
         }
 
         let mut all_collected: Vec<String> = Vec::new();
@@ -583,17 +659,13 @@ mod tests {
 
         let digest =
             put_blob_direct(registry.metadata_store.object_store(), b"revision body").await;
-        registry
-            .metadata_store
-            .update_links(
-                &namespace,
-                &[LinkOperation::create(
-                    LinkKind::Digest(digest.clone()),
-                    digest,
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &registry.metadata_store,
+            &namespace,
+            &[(LinkKind::Digest(digest.clone()), digest)],
+        )
+        .await
+        .unwrap();
 
         let response = registry
             .list_tag_entries(ListTagsRequest {
@@ -648,15 +720,11 @@ mod tests {
                 .unwrap();
 
             let referrer_link = LinkKind::Referrer { subject: base_manifest_digest.clone(), referrer: referrer_manifest_digest.clone(), };
-            registry
-                .metadata_store
-                .update_links(
-                    namespace,
-                    &[LinkOperation::create(
+            seed_links(&registry
+                .metadata_store, namespace, &[(
                         referrer_link,
                         referrer_manifest_digest.clone(),
-                    )],
-                )
+                    )])
                 .await
                 .unwrap();
 
@@ -747,19 +815,9 @@ mod tests {
         manifest: &Digest,
         descriptor: Option<Descriptor>,
     ) {
-        let ops = vec![LinkOperation::Create {
-            link: LinkKind::Referrer {
-                subject: subject(),
-                referrer: manifest.clone(),
-            },
-            target: manifest.clone(),
-            referrer: None,
-            media_type: None,
-            size: None,
-            annotations: None,
-            descriptor: descriptor.map(Box::new),
-        }];
-        m.update_links(namespace, &ops).await.unwrap();
+        m.put_referrer(namespace, &subject(), manifest, descriptor.as_ref())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -988,17 +1046,13 @@ mod tests {
         .unwrap();
         let fallback_digest = upload_blob(registry, &namespace, &fallback).await;
         let tag = subject.referrers_fallback_tag();
-        registry
-            .metadata_store
-            .update_links(
-                &namespace,
-                &[LinkOperation::create(
-                    LinkKind::Tag(tag),
-                    fallback_digest.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &registry.metadata_store,
+            &namespace,
+            &[(LinkKind::Tag(tag), fallback_digest.clone())],
+        )
+        .await
+        .unwrap();
 
         let page = registry
             .list_referrers(None, &referrers_request(&namespace, &subject))
@@ -1170,5 +1224,348 @@ mod tests {
             served, expected,
             "paging must visit every referrer exactly once, in digest order"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+            let m = registry.metadata_store.clone();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let base_digest = put_blob_direct(m.object_store(), b"base manifest content").await;
+            let base_link = LinkKind::Digest(base_digest.clone());
+
+            create_link(&m, namespace, &base_link, &base_digest).await;
+
+            let referrer_content = format!(
+                r#"{{
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "subject": {{
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "{base_digest}",
+                        "size": 123
+                    }},
+                    "artifactType": "application/vnd.example.test-artifact",
+                    "config": {{
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "size": 7023
+                    }},
+                    "layers": []
+                }}"#
+            );
+
+            let referrer_digest = put_blob_direct(m.object_store(), referrer_content.as_bytes()).await;
+            let link = LinkKind::Digest(referrer_digest.clone());
+
+            create_link(&m, namespace, &link, &referrer_digest).await;
+
+            let referrers_link = LinkKind::Referrer {
+                subject: base_digest.clone(),
+                referrer: referrer_digest.clone(),
+            };
+
+            create_link(&m, namespace, &referrers_link, &referrer_digest).await;
+
+            let referrers = registry
+                .list_referrers(None, &referrers_request(namespace, &base_digest))
+                .await;
+
+            let expected = vec![Descriptor {
+                media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
+                digest: referrer_digest,
+                size: u64::try_from(referrer_content.len()).unwrap(),
+                annotations: HashMap::new(),
+                artifact_type: Some(media_type("application/vnd.example.test-artifact")),
+                platform: None,
+            }];
+
+            assert_eq!(referrers.unwrap().items, expected);
+
+            let filtered_referrers = registry
+                .list_referrers(
+                    None,
+                    &GetReferrersRequest {
+                        artifact_type: Some(media_type("application/vnd.example.test-artifact")),
+                        ..referrers_request(namespace, &base_digest)
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert!(!filtered_referrers.items.is_empty());
+
+            let non_matching_referrers = registry
+                .list_referrers(
+                    None,
+                    &GetReferrersRequest {
+                        artifact_type: Some(media_type("application/vnd.non-existent")),
+                        ..referrers_request(namespace, &base_digest)
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert!(non_matching_referrers.items.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers_with_artifact_type_filter() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+            let m = registry.metadata_store.clone();
+            let namespace = &Namespace::new("test-referrers-filter").unwrap();
+            let subject_digest =
+                put_blob_direct(m.object_store(), b"subject manifest for filter test").await;
+            let subject_link = LinkKind::Digest(subject_digest.clone());
+            create_link(&m, namespace, &subject_link, &subject_digest).await;
+
+            for i in 0..3 {
+                let referrer_content = format!(
+                    r#"{{
+                        "schemaVersion": 2,
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "subject": {{
+                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": "{subject_digest}",
+                            "size": 123
+                        }},
+                        "artifactType": "application/vnd.example.sbom",
+                        "config": {{
+                            "mediaType": "application/vnd.oci.image.config.v1+json",
+                            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                            "size": 7023
+                        }},
+                        "layers": [],
+                        "annotations": {{ "sbom-index": "{i}" }}
+                    }}"#
+                );
+
+                let referrer_digest = put_blob_direct(m.object_store(), referrer_content.as_bytes()).await;
+                let digest_link = LinkKind::Digest(referrer_digest.clone());
+                create_link(&m, namespace, &digest_link, &referrer_digest).await;
+
+                let referrer_link = LinkKind::Referrer {
+                    subject: subject_digest.clone(),
+                    referrer: referrer_digest.clone(),
+                };
+                create_link(&m, namespace, &referrer_link, &referrer_digest).await;
+            }
+
+            for i in 0..2 {
+                let referrer_content = format!(
+                    r#"{{
+                        "schemaVersion": 2,
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "subject": {{
+                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": "{subject_digest}",
+                            "size": 123
+                        }},
+                        "artifactType": "application/vnd.example.signature",
+                        "config": {{
+                            "mediaType": "application/vnd.oci.image.config.v1+json",
+                            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                            "size": 7023
+                        }},
+                        "layers": [],
+                        "annotations": {{ "sig-index": "{i}" }}
+                    }}"#
+                );
+
+                let referrer_digest = put_blob_direct(m.object_store(), referrer_content.as_bytes()).await;
+                let digest_link = LinkKind::Digest(referrer_digest.clone());
+                create_link(&m, namespace, &digest_link, &referrer_digest).await;
+
+                let referrer_link = LinkKind::Referrer {
+                    subject: subject_digest.clone(),
+                    referrer: referrer_digest.clone(),
+                };
+                create_link(&m, namespace, &referrer_link, &referrer_digest).await;
+            }
+
+            let descriptors = registry
+                .list_referrers(
+                    None,
+                    &GetReferrersRequest {
+                        artifact_type: Some(media_type("application/vnd.example.sbom")),
+                        ..referrers_request(namespace, &subject_digest)
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                descriptors.items.len(),
+                3,
+                "Expected 3 SBOM referrer descriptors but got {}",
+                descriptors.items.len()
+            );
+
+            for desc in &descriptors.items {
+                assert_eq!(
+                    desc.artifact_type.as_deref(),
+                    Some("application/vnd.example.sbom"),
+                    "All filtered descriptors should have SBOM artifact type"
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers_deterministic_order() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+            let m = registry.metadata_store.clone();
+            let namespace = &Namespace::new("test-referrers-order").unwrap();
+            let subject_digest =
+                put_blob_direct(m.object_store(), b"subject manifest for order test").await;
+            let subject_link = LinkKind::Digest(subject_digest.clone());
+            create_link(&m, namespace, &subject_link, &subject_digest).await;
+
+            for i in 0..10 {
+                let referrer_content = format!(
+                    r#"{{
+                        "schemaVersion": 2,
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "subject": {{
+                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": "{subject_digest}",
+                            "size": 123
+                        }},
+                        "artifactType": "application/vnd.example.test-artifact",
+                        "config": {{
+                            "mediaType": "application/vnd.oci.image.config.v1+json",
+                            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                            "size": 7023
+                        }},
+                        "layers": [],
+                        "annotations": {{ "order-index": "{i}" }}
+                    }}"#
+                );
+
+                let referrer_digest = put_blob_direct(m.object_store(), referrer_content.as_bytes()).await;
+                let digest_link = LinkKind::Digest(referrer_digest.clone());
+                create_link(&m, namespace, &digest_link, &referrer_digest).await;
+
+                let referrer_link = LinkKind::Referrer {
+                    subject: subject_digest.clone(),
+                    referrer: referrer_digest.clone(),
+                };
+                create_link(&m, namespace, &referrer_link, &referrer_digest).await;
+            }
+
+            let result1 = registry
+                .list_referrers(None, &referrers_request(namespace, &subject_digest))
+                .await
+                .unwrap();
+            let result2 = registry
+                .list_referrers(None, &referrers_request(namespace, &subject_digest))
+                .await
+                .unwrap();
+            let result3 = registry
+                .list_referrers(None, &referrers_request(namespace, &subject_digest))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result1.items.len(),
+                10,
+                "Expected 10 referrer descriptors but got {}",
+                result1.items.len()
+            );
+            assert_eq!(
+                result1, result2,
+                "First and second list_referrers calls should return identical results"
+            );
+            assert_eq!(
+                result2, result3,
+                "Second and third list_referrers calls should return identical results"
+            );
+
+            for pair in result1.items.windows(2) {
+                assert!(
+                    pair[0].digest.to_string() <= pair[1].digest.to_string(),
+                    "Descriptors should be sorted by digest: {} should come before {}",
+                    pair[0].digest,
+                    pair[1].digest
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers_with_stored_descriptor() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+            let m = registry.metadata_store.clone();
+            let namespace = &Namespace::new("test-stored-descriptor").unwrap();
+
+            let base_digest = put_blob_direct(m.object_store(), b"base manifest content").await;
+            let base_link = LinkKind::Digest(base_digest.clone());
+            create_link(&m, namespace, &base_link, &base_digest).await;
+
+            // The referrer blob is never written, so the descriptor can only come
+            // from the stored link metadata.
+            let referrer_digest: Digest =
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .parse()
+                    .unwrap();
+
+            let descriptor = Descriptor {
+                media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
+                digest: referrer_digest.clone(),
+                size: 1234,
+                annotations: HashMap::new(),
+                artifact_type: Some(media_type("application/vnd.example.test-artifact")),
+                platform: None,
+            };
+
+            m.put_referrer(namespace, &base_digest, &referrer_digest, Some(&descriptor))
+                .await
+                .unwrap();
+
+            let referrers = registry
+                .list_referrers(None, &referrers_request(namespace, &base_digest))
+                .await
+                .unwrap();
+
+            assert_eq!(referrers.items.len(), 1, "Expected 1 referrer descriptor");
+            assert_eq!(referrers.items[0], descriptor);
+
+            let filtered = registry
+                .list_referrers(
+                    None,
+                    &GetReferrersRequest {
+                        artifact_type: Some(media_type("application/vnd.example.test-artifact")),
+                        ..referrers_request(namespace, &base_digest)
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(filtered.items.len(), 1, "Should match artifact type filter");
+            assert_eq!(filtered.items[0], descriptor);
+
+            let non_matching = registry
+                .list_referrers(
+                    None,
+                    &GetReferrersRequest {
+                        artifact_type: Some(media_type("application/vnd.non-existent")),
+                        ..referrers_request(namespace, &base_digest)
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                non_matching.items.is_empty(),
+                "Should return empty for non-matching artifact type"
+            );
+        })
+        .await;
     }
 }

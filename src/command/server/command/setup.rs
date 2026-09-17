@@ -4,6 +4,8 @@ use tokio::time::timeout;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{info, warn};
 
+use angos_cache::Cache;
+
 use crate::{
     cache_fill::CacheFillJobHandler,
     command::{bootstrap, server::error::Error},
@@ -22,8 +24,6 @@ use crate::{
     replication::ReplicationJobHandler,
     scan::ScanJobHandler,
 };
-use angos_cache::Cache;
-
 /// A built registry and what the server owns around it: the handle its
 /// queue-depth gauges refresh from when `[global.job_queue]` is configured,
 /// and otherwise the claim loops draining the in-process queue.
@@ -172,7 +172,6 @@ pub async fn build_registry(
     let storage_config = resolve_storage_config(config);
     let metadata_store = bootstrap::metadata_store(
         &storage_config,
-        auth_cache,
         config.global.namespace_walk_concurrency,
         config.global.gc_grace_secs,
         config.global.atime_audit_window_secs,

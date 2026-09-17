@@ -11,15 +11,18 @@ use hyper::{
 };
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-use crate::command::server::router::Route;
+use angos_cache::Cache;
 use angos_oci::{Digest, Namespace, Reference, Tag};
 use angos_oci_service::Endpoint as OciEndpoint;
 
-use crate::registry::test_utils::test_job_store;
-
 use crate::{
-    command::bootstrap,
-    command::server::server_context::{ServerContext, resolve_forwarded_ip},
+    command::{
+        bootstrap,
+        server::{
+            router::Route,
+            server_context::{ServerContext, resolve_forwarded_ip},
+        },
+    },
     configuration::{Configuration, TrustedProxy},
     event_webhook::{config::EventWebhookConfig, dispatcher::EventDispatcher, event::Event},
     identity::{Action, ClientIdentity, RequestScheme},
@@ -27,12 +30,12 @@ use crate::{
     policy::AccessPolicyConfig,
     registry::{
         Error as RegistryError, Registry, RegistryConfig, Repository,
-        metadata_store::MetadataStore, repository_resolver::RepositoryResolver,
+        metadata_store::{MetadataStore, Settings},
+        repository_resolver::RepositoryResolver,
+        test_utils::test_job_store,
     },
     test_fixtures::configuration::{load_config, minimal_config},
 };
-use angos_cache::Cache;
-
 #[derive(Default)]
 pub struct TestConfigOptions<'a> {
     pub access_policy: Option<AccessPolicyConfig>,
@@ -100,7 +103,7 @@ pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
     let store = bootstrap::build_object_store(&storage_config).unwrap();
-    let metadata_store = Arc::new(MetadataStore::builder(store).build());
+    let metadata_store = Arc::new(MetadataStore::new(store, Settings::default()));
 
     let mut repositories_map = HashMap::new();
     for (name, repo_config) in &config.repository {
