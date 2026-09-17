@@ -173,7 +173,7 @@ impl Validator {
         let young = object_younger_than_grace(
             self.metadata_store.object_store().as_ref(),
             key,
-            self.metadata_store.gc_grace_secs(),
+            self.metadata_store.gc_grace_secs,
         )
         .await
         .map_err(RegistryError::from)?;

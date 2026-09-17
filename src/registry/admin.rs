@@ -14,19 +14,15 @@ use angos_extension_service::{
     NoContent, ParentRef, PullsBody, ReferrerInfo, RepositoriesBody, RepositoryInfo,
     RetryJobRequest, RevisionsBody, UploadEntry, UploadsBody,
 };
-use angos_oci::request::GetReferrersRequest;
 use angos_oci::{
-    Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace, Platform, Reference,
-    Tag, UploadSessionId, namespace_belongs_to,
+    Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace, Platform, Tag,
+    UploadSessionId, namespace_belongs_to, request::GetReferrersRequest,
 };
 
 use crate::{
     configuration::RegexPattern,
-    jobs::store as job_store,
-    jobs::{JobState, Queue},
-    registry::{
-        Error, Registry, keys::NamespaceKeys, manifest::read_manifest, metadata_store::LinkKind,
-    },
+    jobs::{JobState, Queue, store as job_store},
+    registry::{Error, Registry, manifest::read_manifest, metadata_store::LinkKind},
 };
 
 /// Most pull-history entries one listing returns; the directory is unbounded,
@@ -193,8 +189,12 @@ impl Registry {
             // The three counts read disjoint prefixes, so they go out together
             // rather than paying one round trip after another per namespace.
             let (tag_count, manifest_count, upload_count) = try_join!(
-                self.metadata_store.count_tags(&name),
-                self.metadata_store.count_manifests(&name),
+                self.metadata_store
+                    .stream_live_tags(&name, None)
+                    .try_fold(0usize, |count, _| async move { Ok(count + 1) }),
+                self.metadata_store
+                    .stream_revisions(&name)
+                    .try_fold(0usize, |count, _| async move { Ok(count + 1) }),
                 self.count_uploads(&name),
             )?;
             Ok::<_, Error>(NamespaceInfo {
@@ -253,42 +253,31 @@ impl Registry {
         })
     }
 
-    /// The newest recorded pulls of one tag or revision, newest first. The
-    /// entry directory is append-only, so an entry deleted or corrupted
-    /// mid-listing is skipped rather than failing the request.
+    /// The newest recorded pulls of one tag or revision, newest first.
     #[instrument(skip(self))]
     pub async fn get_pull_history(&self, request: ListPullsRequest) -> Result<PullsBody, Error> {
         let ListPullsRequest {
             namespace,
             reference,
         } = request;
-        let dir = match &reference {
-            Reference::Tag(tag) => namespace.tag_atime_entry_dir(tag),
-            Reference::Digest(digest) => namespace.revision_atime_entry_dir(digest),
-        };
-        let page = self
+        let entries = self
             .metadata_store
-            .object_store()
-            .list(&dir, PULL_HISTORY_PAGE, None)
-            .await?;
-
-        // `buffered` keeps the listing's newest-first order.
-        let entries: Vec<AccessEntry> = stream::iter(page.items)
-            .map(|name| {
-                let key = format!("{dir}/{name}");
-                async move {
-                    let raw = self.metadata_store.object_store().get(&key).await.ok()?;
-                    serde_json::from_slice::<AccessEntry>(&raw).ok()
-                }
+            .read_access_entries(
+                &namespace,
+                &LinkKind::from_reference(&reference),
+                PULL_HISTORY_PAGE,
+            )
+            .await?
+            .into_iter()
+            .map(|entry| AccessEntry {
+                client: entry.client,
+                at: entry.at,
             })
-            .buffered(ADMIN_READ_CONCURRENCY)
-            .filter_map(|entry| async move { entry })
-            .collect()
-            .await;
+            .collect();
 
         Ok(PullsBody {
             target: reference.to_string(),
-            window_secs: self.metadata_store.atime_audit_window_secs(),
+            window_secs: self.metadata_store.atime_audit_window_secs,
             entries,
         })
     }
@@ -574,7 +563,7 @@ impl Registry {
                 // A revision's last pull lives in its access entries.
                 let last_pulled_at = self
                     .metadata_store
-                    .read_revision_access_time(namespace, &digest)
+                    .read_access_time(namespace, &LinkKind::Digest(digest.clone()))
                     .await
                     .ok()
                     .flatten();
@@ -622,7 +611,7 @@ impl Registry {
             .map(|tag| async move {
                 let at = self
                     .metadata_store
-                    .read_tag_access_time(namespace, &tag)
+                    .read_access_time(namespace, &LinkKind::Tag(tag.clone()))
                     .await
                     .ok()
                     .flatten()?;
@@ -645,25 +634,15 @@ impl Registry {
         &self,
         namespace: &Namespace,
     ) -> Result<HashMap<Digest, Vec<Tag>>, Error> {
-        let mut all_tags: Vec<Tag> = self
+        // The listing resolves each tag, so the map costs one walk and no
+        // point read; sorting it keeps each digest's tag list deterministic.
+        let mut tag_links: Vec<(Tag, Digest)> = self
             .metadata_store
-            .stream_tags(namespace)
+            .stream_live_tags(namespace, None)
+            .map_ok(|(tag, metadata)| (tag, metadata.target))
             .try_collect()
             .await?;
-        all_tags.sort();
-
-        // `buffered` keeps the sorted tag order so each digest's tag list stays
-        // deterministic; a tag whose link read fails is skipped.
-        let tag_links: Vec<(Tag, Digest)> = stream::iter(all_tags)
-            .map(|tag| async move {
-                let link = LinkKind::Tag(tag.clone());
-                let metadata = self.metadata_store.read_link(namespace, &link).await.ok()?;
-                Some((tag, metadata.target))
-            })
-            .buffered(ADMIN_READ_CONCURRENCY)
-            .filter_map(|pair| async move { pair })
-            .collect()
-            .await;
+        tag_links.sort();
 
         Ok(tag_links
             .into_iter()
@@ -705,46 +684,37 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use bytes::Bytes;
     use std::{
+        collections::HashMap,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
-    use tokio::time::sleep;
 
-    use angos_storage::{
-        Error as StorageError, ObjectStore,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use bytes::Bytes;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use serde_json::Value;
+    use tokio::time::sleep;
 
     use angos_oci::{
         DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, Platform, Reference, Tag,
         UploadSessionId,
     };
-
-    use chrono::{DateTime, Duration as ChronoDuration, Utc};
-
-    use crate::registry::admin::{analyze_manifest, extract_docker_referrer, parent_refs_for};
-    use serde_json::Value;
-
-    use crate::registry::admin::ListPullsRequest;
-    use crate::registry::keys::NamespaceKeys;
-    use crate::registry::metadata_store::{
-        AccessEntry, MetadataStore,
-        access_time::{atime_client_suffix, atime_entry_name},
-        tag_ord,
+    use angos_storage::{
+        Error as StorageError, ObjectStore,
+        test_util::{HookedStore, StoreHook, StoreOp},
     };
+
     use crate::registry::{
         Registry,
-        metadata_store::{LinkKind, LinkOperation},
+        admin::{ListPullsRequest, analyze_manifest, extract_docker_referrer, parent_refs_for},
+        keys::NamespaceKeys,
+        metadata_store::{AccessEntry, LinkKind, MetadataStore},
         test_utils::{
             FSRegistryTestCase, RegistryTestCase, create_test_blob, create_test_registry,
-            for_each_backend, media_type, metadata_store_over, response_json,
+            for_each_backend, media_type, metadata_store_over, response_json, seed_links,
         },
     };
 
@@ -1111,17 +1081,13 @@ mod tests {
 
             let namespace = Namespace::new("test-repo/multi-tag").unwrap();
             let (digest, _) = create_test_blob(registry, &namespace, b"multi tag content").await;
-            registry
-                .metadata_store
-                .update_links(
-                    &namespace,
-                    &[LinkOperation::create(
-                        LinkKind::Tag(Tag::new("v1.0").unwrap()),
-                        digest.clone(),
-                    )],
-                )
-                .await
-                .unwrap();
+            seed_links(
+                &registry.metadata_store,
+                &namespace,
+                &[(LinkKind::Tag(Tag::new("v1.0").unwrap()), digest.clone())],
+            )
+            .await
+            .unwrap();
 
             let response = registry
                 .get_namespaces_info(&Namespace::new("test-repo").unwrap())
@@ -1288,11 +1254,11 @@ mod tests {
     /// Plant one access entry at `at`, the shape a stamped pull writes.
     async fn put_pull_entry(
         metadata_store: &MetadataStore,
-        dir: &str,
+        namespace: &Namespace,
+        link: &LinkKind,
         client: &str,
         at: DateTime<Utc>,
     ) {
-        let name = atime_entry_name(tag_ord(Some(at)), &atime_client_suffix(client));
         let body = serde_json::to_vec(&AccessEntry {
             client: client.to_string(),
             at,
@@ -1300,7 +1266,10 @@ mod tests {
         .unwrap();
         metadata_store
             .object_store()
-            .put(&format!("{dir}/{name}"), Bytes::from(body))
+            .put(
+                &namespace.atime_entry_path(link, at, client).unwrap(),
+                Bytes::from(body),
+            )
             .await
             .unwrap();
     }
@@ -1312,16 +1281,25 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("test-repo/pulls").unwrap();
             let tag = Tag::new("v1").unwrap();
-            let dir = namespace.tag_atime_entry_dir(&tag);
+            let link = LinkKind::Tag(tag.clone());
 
             let now = Utc::now();
-            put_pull_entry(&metadata_store, &dir, "alice", now).await;
-            put_pull_entry(&metadata_store, &dir, "bob", now - ChronoDuration::hours(2)).await;
+            put_pull_entry(&metadata_store, &namespace, &link, "alice", now).await;
+            put_pull_entry(
+                &metadata_store,
+                &namespace,
+                &link,
+                "bob",
+                now - ChronoDuration::hours(2),
+            )
+            .await;
             // An unparseable body must be skipped, not fail the listing.
             metadata_store
                 .object_store()
                 .put(
-                    &format!("{dir}/{}", atime_entry_name(tag_ord(Some(now)), "ffffffff")),
+                    &namespace
+                        .atime_entry_path(&link, now, "some-other-client")
+                        .unwrap(),
                     Bytes::from_static(b"not json"),
                 )
                 .await
@@ -1359,17 +1337,11 @@ mod tests {
         target: &Digest,
         tags: &[&str],
     ) {
-        let mut ops = vec![LinkOperation::create(
-            LinkKind::Digest(target.clone()),
-            target.clone(),
-        )];
+        let mut ops = vec![(LinkKind::Digest(target.clone()), target.clone())];
         for tag in tags {
-            ops.push(LinkOperation::create(
-                LinkKind::Tag(Tag::new(tag).unwrap()),
-                target.clone(),
-            ));
+            ops.push((LinkKind::Tag(Tag::new(tag).unwrap()), target.clone()));
         }
-        metadata_store.update_links(namespace, &ops).await.unwrap();
+        seed_links(metadata_store, namespace, &ops).await.unwrap();
     }
 
     /// An access entry is named by a millisecond ordinal, so a fixture instant
@@ -1417,7 +1389,8 @@ mod tests {
             let pulled_at = pulled_ago(ChronoDuration::minutes(5));
             put_pull_entry(
                 &metadata_store,
-                &namespace.tag_atime_entry_dir(&Tag::new("main").unwrap()),
+                &namespace,
+                &LinkKind::Tag(Tag::new("main").unwrap()),
                 "kubelet",
                 pulled_at,
             )
@@ -1450,14 +1423,16 @@ mod tests {
             let newest = pulled_ago(ChronoDuration::minutes(1));
             put_pull_entry(
                 &metadata_store,
-                &namespace.tag_atime_entry_dir(&Tag::new("old").unwrap()),
+                &namespace,
+                &LinkKind::Tag(Tag::new("old").unwrap()),
                 "alice",
                 older,
             )
             .await;
             put_pull_entry(
                 &metadata_store,
-                &namespace.tag_atime_entry_dir(&Tag::new("new").unwrap()),
+                &namespace,
+                &LinkKind::Tag(Tag::new("new").unwrap()),
                 "bob",
                 newest,
             )
@@ -1495,7 +1470,8 @@ mod tests {
             let pulled_at = pulled_ago(ChronoDuration::minutes(2));
             put_pull_entry(
                 &metadata_store,
-                &namespace.revision_atime_entry_dir(&target),
+                &namespace,
+                &LinkKind::Digest(target.clone()),
                 "carol",
                 pulled_at,
             )
@@ -1521,17 +1497,21 @@ mod tests {
             let namespace = Namespace::new("test-repo/pulls-rev").unwrap();
             let target = digest("beef1");
             let link = LinkKind::Digest(target.clone());
-            metadata_store
-                .update_links(
-                    &namespace,
-                    &[LinkOperation::create(link.clone(), target.clone())],
-                )
-                .await
-                .unwrap();
-            metadata_store
-                .read_link_recording_access(&namespace, &link, "carol")
-                .await
-                .unwrap();
+            seed_links(
+                &metadata_store,
+                &namespace,
+                &[(link.clone(), target.clone())],
+            )
+            .await
+            .unwrap();
+            put_pull_entry(
+                &metadata_store,
+                &namespace,
+                &LinkKind::Digest(target.clone()),
+                "carol",
+                Utc::now(),
+            )
+            .await;
 
             let response = registry
                 .get_pull_history(ListPullsRequest {

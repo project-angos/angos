@@ -753,7 +753,7 @@ workflow that expected a `409` for a first push gets a `201`.
 None. To keep a tag unwritable altogether, deny the push at the authorization
 layer instead: `immutable_tags` protects content, not the namespace.
 
-## 1.7.x → 1.7.3
+## 1.7.x → 1.8.0
 
 ### The Container Image Runs Unprivileged (Breaking Change)
 
@@ -810,3 +810,72 @@ unchanged.
 #### Migration
 
 Replace `angos replicate` with `angos reconcile replication`.
+
+## 1.8.0 → 1.9.0
+
+### The Link Cache Is Gone
+
+Tags, revisions and referrers were read through a cache bounded by
+`link_cache_ttl`, so a replica could answer with a tag a peer had already
+moved until the TTL elapsed. Every such read now goes to the metadata store,
+and `link_cache_ttl` joins the ignored keys.
+
+**Who is affected:** deployments that set `link_cache_ttl`, and multi-instance
+deployments pointing the cache at a shared Redis so that replicas would agree.
+The key is ignored rather than refused, so configurations keep loading. A
+repeated tag or revision read now costs one backend round trip, which on S3
+shows up as more `GET` requests against hot tags.
+
+#### Migration
+
+None. Remove `link_cache_ttl` at your convenience; the cache backend still
+serves authentication, so a configured Redis stays in use.
+
+### A Pull Angos Cannot Record Fails
+
+A manifest pull served from a pull-through cache hit or as a presigned
+redirect used to be served even when writing its access-time entry failed,
+where a local pull already failed. All three now fail, since retention
+reclaims by that record and serving content angos then treats as never pulled
+would delete live images.
+
+**Who is affected:** deployments with `update_pull_time` enabled whose
+metadata store can reject writes while still serving reads, such as a bucket
+at a quota. Those pulls answer `500` instead of being served unrecorded.
+
+#### Migration
+
+None. Disable `update_pull_time` if retention does not need last-pull times.
+
+### Per-Role Reference Keys Are Quarantined
+
+An angos before 1.8.0 recorded a referenced blob with one key per role,
+`r/layer`, `r/config` or `r/idx.<algo>.<hash>` under the blob's reference
+directory. Since 1.8.0 a push pins each referenced digest through the
+referring manifest instead, and such a key has counted for nothing. It is now
+not recognised at all, so `angos scrub` treats it like any key matching no
+known layout: quarantined by default, deleted under `--delete-unknown`, and
+counted either way.
+
+**Who is affected:** stores that ran an angos before 1.8.0 and still hold
+those keys. Read access and reclamation are unaffected, since the keys already
+vouched for nothing; the next scrub run simply reports more quarantined keys
+than before.
+
+#### Migration
+
+None. Run `angos scrub` to clear them, with `--delete-unknown` if you would
+rather not keep the quarantine copies.
+
+### `namespace_walk_concurrency` Must Be Non-Zero
+
+A `0` used to be read as `1`. It is now refused when the configuration loads,
+so a mistake fails loudly instead of quietly running the walks unparallelised.
+
+**Who is affected:** deployments that set `namespace_walk_concurrency = 0`.
+The server, and every offline command, exits with a configuration error.
+
+#### Migration
+
+Remove the setting to take the default of 128, or set it to at least 1.
+

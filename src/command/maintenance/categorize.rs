@@ -9,13 +9,15 @@ use std::str::FromStr;
 
 use angos_oci::{Algorithm, Digest, Namespace, Tag, UploadSessionId};
 
-use crate::command::maintenance::action::LOST_AND_FOUND_PREFIX;
 use crate::{
+    command::maintenance::action::LOST_AND_FOUND_PREFIX,
     jobs::{JobState, Queue, store::JOBS_ROOT},
     registry::{
-        keys::DigestKeys,
-        keys::{BLOBS_ROOT, CAT_ROOT, GC_ROOT, LAYERS_ROOT, NS_ROOT, REF_ROOT, REPOS_ROOT},
-        metadata_store::{LinkKind, parse_atime_entry, parse_tag_entry},
+        keys::{
+            BLOBS_ROOT, CAT_ROOT, DigestKeys, GC_ROOT, LAYERS_ROOT, NS_ROOT, REF_ROOT, REPOS_ROOT,
+            TagEntry, parse_atime_entry,
+        },
+        metadata_store::LinkKind,
     },
 };
 
@@ -97,10 +99,12 @@ pub enum UploadArtifact {
 /// Prefix of the startup CAS-probe objects at the store root.
 const PROBE_KEY_PREFIX: &str = "_angos_probe_";
 
-/// The reserved first path segment after the namespace in a repository key.
-/// Valid namespace components never start with `_`, so the first marker
-/// segment unambiguously ends the namespace.
-const NAMESPACE_MARKERS: [&str; 1] = ["_uploads"];
+/// The only reserved segment left after the namespace in a repository key.
+/// Valid namespace components never start with `_`, so it unambiguously ends
+/// the namespace. The retired link-file subtrees (`_manifests`, `_layers`,
+/// `_config`, `_blobs`) are no layout this version knows, so they quarantine
+/// like any other unrecognized key.
+const UPLOADS_MARKER: &str = "_uploads";
 
 /// Categorize a raw store key against the union of both stores' layouts.
 pub fn categorize(key: &str) -> KeyCategory {
@@ -234,7 +238,7 @@ fn categorize_ns(rest: &str) -> KeyCategory {
         let Some((tag, entry)) = entries.split_once("!/") else {
             return KeyCategory::Unknown;
         };
-        if Tag::new(tag).is_err() || parse_tag_entry(entry).is_none() {
+        if Tag::new(tag).is_err() || entry.parse::<TagEntry>().is_err() {
             return KeyCategory::Unknown;
         }
         return if kind == "tag" {
@@ -354,13 +358,13 @@ fn categorize_job(rest: &str) -> KeyCategory {
     }
 }
 
-/// `{ns...}/{marker}/{...}` where `{ns...}` is one or more namespace segments
-/// and `{marker}` is the first reserved `_`-segment.
+/// `{ns...}/_uploads/{...}`, where `{ns...}` is one or more namespace
+/// segments.
 fn categorize_repository(rest: &str) -> KeyCategory {
     let segments: Vec<&str> = rest.split('/').collect();
     let Some(marker_at) = segments
         .iter()
-        .position(|segment| NAMESPACE_MARKERS.contains(segment))
+        .position(|segment| *segment == UPLOADS_MARKER)
     else {
         return KeyCategory::Unknown;
     };
@@ -368,13 +372,7 @@ fn categorize_repository(rest: &str) -> KeyCategory {
         // No namespace before the marker; not addressable by any angos API.
         return KeyCategory::Unknown;
     }
-    let namespace = segments[..marker_at].join("/");
-    let tail = &segments[marker_at + 1..];
-
-    match segments[marker_at] {
-        "_uploads" => categorize_upload(namespace, tail),
-        _ => KeyCategory::Unknown,
-    }
+    categorize_upload(segments[..marker_at].join("/"), &segments[marker_at + 1..])
 }
 
 /// `{uuid}/data`, `{uuid}/session.json`, or `{uuid}/staged/{offset}`.
@@ -414,18 +412,19 @@ fn parse_digest(algorithm: &str, hash: &str) -> Option<Digest> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
+
     use angos_oci::{Namespace, Tag};
 
-    use crate::command::maintenance::categorize::*;
+    /// The epoch stamp, whose ordinal is the highest one a writer produces.
+    fn epoch() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(0).unwrap()
+    }
+
     use crate::{
+        command::maintenance::categorize::*,
         jobs::store::{LockKey, job_failed_path, job_lock_key_index_path, job_pending_path},
-        registry::{
-            keys::NamespaceKeys,
-            metadata_store::{
-                LinkKind,
-                access_time::{atime_client_suffix, atime_entry_name},
-            },
-        },
+        registry::{keys::NamespaceKeys, metadata_store::LinkKind},
     };
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -456,17 +455,12 @@ mod tests {
         let links = [
             LinkKind::Blob(digest_a()),
             LinkKind::Digest(digest_a()),
-            LinkKind::Layer(digest_a()),
-            LinkKind::Config(digest_a()),
             LinkKind::Tag(Tag::new("v1.0").unwrap()),
             LinkKind::Referrer {
                 subject: digest_b(),
                 referrer: digest_a(),
             },
-            LinkKind::Manifest {
-                index: digest_b(),
-                child: digest_a(),
-            },
+            LinkKind::ReferencedBy(digest_b()),
         ];
         for link in links {
             assert_eq!(
@@ -489,11 +483,30 @@ mod tests {
         );
     }
 
+    /// The per-role reference keys an older angos wrote no longer parse, so
+    /// scrub sees them as unknown and quarantines them rather than judging
+    /// them as references.
+    #[test]
+    fn a_per_role_reference_key_of_an_older_angos_is_unknown() {
+        let dir = digest_a().blob_ref_namespace_dir(&namespace());
+        for tail in [
+            "layer".to_string(),
+            "config".to_string(),
+            format!("idx.{}.{}", digest_b().algorithm(), digest_b().hash()),
+        ] {
+            assert_eq!(
+                categorize(&format!("{dir}/{tail}")),
+                KeyCategory::Unknown,
+                "the legacy '{tail}' key must be quarantined"
+            );
+        }
+    }
+
     #[test]
     fn tag_entry_and_atime_paths_round_trip() {
         let ns = Namespace::new("org/app").unwrap();
         let tag = Tag::new("v1.0").unwrap();
-        let key = ns.tag_entry_path(&tag, u64::MAX - 1, false, &digest_a());
+        let key = ns.tag_entry_path(&tag, epoch(), false, &digest_a());
         assert_eq!(
             categorize(&key),
             KeyCategory::TagEntry {
@@ -507,19 +520,23 @@ mod tests {
     fn atime_entry_paths_round_trip() {
         let ns = Namespace::new("org/app").unwrap();
         let tag = Tag::new("v1.0").unwrap();
-        let name = atime_entry_name(u64::MAX - 1, &atime_client_suffix("alice"));
+        let at = chrono::DateTime::UNIX_EPOCH;
+        let key = ns
+            .atime_entry_path(&LinkKind::Tag(tag.clone()), at, "alice")
+            .unwrap();
+        let name = key.rsplit_once('/').unwrap().1.to_string();
         assert_eq!(
-            categorize(&format!("{}/{name}", ns.tag_atime_entry_dir(&tag))),
+            categorize(&key),
             KeyCategory::TagAtimeEntry {
                 namespace: "org/app".to_string(),
                 tag: "v1.0".to_string(),
             }
         );
         assert_eq!(
-            categorize(&format!(
-                "{}/{name}",
-                ns.revision_atime_entry_dir(&digest_a())
-            )),
+            categorize(
+                &ns.atime_entry_path(&LinkKind::Digest(digest_a()), at, "alice")
+                    .unwrap()
+            ),
             KeyCategory::RevisionAtimeEntry {
                 namespace: "org/app".to_string(),
                 digest: digest_a(),
@@ -543,7 +560,7 @@ mod tests {
     fn tag_hist_paths_round_trip() {
         let ns = Namespace::new("org/app").unwrap();
         let tag = Tag::new("v1.0").unwrap();
-        let entry_key = ns.tag_entry_path(&tag, u64::MAX - 1, false, &digest_a());
+        let entry_key = ns.tag_entry_path(&tag, epoch(), false, &digest_a());
         let file = entry_key.rsplit_once('/').unwrap().1;
         assert_eq!(
             categorize(&ns.tag_hist_path(&tag, file)),

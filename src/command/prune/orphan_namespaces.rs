@@ -5,7 +5,7 @@
 use std::pin::pin;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tracing::{error, warn};
 
 use angos_oci::Namespace;
@@ -13,7 +13,9 @@ use angos_oci::Namespace;
 use crate::{
     command::maintenance::{Error, action::Action, executor::ActionSink},
     registry::{
-        blob_store::BlobStore, metadata_store::MetadataStore,
+        blob_store::BlobStore,
+        content_discovery::holds_manifest_content,
+        metadata_store::{LIST_PAGE, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
 };
@@ -35,10 +37,16 @@ pub async fn sweep_orphan_namespaces(
         return Ok(());
     }
 
-    for namespace in metadata_store.collect_namespaces(None).await? {
-        if resolver.resolve(&namespace).is_some() {
-            continue;
-        }
+    // Ownership is resolved in the walk, so a namespace a repository claims
+    // costs no content probe at all.
+    let unowned = |namespace: &Namespace| resolver.resolve(namespace).is_none();
+    let mut orphans = pin!(metadata_store.stream_namespaces(
+        None,
+        LIST_PAGE,
+        &unowned,
+        |namespace| holds_manifest_content(metadata_store, namespace)
+    ));
+    while let Some(namespace) = orphans.try_next().await? {
         if let Err(e) = clear_namespace(metadata_store, &namespace, sink).await {
             error!("prune: failed to clear orphan namespace '{namespace}': {e}");
         }
@@ -74,11 +82,11 @@ async fn clear_namespace(
         })
         .await?;
     }
-    let mut tags = pin!(metadata_store.stream_tags(namespace));
+    let mut tags = pin!(metadata_store.stream_live_tags(namespace, None));
     while let Some(tag) = tags.next().await {
         sink.apply(Action::DeleteTag {
             namespace: namespace.clone(),
-            tag: tag?,
+            tag: tag?.0,
             // The namespace belongs to no configured repository, so every tag
             // in it goes whatever it points at.
             target: None,

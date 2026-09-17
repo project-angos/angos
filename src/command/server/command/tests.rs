@@ -5,7 +5,9 @@ use std::{
 
 use tempfile::TempDir;
 
-use crate::metrics_provider::init_for_tests;
+use angos_docker_extension_service::CatalogRequest;
+use angos_secret::Secret;
+
 use crate::{
     command::{
         bootstrap,
@@ -17,6 +19,7 @@ use crate::{
         },
     },
     configuration::Configuration,
+    metrics_provider::init_for_tests,
     policy::{AccessMode, AccessPolicyConfig},
     registry::{
         Registry, RegistryConfig,
@@ -26,9 +29,6 @@ use crate::{
     },
     test_fixtures::client::test_client_config,
 };
-use angos_docker_extension_service::CatalogRequest;
-use angos_secret::Secret;
-
 static CRYPTO_INIT: Once = Once::new();
 
 fn init_crypto_provider() {
@@ -194,7 +194,6 @@ async fn test_build_registry_components_integration() {
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let metadata_store = bootstrap::metadata_store(
         &config.resolve_registry_storage(),
-        &auth_cache,
         config.global.namespace_walk_concurrency,
         config.global.gc_grace_secs,
         config.global.atime_audit_window_secs,

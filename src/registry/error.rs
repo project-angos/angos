@@ -61,7 +61,7 @@ pub enum Error {
     #[error("{0}")]
     ReplicationSuperseded(String),
     /// A `required`-policy webhook rejected or failed the event delivery; the
-    /// operation itself has already committed when this surfaces.
+    /// operation itself has already been written when this surfaces.
     #[error("event delivery failed: {0}")]
     EventDelivery(String),
     #[error("internal server error: {0}")]

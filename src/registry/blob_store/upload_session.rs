@@ -19,17 +19,15 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tracing::{instrument, warn};
 
 use angos_oci::{Algorithm, Digest, Namespace, UploadSessionId};
-use angos_storage::Error as StorageError;
-use angos_storage::paginated;
+use angos_storage::{Error as StorageError, paginated};
 
-use crate::registry::keys::{DigestKeys, NamespaceKeys, REPOS_ROOT};
 use crate::registry::{
     Error,
     blob_store::{
         BlobStore, UploadSummary,
-        hashing_reader::{HashingReader, hashing_stream},
-        resumable_hasher::{HashState, Hasher},
+        hashing::{HashState, Hasher, HashingReader, hashing_stream},
     },
+    keys::{DigestKeys, NamespaceKeys, REPOS_ROOT},
     pagination,
 };
 
@@ -153,7 +151,7 @@ impl BlobStore {
             &root,
             &prefix,
             "_uploads",
-            self.namespace_walk_concurrency,
+            self.namespace_walk_concurrency.get(),
             |path| async move {
                 let sub_prefixes = self.object.list_all_children(&path).await?.sub_prefixes;
                 Ok(sub_prefixes)

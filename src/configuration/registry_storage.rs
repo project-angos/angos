@@ -14,25 +14,10 @@ pub struct MetadataFsConfig {
     pub sync_to_disk: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct MetadataS3Config {
     #[serde(flatten)]
     pub connection: S3ConnectionConfig,
-    #[serde(default = "default_link_cache_ttl")]
-    pub link_cache_ttl: u64,
-}
-
-impl Default for MetadataS3Config {
-    fn default() -> Self {
-        Self {
-            connection: S3ConnectionConfig::default(),
-            link_cache_ttl: default_link_cache_ttl(),
-        }
-    }
-}
-
-fn default_link_cache_ttl() -> u64 {
-    30
 }
 
 /// Storage configuration shared by the metadata store and the job store, both
@@ -76,7 +61,6 @@ impl ResolvedStorageConfig {
             blob_store::BlobStoreConfig::S3(config) => {
                 ResolvedStorageConfig::S3(MetadataS3Config {
                     connection: config.connection.clone(),
-                    ..Default::default()
                 })
             }
         }
@@ -85,9 +69,10 @@ impl ResolvedStorageConfig {
 
 #[cfg(test)]
 mod tests {
+    use angos_secret::Secret;
+
     use super::*;
     use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
-    use angos_secret::Secret;
 
     #[test]
     fn test_from_blob_store_fs_copies_paths_and_sync() {
@@ -135,7 +120,8 @@ mod tests {
     }
 
     /// Flat TOML deserialises into a `MetadataS3Config` whose `connection`
-    /// carries the right values and whose own keys override their defaults.
+    /// carries the right values. The ignored keys of removed subsystems are
+    /// kept in the fixture: a config carrying them must still load.
     #[test]
     fn s3_backend_config_toml_round_trip() {
         let toml = r#"
@@ -156,7 +142,6 @@ mod tests {
         assert_eq!(cfg.connection.bucket, "meta-bucket");
         assert_eq!(cfg.connection.region, "eu-central-1");
         assert_eq!(cfg.connection.key_prefix, "_meta");
-        assert_eq!(cfg.link_cache_ttl, 60);
     }
 
     /// Regression: `region` must be required, matching the documented schema.

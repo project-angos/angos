@@ -349,19 +349,9 @@ copy limits without proxying blob bytes through Angos.
 
 When using S3 for metadata, Angos includes several optimizations to reduce round-trips and improve scalability:
 
-**Link cache**: A read-through cache for link metadata (tags, revisions, referrers). Populated on both read and write, and invalidated on delete by the instance that performed it, so the TTL is what bounds a stale entry elsewhere. Configurable TTL (default 30 s, `link_cache_ttl = 0` to disable), and it applies to every kind: nothing is pinned for longer. Shares the same cache backend (in-memory or Redis) as authentication tokens.
-
-In single-instance deployments, in-memory cache is sufficient. In multi-instance deployments, each instance maintains its own in-memory cache, so a write on instance A is not visible to instance B until the TTL expires. For consistency, use a shared Redis cache: when instance A writes a tag, all instances see the updated entry immediately.
-
 **Access time updates**: A recording pull appends one write-once entry under the target's `!atime/` directory, named newest-first (inverted-millisecond ordinal plus a short hash of the client identity) with a JSON body carrying the authenticated client and the RFC3339 pull time, so access times double as a rolling audit log. Readers stay O(1): retention and the namespace listings read only the newest entry. Scrub always keeps each target's newest entry (retention needs the last access durably) and collects superseded entries older than the audit window, which `[global] atime_audit_window_secs` sets (default 3600).
 
 The stamp is written inline: every stamped pull is one extra storage write, and same-millisecond stamps never contend (distinct clients land as distinct entries; a same-client repeat dedupes by key). Entries accumulate between scrub sweeps proportional to distinct-client pull volume, bounded by the collection window; readers stay O(1) regardless. Disable `update_pull_time` if retention does not need last-pull times.
-
-```toml
-[metadata_store.s3]
-# ... S3 connection options
-link_cache_ttl = 30               # seconds (0 to disable)
-```
 
 For retention policies that use `last_pulled_at`, set thresholds in **days rather than minutes**:
 
@@ -421,9 +411,8 @@ Mid-flight failures or out-of-band edits can leave stale entries pointing to
 namespaces that do not exist.
 
 Periodic `angos scrub` probes every reference key against the record backing
-it, bypassing the link cache so a stale cache entry cannot mask a repair. Keys
-whose backing is confirmed gone are removed. This
-convergence is part of every scrub run. Entries that reference a blob whose
+it. Keys whose backing is confirmed gone are removed. This convergence is part
+of every scrub run. Entries that reference a blob whose
 backing bytes are absent are left alone: they usually belong to an in-flight
 upload or a lazily filled pull-through cache entry.
 

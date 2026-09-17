@@ -32,7 +32,7 @@ impl Validator {
             }
             Err(e) => return Err(e.into()),
         };
-        if index.namespace.is_empty() {
+        if index.is_empty() {
             return self.reclaim_orphan_blob(digest).await;
         }
         // Referenced: per-entry link probing is the reference pass's job, and
@@ -60,7 +60,7 @@ impl Validator {
         let young = object_younger_than_grace(
             self.blob_store.object_store().as_ref(),
             &digest.blob_path(),
-            self.metadata_store.gc_grace_secs(),
+            self.metadata_store.gc_grace_secs,
         )
         .await
         .map_err(RegistryError::from)?;

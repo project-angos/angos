@@ -286,13 +286,10 @@ impl ReplicationJobHandler {
         namespace: &Namespace,
         target: &ReplicationTarget,
     ) -> Result<Option<(Digest, Option<DateTime<Utc>>)>, Error> {
-        // Reads bypass the per-process link cache: a worker's cache can lag a
-        // sibling process's write, and a stale resolve would replicate the old
-        // digest and complete the job.
         if let Some(tag) = &target.tag {
             match self
                 .metadata_store
-                .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
+                .read_link(namespace, &LinkKind::Tag(tag.clone()))
                 .await
             {
                 Ok(link) => Ok(Some((link.target, link.created_at))),
@@ -310,7 +307,7 @@ impl ReplicationJobHandler {
             // A content-addressed digest carries no local version timestamp.
             match self
                 .metadata_store
-                .read_link_reference(namespace, &LinkKind::Digest(digest.clone()))
+                .read_link(namespace, &LinkKind::Digest(digest.clone()))
                 .await
             {
                 Ok(_) => Ok(Some((digest, None))),

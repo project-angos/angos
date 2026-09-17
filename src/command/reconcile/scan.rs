@@ -17,8 +17,7 @@ use crate::{
         maintenance::{
             Error,
             action::Action,
-            check,
-            check::NamespaceChecker,
+            check::{self, NamespaceChecker},
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
         },
     },
@@ -120,9 +119,10 @@ mod tests {
     use crate::{
         command::maintenance::{action::Action, check::NamespaceChecker},
         registry::{
-            metadata_store::{LinkKind, LinkOperation},
+            metadata_store::LinkKind,
             test_utils::{
-                fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
+                fs_test_stack, repository_with_replication, seed_links, seed_manifest,
+                single_repo_resolver,
             },
         },
     };
@@ -148,17 +148,13 @@ mod tests {
         let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
         // The walk is over revision records, which the seed helper leaves to
         // the push path.
-        stack
-            .metadata_store
-            .update_links(
-                &namespace,
-                &[LinkOperation::create(
-                    LinkKind::Digest(image.clone()),
-                    image.clone(),
-                )],
-            )
-            .await
-            .unwrap();
+        seed_links(
+            &stack.metadata_store,
+            &namespace,
+            &[(LinkKind::Digest(image.clone()), image.clone())],
+        )
+        .await
+        .unwrap();
 
         let mut repository = repository_with_replication("apps", Vec::new());
         repository.scan = true;

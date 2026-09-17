@@ -87,7 +87,7 @@ pub struct GlobalConfig {
     /// Concurrent directory scans a catalog / upload-namespace walk keeps in
     /// flight, hiding per-request backend latency on S3.
     #[serde(default = "default_namespace_walk_concurrency")]
-    pub namespace_walk_concurrency: usize,
+    pub namespace_walk_concurrency: NonZeroUsize,
     /// Reclamation grace period in seconds: scrub leaves unreferenced blobs,
     /// dangling reference keys and stale index entries younger than this alone,
     /// so it cannot race an in-flight push or upload. Lower it only for offline
@@ -111,7 +111,7 @@ fn default_shutdown_drain_secs() -> u64 {
     30
 }
 
-fn default_namespace_walk_concurrency() -> usize {
+fn default_namespace_walk_concurrency() -> NonZeroUsize {
     NAMESPACE_WALK_CONCURRENCY
 }
 

@@ -13,9 +13,10 @@ use crate::{
     event_webhook::event::{Event, EventActor},
     registry::{
         Error, Registry,
-        blob_ownership::{GrantOutcome, promote_and_grant},
+        blob_ownership::{GrantOutcome, grant_existing, promote_and_grant},
         blob_store::{
-            hashing_reader::HashingReader, resumable_hasher::Hasher, upload_session::HashStart,
+            hashing::{Hasher, HashingReader},
+            upload_session::HashStart,
         },
     },
 };
@@ -76,11 +77,7 @@ impl Registry {
         // The pre-existing bytes may be old, so the guarded grant catches a
         // mid-flight reclaim. The body is already drained, so neither miss may
         // fall through to a fresh write; both surface as retryable conflicts.
-        match self
-            .metadata_store()
-            .grant_existing(&self.blob_store, namespace, digest)
-            .await?
-        {
+        match grant_existing(&self.blob_store, self.metadata_store(), namespace, digest).await? {
             GrantOutcome::Granted => Ok(true),
             GrantOutcome::BytesAbsent => Err(Error::ReclamationInProgress(
                 "blob bytes were reclaimed during upload; retry".to_string(),
@@ -126,10 +123,13 @@ impl Registry {
             return Ok(None);
         }
 
-        match self
-            .metadata_store()
-            .grant_existing(&self.blob_store, namespace, &mount.digest)
-            .await?
+        match grant_existing(
+            &self.blob_store,
+            self.metadata_store(),
+            namespace,
+            &mount.digest,
+        )
+        .await?
         {
             GrantOutcome::Granted => Ok(Some(mount.digest.clone())),
             // Vanished or reclaiming bytes both degrade to a fresh session.
@@ -1286,7 +1286,7 @@ mod tests {
                 .read_blob_index(&expected_digest)
                 .await
                 .unwrap();
-            let namespace_links = blob_index.namespace.get(namespace).unwrap();
+            let namespace_links = blob_index.get(namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(expected_digest.clone())));
         })
         .await;

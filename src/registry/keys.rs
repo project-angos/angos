@@ -6,9 +6,136 @@
 
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
+
 use angos_oci::{Algorithm, Digest, Namespace, Tag, UploadSessionId};
 
 use crate::registry::metadata_store::LinkKind;
+
+/// The reference-key tail after `<ns>!`. Digest-bearing kinds omit the blob's
+/// own digest and spell out only the foreign one: a referrer entry names its
+/// subject, a per-referrer entry the manifest that references the blob.
+/// [`DigestKeys::parse_blob_ref_entry`] inverts it.
+fn ref_tail(link: &LinkKind) -> String {
+    match link {
+        LinkKind::Blob(_) => "own".to_string(),
+        LinkKind::Digest(_) => "r/rev".to_string(),
+        LinkKind::Tag(tag) => format!("r/tag.{tag}"),
+        LinkKind::Referrer { subject, .. } => {
+            format!("r/sub.{}.{}", subject.algorithm(), subject.hash())
+        }
+        LinkKind::ReferencedBy(referrer) => {
+            format!("r/{}.{}", referrer.algorithm(), referrer.hash())
+        }
+    }
+}
+
+/// One tag entry, decoded from its key name: what the entry records, plus the
+/// ordinal that orders and groups entries straight off a listing and the stamp
+/// that ordinal encodes.
+#[derive(Debug, Eq, PartialEq)]
+pub enum TagEntry {
+    /// A push: the tag points at `digest`.
+    Set {
+        ord: u64,
+        authored_at: Option<DateTime<Utc>>,
+        digest: Digest,
+    },
+    /// A delete: the tag holds nothing, and `held` names the digest it pointed
+    /// at, which tag history requires a tombstone to carry.
+    Deletion {
+        ord: u64,
+        authored_at: Option<DateTime<Utc>>,
+        held: Digest,
+    },
+}
+
+impl TagEntry {
+    /// The inverted-millis ordinal, which orders entries newest-first and
+    /// groups the ones authored in the same millisecond.
+    #[must_use]
+    pub fn ord(&self) -> u64 {
+        match self {
+            TagEntry::Set { ord, .. } | TagEntry::Deletion { ord, .. } => *ord,
+        }
+    }
+
+    /// The stamp the ordinal encodes; `None` for an ordinal outside the range
+    /// a writer produces.
+    #[must_use]
+    pub fn authored_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            TagEntry::Set { authored_at, .. } | TagEntry::Deletion { authored_at, .. } => {
+                *authored_at
+            }
+        }
+    }
+
+    /// The digest the entry names: the tag's target, or what a delete ended.
+    #[must_use]
+    pub fn digest(&self) -> &Digest {
+        match self {
+            TagEntry::Set { digest, .. } => digest,
+            TagEntry::Deletion { held, .. } => held,
+        }
+    }
+}
+
+impl FromStr for TagEntry {
+    /// Nothing to report: a caller skips or quarantines the key, and a
+    /// listing parses every name it walks, so the rejection must not
+    /// allocate.
+    type Err = ();
+
+    /// Decode one entry file of [`NamespaceKeys::tag_entry_dir`].
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let mut parts = name.splitn(4, '.');
+        let (Some(ord), Some(kind), Some(algorithm), Some(hash)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(());
+        };
+        if ord.len() != 16 {
+            return Err(());
+        }
+        let ord = u64::from_str_radix(ord, 16).map_err(|_| ())?;
+        // No stamp for an ordinal outside the band a writer produces, such as
+        // the `u64::MAX` an angos before 1.9.0 wrote for an entry converted
+        // from a stamp-less link: those sort last and never win resolution.
+        let authored_at = (u64::MAX - 1)
+            .checked_sub(ord)
+            .and_then(|millis| i64::try_from(millis).ok())
+            .and_then(DateTime::from_timestamp_millis);
+        let algorithm = Algorithm::from_str(algorithm).map_err(|_| ())?;
+        let digest = Digest::with_algorithm(algorithm, hash).map_err(|_| ())?;
+        match kind {
+            "set" => Ok(TagEntry::Set {
+                ord,
+                authored_at,
+                digest,
+            }),
+            "del" => Ok(TagEntry::Deletion {
+                ord,
+                authored_at,
+                held: digest,
+            }),
+            _ => Err(()),
+        }
+    }
+}
+
+/// The stamp time one entry file of an atime directory records. `None` = not a
+/// shape this version writes.
+pub fn parse_atime_entry(name: &str) -> Option<DateTime<Utc>> {
+    let (ord, suffix) = name.split_once('.')?;
+    if ord.len() != 16 || suffix.len() != 8 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (u64::MAX - 1)
+        .checked_sub(u64::from_str_radix(ord, 16).ok()?)
+        .and_then(|millis| i64::try_from(millis).ok())
+        .and_then(DateTime::from_timestamp_millis)
+}
 
 /// The store roots. They live together because the maintenance walk matches
 /// all six in one dispatch.
@@ -108,7 +235,7 @@ impl DigestKeys for Digest {
     }
 
     fn blob_ref_path(&self, namespace: &Namespace, link: &LinkKind) -> String {
-        format!("{}/{namespace}!{}", self.blob_ref_dir(), link.ref_entry())
+        format!("{}/{namespace}!{}", self.blob_ref_dir(), ref_tail(link))
     }
 
     fn blob_ref_own_path(&self, namespace: &Namespace) -> String {
@@ -129,32 +256,22 @@ impl DigestKeys for Digest {
     }
 
     fn parse_blob_ref_entry(&self, entry: &str) -> Option<LinkKind> {
-        match entry {
-            "rev" => Some(LinkKind::Digest(self.clone())),
-            "layer" => Some(LinkKind::Layer(self.clone())),
-            "config" => Some(LinkKind::Config(self.clone())),
-            _ => {
-                if let Some(tag) = entry.strip_prefix("tag.") {
-                    Some(LinkKind::Tag(Tag::new(tag).ok()?))
-                } else if let Some(subject) = entry.strip_prefix("sub.") {
-                    Some(LinkKind::Referrer {
-                        subject: parse_ref_digest(subject)?,
-                        referrer: self.clone(),
-                    })
-                } else if let Some(index) = entry.strip_prefix("idx.") {
-                    Some(LinkKind::Manifest {
-                        index: parse_ref_digest(index)?,
-                        child: self.clone(),
-                    })
-                } else {
-                    // A bare `<algo>.<hash>` names the referring manifest,
-                    // unambiguous against the prefixed shapes because no
-                    // algorithm is named `rev`, `layer`, `config`, `tag`,
-                    // `sub`, or `idx`.
-                    Some(LinkKind::ReferencedBy(parse_ref_digest(entry)?))
-                }
-            }
+        if entry == "rev" {
+            return Some(LinkKind::Digest(self.clone()));
         }
+        if let Some(tag) = entry.strip_prefix("tag.") {
+            return Some(LinkKind::Tag(Tag::new(tag).ok()?));
+        }
+        if let Some(subject) = entry.strip_prefix("sub.") {
+            return Some(LinkKind::Referrer {
+                subject: parse_ref_digest(subject)?,
+                referrer: self.clone(),
+            });
+        }
+        // A bare `<algo>.<hash>` names the referring manifest, unambiguous
+        // against the prefixed shapes because no algorithm is named `rev`,
+        // `tag` or `sub`.
+        Some(LinkKind::ReferencedBy(parse_ref_digest(entry)?))
     }
 }
 
@@ -189,7 +306,13 @@ pub trait NamespaceKeys {
     /// author's unix-millisecond timestamp so entries list newest first, and
     /// `<kind>` is `set` or `del` (a deletion still names the digest the tag
     /// held, which tag history requires).
-    fn tag_entry_path(&self, tag: &Tag, ord: u64, deletion: bool, digest: &Digest) -> String;
+    fn tag_entry_path(
+        &self,
+        tag: &Tag,
+        authored_at: DateTime<Utc>,
+        deletion: bool,
+        digest: &Digest,
+    ) -> String;
 
     /// One tag's demoted entry, under a `!`-terminated history directory. It
     /// keeps its [`NamespaceKeys::tag_entry_path`] file name, so history stays
@@ -203,6 +326,19 @@ pub trait NamespaceKeys {
 
     /// Directory holding one revision's append-only access entries.
     fn revision_atime_entry_dir(&self, digest: &Digest) -> String;
+
+    /// The directory holding `link`'s access entries. Only tags and revisions
+    /// are pull-tracked, so every other kind has none.
+    fn atime_dir(&self, link: &LinkKind) -> Option<String>;
+
+    /// The access entry a pull of `link` at `at` by `client` records, named
+    /// `<ord>.<suffix>`: `<ord>` is the same inverted-millis ordinal a tag
+    /// entry carries, so entries list newest first, and `<suffix>` is the
+    /// first 8 hex of the client identity's sha256, so two clients stamping in
+    /// the same millisecond land on distinct entries instead of one
+    /// overwriting the other's audit record. `None` for a kind that is not
+    /// pull-tracked.
+    fn atime_entry_path(&self, link: &LinkKind, at: DateTime<Utc>, client: &str) -> Option<String>;
 
     /// The namespace's catalog index key: empty, write-once, one per
     /// namespace. The `!` terminator is what lets `a` and `a/b` coexist on FS
@@ -249,8 +385,16 @@ impl NamespaceKeys for Namespace {
         format!("{}/{tag}!", self.tag_entries_root())
     }
 
-    fn tag_entry_path(&self, tag: &Tag, ord: u64, deletion: bool, digest: &Digest) -> String {
+    fn tag_entry_path(
+        &self,
+        tag: &Tag,
+        authored_at: DateTime<Utc>,
+        deletion: bool,
+        digest: &Digest,
+    ) -> String {
         let kind = if deletion { "del" } else { "set" };
+        // Inverted millis, so a listing yields the newest entry first.
+        let ord = u64::MAX - 1 - authored_at.timestamp_millis().max(0).unsigned_abs();
         format!(
             "{}/{ord:016x}.{kind}.{}.{}",
             self.tag_entry_dir(tag),
@@ -265,6 +409,24 @@ impl NamespaceKeys for Namespace {
 
     fn tag_atime_entry_dir(&self, tag: &Tag) -> String {
         format!("{NS_ROOT}/{self}!atime/tag/{tag}!")
+    }
+
+    fn atime_dir(&self, link: &LinkKind) -> Option<String> {
+        match link {
+            LinkKind::Tag(tag) => Some(self.tag_atime_entry_dir(tag)),
+            LinkKind::Digest(digest) => Some(self.revision_atime_entry_dir(digest)),
+            _ => None,
+        }
+    }
+
+    fn atime_entry_path(&self, link: &LinkKind, at: DateTime<Utc>, client: &str) -> Option<String> {
+        let identity = Digest::sha256_of_bytes(client.as_bytes());
+        let ord = u64::MAX - 1 - at.timestamp_millis().max(0).unsigned_abs();
+        Some(format!(
+            "{}/{ord:016x}.{}",
+            self.atime_dir(link)?,
+            &identity.hash()[..8]
+        ))
     }
 
     fn revision_atime_entry_dir(&self, digest: &Digest) -> String {
@@ -346,13 +508,109 @@ pub fn namespace_dir(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::DateTime;
+    use chrono::{DateTime, TimeDelta};
 
-    use crate::registry::{keys::*, metadata_store::tag_ord};
+    use crate::registry::keys::*;
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const HASH_512: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    /// The name an entry key carries encodes its stamp at millisecond
+    /// precision, and an ordinal outside the band a writer produces reads as
+    /// no stamp while sorting after every real one.
+    #[test]
+    fn an_entry_name_encodes_its_stamp_and_a_foreign_ordinal_reads_as_none() {
+        let namespace = Namespace::new("org/app").unwrap();
+        let tag = Tag::new("v1.0").unwrap();
+        let digest = Digest::sha256(HASH_A).unwrap();
+        let at = DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
+
+        let entry_name = |at| {
+            namespace
+                .tag_entry_path(&tag, at, false, &digest)
+                .rsplit_once('/')
+                .unwrap()
+                .1
+                .to_string()
+        };
+        let name = entry_name(at);
+        assert_eq!(name.parse::<TagEntry>().unwrap().authored_at(), Some(at));
+
+        // Sub-millisecond precision is not encoded, so a stamp truncates to
+        // the same name.
+        assert_eq!(entry_name(at + TimeDelta::microseconds(400)), name);
+
+        let foreign = format!(
+            "{:016x}.set.{}.{}",
+            u64::MAX,
+            digest.algorithm(),
+            digest.hash()
+        );
+        assert_eq!(
+            foreign.parse::<TagEntry>().unwrap().authored_at(),
+            None,
+            "the ordinal an angos before 1.9.0 wrote for a stamp-less entry"
+        );
+        assert!(
+            foreign > entry_name(DateTime::from_timestamp_millis(0).unwrap()),
+            "such an entry must sort after a real epoch one"
+        );
+    }
+
+    #[test]
+    fn entry_names_round_trip_through_the_parser() {
+        let namespace = Namespace::new("org/app").unwrap();
+        let tag = Tag::new("v1.0").unwrap();
+        let digest = Digest::sha256(HASH_A).unwrap();
+        let at = DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
+
+        for deletion in [false, true] {
+            let key = namespace.tag_entry_path(&tag, at, deletion, &digest);
+            let (_, name) = key.rsplit_once('/').unwrap();
+            let parsed = name.parse::<TagEntry>().expect("entry must parse");
+            let expected = if deletion {
+                TagEntry::Deletion {
+                    ord: parsed.ord(),
+                    authored_at: Some(at),
+                    held: digest.clone(),
+                }
+            } else {
+                TagEntry::Set {
+                    ord: parsed.ord(),
+                    authored_at: Some(at),
+                    digest: digest.clone(),
+                }
+            };
+            assert_eq!(
+                name.parse::<TagEntry>(),
+                Ok(expected),
+                "entry {name:?} must round-trip"
+            );
+        }
+
+        // Same millisecond, different digests: distinct keys, both parseable.
+        let other = Digest::sha256(HASH_B).unwrap();
+        assert_ne!(
+            namespace.tag_entry_path(&tag, at, false, &digest),
+            namespace.tag_entry_path(&tag, at, false, &other)
+        );
+    }
+
+    #[test]
+    fn foreign_entry_names_do_not_parse() {
+        for name in [
+            "",
+            &format!("{:016x}.set.sha256", 1_u64),
+            &format!("{:08x}.set.sha256.{HASH_A}", 1_u64),
+            &format!("{:016x}.mov.sha256.{HASH_A}", 1_u64),
+            &format!("{:016x}.set.sha3.{HASH_A}", 1_u64),
+            &format!("{:016x}.set.sha256.{}", 1_u64, "z".repeat(64)),
+            &format!("{:016x}.set.sha256.{HASH_A}.extra", 1_u64),
+        ] {
+            assert!(name.parse::<TagEntry>().is_err(), "name {name:?}");
+        }
+    }
 
     #[test]
     fn test_blob_paths() {
@@ -429,7 +687,12 @@ mod tests {
         let ns = Namespace::new("org/app").unwrap();
         let tag = Tag::new("v1").unwrap();
         let digest = Digest::sha256(HASH_A).unwrap();
-        let entry_key = ns.tag_entry_path(&tag, 7, true, &digest);
+        let entry_key = ns.tag_entry_path(
+            &tag,
+            DateTime::from_timestamp_millis(7).unwrap(),
+            true,
+            &digest,
+        );
         let file = entry_key.rsplit_once('/').unwrap().1;
         let hist_key = ns.tag_hist_path(&tag, file);
         assert_eq!(hist_key, format!("v2/ns/org/app!hist/v1!/{file}"));
@@ -443,8 +706,8 @@ mod tests {
         let older = DateTime::from_timestamp_millis(1_000_000).unwrap();
         let newer = DateTime::from_timestamp_millis(2_000_000).unwrap();
 
-        let older_key = ns.tag_entry_path(&tag, tag_ord(Some(older)), false, &digest);
-        let newer_key = ns.tag_entry_path(&tag, tag_ord(Some(newer)), true, &digest);
+        let older_key = ns.tag_entry_path(&tag, older, false, &digest);
+        let newer_key = ns.tag_entry_path(&tag, newer, true, &digest);
         assert!(
             newer_key < older_key,
             "a newer entry must sort before an older one"
@@ -471,16 +734,10 @@ mod tests {
         let links = [
             LinkKind::Blob(digest.clone()),
             LinkKind::Digest(digest.clone()),
-            LinkKind::Layer(digest.clone()),
-            LinkKind::Config(digest.clone()),
             LinkKind::Tag(Tag::new("v1.2-rc.1_x").unwrap()),
             LinkKind::Referrer {
                 subject: other.clone(),
                 referrer: digest.clone(),
-            },
-            LinkKind::Manifest {
-                index: other.clone(),
-                child: digest.clone(),
             },
             LinkKind::ReferencedBy(other.clone()),
         ];
@@ -504,10 +761,9 @@ mod tests {
             digest.blob_ref_own_path(&ns),
             digest.blob_ref_path(&ns, &LinkKind::Blob(digest.clone()))
         );
-        let layer_key = digest.blob_ref_path(&ns, &LinkKind::Layer(digest.clone()));
         assert_eq!(
-            layer_key,
-            format!("{}/layer", digest.blob_ref_namespace_dir(&ns))
+            digest.blob_ref_path(&ns, &LinkKind::Digest(digest.clone())),
+            format!("{}/rev", digest.blob_ref_namespace_dir(&ns))
         );
     }
 

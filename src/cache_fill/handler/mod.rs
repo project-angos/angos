@@ -1,5 +1,5 @@
 //! [`CacheFillJobHandler`]: the [`JobHandler`] that fills the pull-through
-//! blob cache. Bytes and grants commit on their own stores, so the fill must
+//! blob cache. Bytes and grants land on their own stores, so the fill must
 //! stay idempotent under the at-least-once queue contract.
 
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use crate::{
     jobs::Queue,
     jobs::store::{Error, JobEnvelope, JobHandler},
     registry::{
-        Error as RegistryError, blob::cache_blob, blob_ownership::GrantOutcome,
+        Error as RegistryError, blob::cache_blob, blob_ownership, blob_ownership::GrantOutcome,
         blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
@@ -118,10 +118,13 @@ impl CacheFillJobHandler {
         // grant falls through to the fetch, whose fresh bytes are grace-protected.
         let granted = match self.blob_store.size(digest).await {
             Ok(_) => {
-                self.metadata_store
-                    .as_ref()
-                    .grant_existing(&self.blob_store, namespace, digest)
-                    .await?
+                blob_ownership::grant_existing(
+                    &self.blob_store,
+                    &self.metadata_store,
+                    namespace,
+                    digest,
+                )
+                .await?
                     == GrantOutcome::Granted
             }
             Err(RegistryError::BlobUnknown | RegistryError::NotFound) => false,
