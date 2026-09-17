@@ -21,7 +21,6 @@ use angos_storage::Page;
 use crate::registry::{
     Error, Registry, Repository,
     metadata_store::{LinkKind, MetadataStore},
-    pagination,
 };
 
 /// Whether the catalog names `namespace` as a repository: it holds at least
@@ -153,9 +152,9 @@ impl Registry {
 
     /// One page of the request's subject referrers as a sorted descriptor list,
     /// where `upstream` is the pull-through repository whose referrers join the
-    /// local ones. The page is cut over the candidate digests, so a filter that
-    /// drops entries yields a shorter page while the continuation token still
-    /// names where to resume.
+    /// local ones. The page holds a full page of matches whenever that many
+    /// remain: candidates resolve until it is filled, so a filter dropping a
+    /// long stretch costs reads rather than a short page.
     ///
     /// Merging needs both listings whole, so every page re-enumerates the
     /// upstream in full: walking a subject costs one upstream enumeration per
@@ -191,34 +190,71 @@ impl Registry {
             .collect();
         candidates.sort();
 
-        let page =
-            pagination::paginate_sorted(&candidates, DEFAULT_PAGE_SIZE, request.last.as_deref());
+        // The candidates past the cursor, in the order their digests sort.
+        let start = request.last.as_deref().map_or(0, |last| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.to_string().as_str() > last)
+                .unwrap_or(candidates.len())
+        });
+        let remaining = &candidates[start..];
+
         // A candidate the local index does not hold is already resolved, its
         // descriptor having come with it.
         let (local, described) = (&local, &described);
-        let mut referrers: Vec<Descriptor> = stream::iter(page.items)
-            .map(async |manifest_digest| {
-                if local.contains(&manifest_digest) {
-                    return self
-                        .resolve_referrer_descriptor(
-                            namespace,
-                            digest,
-                            manifest_digest,
-                            artifact_type,
-                        )
-                        .await;
-                }
-                described.get(&manifest_digest).cloned()
-            })
-            .buffer_unordered(REFERRER_RESOLVE_CONCURRENCY)
-            .filter_map(|descriptor| async move { descriptor })
-            .collect()
-            .await;
+        let page_size = usize::from(DEFAULT_PAGE_SIZE);
+        let mut referrers: Vec<Descriptor> = Vec::new();
+        let mut consumed = 0usize;
+        let mut last_consumed: Option<&Digest> = None;
+        // A local candidate's artifact type is only known once its descriptor
+        // is resolved, so the page fills as they resolve rather than being cut
+        // over the candidates first, which would answer short while matches
+        // remain. Resolution is batched a page at a time to bound the reads an
+        // unmatched stretch costs.
+        for chunk in remaining.chunks(page_size) {
+            let resolved: Vec<Option<Descriptor>> = stream::iter(chunk.to_vec())
+                .map(async |manifest_digest| {
+                    if local.contains(&manifest_digest) {
+                        return self
+                            .resolve_referrer_descriptor(
+                                namespace,
+                                digest,
+                                manifest_digest,
+                                artifact_type,
+                            )
+                            .await;
+                    }
+                    described.get(&manifest_digest).cloned()
+                })
+                .buffered(REFERRER_RESOLVE_CONCURRENCY)
+                .collect()
+                .await;
 
-        referrers.sort_by(|a, b| a.digest.cmp(&b.digest));
+            for (candidate, descriptor) in chunk.iter().zip(resolved) {
+                if referrers.len() == page_size {
+                    break;
+                }
+                consumed += 1;
+                last_consumed = Some(candidate);
+                if let Some(descriptor) = descriptor {
+                    referrers.push(descriptor);
+                }
+            }
+            if referrers.len() == page_size {
+                break;
+            }
+        }
+
+        // The cursor names the last candidate consumed rather than the last
+        // served, so a stretch the filter dropped is not walked a second time.
+        let next_token = match last_consumed {
+            Some(candidate) if consumed < remaining.len() => Some(candidate.to_string()),
+            _ => None,
+        };
+
         Ok(Page {
             items: referrers,
-            next_token: page.next_token,
+            next_token,
         })
     }
 
@@ -1223,6 +1259,64 @@ mod tests {
         assert_eq!(
             served, expected,
             "paging must visit every referrer exactly once, in digest order"
+        );
+    }
+
+    /// A filter that drops a whole page's worth of candidates must not answer
+    /// with a short page while matches remain: the walk carries on past them.
+    #[tokio::test]
+    async fn filtered_referrer_pages_fill_past_what_the_filter_drops() {
+        let case = FSRegistryTestCase::with_split_backends();
+        let registry = case.registry();
+        let wanted = "application/vnd.wanted";
+
+        // Enough that the dropped stretch alone covers a full page, so a page
+        // cut over the candidates would answer with nothing at all.
+        let dropped = usize::from(DEFAULT_PAGE_SIZE);
+        let matching = 50;
+        let mut digests: Vec<Digest> = (0..dropped + matching)
+            .map(|index| Digest::sha256_of_bytes(index.to_le_bytes()))
+            .collect();
+        digests.sort_by_key(ToString::to_string);
+
+        let mut expected = Vec::new();
+        for (position, digest) in digests.iter().enumerate() {
+            let artifact_type = if position < dropped {
+                "application/vnd.other"
+            } else {
+                expected.push(digest.to_string());
+                wanted
+            };
+            create_referrer_link(
+                &registry.metadata_store,
+                &referrer_namespace(),
+                digest,
+                Some(descriptor_with(Some(artifact_type), digest)),
+            )
+            .await;
+        }
+
+        let page = registry
+            .list_referrers(
+                None,
+                &GetReferrersRequest {
+                    namespace: referrer_namespace(),
+                    digest: subject(),
+                    artifact_type: Some(media_type(wanted)),
+                    last: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let served: Vec<String> = page.items.iter().map(|d| d.digest.to_string()).collect();
+        assert_eq!(
+            served, expected,
+            "the page must hold every match, not stop at the dropped stretch"
+        );
+        assert!(
+            page.next_token.is_none(),
+            "nothing remains after the last match, so no next page is advertised"
         );
     }
 

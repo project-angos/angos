@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A filtered referrers listing now serves a full page whenever that many matches remain, where the page was cut over the candidates before the `artifactType` filter ran: a subject whose first hundred referrers were all of another type answered with an empty page, leaving a client that stops on one to miss every match behind it.
 - The `_angos/repositories/list` and `_angos/namespaces/list` listings are now filtered by access policy, as the catalog already was: each serves a repository only while it holds a namespace the caller could list tags under, and `namespace_count` counts those alone, so a repository whose policy denies the caller is neither listed nor distinguishable from an empty or unconfigured one, which both now answer `404 NAME_UNKNOWN` as well. A global rule allowing `list-` actions previously exposed every repository, its namespace names and their tag and manifest counts to any caller it admitted. A configured repository is no longer listed before it holds content the caller may see.
 - A tag push or delete landing in the same millisecond as the entry it supersedes now wins resolution, where the entry key's millisecond precision left the two tied and the tag decided by digest order instead: a re-point could leave the tag on the older digest, and a delete could answer `202` with the tag still live.
 
