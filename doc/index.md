@@ -23,6 +23,7 @@ Step-by-step instructions for specific tasks:
 - [Configure GitHub Actions OIDC](how-to/configure-github-actions-oidc.md)
 - [Push from GitHub Actions](how-to/push-from-github-actions.md)
 - [Configure OIDC](how-to/configure-generic-oidc.md)
+- [Configure Kubernetes OIDC](how-to/configure-kubernetes-oidc.md)
 
 ### Policies
 - [Set Up Access Control](how-to/set-up-access-control.md)
@@ -41,6 +42,7 @@ Step-by-step instructions for specific tasks:
 - [Run Storage Maintenance](how-to/run-storage-maintenance.md)
 - [Enable Durable Cache Jobs](how-to/durable-cache-jobs.md)
 - [Enable the Web UI](how-to/enable-web-ui.md)
+- [Explore Image Filesystems](how-to/explore-image-filesystems.md)
 - [Upgrade](how-to/upgrade.md)
 - [Troubleshoot Common Issues](how-to/troubleshoot-common-issues.md)
 
@@ -76,11 +78,12 @@ Conceptual explanations and architecture:
 - **Retention policies**: Automated cleanup with flexible rules
 - **Immutable tags**: Protect releases from overwrites
 - **mTLS support**: Client certificate authentication
-- **OIDC authentication**: GitHub Actions, Google, Okta, and more
+- **OIDC authentication**: GitHub Actions, Kubernetes, Google, Okta, and more
 - **Token service**: Exchange a client credential for a registry-signed bearer token
 - **Event webhooks**: Notify external systems with required, optional, or async delivery
+- **Vulnerability scanning**: Reports from Grype or Trivy, attached to the image as referrers
 - **Online maintenance**: scrub and prune run alongside the live server, without downtime
-- **Web UI**: Browse and manage images visually
+- **Web UI**: Browse and manage images visually, sign in with OIDC, and walk an image's layer filesystem
 
 ## Getting Help
 

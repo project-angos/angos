@@ -18,6 +18,16 @@ url = "http://127.0.0.1:8901"    # the scanner service below
 [ui]
 enabled = true
 
+# Puts the Sign in button in the top bar, which the UI shows only when a
+# provider is configured. The issuer is never reached: nothing here signs in.
+[ui.oidc]
+provider = "dex"
+client_id = "angos-ui"
+
+[auth.oidc.dex]
+issuer = "http://127.0.0.1:5556"
+required_audience = "angos-ui"
+
 # The browser pulls as admin and generate.sh as ci-runner, so the Pull History
 # tab names its clients. Both passwords are "test".
 [auth.identity.admin]
