@@ -19,6 +19,7 @@ use crate::{
     },
     registry::{
         Error as RegistryError,
+        content_discovery::holds_manifest_content,
         manifest::referenced_digests,
         metadata_store::{AccessEntry, LinkKind},
     },
@@ -362,6 +363,35 @@ impl Validator {
             namespace: namespace.clone(),
         })
         .await
+    }
+
+    /// A catalog index key is live only while its namespace holds a revision
+    /// or a tag. An emptied namespace's key is reaped once past the grace
+    /// window, so the admin listings stop naming it. A push landing in the
+    /// meantime rewrites the key, and a race against that is repaired by the
+    /// next run's `ensure_catalog`.
+    pub async fn validate_catalog_index(&self, namespace_raw: &str) -> Result<(), Error> {
+        // `categorize` rejects an unaddressable namespace before dispatch.
+        let Ok(namespace) = Namespace::new(namespace_raw) else {
+            return Ok(());
+        };
+        let key = namespace.catalog_index_path();
+        if !self
+            .metadata_store
+            .object_store()
+            .exists(&key)
+            .await
+            .map_err(RegistryError::from)?
+        {
+            return Ok(());
+        }
+        if self.younger_than_grace(&key).await? {
+            return Ok(());
+        }
+        if holds_manifest_content(&self.metadata_store, namespace.clone()).await? {
+            return Ok(());
+        }
+        self.emit(Action::ReapCatalogIndex { namespace }).await
     }
 
     /// Whether `namespace` already holds `target`. Raw key existence is not

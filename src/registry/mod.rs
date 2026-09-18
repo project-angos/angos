@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, num::NonZeroUsize, sync::Arc};
 
 use tracing::instrument;
 
@@ -58,6 +58,8 @@ pub struct RegistryConfig {
     /// push. `subject` references and pull-through cache-fill writes are exempt
     /// either way.
     pub validate_manifest_references: bool,
+    /// Concurrent reads an admin listing keeps in flight per request.
+    pub listing_read_concurrency: NonZeroUsize,
     /// The queue every cache-fill and replication job is enqueued to. Who
     /// drains it is the caller's business: the registry only enqueues, and
     /// starts nothing of its own.
@@ -84,6 +86,7 @@ impl RegistryConfig {
             // validating; the server opts into the permissive production
             // default via `[global]`.
             validate_manifest_references: true,
+            listing_read_concurrency: pagination::LISTING_READ_CONCURRENCY,
             job_queue,
             event_dispatcher: None,
         }
@@ -105,6 +108,7 @@ pub struct Registry {
     max_blob_size_bytes: u64,
     blob_stream_frame_size: usize,
     validate_manifest_references: bool,
+    listing_read_concurrency: NonZeroUsize,
     event_dispatcher: Option<Arc<EventDispatcher>>,
 }
 
@@ -192,6 +196,7 @@ impl Registry {
             max_blob_size_bytes: config.max_blob_size_bytes,
             blob_stream_frame_size: config.blob_stream_frame_size,
             validate_manifest_references: config.validate_manifest_references,
+            listing_read_concurrency: config.listing_read_concurrency,
             event_dispatcher: config.event_dispatcher,
         })
     }

@@ -9,7 +9,7 @@ use crate::{
     jobs::store::JobQueueConfig,
     policy::{AccessPolicyConfig, RetentionPolicyConfig},
     registry::metadata_store::{DEFAULT_ATIME_AUDIT_WINDOW_SECS, DEFAULT_GC_GRACE_SECS},
-    registry::pagination::NAMESPACE_WALK_CONCURRENCY,
+    registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY},
 };
 
 /// Default Tokio worker-thread count; the `unwrap` is const-evaluated.
@@ -88,6 +88,10 @@ pub struct GlobalConfig {
     /// flight, hiding per-request backend latency on S3.
     #[serde(default = "default_namespace_walk_concurrency")]
     pub namespace_walk_concurrency: NonZeroUsize,
+    /// Concurrent reads an admin listing behind the web UI keeps in flight
+    /// per request: revision records, referrer descriptors, job records.
+    #[serde(default = "default_listing_read_concurrency")]
+    pub listing_read_concurrency: NonZeroUsize,
     /// Reclamation grace period in seconds: scrub leaves unreferenced blobs,
     /// dangling reference keys and stale index entries younger than this alone,
     /// so it cannot race an in-flight push or upload. Lower it only for offline
@@ -113,6 +117,10 @@ fn default_shutdown_drain_secs() -> u64 {
 
 fn default_namespace_walk_concurrency() -> NonZeroUsize {
     NAMESPACE_WALK_CONCURRENCY
+}
+
+fn default_listing_read_concurrency() -> NonZeroUsize {
+    LISTING_READ_CONCURRENCY
 }
 
 fn default_gc_grace_secs() -> u64 {
@@ -192,6 +200,7 @@ impl Default for GlobalConfig {
             scan: None,
             shutdown_drain_secs: default_shutdown_drain_secs(),
             namespace_walk_concurrency: default_namespace_walk_concurrency(),
+            listing_read_concurrency: default_listing_read_concurrency(),
             gc_grace_secs: default_gc_grace_secs(),
             atime_audit_window_secs: default_atime_audit_window_secs(),
             trusted_proxies: Vec::new(),

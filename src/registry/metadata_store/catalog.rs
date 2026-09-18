@@ -1,6 +1,8 @@
 //! The namespace / tag / revision / referrer enumeration endpoints, served
 //! from the `v2/cat` index and the namespace's own `v2/ns` listings.
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{
@@ -371,6 +373,54 @@ impl MetadataStore {
         })
     }
 
+    /// Every referrer record in `namespace`, keyed by subject: one walk of the
+    /// `!sub` tree, where a listing per subject would cost one round trip each.
+    pub async fn collect_referrers(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<HashMap<Digest, Vec<Digest>>, Error> {
+        let root = namespace.referrer_records_root();
+        let keys: Vec<String> = paginated(move |token| {
+            let root = root.clone();
+            async move {
+                let page = self.object_store().list(&root, LIST_PAGE, token).await?;
+                Ok::<_, Error>((page.items, page.next_token))
+            }
+        })
+        .try_collect()
+        .await?;
+
+        let mut by_subject: HashMap<Digest, Vec<Digest>> = HashMap::new();
+        for key in keys {
+            // `<algo>/<pfx>/<hash>/<algo>.<hash>`, the subject then the referrer.
+            let mut parts = key.split('/');
+            let (Some(algorithm), Some(_), Some(hash), Some(file), None) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) else {
+                continue;
+            };
+            let Some(subject) = algorithm
+                .parse::<Algorithm>()
+                .ok()
+                .and_then(|algorithm| Digest::with_algorithm(algorithm, hash).ok())
+            else {
+                continue;
+            };
+            let Some(referrer) = file.split_once('.').and_then(|(algorithm, hash)| {
+                let algorithm = algorithm.parse::<Algorithm>().ok()?;
+                Digest::with_algorithm(algorithm, hash).ok()
+            }) else {
+                continue;
+            };
+            by_subject.entry(subject).or_default().push(referrer);
+        }
+        Ok(by_subject)
+    }
+
     /// Whether `namespace` holds any revision record. One key answers it, so
     /// it never pages.
     pub async fn any_revision(&self, namespace: &Namespace) -> Result<bool, Error> {
@@ -481,6 +531,52 @@ mod tests {
                 "a namespace whose revisions and tags were all deleted must \
                  disappear from the catalog; got: {listed:?}"
             );
+        })
+        .await;
+    }
+
+    /// One walk of the `!sub` tree yields every referrer record keyed by its
+    /// subject, and a namespace whose name extends this one's stays out of it:
+    /// the `!` after the name is what keeps the two prefixes apart.
+    #[tokio::test]
+    async fn collect_referrers_groups_records_by_subject() {
+        for_each_backend(async |test_case| {
+            let metadata_store = test_case.metadata_store();
+            let namespace = Namespace::new("collect/img").unwrap();
+            let neighbour = Namespace::new("collect/img2").unwrap();
+            let subject_a = Digest::sha256_of_bytes(b"subject a");
+            let subject_b = Digest::sha256_of_bytes(b"subject b");
+            let (r1, r2, r3) = (
+                Digest::sha256_of_bytes(b"referrer 1"),
+                Digest::sha256_of_bytes(b"referrer 2"),
+                Digest::sha256_of_bytes(b"referrer 3"),
+            );
+            for (ns, subject, referrer) in [
+                (&namespace, &subject_a, &r1),
+                (&namespace, &subject_a, &r2),
+                (&namespace, &subject_b, &r3),
+                (&neighbour, &subject_a, &r3),
+            ] {
+                metadata_store
+                    .put_referrer(ns, subject, referrer, None)
+                    .await
+                    .unwrap();
+            }
+
+            let mut collected = metadata_store.collect_referrers(&namespace).await.unwrap();
+            for referrers in collected.values_mut() {
+                referrers.sort();
+            }
+            let mut of_a = vec![r1.clone(), r2.clone()];
+            of_a.sort();
+
+            assert_eq!(
+                collected.len(),
+                2,
+                "two subjects hold records; got: {collected:?}"
+            );
+            assert_eq!(collected.get(&subject_a), Some(&of_a));
+            assert_eq!(collected.get(&subject_b), Some(&vec![r3.clone()]));
         })
         .await;
     }

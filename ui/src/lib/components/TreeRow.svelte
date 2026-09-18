@@ -14,6 +14,11 @@
 		expanded: Set<string>;
 		deleteConfirm: string | null;
 		deleting: boolean;
+		selecting: boolean;
+		selected: Set<string>;
+		implied: Set<string>;
+		ontoggleselect: (digest: string) => void;
+		getdeleteconfirmlabel: (digests: string[]) => string;
 		ontoggleexpand: (digest: string, event: MouseEvent) => void;
 		onrowclick: (event: MouseEvent, digest: string) => void;
 		ondeletemanifest: (digest: string) => void;
@@ -30,6 +35,11 @@
 		expanded,
 		deleteConfirm,
 		deleting,
+		selecting,
+		selected,
+		implied,
+		ontoggleselect,
+		getdeleteconfirmlabel,
 		ontoggleexpand,
 		onrowclick,
 		ondeletemanifest,
@@ -47,6 +57,24 @@
 </script>
 
 <tr class={rowClass} onclick={(e) => onrowclick(e, node.digest)}>
+	{#if selecting}
+		{@const isImplied = implied.has(node.digest)}
+		<td class="col-select">
+			<label
+				title={isImplied
+					? 'Deleted with the manifest that refers to it; untick to keep it'
+					: undefined}
+			>
+				<input
+					type="checkbox"
+					aria-label={`Select manifest ${node.digest}`}
+					checked={selected.has(node.digest) || isImplied}
+					disabled={deleting}
+					onchange={() => ontoggleselect(node.digest)}
+				/>
+			</label>
+		</td>
+	{/if}
 	<td
 		class={cellClass}
 		class:expanded={depth === 0 && isExpanded}
@@ -77,6 +105,9 @@
 	<td>
 		<DeleteButton
 			isConfirming={deleteConfirm === digestConfirmKey(node.digest)}
+			confirmLabel={deleteConfirm === digestConfirmKey(node.digest)
+				? getdeleteconfirmlabel([node.digest])
+				: 'confirm'}
 			disabled={deleting}
 			onconfirm={() => ondeletemanifest(node.digest)}
 			oncancel={() => onconfirmchange(null)}
@@ -93,6 +124,11 @@
 			{expanded}
 			{deleteConfirm}
 			{deleting}
+			{selecting}
+			{selected}
+			{implied}
+			{ontoggleselect}
+			{getdeleteconfirmlabel}
 			{ontoggleexpand}
 			{onrowclick}
 			{ondeletemanifest}

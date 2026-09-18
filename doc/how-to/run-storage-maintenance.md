@@ -34,6 +34,7 @@ Before applying a cross-key repair, scrub confirms the inconsistency is settled 
 | Blob-index grants | Re-issues grants the index is missing relative to the manifests; removes entries nothing backs |
 | Withheld references | Left alone: a reference the namespace holds no grant for is never re-derived, so scrub cannot grant read access a permissive push refused |
 | Dangling references | Removes tags and revisions whose manifest blob is missing, and orphan referrer records |
+| Emptied namespaces | Removes the catalog index key of a namespace holding no revision or tag, so it leaves the admin listings; a namespace that gains content again is re-indexed by the push |
 | Invalid names | Deletes upload directories whose namespace violates the OCI grammar (nothing can address them) |
 | Corrupt content | Deletes job records and access entries whose content does not parse |
 | Orphan blobs | Reclaims blobs with no live references, past a grace period and fenced by a `v2/gc/` run marker at apply time |

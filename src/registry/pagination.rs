@@ -13,6 +13,9 @@ use angos_storage::Page;
 /// per-request backend latency, which dominates on S3.
 pub const NAMESPACE_WALK_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 
+/// Concurrent reads an admin listing keeps in flight per request.
+pub const LISTING_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+
 /// One scanned directory: its namespace name when it holds the `marker` child,
 /// and the sub-directories to descend into.
 struct DirectoryScan {

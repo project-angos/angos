@@ -402,8 +402,22 @@ tfoot td {
 	text-align: right;
 }
 
+/* The whole cell toggles the box: a label fills it edge to edge, so the
+   target is the row's height and the column's width, the box centred behind
+   the same margin on either side. */
 .col-select {
-	width: 2.25rem;
+	position: relative;
+	width: 2.5rem;
+	padding: 0;
+}
+
+.col-select label {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
 }
 
 /* A size or a date never breaks; the wide columns give way instead. */

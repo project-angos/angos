@@ -19,6 +19,10 @@
 		rows: TreeRowNode[];
 		uploads: UploadEntry[];
 		selectedUploads: Set<string>;
+		selectingManifests: boolean;
+		selectedManifests: Set<string>;
+		/** Digests the selection would delete as orphans, ticked and locked. */
+		impliedDeletes: Set<string>;
 		deleteConfirm: string | null;
 		deleting: boolean;
 		expanded: Set<string>;
@@ -29,6 +33,10 @@
 		oncancelupload: (uuid: string) => void;
 		onuploadselectionchange: (selected: Set<string>) => void;
 		oncancelselecteduploads: () => void;
+		onmanifestselectionchange: (selected: Set<string>) => void;
+		/** One row's checkbox: picks, drops, spares or takes back. */
+		toggleManifestSelection: (digest: string) => void;
+		getdeleteconfirmlabel: (digests: string[]) => string;
 	}
 
 	let {
@@ -36,6 +44,9 @@
 		rows,
 		uploads,
 		selectedUploads,
+		selectingManifests,
+		selectedManifests,
+		impliedDeletes,
 		deleteConfirm,
 		deleting,
 		expanded,
@@ -45,8 +56,23 @@
 		ondeletetag,
 		oncancelupload,
 		onuploadselectionchange,
-		oncancelselecteduploads
+		oncancelselecteduploads,
+		onmanifestselectionchange,
+		toggleManifestSelection,
+		getdeleteconfirmlabel
 	}: Props = $props();
+
+	// Select-all covers the rows on screen at depth zero; a nested row is
+	// picked on its own once its parent is expanded.
+	const allManifestsSelected = $derived(
+		rows.length > 0 && rows.every((row) => selectedManifests.has(row.digest))
+	);
+
+	function toggleAllManifests() {
+		onmanifestselectionchange(
+			allManifestsSelected ? new Set() : new Set(rows.map((row) => row.digest))
+		);
+	}
 
 	const allUploadsSelected = $derived(
 		uploads.length > 0 && uploads.every((upload) => selectedUploads.has(upload.uuid))
@@ -92,13 +118,15 @@
 			<thead>
 				<tr>
 					<th class="col-select">
-						<input
-							type="checkbox"
-							aria-label="Select all uploads"
-							checked={allUploadsSelected}
-							disabled={deleting}
-							onchange={toggleAllUploads}
-						/>
+						<label>
+							<input
+								type="checkbox"
+								aria-label="Select all uploads"
+								checked={allUploadsSelected}
+								disabled={deleting}
+								onchange={toggleAllUploads}
+							/>
+						</label>
 					</th>
 					<th>UUID</th>
 					<th>Size</th>
@@ -110,13 +138,15 @@
 				{#each uploads as upload}
 					<tr>
 						<td class="col-select">
-							<input
-								type="checkbox"
-								aria-label={`Select upload ${upload.uuid}`}
-								checked={selectedUploads.has(upload.uuid)}
-								disabled={deleting}
-								onchange={() => toggleUploadSelection(upload.uuid)}
-							/>
+							<label>
+								<input
+									type="checkbox"
+									aria-label={`Select upload ${upload.uuid}`}
+									checked={selectedUploads.has(upload.uuid)}
+									disabled={deleting}
+									onchange={() => toggleUploadSelection(upload.uuid)}
+								/>
+							</label>
 						</td>
 						<td><code class="uuid">{upload.uuid}</code></td>
 						<td class="nowrap">{formatSize(upload.size)}</td>
@@ -141,6 +171,19 @@
 <table>
 	<thead>
 		<tr>
+			{#if selectingManifests}
+				<th class="col-select">
+					<label>
+						<input
+							type="checkbox"
+							aria-label="Select all manifests"
+							checked={allManifestsSelected}
+							disabled={deleting}
+							onchange={toggleAllManifests}
+						/>
+					</label>
+				</th>
+			{/if}
 			<th>Digest</th>
 			<th>Tags / Platform</th>
 			<th>Pushed</th>
@@ -151,7 +194,7 @@
 	<tbody>
 		{#if rows.length === 0}
 			<tr>
-				<td colspan="5" class="empty">No manifests found</td>
+				<td colspan={selectingManifests ? 6 : 5} class="empty">No manifests found</td>
 			</tr>
 		{:else}
 			{#each rows as node (`${node.kind}:${node.digest}`)}
@@ -161,6 +204,11 @@
 					{expanded}
 					{deleteConfirm}
 					{deleting}
+					selecting={selectingManifests}
+					selected={selectedManifests}
+					implied={impliedDeletes}
+					ontoggleselect={toggleManifestSelection}
+					{getdeleteconfirmlabel}
 					{ontoggleexpand}
 					onrowclick={handleRowClick}
 					{ondeletemanifest}
@@ -173,3 +221,6 @@
 		{/if}
 	</tbody>
 </table>
+
+<style>
+</style>

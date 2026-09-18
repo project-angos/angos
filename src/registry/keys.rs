@@ -355,6 +355,9 @@ pub trait NamespaceKeys {
 
     /// Directory holding `subject`'s referrer records: one key per referring
     /// manifest, whose body is that manifest's descriptor.
+    /// Root of every referrer record in the namespace, which one walk lists
+    /// where reading per subject would list once each.
+    fn referrer_records_root(&self) -> String;
     fn referrer_record_dir(&self, subject: &Digest) -> String;
 
     /// One referring manifest's record under `subject`.
@@ -455,9 +458,14 @@ impl NamespaceKeys for Namespace {
         format!("{NS_ROOT}/{self}!rev")
     }
 
+    fn referrer_records_root(&self) -> String {
+        format!("{NS_ROOT}/{self}!sub")
+    }
+
     fn referrer_record_dir(&self, subject: &Digest) -> String {
         format!(
-            "{NS_ROOT}/{self}!sub/{}/{}/{}",
+            "{}/{}/{}/{}",
+            self.referrer_records_root(),
             subject.algorithm(),
             subject.hash_prefix(),
             subject.hash()
