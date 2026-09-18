@@ -573,7 +573,12 @@ impl Registry {
                 };
                 let mut referrers_next = None;
                 if let Ok(page) = self.list_referrers(None, &listing).await {
-                    referrers.extend(page.items.iter().map(ReferrerInfo::from));
+                    let listed: Vec<ReferrerInfo> =
+                        page.items.iter().map(ReferrerInfo::from).collect();
+                    referrers.retain(|candidate| {
+                        !listed.iter().any(|info| info.digest == candidate.digest)
+                    });
+                    referrers.extend(listed);
                     referrers_next = page.next_token;
                 }
 
@@ -740,7 +745,8 @@ mod tests {
         metadata_store::{AccessEntry, LinkKind, MetadataStore},
         test_utils::{
             FSRegistryTestCase, RegistryTestCase, create_test_blob, create_test_registry,
-            for_each_backend, media_type, metadata_store_over, response_json, seed_links,
+            for_each_backend, media_type, metadata_store_over, put_blob_body, response_json,
+            seed_links,
         },
     };
 
@@ -1429,6 +1435,105 @@ mod tests {
                 .map(|entry| entry["client"].as_str().unwrap())
                 .collect();
             assert_eq!(clients, ["alice", "bob"], "entries must be newest first");
+        })
+        .await;
+    }
+
+    /// A buildx index names its attestation manifest through the
+    /// `vnd.docker.reference.digest` annotation, and the registry records that
+    /// same manifest in the referrers index. The listing must carry it once,
+    /// with the artifact type only the index entry knows.
+    #[tokio::test]
+    async fn a_docker_attestation_is_listed_once_with_its_artifact_type() {
+        for_each_backend(async |test_case| {
+            let registry = test_case.registry();
+            let namespace = Namespace::new("test-repo/buildx").unwrap();
+            let subject = digest("50b1");
+            let attestation = digest("a11e");
+
+            let index = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [
+                    {
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": subject.to_string(),
+                        "size": 1,
+                        "platform": { "os": "linux", "architecture": "amd64" }
+                    },
+                    {
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": attestation.to_string(),
+                        "size": 1,
+                        "annotations": { DOCKER_REFERENCE_DIGEST: subject.to_string() }
+                    }
+                ]
+            });
+            let index_digest = put_blob_body(
+                registry.blob_store.as_ref(),
+                &serde_json::to_vec(&index).unwrap(),
+            )
+            .await;
+
+            seed_links(
+                &registry.metadata_store,
+                &namespace,
+                &[
+                    (LinkKind::Digest(index_digest.clone()), index_digest.clone()),
+                    (LinkKind::Digest(subject.clone()), subject.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+            // The same manifest as the referrers index holds it, where it does
+            // carry an artifact type.
+            registry
+                .metadata_store
+                .put_referrer(
+                    &namespace,
+                    &subject,
+                    &attestation,
+                    Some(&Descriptor {
+                        media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
+                        digest: attestation.clone(),
+                        size: 1,
+                        annotations: HashMap::new(),
+                        artifact_type: Some(media_type(
+                            "application/vnd.docker.attestation.manifest.v1+json",
+                        )),
+                        platform: None,
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let body = response_json(
+                registry
+                    .get_revisions_info(&namespace)
+                    .await
+                    .unwrap()
+                    .into_response()
+                    .unwrap(),
+            )
+            .await;
+            let entry = body["manifests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["digest"] == subject.to_string())
+                .unwrap_or_else(|| panic!("the subject must be listed: {body}"));
+            let referrers = entry["referrers"].as_array().unwrap();
+
+            assert_eq!(
+                referrers.len(),
+                1,
+                "the attestation must be listed once, not once per source: {entry}"
+            );
+            assert_eq!(referrers[0]["digest"], attestation.to_string());
+            assert_eq!(
+                referrers[0]["artifactType"], "application/vnd.docker.attestation.manifest.v1+json",
+                "the referrers-index entry carries the artifact type the annotation does not"
+            );
         })
         .await;
     }

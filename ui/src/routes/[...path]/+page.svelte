@@ -245,13 +245,24 @@
 		deleting = true;
 		actionError = null;
 		const err = await apiDeleteManifest(data.path, reference);
+		// The refresh below re-lists the whole namespace, which costs far more
+		// than the delete it reflects. Holding every delete control disabled for
+		// it is what made deleting a tag feel slow, so the controls come back as
+		// soon as the registry has answered.
+		deleting = false;
 		if (err) {
 			actionError = `Delete failed (${err}).`;
-		} else {
-			deleteConfirm = null;
-			await reloadAfterDelete(reference);
+			return;
 		}
-		deleting = false;
+		deleteConfirm = null;
+		// Drop the tag from its row at once, so the click shows straight away;
+		// the refresh reconciles whatever else the delete reclaimed.
+		rows = rows.map((row) =>
+			row.tags.includes(reference)
+				? { ...row, tags: row.tags.filter((tag) => tag !== reference) }
+				: row
+		);
+		await reloadAfterDelete(reference);
 	}
 
 	// Deleting by digest removes the manifest and every tag pointing at it, so
