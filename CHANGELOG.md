@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.9.1 - UNRELEASED
+
+### Changed
+
+- **Breaking:** the `route` label on `http_requests_total` and `http_request_duration_ms` is the endpoint name rather than the access-policy action name: `get-api-version` is `check-version`, a `HEAD` is `head-manifest` or `head-blob` instead of being counted under the `get-` route, and the upload steps are `patch-upload`, `put-upload` and `delete-upload` in place of `update-upload`, `complete-upload` and `cancel-upload`.
+
+## Fixed
+
+- `http_request_duration_ms` has millisecond buckets from 1 ms to 60 s: it used the prometheus crate's defaults, which end at 10, so a `histogram_quantile` over it answered 10 ms for every route slower than that.
+
 ## 1.9.0
 
 ### Added

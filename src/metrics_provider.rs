@@ -7,6 +7,13 @@ use prometheus::{
 };
 use tracing::error;
 
+/// Millisecond buckets, from a cached HEAD to a multi-gigabyte blob transfer.
+/// The crate default ends at 10, which as milliseconds would pin every quantile there.
+const HTTP_DURATION_BUCKETS_MS: [f64; 14] = [
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+    60_000.0,
+];
+
 /// Errors raised while initializing or serving the metrics registry.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -101,6 +108,7 @@ impl MetricsProvider {
             "http_request_duration_ms",
             "The HTTP request latencies in milliseconds.",
             &["method", "route"],
+            HTTP_DURATION_BUCKETS_MS.to_vec(),
             registry
         )
         .map_err(register_err("http_request_duration_ms"))?;
@@ -306,6 +314,27 @@ mod tests {
         assert!(
             text.contains("} 2"),
             "gathered output must contain a sample with value 2, output:\n{text}"
+        );
+    }
+
+    #[test]
+    fn http_duration_buckets_resolve_a_request_slower_than_ten_milliseconds() {
+        let provider = MetricsProvider::new().expect("MetricsProvider::new must succeed");
+        provider
+            .metric_http_request_duration
+            .with_label_values(&["GET", "get-manifest"])
+            .observe(40.0);
+
+        let (_, payload) = provider.gather().expect("gather must succeed");
+        let text = String::from_utf8(payload).expect("gather output must be valid UTF-8");
+
+        assert!(
+            text.contains("route=\"get-manifest\",le=\"25\"} 0"),
+            "a 40 ms observation must fall outside the 25 ms bucket, output:\n{text}"
+        );
+        assert!(
+            text.contains("route=\"get-manifest\",le=\"50\"} 1"),
+            "a 40 ms observation must fall inside the 50 ms bucket, output:\n{text}"
         );
     }
 
