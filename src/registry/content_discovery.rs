@@ -45,7 +45,7 @@ fn matches_filter(referrer: &Descriptor, artifact_type: Option<&MediaType>) -> b
 }
 
 /// Fan-out for resolving referrer candidates, each an independent manifest read.
-const REFERRER_RESOLVE_CONCURRENCY: usize = 10;
+pub const REFERRER_RESOLVE_CONCURRENCY: usize = 10;
 
 /// Default page size when a listing omits `n`, shared with the HTTP handlers so
 /// the `Link` they build echoes the size actually used.
@@ -317,7 +317,7 @@ impl Registry {
     /// One referrer entry as an OCI [`Descriptor`]: the cached link descriptor
     /// when that answers the `artifact_type` filter, else the manifest read
     /// through the blob store, where manifest bodies live.
-    async fn resolve_referrer_descriptor(
+    pub async fn resolve_referrer_descriptor(
         &self,
         namespace: &Namespace,
         subject_digest: &Digest,

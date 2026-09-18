@@ -193,6 +193,7 @@ export function uploadConfirmKey(uuid: string): string {
 }
 
 export const selectedUploadsConfirmKey = 'uploads:selected';
+export const selectedManifestsConfirmKey = 'manifests:selected';
 
 const WELL_KNOWN_ANNOTATIONS: Record<string, string> = {
 	'org.opencontainers.image.created': 'created',
@@ -326,13 +327,90 @@ export function buildTree(manifests: ManifestEntry[]): TreeNode[] {
 	return roots;
 }
 
+export interface DeleteCascade {
+	/** Children whose every parent is being deleted and that carry no tag. */
+	platforms: string[];
+	/** Referrers of everything removed, which have no subject left. */
+	referrers: string[];
+}
+
+/**
+ * What deleting `digests` would leave behind as untagged orphans, so the
+ * delete can take it along: a child whose parents are all among the deleted
+ * and that carries no tag of its own, and the referrers of everything removed,
+ * recursively. A child another index still names, or anything tagged, stays,
+ * since a tag is intent and a shared child is still in use. Only the referrers
+ * the listing loaded are seen; a subject with more pages keeps the rest.
+ *
+ * A digest in `spared` is kept, and the walk does not pass through it: sparing
+ * a platform manifest keeps its own referrers too, which is the point of
+ * sparing it.
+ */
+export function deleteCascade(
+	manifests: ManifestEntry[],
+	digests: string[],
+	spared: Set<string> = new Set()
+): DeleteCascade {
+	const byDigest = new Map(manifests.map((m) => [m.digest, m]));
+	const childrenOf = new Map<string, ManifestEntry[]>();
+	for (const m of manifests) {
+		for (const parent of m.parents ?? []) {
+			childrenOf.set(parent.digest, [...(childrenOf.get(parent.digest) ?? []), m]);
+		}
+	}
+	const removed = new Set(digests);
+	const platforms: string[] = [];
+	const referrers: string[] = [];
+	const queue = [...digests];
+	for (let i = 0; i < queue.length; i++) {
+		const digest = queue[i];
+		for (const child of childrenOf.get(digest) ?? []) {
+			const orphaned =
+				!removed.has(child.digest) &&
+				!spared.has(child.digest) &&
+				child.tags.length === 0 &&
+				(child.parents ?? []).every((parent) => removed.has(parent.digest));
+			if (orphaned) {
+				removed.add(child.digest);
+				platforms.push(child.digest);
+				queue.push(child.digest);
+			}
+		}
+		for (const referrer of byDigest.get(digest)?.referrers ?? []) {
+			const entry = byDigest.get(referrer.digest);
+			if (
+				!removed.has(referrer.digest) &&
+				!spared.has(referrer.digest) &&
+				(entry?.tags.length ?? 0) === 0
+			) {
+				removed.add(referrer.digest);
+				referrers.push(referrer.digest);
+				queue.push(referrer.digest);
+			}
+		}
+	}
+	return { platforms, referrers };
+}
+
+/** The cascade as a delete button's confirm label spells it, empty when nothing cascades. */
+export function cascadeSummary(cascade: DeleteCascade): string {
+	const parts: string[] = [];
+	if (cascade.platforms.length > 0) parts.push(`+${cascade.platforms.length} platform`);
+	if (cascade.referrers.length > 0) {
+		parts.push(`+${cascade.referrers.length} attestation${cascade.referrers.length === 1 ? '' : 's'}`);
+	}
+	return parts.length > 0 ? ` (${parts.join(', ')})` : '';
+}
+
 export function isInteractiveTarget(event: MouseEvent): boolean {
 	const target = event.target as HTMLElement;
 	return (
 		target.tagName === 'BUTTON' ||
 		!!target.closest('button') ||
 		target.tagName === 'A' ||
-		!!target.closest('a')
+		!!target.closest('a') ||
+		target.tagName === 'INPUT' ||
+		!!target.closest('label')
 	);
 }
 

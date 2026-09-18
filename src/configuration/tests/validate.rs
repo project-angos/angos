@@ -271,3 +271,28 @@ fn ui_sign_in_accepts_a_configured_oidc_provider() {
 
     assert_eq!(configuration.ui.oidc.unwrap().client_id, "angos-ui");
 }
+
+#[test]
+fn listing_read_concurrency_must_be_greater_than_zero() {
+    let config = config_toml("listing_read_concurrency = 0");
+
+    match Configuration::load_from_str(&config) {
+        Err(Error::InvalidFormat(msg)) => {
+            assert!(
+                msg.contains("listing_read_concurrency"),
+                "the refusal must name the key; got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidFormat error, got {other:?}"),
+    }
+}
+
+#[test]
+fn listing_read_concurrency_defaults_and_loads() {
+    let default = Configuration::load_from_str(&config_toml("")).unwrap();
+    assert_eq!(default.global.listing_read_concurrency.get(), 16);
+
+    let raised =
+        Configuration::load_from_str(&config_toml("listing_read_concurrency = 64")).unwrap();
+    assert_eq!(raised.global.listing_read_concurrency.get(), 64);
+}

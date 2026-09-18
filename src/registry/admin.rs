@@ -1,7 +1,10 @@
 //! The `/v2/_angos` admin surface: repository and namespace info for the web UI,
 //! plus the durable job list/retry/delete endpoints.
 
-use std::{collections::HashMap, future::Future};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+};
 
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
@@ -15,14 +18,19 @@ use angos_extension_service::{
     RepositoryInfo, RetryJobRequest, RevisionsBody, UploadEntry, UploadsBody,
 };
 use angos_oci::{
-    Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace, Platform, Tag,
-    UploadSessionId, namespace_belongs_to, request::GetReferrersRequest,
+    Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType, Namespace, Platform,
+    Tag, UploadSessionId, namespace_belongs_to, request::GetReferrersRequest,
 };
 
 use crate::{
     configuration::RegexPattern,
     jobs::{JobState, Queue, store as job_store},
-    registry::{Error, Registry, manifest::read_manifest, metadata_store::LinkKind},
+    registry::{
+        Error, Registry,
+        content_discovery::{DEFAULT_PAGE_SIZE, REFERRER_RESOLVE_CONCURRENCY},
+        manifest::read_manifest,
+        metadata_store::{LinkKind, LinkMetadata},
+    },
 };
 
 /// Most pull-history entries one listing returns; the directory is unbounded,
@@ -32,9 +40,6 @@ const PULL_HISTORY_PAGE: u16 = 100;
 /// Bounds the per-namespace stat fan-out so a repository with many namespaces
 /// does not open one request per namespace at once.
 const NAMESPACE_STAT_CONCURRENCY: usize = 32;
-
-/// Fan-out for the per-item reads behind the info endpoints.
-const ADMIN_READ_CONCURRENCY: usize = 16;
 
 struct RepositoryConfig {
     pull_through_cache: bool,
@@ -61,6 +66,32 @@ fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCand
         child_digest: descriptor.digest.clone(),
         info: descriptor.into(),
     })
+}
+
+/// Whether a revision of this media type is an index, the one kind of
+/// manifest with children to analyze.
+fn is_index(media_type: &MediaType) -> bool {
+    *media_type == MediaType::oci_index() || *media_type == MediaType::docker_manifest_list()
+}
+
+/// What the revisions listing gathers in bulk, each in one walk or one
+/// bounded fan-out, before it assembles an entry per revision.
+struct ListingInputs {
+    digest_to_tags: HashMap<Digest, Vec<Tag>>,
+    /// Records of the revisions that are not another's referrer.
+    records: HashMap<Digest, LinkMetadata>,
+    /// The revisions recorded as another's referrer, listed as leaves.
+    leaves: HashSet<Digest>,
+    subject_referrers: HashMap<Digest, SubjectReferrers>,
+    child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+    docker_referrers: HashMap<Digest, Vec<ReferrerInfo>>,
+}
+
+/// One subject's referrers as the listing serves them: the descriptors of
+/// one page, and the cursor to the rest.
+struct SubjectReferrers {
+    descriptors: Vec<Descriptor>,
+    next: Option<String>,
 }
 
 struct ManifestAnalysis {
@@ -93,6 +124,7 @@ fn analyze_manifest(manifest: &Manifest) -> ManifestAnalysis {
 /// record gone or unreadable mid-scan is skipped rather than failing the page.
 async fn read_job_page<T, Fut>(
     storage_keys: Vec<String>,
+    concurrency: usize,
     read: impl Fn(String) -> Fut,
 ) -> Result<Vec<T>, Error>
 where
@@ -112,7 +144,7 @@ where
                 Err(e) => Err(Error::from(e)),
             }
         })
-        .buffered(ADMIN_READ_CONCURRENCY)
+        .buffered(concurrency)
         .try_filter_map(|entry| async move { Ok(entry) })
         .try_collect()
         .await
@@ -251,22 +283,68 @@ impl Registry {
 
     #[instrument(skip(self))]
     pub async fn get_revisions_info(&self, namespace: &Namespace) -> Result<RevisionsBody, Error> {
-        // Materialized once: every step below needs the full revision set.
-        let all_revisions: Vec<Digest> = self
-            .metadata_store
-            .stream_revisions(namespace)
-            .try_collect()
-            .await?;
-        let digest_to_tags = self.build_digest_to_tags_map(namespace).await?;
-        let (child_to_parents, docker_referrers) =
-            self.build_parent_and_referrer_maps(&all_revisions).await;
+        // Materialized once: every step below needs the full revision set. The
+        // three walks are independent, so they go out together.
+        let (all_revisions, digest_to_tags, referrers_by_subject) = try_join!(
+            self.metadata_store
+                .stream_revisions(namespace)
+                .try_collect::<Vec<Digest>>(),
+            self.build_digest_to_tags_map(namespace),
+            self.metadata_store.collect_referrers(namespace),
+        )?;
+        let tag_names: HashSet<Tag> = digest_to_tags.values().flatten().cloned().collect();
+        // A subject is any revision holding referrer records, or carrying the
+        // pre-API fallback tag that holds them instead.
+        let subjects: Vec<Digest> = all_revisions
+            .iter()
+            .filter(|digest| {
+                referrers_by_subject.contains_key(*digest)
+                    || tag_names.contains(&digest.referrers_fallback_tag())
+            })
+            .cloned()
+            .collect();
+        let subject_referrers = self
+            .resolve_subject_referrers(namespace, subjects, &referrers_by_subject, &tag_names)
+            .await;
+
+        // A revision recorded as another's referrer lists as a leaf under it,
+        // where no push or pull time is shown, and the descriptor just read for
+        // its subject names its media type: its record goes unread.
+        let leaves: HashSet<Digest> = referrers_by_subject.values().flatten().cloned().collect();
+        let roots: Vec<Digest> = all_revisions
+            .iter()
+            .filter(|digest| !leaves.contains(*digest))
+            .cloned()
+            .collect();
+        let records = self.read_revision_records(namespace, &roots).await;
+        let mut media_types: HashMap<Digest, MediaType> = records
+            .iter()
+            .filter_map(|(digest, record)| Some((digest.clone(), record.media_type.clone()?)))
+            .collect();
+        for descriptor in subject_referrers
+            .values()
+            .flat_map(|listed| &listed.descriptors)
+        {
+            media_types
+                .entry(descriptor.digest.clone())
+                .or_insert_with(|| descriptor.media_type.clone());
+        }
+
+        let (child_to_parents, docker_referrers) = self
+            .build_parent_and_referrer_maps(&all_revisions, &media_types)
+            .await;
         let manifests = self
             .build_manifest_entries(
                 namespace,
                 all_revisions,
-                &digest_to_tags,
-                child_to_parents,
-                docker_referrers,
+                ListingInputs {
+                    digest_to_tags,
+                    records,
+                    leaves,
+                    subject_referrers,
+                    child_to_parents,
+                    docker_referrers,
+                },
             )
             .await;
 
@@ -329,7 +407,7 @@ impl Registry {
                     started_at: summary.started_at,
                 })
             })
-            .buffered(ADMIN_READ_CONCURRENCY)
+            .buffered(self.listing_read_concurrency.get())
             .filter_map(|entry| async move { entry })
             .collect()
             .await;
@@ -353,21 +431,25 @@ impl Registry {
             .list_pending_page(queue, n, after.as_deref())
             .await?;
 
-        let jobs = read_job_page(page.items, |storage_key| async move {
-            let envelope = self.job_queue.read_pending(queue, &storage_key).await?;
-            let not_before =
-                job_store::parse_not_before(&storage_key).unwrap_or(envelope.created_at);
-            Ok(JobEntry {
-                storage_key,
-                id: envelope.id,
-                kind: envelope.kind,
-                lock_key: envelope.lock_key.to_string(),
-                attempts: envelope.attempts,
-                max_attempts: envelope.max_attempts.unwrap_or_default(),
-                created_at: envelope.created_at,
-                not_before,
-            })
-        })
+        let jobs = read_job_page(
+            page.items,
+            self.listing_read_concurrency.get(),
+            |storage_key| async move {
+                let envelope = self.job_queue.read_pending(queue, &storage_key).await?;
+                let not_before =
+                    job_store::parse_not_before(&storage_key).unwrap_or(envelope.created_at);
+                Ok(JobEntry {
+                    storage_key,
+                    id: envelope.id,
+                    kind: envelope.kind,
+                    lock_key: envelope.lock_key.to_string(),
+                    attempts: envelope.attempts,
+                    max_attempts: envelope.max_attempts.unwrap_or_default(),
+                    created_at: envelope.created_at,
+                    not_before,
+                })
+            },
+        )
         .await?;
 
         Ok(JobsBody {
@@ -391,20 +473,24 @@ impl Registry {
             .list_failed_page(queue, n, after.as_deref())
             .await?;
 
-        let failed = read_job_page(page.items, |storage_key| async move {
-            let record = self.job_queue.read_failed(queue, &storage_key).await?;
-            Ok(FailedJobEntry {
-                storage_key,
-                id: record.envelope.id,
-                kind: record.envelope.kind,
-                lock_key: record.envelope.lock_key.to_string(),
-                attempts: record.envelope.attempts,
-                max_attempts: record.envelope.max_attempts.unwrap_or_default(),
-                created_at: record.envelope.created_at,
-                failed_at: record.failed_at,
-                last_error: record.last_error,
-            })
-        })
+        let failed = read_job_page(
+            page.items,
+            self.listing_read_concurrency.get(),
+            |storage_key| async move {
+                let record = self.job_queue.read_failed(queue, &storage_key).await?;
+                Ok(FailedJobEntry {
+                    storage_key,
+                    id: record.envelope.id,
+                    kind: record.envelope.kind,
+                    lock_key: record.envelope.lock_key.to_string(),
+                    attempts: record.envelope.attempts,
+                    max_attempts: record.envelope.max_attempts.unwrap_or_default(),
+                    created_at: record.envelope.created_at,
+                    failed_at: record.failed_at,
+                    last_error: record.last_error,
+                })
+            },
+        )
         .await?;
 
         Ok(FailedJobsBody {
@@ -469,16 +555,49 @@ impl Registry {
         }
     }
 
+    /// Each revision's record, keyed by digest: its push time, and the media
+    /// type that decides whether its body is worth reading. A record that will
+    /// not read is absent, and its revision lists without a push time.
+    async fn read_revision_records(
+        &self,
+        namespace: &Namespace,
+        all_revisions: &[Digest],
+    ) -> HashMap<Digest, LinkMetadata> {
+        stream::iter(all_revisions.iter().cloned())
+            .map(|digest| async move {
+                let record = self
+                    .metadata_store
+                    .read_link(namespace, &LinkKind::Digest(digest.clone()))
+                    .await
+                    .ok()?;
+                Some((digest, record))
+            })
+            .buffer_unordered(self.listing_read_concurrency.get())
+            .filter_map(|record| async move { record })
+            .collect()
+            .await
+    }
+
     async fn build_parent_and_referrer_maps(
         &self,
         all_revisions: &[Digest],
+        media_types: &HashMap<Digest, MediaType>,
     ) -> (
         HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
         HashMap<Digest, Vec<ReferrerInfo>>,
     ) {
+        // Only an index has children to analyze, and the media type is known
+        // for nearly every revision without its body, so every other body goes
+        // unread. A revision whose type is unknown is read to be sure.
+        let indexes: Vec<Digest> = all_revisions
+            .iter()
+            .filter(|digest| media_types.get(*digest).is_none_or(is_index))
+            .cloned()
+            .collect();
+
         // `buffered` keeps the revision order so the merged map values stay
         // deterministic.
-        let analyses: Vec<_> = stream::iter(all_revisions.iter().cloned())
+        let analyses: Vec<_> = stream::iter(indexes)
             .map(|digest| async move {
                 // A body that will not read drops its row rather than failing
                 // the whole listing.
@@ -496,7 +615,7 @@ impl Registry {
                 }
                 Some((digest, analysis.parent_links, referrers))
             })
-            .buffered(ADMIN_READ_CONCURRENCY)
+            .buffered(self.listing_read_concurrency.get())
             .collect()
             .await;
 
@@ -537,92 +656,167 @@ impl Registry {
         &self,
         namespace: &Namespace,
         all_revisions: Vec<Digest>,
-        digest_to_tags: &HashMap<Digest, Vec<Tag>>,
-        child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
-        mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>>,
+        inputs: ListingInputs,
     ) -> Vec<ManifestEntry> {
-        // Read once for the whole listing, not once per manifest carrying the
-        // tag, and bounded by the same fan-out as the reads below.
-        let tag_pulls = self.newest_tag_pulls(namespace, digest_to_tags).await;
-        let tag_pulls = &tag_pulls;
+        let ListingInputs {
+            digest_to_tags,
+            records,
+            leaves,
+            mut subject_referrers,
+            child_to_parents,
+            mut docker_referrers,
+        } = inputs;
+        // Pull times exist only while pulls are recorded: with recording off
+        // every read below would list an empty directory.
+        let tag_pulls = if self.update_pull_time {
+            self.newest_tag_pulls(namespace, &digest_to_tags).await
+        } else {
+            HashMap::new()
+        };
 
         // `buffered` below keeps the revision order.
         let seeds: Vec<_> = all_revisions
             .into_iter()
             .map(|digest| {
                 let tags = digest_to_tags.get(&digest).cloned().unwrap_or_default();
-                let parents = parent_refs_for(&digest, &child_to_parents, digest_to_tags);
-                let referrers = docker_referrers.remove(&digest).unwrap_or_default();
-                (digest, tags, parents, referrers)
-            })
-            .collect();
-
-        stream::iter(seeds)
-            .map(|(digest, tags, parents, mut referrers)| async move {
-                // One page of what this registry holds alone: querying the
-                // upstream would do so once per manifest. The fallback-tag
-                // lookup stays because the cursor handed back here is followed
-                // through the OCI referrers endpoint, which merges that index,
-                // so dropping it would cut the cursor over a different
-                // candidate set.
-                let listing = GetReferrersRequest {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                    artifact_type: None,
-                    last: None,
-                };
+                let parents = parent_refs_for(&digest, &child_to_parents, &digest_to_tags);
+                // The index-annotation candidates join the recorded referrers,
+                // which win where both name a manifest: they carry the
+                // artifact type the annotation does not.
+                let mut referrers = docker_referrers.remove(&digest).unwrap_or_default();
                 let mut referrers_next = None;
-                if let Ok(page) = self.list_referrers(None, &listing).await {
-                    let listed: Vec<ReferrerInfo> =
-                        page.items.iter().map(ReferrerInfo::from).collect();
+                if let Some(listed) = subject_referrers.remove(&digest) {
+                    let listed_infos: Vec<ReferrerInfo> =
+                        listed.descriptors.iter().map(ReferrerInfo::from).collect();
                     referrers.retain(|candidate| {
-                        !listed.iter().any(|info| info.digest == candidate.digest)
+                        !listed_infos
+                            .iter()
+                            .any(|info| info.digest == candidate.digest)
                     });
-                    referrers.extend(listed);
-                    referrers_next = page.next_token;
+                    referrers.extend(listed_infos);
+                    referrers_next = listed.next;
                 }
-
-                let pushed_at = self
-                    .metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest.clone()))
-                    .await
-                    .ok()
-                    .and_then(|m| m.created_at);
-                // A revision's last pull lives in its access entries.
-                let last_pulled_at = self
-                    .metadata_store
-                    .read_access_time(namespace, &LinkKind::Digest(digest.clone()))
-                    .await
-                    .ok()
-                    .flatten();
-                // A pull naming a tag stamps that tag alone, never the revision
-                // it resolves to, so a manifest only ever fetched by tag has no
-                // revision atime at all. Folding its tags in is what makes the
-                // reported time the manifest's last pull rather than its last
-                // pull by digest.
-                //
-                // A tag that later moves to another manifest carries its pull
-                // history to the new target, which then reports a pull that
-                // happened against the old one. Acceptable for an advisory
-                // timestamp, and the alternative is stamping the revision on
-                // every tag pull, doubling writes on the hottest path.
-                let last_pulled_at = tags
-                    .iter()
-                    .filter_map(|tag| tag_pulls.get(tag).copied())
-                    .chain(last_pulled_at)
-                    .max();
-
-                ManifestEntry {
-                    digest: digest.to_string(),
+                let pushed_at = records.get(&digest).and_then(|record| record.created_at);
+                let reads_pull_time = self.update_pull_time && !leaves.contains(&digest);
+                (
+                    digest,
                     tags,
                     parents,
                     referrers,
                     referrers_next,
                     pushed_at,
-                    last_pulled_at,
-                }
+                    reads_pull_time,
+                )
             })
-            .buffered(ADMIN_READ_CONCURRENCY)
+            .collect();
+
+        let tag_pulls = &tag_pulls;
+        stream::iter(seeds)
+            .map(
+                |(digest, tags, parents, referrers, referrers_next, pushed_at, reads_pull_time)| async move {
+                    // A revision's last pull lives in its access entries.
+                    let last_pulled_at = if reads_pull_time {
+                        self.metadata_store
+                            .read_access_time(namespace, &LinkKind::Digest(digest.clone()))
+                            .await
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    // A pull naming a tag stamps that tag alone, never the
+                    // revision it resolves to, so a manifest only ever fetched
+                    // by tag has no revision atime at all. Folding its tags in
+                    // is what makes the reported time the manifest's last pull
+                    // rather than its last pull by digest.
+                    //
+                    // A tag that later moves to another manifest carries its
+                    // pull history to the new target, which then reports a pull
+                    // that happened against the old one. Acceptable for an
+                    // advisory timestamp, and the alternative is stamping the
+                    // revision on every tag pull, doubling writes on the
+                    // hottest path.
+                    let last_pulled_at = tags
+                        .iter()
+                        .filter_map(|tag| tag_pulls.get(tag).copied())
+                        .chain(last_pulled_at)
+                        .max();
+
+                    ManifestEntry {
+                        digest: digest.to_string(),
+                        tags,
+                        parents,
+                        referrers,
+                        referrers_next,
+                        pushed_at,
+                        last_pulled_at,
+                    }
+                },
+            )
+            .buffered(self.listing_read_concurrency.get())
+            .collect()
+            .await
+    }
+
+    /// Each subject's referrers as the listing serves them. A subject carrying
+    /// the pre-API fallback tag takes the OCI listing path, which folds that
+    /// tag's index in and cuts its cursor over the same candidates the cursor
+    /// is later followed through; every other subject resolves one page of
+    /// its recorded referrers directly.
+    async fn resolve_subject_referrers(
+        &self,
+        namespace: &Namespace,
+        subjects: Vec<Digest>,
+        referrers_by_subject: &HashMap<Digest, Vec<Digest>>,
+        tag_names: &HashSet<Tag>,
+    ) -> HashMap<Digest, SubjectReferrers> {
+        stream::iter(subjects)
+            .map(|subject| async move {
+                let listed = if tag_names.contains(&subject.referrers_fallback_tag()) {
+                    let listing = GetReferrersRequest {
+                        namespace: namespace.clone(),
+                        digest: subject.clone(),
+                        artifact_type: None,
+                        last: None,
+                    };
+                    match self.list_referrers(None, &listing).await {
+                        Ok(page) => SubjectReferrers {
+                            descriptors: page.items,
+                            next: page.next_token,
+                        },
+                        Err(_) => SubjectReferrers {
+                            descriptors: Vec::new(),
+                            next: None,
+                        },
+                    }
+                } else {
+                    let mut recorded = referrers_by_subject
+                        .get(&subject)
+                        .cloned()
+                        .unwrap_or_default();
+                    recorded.sort();
+                    let page_size = usize::from(DEFAULT_PAGE_SIZE);
+                    let next = recorded
+                        .get(page_size..)
+                        .filter(|rest| !rest.is_empty())
+                        .and_then(|_| recorded.get(page_size - 1))
+                        .map(ToString::to_string);
+                    recorded.truncate(page_size);
+                    let subject = &subject;
+                    let descriptors = stream::iter(recorded)
+                        .map(|referrer| async move {
+                            self.resolve_referrer_descriptor(namespace, subject, referrer, None)
+                                .await
+                        })
+                        .buffered(REFERRER_RESOLVE_CONCURRENCY)
+                        .filter_map(|descriptor| async move { descriptor })
+                        .collect()
+                        .await;
+                    SubjectReferrers { descriptors, next }
+                };
+                (subject, listed)
+            })
+            .buffer_unordered(self.listing_read_concurrency.get())
             .collect()
             .await
     }
@@ -645,7 +839,7 @@ impl Registry {
                     .flatten()?;
                 Some((tag, at))
             })
-            .buffered(ADMIN_READ_CONCURRENCY)
+            .buffered(self.listing_read_concurrency.get())
             .filter_map(|pull| async move { pull })
             .collect()
             .await
@@ -745,8 +939,8 @@ mod tests {
         metadata_store::{AccessEntry, LinkKind, MetadataStore},
         test_utils::{
             FSRegistryTestCase, RegistryTestCase, create_test_blob, create_test_registry,
-            for_each_backend, media_type, metadata_store_over, put_blob_body, response_json,
-            seed_links,
+            create_test_registry_recording_pulls, for_each_backend, media_type,
+            metadata_store_over, put_blob_body, response_json, seed_links,
         },
     };
 
@@ -1583,7 +1777,13 @@ mod tests {
     #[tokio::test]
     async fn last_pulled_at_reports_a_pull_that_only_named_the_tag() {
         for_each_backend(async |test_case| {
-            let registry = test_case.registry();
+            // Pull times are listed only while pulls are recorded.
+            let stores = test_case.registry();
+            let registry = create_test_registry_recording_pulls(
+                stores.blob_store.clone(),
+                stores.metadata_store.clone(),
+            );
+            let registry = registry.as_ref();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("test-repo/tag-pulled").unwrap();
             let target = digest("da61");
@@ -1622,7 +1822,13 @@ mod tests {
     #[tokio::test]
     async fn last_pulled_at_takes_the_newest_of_several_tags() {
         for_each_backend(async |test_case| {
-            let registry = test_case.registry();
+            // Pull times are listed only while pulls are recorded.
+            let stores = test_case.registry();
+            let registry = create_test_registry_recording_pulls(
+                stores.blob_store.clone(),
+                stores.metadata_store.clone(),
+            );
+            let registry = registry.as_ref();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("test-repo/many-tags").unwrap();
             let target = digest("da62");
@@ -1664,7 +1870,13 @@ mod tests {
     #[tokio::test]
     async fn last_pulled_at_of_an_untagged_manifest_stays_revision_only() {
         for_each_backend(async |test_case| {
-            let registry = test_case.registry();
+            // Pull times are listed only while pulls are recorded.
+            let stores = test_case.registry();
+            let registry = create_test_registry_recording_pulls(
+                stores.blob_store.clone(),
+                stores.metadata_store.clone(),
+            );
+            let registry = registry.as_ref();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("test-repo/untagged").unwrap();
             let target = digest("da63");

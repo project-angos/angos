@@ -316,8 +316,23 @@ Delete buttons require double-click confirmation:
 
 **Deletable items:**
 - Tags (removes tag, keeps the manifest unless a retention policy allows its deletion)
-- Manifests (by digest)
+- Manifests (by digest), with what their going would orphan
 - Uploads (cancels in-progress uploads)
+
+**Deleting a manifest takes its orphans with it.** Deleting an index also deletes the platform
+manifests no other index names and that carry no tag of their own, and the referrers (signatures,
+SBOMs, scan reports) of everything removed, since a referrer without its subject has nothing left
+to describe. A platform manifest another index still names, and anything tagged, stays. The armed
+confirm button names what goes, as `confirm (+2 platform, +1 attestation)`. The registry's own
+`DELETE` is per manifest and unchanged: this is the web UI deleting what a retention policy would
+otherwise reclaim later, which matters most when no retention policy is configured, since untagged
+manifests are then kept indefinitely.
+
+**Deleting several manifests:** the **Select** button above the manifest table puts a checkbox
+on every row, with one in the header that covers the rows at the top level. **delete selected
+(N)** then arms and confirms like any other delete and sends one delete per manifest; the rows
+that went disappear at once and the refresh reconciles the rest. **Done** leaves select mode, and
+so does opening another page; the whole checkbox cell is the target, not only the box.
 
 ### Copy to Clipboard
 

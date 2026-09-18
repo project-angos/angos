@@ -45,6 +45,7 @@
 		deleting: boolean;
 		ondeletetag: (tag: string) => void;
 		ondeletebyhash: () => void;
+		deleteconfirmlabel: string;
 		onconfirmchange: (value: string | null) => void;
 		getbloburl: (blobDigest: string) => string;
 	}
@@ -64,6 +65,7 @@
 		deleting,
 		ondeletetag,
 		ondeletebyhash,
+		deleteconfirmlabel,
 		onconfirmchange,
 		getbloburl
 	}: Props = $props();
@@ -206,6 +208,7 @@
 					<td>
 						<DeleteButton
 							isConfirming={deleteConfirm === 'digest'}
+							confirmLabel={deleteconfirmlabel}
 							disabled={deleting}
 							onconfirm={ondeletebyhash}
 							oncancel={() => onconfirmchange(null)}

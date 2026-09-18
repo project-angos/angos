@@ -8,10 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Deleting a manifest in the web UI now deletes what its going would orphan: the platform manifests no other index names and that carry no tag, and the referrers of everything removed. The armed confirm button names them. The registry's `DELETE` is unchanged and still per manifest; without this the orphans lingered until a retention policy reclaimed them, and indefinitely where none is configured.
+- The web UI's manifest view has a **Select** mode: a checkbox per row, one in the header for the top-level rows, and a **delete selected (N)** action that deletes the ticked manifests with one request each and drops the rows that went without waiting for the refresh.
+- `listing_read_concurrency` under `[global]` sets how many reads an admin listing behind the web UI keeps in flight per request, so a high-latency store can be given a wider fan-out than the default of 16.
 - The web UI signs users in against an OIDC provider: `[ui.oidc]` names one of the configured `auth.oidc` providers and a public client id, and the browser runs the authorization code flow with PKCE and sends the resulting ID token as a bearer on every registry call. Sign-in starts on its own when the registry refuses a request, so a private registry needs no click and a public one is still browsed anonymously.
 
 ### Changed
 
+- The revisions listing behind the web UI's manifest view costs a fraction of the storage round trips it did: every referrer record is read in one walk instead of one listing per revision, a manifest body is read only for an index since the revision record already names the media type, the pre-API fallback tag is probed only where the tag listing shows one, and a revision that is another's referrer, listed as a leaf, has neither its record nor its pull time read, since the descriptor read for its subject already names its media type. The three namespace walks the listing starts from run together. On a namespace of 255 revisions that is under 260 operations where it was 1525; `pushed_at` and `last_pulled_at` are no longer reported for a leaf.
 - The link-metadata cache is gone and `link_cache_ttl` is ignored: every tag, revision and referrer read goes to the metadata store, so a replica never serves a tag a peer has already moved, and a shared Redis cache is no longer what makes replicas agree.
 - A manifest pull whose access-time record cannot be written now fails instead of being served unrecorded, on the pull-through and redirect paths as it already did on the local one, since retention reclaims by that record.
 - A tag entry's body is now empty: its key name already carries the ordinal, the kind and the digest, and no read path served the media type, size and annotations it held.

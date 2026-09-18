@@ -2,8 +2,8 @@
 	import { goto } from '$app/navigation';
 	import { base } from '$app/paths';
 	import { getRegistryName } from '$lib/config.svelte';
-	import { fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ReferrerInfo } from '$lib/api';
-	import { buildTree, buildTreeRows, descendantNamespaces, isInteractiveTarget, pathUrl, manifestUrl, type NamespaceDescendant, type TreeRowNode } from '$lib/utils';
+	import { fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo } from '$lib/api';
+	import { buildTree, buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, isInteractiveTarget, pathUrl, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '$lib/utils';
 	import LoadingState from '$lib/components/LoadingState.svelte';
 	import ErrorState from '$lib/components/ErrorState.svelte';
 	import Breadcrumb from '$lib/components/Breadcrumb.svelte';
@@ -11,6 +11,7 @@
 	import RepositoryTree from '$lib/components/RepositoryTree.svelte';
 	import Card from '$lib/components/Card.svelte';
 	import CopyButton from '$lib/components/CopyButton.svelte';
+	import DeleteButton from '$lib/components/DeleteButton.svelte';
 	import type { BrowseParams } from './+page';
 
 	let { data }: { data: BrowseParams } = $props();
@@ -30,6 +31,8 @@
 	);
 
 	let rows: TreeRowNode[] = $state([]);
+	// The listing the rows were built from; a delete reads what it orphans here.
+	let manifests: ManifestEntry[] = $state([]);
 	// Namespaces nested under this path, named relative to it. Counts are absent
 	// above a repository, where only the repository names are known.
 	let children: NamespaceDescendant[] = $state([]);
@@ -39,6 +42,11 @@
 	let immutableTagsExclusions: string[] = $state([]);
 	let uploads: UploadEntry[] = $state([]);
 	let selectedUploads: Set<string> = $state(new Set());
+	// Select mode over the manifest table, for deleting several at once.
+	let selectingManifests = $state(false);
+	let selectedManifests: Set<string> = $state(new Set());
+	// Rows unticked out of a cascade: kept, along with what they in turn hold.
+	let sparedManifests: Set<string> = $state(new Set());
 
 	let manifest: Manifest | null = $state(null);
 	let digest: string | null = $state(null);
@@ -125,7 +133,8 @@
 		if (revisionsResult.error) {
 			error = revisionsResult.error;
 		} else if (revisionsResult.data) {
-			rows = buildTreeRows(buildTree(revisionsResult.data.manifests ?? []));
+			manifests = revisionsResult.data.manifests ?? [];
+			rows = buildTreeRows(buildTree(manifests));
 		}
 		uploads = uploadsResult.data?.uploads ?? [];
 		if (uploadsResult.error) {
@@ -146,6 +155,10 @@
 			immutableTagsExclusions = namespacesResult.data.immutable_tags_exclusions;
 		}
 		selectedUploads = new Set();
+		// A new path is a new view: select mode does not follow across it.
+		selectedManifests = new Set();
+		sparedManifests = new Set();
+		selectingManifests = false;
 		loading = false;
 	}
 
@@ -175,6 +188,7 @@
 			const revisionsResult = await fetchRevisions(namespace);
 			if (token !== loadToken) return;
 			if (revisionsResult.data) {
+				manifests = revisionsResult.data.manifests;
 				const entry = revisionsResult.data.manifests.find(m => m.digest === digest);
 				if (entry) {
 					tags = entry.tags;
@@ -241,7 +255,76 @@
 		}
 	}
 
+	// What the current selection would take along: shown ticked and locked on
+	// the rows themselves, so an index's children read as going with it while a
+	// child another index still names visibly stays.
+	const impliedDeletes = $derived.by(() => {
+		if (selectedManifests.size === 0) return new Set<string>();
+		const cascade = deleteCascade(manifests, [...selectedManifests], sparedManifests);
+		return new Set([...cascade.platforms, ...cascade.referrers]);
+	});
+
+	// One checkbox, three meanings: a row the cascade holds is spared or taken
+	// back, anything else is picked or dropped from the selection itself.
+	function toggleManifestSelection(digest: string) {
+		if (sparedManifests.has(digest)) {
+			const spared = new Set(sparedManifests);
+			spared.delete(digest);
+			sparedManifests = spared;
+			return;
+		}
+		if (impliedDeletes.has(digest)) {
+			sparedManifests = new Set(sparedManifests).add(digest);
+			return;
+		}
+		const selected = new Set(selectedManifests);
+		if (selected.has(digest)) {
+			selected.delete(digest);
+		} else {
+			selected.add(digest);
+		}
+		selectedManifests = selected;
+	}
+
+	// The confirm label of a digest delete names what it takes along.
+	const deleteConfirmLabel = (digests: string[]) =>
+		`confirm${cascadeSummary(deleteCascade(manifests, digests, sparedManifests))}`;
+
+	// Deletes `digests` and what their going orphans, the roots first so a
+	// child is only ever removed once nothing names it. One request each: the
+	// registry has no bulk delete, and deleting stays per manifest there.
+	async function deleteWithCascade(digests: string[]) {
+		const rootResults = await Promise.all(
+			digests.map((digest) => apiDeleteManifest(data.path, digest))
+		);
+		const rootsGone = digests.filter((_, i) => rootResults[i] === null);
+		const cascade = deleteCascade(manifests, rootsGone, sparedManifests);
+		const extra = [...cascade.platforms, ...cascade.referrers];
+		const extraResults = await Promise.all(
+			extra.map((digest) => apiDeleteManifest(data.path, digest))
+		);
+		const gone = new Set([...rootsGone, ...extra.filter((_, i) => extraResults[i] === null)]);
+		return { gone, failed: digests.length + extra.length - gone.size, total: digests.length + extra.length };
+	}
+
 	async function deleteByReference(reference: string) {
+		// A tag cannot hold a colon; a digest always does. A tag delete keeps
+		// the manifest, so nothing cascades from it.
+		if (reference.includes(':')) {
+			deleting = true;
+			actionError = null;
+			const { gone, failed, total } = await deleteWithCascade([reference]);
+			rows = rows.filter((row) => !gone.has(row.digest));
+			deleteConfirm = null;
+			deleting = false;
+			if (failed > 0) {
+				actionError = `Failed to delete ${failed} of ${total} manifests.`;
+			}
+			if (gone.has(reference)) {
+				await reloadAfterDelete(reference);
+			}
+			return;
+		}
 		deleting = true;
 		actionError = null;
 		const err = await apiDeleteManifest(data.path, reference);
@@ -272,13 +355,17 @@
 		if (!digest) return;
 		deleting = true;
 		actionError = null;
-		const err = await apiDeleteManifest(data.path, digest);
-		if (err) {
-			actionError = `Delete failed (${err}).`;
-		} else {
-			await goto(pathUrl(data.path));
-		}
+		const { gone, failed, total } = await deleteWithCascade([digest]);
 		deleting = false;
+		if (!gone.has(digest)) {
+			actionError = `Delete failed.`;
+			return;
+		}
+		// The view leaves for the namespace; a cascade failure is reported there.
+		if (failed > 0) {
+			actionError = `Failed to delete ${failed} of ${total} manifests.`;
+		}
+		await goto(pathUrl(data.path));
 	}
 
 	async function cancelUpload(uuid: string) {
@@ -292,6 +379,25 @@
 			await loadBrowse(data.path, true);
 		}
 		deleting = false;
+	}
+
+	// One request per manifest: the registry has no bulk delete. Rows that
+	// went are dropped at once and the controls come back before the refresh,
+	// which reconciles what the deletes cascaded to.
+	async function deleteSelectedManifests() {
+		deleting = true;
+		actionError = null;
+		const { gone, failed, total } = await deleteWithCascade([...selectedManifests]);
+		rows = rows.filter((row) => !gone.has(row.digest));
+		selectedManifests = new Set();
+		sparedManifests = new Set();
+		selectingManifests = false;
+		deleteConfirm = null;
+		deleting = false;
+		if (failed > 0) {
+			actionError = `Failed to delete ${failed} of ${total} manifests.`;
+		}
+		await loadBrowse(data.path, true);
 	}
 
 	async function cancelSelectedUploads() {
@@ -331,7 +437,39 @@
 	<CopyButton text={fullName} label={isManifestView ? 'Copy the reference' : 'Copy the namespace'} />
 </div>
 {#if !isManifestView}
-	<p class="lede">{loading ? '\u00a0' : summary}</p>
+	<!-- The count and the manifest-table actions share a line. -->
+	<div class="lede-row">
+		<p class="lede">{loading ? '\u00a0' : summary}</p>
+		{#if rows.length > 0}
+			<div class="table-actions">
+				{#if selectingManifests && selectedManifests.size > 0}
+					<DeleteButton
+						label={`delete selected (${selectedManifests.size + impliedDeletes.size})`}
+						confirmLabel={deleteConfirm === selectedManifestsConfirmKey
+							? deleteConfirmLabel([...selectedManifests])
+							: 'confirm'}
+						isConfirming={deleteConfirm === selectedManifestsConfirmKey}
+						disabled={deleting}
+						onconfirm={deleteSelectedManifests}
+						oncancel={() => (deleteConfirm = null)}
+						onrequestconfirm={() => (deleteConfirm = selectedManifestsConfirmKey)}
+					/>
+				{/if}
+				<button
+					class="secondary"
+					onclick={() => {
+						selectingManifests = !selectingManifests;
+						selectedManifests = new Set();
+						sparedManifests = new Set();
+						deleteConfirm = null;
+					}}
+					disabled={deleting}
+				>
+					{selectingManifests ? 'Done' : 'Select'}
+				</button>
+			</div>
+		{/if}
+	</div>
 {/if}
 
 {#if actionError}
@@ -358,6 +496,7 @@
 		{deleting}
 		ondeletetag={deleteByReference}
 		ondeletebyhash={deleteByHash}
+		deleteconfirmlabel={digest ? deleteConfirmLabel([digest]) : 'confirm'}
 		onconfirmchange={(value) => deleteConfirm = value}
 		getbloburl={(blobDigest) => blobUrl(data.path, blobDigest)}
 	/>
@@ -417,6 +556,9 @@
 		{rows}
 		{uploads}
 		{selectedUploads}
+		{selectingManifests}
+		{selectedManifests}
+		{impliedDeletes}
 		{deleteConfirm}
 		{deleting}
 		{expanded}
@@ -427,11 +569,30 @@
 		oncancelupload={cancelUpload}
 		onuploadselectionchange={(selected) => selectedUploads = selected}
 		oncancelselecteduploads={cancelSelectedUploads}
+		onmanifestselectionchange={(selected) => selectedManifests = selected}
+		{toggleManifestSelection}
+		getdeleteconfirmlabel={deleteConfirmLabel}
 	/>
 	{/if}
 {/if}
 
 <style>
+	/* The count and the table's actions on one line, the actions to the right. */
+	.lede-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+		margin-bottom: 1.25rem;
+	}
+	.lede-row .lede {
+		margin: 0;
+	}
+	.table-actions {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
 	.title {
 		display: flex;
 		align-items: center;

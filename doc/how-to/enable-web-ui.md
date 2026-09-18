@@ -208,8 +208,9 @@ URLs follow Docker reference format:
 Click a delete button once to arm, click again to confirm.
 
 - **Delete tag**: Removes tag, keeps manifest if other tags exist
-- **Delete manifest**: Removes by digest
+- **Delete manifest**: Removes by digest, along with the platform manifests and referrers its going orphans (anything tagged, or still named by another index, stays)
 - **Cancel upload**: Aborts in-progress uploads
+- **Delete several**: **Select** above the manifest table adds a checkbox per row; **delete selected (N)** removes the ticked ones
 
 ### Theme Toggle
 

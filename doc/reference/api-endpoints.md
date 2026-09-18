@@ -355,6 +355,13 @@ GET /v2/{namespace}/_angos/revisions/list
 
 List all manifest revisions with tags, parent relationships, and referrers.
 
+A revision that is itself another's referrer is listed as a leaf: the web UI shows it under its
+subject with no push or pull time, so neither `pushed_at` nor `last_pulled_at` is reported for it.
+`last_pulled_at` is reported for the rest only while `update_pull_time` records pulls. The listing
+reads one record per root revision, one descriptor per referrer, and a manifest body only for an
+index, with the fan-out set by `listing_read_concurrency`; its cost is set by the number of roots
+and referrers rather than by a round trip per manifest field.
+
 **Response:**
 ```json
 {
