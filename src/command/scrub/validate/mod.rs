@@ -151,6 +151,9 @@ impl Validator {
                 self.validate_upload_artifact(key, &namespace, artifact)
                     .await
             }
+            (Pass::MetadataLinks, KeyCategory::CatalogIndex { namespace }) => {
+                self.validate_catalog_index(&namespace).await
+            }
             (pass, KeyCategory::Unknown) => self.quarantine(walked_store(pass), key).await,
             // A known category needing nothing here: owned by another pass or
             // the other store, write-once tag history, or a live run marker.

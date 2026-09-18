@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `angos scrub` now removes the catalog index key of a namespace that holds no revision or tag, once the key is past the grace window, so a namespace whose content was all deleted leaves the `_angos/repositories/list` and `_angos/namespaces/list` listings and the web UI. The reference documented this reaping, but no code performed it: scrub only ever wrote a missing key, and an emptied namespace stayed listed with zero counts indefinitely.
 - Deleting a tag in the web UI now drops it from the view as soon as the registry answers, instead of holding the view until the namespace had been listed again: that listing reads every manifest and its referrers, so on a namespace of any size it took far longer than the delete it was reflecting.
 - The revisions listing no longer names a buildx attestation twice: the manifest an index points at through its `vnd.docker.reference.digest` annotation is recorded in the referrers index as well, and both were merged, so the entry appeared once without an artifact type and once with it. The web UI rendered the pair as duplicate rows and failed to expand the manifest.
 - A filtered referrers listing now serves a full page whenever that many matches remain, where the page was cut over the candidates before the `artifactType` filter ran: a subject whose first hundred referrers were all of another type answered with an empty page, leaving a client that stops on one to miss every match behind it.

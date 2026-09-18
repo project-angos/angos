@@ -683,6 +683,46 @@ async fn orphan_referrer_record_is_deleted() {
     .await;
 }
 
+/// The catalog index key of a namespace that holds no revision or tag is
+/// reaped, so an emptied namespace leaves the admin listings; the key of a
+/// namespace with content is left alone.
+#[tokio::test]
+async fn catalog_index_key_of_an_emptied_namespace_is_reaped() {
+    for_each_backend(async |test_case| {
+        let metadata_store = test_case.metadata_store();
+        let emptied = &Namespace::new("test-repo/emptied").unwrap();
+        let populated = &Namespace::new("test-repo/populated").unwrap();
+        push_healthy_image(test_case, populated).await;
+        // What a namespace looks like once its last manifest was deleted: the
+        // index key its first push wrote, and nothing behind it.
+        metadata_store
+            .object_store()
+            .put(&emptied.catalog_index_path(), Bytes::new())
+            .await
+            .unwrap();
+
+        scrub_apply(test_case).await;
+
+        assert!(
+            !metadata_store
+                .object_store()
+                .exists(&emptied.catalog_index_path())
+                .await
+                .unwrap(),
+            "an emptied namespace's catalog key must be reaped"
+        );
+        assert!(
+            metadata_store
+                .object_store()
+                .exists(&populated.catalog_index_path())
+                .await
+                .unwrap(),
+            "a namespace holding content must keep its catalog key"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn unknown_keys_are_quarantined_in_both_stores() {
     for_each_backend(async |test_case| {

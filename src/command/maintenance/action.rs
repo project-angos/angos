@@ -57,6 +57,11 @@ pub enum Action {
     EnsureCatalogIndex {
         namespace: Namespace,
     },
+    /// Remove the catalog index key of a namespace holding no revision or
+    /// tag, so an emptied namespace leaves the admin listings.
+    ReapCatalogIndex {
+        namespace: Namespace,
+    },
     /// Revoke a namespace's blob-ownership grant no manifest references,
     /// reclaiming the bytes when it was the last reference anywhere.
     RemoveOrphanBlobGrant {
@@ -204,6 +209,12 @@ impl fmt::Display for Action {
             }
             Action::EnsureCatalogIndex { namespace } => {
                 write!(f, "write missing catalog index key for '{namespace}'")
+            }
+            Action::ReapCatalogIndex { namespace } => {
+                write!(
+                    f,
+                    "remove catalog index key of emptied namespace '{namespace}'"
+                )
             }
             Action::RemoveOrphanBlobGrant { namespace, blob } => {
                 write!(
