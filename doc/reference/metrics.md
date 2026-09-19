@@ -30,7 +30,7 @@ Total number of HTTP requests.
 | Counter | `method`, `route`, `status` |
 
 **Labels:**
-- `method`: HTTP method (`GET`, `POST`, `PUT`, `DELETE`, etc.)
+- `method`: HTTP method (`GET`, `POST`, `PUT`, `DELETE`, etc.); any other method is `other`
 - `route`: Route action (e.g., `get-manifest`, `get-blob`, `list-tags`)
 - `status`: HTTP status code (`200`, `404`, `500`, etc.)
 
@@ -56,6 +56,8 @@ HTTP request latency in milliseconds.
 | Type      | Labels            |
 |-----------|-------------------|
 | Histogram | `method`, `route` |
+
+Buckets: 1, 5, 10, 25, 50, 100, 250 and 500 ms, then 1, 2.5, 5, 10, 30 and 60 s.
 
 **Example:**
 ```promql
@@ -92,41 +94,45 @@ max_over_time(http_requests_in_flight[1h])
 
 ### Route Values
 
-The `route` label uses action names from the OCI Distribution API:
+The `route` label is the endpoint name. It is close to the action name an access policy sees (see [CEL Expressions](cel-expressions.md)) but not identical: the version check, `HEAD` requests and the upload steps are told apart here.
 
-| Route               | Description        |
-|---------------------|--------------------|
-| `healthz`           | Health check       |
-| `readyz`            | Readiness check    |
-| `metrics`           | Prometheus metrics |
-| `get-api-version`   | API version check  |
-| `get-blob`          | Download blob      |
-| `delete-blob`       | Delete blob        |
-| `mount-blob`        | Cross-repo blob mount |
-| `start-upload`      | Start blob upload  |
-| `update-upload`     | Chunk upload       |
-| `complete-upload`   | Complete upload    |
-| `get-upload`        | Upload status      |
-| `cancel-upload`     | Cancel upload      |
-| `get-manifest`      | Pull manifest      |
-| `put-manifest`      | Push manifest      |
-| `delete-manifest`   | Delete manifest    |
-| `list-tags`         | List tags          |
-| `list-catalog`      | List repositories  |
-| `get-referrers`     | Get referrers      |
-| `ui-asset`          | UI static files    |
-| `ui-config`         | UI configuration   |
-| `get-token`         | Token service      |
-| `list-repositories` | Extension API      |
-| `list-namespaces`   | Extension API      |
-| `list-revisions`    | Extension API, also the pull-history endpoint |
-| `list-uploads`      | Extension API      |
-| `list-jobs`         | List pending jobs  |
-| `list-failed-jobs`  | List dead-letter jobs |
-| `retry-job`         | Requeue dead-letter job |
-| `delete-job`        | Delete queued job  |
-| `unknown`           | Unrecognized route |
-
+| Route                | Description |
+|----------------------|-------------|
+| `healthz`            | Health check |
+| `readyz`             | Readiness check |
+| `metrics`            | Prometheus metrics |
+| `check-version`      | API version check, `GET /v2/` |
+| `get-manifest`       | Pull manifest |
+| `head-manifest`      | Manifest existence check |
+| `put-manifest`       | Push manifest |
+| `delete-manifest`    | Delete manifest |
+| `get-blob`           | Download blob |
+| `head-blob`          | Blob existence check |
+| `delete-blob`        | Delete blob |
+| `start-upload`       | Start blob upload |
+| `mount-blob`         | Cross-repo blob mount |
+| `get-upload`         | Upload status |
+| `patch-upload`       | Chunk upload |
+| `put-upload`         | Complete upload |
+| `delete-upload`      | Cancel upload |
+| `list-tags`          | List tags |
+| `get-referrers`      | Get referrers |
+| `list-catalog`       | List repositories, `/v2/_catalog` |
+| `ui-asset`           | UI static files |
+| `ui-config`          | UI configuration |
+| `get-token`          | Token service |
+| `list-repositories`  | Extension API |
+| `list-namespaces`    | Extension API |
+| `list-revisions`     | Extension API |
+| `list-uploads`       | Extension API |
+| `list-pulls`         | Extension API, the pull-history endpoint |
+| `list-layer-entries` | Extension API, the entries of a layer |
+| `get-layer-file`     | Extension API, one file out of a layer |
+| `list-jobs`          | List pending jobs |
+| `list-failed-jobs`   | List dead-letter jobs |
+| `retry-job`          | Requeue dead-letter job |
+| `delete-job`         | Delete queued job |
+| `unknown`            | Unrecognized route |
 ---
 
 ## Authentication Metrics

@@ -55,7 +55,7 @@ impl Registry {
     /// One page of namespaces the caller may list, advertising the next through
     /// the `Link` header while the listing is not exhausted. `visibility` drops
     /// the entries the caller's access policy hides.
-    pub async fn list_catalog_entries(
+    pub async fn handle_list_catalog(
         &self,
         request: CatalogRequest,
         visibility: &dyn NamespaceVisibility,
@@ -86,7 +86,7 @@ impl Registry {
 
     /// One page of a namespace's tags, advertising the next through the `Link`
     /// header while the listing is not exhausted.
-    pub async fn list_tag_entries(&self, request: ListTagsRequest) -> Result<Tags, Error> {
+    pub async fn handle_list_tags(&self, request: ListTagsRequest) -> Result<Tags, Error> {
         let n = request.n.unwrap_or(DEFAULT_PAGE_SIZE);
         let page = self
             .metadata_store
@@ -123,7 +123,7 @@ impl Registry {
     /// One page of a subject's referrers, served as the OCI image index that
     /// carries them.
     #[instrument(skip(request))]
-    pub async fn get_referrers(
+    pub async fn handle_get_referrers(
         &self,
         mut request: GetReferrersRequest,
     ) -> Result<Referrers, Error> {
@@ -460,7 +460,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let response = test_case
                 .registry()
-                .list_catalog_entries(
+                .handle_list_catalog(
                     CatalogRequest {
                         n: None,
                         last: None,
@@ -497,7 +497,7 @@ mod tests {
 
             let list = async |n: Option<u16>, last: Option<String>| {
                 registry
-                    .list_tag_entries(ListTagsRequest {
+                    .handle_list_tags(ListTagsRequest {
                         namespace: namespace.clone(),
                         n,
                         last,
@@ -575,7 +575,7 @@ mod tests {
                 .is_some_and(|i| i % 3 == 0)
         };
         let response = registry
-            .list_catalog_entries(
+            .handle_list_catalog(
                 CatalogRequest {
                     n: Some(2),
                     last: None,
@@ -590,7 +590,7 @@ mod tests {
         assert_eq!(catalog(response).await, ["vis-00", "vis-03"]);
 
         let response = registry
-            .list_catalog_entries(
+            .handle_list_catalog(
                 CatalogRequest {
                     n: Some(2),
                     last: cursor,
@@ -637,7 +637,7 @@ mod tests {
 
         loop {
             let response = registry
-                .list_catalog_entries(CatalogRequest { n: Some(2), last }, &|_: &Namespace| true)
+                .handle_list_catalog(CatalogRequest { n: Some(2), last }, &|_: &Namespace| true)
                 .await
                 .unwrap()
                 .into_response()
@@ -672,7 +672,7 @@ mod tests {
         let registry = test_case.registry();
 
         let result = registry
-            .list_tag_entries(ListTagsRequest {
+            .handle_list_tags(ListTagsRequest {
                 namespace: Namespace::new("no-such-repo/no-such-image").unwrap(),
                 n: None,
                 last: None,
@@ -704,7 +704,7 @@ mod tests {
         .unwrap();
 
         let response = registry
-            .list_tag_entries(ListTagsRequest {
+            .handle_list_tags(ListTagsRequest {
                 namespace,
                 n: None,
                 last: None,
@@ -734,7 +734,7 @@ mod tests {
             let (base_manifest_digest, _) =
                 create_test_blob(registry, namespace, manifest_content.as_bytes()).await;
             registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Digest(base_manifest_digest.clone()),
                     Some(&media_type),
@@ -746,7 +746,7 @@ mod tests {
             let (referrer_manifest_digest, _) =
                 create_test_blob(registry, namespace, manifest_content.as_bytes()).await;
             registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Digest(referrer_manifest_digest.clone()),
                     Some(&media_type),
@@ -1230,7 +1230,7 @@ mod tests {
         let mut pages = 0;
         loop {
             let response = registry
-                .get_referrers(GetReferrersRequest {
+                .handle_get_referrers(GetReferrersRequest {
                     namespace: referrer_namespace(),
                     digest: subject(),
                     artifact_type: None,

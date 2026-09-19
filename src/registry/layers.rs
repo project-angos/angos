@@ -32,7 +32,7 @@ impl Registry {
     /// The listing, or 202 while the index job it enqueues runs; 404 for a
     /// layer the namespace does not own, like the blob itself.
     #[instrument(skip(self))]
-    pub async fn get_layer_entries(
+    pub async fn handle_list_layer_entries(
         &self,
         request: LayerEntriesRequest,
     ) -> Result<LayerEntries, Error> {
@@ -56,7 +56,7 @@ impl Registry {
 
     /// One file's bytes out of the layer, decoded from the nearest checkpoint.
     #[instrument(skip(self))]
-    pub async fn get_layer_file(
+    pub async fn handle_get_layer_file(
         &self,
         request: LayerFileRequest,
     ) -> Result<LayerFile<LayerFileReader>, Error> {

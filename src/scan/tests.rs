@@ -281,7 +281,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
     let accepted = [MediaRange::from(MediaType::oci_manifest())];
     let latest = Tag::new("latest").unwrap();
     let pull = || {
-        registry.get_manifest(
+        registry.get_manifest_direct(
             Some(repository),
             &accepted,
             &namespace,
@@ -343,7 +343,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
             tags: Vec::new(),
             source_ts: None,
         };
-        registry.accept_put_manifest(None, request, Cursor::new(body.into_bytes()))
+        registry.handle_put_manifest(None, request, Cursor::new(body.into_bytes()))
     };
     let descriptor = |media: &str, digest: &Digest| {
         format!(r#"{{"mediaType":"{media}","digest":"{digest}","size":1}}"#)

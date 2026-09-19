@@ -190,7 +190,7 @@ impl Registry {
     /// when a `?digest=` POST carries the whole blob, otherwise a new session
     /// (`202`).
     #[instrument(skip(request, stream), fields(namespace = %request.namespace))]
-    pub async fn start_upload<S>(
+    pub async fn handle_start_upload<S>(
         &self,
         actor: Option<EventActor>,
         request: StartUploadRequest,
@@ -235,7 +235,7 @@ impl Registry {
             .await?;
 
         Ok(StartUpload::Completed(Box::new(
-            self.complete_upload(
+            self.handle_complete_upload(
                 actor,
                 CompleteUploadRequest {
                     namespace: request.namespace.clone(),
@@ -258,7 +258,7 @@ impl Registry {
     /// The `blob.push` intent event fires before the mount attempt, so a
     /// mounted blob is as visible to webhook consumers as an uploaded one.
     #[instrument(skip(request))]
-    pub async fn mount_blob(
+    pub async fn handle_mount_blob(
         &self,
         actor: Option<EventActor>,
         request: MountBlobRequest,
@@ -383,7 +383,7 @@ impl Registry {
     }
 
     #[instrument(skip(stream))]
-    pub async fn patch_upload<S>(
+    pub async fn handle_patch_upload<S>(
         &self,
         request: PatchUploadRequest,
         stream: S,
@@ -456,7 +456,7 @@ impl Registry {
             digest = %request.digest,
         )
     )]
-    pub async fn complete_upload<S>(
+    pub async fn handle_complete_upload<S>(
         &self,
         actor: Option<EventActor>,
         request: CompleteUploadRequest,
@@ -576,7 +576,10 @@ impl Registry {
     }
 
     #[instrument]
-    pub async fn delete_upload(&self, request: DeleteUploadRequest) -> Result<NoContent, Error> {
+    pub async fn handle_cancel_upload(
+        &self,
+        request: DeleteUploadRequest,
+    ) -> Result<NoContent, Error> {
         self.blob_store
             .delete_upload(&request.namespace, &request.session_id)
             .await?;
@@ -585,7 +588,7 @@ impl Registry {
     }
 
     #[instrument]
-    pub async fn get_upload_status(
+    pub async fn handle_upload_status(
         &self,
         request: GetUploadRequest,
     ) -> Result<UploadSession, Error> {
@@ -680,7 +683,7 @@ mod tests {
             let content = b"test upload content";
 
             let response = registry
-                .start_upload(
+                .handle_start_upload(
                     None,
                     StartUploadRequest {
                         namespace: namespace.clone(),
@@ -704,7 +707,7 @@ mod tests {
 
             let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
             let response = registry
-                .start_upload(
+                .handle_start_upload(
                     None,
                     StartUploadRequest {
                         namespace: namespace.clone(),
@@ -733,7 +736,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .start_upload(
+                .handle_start_upload(
                     None,
                     StartUploadRequest {
                         namespace: namespace.clone(),
@@ -779,7 +782,7 @@ mod tests {
                 from: Some(source.clone()),
             };
             let response = registry
-                .mount_blob(
+                .handle_mount_blob(
                     None,
                     MountBlobRequest {
                         namespace: target.clone(),
@@ -828,7 +831,7 @@ mod tests {
                 from: Some(source.clone()),
             };
             let response = registry
-                .mount_blob(
+                .handle_mount_blob(
                     None,
                     MountBlobRequest {
                         namespace: target.clone(),
@@ -883,7 +886,7 @@ mod tests {
                 from: Some(source.clone()),
             };
             let response = registry
-                .mount_blob(
+                .handle_mount_blob(
                     None,
                     MountBlobRequest {
                         namespace: target.clone(),
@@ -925,7 +928,7 @@ mod tests {
                 from: None,
             };
             let response = registry
-                .mount_blob(
+                .handle_mount_blob(
                     None,
                     MountBlobRequest {
                         namespace: target.clone(),
@@ -971,7 +974,7 @@ mod tests {
                 from: None,
             };
             let response = registry
-                .mount_blob(
+                .handle_mount_blob(
                     None,
                     MountBlobRequest {
                         namespace: target.clone(),
@@ -1016,7 +1019,7 @@ mod tests {
                 from: None,
             };
             let response = registry
-                .mount_blob(
+                .handle_mount_blob(
                     None,
                     MountBlobRequest {
                         namespace: target.clone(),
@@ -1120,7 +1123,7 @@ mod tests {
 
             let stream = Cursor::new(content);
             let response = registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1141,7 +1144,7 @@ mod tests {
             let additional_content = b" additional";
             let stream = Cursor::new(additional_content);
             let response = registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1192,7 +1195,7 @@ mod tests {
                 .unwrap();
 
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1206,7 +1209,7 @@ mod tests {
 
             let expected_digest = Digest::sha256_of_bytes(content);
             registry
-                .complete_upload(
+                .handle_complete_upload(
                     None,
                     CompleteUploadRequest {
                         namespace: namespace.clone(),
@@ -1244,7 +1247,7 @@ mod tests {
 
             let stream = Cursor::new(content);
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1260,7 +1263,7 @@ mod tests {
 
             let empty_stream = Cursor::new(Vec::new());
             let response = registry
-                .complete_upload(
+                .handle_complete_upload(
                     None,
                     CompleteUploadRequest {
                         namespace: namespace.clone(),
@@ -1311,7 +1314,7 @@ mod tests {
 
                 let expected_digest = Digest::from_bytes(algorithm, content);
                 let response = registry
-                    .complete_upload(
+                    .handle_complete_upload(
                         None,
                         CompleteUploadRequest {
                             namespace: namespace.clone(),
@@ -1348,7 +1351,7 @@ mod tests {
         let digest = Digest::sha256_of_bytes(content);
 
         let error = registry
-            .complete_upload(
+            .handle_complete_upload(
                 None,
                 CompleteUploadRequest {
                     namespace: namespace.clone(),
@@ -1379,7 +1382,7 @@ mod tests {
         let digest = put_blob_direct(test_case.metadata_store().object_store(), content).await;
 
         let response = registry
-            .complete_upload(
+            .handle_complete_upload(
                 None,
                 CompleteUploadRequest {
                     namespace: namespace.clone(),
@@ -1414,7 +1417,7 @@ mod tests {
                 .unwrap();
 
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1426,7 +1429,7 @@ mod tests {
                 .await
                 .unwrap();
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1443,7 +1446,7 @@ mod tests {
 
             let expected_digest = Digest::from_bytes(Algorithm::Sha512, full_content);
             let response = registry
-                .complete_upload(
+                .handle_complete_upload(
                     None,
                     CompleteUploadRequest {
                         namespace: namespace.clone(),
@@ -1486,7 +1489,7 @@ mod tests {
                 .unwrap();
 
             let result = registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1533,7 +1536,7 @@ mod tests {
                 .await
                 .unwrap();
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1547,7 +1550,7 @@ mod tests {
 
             let offset = committed.len() as u64;
             let result = registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1595,7 +1598,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1627,7 +1630,7 @@ mod tests {
             let digest = Digest::sha256_of_bytes(b"");
 
             let response = registry
-                .start_upload(
+                .handle_start_upload(
                     None,
                     StartUploadRequest {
                         namespace: namespace.clone(),
@@ -1661,7 +1664,7 @@ mod tests {
             let digest = Digest::sha256_of_bytes(content);
 
             let response = registry
-                .start_upload(
+                .handle_start_upload(
                     None,
                     StartUploadRequest {
                         namespace: namespace.clone(),
@@ -1699,7 +1702,7 @@ mod tests {
             let claimed = Digest::sha256_of_bytes(b"something else entirely");
 
             let result = registry
-                .start_upload(
+                .handle_start_upload(
                     None,
                     StartUploadRequest {
                         namespace: namespace.clone(),
@@ -1738,7 +1741,7 @@ mod tests {
                 .await
                 .unwrap();
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1752,7 +1755,7 @@ mod tests {
 
             let expected_digest = Digest::from_bytes(Algorithm::Sha512, content);
             let response = registry
-                .complete_upload(
+                .handle_complete_upload(
                     None,
                     CompleteUploadRequest {
                         namespace: namespace.clone(),
@@ -1789,7 +1792,7 @@ mod tests {
                 .await
                 .unwrap();
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1802,7 +1805,7 @@ mod tests {
                 .unwrap();
 
             let result = registry
-                .complete_upload(
+                .handle_complete_upload(
                     None,
                     CompleteUploadRequest {
                         namespace: namespace.clone(),
@@ -1838,7 +1841,7 @@ mod tests {
                 .unwrap();
 
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -1852,7 +1855,7 @@ mod tests {
 
             let wrong_digest = Digest::from_bytes(Algorithm::Sha512, b"different content");
             let result = registry
-                .complete_upload(
+                .handle_complete_upload(
                     None,
                     CompleteUploadRequest {
                         namespace: namespace.clone(),
@@ -1891,7 +1894,7 @@ mod tests {
             .unwrap();
 
         registry
-            .patch_upload(
+            .handle_patch_upload(
                 PatchUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),
@@ -1905,7 +1908,7 @@ mod tests {
 
         let expected_digest = Digest::sha256_of_bytes(content);
         let response = registry
-            .complete_upload(
+            .handle_complete_upload(
                 None,
                 CompleteUploadRequest {
                     namespace: namespace.clone(),
@@ -1956,7 +1959,7 @@ mod tests {
             .await
             .unwrap();
         registry
-            .patch_upload(
+            .handle_patch_upload(
                 PatchUploadRequest {
                     namespace: second_namespace.clone(),
                     session_id: session_id.clone(),
@@ -1969,7 +1972,7 @@ mod tests {
             .unwrap();
 
         registry
-            .complete_upload(
+            .handle_complete_upload(
                 None,
                 CompleteUploadRequest {
                     namespace: second_namespace.clone(),
@@ -2031,7 +2034,7 @@ mod tests {
             .unwrap();
 
         registry
-            .complete_upload(
+            .handle_complete_upload(
                 None,
                 CompleteUploadRequest {
                     namespace: second_namespace.clone(),
@@ -2085,7 +2088,7 @@ mod tests {
             );
 
             registry
-                .delete_upload(DeleteUploadRequest {
+                .handle_cancel_upload(DeleteUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),
                 })
@@ -2118,7 +2121,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .get_upload_status(GetUploadRequest {
+                .handle_upload_status(GetUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),
                 })
@@ -2130,7 +2133,7 @@ mod tests {
 
             let stream = Cursor::new(content);
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -2143,7 +2146,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .get_upload_status(GetUploadRequest {
+                .handle_upload_status(GetUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),
                 })
@@ -2174,7 +2177,7 @@ mod tests {
 
             let stream = Cursor::new(b"some data".to_vec());
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -2188,7 +2191,7 @@ mod tests {
 
             let stream = Cursor::new(b"more data".to_vec());
             let result = registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -2222,7 +2225,7 @@ mod tests {
 
             let stream = Cursor::new(b"test content".to_vec());
             registry
-                .patch_upload(
+                .handle_patch_upload(
                     PatchUploadRequest {
                         namespace: namespace.clone(),
                         session_id: session_id.clone(),
@@ -2241,7 +2244,7 @@ mod tests {
 
             let empty_stream = Cursor::new(Vec::new());
             let result = registry
-                .complete_upload(
+                .handle_complete_upload(
                     None,
                     CompleteUploadRequest {
                         namespace: namespace.clone(),
@@ -2286,7 +2289,7 @@ mod tests {
 
             // Declare far fewer bytes than the body actually carries.
             let result = registry
-                .complete_upload(
+                .handle_complete_upload(
                     None,
                     CompleteUploadRequest {
                         namespace: namespace.clone(),
@@ -2409,7 +2412,7 @@ mod tests {
 
         let stream = Cursor::new(content);
         registry
-            .patch_upload(
+            .handle_patch_upload(
                 PatchUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),
@@ -2438,7 +2441,7 @@ mod tests {
 
         let empty_stream = Cursor::new(Vec::new());
         let result = registry
-            .complete_upload(
+            .handle_complete_upload(
                 None,
                 CompleteUploadRequest {
                     namespace: namespace.clone(),
@@ -2507,7 +2510,7 @@ mod tests {
 
         let content = b"way past the eight byte cap";
         let result = registry
-            .patch_upload(
+            .handle_patch_upload(
                 PatchUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),
@@ -2549,7 +2552,7 @@ mod tests {
         // detected after the write.
         let content = b"way past the eight byte cap";
         let result = registry
-            .patch_upload(
+            .handle_patch_upload(
                 PatchUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),
@@ -2591,7 +2594,7 @@ mod tests {
         let content = b"single chunked PUT over the cap";
         let digest = Digest::sha256_of_bytes(content);
         let result = registry
-            .complete_upload(
+            .handle_complete_upload(
                 None,
                 CompleteUploadRequest {
                     namespace: namespace.clone(),
@@ -2639,7 +2642,7 @@ mod tests {
 
         let claim = store.gc_claim(&digest, &digest).await.unwrap();
         let result = registry
-            .complete_upload(
+            .handle_complete_upload(
                 None,
                 CompleteUploadRequest {
                     namespace: namespace.clone(),
@@ -2674,7 +2677,7 @@ mod tests {
 
         // Exactly at the cap, via both the known-length and chunked paths.
         registry
-            .patch_upload(
+            .handle_patch_upload(
                 PatchUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),
@@ -2686,7 +2689,7 @@ mod tests {
             .await
             .expect("a body within the cap must be accepted");
         registry
-            .patch_upload(
+            .handle_patch_upload(
                 PatchUploadRequest {
                     namespace: namespace.clone(),
                     session_id: session_id.clone(),

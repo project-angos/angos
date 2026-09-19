@@ -176,7 +176,7 @@ fn parent_refs_for(
 
 impl Registry {
     #[instrument(skip(self, visibility))]
-    pub async fn get_repositories_info(
+    pub async fn handle_list_repositories(
         &self,
         visibility: &dyn NamespaceVisibility,
     ) -> Result<RepositoriesBody, Error> {
@@ -214,7 +214,7 @@ impl Registry {
     }
 
     #[instrument(skip(self, visibility))]
-    pub async fn get_namespaces_info(
+    pub async fn handle_list_namespaces(
         &self,
         repository: &Namespace,
         visibility: &dyn NamespaceVisibility,
@@ -282,7 +282,10 @@ impl Registry {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_revisions_info(&self, namespace: &Namespace) -> Result<RevisionsBody, Error> {
+    pub async fn handle_list_revisions(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<RevisionsBody, Error> {
         // Materialized once: every step below needs the full revision set. The
         // three walks are independent, so they go out together.
         let (all_revisions, digest_to_tags, referrers_by_subject) = try_join!(
@@ -356,7 +359,7 @@ impl Registry {
 
     /// The newest recorded pulls of one tag or revision, newest first.
     #[instrument(skip(self))]
-    pub async fn get_pull_history(&self, request: ListPullsRequest) -> Result<PullsBody, Error> {
+    pub async fn handle_list_pulls(&self, request: ListPullsRequest) -> Result<PullsBody, Error> {
         let ListPullsRequest {
             namespace,
             reference,
@@ -384,7 +387,7 @@ impl Registry {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_uploads_info(&self, namespace: &Namespace) -> Result<UploadsBody, Error> {
+    pub async fn handle_list_uploads(&self, namespace: &Namespace) -> Result<UploadsBody, Error> {
         let mut session_ids: Vec<UploadSessionId> = self
             .blob_store
             .stream_uploads(namespace)
@@ -422,7 +425,7 @@ impl Registry {
     /// `after` is the plain storage key from a previous page's `next`. A row
     /// deleted mid-scan is silently skipped.
     #[instrument(skip(self))]
-    pub async fn get_jobs_info(&self, request: ListJobsRequest) -> Result<JobsBody, Error> {
+    pub async fn handle_list_jobs(&self, request: ListJobsRequest) -> Result<JobsBody, Error> {
         let ListJobsRequest { queue, n, after } = request;
         let queue = Queue::from(queue);
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
@@ -461,7 +464,7 @@ impl Registry {
     /// One keyset page of dead-letter jobs on `queue`; see
     /// [`Self::get_jobs_info`] for the cursor and skip semantics.
     #[instrument(skip(self))]
-    pub async fn get_failed_jobs_info(
+    pub async fn handle_list_failed_jobs(
         &self,
         request: ListJobsRequest,
     ) -> Result<FailedJobsBody, Error> {
@@ -502,7 +505,7 @@ impl Registry {
     /// Requeue a dead-letter job on `queue` with its attempts reset to zero; a
     /// stale key surfaces as [`Error::NotFound`].
     #[instrument(skip(self))]
-    pub async fn retry_failed_job(&self, request: RetryJobRequest) -> Result<NoContent, Error> {
+    pub async fn handle_retry_job(&self, request: RetryJobRequest) -> Result<NoContent, Error> {
         self.job_queue
             .retry_failed(Queue::from(request.queue), &request.storage_key)
             .await?;
@@ -513,7 +516,7 @@ impl Registry {
     /// Delete a job on `queue` in the given partition; a stale key surfaces as
     /// [`Error::NotFound`].
     #[instrument(skip(self))]
-    pub async fn delete_job(&self, request: DeleteJobRequest) -> Result<NoContent, Error> {
+    pub async fn handle_delete_job(&self, request: DeleteJobRequest) -> Result<NoContent, Error> {
         self.job_queue
             .delete_job(
                 Queue::from(request.queue),
@@ -1017,7 +1020,7 @@ mod tests {
         let registry = create_test_registry(case.blob_store(), metadata_store_over(hooked));
 
         registry
-            .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+            .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
             .await
             .unwrap();
 
@@ -1251,7 +1254,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+                .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1283,7 +1286,7 @@ mod tests {
             );
 
             let response = registry
-                .get_repositories_info(&ALL_VISIBLE)
+                .handle_list_repositories(&ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1325,14 +1328,16 @@ mod tests {
 
             assert!(
                 matches!(
-                    registry.get_namespaces_info(&repository, &hide_all).await,
+                    registry
+                        .handle_list_namespaces(&repository, &hide_all)
+                        .await,
                     Err(RegistryError::NameUnknown)
                 ),
                 "a repository with nothing visible must answer as unknown"
             );
             let body = response_json(
                 registry
-                    .get_repositories_info(&hide_all)
+                    .handle_list_repositories(&hide_all)
                     .await
                     .unwrap()
                     .into_response()
@@ -1346,7 +1351,7 @@ mod tests {
 
             let body = response_json(
                 registry
-                    .get_namespaces_info(&repository, &namespaces_only)
+                    .handle_list_namespaces(&repository, &namespaces_only)
                     .await
                     .unwrap()
                     .into_response()
@@ -1361,7 +1366,7 @@ mod tests {
 
             let body = response_json(
                 registry
-                    .get_repositories_info(&namespaces_only)
+                    .handle_list_repositories(&namespaces_only)
                     .await
                     .unwrap()
                     .into_response()
@@ -1394,7 +1399,7 @@ mod tests {
             .unwrap();
 
             let response = registry
-                .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+                .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1431,7 +1436,7 @@ mod tests {
             .unwrap();
 
         let response = registry
-            .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+            .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
             .await
             .unwrap()
             .into_response()
@@ -1464,7 +1469,7 @@ mod tests {
 
             let body = response_json(
                 registry
-                    .get_uploads_info(&namespace)
+                    .handle_list_uploads(&namespace)
                     .await
                     .unwrap()
                     .into_response()
@@ -1494,7 +1499,7 @@ mod tests {
             create_test_blob(registry, &other, b"hidden content").await;
 
             let response = registry
-                .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+                .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1539,7 +1544,7 @@ mod tests {
             .unwrap();
 
         let response = registry
-            .get_namespaces_info(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+            .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
             .await
             .expect("one invalid directory must not fail the listing")
             .into_response()
@@ -1610,7 +1615,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .get_pull_history(ListPullsRequest {
+                .handle_list_pulls(ListPullsRequest {
                     namespace: namespace.clone(),
                     reference: Reference::Tag(tag.clone()),
                 })
@@ -1703,7 +1708,7 @@ mod tests {
 
             let body = response_json(
                 registry
-                    .get_revisions_info(&namespace)
+                    .handle_list_revisions(&namespace)
                     .await
                     .unwrap()
                     .into_response()
@@ -1756,7 +1761,7 @@ mod tests {
 
     async fn last_pulled_of(registry: &Registry, namespace: &Namespace, target: &Digest) -> Value {
         let response = registry
-            .get_revisions_info(&namespace.clone())
+            .handle_list_revisions(&namespace.clone())
             .await
             .unwrap()
             .into_response()
@@ -1935,7 +1940,7 @@ mod tests {
             .await;
 
             let response = registry
-                .get_pull_history(ListPullsRequest {
+                .handle_list_pulls(ListPullsRequest {
                     namespace: namespace.clone(),
                     reference: Reference::Digest(target.clone()),
                 })
@@ -1959,7 +1964,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let response = test_case
                 .registry()
-                .get_pull_history(ListPullsRequest {
+                .handle_list_pulls(ListPullsRequest {
                     namespace: Namespace::new("test-repo/quiet").unwrap(),
                     reference: Reference::Tag(Tag::new("never").unwrap()),
                 })

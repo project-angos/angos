@@ -148,7 +148,7 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
 
     fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -160,7 +160,7 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
             Cursor::new(manifest_bytes),
         )
         .await
-        .expect("accept_put_manifest");
+        .expect("handle_put_manifest");
 
     let events = received_events(&server).await;
     let kinds = kinds_of(&events);
@@ -202,7 +202,7 @@ async fn digest_push_suppresses_tag_create_event() {
 
     let tag_response = fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -223,7 +223,7 @@ async fn digest_push_suppresses_tag_create_event() {
 
     fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -263,7 +263,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
 
     fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -281,7 +281,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
     let reference = Reference::Tag(Tag::new("v1").unwrap());
     fixture
         .registry
-        .delete_manifest(None, None, &namespace, &reference)
+        .remove_manifest(None, None, &namespace, &reference)
         .await
         .expect("delete_manifest");
 
@@ -313,7 +313,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
 
     let push = fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -335,7 +335,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
     let reference = Reference::Digest(digest);
     fixture
         .registry
-        .delete_manifest(None, None, &namespace, &reference)
+        .remove_manifest(None, None, &namespace, &reference)
         .await
         .expect("delete_manifest");
 
@@ -366,7 +366,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
     let before = Utc::now();
     fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -378,7 +378,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
             Cursor::new(manifest_bytes),
         )
         .await
-        .expect("accept_put_manifest");
+        .expect("handle_put_manifest");
     let after = Utc::now();
 
     let events = received_events(&server).await;
@@ -441,7 +441,7 @@ async fn digest_push_with_tag_params_emits_tag_create_per_tag() {
 
     fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -492,7 +492,7 @@ async fn noop_push_still_emits_events() {
 
     fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -509,7 +509,7 @@ async fn noop_push_still_emits_events() {
 
     fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -581,7 +581,7 @@ async fn mount_emits_blob_push_event() {
     };
     let response = fixture
         .registry
-        .mount_blob(
+        .handle_mount_blob(
             None,
             MountBlobRequest {
                 namespace: target.clone(),
@@ -624,7 +624,7 @@ async fn mount_fallback_still_emits_intent_event() {
     };
     let response = fixture
         .registry
-        .mount_blob(
+        .handle_mount_blob(
             None,
             MountBlobRequest {
                 namespace: target.clone(),
@@ -664,7 +664,7 @@ async fn failing_required_webhook_blocks_the_write() {
     let tag = Tag::new("gated").unwrap();
     let result = fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -751,7 +751,7 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
 
     fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -763,7 +763,7 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
             Cursor::new(manifest_bytes),
         )
         .await
-        .expect("accept_put_manifest");
+        .expect("handle_put_manifest");
 
     assert_eq!(
         fixture
@@ -798,7 +798,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
     // only one enqueued.
     fixture
         .registry
-        .put_manifest(
+        .put_manifest_direct(
             &namespace,
             &Reference::Tag(Tag::new("doomed").unwrap()),
             Some(&mime_type),
@@ -818,7 +818,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
 
     fixture
         .registry
-        .delete_manifest(
+        .remove_manifest(
             None,
             None,
             &namespace,
@@ -857,7 +857,7 @@ async fn retention_delete_mirrors_only_to_prune_downstreams() {
 
     fixture
         .registry
-        .put_manifest(
+        .put_manifest_direct(
             &namespace,
             &Reference::Tag(Tag::new("expired").unwrap()),
             Some(&mime_type),
@@ -868,7 +868,7 @@ async fn retention_delete_mirrors_only_to_prune_downstreams() {
 
     fixture
         .registry
-        .delete_manifest(
+        .remove_manifest(
             Some(EventActor::internal("prune")),
             None,
             &namespace,
@@ -904,7 +904,7 @@ async fn client_delete_mirrors_to_all_downstreams() {
 
     fixture
         .registry
-        .put_manifest(
+        .put_manifest_direct(
             &namespace,
             &Reference::Tag(Tag::new("doomed").unwrap()),
             Some(&mime_type),
@@ -915,7 +915,7 @@ async fn client_delete_mirrors_to_all_downstreams() {
 
     fixture
         .registry
-        .delete_manifest(
+        .remove_manifest(
             None,
             None,
             &namespace,
@@ -948,7 +948,7 @@ async fn get_blob_emits_pull_event() {
 
     let response = fixture
         .registry
-        .resolve_get_blob(
+        .handle_get_blob(
             None,
             GetBlobRequest {
                 namespace: namespace.clone(),
@@ -985,7 +985,7 @@ async fn get_manifest_emits_pull_event() {
 
     let seeded = fixture
         .registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
@@ -1004,7 +1004,7 @@ async fn get_manifest_emits_pull_event() {
 
     let response = fixture
         .registry
-        .get_manifest_served(
+        .handle_get_manifest(
             None,
             GetManifestRequest {
                 namespace: namespace.clone(),

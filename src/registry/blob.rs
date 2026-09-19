@@ -2,7 +2,7 @@ use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
 
 use angos_oci::{
-    Digest, MediaRange, Namespace, UploadSessionId,
+    Digest, Namespace, UploadSessionId,
     http_range::RequestRange,
     request::{DeleteBlobRequest, GetBlobRequest, HeadBlobRequest},
 };
@@ -18,7 +18,7 @@ use crate::{
         blob_ownership::promote_and_grant,
         blob_store::{BlobStore, BoxedReader, upload_session::HashStart},
         metadata_store::{LinkKind, MetadataStore},
-        pull_through_name, record_pull_through, repository_name,
+        record_pull_through, repository_name,
     },
 };
 
@@ -130,7 +130,10 @@ async fn fill_cache_session(
 impl Registry {
     #[instrument]
     /// `HEAD /v2/<name>/blobs/<digest>`: the blob's descriptor, no body.
-    pub async fn head_blob(&self, request: HeadBlobRequest) -> Result<BlobDescriptor, Error> {
+    pub async fn handle_head_blob(
+        &self,
+        request: HeadBlobRequest,
+    ) -> Result<BlobDescriptor, Error> {
         let has_access = self
             .metadata_store()
             .can_read(&request.namespace, &request.digest)
@@ -138,37 +141,14 @@ impl Registry {
         // A namespace no `[repository]` entry matches has no upstream, so it
         // serves what it owns and nothing else.
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
-        let upstream = repository.filter(|repository| repository.is_pull_through());
-        let cache_of = pull_through_name(repository);
-
-        if upstream.is_none() && !has_access {
-            return Err(Error::BlobUnknown);
-        }
-
-        if has_access {
-            match self.blob_store.size(&request.digest).await {
-                Ok(size) => {
-                    record_pull_through(cache_of, "blob", "hit");
-                    return Ok(BlobDescriptor {
-                        digest: request.digest,
-                        size,
-                        media_type: None,
-                    });
-                }
-                // As on GET, a genuine miss re-heads upstream while every
-                // other error propagates instead of masquerading as a 404.
-                Err(Error::BlobUnknown) if upstream.is_some() => {}
-                Err(error) => return Err(error),
+        let (digest, size) = match repository.filter(|repository| repository.is_pull_through()) {
+            Some(upstream) => self.head_cached_blob(upstream, request, has_access).await?,
+            None if has_access => {
+                let size = self.blob_store.size(&request.digest).await?;
+                (request.digest, size)
             }
-        }
-
-        let Some(repository) = upstream else {
-            return Err(Error::BlobUnknown);
+            None => return Err(Error::BlobUnknown),
         };
-        record_pull_through(cache_of, "blob", "miss");
-        let (digest, size) = repository
-            .head_blob(&request.accepted_types, &request.namespace, &request.digest)
-            .await?;
 
         Ok(BlobDescriptor {
             digest,
@@ -177,57 +157,103 @@ impl Registry {
         })
     }
 
-    /// Serve the blob locally when `has_access`, else fall back to the
-    /// pull-through upstream. The caller resolves the ownership verdict once,
-    /// so the hot GET path does not pay for the blob-index read twice.
-    pub async fn get_blob_with_access(
+    /// HEAD on a pull-through namespace: the cached descriptor when the
+    /// namespace owns the blob and the bytes are there, else the upstream's.
+    async fn head_cached_blob(
         &self,
-        repository: Option<&Repository>,
-        accepted_types: &[MediaRange],
-        namespace: &Namespace,
-        digest: &Digest,
-        range: Option<RequestRange>,
+        upstream: &Repository,
+        request: HeadBlobRequest,
         has_access: bool,
-    ) -> Result<BlobStream<BoxedReader>, Error> {
-        let upstream = repository.filter(|repository| repository.is_pull_through());
-        let cache_of = pull_through_name(repository);
-
+    ) -> Result<(Digest, u64), Error> {
         if has_access {
-            match self.get_local_blob(digest, range).await {
-                Ok(stream) => {
-                    record_pull_through(cache_of, "blob", "hit");
-                    return Ok(stream);
+            match self.blob_store.size(&request.digest).await {
+                Ok(size) => {
+                    record_pull_through(&upstream.name, "blob", "hit");
+                    return Ok((request.digest, size));
                 }
-                // Owned but the bytes are gone: a pull-through repo re-fetches.
-                Err(Error::BlobUnknown) if upstream.is_some() => {}
+                // As on GET, a genuine miss re-heads upstream while every
+                // other error propagates instead of masquerading as a 404.
+                Err(Error::BlobUnknown) => {}
                 Err(error) => return Err(error),
             }
-        } else if upstream.is_none() {
-            return Err(Error::BlobUnknown);
         }
+        record_pull_through(&upstream.name, "blob", "miss");
+        upstream
+            .head_blob(&request.accepted_types, &request.namespace, &request.digest)
+            .await
+    }
 
-        let Some(repository) = upstream else {
-            return Err(Error::BlobUnknown);
-        };
-        record_pull_through(cache_of, "blob", "miss");
-        let fetched = repository
-            .get_blob(accepted_types, namespace, digest, range)
+    /// GET on a pull-through namespace: the cached copy when the namespace
+    /// owns the blob and the bytes are there, else the upstream's, which a
+    /// cache-fill job then stores. The caller resolves `has_access` once, so
+    /// the hot path does not pay for the blob-index read twice.
+    pub async fn get_cached_blob(
+        &self,
+        upstream: &Repository,
+        request: &GetBlobRequest,
+        has_access: bool,
+        allow_redirect: bool,
+    ) -> Result<BlobGet<BoxedReader>, Error> {
+        if has_access {
+            match self.serve_local_blob(request, allow_redirect).await {
+                Ok(served) => {
+                    record_pull_through(&upstream.name, "blob", "hit");
+                    return Ok(served);
+                }
+                // Owned but the bytes are gone: re-fetch. Every other error
+                // propagates instead of masquerading as a 404.
+                Err(Error::BlobUnknown) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        record_pull_through(&upstream.name, "blob", "miss");
+        let fetched = upstream
+            .get_blob(
+                &request.accepted_types,
+                &request.namespace,
+                &request.digest,
+                request.range,
+            )
             .await?;
 
-        self.dispatch_cache_fill(namespace, digest).await;
+        self.dispatch_cache_fill(&request.namespace, &request.digest)
+            .await;
 
         // An upstream is free to ignore `Range` and answer the whole blob,
         // which stays a valid answer; only its `206` becomes partial content.
-        let Some(content_range) = fetched.content_range else {
-            return Ok(whole_blob_response(digest, fetched.length, fetched.reader));
+        let stream = match fetched.content_range {
+            Some(range) => BlobStream {
+                digest: request.digest.clone(),
+                total_length: fetched.length,
+                range: Some(range),
+                reader: fetched.reader,
+            },
+            None => whole_blob_response(&request.digest, fetched.length, fetched.reader),
         };
+        Ok(BlobGet::Content(stream))
+    }
 
-        Ok(BlobStream {
-            digest: digest.clone(),
-            total_length: fetched.length,
-            range: Some(content_range),
-            reader: fetched.reader,
-        })
+    /// The locally held blob: a presigned redirect when the caller and
+    /// `enable_blob_redirect` allow one and no range is asked, else a stream.
+    pub async fn serve_local_blob(
+        &self,
+        request: &GetBlobRequest,
+        allow_redirect: bool,
+    ) -> Result<BlobGet<BoxedReader>, Error> {
+        if request.range.is_none()
+            && allow_redirect
+            && self.enable_blob_redirect
+            && self.blob_store.size(&request.digest).await.is_ok()
+            && let Ok(Some(location)) = self.blob_store.presigned_url(&request.digest, None).await
+        {
+            return Ok(BlobGet::Redirect {
+                digest: request.digest.clone(),
+                location,
+            });
+        }
+        Ok(BlobGet::Content(
+            self.get_local_blob(&request.digest, request.range).await?,
+        ))
     }
 
     /// Fire-and-forget enqueue of a pull-through cache-fill job. A failure is
@@ -281,7 +307,7 @@ impl Registry {
     #[instrument]
     /// `DELETE /v2/<name>/blobs/<digest>`: revokes ownership; the collector
     /// reclaims the bytes once every reference is stale.
-    pub async fn delete_blob(&self, request: DeleteBlobRequest) -> Result<Accepted, Error> {
+    pub async fn handle_delete_blob(&self, request: DeleteBlobRequest) -> Result<Accepted, Error> {
         let ownership = self.metadata_store();
         let links = match ownership
             .read_blob_index_namespace(&request.namespace, &request.digest)
@@ -322,48 +348,27 @@ impl Registry {
     /// `allow_redirect`, `enable_blob_redirect`, no range, and locally
     /// available bytes.
     #[instrument(skip(self, request))]
-    pub async fn resolve_get_blob(
+    pub async fn handle_get_blob(
         &self,
         actor: Option<EventActor>,
         request: GetBlobRequest,
         allow_redirect: bool,
     ) -> Result<BlobGet<BoxedReader>, Error> {
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
+        let repository_name = repository_name(repository);
 
         let has_access = self
             .metadata_store()
             .can_read(&request.namespace, &request.digest)
             .await?;
 
-        if !repository.is_some_and(Repository::is_pull_through) && !has_access {
-            return Err(Error::BlobUnknown);
-        }
-
-        let repository_name = repository_name(repository);
-        let response = if request.range.is_none()
-            && allow_redirect
-            && self.enable_blob_redirect
-            && has_access
-            && self.blob_store.size(&request.digest).await.is_ok()
-            && let Ok(Some(presigned_url)) =
-                self.blob_store.presigned_url(&request.digest, None).await
-        {
-            BlobGet::Redirect {
-                digest: request.digest.clone(),
-                location: presigned_url,
+        let response = match repository.filter(|repository| repository.is_pull_through()) {
+            Some(upstream) => {
+                self.get_cached_blob(upstream, &request, has_access, allow_redirect)
+                    .await?
             }
-        } else {
-            BlobGet::Content(
-                self.get_blob_with_access(
-                    repository,
-                    &request.accepted_types,
-                    &request.namespace,
-                    &request.digest,
-                    request.range,
-                    has_access,
-                )
-                .await?,
-            )
+            None if has_access => self.serve_local_blob(&request, allow_redirect).await?,
+            None => return Err(Error::BlobUnknown),
         };
 
         let event = Event::pull_blob(
@@ -380,7 +385,7 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, sync::Arc};
+    use std::{io::Cursor, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
     use http::{
@@ -395,14 +400,15 @@ mod tests {
 
     use angos_oci::{Namespace, Tag, http_range::ByteWindow};
     use angos_storage::{
-        Error as StorageError, ObjectStore,
+        Error as StorageError, ObjectStore, PresignedStore,
         fs::Backend as StorageFsBackend,
         test_util::{HookedStore, StoreHook, StoreOp},
     };
 
     use crate::{
-        metrics_provider::init_for_tests,
+        metrics_provider::{init_for_tests, metrics_provider},
         registry::{
+            Registry, RegistryConfig,
             blob::*,
             keys::{DigestKeys, NamespaceKeys},
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -410,7 +416,8 @@ mod tests {
             test_utils::{
                 RegistryTestCase, create_test_blob, create_test_registry, drop_links,
                 for_each_backend, get_blob, metadata_store_over, put_blob_direct, response_body,
-                response_digest, response_header, seed_links,
+                response_digest, response_header, seed_links, single_repo_resolver, test_job_store,
+                upload_blob,
             },
         },
         test_fixtures::client::test_client_config,
@@ -425,7 +432,7 @@ mod tests {
 
             let (digest, _) = create_test_blob(registry, namespace, content).await;
             let response = registry
-                .head_blob(HeadBlobRequest {
+                .handle_head_blob(HeadBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                     accepted_types: Vec::new(),
@@ -486,7 +493,7 @@ mod tests {
             .unwrap();
 
         let result = registry
-            .head_blob(HeadBlobRequest {
+            .handle_head_blob(HeadBlobRequest {
                 namespace: namespace.clone(),
                 digest: digest.clone(),
                 accepted_types: Vec::new(),
@@ -531,7 +538,7 @@ mod tests {
             let repository = registry.get_repository_for_namespace(namespace).unwrap();
 
             let head_result = registry
-                .head_blob(HeadBlobRequest {
+                .handle_head_blob(HeadBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                     accepted_types: Vec::new(),
@@ -597,7 +604,7 @@ mod tests {
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
@@ -646,7 +653,7 @@ mod tests {
                 .unwrap();
 
             let result = registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
@@ -697,7 +704,7 @@ mod tests {
                 .unwrap();
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
@@ -706,7 +713,7 @@ mod tests {
 
             assert!(!ownership.can_read(namespace, &digest).await.unwrap());
             let head = registry
-                .head_blob(HeadBlobRequest {
+                .handle_head_blob(HeadBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                     accepted_types: Vec::new(),
@@ -778,7 +785,7 @@ mod tests {
                 .unwrap();
 
                 let result = registry
-                    .delete_blob(DeleteBlobRequest {
+                    .handle_delete_blob(DeleteBlobRequest {
                         namespace: namespace.clone(),
                         digest: digest.clone(),
                     })
@@ -819,7 +826,7 @@ mod tests {
             ownership.grant(second, &digest).await.unwrap();
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: first.clone(),
                     digest: digest.clone(),
                 })
@@ -831,7 +838,7 @@ mod tests {
             assert!(ownership.can_read(second, &digest).await.unwrap());
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: second.clone(),
                     digest: digest.clone(),
                 })
@@ -854,7 +861,7 @@ mod tests {
             let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
 
             let result = registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
@@ -952,11 +959,8 @@ mod tests {
             end: Some(10),
         }));
 
-        let response = registry
-            .get_blob_with_access(Some(&repository), &[], namespace, &digest, range, false)
+        let response = get_blob(&registry, &repository, &[], namespace, &digest, range)
             .await
-            .unwrap()
-            .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
@@ -969,6 +973,86 @@ mod tests {
                 .get(),
             1,
             "a blob the upstream served counts one pull-through miss"
+        );
+    }
+
+    /// Hands out a fixed URL so the redirect fast path runs over the fs store.
+    struct FixedPresigner;
+
+    #[async_trait]
+    impl PresignedStore for FixedPresigner {
+        async fn presign_get(
+            &self,
+            key: &str,
+            _ttl: Duration,
+            _content_type: Option<&str>,
+        ) -> Result<String, StorageError> {
+            Ok(format!("https://presigned.test/{key}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn redirected_get_of_a_cached_blob_counts_a_pull_through_hit() {
+        let mock_server = MockServer::start().await;
+        let config = Config {
+            upstream: vec![test_client_config(mock_server.uri())],
+            ..Default::default()
+        };
+        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let repository = Repository::new(
+            "redirect-cache",
+            &config,
+            &cache_backend,
+            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
+        let metadata_store = metadata_store_over(object.clone());
+        let blob_store = Arc::new(BlobStore::new(
+            object,
+            Some((Arc::new(FixedPresigner), Duration::from_secs(60))),
+        ));
+        let registry = Registry::new(
+            blob_store,
+            metadata_store.clone(),
+            single_repo_resolver("redirect-cache", repository),
+            RegistryConfig::new(test_job_store(&metadata_store)),
+        );
+        let namespace = Namespace::new("redirect-cache/alpine").unwrap();
+        let digest = upload_blob(&registry, &namespace, b"cached blob").await;
+        let hits = || {
+            metrics_provider()
+                .pull_through_total
+                .with_label_values(&["redirect-cache", "blob", "hit"])
+                .get()
+        };
+        let before = hits();
+
+        let response = registry
+            .handle_get_blob(
+                None,
+                GetBlobRequest {
+                    namespace,
+                    digest,
+                    accepted_types: Vec::new(),
+                    range: None,
+                },
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(response, BlobGet::Redirect { .. }),
+            "a cached blob with a presigner must take the redirect fast path"
+        );
+        assert_eq!(
+            hits(),
+            before + 1,
+            "a redirected pull of a cached blob counts one pull-through hit"
         );
     }
 
@@ -1375,7 +1459,7 @@ mod tests {
             let (digest, repository) = create_test_blob(registry, namespace, content).await;
 
             let head_response = registry
-                .head_blob(HeadBlobRequest {
+                .handle_head_blob(HeadBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                     accepted_types: Vec::new(),

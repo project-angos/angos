@@ -41,7 +41,7 @@ impl OciService for Registry {
         request: GetManifestRequest,
         allow_redirect: bool,
     ) -> Result<ManifestGet, Error> {
-        self.get_manifest_served(Some(actor.clone()), request, allow_redirect)
+        self.handle_get_manifest(Some(actor.clone()), request, allow_redirect)
             .await
     }
 
@@ -50,7 +50,7 @@ impl OciService for Registry {
         actor: &EventActor,
         request: HeadManifestRequest,
     ) -> Result<ManifestDescriptor, Error> {
-        self.head_manifest_served(Some(actor.clone()), request)
+        self.handle_head_manifest(Some(actor.clone()), request)
             .await
     }
 
@@ -60,7 +60,7 @@ impl OciService for Registry {
         request: PutManifestRequest,
         body: BoxedReader,
     ) -> Result<ManifestWritten, Error> {
-        self.accept_put_manifest(Some(actor.clone()), request, body)
+        self.handle_put_manifest(Some(actor.clone()), request, body)
             .await
     }
 
@@ -69,7 +69,7 @@ impl OciService for Registry {
         actor: &EventActor,
         request: DeleteManifestRequest,
     ) -> Result<Accepted, Error> {
-        self.accept_delete_manifest(Some(actor.clone()), request)
+        self.handle_delete_manifest(Some(actor.clone()), request)
             .await
     }
 
@@ -79,7 +79,7 @@ impl OciService for Registry {
         request: GetBlobRequest,
         allow_redirect: bool,
     ) -> Result<BlobGet<BoxedReader>, Error> {
-        self.resolve_get_blob(Some(actor.clone()), request, allow_redirect)
+        self.handle_get_blob(Some(actor.clone()), request, allow_redirect)
             .await
     }
 
@@ -88,7 +88,7 @@ impl OciService for Registry {
         _actor: &EventActor,
         request: HeadBlobRequest,
     ) -> Result<BlobDescriptor, Error> {
-        self.head_blob(request).await
+        self.handle_head_blob(request).await
     }
 
     async fn delete_blob(
@@ -96,7 +96,7 @@ impl OciService for Registry {
         _actor: &EventActor,
         request: DeleteBlobRequest,
     ) -> Result<Accepted, Error> {
-        self.delete_blob(request).await
+        self.handle_delete_blob(request).await
     }
 
     async fn start_upload(
@@ -105,7 +105,8 @@ impl OciService for Registry {
         request: StartUploadRequest,
         body: BoxedReader,
     ) -> Result<StartUpload, Error> {
-        self.start_upload(Some(actor.clone()), request, body).await
+        self.handle_start_upload(Some(actor.clone()), request, body)
+            .await
     }
 
     async fn mount_blob(
@@ -114,7 +115,8 @@ impl OciService for Registry {
         request: MountBlobRequest,
         source: Option<Namespace>,
     ) -> Result<StartUpload, Error> {
-        self.mount_blob(Some(actor.clone()), request, source).await
+        self.handle_mount_blob(Some(actor.clone()), request, source)
+            .await
     }
 
     async fn upload_status(
@@ -122,7 +124,7 @@ impl OciService for Registry {
         _actor: &EventActor,
         request: GetUploadRequest,
     ) -> Result<UploadSession, Error> {
-        self.get_upload_status(request).await
+        self.handle_upload_status(request).await
     }
 
     async fn patch_upload(
@@ -131,7 +133,7 @@ impl OciService for Registry {
         request: PatchUploadRequest,
         body: BoxedReader,
     ) -> Result<UploadSession, Error> {
-        self.patch_upload(request, body).await
+        self.handle_patch_upload(request, body).await
     }
 
     async fn complete_upload(
@@ -140,7 +142,7 @@ impl OciService for Registry {
         request: CompleteUploadRequest,
         body: BoxedReader,
     ) -> Result<BlobWritten, Error> {
-        self.complete_upload(Some(actor.clone()), request, body)
+        self.handle_complete_upload(Some(actor.clone()), request, body)
             .await
     }
 
@@ -149,7 +151,7 @@ impl OciService for Registry {
         _actor: &EventActor,
         request: DeleteUploadRequest,
     ) -> Result<NoContent, Error> {
-        self.delete_upload(request).await
+        self.handle_cancel_upload(request).await
     }
 
     async fn list_tags(
@@ -157,7 +159,7 @@ impl OciService for Registry {
         _actor: &EventActor,
         request: ListTagsRequest,
     ) -> Result<Tags, Error> {
-        self.list_tag_entries(request).await
+        self.handle_list_tags(request).await
     }
 
     async fn get_referrers(
@@ -165,6 +167,6 @@ impl OciService for Registry {
         _actor: &EventActor,
         request: GetReferrersRequest,
     ) -> Result<Referrers, Error> {
-        self.get_referrers(request).await
+        self.handle_get_referrers(request).await
     }
 }

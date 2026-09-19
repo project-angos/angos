@@ -417,7 +417,7 @@ impl Executor {
         }
 
         self.retention_registry()?
-            .delete_manifest(
+            .remove_manifest(
                 Some(EventActor::internal(RETENTION_ACTOR)),
                 None,
                 &namespace,
@@ -467,7 +467,7 @@ impl Executor {
         }
 
         self.retention_registry()?
-            .delete_manifest(
+            .remove_manifest(
                 Some(EventActor::internal(RETENTION_ACTOR)),
                 None,
                 &namespace,

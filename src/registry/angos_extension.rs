@@ -85,7 +85,7 @@ impl ext::AngosExtensionService for Registry {
         &self,
         visibility: &dyn ext::NamespaceVisibility,
     ) -> Result<ext::RepositoriesBody, Error> {
-        self.get_repositories_info(visibility).await
+        self.handle_list_repositories(visibility).await
     }
 
     async fn list_namespaces(
@@ -93,51 +93,51 @@ impl ext::AngosExtensionService for Registry {
         repository: Namespace,
         visibility: &dyn ext::NamespaceVisibility,
     ) -> Result<ext::NamespacesBody, Error> {
-        self.get_namespaces_info(&repository, visibility).await
+        self.handle_list_namespaces(&repository, visibility).await
     }
 
     async fn list_revisions(&self, namespace: Namespace) -> Result<ext::RevisionsBody, Error> {
-        self.get_revisions_info(&namespace).await
+        self.handle_list_revisions(&namespace).await
     }
 
     async fn list_uploads(&self, namespace: Namespace) -> Result<ext::UploadsBody, Error> {
-        self.get_uploads_info(&namespace).await
+        self.handle_list_uploads(&namespace).await
     }
 
     async fn list_pulls(&self, request: ext::ListPullsRequest) -> Result<ext::PullsBody, Error> {
-        self.get_pull_history(request).await
+        self.handle_list_pulls(request).await
     }
 
     async fn list_layer_entries(
         &self,
         request: ext::LayerEntriesRequest,
     ) -> Result<ext::LayerEntries, Error> {
-        self.get_layer_entries(request).await
+        self.handle_list_layer_entries(request).await
     }
 
     async fn get_layer_file(
         &self,
         request: ext::LayerFileRequest,
     ) -> Result<ext::LayerFile<Self::Body>, Error> {
-        self.get_layer_file(request).await
+        self.handle_get_layer_file(request).await
     }
 
     async fn list_jobs(&self, request: ext::ListJobsRequest) -> Result<ext::JobsBody, Error> {
-        self.get_jobs_info(request).await
+        self.handle_list_jobs(request).await
     }
 
     async fn list_failed_jobs(
         &self,
         request: ext::ListJobsRequest,
     ) -> Result<ext::FailedJobsBody, Error> {
-        self.get_failed_jobs_info(request).await
+        self.handle_list_failed_jobs(request).await
     }
 
     async fn retry_job(&self, request: ext::RetryJobRequest) -> Result<ext::NoContent, Error> {
-        self.retry_failed_job(request).await
+        self.handle_retry_job(request).await
     }
 
     async fn delete_job(&self, request: ext::DeleteJobRequest) -> Result<ext::NoContent, Error> {
-        self.delete_job(request).await
+        self.handle_delete_job(request).await
     }
 }

@@ -265,24 +265,13 @@ impl Registry {
     }
 }
 
-/// The pull-through repository serving a pull, `None` when the repository
-/// mirrors no upstream and so caches nothing.
-pub fn pull_through_name(repository: Option<&Repository>) -> Option<&str> {
-    repository
-        .filter(|repository| repository.is_pull_through())
-        .map(|repository| repository.name.as_ref())
-}
-
-/// Records one pull-through cache outcome for `repository`, which names the
-/// pull-through repository serving the pull; a repository with no upstream
-/// caches nothing and so records nothing.
-pub fn record_pull_through(repository: Option<&str>, kind: &str, outcome: &str) {
-    if let Some(repository) = repository {
-        metrics_provider()
-            .pull_through_total
-            .with_label_values(&[repository, kind, outcome])
-            .inc();
-    }
+/// Records one cache outcome for the pull-through `repository` serving the
+/// pull.
+pub fn record_pull_through(repository: &str, kind: &str, outcome: &str) {
+    metrics_provider()
+        .pull_through_total
+        .with_label_values(&[repository, kind, outcome])
+        .inc();
 }
 
 /// The event `repository` field for an already-resolved repository, empty when
