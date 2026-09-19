@@ -265,6 +265,22 @@ impl Registry {
     }
 }
 
+/// Publishes every outcome series of the pull-through `repository` at zero, so
+/// the first pull after a start or a reload is a step Prometheus can rate.
+pub fn prime_pull_through(repository: &str) {
+    for (kind, outcome) in [
+        ("manifest", "hit"),
+        ("manifest", "miss"),
+        ("manifest", "refresh"),
+        ("blob", "hit"),
+        ("blob", "miss"),
+    ] {
+        metrics_provider()
+            .pull_through_total
+            .with_label_values(&[repository, kind, outcome]);
+    }
+}
+
 /// Records one cache outcome for the pull-through `repository` serving the
 /// pull.
 pub fn record_pull_through(repository: &str, kind: &str, outcome: &str) {

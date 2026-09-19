@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.9.2
+
+### Fixed
+
+- `angos_pull_through_total` publishes every outcome series of a repository with an upstream at zero from startup and from a configuration reload, so the first pull after a restart is a step `rate` and `increase` see instead of a series Prometheus only meets already counted.
+
 ## 1.9.1
 
 ### Changed

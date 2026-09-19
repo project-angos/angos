@@ -16,7 +16,7 @@ use crate::{
         self, Registry, RegistryConfig, Repository,
         blob_store::BlobStore,
         metadata_store::{MetadataStore, Settings},
-        repository,
+        prime_pull_through, repository,
         repository_resolver::{OverlapError, RepositoryResolver},
     },
 };
@@ -170,6 +170,12 @@ pub async fn repositories(
             })?;
         map.insert(name.clone(), repository);
     }
+    for repository in map
+        .values()
+        .filter(|repository| repository.is_pull_through())
+    {
+        prime_pull_through(repository.name.as_ref());
+    }
     let resolver = RepositoryResolver::new(Arc::new(map))?;
     Ok(Arc::new(resolver))
 }
@@ -178,13 +184,51 @@ pub async fn repositories(
 mod tests {
     use std::collections::HashMap;
 
+    use wiremock::MockServer;
+
     use crate::{
         command::bootstrap::{Error, repositories},
         command::maintenance::Error as MaintenanceError,
         command::server::Error as ServerError,
+        metrics_provider::metrics_provider,
         policy::{AccessMode, AccessPolicyConfig},
         registry::{self, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
+        test_fixtures::client::test_client_config,
     };
+
+    #[tokio::test]
+    async fn repositories_prime_pull_through_outcomes_at_zero() {
+        let server = MockServer::start().await;
+        let configs = HashMap::from([(
+            "primed-repo".to_string(),
+            repository::Config {
+                upstream: vec![test_client_config(server.uri())],
+                ..repository::Config::default()
+            },
+        )]);
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
+
+        let (_, payload) = metrics_provider().gather().unwrap();
+        let text = String::from_utf8(payload).unwrap();
+        for (kind, outcome) in [
+            ("manifest", "hit"),
+            ("manifest", "miss"),
+            ("manifest", "refresh"),
+            ("blob", "hit"),
+            ("blob", "miss"),
+        ] {
+            let line = format!(
+                "angos_pull_through_total{{kind=\"{kind}\",outcome=\"{outcome}\",repository=\"primed-repo\"}} 0"
+            );
+            assert!(
+                text.contains(&line),
+                "a repository with an upstream must publish {kind} {outcome} at zero, output:\n{text}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn repository_with_default_config_succeeds() {
