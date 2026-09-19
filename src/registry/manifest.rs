@@ -258,7 +258,7 @@ impl Registry {
     #[instrument(skip(actor))]
     /// The typed manifest-HEAD the [`angos_oci_service::OciService`] trait
     /// serves.
-    pub async fn head_manifest_served(
+    pub async fn handle_head_manifest(
         &self,
         actor: Option<EventActor>,
         request: HeadManifestRequest,
@@ -433,7 +433,7 @@ impl Registry {
     /// Test-only: the cached or hosted GET for an explicit `repository`,
     /// without redirects.
     #[cfg(test)]
-    pub async fn get_manifest(
+    pub async fn get_manifest_direct(
         &self,
         repository: Option<&Repository>,
         accepted_types: &[MediaRange],
@@ -629,7 +629,7 @@ impl Registry {
     /// Test-only wrapper that stores a manifest without a replication `source_ts`.
     #[cfg(test)]
     #[instrument(skip(body))]
-    pub async fn put_manifest(
+    pub async fn put_manifest_direct(
         &self,
         namespace: &Namespace,
         reference: &Reference,
@@ -826,13 +826,13 @@ impl Registry {
     }
 
     /// Serves a client's manifest delete; only this entry point answers `202`,
-    /// since the retention sweeper also calls [`Registry::delete_manifest`].
-    pub async fn accept_delete_manifest(
+    /// since the retention sweeper also calls [`Registry::remove_manifest`].
+    pub async fn handle_delete_manifest(
         &self,
         actor: Option<EventActor>,
         request: DeleteManifestRequest,
     ) -> Result<Accepted, Error> {
-        self.delete_manifest(
+        self.remove_manifest(
             actor,
             request.source_ts,
             &request.namespace,
@@ -848,7 +848,7 @@ impl Registry {
     /// only to downstreams marked `prune = true`, a client delete to every
     /// matching downstream.
     #[instrument(skip(actor))]
-    pub async fn delete_manifest(
+    pub async fn remove_manifest(
         &self,
         actor: Option<EventActor>,
         source_ts: Option<DateTime<Utc>>,
@@ -1077,7 +1077,7 @@ impl Registry {
     #[instrument(skip(self, request))]
     /// The typed manifest-GET the [`angos_oci_service::OciService`] trait
     /// serves.
-    pub async fn get_manifest_served(
+    pub async fn handle_get_manifest(
         &self,
         actor: Option<EventActor>,
         request: GetManifestRequest,
@@ -1273,7 +1273,7 @@ impl Registry {
         skip(self, body_stream, request),
         fields(namespace = %request.namespace, reference = %request.reference)
     )]
-    pub async fn accept_put_manifest<S>(
+    pub async fn handle_put_manifest<S>(
         &self,
         actor: Option<EventActor>,
         request: PutManifestRequest,
@@ -1764,12 +1764,12 @@ mod tests {
             let (content, media_type) = create_test_manifest(registry, namespace).await;
             let tag = Reference::Tag(Tag::new("latest").unwrap());
             registry
-                .put_manifest(namespace, &tag, Some(&media_type), &content)
+                .put_manifest_direct(namespace, &tag, Some(&media_type), &content)
                 .await
                 .unwrap();
 
             let stored = registry
-                .get_manifest_served(
+                .handle_get_manifest(
                     None,
                     GetManifestRequest {
                         namespace: namespace.clone(),
@@ -1797,7 +1797,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new(tag).unwrap()),
                     Some(&media_type),
@@ -1807,7 +1807,7 @@ mod tests {
                 .unwrap();
 
             let stored_manifest = registry
-                .get_manifest(
+                .get_manifest_direct(
                     registry.get_repository_for_namespace(namespace).ok(),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
@@ -1825,7 +1825,7 @@ mod tests {
 
             let digest = response.digest.clone();
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Digest(digest.clone()),
                     Some(&media_type),
@@ -1852,7 +1852,7 @@ mod tests {
         assert_eq!(digest.algorithm(), Algorithm::Sha512);
 
         let response = registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -1877,7 +1877,7 @@ mod tests {
 
         for tag in ["1.2.3", "latest"] {
             let head = registry
-                .head_manifest_served(
+                .handle_head_manifest(
                     None,
                     HeadManifestRequest {
                         namespace: namespace.clone(),
@@ -1907,7 +1907,7 @@ mod tests {
         let (content, media_type) = create_test_manifest(registry, &namespace).await;
 
         let response = registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -1929,7 +1929,7 @@ mod tests {
         );
 
         let ignored = registry
-            .head_manifest_served(
+            .handle_head_manifest(
                 None,
                 HeadManifestRequest {
                     namespace: namespace.clone(),
@@ -1956,7 +1956,7 @@ mod tests {
                 manifest_with_references(&missing_config, 256, &layer_digest, layer_content.len());
 
             let Err(err) = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -1993,7 +1993,7 @@ mod tests {
                 manifest_with_references(&config_digest, config_content.len(), &missing_layer, 512);
 
             let Err(err) = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -2018,7 +2018,7 @@ mod tests {
             let (content, media_type) = index_manifest_with_child(&missing_child);
 
             let Err(err) = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -2052,7 +2052,7 @@ mod tests {
             );
 
             let Err(err) = registry
-                .put_manifest(
+                .put_manifest_direct(
                     target_namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -2082,7 +2082,7 @@ mod tests {
 
         let error = case
             .registry()
-            .put_manifest(
+            .put_manifest_direct(
                 &namespace,
                 &Reference::Tag(Tag::new("legacy").unwrap()),
                 Some(&MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap()),
@@ -2106,7 +2106,7 @@ mod tests {
                 create_test_manifest_with_subject(registry, namespace).await;
 
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -2131,7 +2131,7 @@ mod tests {
         .await;
     }
 
-    /// `accept_put_manifest` honors `validate_manifest_references`: permissive
+    /// `handle_put_manifest` honors `validate_manifest_references`: permissive
     /// stores an index whose child manifest is absent, strict rejects the identical
     /// push with `MANIFEST_BLOB_UNKNOWN`.
     #[tokio::test]
@@ -2147,7 +2147,7 @@ mod tests {
             false,
         );
         permissive
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -2165,7 +2165,7 @@ mod tests {
         let strict =
             create_test_registry_with(strict_case.blob_store(), strict_case.metadata_store(), true);
         let Err(err) = strict
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -2205,7 +2205,7 @@ mod tests {
             layer_content.len(),
         );
         permissive
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: attacker.clone(),
@@ -2257,7 +2257,7 @@ mod tests {
         let attacker = Namespace::new("test-repo/attacker").unwrap();
         let (content, media_type) = index_manifest_with_child(&child_digest);
         permissive
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: attacker.clone(),
@@ -2280,7 +2280,7 @@ mod tests {
 
         let repository = permissive.get_repository_for_namespace(&attacker).unwrap();
         let outcome = permissive
-            .get_manifest(
+            .get_manifest_direct(
                 Some(repository),
                 &[],
                 &attacker,
@@ -2317,7 +2317,7 @@ mod tests {
             layer_content.len(),
         );
         permissive
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -2342,7 +2342,7 @@ mod tests {
 
         let repository = permissive.get_repository_for_namespace(&namespace).unwrap();
         permissive
-            .get_manifest(
+            .get_manifest_direct(
                 Some(repository),
                 &[],
                 &namespace,
@@ -2420,7 +2420,7 @@ mod tests {
 
         let manifest = case
             .registry()
-            .get_manifest(
+            .get_manifest_direct(
                 Some(&repository),
                 &[MediaRange::from(MediaType::docker_manifest())],
                 &namespace,
@@ -2485,7 +2485,7 @@ mod tests {
 
         let pull = async |immutable_tag: bool| {
             case.registry()
-                .get_manifest(
+                .get_manifest_direct(
                     Some(&repository),
                     &accepted,
                     &namespace,
@@ -2556,7 +2556,7 @@ mod tests {
 
         let manifest = case
             .registry()
-            .get_manifest(
+            .get_manifest_direct(
                 Some(&repository),
                 &[MediaRange::from(MediaType::docker_manifest())],
                 &namespace,
@@ -2587,7 +2587,7 @@ mod tests {
         let (content, media_type) = create_test_manifest(case.registry(), namespace).await;
         let response = case
             .registry()
-            .put_manifest(
+            .put_manifest_direct(
                 namespace,
                 &Reference::Tag(tag.clone()),
                 Some(&media_type),
@@ -2608,7 +2608,7 @@ mod tests {
         );
 
         registry
-            .delete_manifest(
+            .remove_manifest(
                 None,
                 None,
                 namespace,
@@ -2622,7 +2622,7 @@ mod tests {
             .get_repository_for_namespace(namespace)
             .unwrap();
         case.registry()
-            .get_manifest(
+            .get_manifest_direct(
                 Some(repository),
                 &[MediaRange::from(media_type)],
                 namespace,
@@ -2674,7 +2674,7 @@ mod tests {
         let repository = registry.get_repository_for_namespace(&namespace).unwrap();
 
         let error = registry
-            .get_manifest(
+            .get_manifest_direct(
                 Some(repository),
                 &[],
                 &namespace,
@@ -2700,7 +2700,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new(tag).unwrap()),
                     Some(&media_type),
@@ -2710,7 +2710,7 @@ mod tests {
                 .unwrap();
 
             let manifest = registry
-                .get_manifest(
+                .get_manifest_direct(
                     registry.get_repository_for_namespace(namespace).ok(),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
@@ -2727,7 +2727,7 @@ mod tests {
             assert_eq!(manifest.digest, response.digest.clone());
 
             let manifest = registry
-                .get_manifest(
+                .get_manifest_direct(
                     registry.get_repository_for_namespace(namespace).ok(),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
@@ -2755,7 +2755,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new(tag).unwrap()),
                     Some(&media_type),
@@ -2766,7 +2766,7 @@ mod tests {
             let pushed_digest = response.digest.clone();
 
             let manifest = registry
-                .head_manifest_served(
+                .handle_head_manifest(
                     None,
                     HeadManifestRequest {
                         namespace: namespace.clone(),
@@ -2790,7 +2790,7 @@ mod tests {
             );
 
             let manifest = registry
-                .head_manifest_served(
+                .handle_head_manifest(
                     None,
                     HeadManifestRequest {
                         namespace: namespace.clone(),
@@ -2859,7 +2859,7 @@ mod tests {
         );
         let (content, media_type) = create_test_manifest(&registry, namespace).await;
         registry
-            .put_manifest(
+            .put_manifest_direct(
                 namespace,
                 &Reference::Tag(tag_name.clone()),
                 Some(&media_type),
@@ -2874,7 +2874,7 @@ mod tests {
         assert_eq!(stamps.load(Ordering::SeqCst), 0, "a push is not a pull");
 
         registry
-            .get_manifest_served(
+            .handle_get_manifest(
                 None,
                 GetManifestRequest {
                     namespace: namespace.clone(),
@@ -2890,7 +2890,7 @@ mod tests {
         assert_eq!(stamps.load(Ordering::SeqCst), 1, "one GET records one pull");
 
         registry
-            .head_manifest_served(
+            .handle_head_manifest(
                 None,
                 HeadManifestRequest {
                     namespace: namespace.clone(),
@@ -2918,7 +2918,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new(tag).unwrap()),
                     Some(&media_type),
@@ -2928,7 +2928,7 @@ mod tests {
                 .unwrap();
 
             registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     None,
                     namespace,
@@ -2939,7 +2939,7 @@ mod tests {
 
             assert!(
                 registry
-                    .get_manifest(
+                    .get_manifest_direct(
                         registry.get_repository_for_namespace(namespace).ok(),
                         &[MediaRange::from(media_type.clone())],
                         namespace,
@@ -2952,7 +2952,7 @@ mod tests {
             );
 
             registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     None,
                     namespace,
@@ -2963,7 +2963,7 @@ mod tests {
 
             assert!(
                 registry
-                    .get_manifest(
+                    .get_manifest_direct(
                         registry.get_repository_for_namespace(namespace).ok(),
                         &[MediaRange::from(media_type.clone())],
                         namespace,
@@ -3009,7 +3009,7 @@ mod tests {
             });
             let manifest_content = serde_json::to_vec(&manifest).unwrap();
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     first,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -3024,7 +3024,7 @@ mod tests {
             ownership.grant(second, &digest).await.unwrap();
             let reference = Reference::Digest(digest.clone());
             registry
-                .delete_manifest(None, None, first, &reference)
+                .remove_manifest(None, None, first, &reference)
                 .await
                 .unwrap();
 
@@ -3047,7 +3047,7 @@ mod tests {
 
             let (manifest_content, media_type) = create_test_manifest(registry, namespace).await;
             let digest = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -3059,7 +3059,7 @@ mod tests {
 
             let reference = Reference::Digest(digest.clone());
             registry
-                .delete_manifest(None, None, namespace, &reference)
+                .remove_manifest(None, None, namespace, &reference)
                 .await
                 .unwrap();
 
@@ -3081,7 +3081,7 @@ mod tests {
                 "the digest delete must remove the revision record, got: {revision:?}"
             );
             let resolved = registry
-                .get_manifest(
+                .get_manifest_direct(
                     registry.get_repository_for_namespace(namespace).ok(),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
@@ -3127,7 +3127,7 @@ mod tests {
             let manifest_content = serde_json::to_vec(&manifest).unwrap();
 
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -3138,7 +3138,7 @@ mod tests {
             let manifest_digest = response.digest.clone();
 
             let manifest_blob_result = registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: manifest_digest.clone(),
                 })
@@ -3146,7 +3146,7 @@ mod tests {
             assert!(matches!(manifest_blob_result, Err(Error::BlobReferenced)));
 
             let layer_result = registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: layer_digest.clone(),
                 })
@@ -3154,7 +3154,7 @@ mod tests {
             assert!(matches!(layer_result, Err(Error::BlobReferenced)));
 
             registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     None,
                     namespace,
@@ -3182,14 +3182,14 @@ mod tests {
             );
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: layer_digest.clone(),
                 })
                 .await
                 .unwrap();
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: config_digest.clone(),
                 })
@@ -3242,7 +3242,7 @@ mod tests {
             });
             let manifest_content = serde_json::to_vec(&manifest).unwrap();
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     Some(&media_type),
@@ -3319,7 +3319,7 @@ mod tests {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let put_err = registry
-            .put_manifest(
+            .put_manifest_direct(
                 namespace,
                 &Reference::Tag(Tag::new("latest").unwrap()),
                 None,
@@ -3348,7 +3348,7 @@ mod tests {
 
         let err = test_case
             .registry()
-            .put_manifest(
+            .put_manifest_direct(
                 &Namespace::new("test-repo").unwrap(),
                 &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&wrong_type),
@@ -3370,7 +3370,7 @@ mod tests {
         let body = vec![b' '; DEFAULT_MAX_MANIFEST_SIZE_BYTES + 1];
 
         let err = registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -3479,7 +3479,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
             let put_response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new(tag).unwrap()),
                     Some(&media_type),
@@ -3489,7 +3489,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .get_manifest_served(
+                .handle_get_manifest(
                     None,
                     GetManifestRequest {
                         namespace: namespace.clone(),
@@ -3526,7 +3526,7 @@ mod tests {
 
             let manifest_stream = Cursor::new(content.clone());
             let response = registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -3551,7 +3551,7 @@ mod tests {
                 .get_repository_for_namespace(namespace)
                 .expect("get repository failed");
             let stored_manifest = registry
-                .get_manifest(
+                .get_manifest_direct(
                     Some(repository),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
@@ -3580,7 +3580,7 @@ mod tests {
                 create_test_manifest_with_subject(registry, namespace).await;
 
             let response_a = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("tag-0").unwrap()),
                     Some(&media_type_a),
@@ -3591,7 +3591,7 @@ mod tests {
 
             for i in 1..20 {
                 registry
-                    .put_manifest(
+                    .put_manifest_direct(
                         namespace,
                         &Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
                         Some(&media_type_a),
@@ -3603,7 +3603,7 @@ mod tests {
 
             for i in 0..20 {
                 registry
-                    .put_manifest(
+                    .put_manifest_direct(
                         namespace,
                         &Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
                         Some(&media_type_b),
@@ -3614,7 +3614,7 @@ mod tests {
             }
 
             registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     None,
                     namespace,
@@ -3628,7 +3628,7 @@ mod tests {
             for i in 0..20 {
                 assert!(
                     registry
-                        .get_manifest(
+                        .get_manifest_direct(
                             Some(repository),
                             &[MediaRange::from(media_type_a.clone())],
                             namespace,
@@ -3645,7 +3645,7 @@ mod tests {
             for i in 0..20 {
                 assert!(
                     registry
-                        .get_manifest(
+                        .get_manifest_direct(
                             Some(repository),
                             &[MediaRange::from(media_type_b.clone())],
                             namespace,
@@ -3679,7 +3679,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new(tag).unwrap()),
                     Some(&media_type),
@@ -3722,7 +3722,7 @@ mod tests {
             let (content, _media_type) = create_test_manifest(registry, namespace).await;
 
             let response = registry
-                .put_manifest(
+                .put_manifest_direct(
                     namespace,
                     &Reference::Tag(Tag::new("latest").unwrap()),
                     None,
@@ -3764,7 +3764,7 @@ mod tests {
         let expected_digest = Digest::sha256_of_bytes(&manifest_bytes);
 
         let response = registry
-            .put_manifest(
+            .put_manifest_direct(
                 &namespace,
                 &Reference::Tag(Tag::new("v1").unwrap()),
                 Some(&media_type),
@@ -3810,7 +3810,7 @@ mod tests {
         let digest = Digest::sha256_of_bytes(&manifest_bytes);
 
         registry
-            .put_manifest(
+            .put_manifest_direct(
                 &namespace,
                 &Reference::Tag(Tag::new("v1").unwrap()),
                 Some(&media_type),
@@ -3835,7 +3835,7 @@ mod tests {
         );
 
         registry
-            .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
+            .remove_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
             .await
             .expect("delete by digest must succeed");
         assert!(
@@ -3863,7 +3863,7 @@ mod tests {
         let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
 
         registry
-            .put_manifest(
+            .put_manifest_direct(
                 &namespace,
                 &Reference::Tag(Tag::new("v1").unwrap()),
                 Some(&media_type),
@@ -3873,7 +3873,7 @@ mod tests {
             .unwrap();
 
         registry
-            .put_manifest(
+            .put_manifest_direct(
                 &namespace,
                 &Reference::Tag(Tag::new("v1").unwrap()),
                 Some(&media_type),
@@ -3901,7 +3901,7 @@ mod tests {
         let digest = Digest::sha256_of_bytes(&manifest_bytes);
 
         registry
-            .put_manifest(
+            .put_manifest_direct(
                 &namespace,
                 &Reference::Tag(Tag::new("v1").unwrap()),
                 Some(&media_type),
@@ -3917,7 +3917,7 @@ mod tests {
             .unwrap();
 
         registry
-            .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
+            .remove_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
             .await
             .unwrap();
 
@@ -3940,7 +3940,7 @@ mod tests {
     ) -> (Vec<u8>, MediaType) {
         let (content, media_type) = create_test_manifest(registry, namespace).await;
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -3988,7 +3988,7 @@ mod tests {
         let source_ts = entry_ms(chrono::Utc::now() - chrono::Duration::hours(3));
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4019,7 +4019,7 @@ mod tests {
         let before = chrono::Utc::now();
         let (content, media_type) = create_test_manifest(registry, namespace).await;
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4051,7 +4051,7 @@ mod tests {
         let older = created_at - chrono::Duration::seconds(60);
 
         let result = registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4083,7 +4083,7 @@ mod tests {
         let newer = created_at + chrono::Duration::seconds(60);
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4111,7 +4111,7 @@ mod tests {
         let created_at = local_created_at(registry, namespace, tag).await;
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4167,7 +4167,7 @@ mod tests {
         let ts = chrono::Utc::now() - chrono::Duration::hours(1);
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4182,7 +4182,7 @@ mod tests {
             .expect("seed the larger-digest manifest");
 
         let result = registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4214,7 +4214,7 @@ mod tests {
         let ts = chrono::Utc::now() - chrono::Duration::hours(1);
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4229,7 +4229,7 @@ mod tests {
             .expect("seed the smaller-digest manifest");
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4473,13 +4473,13 @@ mod tests {
         let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
 
         let first = registry
-            .put_manifest(namespace, &tag_ref, Some(&media_type_a), &content_a)
+            .put_manifest_direct(namespace, &tag_ref, Some(&media_type_a), &content_a)
             .await
             .expect("fresh tag push");
         assert!(first.changed, "a fresh tag push must report changed");
 
         let replay = registry
-            .put_manifest(namespace, &tag_ref, Some(&media_type_a), &content_a)
+            .put_manifest_direct(namespace, &tag_ref, Some(&media_type_a), &content_a)
             .await
             .expect("tag re-assert");
         assert!(
@@ -4489,7 +4489,7 @@ mod tests {
 
         let digest_ref = Reference::Digest(first.digest.clone());
         let digest_replay = registry
-            .put_manifest(namespace, &digest_ref, Some(&media_type_a), &content_a)
+            .put_manifest_direct(namespace, &digest_ref, Some(&media_type_a), &content_a)
             .await
             .expect("digest re-push");
         assert!(
@@ -4508,7 +4508,7 @@ mod tests {
             layer_content.len(),
         );
         let moved = registry
-            .put_manifest(namespace, &tag_ref, Some(&media_type_b), &content_b)
+            .put_manifest_direct(namespace, &tag_ref, Some(&media_type_b), &content_b)
             .await
             .expect("tag move");
         assert!(
@@ -4528,7 +4528,7 @@ mod tests {
         let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4553,7 +4553,7 @@ mod tests {
         let (content, media_type) = seed_tag(registry, namespace, tag).await;
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4579,7 +4579,7 @@ mod tests {
         let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4606,7 +4606,7 @@ mod tests {
         let older = created_at - chrono::Duration::seconds(60);
 
         let result = registry
-            .delete_manifest(
+            .remove_manifest(
                 None,
                 Some(older),
                 namespace,
@@ -4639,7 +4639,7 @@ mod tests {
         let newer = created_at + chrono::Duration::seconds(60);
 
         registry
-            .delete_manifest(
+            .remove_manifest(
                 None,
                 Some(newer),
                 namespace,
@@ -4673,7 +4673,7 @@ mod tests {
         let created_at = local_created_at(registry, namespace, tag).await;
 
         registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -4734,7 +4734,7 @@ mod tests {
 
         let ancient = chrono::DateTime::from_timestamp(0, 0).unwrap();
         registry
-            .delete_manifest(
+            .remove_manifest(
                 None,
                 Some(ancient),
                 namespace,
@@ -4765,7 +4765,7 @@ mod tests {
             local_created_at(registry, namespace, tag).await - chrono::Duration::seconds(60);
 
         let result = registry
-            .delete_manifest(
+            .remove_manifest(
                 None,
                 Some(older),
                 namespace,
@@ -4804,7 +4804,7 @@ mod tests {
             local_created_at(registry, namespace, tag).await + chrono::Duration::seconds(60);
 
         registry
-            .delete_manifest(None, Some(newer), namespace, &Reference::Digest(digest))
+            .remove_manifest(None, Some(newer), namespace, &Reference::Digest(digest))
             .await
             .expect("digest delete newer than every pointing tag must win");
 
@@ -4822,7 +4822,7 @@ mod tests {
     async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_proceeds() {
         // Exercises the prune wire round trip: source_ts is stamped, serialized to
         // RFC 3339 (the `X-Angos-Source-Timestamp` header), and reparsed before
-        // reaching `delete_manifest`.
+        // reaching `remove_manifest`.
         let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
         let namespace = &Namespace::new("prune-repo").unwrap();
@@ -4839,7 +4839,7 @@ mod tests {
             .with_timezone(&chrono::Utc);
 
         let result = registry
-            .delete_manifest(
+            .remove_manifest(
                 None,
                 Some(reparsed),
                 namespace,
@@ -4865,7 +4865,7 @@ mod tests {
             .with_timezone(&chrono::Utc);
 
         registry
-            .delete_manifest(
+            .remove_manifest(
                 None,
                 Some(reparsed),
                 namespace,
@@ -5010,7 +5010,7 @@ mod tests {
             let (content_a, media_type) = create_test_manifest(&registry, &namespace).await;
 
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5037,7 +5037,7 @@ mod tests {
             // suppress the replay. This per-node drop is what terminates mesh
             // cycles without origin tracking.
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5058,7 +5058,7 @@ mod tests {
 
             let (content_b, media_type_b) = create_second_manifest(&registry, &namespace).await;
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5089,7 +5089,7 @@ mod tests {
             let digest = Digest::sha256_of_bytes(&content);
 
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5115,7 +5115,7 @@ mod tests {
             // With the queue empty a broken gate would freshly enqueue, so pending
             // staying 0 proves the gate, not the dedup index, suppressed the replay.
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5149,7 +5149,7 @@ mod tests {
             let digest = Digest::sha256_of_bytes(&content);
 
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5176,7 +5176,7 @@ mod tests {
             // gate must still dispatch so that tag replicates. The OR-gate re-dispatches
             // the unchanged digest push once alongside the changed tag, so two jobs land.
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5203,7 +5203,7 @@ mod tests {
 
             // Both the digest and the tag are now present, so nothing changed.
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5231,7 +5231,7 @@ mod tests {
 
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5247,7 +5247,7 @@ mod tests {
             let baseline = pending(&job_store).await;
 
             registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     None,
                     &namespace,
@@ -5263,7 +5263,7 @@ mod tests {
 
             let after_delete = pending(&job_store).await;
             let _ = registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     None,
                     &namespace,
@@ -5289,7 +5289,7 @@ mod tests {
 
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5307,7 +5307,7 @@ mod tests {
 
             // First delete, deliberately left pending.
             registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     None,
                     &namespace,
@@ -5322,7 +5322,7 @@ mod tests {
             );
 
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5342,7 +5342,7 @@ mod tests {
             );
 
             registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     None,
                     &namespace,
@@ -5372,7 +5372,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
             let push_ts = Utc::now() - Duration::hours(2);
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5389,7 +5389,7 @@ mod tests {
 
             let delete_ts = Utc::now() - Duration::hours(1);
             registry
-                .delete_manifest(
+                .remove_manifest(
                     None,
                     Some(delete_ts),
                     &namespace,
@@ -5418,7 +5418,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
             let digest = Digest::sha256_of_bytes(&content);
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5444,7 +5444,7 @@ mod tests {
 
             let baseline = pending(&job_store).await;
             registry
-                .delete_manifest(None, None, &namespace, &Reference::Digest(digest))
+                .remove_manifest(None, None, &namespace, &Reference::Digest(digest))
                 .await
                 .expect("digest delete");
             assert_eq!(
@@ -5464,7 +5464,7 @@ mod tests {
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
             let digest = Digest::sha256_of_bytes(&content);
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5481,7 +5481,7 @@ mod tests {
 
             let baseline = pending(&job_store).await;
             registry
-                .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
+                .remove_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
                 .await
                 .expect("delete existing revision");
             assert_eq!(
@@ -5495,7 +5495,7 @@ mod tests {
             // `after` proves the gate suppressed it.
             let after = pending(&job_store).await;
             let _ = registry
-                .delete_manifest(None, None, &namespace, &Reference::Digest(digest))
+                .remove_manifest(None, None, &namespace, &Reference::Digest(digest))
                 .await;
             assert_eq!(
                 pending(&job_store).await,
@@ -5700,7 +5700,7 @@ mod tests {
             let namespace = Namespace::new(NAMESPACE).unwrap();
             let (body, media_type) = create_test_manifest_with_subject(&registry, &namespace).await;
             let referrer = registry
-                .put_manifest(
+                .put_manifest_direct(
                     &namespace,
                     &Reference::Tag(Tag::new("v1").unwrap()),
                     Some(&media_type),
@@ -5711,11 +5711,11 @@ mod tests {
                 .digest;
 
             registry
-                .delete_manifest(None, None, &namespace, &Reference::Digest(referrer))
+                .remove_manifest(None, None, &namespace, &Reference::Digest(referrer))
                 .await
                 .expect("the digest delete must succeed");
 
-            // The push enqueued by `put_manifest` is still pending alongside it.
+            // The push enqueued by `put_manifest_direct` is still pending alongside it.
             let mut deletes = Vec::new();
             for key in job_store
                 .list_pending(Queue::Replication, 16)
@@ -5861,7 +5861,7 @@ mod tests {
         // stamped deterministically rather than from the wall clock.
         let newer_ts = Utc::now() - chrono::Duration::seconds(10);
         let seeded = registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -5879,7 +5879,7 @@ mod tests {
         let kept_digest = response_digest(&seeded);
 
         let result = registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -5900,7 +5900,7 @@ mod tests {
         // Kill criterion: the tag must still point at the manifest seeded above. If
         // the source_ts were dropped, the backdated put would have overwritten it.
         let head = registry
-            .head_manifest_served(
+            .handle_head_manifest(
                 None,
                 HeadManifestRequest {
                     namespace: namespace.clone(),
@@ -5937,7 +5937,7 @@ mod tests {
 
         let push = async |body: &'static [u8]| {
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -5978,7 +5978,7 @@ mod tests {
 
         let push = async |body: &'static [u8]| {
             registry
-                .accept_put_manifest(
+                .handle_put_manifest(
                     None,
                     PutManifestRequest {
                         namespace: namespace.clone(),
@@ -6011,7 +6011,7 @@ mod tests {
         let namespace = Namespace::new("test-repo/app").unwrap();
 
         let response = registry
-        .accept_put_manifest(
+        .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),

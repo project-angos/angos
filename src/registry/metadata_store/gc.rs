@@ -414,7 +414,7 @@ mod tests {
         }))
         .unwrap();
         let digest = registry
-            .put_manifest(
+            .put_manifest_direct(
                 &namespace,
                 &Reference::Tag(Tag::new("latest").unwrap()),
                 Some(&media_type),
@@ -490,7 +490,7 @@ mod tests {
             .await
             .unwrap();
         let error = registry
-            .put_manifest(&namespace, &reference, Some(&media_type), &content)
+            .put_manifest_direct(&namespace, &reference, Some(&media_type), &content)
             .await
             .err();
         assert!(
@@ -501,7 +501,7 @@ mod tests {
         store.gc_release(claim).await.unwrap();
         sleep(linger(&store) * 2).await;
         registry
-            .put_manifest(&namespace, &reference, Some(&media_type), &content)
+            .put_manifest_direct(&namespace, &reference, Some(&media_type), &content)
             .await
             .expect("a retry past the released run's linger must succeed");
     }

@@ -219,7 +219,7 @@ async fn test_build_registry_components_integration() {
     let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);
 
     let response = registry
-        .list_catalog_entries(
+        .handle_list_catalog(
             CatalogRequest {
                 n: None,
                 last: None,

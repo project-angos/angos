@@ -1,7 +1,7 @@
 //! [`DockerExtensionService`] for [`Registry`]: the Docker V2 catalog, which
 //! the OCI spec does not define.
 //!
-//! The trait is the transport's seam; the inherent [`Registry::list_catalog_entries`]
+//! The trait is the transport's seam; the inherent [`Registry::handle_list_catalog`]
 //! holds the paging and filtering, and this delegates to it.
 
 use async_trait::async_trait;
@@ -21,6 +21,6 @@ impl DockerExtensionService for Registry {
         request: CatalogRequest,
         visibility: &dyn NamespaceVisibility,
     ) -> Result<Catalog, Error> {
-        self.list_catalog_entries(request, visibility).await
+        self.handle_list_catalog(request, visibility).await
     }
 }

@@ -151,7 +151,7 @@ pub fn create_test_registry(
     create_test_registry_with(blob_store, metadata_store, true)
 }
 
-/// Like [`create_test_registry`] but pins whether `accept_put_manifest`
+/// Like [`create_test_registry`] but pins whether `handle_put_manifest`
 /// enforces manifest-reference validation.
 pub fn create_test_registry_with(
     blob_store: Arc<BlobStore>,
@@ -226,7 +226,7 @@ pub async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[
     let body = content.to_vec();
     let digest = Digest::sha256_of_bytes(&body);
     registry
-        .complete_upload(
+        .handle_complete_upload(
             None,
             CompleteUploadRequest {
                 namespace: namespace.clone(),
@@ -331,7 +331,7 @@ pub async fn put_blob_direct(store: &Arc<dyn ObjectStore>, content: &[u8]) -> Di
     digest
 }
 
-/// Fetch a blob the way `resolve_get_blob` does for an explicit `repository`,
+/// Fetch a blob the way `handle_get_blob` does for an explicit `repository`,
 /// minus the resolver, the redirect and the event.
 pub async fn get_blob(
     registry: &Registry,

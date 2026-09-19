@@ -242,7 +242,7 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
         RegistryConfig::new(job_store.clone()),
     );
     let entries = |namespace: &Namespace| {
-        registry.get_layer_entries(LayerEntriesRequest {
+        registry.handle_list_layer_entries(LayerEntriesRequest {
             namespace: namespace.clone(),
             digest: digest.clone(),
         })
@@ -270,7 +270,7 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
     assert_eq!(listing.entries.len(), 9);
 
     let file = |path: &str| {
-        registry.get_layer_file(LayerFileRequest {
+        registry.handle_get_layer_file(LayerFileRequest {
             namespace: namespace.clone(),
             digest: digest.clone(),
             path: path.to_string(),
@@ -358,7 +358,7 @@ async fn a_push_enqueues_an_index_job_per_tar_layer_of_an_indexing_repository() 
         source_ts: None,
     };
     registry
-        .accept_put_manifest(None, request, Cursor::new(image.into_bytes()))
+        .handle_put_manifest(None, request, Cursor::new(image.into_bytes()))
         .await
         .unwrap();
     assert_eq!(

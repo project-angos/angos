@@ -130,7 +130,10 @@ async fn fill_cache_session(
 impl Registry {
     #[instrument]
     /// `HEAD /v2/<name>/blobs/<digest>`: the blob's descriptor, no body.
-    pub async fn head_blob(&self, request: HeadBlobRequest) -> Result<BlobDescriptor, Error> {
+    pub async fn handle_head_blob(
+        &self,
+        request: HeadBlobRequest,
+    ) -> Result<BlobDescriptor, Error> {
         let has_access = self
             .metadata_store()
             .can_read(&request.namespace, &request.digest)
@@ -304,7 +307,7 @@ impl Registry {
     #[instrument]
     /// `DELETE /v2/<name>/blobs/<digest>`: revokes ownership; the collector
     /// reclaims the bytes once every reference is stale.
-    pub async fn delete_blob(&self, request: DeleteBlobRequest) -> Result<Accepted, Error> {
+    pub async fn handle_delete_blob(&self, request: DeleteBlobRequest) -> Result<Accepted, Error> {
         let ownership = self.metadata_store();
         let links = match ownership
             .read_blob_index_namespace(&request.namespace, &request.digest)
@@ -345,7 +348,7 @@ impl Registry {
     /// `allow_redirect`, `enable_blob_redirect`, no range, and locally
     /// available bytes.
     #[instrument(skip(self, request))]
-    pub async fn resolve_get_blob(
+    pub async fn handle_get_blob(
         &self,
         actor: Option<EventActor>,
         request: GetBlobRequest,
@@ -429,7 +432,7 @@ mod tests {
 
             let (digest, _) = create_test_blob(registry, namespace, content).await;
             let response = registry
-                .head_blob(HeadBlobRequest {
+                .handle_head_blob(HeadBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                     accepted_types: Vec::new(),
@@ -490,7 +493,7 @@ mod tests {
             .unwrap();
 
         let result = registry
-            .head_blob(HeadBlobRequest {
+            .handle_head_blob(HeadBlobRequest {
                 namespace: namespace.clone(),
                 digest: digest.clone(),
                 accepted_types: Vec::new(),
@@ -535,7 +538,7 @@ mod tests {
             let repository = registry.get_repository_for_namespace(namespace).unwrap();
 
             let head_result = registry
-                .head_blob(HeadBlobRequest {
+                .handle_head_blob(HeadBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                     accepted_types: Vec::new(),
@@ -601,7 +604,7 @@ mod tests {
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
@@ -650,7 +653,7 @@ mod tests {
                 .unwrap();
 
             let result = registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
@@ -701,7 +704,7 @@ mod tests {
                 .unwrap();
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
@@ -710,7 +713,7 @@ mod tests {
 
             assert!(!ownership.can_read(namespace, &digest).await.unwrap());
             let head = registry
-                .head_blob(HeadBlobRequest {
+                .handle_head_blob(HeadBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                     accepted_types: Vec::new(),
@@ -782,7 +785,7 @@ mod tests {
                 .unwrap();
 
                 let result = registry
-                    .delete_blob(DeleteBlobRequest {
+                    .handle_delete_blob(DeleteBlobRequest {
                         namespace: namespace.clone(),
                         digest: digest.clone(),
                     })
@@ -823,7 +826,7 @@ mod tests {
             ownership.grant(second, &digest).await.unwrap();
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: first.clone(),
                     digest: digest.clone(),
                 })
@@ -835,7 +838,7 @@ mod tests {
             assert!(ownership.can_read(second, &digest).await.unwrap());
 
             registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: second.clone(),
                     digest: digest.clone(),
                 })
@@ -858,7 +861,7 @@ mod tests {
             let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
 
             let result = registry
-                .delete_blob(DeleteBlobRequest {
+                .handle_delete_blob(DeleteBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                 })
@@ -1029,7 +1032,7 @@ mod tests {
         let before = hits();
 
         let response = registry
-            .resolve_get_blob(
+            .handle_get_blob(
                 None,
                 GetBlobRequest {
                     namespace,
@@ -1456,7 +1459,7 @@ mod tests {
             let (digest, repository) = create_test_blob(registry, namespace, content).await;
 
             let head_response = registry
-                .head_blob(HeadBlobRequest {
+                .handle_head_blob(HeadBlobRequest {
                     namespace: namespace.clone(),
                     digest: digest.clone(),
                     accepted_types: Vec::new(),

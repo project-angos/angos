@@ -423,7 +423,7 @@ impl ScanJobHandler {
             .map_err(|e| Error::Execution(format!("report manifest: {e}")))?;
         let manifest_digest = Digest::sha256_of_bytes(&body);
         self.registry
-            .accept_put_manifest(
+            .handle_put_manifest(
                 Some(EventActor::internal(SCAN_ACTOR)),
                 PutManifestRequest {
                     namespace: namespace.clone(),
@@ -447,7 +447,7 @@ impl ScanJobHandler {
     ) -> Result<(), Error> {
         let length = bytes.len() as u64;
         self.registry
-            .start_upload(
+            .handle_start_upload(
                 Some(EventActor::internal(SCAN_ACTOR)),
                 StartUploadRequest {
                     namespace: namespace.clone(),

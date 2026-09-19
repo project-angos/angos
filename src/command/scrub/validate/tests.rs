@@ -140,7 +140,7 @@ async fn push_healthy_image(
         layer_bytes.len(),
     );
     let response = registry
-        .put_manifest(
+        .put_manifest_direct(
             namespace,
             &Reference::Tag(Tag::new("v1").unwrap()),
             Some(&media_type("application/vnd.oci.image.manifest.v1+json")),
@@ -216,7 +216,7 @@ async fn an_attested_image_emits_zero_actions() {
         );
         let attestation_digest = test_case
             .registry()
-            .put_manifest(
+            .put_manifest_direct(
                 namespace,
                 &Reference::Digest(Digest::sha256_of_bytes(attestation.as_bytes())),
                 Some(&media_type("application/vnd.oci.image.manifest.v1+json")),
@@ -372,7 +372,7 @@ async fn withheld_cross_namespace_reference_is_not_regranted() {
         }}"#
         );
         permissive
-            .accept_put_manifest(
+            .handle_put_manifest(
                 None,
                 PutManifestRequest {
                     namespace: borrower.clone(),
@@ -1432,7 +1432,7 @@ async fn a_tracked_reference_is_pinned_by_its_entry_alone() {
             "the layer must be readable through its per-referrer entry"
         );
         let refused = registry
-            .delete_blob(DeleteBlobRequest {
+            .handle_delete_blob(DeleteBlobRequest {
                 namespace: namespace.clone(),
                 digest: layer_digest.clone(),
             })
