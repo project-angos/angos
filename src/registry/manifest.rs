@@ -23,7 +23,7 @@ use crate::{
         blob_store::BlobStore,
         keys::NamespaceKeys,
         metadata_store::{LinkKind, LinkMetadata},
-        pull_through_name, record_pull_through, repository_name,
+        record_pull_through, repository_name,
     },
     replication::{ReplicationDownstream, ReplicationJob, ReplicationTarget, build_envelope},
     scan,
@@ -205,6 +205,55 @@ impl<T> ServeLocal<T> {
     }
 }
 
+/// Only a genuine miss is a 404; collapsing a backend fault into one makes a
+/// storage outage look like deleted images.
+fn hosted_manifest_error(namespace: &Namespace, reference: &Reference, error: Error) -> Error {
+    match error {
+        Error::NotFound | Error::ManifestUnknown => {
+            debug!("No local manifest for {namespace}:{reference}");
+            Error::ManifestUnknown
+        }
+        other => {
+            error!("Failed to read local manifest {namespace}:{reference}: {other}");
+            other
+        }
+    }
+}
+
+/// The serve-local gate shared by the cached manifest HEAD and GET: `local`
+/// is served unless it is absent or `needs_upstream` finds it stale.
+async fn serveable_cached<T>(
+    local: Result<T, Error>,
+    needs_upstream: impl AsyncFnOnce(&T) -> Result<bool, Error>,
+) -> Result<ServeLocal<T>, Error> {
+    let Ok(value) = local else {
+        return Ok(ServeLocal::Miss);
+    };
+    if needs_upstream(&value).await? {
+        return Ok(ServeLocal::Refresh);
+    }
+    Ok(ServeLocal::Hit(value))
+}
+
+/// Whether a cached mutable tag must be refetched because the upstream has
+/// re-pointed it; a digest or an immutable tag never moves.
+async fn needs_upstream_pull(
+    upstream: &Repository,
+    accepted_types: &[MediaRange],
+    namespace: &Namespace,
+    reference: &Reference,
+    is_tag_immutable: bool,
+    local_digest: &Digest,
+) -> Result<bool, Error> {
+    if !matches!(reference, Reference::Tag(_)) || is_tag_immutable {
+        return Ok(false);
+    }
+
+    Ok(!upstream
+        .is_upstream_digest_match(accepted_types, namespace, reference, local_digest)
+        .await?)
+}
+
 impl Registry {
     #[instrument(skip(actor))]
     /// The typed manifest-HEAD the [`angos_oci_service::OciService`] trait
@@ -216,34 +265,63 @@ impl Registry {
     ) -> Result<ManifestDescriptor, Error> {
         let client = actor.as_ref().map_or("anonymous", EventActor::audit_name);
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
-        let cache_of = pull_through_name(repository);
-        let is_tag_immutable = self.is_reference_immutable(repository, &request.reference);
+        match repository.filter(|repository| repository.is_pull_through()) {
+            Some(upstream) => {
+                let is_tag_immutable = self.is_reference_immutable(repository, &request.reference);
+                self.head_cached_manifest(upstream, &request, is_tag_immutable, client)
+                    .await
+            }
+            None => {
+                self.head_hosted_manifest(&request.namespace, &request.reference, client)
+                    .await
+            }
+        }
+    }
+
+    /// HEAD on a namespace no upstream backs: the local manifest or a 404.
+    async fn head_hosted_manifest(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+        client: &str,
+    ) -> Result<ManifestDescriptor, Error> {
+        let meta = self
+            .head_local_manifest(namespace, reference)
+            .await
+            .map_err(|error| hosted_manifest_error(namespace, reference, error))?;
+        self.record_manifest_pull(namespace, &LinkKind::from_reference(reference), client)
+            .await?;
+        Ok(meta)
+    }
+
+    /// HEAD on a pull-through namespace: the cached manifest while it is
+    /// current, else the upstream's, fetched and stored by the GET path.
+    async fn head_cached_manifest(
+        &self,
+        upstream: &Repository,
+        request: &HeadManifestRequest,
+        is_tag_immutable: bool,
+        client: &str,
+    ) -> Result<ManifestDescriptor, Error> {
         let local = self
             .head_local_manifest(&request.namespace, &request.reference)
             .await;
-        let serveable = self
-            .serveable_local(
+        let serveable = serveable_cached(local, async |meta| {
+            needs_upstream_pull(
+                upstream,
+                &request.accepted_types,
                 &request.namespace,
                 &request.reference,
-                cache_of.is_some(),
-                local,
-                async |meta| {
-                    self.needs_upstream_pull_manifest(
-                        repository,
-                        &request.accepted_types,
-                        &request.namespace,
-                        &request.reference,
-                        is_tag_immutable,
-                        &meta.digest,
-                    )
-                    .await
-                },
+                is_tag_immutable,
+                &meta.digest,
             )
-            .await?;
+            .await
+        })
+        .await?;
         // Only the hit is counted here: the fall-through below goes through
-        // `get_manifest`, which counts the outcome it acts on.
+        // `get_cached_manifest`, which counts the outcome it acts on.
         if let ServeLocal::Hit(meta) = serveable {
-            record_pull_through(cache_of, "manifest", "hit");
+            record_pull_through(&upstream.name, "manifest", "hit");
             self.record_manifest_pull(
                 &request.namespace,
                 &LinkKind::from_reference(&request.reference),
@@ -254,12 +332,15 @@ impl Registry {
         }
 
         let body = self
-            .get_manifest(
-                repository,
-                &request.accepted_types,
-                &request.namespace,
-                request.reference,
+            .get_cached_manifest(
+                upstream,
+                &GetManifestRequest {
+                    namespace: request.namespace.clone(),
+                    reference: request.reference.clone(),
+                    accepted_types: request.accepted_types.clone(),
+                },
                 is_tag_immutable,
+                false,
                 client,
             )
             .await?;
@@ -349,7 +430,9 @@ impl Registry {
         })
     }
 
-    #[instrument(skip(repository))]
+    /// Test-only: the cached or hosted GET for an explicit `repository`,
+    /// without redirects.
+    #[cfg(test)]
     pub async fn get_manifest(
         &self,
         repository: Option<&Repository>,
@@ -359,37 +442,94 @@ impl Registry {
         is_tag_immutable: bool,
         client: &str,
     ) -> Result<ManifestGet, Error> {
-        let cache_of = pull_through_name(repository);
-        let local = self.get_local_manifest(namespace, &reference, client).await;
-        let serveable = self
-            .serveable_local(
-                namespace,
-                &reference,
-                cache_of.is_some(),
-                local,
-                async |body| {
-                    self.needs_upstream_pull_manifest(
-                        repository,
-                        accepted_types,
-                        namespace,
-                        &reference,
-                        is_tag_immutable,
-                        body.digest(),
-                    )
+        let request = GetManifestRequest {
+            namespace: namespace.clone(),
+            reference,
+            accepted_types: accepted_types.to_vec(),
+        };
+        match repository.filter(|repository| repository.is_pull_through()) {
+            Some(upstream) => {
+                self.get_cached_manifest(upstream, &request, is_tag_immutable, false, client)
                     .await
-                },
+            }
+            None => self.get_hosted_manifest(&request, false, client).await,
+        }
+    }
+
+    /// GET on a namespace no upstream backs: the local manifest, as a
+    /// redirect when the link alone can answer, or a 404.
+    async fn get_hosted_manifest(
+        &self,
+        request: &GetManifestRequest,
+        allow_redirect: bool,
+        client: &str,
+    ) -> Result<ManifestGet, Error> {
+        let GetManifestRequest {
+            namespace,
+            reference,
+            ..
+        } = request;
+        if allow_redirect
+            && self.enable_manifest_redirect
+            && let Some(response) = self
+                .try_redirect_via_link(namespace, reference, client)
+                .await?
+        {
+            return Ok(response);
+        }
+        self.get_local_manifest(namespace, reference, client)
+            .await
+            .map_err(|error| hosted_manifest_error(namespace, reference, error))
+    }
+
+    /// GET on a pull-through namespace: the cached manifest while it is
+    /// current, else the upstream's, stored on the way out. A digest or an
+    /// immutable tag cannot move upstream, so only those redirect from the
+    /// link alone; a mutable tag is checked against the upstream first.
+    #[instrument(skip(upstream))]
+    async fn get_cached_manifest(
+        &self,
+        upstream: &Repository,
+        request: &GetManifestRequest,
+        is_tag_immutable: bool,
+        allow_redirect: bool,
+        client: &str,
+    ) -> Result<ManifestGet, Error> {
+        let GetManifestRequest {
+            namespace,
+            reference,
+            accepted_types,
+        } = request;
+        if allow_redirect
+            && self.enable_manifest_redirect
+            && (matches!(reference, Reference::Digest(_)) || is_tag_immutable)
+            && let Some(response) = self
+                .try_redirect_via_link(namespace, reference, client)
+                .await?
+        {
+            return Ok(response);
+        }
+
+        let local = self.get_local_manifest(namespace, reference, client).await;
+        let serveable = serveable_cached(local, async |body| {
+            needs_upstream_pull(
+                upstream,
+                accepted_types,
+                namespace,
+                reference,
+                is_tag_immutable,
+                body.digest(),
             )
-            .await?;
-        record_pull_through(cache_of, "manifest", serveable.outcome());
+            .await
+        })
+        .await?;
+        record_pull_through(&upstream.name, "manifest", serveable.outcome());
         if let ServeLocal::Hit(manifest) = serveable {
             return Ok(manifest);
         }
 
-        let Some(repository) = repository else {
-            return Err(Error::ManifestUnknown);
-        };
-        let fetched = repository
-            .get_manifest(accepted_types, namespace, &reference)
+        let fetched = upstream
+            .get_manifest(accepted_types, namespace, reference)
             .await?;
 
         // `Docker-Content-Digest` may be omitted, so hash the body under the
@@ -398,7 +538,7 @@ impl Registry {
         let media_type = fetched.media_type;
         let digest = match fetched.digest {
             Some(digest) => digest,
-            None => match &reference {
+            None => match reference {
                 Reference::Digest(requested) => Digest::from_bytes(requested.algorithm(), &content),
                 Reference::Tag(_) => Digest::sha256_of_bytes(&content),
             },
@@ -408,9 +548,9 @@ impl Registry {
         // must not fail it.
         let event = Event::push_manifest(
             namespace,
-            &repository.name,
+            &upstream.name,
             &digest,
-            &reference,
+            reference,
             Some(&EventActor::internal(CACHE_ACTOR)),
         );
         if let Err(error) = self.dispatch_events(&[event]).await {
@@ -420,12 +560,12 @@ impl Registry {
         self.store_manifest(
             &StoreManifest {
                 namespace,
-                reference: &reference,
+                reference,
                 content_type: media_type.as_ref(),
                 created_tags: &[],
                 reference_policy: ReferencePolicy::Trusted,
                 created_at: None,
-                repository: Some(repository),
+                repository: Some(upstream),
             },
             &content,
         )
@@ -436,62 +576,6 @@ impl Registry {
             media_type,
             bytes: content,
         })
-    }
-
-    /// The serve-local gate shared by manifest HEAD and GET. A non-pull-through
-    /// repository always serves local, reporting `Error::ManifestUnknown` when
-    /// there is none.
-    async fn serveable_local<T>(
-        &self,
-        namespace: &Namespace,
-        reference: &Reference,
-        pull_through: bool,
-        local: Result<T, Error>,
-        needs_upstream: impl AsyncFnOnce(&T) -> Result<bool, Error>,
-    ) -> Result<ServeLocal<T>, Error> {
-        if !pull_through {
-            // Only a genuine miss is a 404; collapsing a backend fault into one
-            // makes a storage outage look like deleted images.
-            return local.map(ServeLocal::Hit).map_err(|error| match error {
-                Error::NotFound | Error::ManifestUnknown => {
-                    debug!("No local manifest for {namespace}:{reference}");
-                    Error::ManifestUnknown
-                }
-                other => {
-                    error!("Failed to read local manifest {namespace}:{reference}: {other}");
-                    other
-                }
-            });
-        }
-        let Ok(value) = local else {
-            return Ok(ServeLocal::Miss);
-        };
-        if needs_upstream(&value).await? {
-            return Ok(ServeLocal::Refresh);
-        }
-        Ok(ServeLocal::Hit(value))
-    }
-
-    async fn needs_upstream_pull_manifest(
-        &self,
-        repository: Option<&Repository>,
-        accepted_types: &[MediaRange],
-        namespace: &Namespace,
-        reference: &Reference,
-        is_tag_immutable: bool,
-        local_digest: &Digest,
-    ) -> Result<bool, Error> {
-        let upstream = repository.filter(|repository| repository.is_pull_through());
-        let Some(repository) = upstream else {
-            return Ok(false);
-        };
-        if !matches!(reference, Reference::Tag(_)) || is_tag_immutable {
-            return Ok(false);
-        }
-
-        Ok(!repository
-            .is_upstream_digest_match(accepted_types, namespace, reference, local_digest)
-            .await?)
     }
 
     async fn get_local_manifest(
@@ -989,8 +1073,7 @@ impl Registry {
     /// Resolves a manifest GET to a presigned redirect or the manifest body,
     /// then emits `manifest.pull` for the served digest. The redirect fast-path
     /// needs the caller's consent (a client opts out with
-    /// `X-Angos-No-Redirect`) and an authoritative target, so a mutable tag on
-    /// a pull-through cache falls through to `get_manifest` to refresh.
+    /// `X-Angos-No-Redirect`) and an authoritative target.
     #[instrument(skip(self, request))]
     /// The typed manifest-GET the [`angos_oci_service::OciService`] trait
     /// serves.
@@ -1003,64 +1086,35 @@ impl Registry {
         let client = actor.as_ref().map_or("anonymous", EventActor::audit_name);
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
         let repository_name = repository_name(repository);
-        let event_reference = request.reference.clone();
 
-        let response = self
-            .resolve_get_manifest_response(
-                repository,
-                &request.namespace,
-                request.reference,
-                &request.accepted_types,
-                allow_redirect,
-                client,
-            )
-            .await?;
+        let response = match repository.filter(|repository| repository.is_pull_through()) {
+            Some(upstream) => {
+                let is_tag_immutable = self.is_reference_immutable(repository, &request.reference);
+                self.get_cached_manifest(
+                    upstream,
+                    &request,
+                    is_tag_immutable,
+                    allow_redirect,
+                    client,
+                )
+                .await?
+            }
+            None => {
+                self.get_hosted_manifest(&request, allow_redirect, client)
+                    .await?
+            }
+        };
 
         let event = Event::pull_manifest(
             &request.namespace,
             &repository_name,
             response.digest(),
-            &event_reference,
+            &request.reference,
             actor.as_ref(),
         );
         self.dispatch_events(&[event]).await?;
 
         Ok(response)
-    }
-
-    async fn resolve_get_manifest_response(
-        &self,
-        repository: Option<&Repository>,
-        namespace: &Namespace,
-        reference: Reference,
-        mime_types: &[MediaRange],
-        allow_redirect: bool,
-        client: &str,
-    ) -> Result<ManifestGet, Error> {
-        let is_tag_immutable = self.is_reference_immutable(repository, &reference);
-        let redirect_is_authoritative = !repository.is_some_and(Repository::is_pull_through)
-            || matches!(reference, Reference::Digest(_))
-            || is_tag_immutable;
-
-        if allow_redirect
-            && self.enable_manifest_redirect
-            && redirect_is_authoritative
-            && let Some(resp) = self
-                .try_redirect_via_link(namespace, &reference, client)
-                .await?
-        {
-            return Ok(resp);
-        }
-
-        self.get_manifest(
-            repository,
-            mime_types,
-            namespace,
-            reference,
-            is_tag_immutable,
-            client,
-        )
-        .await
     }
 
     /// Refuse a push that would move an immutable `tag` to different content.

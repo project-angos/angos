@@ -15,7 +15,7 @@ use angos_oci::{
     Digest, MediaRange, MediaType, Namespace, Tag, UploadSessionId,
     header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID},
     http_range::RequestRange,
-    request::{CompleteUploadRequest, GetReferrersRequest},
+    request::{CompleteUploadRequest, GetBlobRequest, GetReferrersRequest},
 };
 use angos_oci_client::RegistryClient;
 use angos_s3_client::{
@@ -331,8 +331,8 @@ pub async fn put_blob_direct(store: &Arc<dyn ObjectStore>, content: &[u8]) -> Di
     digest
 }
 
-/// Fetch a blob the way `resolve_get_blob` does, minus the redirect and event
-/// paths.
+/// Fetch a blob the way `resolve_get_blob` does for an explicit `repository`,
+/// minus the resolver, the redirect and the event.
 pub async fn get_blob(
     registry: &Registry,
     repository: &Repository,
@@ -345,17 +345,22 @@ pub async fn get_blob(
         .metadata_store()
         .can_read(namespace, digest)
         .await?;
-    Ok(registry
-        .get_blob_with_access(
-            Some(repository),
-            accepted_types,
-            namespace,
-            digest,
-            range,
-            has_access,
-        )
-        .await?
-        .into_response(registry.blob_stream_frame_size())?)
+    let request = GetBlobRequest {
+        namespace: namespace.clone(),
+        digest: digest.clone(),
+        accepted_types: accepted_types.to_vec(),
+        range,
+    };
+    let served = if repository.is_pull_through() {
+        registry
+            .get_cached_blob(repository, &request, has_access, false)
+            .await?
+    } else if has_access {
+        registry.serve_local_blob(&request, false).await?
+    } else {
+        return Err(Error::BlobUnknown);
+    };
+    Ok(served.into_response(registry.blob_stream_frame_size())?)
 }
 
 pub async fn create_test_blob(
