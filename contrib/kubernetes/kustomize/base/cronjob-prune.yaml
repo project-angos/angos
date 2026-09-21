@@ -1,0 +1,85 @@
+---
+# Retention enforcement and upload reclamation, hourly at :15, half an hour
+# before the scrub at :45 so that run reclaims the blobs these deletions leave
+# unreferenced.
+#
+# Prune deletes by configuration, not only by age: every namespace no
+# [repository] in config.toml owns is cleared, revisions, tags, uploads and
+# blob grants alike. That is how orphan namespaces are collected and it cannot
+# be switched off, so config.toml decides what survives. The one guard is that
+# prune refuses to run while no repository is configured at all. After any
+# change to [repository] or a retention policy, run it once with -d and read
+# the report before the schedule fires again.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: angos-prune
+  namespace: angos
+  labels:
+    app: angos
+spec:
+  schedule: "15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: angos
+            job: prune
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: prune
+              # The same tag as the Deployment, for the reason given there.
+              image: ghcr.io/project-angos/angos:1.8.0
+              args:
+                - -c
+                - /config/config.toml
+                - -c
+                - /credentials/secrets.toml
+                - prune
+                # Upload sessions, orphan multipart uploads and byteless index
+                # entries are reclaimed only once older than this. The default
+                # is 1h; a day shields a push that stalls overnight.
+                - -u
+                - 24h
+              env:
+                # The job log is the only record of what prune deleted.
+                - name: RUST_LOG
+                  value: info
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                  readOnly: true
+                - name: credentials
+                  mountPath: /credentials
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  memory: 512Mi
+          volumes:
+            - name: config
+              configMap:
+                name: angos-config
+            - name: credentials
+              secret:
+                secretName: angos-credentials

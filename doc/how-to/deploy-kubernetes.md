@@ -13,7 +13,7 @@ Deploy Angos on Kubernetes as a stateless service. Angos requires only configura
 - Kubernetes cluster
 - `kubectl` configured
 - S3-compatible storage (AWS S3, Exoscale SOS, etc.) for production deployments
-- Optional: Redis for a shared cache in multi-replica deployments
+- Optional: Redis, to share the JWKS and token caches between replicas
 - Optional: Ingress controller for external access
 
 ---
@@ -27,18 +27,34 @@ git clone https://github.com/project-angos/angos.git
 cd angos
 ```
 
-### Step 2: Choose a TLS termination approach
+### Step 2: Fill in the configuration
+
+Set the S3 bucket, the public URL and the repositories in
+`contrib/kubernetes/kustomize/base/config.toml`, and the S3 keys, a token
+signing key and an identity in `base/credentials-secret.yaml`; the README
+beside them lists every value. The configuration is split that way so a secret
+rotates without a restart, as described below.
+
+### Step 3: Choose a TLS termination approach
 
 ```bash
-# TLS terminated by ingress controller
+# TLS terminated by an ingress controller
 kubectl apply -k contrib/kubernetes/kustomize/overlays/simple
+
+# TLS terminated at a Gateway, through an HTTPRoute
+kubectl apply -k contrib/kubernetes/kustomize/overlays/gateway-api
 
 # TLS passthrough (required for mTLS policy enforcement)
 kubectl apply -k contrib/kubernetes/kustomize/overlays/tls
 
-# TLS passthrough with Traefik
-kubectl apply -k contrib/kubernetes/kustomize/overlays/tls-traefik
+# TLS passthrough at a Gateway, through a TLSRoute, with a client CA
+kubectl apply -k contrib/kubernetes/kustomize/overlays/tls-gateway-api
 ```
+
+Each overlay lists two optional components: `kubernetes-oidc`, which lets pods
+pull with their own service-account token, and `kubelet-credential-provider`,
+which installs the plugin those pulls need on every node. See
+[Configure Kubernetes OIDC](configure-kubernetes-oidc.md).
 
 ---
 
@@ -279,7 +295,7 @@ kubectl apply -f ingress.yaml
 
 ## With Redis for Caching
 
-Replicas need no coordination backend. In multi-replica deployments, an optional Redis shares the link and token caches across replicas, so a write on one replica is visible to the others immediately instead of after the cache TTL.
+Replicas need no coordination backend, and no shared cache: every tag, revision and referrer read goes to the metadata store, so a replica never serves what a peer has already moved. The cache holds only each provider's JWKS, upstream tokens and webhook decisions, all TTL-bounded, so a per-replica copy is safe. An optional Redis shares those entries, so a new replica starts warm and a JWKS is fetched once for all rather than once per replica.
 
 ### Deploy Redis
 
@@ -332,7 +348,7 @@ key_prefix = "angos"
 
 ## Scheduled Storage Maintenance (CronJob)
 
-Run periodic maintenance to verify storage integrity. For retention enforcement, add a second CronJob with `args: ["-c", "/config/config.toml", "prune"]`; see [Configure Retention Policies](configure-retention-policies.md).
+Run periodic maintenance to verify storage integrity. For retention enforcement, add a second CronJob with `args: ["-c", "/config/config.toml", "prune"]`; see [Configure Retention Policies](configure-retention-policies.md). The kustomize base ships both, prune at :15 and scrub at :45, so the scrub reclaims what the prune just unreferenced.
 
 **Important:** With S3 storage, the scrub job only needs the config volume, no data storage volume is required.
 

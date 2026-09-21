@@ -79,14 +79,34 @@ RUST_LOG=info angos -c scanner.toml scanner grype
 
 At `info` it logs one line per image scanned. See the [configuration reference](../reference/configuration.md#scanner-service-scanner) for the other options.
 
-The registry image also comes with a scanner built in, under the `-grype` and `-trivy` tag suffixes, so the same service runs as a container:
+The same service runs as a container from the registry image, with the scanner's own image mounted read-only on `PATH`. The registry image has no `/tmp` and nothing writable, so mount a directory there for the scanner's temporary files and its database (`XDG_CACHE_HOME`), world-writable since the image runs as user 65534. Docker calls image mounts experimental and needs the image pulled first:
 
 ```bash
-docker run -d -p 8766:8766 -v "$PWD/scanner.toml:/scanner.toml" \
-  ghcr.io/project-angos/angos:latest-grype -c /scanner.toml scanner grype
+mkdir -m 1777 scanner-tmp
+docker pull anchore/grype:latest
+docker run -d -p 8766:8766 -v "$PWD/scanner.toml:/scanner.toml" -v "$PWD/scanner-tmp:/tmp" \
+  --mount type=image,source=anchore/grype:latest,target=/opt/scanner \
+  -e PATH=/opt/scanner:/opt/scanner/usr/local/bin -e XDG_CACHE_HOME=/tmp \
+  ghcr.io/project-angos/angos:latest -c /scanner.toml scanner grype
 ```
 
-The scanner keeps its database under `/cache`; mount a volume there to keep it across restarts.
+For Trivy, mount `aquasec/trivy:latest` instead; the `PATH` above covers both layouts. A `--tmpfs /tmp` works too, but then Grype's database, about two gigabytes, lives in memory and is fetched on every start. On Kubernetes 1.35 or later an image volume mounts the same image at the same path, with an `emptyDir` on `/tmp`:
+
+```yaml
+containers:
+  - image: ghcr.io/project-angos/angos:latest
+    args: [-c, /scanner.toml, scanner, grype]
+    env:
+      - { name: PATH, value: /opt/scanner:/opt/scanner/usr/local/bin }
+      - { name: XDG_CACHE_HOME, value: /tmp }
+    volumeMounts:
+      - { name: scanner, mountPath: /opt/scanner, readOnly: true }
+      - { name: tmp, mountPath: /tmp }
+volumes:
+  - name: scanner
+    image: { reference: anchore/grype:latest, pullPolicy: Always }
+  - { name: tmp, emptyDir: {} }
+```
 
 ## Step 4: Drain the Scan Queue
 

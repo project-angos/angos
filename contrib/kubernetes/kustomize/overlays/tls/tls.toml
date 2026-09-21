@@ -1,0 +1,5 @@
+# Merged into the angos-config ConfigMap by this overlay and passed as a third
+# `-c` file, so config.toml stays the same across overlays.
+[server.tls]
+server_certificate_bundle = "/tls/tls.crt"
+server_private_key = "/tls/tls.key"

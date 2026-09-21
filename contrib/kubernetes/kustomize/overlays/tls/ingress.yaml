@@ -1,27 +1,26 @@
 ---
-kind: Ingress
 apiVersion: networking.k8s.io/v1
+kind: Ingress
 metadata:
   name: angos
   namespace: angos
   annotations:
     ingress.cilium.io/tls-passthrough: "enabled"
     ingress.cilium.io/force-https: "true"
-    # nginx ingress controller must have the --enable-ssl-passthrough set
-    # to true in the command line arguments to support TLS passthrough
+    # The nginx controller must run with --enable-ssl-passthrough.
     nginx.ingress.kubernetes.io/ssl-passthrough: "true"
 spec:
   rules:
-  - host: cr.example.com
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: angos
-            port:
-              number: 8000
+    - host: cr.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: angos
+                port:
+                  number: 8000
   tls:
-  - hosts:
-    - cr.example.com
+    - hosts:
+        - cr.example.com

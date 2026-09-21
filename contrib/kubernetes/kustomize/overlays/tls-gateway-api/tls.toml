@@ -1,0 +1,7 @@
+# Merged into the angos-config ConfigMap by this overlay and passed as a third
+# `-c` file, so config.toml stays the same across overlays. The client CA is
+# what lets an access policy read identity.certificate.
+[server.tls]
+server_certificate_bundle = "/tls/tls.crt"
+server_private_key = "/tls/tls.key"
+client_ca_bundle = "/client-ca/ca.crt"

@@ -190,7 +190,13 @@ setup guide including `angos worker` invocation and KEDA autoscaling.
 
 ## Cache (`cache`)
 
-Token and key cache configuration. Defaults to in-memory (not suitable for multi-replica).
+What the registry caches: the JWKS and discovery documents of each OIDC provider,
+the bearer tokens it holds against pull-through upstreams, and webhook
+authorization decisions. All of it is derived and bounded by a TTL, so the
+default in-memory cache is safe across any number of replicas: nothing in it
+decides what a replica serves. Redis is optional, and shares those entries so a
+new replica starts warm and every replica refetches a JWKS once rather than
+once each.
 
 ### Redis Cache (`cache.redis`)
 

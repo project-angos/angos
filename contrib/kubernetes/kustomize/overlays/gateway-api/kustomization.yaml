@@ -1,5 +1,5 @@
 ---
-# TLS terminated at the ingress controller. Before applying, edit
+# Gateway API, TLS terminated at the gateway. Before applying, edit
 # base/config.toml and fill base/credentials-secret.yaml; the README lists
 # what to change.
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -7,7 +7,7 @@ kind: Kustomization
 
 resources:
   - ../../base
-  - ingress.yaml
+  - httproute.yaml
 
 # components:
 #   - ../../components/kubernetes-oidc

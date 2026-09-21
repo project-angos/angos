@@ -283,6 +283,10 @@ Each pull records exactly one outcome, `HEAD` and `GET` alike. A `hit` on a
 mutable tag still costs the upstream a `HEAD` to confirm the digest; an
 `immutable_tags` entry skips that check, which is what makes a cached tag free.
 
+Every outcome series of a repository with an upstream exists at zero from
+startup and from a configuration reload, so the first pull after a restart is
+a step that `rate` and `increase` see.
+
 **Example:**
 ```promql
 # Cache hit ratio per repository
