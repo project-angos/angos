@@ -1,0 +1,18 @@
+---
+# The registry reads the cluster's JWKS with its own token, which is how it
+# validates the service-account tokens [auth.oidc.kube] trusts. Most
+# distributions already grant this role to every service account; binding it
+# to this one account is what keeps a change to that default from failing
+# every image pull at the next node roll.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: angos-oidc-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:service-account-issuer-discovery
+subjects:
+  - kind: ServiceAccount
+    name: angos
+    namespace: angos

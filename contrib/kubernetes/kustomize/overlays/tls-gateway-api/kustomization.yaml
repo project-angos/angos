@@ -1,7 +1,7 @@
 ---
-# TLS terminated by the registry itself, passed through the ingress: what an
-# mTLS access policy needs, since the client certificate must reach the pod.
-# Expects a `server-tls-certificate` Secret of type kubernetes.io/tls in the
+# TLS terminated by the registry itself, passed through a Gateway by SNI, with a
+# client CA for mTLS policies. Expects a `server-tls-certificate` Secret of
+# type kubernetes.io/tls and a `client-ca` Secret carrying `ca.crt` in the
 # namespace. Before applying, edit base/config.toml and fill
 # base/credentials-secret.yaml; the README lists what to change.
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -9,7 +9,7 @@ kind: Kustomization
 
 resources:
   - ../../base
-  - ingress.yaml
+  - tlsroute.yaml
 
 # components:
 #   - ../../components/kubernetes-oidc
@@ -35,10 +35,22 @@ patches:
           secret:
             secretName: server-tls-certificate
       - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: client-ca
+          secret:
+            secretName: client-ca
+      - op: add
         path: /spec/template/spec/containers/0/volumeMounts/-
         value:
           name: tls
           mountPath: /tls
+          readOnly: true
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: client-ca
+          mountPath: /client-ca
           readOnly: true
       # A third configuration file, inserted before the subcommand.
       - op: add

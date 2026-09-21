@@ -1,0 +1,116 @@
+# The registry's configuration, mounted as a directory at /config. An edit
+# reloads in place, except the listener, the storage backends and the cache,
+# which take a `kubectl rollout restart deployment/angos`.
+#
+# Every secret lives in credentials-secret.yaml, the second `-c` file. It is
+# merged over this one at startup and watched the same way.
+
+[server]
+bind_address = "0.0.0.0"
+port = 8000
+# TLS terminates at the ingress or gateway in the simple and gateway-api
+# overlays. The tls overlays add a [server.tls] section through a second file
+# in this same ConfigMap.
+
+[global]
+# Records each pull's time, shown in the UI and needed by any retention rule
+# on image.last_pulled_at.
+update_pull_time = true
+
+# Blobs and metadata in one bucket. The registry coordinates its replicas
+# through S3 conditional requests, so no Redis is needed at any replica count.
+# The credentials are in credentials-secret.yaml.
+[blob_store.s3]
+endpoint = "https://s3.example.com"
+bucket = "registry"
+region = "us-east-1"
+
+[metadata_store.s3]
+endpoint = "https://s3.example.com"
+bucket = "registry"
+region = "us-east-1"
+
+# Bearer tokens for clients that log in with an OIDC token or a password. The
+# signing key is in credentials-secret.yaml; `realm` is the registry's public
+# URL, which every pushed image reference will carry.
+[auth.token_service]
+realm = "https://cr.example.com/token"
+ttl_secs = 3600
+
+# GitHub Actions workflows push with the job's own OIDC token. required_claims
+# checks presence only; which repository may push is decided per [repository]
+# below.
+[auth.oidc.github-actions]
+issuer = "https://token.actions.githubusercontent.com"
+required_claims = ["repository", "actor"]
+
+# Kubernetes service-account tokens, so a pod pulls as itself through the
+# kubelet credential provider. Uncomment together with the kubernetes-oidc
+# component, which grants this registry's ServiceAccount the JWKS read.
+#
+# `issuer` must equal the `iss` the apiserver stamps into its tokens, which is
+# not always the kubeconfig endpoint; check before relying on it:
+#   kubectl create token default --audience angos | cut -d. -f2 | base64 -d
+# `jwks_uri` is pinned because discovery may advertise the apiserver's external
+# address, and the token is only ever sent to the issuer's own origin.
+# [auth.oidc.kube]
+# issuer = "https://kubernetes.default.svc.cluster.local"
+# jwks_uri = "https://kubernetes.default.svc.cluster.local/openid/v1/jwks"
+# server_ca_bundle = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+# required_audience = "angos"
+
+[global.access_policy]
+default = "deny"
+rules = [
+  # The kubelet's probes and an in-cluster scraper carry no credential. The
+  # overlays keep these three paths off the ingress; this policy cannot.
+  "request.action in ['healthz', 'readyz', 'metrics']",
+  # The web UI's own files and settings, which a browser needs before anyone
+  # has signed in. Neither reveals registry content.
+  "request.action in ['ui-asset', 'ui-config']",
+  # The password identities in credentials-secret.yaml.
+  "identity.username != null",
+  # The login handshake. Neither step carries a namespace, so no repository
+  # policy can admit it: the token exchange, and the version ping that
+  # `docker login` repeats with the fresh token.
+  "request.action in ['get-token', 'get-api-version'] && (identity.username != null || identity.oidc != null)",
+  # A namespace covered by a [repository] with an access_policy of its own is
+  # decided there. Not a bare `identity.oidc != null`: with required_claims
+  # checking presence only, that would admit any workflow on github.com.
+  "has_repository_policy()",
+]
+
+# A hosted repository: one GitHub repository's workflow pushes, the admin
+# identity does anything, and, with [auth.oidc.kube], one service account pulls.
+[repository."team/app".access_policy]
+default = "deny"
+rules = [
+  'identity.username == "admin"',
+  '''identity.oidc != null &&
+     identity.oidc.claims["repository"] == "example-org/app"''',
+  # '''identity.oidc != null &&
+  #    identity.oidc.provider_name == "kube" &&
+  #    identity.oidc.claims["sub"] == "system:serviceaccount:app:app"''',
+]
+
+# A pull-through cache of Docker Hub, pulled as cr.example.com/hub/... or, by a
+# mirroring client that sends `?ns=docker.io`, under the upstream's own path.
+# Anonymous on purpose: a mirror configured on the nodes carries no credential,
+# and a pull-through namespace refuses pushes.
+[repository."hub"]
+namespace = "docker.io"
+# Serve a cached tag without the upstream manifest request Docker Hub
+# rate-limits. A mutable tag not excluded here is cached for good.
+immutable_tags = true
+immutable_tags_exclusions = ["^latest$", "^main$", "^master$", "^stable$", "^edge$", "^nightly.*$"]
+
+[repository."hub".access_policy]
+default = "allow"
+
+[[repository."hub".upstream]]
+# The registry API lives on registry-1; docker.io itself serves the web site.
+url = "https://registry-1.docker.io"
+
+[ui]
+enabled = true

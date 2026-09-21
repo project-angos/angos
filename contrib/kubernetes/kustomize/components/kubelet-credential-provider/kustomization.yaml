@@ -1,0 +1,11 @@
+---
+# Installs the kubelet credential provider on every node, from
+# contrib/kubelet-credential-provider. Set VERSION and both checksums in its
+# daemonset.yaml first; the kubelet flags that point at the plugin stay a
+# node-bootstrap concern, as its README explains. It lands in kube-system,
+# where a node installer belongs, whichever overlay includes it.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - ../../../../kubelet-credential-provider

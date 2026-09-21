@@ -1,0 +1,54 @@
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: angos
+  namespace: angos
+spec:
+  parentRefs:
+    # A Gateway whose listener allows routes from this namespace, or add a
+    # ReferenceGrant.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: gateway
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - cr.example.com
+  rules:
+    # The probes and metrics are admitted unauthenticated by the access policy,
+    # for the kubelet and an in-cluster scraper, which reach the Pod directly.
+    # This rule is what keeps them off the internet. An Exact match outranks
+    # the Prefix below whatever the order. A redirect rather than an empty
+    # rule: an implementation may reject a rule with neither backend nor
+    # filter and keep serving its previous configuration, silently.
+    - matches:
+        - path:
+            type: Exact
+            value: /healthz
+        - path:
+            type: Exact
+            value: /readyz
+        - path:
+            type: Exact
+            value: /metrics
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            # A different path, or the redirect would loop.
+            path:
+              type: ReplaceFullPath
+              replaceFullPath: /
+            # Nothing should cache where a health endpoint went.
+            statusCode: 302
+    # /v2/ is the OCI API and everything else the web UI, one listener.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: angos
+          port: 8000

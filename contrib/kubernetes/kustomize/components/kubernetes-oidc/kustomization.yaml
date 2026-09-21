@@ -1,0 +1,10 @@
+---
+# Lets the registry validate Kubernetes service-account tokens, for pods that
+# pull as themselves. Pair it with the [auth.oidc.kube] section in
+# base/config.toml, and with the kubelet-credential-provider component on the
+# nodes.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - rbac.yaml

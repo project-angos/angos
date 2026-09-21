@@ -1,0 +1,26 @@
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: angos
+  namespace: angos
+spec:
+  parentRefs:
+    # A Gateway listener with protocol TLS and tls.mode Passthrough for this
+    # hostname, allowing routes from this namespace or with a ReferenceGrant.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: gateway
+      namespace: gateway-system
+      sectionName: tls-passthrough
+  hostnames:
+    - cr.example.com
+  rules:
+    # Passthrough routes by SNI alone, so unlike the gateway-api overlay no
+    # rule here keeps /healthz, /readyz and /metrics off the host; the access
+    # policy admits them unauthenticated.
+    - backendRefs:
+        - group: ""
+          kind: Service
+          name: angos
+          port: 8000
