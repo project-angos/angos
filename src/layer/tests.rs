@@ -6,6 +6,10 @@ use std::{
 use flate2::{Compression, write::GzEncoder};
 use http::StatusCode;
 use http_body_util::BodyExt;
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
 
 use angos_extension_service::{LayerEntriesRequest, LayerFileRequest};
 use angos_oci::{Digest, Namespace};
@@ -19,11 +23,14 @@ use crate::{
         Checkpoints, IndexLayerJobHandler, Kind, classify, extract_gzip, index_stream, read_listing,
     },
     registry::{
-        Registry, RegistryConfig,
+        Registry, RegistryConfig, Repository,
+        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        repository::Config,
         test_utils::{
             fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
         },
     },
+    test_fixtures::client::test_client_config,
 };
 
 /// A layer as a build produces it: directories, files, links, whiteouts and
@@ -366,4 +373,71 @@ async fn a_push_enqueues_an_index_job_per_tar_layer_of_an_indexing_repository() 
         2,
         "the two tar layers, not the config nor the zstd layer"
     );
+}
+
+/// A pull-through layer the namespace holds no grant for is asked of the
+/// upstream, one the manifest pull linked before its bytes were fetched is
+/// not; both get the cache fill enqueued behind 202, and a layer the upstream
+/// does not have stays as unknown as the blob.
+#[tokio::test]
+async fn the_entries_endpoint_fills_the_cache_of_a_pull_through_layer() {
+    let stack = fs_test_stack();
+    let namespace = Namespace::new("mirror/app").unwrap();
+    let digest = Digest::sha256_of_bytes(b"never fetched");
+    let upstream = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/app/blobs/{digest}")))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "13"))
+        .mount(&upstream)
+        .await;
+    let job_store = Arc::new(JobStore::new(
+        stack.store.clone(),
+        "fill-test",
+        ClaimMode::Atomic,
+    ));
+    let config = Config {
+        upstream: vec![test_client_config(upstream.uri())],
+        ..Default::default()
+    };
+    let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+    let repository = Repository::new(
+        "mirror",
+        &config,
+        &cache_backend,
+        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+    )
+    .await
+    .unwrap();
+    let registry = Registry::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        single_repo_resolver("mirror", repository),
+        RegistryConfig::new(job_store.clone()),
+    );
+    let entries = |digest: &Digest| {
+        registry.handle_list_layer_entries(LayerEntriesRequest {
+            namespace: namespace.clone(),
+            digest: digest.clone(),
+        })
+    };
+
+    assert!(
+        entries(&Digest::sha256_of_bytes(b"not upstream"))
+            .await
+            .is_err()
+    );
+
+    let response = entries(&digest).await.unwrap().into_response().unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(job_store.count_pending(Queue::Cache, 0).await.unwrap(), 1);
+
+    stack
+        .metadata_store
+        .grant(&namespace, &digest)
+        .await
+        .unwrap();
+    let response = entries(&digest).await.unwrap().into_response().unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(job_store.count_pending(Queue::Cache, 0).await.unwrap(), 1);
+    assert_eq!(job_store.count_pending(Queue::Index, 0).await.unwrap(), 0);
 }

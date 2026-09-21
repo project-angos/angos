@@ -485,7 +485,13 @@ impl RegistryClient {
             ));
         }
 
-        let digest = parse_header(&response, DOCKER_CONTENT_DIGEST)?;
+        // A CDN the registry redirects to answers without the digest header;
+        // the blob asked for by digest is that digest.
+        let digest = if response.headers().contains_key(DOCKER_CONTENT_DIGEST) {
+            parse_header(&response, DOCKER_CONTENT_DIGEST)?
+        } else {
+            request.digest
+        };
         let size = parse_header(&response, CONTENT_LENGTH)?;
 
         Ok((digest, size))

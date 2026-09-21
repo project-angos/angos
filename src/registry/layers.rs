@@ -37,10 +37,30 @@ impl Registry {
         request: LayerEntriesRequest,
     ) -> Result<LayerEntries, Error> {
         let LayerEntriesRequest { namespace, digest } = request;
-        self.readable_layer(&namespace, &digest).await?;
+        let upstream = self
+            .get_repository_for_namespace(&namespace)
+            .ok()
+            .filter(|repository| repository.is_pull_through());
+        if !self.metadata_store.can_read(&namespace, &digest).await? {
+            // A pull-through namespace can have lost the grant its manifest
+            // pull made; the upstream decides, as it does for a blob GET.
+            let upstream = upstream.ok_or(Error::BlobUnknown)?;
+            upstream.head_blob(&[], &namespace, &digest).await?;
+            self.dispatch_cache_fill(&namespace, &digest).await;
+            return Ok(LayerEntries::Indexing);
+        }
         let Some(listing) = layer::read_listing(&self.metadata_store, &digest).await? else {
-            // Gone bytes are a 404, not an index job that would find none.
-            self.blob_store.size(&digest).await?;
+            match self.blob_store.size(&digest).await {
+                Ok(_) => {}
+                // A pull-through manifest pull links its layers before their
+                // bytes are fetched; fetch them, and a later poll indexes them.
+                Err(Error::BlobUnknown) if upstream.is_some() => {
+                    self.dispatch_cache_fill(&namespace, &digest).await;
+                    return Ok(LayerEntries::Indexing);
+                }
+                // Gone bytes are a 404, not an index job that would find none.
+                Err(error) => return Err(error),
+            }
             let payload = IndexLayerPayload {
                 namespace,
                 digest,
