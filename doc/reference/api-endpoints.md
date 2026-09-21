@@ -441,8 +441,9 @@ GET /v2/{namespace}/_angos/layers/{algorithm}:{hex}/entries
 The filesystem listing of one layer: every tar entry in order, with its kind, size, mode,
 owner, modification time, link target and the offset of its data in the uncompressed stream.
 The first request for a layer that was never indexed enqueues the index job and answers
-`202 Accepted` with `{"status": "indexing"}`; ask again once it ran. A layer the namespace
-does not own is `404`, like the blob itself.
+`202 Accepted` with `{"status": "indexing"}`; ask again once it ran. On a pull-through
+namespace, a layer the upstream has and the cache does not is fetched first, behind the
+same `202`. A layer the namespace does not own is `404`, like the blob itself.
 
 **Response:**
 ```json

@@ -186,6 +186,32 @@ async fn test_head_blob_success() {
     assert_eq!(size, 1234);
 }
 
+/// A registry that redirects blob HEADs to a CDN answers without
+/// `Docker-Content-Digest`; the blob asked for by digest is that digest.
+#[tokio::test]
+async fn test_head_blob_without_digest_header_reports_the_requested_digest() {
+    let mock_server = MockServer::start().await;
+    let test_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/test/blobs/{test_digest}")))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "1234"))
+        .mount(&mock_server)
+        .await;
+
+    let (digest, size) = client_for(&mock_server)
+        .head_blob(HeadBlobRequest {
+            namespace: Namespace::new("test").unwrap(),
+            digest: Digest::try_from(test_digest).unwrap(),
+            accepted_types: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(digest, Digest::try_from(test_digest).unwrap());
+    assert_eq!(size, 1234);
+}
+
 #[tokio::test]
 async fn test_head_blob_not_found() {
     let mock_server = MockServer::start().await;

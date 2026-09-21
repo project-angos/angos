@@ -259,7 +259,7 @@ impl Registry {
     /// Fire-and-forget enqueue of a pull-through cache-fill job. A failure is
     /// logged and counted but never bubbles up, so a scheduling glitch cannot
     /// degrade the client response.
-    async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
+    pub async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
         // Build + enqueue as one fallible step so failures share the warn + metric path.
         let outcome = match build_envelope(namespace, digest) {
             Ok(envelope) => self

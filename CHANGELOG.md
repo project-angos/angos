@@ -4,12 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 1.9.3 - UNRELEASED
+## 1.9.3
 
 ### Changed
 
 - **Breaking:** the `-grype` and `-trivy` image tags are gone. The scanner service runs from the registry image with the scanner's upstream image mounted on `PATH`, a Docker image mount or a Kubernetes image volume, as the scan-images how-to shows.
 - The Kubernetes kustomize contrib is reworked around the two-file configuration the deployment guide describes: `config.toml` in a ConfigMap and the secrets in a Secret, mounted as directories, with prune and scrub CronJobs, a ServiceAccount, optional components for Kubernetes service-account pulls, and a Gateway API overlay beside the Ingress ones. The Valkey deployment is gone, since a single replica needs no shared cache, and the overlays no longer each carry a copy of the whole configuration.
+
+### Fixed
+
+- The web UI's filesystem tab opens on a pull-through image whose layers were never pulled: the layer entries endpoint enqueues the cache fill and answers `202` where it answered `404`, whether the manifest pull linked the layer without its bytes or the namespace holds no grant for it and the upstream has it.
+- `HEAD` on an uncached pull-through blob answers the upstream's descriptor where the upstream redirects to a CDN that omits `Docker-Content-Digest`.
 
 ## 1.9.2
 
