@@ -21,8 +21,8 @@
     "@docusaurus/theme-mermaid": "^3.10.2",
     "@mdx-js/react": "^3.1.1",
     "prism-react-renderer": "^2.4.1",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "unist-util-visit": "^5.1.0"
   },
   "devDependencies": {
@@ -31,19 +31,19 @@
     "playwright": "^1.63.0"
   },
   "overrides": {
-    "serialize-javascript": "^7.1.0",
+    "serialize-javascript": "^7.1.1",
     "shell-quote": "^1.10.0",
     "ws": "^8.21.3",
-    "qs": "^6.15.3",
-    "uuid": "^14.0.1",
-    "dompurify": "^3.4.13",
+    "qs": "^6.16.0",
+    "uuid": "^14.0.2",
+    "dompurify": "^3.4.15",
     "http-proxy-middleware": "^4.2.0",
-    "joi": "^18.2.3",
+    "joi": "^18.2.9",
     "launch-editor": "^2.14.1",
-    "@babel/core": "^7.29.7",
+    "@babel/core": "^8.0.6",
     "webpack-dev-server": "^6.0.0",
     "gray-matter": {
-      "js-yaml": "^5.3.0"
+      "js-yaml": "^5.4.2"
     }
   },
   "browserslist": {
@@ -59,6 +59,6 @@
     ]
   },
   "engines": {
-    "node": ">=24.19.0"
+    "node": ">=24.21.0"
   }
 }
