@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.25
+# syntax=docker/dockerfile:1.27
 ARG LLVM_VERSION=20
 ARG RELEASE_MODE=""
 
@@ -42,7 +42,7 @@ RUN if [ "$RELEASE_MODE" = "debug" ] ; then export BUILD_FLAG=""; fi; \
 # Scanner images: the binary next to one scanner, for `angos scanner`. Alpine
 # gives the tools the writable cache and /tmp they need; the registry image
 # stays the default target below.
-FROM anchore/grype:v0.118.0 AS grype
+FROM anchore/grype:v0.119.0 AS grype
 FROM aquasec/trivy:0.74.0 AS trivy
 
 FROM --platform=$TARGETPLATFORM alpine:3.24 AS scanner
