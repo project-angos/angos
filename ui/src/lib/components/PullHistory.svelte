@@ -75,13 +75,20 @@
 				<thead>
 					<tr>
 						<th>Client</th>
+						<th class="col-medium">IP address</th>
 						<th class="col-medium">Pulled</th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each history.entries as entry}
 						<tr>
-							<td>{entry.client}</td>
+							<td>
+								{#if entry.method}
+									<span class="badge method {entry.method}">{entry.method}</span>
+								{/if}
+								{#if entry.method !== 'anonymous'}{entry.client}{/if}
+							</td>
+							<td>{entry.client_ip ?? '—'}</td>
 							<td title={entry.at}>{formatTimeAgo(entry.at)}</td>
 						</tr>
 					{:else}
@@ -89,7 +96,7 @@
 							<!-- Not "never pulled": recording is off unless the
 							     operator enables it, and only the newest entry
 							     outlives the window. -->
-							<td colspan="2" class="empty">
+							<td colspan="3" class="empty">
 								No pulls recorded in the retention window (last
 								{formatRetention(history.window_secs)}). Pull recording requires
 								<code>update_pull_time</code> to be enabled.
@@ -100,7 +107,7 @@
 				{#if history.entries.length >= CAP}
 					<tfoot>
 						<tr>
-							<td colspan="2">
+							<td colspan="3">
 								Showing the newest {CAP} pulls; older ones are not listed.
 							</td>
 						</tr>
@@ -110,3 +117,34 @@
 		{/if}
 	{/if}
 </Card>
+
+<style>
+	.method {
+		margin-right: 0.4rem;
+	}
+
+	.method.kubernetes {
+		background: var(--chip-blue-bg);
+		color: var(--chip-blue-fg);
+	}
+
+	.method.oidc {
+		background: var(--chip-cyan-bg);
+		color: var(--chip-cyan-fg);
+	}
+
+	.method.mtls {
+		background: var(--chip-green-bg);
+		color: var(--chip-green-fg);
+	}
+
+	.method.token {
+		background: var(--chip-purple-bg);
+		color: var(--chip-purple-fg);
+	}
+
+	.method.anonymous {
+		background: var(--chip-orange-bg);
+		color: var(--chip-orange-fg);
+	}
+</style>

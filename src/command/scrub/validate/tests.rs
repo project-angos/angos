@@ -1455,6 +1455,8 @@ async fn put_atime_entry(
 ) {
     let body = serde_json::to_vec(&AccessEntry {
         client: client.to_string(),
+        client_ip: None,
+        method: None,
         at,
     })
     .expect("entry body");

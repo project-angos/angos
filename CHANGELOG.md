@@ -9,6 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `image.namespace` joins the CEL variables of the retention, scan and index policies.
+- The pull history records the client's IP address and how it authenticated (`basic`, `token`, `oidc`, `kubernetes`, `mtls`, `internal` or `anonymous`), which the web UI shows in an address column and as a pill beside the client; pulls recorded before the upgrade carry neither.
+
+### Fixed
+
+- The pull history names OIDC and mTLS callers where it recorded them as `anonymous`: a Kubernetes service account as `<provider>:<namespace>/<service account>`, another OIDC token as `<provider>:<email, preferred_username or sub>`, and a client certificate by its common name. Webhook payloads are unchanged.
 
 ## 1.11.0
 

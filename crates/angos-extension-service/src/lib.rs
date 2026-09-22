@@ -134,10 +134,14 @@ pub struct UploadsBody {
     pub uploads: Vec<UploadEntry>,
 }
 
-/// One recorded pull: who pulled and when.
+/// One recorded pull: who pulled, from where, and when.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AccessEntry {
     pub client: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     pub at: DateTime<Utc>,
 }
 

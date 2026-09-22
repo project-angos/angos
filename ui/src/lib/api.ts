@@ -49,6 +49,10 @@ export interface ManifestEntry {
 
 export interface PullEntry {
 	client: string;
+	/** Absent on pulls recorded before the address was. */
+	client_ip?: string;
+	/** How the client authenticated; absent on pulls recorded before it was. */
+	method?: string;
 	at: string;
 }
 

@@ -375,6 +375,8 @@ impl Registry {
             .into_iter()
             .map(|entry| AccessEntry {
                 client: entry.client,
+                client_ip: entry.client_ip,
+                method: entry.method,
                 at: entry.at,
             })
             .collect();
@@ -1570,6 +1572,8 @@ mod tests {
     ) {
         let body = serde_json::to_vec(&AccessEntry {
             client: client.to_string(),
+            client_ip: None,
+            method: None,
             at,
         })
         .unwrap();

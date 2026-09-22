@@ -19,10 +19,16 @@ use crate::registry::{
     metadata_store::{LinkKind, MetadataStore},
 };
 
-/// The stored body of one access entry: who pulled and when.
+/// The stored body of one access entry: who pulled, from where, and when.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AccessEntry {
     pub client: String,
+    /// Absent on entries recorded before the address was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
+    /// How the client authenticated. Absent on entries recorded before it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     pub at: DateTime<Utc>,
 }
 
@@ -41,6 +47,8 @@ impl MetadataStore {
         namespace: &Namespace,
         link: &LinkKind,
         client: &str,
+        client_ip: Option<&str>,
+        method: Option<&str>,
     ) -> Result<(), Error> {
         // Identities come from token claims, which have no length bound of
         // their own. The body and the key's suffix must record the same one,
@@ -55,6 +63,8 @@ impl MetadataStore {
         };
         let entry = serde_json::to_vec(&AccessEntry {
             client: client.to_string(),
+            client_ip: client_ip.map(str::to_string),
+            method: method.map(str::to_string),
             at,
         })?;
         self.object_store()
@@ -208,6 +218,8 @@ mod tests {
     ) {
         let body = serde_json::to_vec(&AccessEntry {
             client: client.to_string(),
+            client_ip: None,
+            method: None,
             at,
         })
         .unwrap();
@@ -249,7 +261,7 @@ mod tests {
         .await;
 
         backend
-            .put_access_entry(&namespace, &tag, "alice")
+            .put_access_entry(&namespace, &tag, "alice", Some("10.0.0.7"), Some("basic"))
             .await
             .unwrap();
 
@@ -263,6 +275,8 @@ mod tests {
             .unwrap();
         let entry: AccessEntry = serde_json::from_slice(&raw).unwrap();
         assert_eq!(entry.client, "alice", "the body must carry the actor");
+        assert_eq!(entry.client_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(entry.method.as_deref(), Some("basic"));
 
         put_entry_at(
             &backend,
@@ -302,7 +316,7 @@ mod tests {
 
         for client in ["alice", "bob"] {
             backend
-                .put_access_entry(&namespace, &tag, client)
+                .put_access_entry(&namespace, &tag, client, None, None)
                 .await
                 .unwrap();
         }
@@ -333,7 +347,7 @@ mod tests {
 
         let mut stamps = Vec::new();
         for _ in 0..10 {
-            stamps.push(backend.put_access_entry(&namespace, &tag, "racer"));
+            stamps.push(backend.put_access_entry(&namespace, &tag, "racer", None, None));
         }
         for stamp in stamps {
             stamp.await.unwrap();
