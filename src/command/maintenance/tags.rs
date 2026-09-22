@@ -1,17 +1,22 @@
 //! The live tags of a namespace with the times the `top_pushed` and
-//! `top_pulled` rankings order them by, read once per namespace by `prune`
-//! and by `reconcile scan`.
+//! `top_pulled` rankings order them by, read once per namespace by `prune`,
+//! `reconcile scan` and `reconcile index`, and the per-image judgement the
+//! scan and index policies share.
 
 use std::cmp::Reverse;
 
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 
-use angos_oci::{Namespace, Tag};
+use angos_oci::{Digest, Namespace, Tag};
 
 use crate::{
     command::maintenance::error::Error,
-    registry::metadata_store::{LinkKind, LinkMetadata, MetadataStore},
+    policy::{ImagePolicy, ManifestImage},
+    registry::{
+        Error as RegistryError,
+        metadata_store::{LinkKind, LinkMetadata, MetadataStore},
+    },
 };
 
 /// Fan-out for the per-tag link-metadata reads feeding the rankings.
@@ -65,4 +70,75 @@ pub fn rank_by(
         .collect();
     ranked.sort_by_key(|t| t.0);
     ranked.into_iter().map(|(_, name)| name).collect()
+}
+
+/// A namespace's tags with both rankings, what an image policy is judged
+/// against.
+pub struct Rankings {
+    pub tags: Vec<TagWithMetadata>,
+    pub last_pushed: Vec<String>,
+    pub last_pulled: Vec<String>,
+}
+
+impl Rankings {
+    pub async fn read(
+        metadata_store: &MetadataStore,
+        namespace: &Namespace,
+    ) -> Result<Self, Error> {
+        let tags = live_tags(metadata_store, namespace).await?;
+        Ok(Self {
+            last_pushed: rank_by(&tags, |t| t.metadata.created_at),
+            last_pulled: rank_by(&tags, |t| t.pulled_at),
+            tags,
+        })
+    }
+
+    /// Whether `policy` applies to the image `digest`, its newest report at
+    /// `scanned_at`: every tag pointing at it is tried in turn, and an
+    /// untagged image once with `image.tag == null`, the way retention
+    /// judges each.
+    pub async fn applies(
+        &self,
+        policy: &ImagePolicy,
+        metadata_store: &MetadataStore,
+        namespace: &Namespace,
+        digest: &Digest,
+        scanned_at: i64,
+    ) -> Result<bool, Error> {
+        let now = Utc::now();
+        let image = |tag: Option<String>,
+                     pushed_at: Option<DateTime<Utc>>,
+                     pulled_at: Option<DateTime<Utc>>| {
+            let mut image = ManifestImage::new(tag, pushed_at, pulled_at, now);
+            image.scanned_at = scanned_at;
+            image
+        };
+        let mut images: Vec<ManifestImage> = self
+            .tags
+            .iter()
+            .filter(|tag| tag.metadata.target == *digest)
+            .map(|tag| {
+                image(
+                    Some(tag.name.to_string()),
+                    tag.metadata.created_at,
+                    tag.pulled_at,
+                )
+            })
+            .collect();
+        if images.is_empty() {
+            let revision = LinkKind::Digest(digest.clone());
+            let pushed_at = match metadata_store.read_link(namespace, &revision).await {
+                Ok(metadata) => metadata.created_at,
+                Err(RegistryError::NotFound) => None,
+                Err(e) => return Err(e.into()),
+            };
+            let pulled_at = metadata_store
+                .read_access_time(namespace, &revision)
+                .await?;
+            images.push(image(None, pushed_at, pulled_at));
+        }
+        Ok(images
+            .iter()
+            .any(|image| policy.applies(image, &self.last_pushed, &self.last_pulled)))
+    }
 }

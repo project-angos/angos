@@ -36,7 +36,7 @@ mod tests;
 use crate::{
     auth::{authenticator, oidc, webhook},
     event_webhook::config::EventWebhookConfig,
-    policy::rules_use_pull_time,
+    policy::{CelRule, rules_use_pull_time},
     registry::{blob_store, repository},
 };
 
@@ -139,36 +139,48 @@ impl Configuration {
             &self.event_webhook,
             self.global.scan.is_some(),
         )?;
-        validate_scan_refresh(&self.global, &self.repository)?;
+        validate_image_policies(&self.global, &self.repository)?;
         Ok(self)
     }
 }
 
-/// Refuses a repository refresh table listing no rule, and rules reading pull
-/// times that are never recorded.
-fn validate_scan_refresh(
+/// Refuses a scan or index table that decides nothing, and rules reading
+/// pull times that are never recorded.
+fn validate_image_policies(
     global: &GlobalConfig,
     repositories: &HashMap<String, repository::Config>,
 ) -> Result<(), Error> {
-    let global_refresh = global.scan.as_ref().and_then(|scan| scan.refresh.as_ref());
-    if let Some(name) = repositories
-        .iter()
-        .find_map(|(name, repo)| repo.refresh()?.rules.is_empty().then_some(name))
-    {
-        return Err(Error::InvalidFormat(format!(
-            "repository.\"{name}\".scan.refresh.rules must list at least one rule"
-        )));
+    let mut tables: Vec<(String, &[CelRule])> = Vec::new();
+    if let Some(scan) = &global.scan {
+        tables.push(("global.scan".to_string(), &scan.policy.rules));
     }
-    let rules = global_refresh
-        .into_iter()
-        .map(|refresh| ("global.scan.refresh".to_string(), refresh.rules.as_slice()))
-        .chain(repositories.iter().filter_map(|(name, repo)| {
-            Some((
-                format!("repository.\"{name}\".scan.refresh"),
-                repo.refresh()?.rules.as_slice(),
-            ))
-        }));
-    for (name, rules) in rules {
+    if let Some(index) = &global.index {
+        if !index.is_set() {
+            return Err(Error::InvalidFormat(
+                "global.index sets neither default nor rules".to_string(),
+            ));
+        }
+        tables.push(("global.index".to_string(), &index.rules));
+    }
+    for (name, repo) in repositories {
+        if let Some(scan) = &repo.scan {
+            if !scan.is_set() {
+                return Err(Error::InvalidFormat(format!(
+                    "repository.\"{name}\".scan sets neither default nor rules"
+                )));
+            }
+            tables.push((format!("repository.\"{name}\".scan"), &scan.rules));
+        }
+        if let Some(index) = &repo.index {
+            if !index.is_set() {
+                return Err(Error::InvalidFormat(format!(
+                    "repository.\"{name}\".index sets neither default nor rules"
+                )));
+            }
+            tables.push((format!("repository.\"{name}\".index"), &index.rules));
+        }
+    }
+    for (name, rules) in tables {
         if rules_use_pull_time(rules) && !global.update_pull_time {
             return Err(Error::InvalidFormat(format!(
                 "{name}.rules use last_pulled_at or top_pulled but update_pull_time is disabled, \

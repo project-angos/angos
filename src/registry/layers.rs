@@ -153,7 +153,7 @@ impl Registry {
     }
 
     /// Fire-and-forget enqueue of a layer's index job after a push into an
-    /// repository with an `index` table; a failure is logged and counted, never the
+    /// image an index policy applies to; a failure is logged and counted, never the
     /// client's problem.
     pub(crate) async fn dispatch_index(&self, namespace: &Namespace, digest: &Digest) {
         let payload = IndexLayerPayload {

@@ -12,8 +12,8 @@ components/kubelet-credential-provider
                             installs the kubelet plugin those pulls need, on every node
 components/reconcile-replication
                             a daily `reconcile replication`, once downstreams are configured
-components/reconcile-scan   a daily `reconcile scan`, refreshing reports under the scan.refresh rules
-components/reconcile-index  a daily `reconcile index`, once `index` tables are configured
+components/reconcile-scan   a daily `reconcile scan`, refreshing reports under the scan policies
+components/reconcile-index  a daily `reconcile index`, once an index policy is configured
 overlays/simple             TLS terminated at an Ingress controller
 overlays/gateway-api        TLS terminated at a Gateway, through an HTTPRoute
 overlays/tls                TLS terminated by the registry, passed through an Ingress
@@ -49,7 +49,7 @@ kubectl apply -k contrib/kubernetes/kustomize/overlays/gateway-api
 - The reconcile components run daily at 03:00, 04:00 and 05:00, away from the
   hourly prune and scrub slots. Include only those whose passes the
   configuration enables: `reconcile index` in particular reclaims every
-  listing outside the repositories with an `index` table. An overlay lists
+  listing no image an index policy applies to uses. An overlay lists
   them under `components:`.
 - Keep the CronJobs on the Deployment's image tag. Scrub judges every stored
   key by its shape, and a newer server's keys read as unknown to an older

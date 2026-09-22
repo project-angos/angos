@@ -118,8 +118,8 @@ pub enum Action {
     /// Enqueue the filesystem indexing of a layer; a forced one walks it
     /// again even when a listing exists.
     EnqueueIndex(IndexLayerPayload),
-    /// Delete a layer's listing and checkpoints: no repository with an `index`
-    /// table holds an image using the layer, so its listing lives on demand only.
+    /// Delete a layer's listing and checkpoints: no image an index policy
+    /// applies to uses the layer, so its listing lives on demand only.
     ReclaimListing(Digest),
     /// Enqueue a replication delete for a downstream-only tag, only on a
     /// `prune = true` downstream: absence-driven deletion would destroy an

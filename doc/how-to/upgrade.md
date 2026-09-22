@@ -909,3 +909,47 @@ index = true
 [repository."apps".scan]
 [repository."apps".index]
 ```
+
+---
+
+## 1.10.x → 1.11.0
+
+### `scan` and `index` Tables Are Policies (Breaking Change)
+
+A `scan` or `index` table, global or per repository, carries `default` and
+`rules` the way an access policy does: `default` decides an image no rule
+matches, a matching rule decides the opposite. A table setting neither is
+refused, so the empty tables of 1.10.0 no longer opt in, and the
+`scan.refresh` table is gone: its rules live in the `scan` table itself, and
+since a new image was never scanned, a rule on `image.scanned_at` scans it as
+it lands too.
+
+**Who is affected:** every deployment with an empty `[repository."<name>".scan]`,
+`[repository."<name>".index]` or `[global.index]` table, or a `scan.refresh`
+table; the registry refuses the configuration at startup.
+
+#### Migration
+
+An opt-in table becomes `default = "scan"` or `default = "index"`; a
+`scan.refresh` table's rules move into the `scan` table with no `default`.
+
+**Before:**
+
+```toml
+[repository."apps".scan]
+
+[repository."apps".scan.refresh]
+rules = ["image.scanned_at < now() - days(30)"]
+
+[repository."apps".index]
+```
+
+**After:**
+
+```toml
+[repository."apps".scan]
+rules = ["image.scanned_at < now() - days(30)"]
+
+[repository."apps".index]
+default = "index"
+```

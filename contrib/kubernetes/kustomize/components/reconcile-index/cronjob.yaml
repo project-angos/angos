@@ -1,10 +1,10 @@
 ---
 # Filesystem index reconciliation, daily at 05:00, away from the hourly prune
 # and scrub slots. It enqueues an index job for every tar layer without a
-# listing in the repositories with an `index` table, and reclaims the
-# listings of every other layer. Include this component only with an `index`
-# table configured: on a registry without one it drops every listing an
-# on-demand open left behind, which then indexes again when opened.
+# listing of the images an index policy applies to, and reclaims the listings
+# of every other layer. Include this component only with an index policy
+# configured: on a registry without one it drops every listing an on-demand
+# open left behind, which then indexes again when opened.
 apiVersion: batch/v1
 kind: CronJob
 metadata:

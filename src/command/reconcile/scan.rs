@@ -1,6 +1,6 @@
-//! `angos reconcile scan`: enqueues a scan job for every image manifest in a
-//! scanning repository that has no report yet or whose newest report the
-//! repository's refresh rules find due, or for every one with `--force`. The
+//! `angos reconcile scan`: enqueues a scan job for every image manifest of a
+//! scanning repository that its scan policy finds due, judged by the rules
+//! with its newest report's time, or for every one with `--force`. The
 //! running server or a worker drains the jobs. Nothing runs this pass on its
 //! own: a `CronJob` or a timer schedules it, as for `prune`.
 
@@ -8,11 +8,11 @@ use std::{pin::pin, sync::Arc};
 
 use argh::FromArgs;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::StreamExt;
 use tracing::info;
 
-use angos_oci::{Digest, Namespace};
+use angos_oci::Namespace;
 
 use crate::{
     command::{
@@ -22,27 +22,23 @@ use crate::{
             action::Action,
             check::{self, NamespaceChecker},
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
-            tags::{TagWithMetadata, live_tags, rank_by},
+            tags::Rankings,
         },
         scrub::default_concurrency,
     },
     configuration::Configuration,
-    policy::{ManifestImage, RetentionPolicy},
     registry::{
-        Error as RegistryError,
-        blob_store::BlobStore,
-        manifest::read_manifest,
-        metadata_store::{LinkKind, MetadataStore},
+        blob_store::BlobStore, manifest::read_manifest, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
-    scan::{ScanImagePayload, ScanReport, is_scan_subject, refresh_due, scan_reports},
+    scan::{ScanImagePayload, is_scan_subject, scan_reports},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
     subcommand,
     name = "scan",
-    description = "Enqueue scans for images without a report or due for one, or for every image with --force"
+    description = "Enqueue scans for the images the scan policies find due, or for every image with --force"
 )]
 pub struct Options {
     #[argh(switch, short = 'd')]
@@ -53,12 +49,12 @@ pub struct Options {
     pub force: bool,
     #[argh(option, default = "default_concurrency()")]
     /// number of namespaces checked concurrently; each adds a small fixed
-    /// tag-read fan-out of its own when refresh rules apply
+    /// tag-read fan-out of its own when a policy has rules
     pub concurrency: usize,
 }
 
-/// Enqueues one scan per image manifest of a scanning repository that has no
-/// report, or whose newest report the repository's refresh rules find due;
+/// Enqueues one scan per image manifest of a scanning repository that its
+/// scan policy finds due, its newest report's time as `image.scanned_at`;
 /// `force` enqueues every image with a fresh report forced.
 pub struct ScanChecker {
     pub blob_store: Arc<BlobStore>,
@@ -67,39 +63,28 @@ pub struct ScanChecker {
     pub force: bool,
 }
 
-/// The tag rankings a namespace's rules are evaluated against.
-struct Rankings {
-    tags: Vec<TagWithMetadata>,
-    last_pushed: Vec<String>,
-    last_pulled: Vec<String>,
-}
-
 #[async_trait]
 impl NamespaceChecker for ScanChecker {
     async fn check(&self, namespace: &Namespace, sink: &dyn ActionSink) -> Result<(), Error> {
-        let Some(scan) = self
+        let Some(policy) = self
             .resolver
             .resolve(namespace)
             .and_then(|repository| repository.scan.as_ref())
         else {
             return Ok(());
         };
-        let policy = scan.refresh.as_ref().filter(|_| !self.force);
-        // Taken before any report is read, so a report attached from here on
-        // is created after it and the handler sees the push it came from.
-        let now = Utc::now();
-        // Only the rules read the tags, so a namespace without any skips them.
-        let rankings = match policy {
-            Some(_) => {
-                let tags = live_tags(&self.metadata_store, namespace).await?;
-                Some(Rankings {
-                    last_pushed: rank_by(&tags, |t| t.metadata.created_at),
-                    last_pulled: rank_by(&tags, |t| t.pulled_at),
-                    tags,
-                })
-            }
-            None => None,
+        // Only the rules read the tags, so a policy without any skips them.
+        let rankings = if policy.has_rules() && !self.force {
+            Some(Rankings::read(&self.metadata_store, namespace).await?)
+        } else {
+            None
         };
+        let empty = Rankings {
+            tags: Vec::new(),
+            last_pushed: Vec::new(),
+            last_pulled: Vec::new(),
+        };
+        let rankings = rankings.as_ref().unwrap_or(&empty);
 
         let mut revisions = pin!(self.metadata_store.stream_revisions(namespace));
         while let Some(digest) = revisions.next().await {
@@ -113,90 +98,34 @@ impl NamespaceChecker for ScanChecker {
             let payload = ScanImagePayload {
                 namespace: namespace.clone(),
                 digest: digest.clone(),
-                force: false,
+                force: self.force,
                 reported_before: None,
             };
-            let payload = if self.force {
-                Some(ScanImagePayload {
-                    force: true,
-                    ..payload
-                })
-            } else {
-                let reports = scan_reports(&self.metadata_store, namespace, &digest).await?;
-                match (reports.first(), policy.zip(rankings.as_ref())) {
-                    (None, _) => Some(payload),
-                    (Some(newest), Some((policy, rankings)))
-                        if self
-                            .selects(policy, namespace, &digest, newest, rankings, now)
-                            .await? =>
-                    {
-                        Some(ScanImagePayload {
-                            reported_before: Some(now),
-                            ..payload
-                        })
-                    }
-                    _ => None,
-                }
-            };
-            if let Some(payload) = payload {
+            if self.force {
                 sink.apply(Action::EnqueueScan(payload)).await?;
+                continue;
+            }
+            // Taken before the reports are read, so a report attached from
+            // here on is created after it and the handler sees the push it
+            // came from.
+            let now = Utc::now();
+            let reports = scan_reports(&self.metadata_store, namespace, &digest).await?;
+            let newest = reports.first();
+            let scanned_at = newest
+                .and_then(|report| report.created)
+                .map_or(0, |created| created.timestamp().max(0));
+            if rankings
+                .applies(policy, &self.metadata_store, namespace, &digest, scanned_at)
+                .await?
+            {
+                sink.apply(Action::EnqueueScan(ScanImagePayload {
+                    reported_before: newest.map(|_| now),
+                    ..payload
+                }))
+                .await?;
             }
         }
         Ok(())
-    }
-}
-
-impl ScanChecker {
-    /// Whether the rules find the image due: any tag pointing at it is tried
-    /// in turn, and an untagged image once with `image.tag == null`, the way
-    /// retention judges each.
-    async fn selects(
-        &self,
-        policy: &RetentionPolicy,
-        namespace: &Namespace,
-        digest: &Digest,
-        newest: &ScanReport,
-        rankings: &Rankings,
-        now: DateTime<Utc>,
-    ) -> Result<bool, Error> {
-        let scanned_at = newest
-            .created
-            .map_or(0, |created| created.timestamp().max(0));
-        let image = |tag: Option<String>,
-                     pushed_at: Option<DateTime<Utc>>,
-                     pulled_at: Option<DateTime<Utc>>| {
-            let mut image = ManifestImage::new(tag, pushed_at, pulled_at, now);
-            image.scanned_at = scanned_at;
-            image
-        };
-        let mut images: Vec<ManifestImage> = rankings
-            .tags
-            .iter()
-            .filter(|tag| tag.metadata.target == *digest)
-            .map(|tag| {
-                image(
-                    Some(tag.name.to_string()),
-                    tag.metadata.created_at,
-                    tag.pulled_at,
-                )
-            })
-            .collect();
-        if images.is_empty() {
-            let revision = LinkKind::Digest(digest.clone());
-            let pushed_at = match self.metadata_store.read_link(namespace, &revision).await {
-                Ok(metadata) => metadata.created_at,
-                Err(RegistryError::NotFound) => None,
-                Err(e) => return Err(e.into()),
-            };
-            let pulled_at = self
-                .metadata_store
-                .read_access_time(namespace, &revision)
-                .await?;
-            images.push(image(None, pushed_at, pulled_at));
-        }
-        Ok(images
-            .iter()
-            .any(|image| refresh_due(policy, image, &rankings.last_pushed, &rankings.last_pulled)))
     }
 }
 
@@ -252,7 +181,7 @@ mod tests {
             Queue,
             store::{ClaimMode, JobStore},
         },
-        policy::CelRule,
+        policy::{CelRule, ImagePolicy, PolicyConfig},
         registry::{
             Repository,
             metadata_store::LinkKind,
@@ -261,19 +190,16 @@ mod tests {
                 seed_manifest, single_repo_resolver,
             },
         },
-        scan::{RefreshConfig, ScanImagePayload, ScanPolicy, refresh_rules},
+        scan::{ScanAction, ScanImagePayload},
     };
 
-    /// A scanning repository refreshing reports under `rules`, or never with
-    /// none.
-    fn scanning_repository(rules: &[&str]) -> Repository {
+    /// A repository scanning under `default` and `rules`.
+    fn scanning_repository(default: Option<ScanAction>, rules: &[&str]) -> Repository {
         let mut repository = repository_with_replication("apps", Vec::new());
-        let config = RefreshConfig {
+        repository.scan = Some(ImagePolicy::new(&PolicyConfig {
+            default,
             rules: rules.iter().map(|r| CelRule::compile(r).unwrap()).collect(),
-        };
-        repository.scan = Some(ScanPolicy {
-            refresh: refresh_rules(None, Some(&config)),
-        });
+        }));
         repository
     }
 
@@ -329,21 +255,30 @@ mod tests {
             .collect()
     }
 
-    /// An image without a report is enqueued, rules or not; a repository
-    /// that does not scan enqueues nothing even forced.
+    /// A scanning default enqueues an unreported image without a cutoff; a
+    /// repository without a scan policy enqueues nothing even forced.
     #[tokio::test]
-    async fn an_unreported_image_is_enqueued_and_a_non_scanning_repository_is_skipped() {
+    async fn the_default_decides_an_unreported_image() {
         let stack = fs_test_stack();
         let namespace = Namespace::new("apps/web").unwrap();
         let image = seed_image(&stack, &namespace).await;
 
-        let checker = build_checker(&stack, scanning_repository(&[]), false);
+        let checker = build_checker(
+            &stack,
+            scanning_repository(Some(ScanAction::Scan), &[]),
+            false,
+        );
         let scans = enqueued(&checker, &namespace).await;
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].digest, image);
         assert!(!scans[0].force);
         assert_eq!(scans[0].reported_before, None);
 
+        let checker = build_checker(&stack, scanning_repository(None, &[]), false);
+        assert!(
+            enqueued(&checker, &namespace).await.is_empty(),
+            "no default is skip"
+        );
         let checker = build_checker(
             &stack,
             repository_with_replication("apps", Vec::new()),
@@ -352,23 +287,18 @@ mod tests {
         assert!(enqueued(&checker, &namespace).await.is_empty());
     }
 
-    /// A reported image is enqueued only when the rules find its newest
-    /// report due, and then with the run's time as `reported_before`;
-    /// forced, it is enqueued whatever the rules say.
+    /// A reported image is enqueued when the rules find its newest report
+    /// due, with the run's time as `reported_before`; forced, it is enqueued
+    /// whatever the policy says.
     #[tokio::test]
     async fn the_rules_decide_when_a_reported_image_is_scanned_again() {
         let stack = fs_test_stack();
         let namespace = Namespace::new("apps/web").unwrap();
         let image = seed_image(&stack, &namespace).await;
         seed_report(&stack, &namespace, &image, Utc::now() - TimeDelta::hours(3)).await;
-        let due = || scanning_repository(&["image.scanned_at < now() - hours(2)"]);
+        let due = || scanning_repository(None, &["image.scanned_at < now() - hours(2)"]);
 
-        let checker = build_checker(&stack, scanning_repository(&[]), false);
-        assert!(
-            enqueued(&checker, &namespace).await.is_empty(),
-            "a repository without rules never refreshes a report"
-        );
-        let checker = build_checker(&stack, scanning_repository(&[]), true);
+        let checker = build_checker(&stack, scanning_repository(None, &[]), true);
         let scans = enqueued(&checker, &namespace).await;
         assert_eq!(scans.len(), 1);
         assert!(scans[0].force && scans[0].reported_before.is_none());
@@ -388,6 +318,16 @@ mod tests {
             enqueued(&checker, &namespace).await.is_empty(),
             "the newest report is not yet due"
         );
+        let checker = build_checker(
+            &stack,
+            scanning_repository(Some(ScanAction::Scan), &[]),
+            false,
+        );
+        assert_eq!(
+            enqueued(&checker, &namespace).await.len(),
+            1,
+            "a scanning default without rules scans again on every run"
+        );
     }
 
     /// The rules see the image's tags, so a rule can pick which due images
@@ -401,14 +341,20 @@ mod tests {
 
         let checker = build_checker(
             &stack,
-            scanning_repository(&["image.tag == 'v2' && image.scanned_at < now() - days(1)"]),
+            scanning_repository(
+                None,
+                &["image.tag == 'v2' && image.scanned_at < now() - days(1)"],
+            ),
             false,
         );
         assert!(enqueued(&checker, &namespace).await.is_empty());
 
         let checker = build_checker(
             &stack,
-            scanning_repository(&["image.tag == 'v1' && image.scanned_at < now() - days(1)"]),
+            scanning_repository(
+                None,
+                &["image.tag == 'v1' && image.scanned_at < now() - days(1)"],
+            ),
             false,
         );
         assert_eq!(enqueued(&checker, &namespace).await.len(), 1);
@@ -435,7 +381,7 @@ mod tests {
         );
         let checker = build_checker(
             &stack,
-            scanning_repository(&["image.scanned_at < now() - days(1)"]),
+            scanning_repository(None, &["image.scanned_at < now() - days(1)"]),
             false,
         );
 

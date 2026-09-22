@@ -15,7 +15,7 @@ Run a vulnerability scanner on every push and keep its report next to the image 
 
 ## How It Works
 
-1. A push of an image manifest into a repository with a `scan` table enqueues a scan job, keyed on the image digest so repeated pushes coalesce.
+1. A push of an image manifest a repository's scan policy applies to enqueues a scan job, keyed on the image digest so repeated pushes coalesce.
 2. The job's handler, in `angos worker` or in the server's own job loops, asks the scanner service for a report.
 3. `angos scanner`, on the scanner host, pulls the image under its own identity, runs the scanner you named, and answers with the SARIF report.
 4. The handler pushes the report back as a referrer of the image, an OCI artifact manifest whose `subject` is the image, through the registry's own write path. It lists under `/v2/<name>/referrers/<digest>`, replicates with the image, shows in the web UI, and is checked at admission by tools such as Kyverno or the sigstore policy-controller.
@@ -51,9 +51,10 @@ url = "http://scanner.internal:8766"
 token = "scan-service-secret"
 
 [repository."apps".scan]
+default = "scan"
 ```
 
-Each repository with a `scan` table, even an empty one, sends its image pushes to the service at `url`. A pull-through cache repository may carry the table too: each image manifest a cache miss stores is scanned once, and the report is local metadata that retention reclaims with the cached image. On a busy general-purpose mirror that is one scan per upstream digest pulled, so weigh the scanner time before enabling it there.
+A `scan` table is a policy shaped like an access policy: `default = "scan"` sends every image pushed here to the service at `url`, and `rules` can narrow that to the images that matter, as Step 7 shows. A pull-through cache repository may carry one too: each image manifest a cache miss stores is scanned once, and the report is local metadata that retention reclaims with the cached image. On a busy general-purpose mirror that is one scan per upstream digest pulled, so weigh the scanner time before enabling it there.
 
 ## Step 3: Run the Scanner Service
 
@@ -141,31 +142,32 @@ The web UI shows it on the manifest's Vulnerabilities tab, whichever scanner wro
 
 ## Step 6: Scan What Was Already There
 
-A `scan` table covers pushes from then on. Give the images already in the repository a report with:
+A policy covers pushes from then on. Give the images already in the repository a report with:
 
 ```bash
 angos -c config.toml reconcile scan
 ```
 
-It enqueues one job per image manifest without a report, and one per image the refresh rules of Step 7 find due; `--dry-run` lists them, and `--force` scans every image again, attaching a fresh report to each. The server or a worker drains the jobs as usual.
+It enqueues one job per image manifest the policy applies to, judged with the time of its newest report as Step 7 describes; `--dry-run` lists them, and `--force` scans every image again, attaching a fresh report to each. The server or a worker drains the jobs as usual.
 
 ## Step 7: Refresh Reports on a Schedule
 
-A report ages as the scanner's database learns new vulnerabilities. The `refresh` table has `angos reconcile scan` scan an image again once its newest report is due, as its rules define it:
+A report ages as the scanner's database learns new vulnerabilities. The scan policy decides that too: `angos reconcile scan` judges every image again with `image.scanned_at`, the time of its newest report, so a rule on that age refreshes reports:
 
 ```toml
-[global.scan.refresh]
+[global.scan]
+url = "http://scanner.internal:8766"
 rules = ["image.scanned_at < now() - days(30)"]
 
-[repository."apps".scan.refresh]
+[repository."apps".scan]
 rules = [
   "image.scanned_at < now() - days(7) && (image.tag == 'latest' || top_pulled(20))",
 ]
 ```
 
-`rules` are CEL expressions over the [retention variables](../reference/cel-expressions.md#retention-policy-variables) plus `image.scanned_at`, the time of the image's newest report: the image is scanned again when any rule is true, so a rule states how old a report may get, and can narrow that to the tags that matter. A repository's rules replace the global ones, and a repository without rules of its own or inherited never refreshes a report. A repository table lists at least one rule, and a rule using `last_pulled_at` or `top_pulled` needs `update_pull_time = true`, as retention does. A tagged image is judged under each of its tags and an untagged one with `image.tag == null`, as retention judges them.
+`default` is what an image no rule matches gets, `scan` or `skip`, and `skip` when absent; an image a rule matches gets the opposite. `rules` are CEL expressions over the [retention variables](../reference/cel-expressions.md#retention-policy-variables) plus `image.scanned_at`. A new image was never scanned, so `image.scanned_at` is 0 there and an age rule scans it as it lands; the tags it is pushed under are the whole ranking then, and it has never been pulled. On a `reconcile scan` run the image is judged with its real times, under each of its tags in turn and untagged with `image.tag == null`, as retention judges it. Leave `default` unset when the rules say when to scan: with `default = "scan"` a matching rule skips instead. A repository's table replaces the global policy, a table sets at least one of the two keys, and a rule using `last_pulled_at` or `top_pulled` needs `update_pull_time = true`, as retention does.
 
-Nothing runs the pass on its own: schedule `angos reconcile scan` like `prune`, with a CronJob or a systemd timer, at the cadence the rules call for. A run reads every image of the scanning repositories once, one manifest read and one referrer listing each, enqueues a scan for each one without a report or whose newest report is due, and logs how many; a run that finds nothing due enqueues nothing, and a scan enqueued twice coalesces on the image. A daily run refreshes a report within a day of its rule coming true:
+Nothing runs the pass on its own: schedule `angos reconcile scan` like `prune`, with a CronJob or a systemd timer, at the cadence the rules call for. A run reads every image of the scanning repositories once, one manifest read and one referrer listing each, enqueues a scan for each one the policy applies to, and logs how many; a run that finds nothing due enqueues nothing, and a scan enqueued twice coalesces on the image. A daily run refreshes a report within a day of its rule coming true:
 
 ```yaml
 apiVersion: batch/v1

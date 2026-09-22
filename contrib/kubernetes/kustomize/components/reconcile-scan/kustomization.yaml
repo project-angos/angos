@@ -1,7 +1,7 @@
 ---
-# Schedules `angos reconcile scan` daily. Pair it with [global.scan], the
-# repositories' `scan` tables and the `scan.refresh` rules in
-# base/config.toml; the rules decide how old a report may get.
+# Schedules `angos reconcile scan` daily. Pair it with the scan policies,
+# [global.scan] and the repositories' `scan` tables, in base/config.toml;
+# their rules decide how old a report may get.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 

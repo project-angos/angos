@@ -20,7 +20,7 @@ use crate::{
     },
     configuration::{Configuration, GlobalConfig},
     metrics_provider::init_for_tests,
-    policy::{AccessMode, AccessPolicyConfig},
+    policy::{AccessMode, PolicyConfig},
     registry::{
         Registry, RegistryConfig, repository,
         test_utils::{response_json, test_job_store},
@@ -86,9 +86,9 @@ fn create_config_with_repository() -> (Configuration, TempDir, TempDir) {
 #[tokio::test]
 async fn test_build_repository_with_upstream() {
     let repo_config = repository::Config {
-        access_policy: Some(AccessPolicyConfig {
-            default: AccessMode::Allow,
-            ..AccessPolicyConfig::default()
+        access_policy: Some(PolicyConfig {
+            default: Some(AccessMode::Allow),
+            ..PolicyConfig::default()
         }),
         upstream: vec![repository::RegistryClientConfig {
             username: Some("testuser".to_string()),
@@ -107,9 +107,9 @@ async fn test_build_repository_with_upstream() {
 #[tokio::test]
 async fn test_build_repositories_multiple() {
     let repo_config = repository::Config {
-        access_policy: Some(AccessPolicyConfig {
-            default: AccessMode::Allow,
-            ..AccessPolicyConfig::default()
+        access_policy: Some(PolicyConfig {
+            default: Some(AccessMode::Allow),
+            ..PolicyConfig::default()
         }),
         ..repository::Config::default()
     };

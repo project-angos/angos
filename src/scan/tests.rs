@@ -6,13 +6,14 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
-use angos_oci::{Digest, Manifest, Namespace};
+use angos_oci::{Digest, Manifest, Namespace, Tag};
 
 use crate::{
     jobs::{
         Queue,
         store::{ClaimMode, JobHandler, JobStore},
     },
+    policy::{CelRule, ImagePolicy, PolicyConfig},
     registry::{
         Registry, RegistryConfig, Repository,
         manifest::read_manifest,
@@ -22,9 +23,8 @@ use crate::{
         },
     },
     scan::{
-        RefreshConfig, RepositoryScanConfig, SARIF_MEDIA_TYPE, ScanConfig, ScanImagePayload,
-        ScanJobHandler, ScanPolicy, ScanSummary, build_envelope, is_scan_subject, refresh_rules,
-        scan_reports,
+        SARIF_MEDIA_TYPE, ScanAction, ScanConfig, ScanImagePayload, ScanJobHandler, ScanSummary,
+        build_envelope, is_scan_subject, scan_reports,
     },
 };
 use angos_secret::Secret;
@@ -54,6 +54,9 @@ fn only_a_plain_image_manifest_is_a_scan_subject() {
     let image = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
     let report = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/sarif+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":2},"layers":[],"subject":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0}}"#;
     let index = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+    // A buildx provenance attestation: an image manifest with no subject,
+    // whose one layer is an in-toto statement.
+    let attestation = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":167},"layers":[{"mediaType":"application/vnd.in-toto+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":34184,"annotations":{"in-toto.io/predicate-type":"https://slsa.dev/provenance/v0.2"}}]}"#;
     assert!(is_scan_subject(
         &Manifest::from_slice(image.as_bytes()).unwrap()
     ));
@@ -62,6 +65,9 @@ fn only_a_plain_image_manifest_is_a_scan_subject() {
     ));
     assert!(!is_scan_subject(
         &Manifest::from_slice(index.as_bytes()).unwrap()
+    ));
+    assert!(!is_scan_subject(
+        &Manifest::from_slice(attestation.as_bytes()).unwrap()
     ));
 }
 
@@ -207,7 +213,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
         "mirror",
         &RepositoryConfig {
             upstream: vec![test_client_config(upstream.uri())],
-            scan: Some(RepositoryScanConfig::default()),
+            scan: Some(scan_everything()),
             ..Default::default()
         },
         &angos_cache::Config::Memory.to_backend().unwrap(),
@@ -268,7 +274,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
         ClaimMode::Atomic,
     ));
     let mut repository = repository_with_replication("apps", Vec::new());
-    repository.scan = Some(ScanPolicy { refresh: None });
+    repository.scan = Some(ImagePolicy::new(&scan_everything()));
     // The seeded digests carry links but no bytes; the push under test is
     // about enqueueing, not reference validation.
     let registry = Registry::new(
@@ -328,7 +334,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
     assert_eq!(
         job_store.count_pending(Queue::Scan, 0).await.unwrap(),
         1,
-        "a repository without a scan table enqueues nothing"
+        "a repository without a scan policy enqueues nothing"
     );
 }
 
@@ -460,7 +466,10 @@ fn handler_for(
             url: scanner.uri(),
             token,
             timeout_secs: 5,
-            refresh: None,
+            policy: PolicyConfig {
+                default: None,
+                rules: Vec::new(),
+            },
         },
     )
     .unwrap()
@@ -541,28 +550,60 @@ async fn reported_before_skips_only_when_a_newer_report_exists() {
     );
 }
 
-/// A repository's rules replace the global ones, and no rule anywhere means
-/// the repository never refreshes.
-#[test]
-fn refresh_tables_merge() {
-    let global: RefreshConfig =
-        toml::from_str(r#"rules = ["image.scanned_at < now() - days(30)"]"#).unwrap();
-    let none: RefreshConfig = toml::from_str("").unwrap();
-    assert!(none.rules.is_empty());
+/// A scan policy that scans every image.
+fn scan_everything() -> PolicyConfig<ScanAction> {
+    PolicyConfig {
+        default: Some(ScanAction::Scan),
+        rules: Vec::new(),
+    }
+}
 
-    let own_rules: RefreshConfig =
-        toml::from_str(r#"rules = ["image.scanned_at < now() - days(7)"]"#).unwrap();
+/// `default` decides an image no rule matches and a matching rule the
+/// opposite; at push an image is untagged or under its pushed tags, never
+/// scanned, so an age rule scans it.
+#[test]
+fn a_policy_default_decides_and_a_rule_flips_it() {
+    let policy = |default: Option<ScanAction>, rules: &[&str]| {
+        ImagePolicy::new(&PolicyConfig {
+            default,
+            rules: rules.iter().map(|r| CelRule::compile(r).unwrap()).collect(),
+        })
+    };
+    let latest = [Tag::new("latest").unwrap()];
+    let v1 = [Tag::new("v1").unwrap()];
+    assert!(policy(Some(ScanAction::Scan), &[]).applies_at_push(&[]));
+    assert!(!policy(Some(ScanAction::Skip), &[]).applies_at_push(&[]));
     assert!(
-        refresh_rules(Some(&global), Some(&own_rules)).is_some(),
-        "a repository's rules replace the global ones"
+        !policy(None, &[]).applies_at_push(&latest),
+        "no default is skip"
+    );
+
+    let scan_latest = policy(None, &["image.tag == 'latest'"]);
+    assert!(scan_latest.applies_at_push(&latest));
+    assert!(!scan_latest.applies_at_push(&v1));
+    assert!(
+        !policy(Some(ScanAction::Scan), &["image.tag == 'latest'"]).applies_at_push(&latest),
+        "with a scanning default a matching rule skips"
     );
     assert!(
-        refresh_rules(Some(&global), None).is_some(),
-        "the global rules apply to a repository without its own"
+        policy(None, &["image.scanned_at < now() - days(30)"]).applies_at_push(&v1),
+        "a fresh image was never scanned"
     );
     assert!(
-        refresh_rules(Some(&none), None).is_none(),
-        "no rules anywhere never refreshes"
+        policy(Some(ScanAction::Skip), &["image.tag.size() > 3"]).applies_at_push(&[]),
+        "a rule that cannot be evaluated applies the policy"
     );
-    assert!(refresh_rules(None, None).is_none());
+
+    let config: ScanConfig = toml::from_str(
+        r#"
+        url = "http://scanner:8766"
+        default = "scan"
+        rules = ["image.tag == 'nightly'"]
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.policy.default, Some(ScanAction::Scan));
+    assert_eq!(config.policy.rules.len(), 1);
+    let service_only: ScanConfig = toml::from_str(r#"url = "http://scanner:8766""#).unwrap();
+    assert!(!service_only.policy.is_set());
 }

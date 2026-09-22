@@ -35,7 +35,7 @@ use crate::{
     },
     identity::{Action, ClientIdentity},
     metrics_provider,
-    policy::{AccessMode, AccessPolicyConfig},
+    policy::{AccessMode, PolicyConfig},
     registry,
     test_fixtures::configuration::load_config,
 };
@@ -592,9 +592,9 @@ async fn an_issued_token_is_never_cached() {
 
 async fn create_test_context_with_allow_policy() -> ServerContext {
     create_test_server_context_with(TestConfigOptions {
-        access_policy: Some(AccessPolicyConfig {
-            default: AccessMode::Allow,
-            ..AccessPolicyConfig::default()
+        access_policy: Some(PolicyConfig {
+            default: Some(AccessMode::Allow),
+            ..PolicyConfig::default()
         }),
         ..TestConfigOptions::default()
     })

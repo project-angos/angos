@@ -6,11 +6,11 @@ use serde::Deserialize;
 use crate::{
     configuration::{RegexPattern, TrustedProxy},
     jobs::store::JobQueueConfig,
-    policy::{AccessPolicyConfig, RetentionPolicyConfig},
+    policy::{AccessMode, PolicyConfig, RetentionPolicyConfig},
     registry::metadata_store::{DEFAULT_ATIME_AUDIT_WINDOW_SECS, DEFAULT_GC_GRACE_SECS},
     registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY},
 };
-use crate::{layer::IndexConfig, scan::ScanConfig};
+use crate::{layer::IndexAction, scan::ScanConfig};
 
 /// Default Tokio worker-thread count; the `unwrap` is const-evaluated.
 const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -57,7 +57,7 @@ pub struct GlobalConfig {
     #[serde(default = "default_redirect_enabled")]
     pub enable_manifest_redirect: bool,
     #[serde(default)]
-    pub access_policy: AccessPolicyConfig,
+    pub access_policy: PolicyConfig<AccessMode>,
     #[serde(default)]
     pub retention_policy: RetentionPolicyConfig,
     #[serde(default)]
@@ -81,10 +81,10 @@ pub struct GlobalConfig {
     /// how their reports are refreshed.
     #[serde(default)]
     pub scan: Option<ScanConfig>,
-    /// Present, every repository indexes the filesystem of its images as they
-    /// land, as if each carried an `index` table.
+    /// The index policy every repository without an `index` table of its own
+    /// follows.
     #[serde(default)]
-    pub index: Option<IndexConfig>,
+    pub index: Option<PolicyConfig<IndexAction>>,
     /// Seconds to keep draining in-flight work on shutdown before forcing exit.
     /// Align this with the orchestrator's termination grace period.
     #[serde(default = "default_shutdown_drain_secs")]
@@ -194,7 +194,7 @@ impl Default for GlobalConfig {
             update_pull_time: default_update_pull_time(),
             enable_blob_redirect: default_redirect_enabled(),
             enable_manifest_redirect: default_redirect_enabled(),
-            access_policy: AccessPolicyConfig::default(),
+            access_policy: PolicyConfig::default(),
             retention_policy: RetentionPolicyConfig::default(),
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),

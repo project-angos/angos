@@ -1,9 +1,9 @@
-//! Vulnerability scanning. A push of an image manifest into a repository with
-//! a `scan` table enqueues one [`SCAN_IMAGE_KIND`] job; [`ScanJobHandler`] asks
+//! Vulnerability scanning. A push of an image manifest a repository's scan
+//! policy applies to enqueues one [`SCAN_IMAGE_KIND`] job; [`ScanJobHandler`] asks
 //! the external scanner service for a SARIF report and pushes it back as a
 //! referrer of the image through the registry's own write path, so the report
 //! is linked, announced and replicated like any client push, and
-//! `angos reconcile scan` refreshes the reports the refresh rules find due.
+//! `angos reconcile scan` scans again the images the scan policy finds due.
 
 use std::{cmp::Reverse, collections::HashMap, io::Cursor, sync::Arc, time::Duration};
 
@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use angos_oci::request::{PutManifestRequest, StartUploadRequest, StartUploadTarget};
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, Reference};
@@ -23,9 +23,7 @@ use crate::{
         Queue,
         store::{Error, JobEnvelope, JobHandler},
     },
-    policy::{
-        CelRule, ManifestImage, RetentionPolicy, RetentionPolicyConfig, RuleOutcome, SystemClock,
-    },
+    policy::PolicyConfig,
     registry::{
         Error as RegistryError, Registry,
         blob_store::BlobStore,
@@ -50,7 +48,8 @@ fn default_timeout_secs() -> u64 {
 }
 
 /// The `[global.scan]` section: the scanner service every scanning
-/// repository's pushes are sent to, and how their reports are refreshed.
+/// repository's pushes are sent to, and the scan policy every repository
+/// without a `scan` table of its own follows.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScanConfig {
     /// Base URL of the scanner service; the handler posts to its `/scan`.
@@ -60,76 +59,22 @@ pub struct ScanConfig {
     /// Bound on one scan request, pull and analysis included.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// When and under which rules reports are refreshed.
-    #[serde(default)]
-    pub refresh: Option<RefreshConfig>,
+    /// `default` and `rules`, beside the service settings.
+    #[serde(flatten)]
+    pub policy: PolicyConfig<ScanAction>,
 }
 
-/// A `[global.scan.refresh]` or `[repository."<name>".scan.refresh]` table:
-/// the rules under which `angos reconcile scan` scans an image again. A
-/// repository's table replaces the global one.
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct RefreshConfig {
-    /// CEL rules over the retention variables and `image.scanned_at`, the
-    /// time of an image's newest report; the image is scanned again when any
-    /// is true.
-    #[serde(default)]
-    pub rules: Vec<CelRule>,
+/// What a `scan` table's `default` gives an image no rule matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanAction {
+    Scan,
+    Skip,
 }
 
-/// A `[repository."<name>".scan]` table: the repository sends its images to
-/// the scanner, and refreshes their reports under `refresh`'s rules.
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct RepositoryScanConfig {
-    #[serde(default)]
-    pub refresh: Option<RefreshConfig>,
-}
-
-/// What a repository's `scan` table resolves to: its images are scanned, and
-/// their reports refreshed under `refresh` when a table lists rules.
-pub struct ScanPolicy {
-    pub refresh: Option<RetentionPolicy>,
-}
-
-/// The refresh rules a repository resolves to: its own, else the global
-/// ones. `None` when neither table lists a rule, so the repository never
-/// refreshes a report.
-pub fn refresh_rules(
-    global: Option<&RefreshConfig>,
-    repository: Option<&RefreshConfig>,
-) -> Option<RetentionPolicy> {
-    let rules = repository
-        .map(|c| &c.rules)
-        .filter(|rules| !rules.is_empty())
-        .or_else(|| global.map(|c| &c.rules).filter(|rules| !rules.is_empty()))?;
-    Some(RetentionPolicy::new(
-        &RetentionPolicyConfig {
-            rules: rules.clone(),
-        },
-        Arc::new(SystemClock),
-    ))
-}
-
-/// Whether `rules` find `image` due for a scan. A rule that cannot be
-/// evaluated selects too: a broken rule costs a scan rather than hiding a
-/// stale image.
-pub fn refresh_due(
-    rules: &RetentionPolicy,
-    image: &ManifestImage,
-    last_pushed: &[String],
-    last_pulled: &[String],
-) -> bool {
-    match rules.evaluate(image, last_pushed, last_pulled) {
-        Ok(RuleOutcome::Matched(_)) => true,
-        Ok(RuleOutcome::NoMatch) => false,
-        Ok(RuleOutcome::Indeterminate { index, message }) => {
-            warn!("Refresh rule {index} is indeterminate: {message}; scanning");
-            true
-        }
-        Err(e) => {
-            warn!("Refresh rules could not be evaluated: {e}; scanning");
-            true
-        }
+impl From<ScanAction> for bool {
+    fn from(action: ScanAction) -> bool {
+        matches!(action, ScanAction::Scan)
     }
 }
 
@@ -161,10 +106,12 @@ pub fn build_envelope(payload: &ScanImagePayload) -> Result<JobEnvelope, Error> 
 }
 
 /// A report, an attestation and an index are pushed like any manifest; only a
-/// plain image manifest is a scan subject.
+/// plain image manifest is a scan subject. A buildx attestation names no
+/// subject: it is an image manifest whose in-toto layers carry a predicate type.
 pub fn is_scan_subject(manifest: &Manifest) -> bool {
     manifest.subject.is_none()
         && manifest.artifact_type.is_none()
+        && manifest.in_toto_predicate_type().is_none()
         && matches!(manifest.content, Content::Image { .. })
 }
 
