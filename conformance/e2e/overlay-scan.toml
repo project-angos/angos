@@ -16,8 +16,7 @@ default = "allow"
 [global.retention_policy]
 rules = ["image.tag != null"]
 
-[repository."scan"]
-scan = true
+[repository."scan".scan]
 
 [scanner]
 bind_address = "127.0.0.1"

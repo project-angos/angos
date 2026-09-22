@@ -46,8 +46,9 @@ root_dir = "./data"
 [repository."library"]
 immutable_tags = true
 immutable_tags_exclusions = ["^latest$", "^edge$"]
-scan = true
-index = true
+
+[repository."library".scan]
+[repository."library".index]
 
 # ORAS artifacts, for the Files view.
 [repository."artifacts"]
