@@ -151,8 +151,9 @@ pub fn registry(
     Ok(registry)
 }
 
-/// `global` supplies the manifest size bound and the `[global.scan.refresh]`
-/// table a repository without refresh rules of its own falls back to.
+/// `global` supplies the manifest size bound, the `[global.scan.refresh]`
+/// table a repository without refresh rules of its own falls back to, and the
+/// `[global.index]` table that indexes every repository.
 pub async fn repositories(
     configs: &HashMap<String, repository::Config>,
     auth_cache: &Arc<Cache>,
@@ -171,6 +172,7 @@ pub async fn repositories(
         if let Some(scan) = &mut repository.scan {
             scan.refresh = refresh_rules(refresh, config.refresh());
         }
+        repository.index |= global.index.is_some();
         map.insert(name.clone(), repository);
     }
     for repository in map
@@ -194,6 +196,7 @@ mod tests {
         command::maintenance::Error as MaintenanceError,
         command::server::Error as ServerError,
         configuration::GlobalConfig,
+        layer::IndexConfig,
         metrics_provider::metrics_provider,
         policy::{AccessMode, AccessPolicyConfig},
         registry::{self, repository},
@@ -248,6 +251,35 @@ mod tests {
         let result = repositories(&configs, &cache, &GlobalConfig::default()).await;
         assert!(result.is_ok());
         assert!(result.unwrap().get("test-repo").is_some());
+    }
+
+    /// `[global.index]` indexes every repository, its own table or not.
+    #[tokio::test]
+    async fn a_global_index_table_indexes_every_repository() {
+        let configs = HashMap::from([
+            ("plain".to_string(), repository::Config::default()),
+            (
+                "indexed".to_string(),
+                repository::Config {
+                    index: Some(IndexConfig {}),
+                    ..repository::Config::default()
+                },
+            ),
+        ]);
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let global = GlobalConfig {
+            index: Some(IndexConfig {}),
+            ..GlobalConfig::default()
+        };
+        let resolver = repositories(&configs, &cache, &global).await.unwrap();
+        assert!(resolver.get("plain").is_some_and(|r| r.index));
+        assert!(resolver.get("indexed").is_some_and(|r| r.index));
+
+        let resolver = repositories(&configs, &cache, &GlobalConfig::default())
+            .await
+            .unwrap();
+        assert!(resolver.get("plain").is_some_and(|r| !r.index));
+        assert!(resolver.get("indexed").is_some_and(|r| r.index));
     }
 
     #[tokio::test]

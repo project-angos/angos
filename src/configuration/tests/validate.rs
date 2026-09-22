@@ -395,3 +395,16 @@ fn refresh_rules_reading_pull_times_require_update_pull_time() {
         "{msg}"
     );
 }
+
+#[test]
+fn a_global_index_table_parses() {
+    let config = load_config(
+        r#"
+    [global.index]
+
+    [repository."apps".index]
+    "#,
+    );
+    assert!(config.global.index.is_some());
+    assert!(config.repository["apps"].index.is_some());
+}

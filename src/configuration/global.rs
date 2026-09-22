@@ -3,7 +3,6 @@ use std::num::NonZeroUsize;
 use bytesize::ByteSize;
 use serde::Deserialize;
 
-use crate::scan::ScanConfig;
 use crate::{
     configuration::{RegexPattern, TrustedProxy},
     jobs::store::JobQueueConfig,
@@ -11,6 +10,7 @@ use crate::{
     registry::metadata_store::{DEFAULT_ATIME_AUDIT_WINDOW_SECS, DEFAULT_GC_GRACE_SECS},
     registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY},
 };
+use crate::{layer::IndexConfig, scan::ScanConfig};
 
 /// Default Tokio worker-thread count; the `unwrap` is const-evaluated.
 const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -81,6 +81,10 @@ pub struct GlobalConfig {
     /// how their reports are refreshed.
     #[serde(default)]
     pub scan: Option<ScanConfig>,
+    /// Present, every repository indexes the filesystem of its images as they
+    /// land, as if each carried an `index` table.
+    #[serde(default)]
+    pub index: Option<IndexConfig>,
     /// Seconds to keep draining in-flight work on shutdown before forcing exit.
     /// Align this with the orchestrator's termination grace period.
     #[serde(default = "default_shutdown_drain_secs")]
@@ -199,6 +203,7 @@ impl Default for GlobalConfig {
             event_webhooks: Vec::new(),
             job_queue: None,
             scan: None,
+            index: None,
             shutdown_drain_secs: default_shutdown_drain_secs(),
             namespace_walk_concurrency: default_namespace_walk_concurrency(),
             listing_read_concurrency: default_listing_read_concurrency(),

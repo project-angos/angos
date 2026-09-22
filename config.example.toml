@@ -56,6 +56,11 @@ update_pull_time = false
 #    'image.pushed_at > now() - days(90)'
 #]
 
+# Optional: Index the filesystem of every image as it lands, so the web UI browses
+# it at once; a repository does the same for itself with [repository."<name>".index]
+# (see doc/how-to/explore-image-filesystems.md)
+#[global.index]
+
 # Optional: Scanner service each repository with a `scan` table sends its images to,
 # and the rules under which `angos reconcile scan` refreshes their reports
 # (see doc/how-to/scan-images.md)

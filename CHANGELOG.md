@@ -10,10 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Report refresh: `angos reconcile scan` scans an image again when a CEL rule of `[global.scan.refresh]`, or of the `[repository."<name>".scan.refresh]` table replacing it, finds its newest report due, so a scheduled run keeps reports current.
 - `image.scanned_at`, the time of an image's newest scan report, joins the CEL variables.
+- `[global.index]` indexes the filesystem of every repository's images as they land, where the repository `index` table does so for one.
 
 ### Changed
 
-- **Breaking:** a repository opts into scanning with a `[repository."<name>".scan]` table, which also holds its report refresh rules, in place of `scan = true`.
+- **Breaking:** a repository opts into scanning with a `[repository."<name>".scan]` table, which also holds its report refresh rules, and into filesystem indexing with a `[repository."<name>".index]` table, in place of `scan = true` and `index = true`.
 - `angos prune` judges a scan report a newer angos report has superseded by the retention rules like any untagged manifest, where every referrer of a live image was shielded; the newest report and every other referrer stay shielded.
 
 ## 1.9.3

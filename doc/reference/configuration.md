@@ -186,6 +186,10 @@ setup guide including `angos worker` invocation and KEDA autoscaling.
 |---------|----------|---------|-------------------------------|
 | `rules` | [string] | `[]`    | CEL expressions for retention |
 
+### Index (`global.index`)
+
+Present, even empty, every repository indexes the filesystem of each image manifest as it lands, as if each carried an [`index`](#index-repositorynamespaceindex) table; a repository cannot opt out. The table carries no options.
+
 ---
 
 ## Cache (`cache`)
@@ -448,7 +452,7 @@ Repository namespace keys must not overlap: a key like `team` and a key like `te
 | `immutable_tags`            | bool     | `false`  | Enable immutable tags for this repository. The effective flag is this value OR `global.immutable_tags`, so a repository can add immutability but never opt out of a global `true` |
 | `immutable_tags_exclusions` | [string] | inherits | Replaces the global exclusion list when non-empty |
 | `scan` | table | - | Send each image manifest pushed here, or stored by a cache miss in a pull-through repository, to the scanner service; see [Scan](#scan-repositorynamespacescan) |
-| `index` | bool | `false` | Index the filesystem of each image manifest pushed here, or stored by a cache miss, as it lands, so the web UI browses it at once; without the flag an image is indexed the first time someone opens its filesystem |
+| `index` | table | - | Index the filesystem of each image manifest pushed here, or stored by a cache miss, as it lands, so the web UI browses it at once; see [Index](#index-repositorynamespaceindex) |
 | `authorization_webhook`     | string   | inherits | Webhook name (empty to disable) |
 | `event_webhooks`            | [string] | inherits | Event webhook names              |
 
@@ -513,6 +517,10 @@ Present, even empty, the repository sends each image manifest pushed here, or st
 | Option  | Type     | Default  | Description                                                  |
 |---------|----------|----------|--------------------------------------------------------------|
 | `rules` | [string] | required | The rules this repository's reports are refreshed under, in place of [`global.scan.refresh`](#report-refresh-globalscanrefresh)'s; at least one |
+
+### Index (`repository."<namespace>".index`)
+
+Present, even empty, the filesystem of each image manifest pushed here, or stored by a cache miss, is indexed as it lands, so the web UI browses it at once; without the table, or [`global.index`](#index-globalindex), an image is indexed the first time someone opens its filesystem. The table carries no options.
 
 ---
 

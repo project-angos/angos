@@ -2,9 +2,9 @@
 //! no random access; [`IndexLayerJobHandler`] walks it once and keeps, by the
 //! layer digest, a listing of its entries with their offsets and the
 //! inflater's checkpoints, so the web UI can browse the merged filesystem and
-//! open a file without decoding the whole layer again. A push into an
-//! `index = true` repository enqueues one [`INDEX_LAYER_KIND`] job per layer;
-//! any other image is indexed the first time someone asks.
+//! open a file without decoding the whole layer again. A push into a
+//! repository with an `index` table enqueues one [`INDEX_LAYER_KIND`] job per
+//! layer; any other image is indexed the first time someone asks.
 
 use std::{
     io::{self, BufRead, BufReader, Read},
@@ -34,6 +34,12 @@ use crate::{
 pub use angos_inflate::{Checkpoint, Inflater};
 
 pub const INDEX_LAYER_KIND: &str = "index.layer";
+
+/// A `[global.index]` or `[repository."<name>".index]` table: the images of
+/// every repository, or of this one, are indexed as they land rather than the
+/// first time someone browses them.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct IndexConfig {}
 /// Output between two checkpoints: what opening a file costs at most in
 /// decoding, against 32 KiB of stored window per checkpoint.
 const CHECKPOINT_EVERY: u64 = 4 * 1024 * 1024;

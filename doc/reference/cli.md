@@ -73,7 +73,7 @@ Scrub streams every object key in both stores (blob and metadata), categorizes i
 
 - Repairs every revision and referrer record a manifest implies, and re-issues missing blob-index grants.
 - Removes tags whose target manifest blob is missing, revisions whose manifest blob is missing, orphan referrer records, and stale blob-index entries.
-- Reclaims the filesystem listings of layers no `index = true` repository uses, the same pass as [`reconcile index`](#reconcile-index); images outside those repositories index again when opened.
+- Reclaims the filesystem listings of layers no repository with an `index` table uses, the same pass as [`reconcile index`](#reconcile-index); images outside those repositories index again when opened.
 - Deletes queued jobs, pending or dead-lettered, whose downstream or repository is no longer configured; [`reconcile`](#reconcile) re-issues the work if the configuration returns.
 - Deletes objects whose content is unreadable (a job record or access entry that does not parse).
 - Reclaims blobs with no references, past the reclamation grace period and fenced by a `v2/gc/` run marker at apply time, so it is safe alongside a live server.
@@ -215,7 +215,7 @@ Enqueue a scan job for every image manifest of a scanning repository that carrie
 
 #### reconcile index
 
-Enqueue a filesystem index job for every tar layer of the images of an `index = true` repository that has no listing yet, so the web UI opens them without an "Indexing" wait, and reclaim the listings of every other layer. A layer shared by several images is enqueued once, and kept while any `index = true` repository uses it. Any image indexes itself the first time its filesystem is opened, so this is for having the listings ready ahead of that, or, with `--force`, for walking every layer again; the reclaim drops what those on-demand opens left behind in repositories without the flag, which index again when opened. The running server or a worker drains the jobs; the command returns once they are enqueued and the listings reclaimed. See [Explore Image Filesystems](../how-to/explore-image-filesystems.md).
+Enqueue a filesystem index job for every tar layer of the images of a repository with an `index` table that has no listing yet, so the web UI opens them without an "Indexing" wait, and reclaim the listings of every other layer. A layer shared by several images is enqueued once, and kept while any repository with an `index` table uses it. Any image indexes itself the first time its filesystem is opened, so this is for having the listings ready ahead of that, or, with `--force`, for walking every layer again; the reclaim drops what those on-demand opens left behind in repositories without the flag, which index again when opened. The running server or a worker drains the jobs; the command returns once they are enqueued and the listings reclaimed. See [Explore Image Filesystems](../how-to/explore-image-filesystems.md).
 
 | Option      | Short | Description                                                 |
 |-------------|-------|-------------------------------------------------------------|

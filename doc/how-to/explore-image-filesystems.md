@@ -19,7 +19,7 @@ Browse what an image contains, layer by layer, and open any file, from the web U
 2. The manifest page fetches the listing of each layer and merges them the way a runtime does: an entry replaces the lower layers' one, a whiteout removes a path, an opaque marker empties a directory.
 3. Opening a file decodes the layer from the nearest checkpoint to the file's offset, so a file deep in a large layer costs a few megabytes of decoding, not the whole layer.
 
-The listing is derived from the blob and shared like it: two images with the same layer share one listing, and it goes when the blob is reclaimed, or when `angos reconcile index` runs while no `index = true` repository uses the layer. zstd-compressed layers are not indexed.
+The listing is derived from the blob and shared like it: two images with the same layer share one listing, and it goes when the blob is reclaimed, or when `angos reconcile index` runs while no repository with an `index` table uses the layer. zstd-compressed layers are not indexed.
 
 ---
 
@@ -46,28 +46,33 @@ Click a file to read it under the tree, up to 512 KiB, or download it whatever i
 Indexing on first open is fine for a registry browsed now and then. A repository whose images are opened as soon as they land indexes them as they land:
 
 ```toml
-[repository."apps"]
-index = true
+[repository."apps".index]
+```
+
+To index every repository this way, put the table under `[global]` instead:
+
+```toml
+[global.index]
 ```
 
 Each image manifest pushed there, or stored by a cache miss in a pull-through repository, enqueues one `index` job per layer. `angos worker` drains the queue, sized by `max_concurrent_index_jobs` (default 1, since a job inflates a whole layer), and the server drains it in-process without a durable queue. The jobs list under the `index` queue of the Jobs page.
 
 ## Step 5: Index What Was Already There
 
-The flag covers images from then on. To have the listings of the images already in the repository ready before anyone opens them:
+The table covers images from then on. To have the listings of the images already in the repository ready before anyone opens them:
 
 ```bash
 angos -c config.toml reconcile index
 ```
 
-It enqueues one job per tar layer without a listing, a shared layer once, and reclaims the listings of the layers no `index = true` repository uses; `--dry-run` lists both, and `--force` walks every layer again. The server or a worker drains the jobs as usual.
+It enqueues one job per tar layer without a listing, a shared layer once, and reclaims the listings of the layers no repository with an `index` table uses; `--dry-run` lists both, and `--force` walks every layer again. The server or a worker drains the jobs as usual.
 
-To stop indexing a repository, drop its `index = true` and run the same command: the listings its images accumulated go, while any image still indexes itself the first time someone opens its filesystem.
+To stop indexing a repository, drop its `index` table and run the same command: the listings its images accumulated go, while any image still indexes itself the first time someone opens its filesystem.
 
 ---
 
 ## Reference
 
 - [API Endpoints Reference](../reference/api-endpoints.md#layer-entries) - The layer endpoints
-- [Configuration Reference](../reference/configuration.md#repository-repositorynamespace) - The `index` flag
+- [Configuration Reference](../reference/configuration.md#index-repositorynamespaceindex) - The `index` table
 - [Web UI Reference](../reference/ui.md) - The Filesystem panel

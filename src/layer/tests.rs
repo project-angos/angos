@@ -319,7 +319,7 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
     assert!(file("nope").await.is_err());
 }
 
-/// A push into an `index = true` repository enqueues one job per tar layer,
+/// A push into a repository with an `index` table enqueues one job per tar layer,
 /// none for the config or a zstd layer, and none at all without the flag.
 #[tokio::test]
 async fn a_push_enqueues_an_index_job_per_tar_layer_of_an_indexing_repository() {

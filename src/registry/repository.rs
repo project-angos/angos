@@ -17,6 +17,7 @@ use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient};
 
 use crate::{
     configuration::RegexPattern,
+    layer::IndexConfig,
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::Error,
     replication::{ReplicationDownstream, ReplicationDownstreamConfig},
@@ -221,10 +222,10 @@ pub struct Config {
     /// Present, each image manifest pushed here is sent to the scanner
     /// service, and its reports are refreshed under the table's rules.
     pub scan: Option<RepositoryScanConfig>,
-    /// Whether the filesystem of each image manifest pushed here is indexed
-    /// right away, rather than the first time someone browses it.
-    #[serde(default)]
-    pub index: bool,
+    /// Present, the filesystem of each image manifest pushed here is indexed
+    /// as it lands, rather than the first time someone browses it; a
+    /// `[global.index]` table does the same for every repository.
+    pub index: Option<IndexConfig>,
 }
 
 impl Config {
@@ -326,7 +327,7 @@ impl Repository {
             scan: config.scan.as_ref().map(|_| ScanPolicy {
                 refresh: refresh_rules(None, config.refresh()),
             }),
-            index: config.index,
+            index: config.index.is_some(),
         })
     }
 
