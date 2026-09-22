@@ -1,0 +1,76 @@
+---
+# Filesystem index reconciliation, daily at 05:00, away from the hourly prune
+# and scrub slots. It enqueues an index job for every tar layer without a
+# listing in the repositories with an `index` table, and reclaims the
+# listings of every other layer. Include this component only with an `index`
+# table configured: on a registry without one it drops every listing an
+# on-demand open left behind, which then indexes again when opened.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: angos-reconcile-index
+  namespace: angos
+  labels:
+    app: angos
+spec:
+  schedule: "0 5 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: angos
+            job: reconcile-index
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: reconcile-index
+              # The same tag as the Deployment, for the reason given there.
+              image: ghcr.io/project-angos/angos:1.8.0
+              args:
+                - -c
+                - /config/config.toml
+                - -c
+                - /credentials/secrets.toml
+                - reconcile
+                - index
+              env:
+                # The job log is the only record of what the run enqueued.
+                - name: RUST_LOG
+                  value: info
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                  readOnly: true
+                - name: credentials
+                  mountPath: /credentials
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  memory: 512Mi
+          volumes:
+            - name: config
+              configMap:
+                name: angos-config
+            - name: credentials
+              secret:
+                secretName: angos-credentials

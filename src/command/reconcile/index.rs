@@ -1,5 +1,5 @@
 //! `angos reconcile index`: enqueues an index job for every tar layer of an
-//! image in an `index = true` repository that has no listing yet, or for
+//! image in a repository with an `index` table that has no listing yet, or for
 //! every layer with `--force`, and reclaims the listings of every other
 //! layer. The running server or a worker drains the jobs. Any image indexes
 //! itself the first time its filesystem is opened, so this is for having the
@@ -46,7 +46,7 @@ use crate::{
 #[argh(
     subcommand,
     name = "index",
-    description = "Enqueue filesystem indexing for layers without a listing, or for every layer with --force, and reclaim the listings no index = true repository uses"
+    description = "Enqueue filesystem indexing for layers without a listing, or for every layer with --force, and reclaim the listings no indexing repository uses"
 )]
 pub struct Options {
     #[argh(switch, short = 'd')]
@@ -58,7 +58,7 @@ pub struct Options {
 }
 
 /// Enqueues one index job per unlisted tar layer of the images of an
-/// `index = true` repository; `force` drops the listing check, `enqueue`
+/// repository with an `index` table; `force` drops the listing check, `enqueue`
 /// off only collects. A layer shared by several images is enqueued once per
 /// run, and `seen` ends up holding every layer those repositories use, the
 /// ones whose listing is kept.
@@ -140,7 +140,7 @@ async fn reclaim_listings(
 }
 
 /// Walks every namespace with `checker`, then reclaims the listings of the
-/// layers it did not see in an `index = true` repository.
+/// layers it did not see in a repository with an `index` table.
 async fn check_and_reclaim(
     checker: IndexChecker,
     metadata_store: &Arc<MetadataStore>,
@@ -154,7 +154,7 @@ async fn check_and_reclaim(
     reclaim_listings(metadata_store, &kept, sink).await
 }
 
-/// Reclaims the listings no `index = true` repository uses, enqueueing
+/// Reclaims the listings no repository with an `index` table uses, enqueueing
 /// nothing: what `angos scrub` runs after its walk.
 pub async fn reclaim_unused_listings(
     blob_store: Arc<BlobStore>,
@@ -275,7 +275,7 @@ mod tests {
             .check(&namespace, &sink)
             .await
             .unwrap();
-        assert!(enqueued(&sink).is_empty(), "no index = true, no job");
+        assert!(enqueued(&sink).is_empty(), "no index table, no job");
 
         // Listed: only a forced run walks it again. The seeded layer holds no
         // tar, so the listing is written by hand.

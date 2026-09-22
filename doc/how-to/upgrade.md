@@ -879,3 +879,33 @@ The server, and every offline command, exits with a configuration error.
 
 Remove the setting to take the default of 128, or set it to at least 1.
 
+---
+
+## 1.9.x → 1.10.0
+
+### `scan = true` and `index = true` Are Now Tables (Breaking Change)
+
+A repository opts into vulnerability scanning with a `[repository."<name>".scan]`
+table, which also carries its report refresh rules, and into filesystem
+indexing with a `[repository."<name>".index]` table, in place of the
+`scan = true` and `index = true` flags; the flags now fail to parse.
+
+**Who is affected:** every deployment with `scan = true` or `index = true` on
+a repository; the registry refuses the configuration at startup.
+
+#### Migration
+
+**Before:**
+
+```toml
+[repository."apps"]
+scan = true
+index = true
+```
+
+**After:**
+
+```toml
+[repository."apps".scan]
+[repository."apps".index]
+```

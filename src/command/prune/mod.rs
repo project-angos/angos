@@ -22,7 +22,7 @@ use crate::{
         scrub::default_concurrency,
     },
     configuration::Configuration,
-    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
+    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock, rules_use_pull_time},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -58,11 +58,11 @@ fn ensure_pull_time_rules_are_recorded(config: &Configuration) -> Result<(), Err
         return Ok(());
     }
     let mut offenders = Vec::new();
-    if config.global.retention_policy.uses_pull_time() {
+    if rules_use_pull_time(&config.global.retention_policy.rules) {
         offenders.push("global".to_string());
     }
     for (name, repository) in &config.repository {
-        if repository.retention_policy.uses_pull_time() {
+        if rules_use_pull_time(&repository.retention_policy.rules) {
             offenders.push(format!("repository '{name}'"));
         }
     }

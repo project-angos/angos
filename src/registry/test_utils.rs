@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use angos_oci::{
-    Digest, MediaRange, MediaType, Namespace, Tag, UploadSessionId,
+    Descriptor, Digest, Manifest, MediaRange, MediaType, Namespace, Tag, UploadSessionId,
     header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID},
     http_range::RequestRange,
     request::{CompleteUploadRequest, GetBlobRequest, GetReferrersRequest},
@@ -629,7 +629,7 @@ pub fn repository_with_replication(
         ),
         immutable_tags: false,
         immutable_tags_exclusions: Vec::new(),
-        scan: false,
+        scan: None,
         index: false,
     }
 }
@@ -665,6 +665,20 @@ pub async fn sole_pending_payload(job_store: &JobStore) -> ReplicationJob {
         .unwrap();
     assert_eq!(envelope.queue, Queue::Replication);
     serde_json::from_value(envelope.payload).expect("decode ReplicationJob")
+}
+
+/// A scan report as angos attaches it to `subject`, created at `created`
+/// (RFC 3339), and its referrer descriptor as the push path records it.
+pub fn angos_report(subject: &Digest, created: &str) -> (Vec<u8>, Descriptor) {
+    let body = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/sarif+json","config":{{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":2}},"layers":[],"subject":{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{subject}","size":0}},"annotations":{{"io.angos.scan.critical":"0","org.opencontainers.image.created":"{created}"}}}}"#
+    )
+    .into_bytes();
+    let digest = Digest::sha256_of_bytes(&body);
+    let descriptor = Manifest::from_slice(&body)
+        .unwrap()
+        .take_descriptor(digest, body.len() as u64);
+    (body, descriptor)
 }
 
 /// Seed a config blob, a layer blob, a manifest referencing both, and a `v1`

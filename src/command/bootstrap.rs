@@ -9,7 +9,7 @@ use angos_storage::{
 };
 
 use crate::{
-    configuration::{Configuration, ResolvedStorageConfig},
+    configuration::{Configuration, GlobalConfig, ResolvedStorageConfig},
     event_webhook::{self, dispatcher::EventDispatcher},
     jobs::store::{self as job_store, JobStore},
     registry::{
@@ -19,6 +19,7 @@ use crate::{
         prime_pull_through, repository,
         repository_resolver::{OverlapError, RepositoryResolver},
     },
+    scan::refresh_rules,
 };
 
 /// Errors produced by the shared CLI bootstrap helpers.
@@ -120,12 +121,7 @@ pub async fn maintenance_context(config: &Configuration) -> Result<MaintenanceCo
         config.global.gc_grace_secs,
         config.global.atime_audit_window_secs,
     )?;
-    let repositories = repositories(
-        &config.repository,
-        &auth_cache,
-        config.global.max_manifest_size_bytes(),
-    )
-    .await?;
+    let repositories = repositories(&config.repository, &auth_cache, &config.global).await?;
     Ok(MaintenanceContext {
         blob_store,
         metadata_store,
@@ -155,19 +151,28 @@ pub fn registry(
     Ok(registry)
 }
 
+/// `global` supplies the manifest size bound, the `[global.scan.refresh]`
+/// table a repository without refresh rules of its own falls back to, and the
+/// `[global.index]` table that indexes every repository.
 pub async fn repositories(
     configs: &HashMap<String, repository::Config>,
     auth_cache: &Arc<Cache>,
-    max_manifest_size_bytes: usize,
+    global: &GlobalConfig,
 ) -> Result<Arc<RepositoryResolver>, Error> {
+    let max_manifest_size_bytes = global.max_manifest_size_bytes();
+    let refresh = global.scan.as_ref().and_then(|scan| scan.refresh.as_ref());
     let mut map = HashMap::with_capacity(configs.len());
     for (name, config) in configs {
-        let repository = Repository::new(name, config, auth_cache, max_manifest_size_bytes)
+        let mut repository = Repository::new(name, config, auth_cache, max_manifest_size_bytes)
             .await
             .map_err(|source| Error::Repository {
                 name: name.clone(),
                 source: Box::new(source),
             })?;
+        if let Some(scan) = &mut repository.scan {
+            scan.refresh = refresh_rules(refresh, config.refresh());
+        }
+        repository.index |= global.index.is_some();
         map.insert(name.clone(), repository);
     }
     for repository in map
@@ -190,9 +195,11 @@ mod tests {
         command::bootstrap::{Error, repositories},
         command::maintenance::Error as MaintenanceError,
         command::server::Error as ServerError,
+        configuration::GlobalConfig,
+        layer::IndexConfig,
         metrics_provider::metrics_provider,
         policy::{AccessMode, AccessPolicyConfig},
-        registry::{self, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
+        registry::{self, repository},
         test_fixtures::client::test_client_config,
     };
 
@@ -207,7 +214,7 @@ mod tests {
             },
         )]);
         let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+        repositories(&configs, &cache, &GlobalConfig::default())
             .await
             .unwrap();
 
@@ -241,16 +248,45 @@ mod tests {
         };
         let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let configs = HashMap::from([("test-repo".to_string(), repo_config)]);
-        let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
+        let result = repositories(&configs, &cache, &GlobalConfig::default()).await;
         assert!(result.is_ok());
         assert!(result.unwrap().get("test-repo").is_some());
+    }
+
+    /// `[global.index]` indexes every repository, its own table or not.
+    #[tokio::test]
+    async fn a_global_index_table_indexes_every_repository() {
+        let configs = HashMap::from([
+            ("plain".to_string(), repository::Config::default()),
+            (
+                "indexed".to_string(),
+                repository::Config {
+                    index: Some(IndexConfig {}),
+                    ..repository::Config::default()
+                },
+            ),
+        ]);
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let global = GlobalConfig {
+            index: Some(IndexConfig {}),
+            ..GlobalConfig::default()
+        };
+        let resolver = repositories(&configs, &cache, &global).await.unwrap();
+        assert!(resolver.get("plain").is_some_and(|r| r.index));
+        assert!(resolver.get("indexed").is_some_and(|r| r.index));
+
+        let resolver = repositories(&configs, &cache, &GlobalConfig::default())
+            .await
+            .unwrap();
+        assert!(resolver.get("plain").is_some_and(|r| !r.index));
+        assert!(resolver.get("indexed").is_some_and(|r| r.index));
     }
 
     #[tokio::test]
     async fn repositories_empty_map_succeeds() {
         let configs = HashMap::new();
         let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
+        let result = repositories(&configs, &cache, &GlobalConfig::default()).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
     }
@@ -279,7 +315,7 @@ mod tests {
             },
         );
         let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
+        let result = repositories(&configs, &cache, &GlobalConfig::default()).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Overlap(_)));
     }

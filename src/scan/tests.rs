@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use chrono::{TimeDelta, Utc};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{header, method, path},
@@ -13,57 +14,22 @@ use crate::{
         store::{ClaimMode, JobHandler, JobStore},
     },
     registry::{
-        Registry, RegistryConfig,
+        Registry, RegistryConfig, Repository,
         manifest::read_manifest,
-        metadata_store::LinkKind,
         test_utils::{
-            fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
+            FsTestStack, fs_test_stack, repository_with_replication, seed_manifest,
+            single_repo_resolver,
         },
     },
     scan::{
-        SARIF_MEDIA_TYPE, ScanConfig, ScanImagePayload, ScanJobHandler, ScanSummary,
-        build_envelope, is_scan_subject,
+        RefreshConfig, RepositoryScanConfig, SARIF_MEDIA_TYPE, ScanConfig, ScanImagePayload,
+        ScanJobHandler, ScanPolicy, ScanSummary, build_envelope, is_scan_subject, refresh_rules,
+        scan_reports,
     },
 };
 use angos_secret::Secret;
 
 const SARIF: &[u8] = br#"{"version":"2.1.0","runs":[]}"#;
-
-/// The SARIF referrers of `digest`, read the way the handler's own no-op
-/// check reads them.
-async fn sarif_referrers(
-    stack: &crate::registry::test_utils::FsTestStack,
-    namespace: &Namespace,
-    digest: &Digest,
-) -> Vec<Digest> {
-    use futures_util::TryStreamExt;
-    let referrers: Vec<Digest> = stack
-        .metadata_store
-        .stream_referrer_digests(namespace, digest)
-        .try_collect()
-        .await
-        .unwrap();
-    let mut reports = Vec::new();
-    for referrer in referrers {
-        let link = LinkKind::Referrer {
-            subject: digest.clone(),
-            referrer: referrer.clone(),
-        };
-        let metadata = stack
-            .metadata_store
-            .read_link(namespace, &link)
-            .await
-            .unwrap();
-        if metadata
-            .descriptor
-            .and_then(|d| d.artifact_type)
-            .is_some_and(|t| t.as_ref() == SARIF_MEDIA_TYPE)
-        {
-            reports.push(referrer);
-        }
-    }
-    reports
-}
 
 #[test]
 fn scan_jobs_coalesce_on_the_image_digest() {
@@ -73,6 +39,7 @@ fn scan_jobs_coalesce_on_the_image_digest() {
         namespace: namespace.clone(),
         digest: digest.clone(),
         force: false,
+        reported_before: None,
     })
     .unwrap();
     assert_eq!(envelope.queue, Queue::Scan);
@@ -117,45 +84,31 @@ async fn a_scan_job_attaches_one_report_and_reruns_as_a_no_op() {
         .mount(&scanner)
         .await;
 
-    let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
-        "scan-test",
-        ClaimMode::Atomic,
-    ));
-    let resolver = single_repo_resolver("apps", repository_with_replication("apps", Vec::new()));
-    let registry = Registry::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        resolver,
-        RegistryConfig::new(job_store),
+    let handler = handler_for(
+        &stack,
+        repository_with_replication("apps", Vec::new()),
+        &scanner,
+        Some(Secret::new("s3cret".to_string())),
     );
-    let handler = ScanJobHandler::new(
-        registry,
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        &ScanConfig {
-            url: scanner.uri(),
-            token: Some(Secret::new("s3cret".to_string())),
-            timeout_secs: 5,
-        },
-    )
-    .unwrap();
 
     let envelope = build_envelope(&ScanImagePayload {
         namespace: namespace.clone(),
         digest: image.clone(),
         force: false,
+        reported_before: None,
     })
     .unwrap();
     handler.execute(&envelope).await.unwrap();
 
-    let reports = sarif_referrers(&stack, &namespace, &image).await;
+    let reports = scan_reports(&stack.metadata_store, &namespace, &image)
+        .await
+        .unwrap();
     assert_eq!(
         reports.len(),
         1,
         "one SARIF referrer must hang off the image"
     );
-    let report = read_manifest(&stack.blob_store, &reports[0])
+    let report = read_manifest(&stack.blob_store, &reports[0].digest)
         .await
         .unwrap()
         .unwrap();
@@ -167,7 +120,10 @@ async fn a_scan_job_attaches_one_report_and_reruns_as_a_no_op() {
 
     handler.execute(&envelope).await.unwrap();
     assert_eq!(
-        sarif_referrers(&stack, &namespace, &image).await.len(),
+        scan_reports(&stack.metadata_store, &namespace, &image)
+            .await
+            .unwrap()
+            .len(),
         1,
         "a re-run must not attach a second report"
     );
@@ -185,45 +141,34 @@ async fn a_failing_scanner_fails_the_job() {
         .respond_with(ResponseTemplate::new(502).set_body_string("grype exited with 1"))
         .mount(&scanner)
         .await;
-    let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
-        "scan-test",
-        ClaimMode::Atomic,
-    ));
-    let resolver = single_repo_resolver("apps", repository_with_replication("apps", Vec::new()));
-    let registry = Registry::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        resolver,
-        RegistryConfig::new(job_store),
+    let handler = handler_for(
+        &stack,
+        repository_with_replication("apps", Vec::new()),
+        &scanner,
+        None,
     );
-    let handler = ScanJobHandler::new(
-        registry,
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        &ScanConfig {
-            url: scanner.uri(),
-            token: None,
-            timeout_secs: 5,
-        },
-    )
-    .unwrap();
     let err = handler
         .execute(
             &build_envelope(&ScanImagePayload {
                 namespace: namespace.clone(),
                 digest: image.clone(),
                 force: false,
+                reported_before: None,
             })
             .unwrap(),
         )
         .await
         .expect_err("a 502 from the scanner must fail the job");
     assert!(err.to_string().contains("grype exited with 1"), "{err}");
-    assert!(sarif_referrers(&stack, &namespace, &image).await.is_empty());
+    assert!(
+        scan_reports(&stack.metadata_store, &namespace, &image)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
-/// A cache miss on a `scan = true` pull-through repository enqueues one scan
+/// A cache miss on a scanning pull-through repository enqueues one scan
 /// job for the image it stores; the hit that follows enqueues nothing more.
 #[tokio::test]
 async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository() {
@@ -262,7 +207,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
         "mirror",
         &RepositoryConfig {
             upstream: vec![test_client_config(upstream.uri())],
-            scan: true,
+            scan: Some(RepositoryScanConfig::default()),
             ..Default::default()
         },
         &angos_cache::Config::Memory.to_backend().unwrap(),
@@ -305,7 +250,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
     );
 }
 
-/// A push into a `scan = true` repository enqueues one scan job for an image
+/// A push into a scanning repository enqueues one scan job for an image
 /// manifest and none for a report, while a repository without the flag
 /// enqueues nothing.
 #[tokio::test]
@@ -323,7 +268,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
         ClaimMode::Atomic,
     ));
     let mut repository = repository_with_replication("apps", Vec::new());
-    repository.scan = true;
+    repository.scan = Some(ScanPolicy { refresh: None });
     // The seeded digests carry links but no bytes; the push under test is
     // about enqueueing, not reference validation.
     let registry = Registry::new(
@@ -383,7 +328,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
     assert_eq!(
         job_store.count_pending(Queue::Scan, 0).await.unwrap(),
         1,
-        "a repository without scan = true enqueues nothing"
+        "a repository without a scan table enqueues nothing"
     );
 }
 
@@ -400,35 +345,19 @@ async fn a_forced_scan_job_scans_a_reported_image_again() {
         .expect(2)
         .mount(&scanner)
         .await;
-    let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
-        "scan-test",
-        ClaimMode::Atomic,
-    ));
-    let resolver = single_repo_resolver("apps", repository_with_replication("apps", Vec::new()));
-    let registry = Registry::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        resolver,
-        RegistryConfig::new(job_store),
+    let handler = handler_for(
+        &stack,
+        repository_with_replication("apps", Vec::new()),
+        &scanner,
+        None,
     );
-    let handler = ScanJobHandler::new(
-        registry,
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        &ScanConfig {
-            url: scanner.uri(),
-            token: None,
-            timeout_secs: 5,
-        },
-    )
-    .unwrap();
     handler
         .execute(
             &build_envelope(&ScanImagePayload {
                 namespace: namespace.clone(),
                 digest: image.clone(),
                 force: false,
+                reported_before: None,
             })
             .unwrap(),
         )
@@ -440,6 +369,7 @@ async fn a_forced_scan_job_scans_a_reported_image_again() {
                 namespace: namespace.clone(),
                 digest: image.clone(),
                 force: true,
+                reported_before: None,
             })
             .unwrap(),
         )
@@ -447,7 +377,13 @@ async fn a_forced_scan_job_scans_a_reported_image_again() {
         .unwrap();
     // The forced report carries a later `created` annotation, so it is a
     // distinct manifest and a second referrer.
-    assert_eq!(sarif_referrers(&stack, &namespace, &image).await.len(), 2);
+    assert_eq!(
+        scan_reports(&stack.metadata_store, &namespace, &image)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 /// Trivy tags each rule with its severity and states it in the message;
@@ -495,4 +431,138 @@ fn summary_reads_grype_messages_then_scores() {
 #[test]
 fn summary_of_a_non_sarif_body_is_empty() {
     assert_eq!(ScanSummary::of(b"not json"), ScanSummary::default());
+}
+
+/// A handler over `scanner`, presenting `token`, for the repository
+/// `repository` resolves `apps/...` to.
+fn handler_for(
+    stack: &FsTestStack,
+    repository: Repository,
+    scanner: &MockServer,
+    token: Option<Secret<String>>,
+) -> ScanJobHandler {
+    let job_store = Arc::new(JobStore::new(
+        stack.store.clone(),
+        "scan-test",
+        ClaimMode::Atomic,
+    ));
+    let registry = Registry::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        single_repo_resolver("apps", repository),
+        RegistryConfig::new(job_store),
+    );
+    ScanJobHandler::new(
+        registry,
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        &ScanConfig {
+            url: scanner.uri(),
+            token,
+            timeout_secs: 5,
+            refresh: None,
+        },
+    )
+    .unwrap()
+}
+
+fn payload(namespace: &Namespace, digest: &Digest) -> ScanImagePayload {
+    ScanImagePayload {
+        namespace: namespace.clone(),
+        digest: digest.clone(),
+        force: false,
+        reported_before: None,
+    }
+}
+
+/// A run's `reported_before` makes the job a no-op only when a report
+/// newer than it exists; a report older than the cutoff is the stale one the
+/// run saw, and is scanned over.
+#[tokio::test]
+async fn reported_before_skips_only_when_a_newer_report_exists() {
+    let stack = fs_test_stack();
+    let namespace = Namespace::new("apps/web").unwrap();
+    let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let scanner = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(SARIF))
+        .expect(2)
+        .mount(&scanner)
+        .await;
+    let handler = handler_for(
+        &stack,
+        repository_with_replication("apps", Vec::new()),
+        &scanner,
+        None,
+    );
+
+    handler
+        .execute(&build_envelope(&payload(&namespace, &image)).unwrap())
+        .await
+        .unwrap();
+    let attached_at = Utc::now();
+
+    // Judged before the report landed: the push it came from already scanned.
+    handler
+        .execute(
+            &build_envelope(&ScanImagePayload {
+                reported_before: Some(attached_at - TimeDelta::hours(1)),
+                ..payload(&namespace, &image)
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_reports(&stack.metadata_store, &namespace, &image)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Judged after it: the report is the stale one, so it is scanned again.
+    handler
+        .execute(
+            &build_envelope(&ScanImagePayload {
+                reported_before: Some(Utc::now()),
+                ..payload(&namespace, &image)
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_reports(&stack.metadata_store, &namespace, &image)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// A repository's rules replace the global ones, and no rule anywhere means
+/// the repository never refreshes.
+#[test]
+fn refresh_tables_merge() {
+    let global: RefreshConfig =
+        toml::from_str(r#"rules = ["image.scanned_at < now() - days(30)"]"#).unwrap();
+    let none: RefreshConfig = toml::from_str("").unwrap();
+    assert!(none.rules.is_empty());
+
+    let own_rules: RefreshConfig =
+        toml::from_str(r#"rules = ["image.scanned_at < now() - days(7)"]"#).unwrap();
+    assert!(
+        refresh_rules(Some(&global), Some(&own_rules)).is_some(),
+        "a repository's rules replace the global ones"
+    );
+    assert!(
+        refresh_rules(Some(&global), None).is_some(),
+        "the global rules apply to a repository without its own"
+    );
+    assert!(
+        refresh_rules(Some(&none), None).is_none(),
+        "no rules anywhere never refreshes"
+    );
+    assert!(refresh_rules(None, None).is_none());
 }

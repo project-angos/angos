@@ -348,7 +348,7 @@ key_prefix = "angos"
 
 ## Scheduled Storage Maintenance (CronJob)
 
-Run periodic maintenance to verify storage integrity. For retention enforcement, add a second CronJob with `args: ["-c", "/config/config.toml", "prune"]`; see [Configure Retention Policies](configure-retention-policies.md). The kustomize base ships both, prune at :15 and scrub at :45, so the scrub reclaims what the prune just unreferenced.
+Run periodic maintenance to verify storage integrity. For retention enforcement, add a second CronJob with `args: ["-c", "/config/config.toml", "prune"]`; see [Configure Retention Policies](configure-retention-policies.md). The kustomize base ships both, prune at :15 and scrub at :45, so the scrub reclaims what the prune just unreferenced. The `reconcile-replication`, `reconcile-scan` and `reconcile-index` components add a daily run of each `reconcile` pass, to include once the configuration they act on exists; see the [kustomize README](https://github.com/project-angos/angos/tree/main/contrib/kubernetes/kustomize).
 
 **Important:** With S3 storage, the scrub job only needs the config volume, no data storage volume is required.
 

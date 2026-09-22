@@ -6,7 +6,7 @@ title: "CEL Expressions"
 
 # CEL Expressions Reference
 
-Angos uses [CEL (Common Expression Language)](https://cel.dev/) for access control policies and retention policies. This reference documents all available variables and functions.
+Angos uses [CEL (Common Expression Language)](https://cel.dev/) for access control policies, retention policies and report refresh rules. This reference documents all available variables and functions.
 
 ---
 
@@ -126,6 +126,8 @@ Optional `request` fields are **omitted** when unset (only `request.action` is a
 
 ## Retention Policy Variables
 
+Report refresh rules (`scan.refresh.rules`) share these variables and the retention functions below.
+
 ### Image (`image`)
 
 Information about the manifest being evaluated.
@@ -135,6 +137,7 @@ Information about the manifest being evaluated.
 | `image.tag`            | string/null | Tag name, or null if untagged      |
 | `image.pushed_at`      | int         | Push time (seconds since epoch)    |
 | `image.last_pulled_at` | int         | Last pull time (0 if never pulled) |
+| `image.scanned_at`     | int         | Time of the newest scan report; set for refresh rules, which see only reported images, and always 0 under retention |
 
 ---
 
@@ -166,7 +169,7 @@ It is false for a namespace no `[repository]` declares and for a repository decl
 
 Rankings are per namespace and contain tag names only: an untagged image has `image.tag == null` and never matches `top_pushed` or `top_pulled`. A ranking lists the tags carrying the time it orders by, so a tag nobody ever pulled never matches `top_pulled(n)` however few tags the namespace holds, and a tag whose push time is unknown never matches `top_pushed(n)`.
 
-`top_pulled` and `image.last_pulled_at` require `update_pull_time = true`; `angos prune` refuses to start otherwise, since pull times would never be recorded.
+`top_pulled` and `image.last_pulled_at` require `update_pull_time = true`; `angos prune` refuses to start otherwise, and refresh rules using them fail validation, since pull times would never be recorded.
 
 ### String Functions (CEL built-in)
 
@@ -236,6 +239,22 @@ top_pushed(10)
 
 // Keep 5 most recently pulled
 top_pulled(5)
+```
+
+### Report Refresh
+
+An image is scanned again when any rule is true; a rule states how old its newest report may get.
+
+```cel
+// Refresh monthly
+image.scanned_at < now() - days(30)
+
+// Refresh weekly what is still pulled
+image.scanned_at < now() - days(7) && image.last_pulled_at > now() - days(30)
+
+// Refresh weekly the tags deployments name, monthly the rest
+image.scanned_at < now() - days(7) && (image.tag == 'latest' || top_pulled(20))
+  || image.scanned_at < now() - days(30)
 ```
 
 ---
@@ -324,3 +343,6 @@ rules = [
 - A rule that returns a non-boolean value or fails to evaluate causes the manifest to be retained and emits a `warn`-level log
 - Retention is fail-open by design: unexpected rule outcomes keep the manifest rather than deleting it
 - See [Configure Retention Policies, Misconfigured Rules](../how-to/configure-retention-policies.md#misconfigured-rules-and-fail-open-semantics) for details and log examples
+
+**Report refresh rules:**
+- A rule that returns a non-boolean value or fails to evaluate selects the image for a scan and emits a `warn`-level log: a broken rule costs a scan rather than hiding a due image

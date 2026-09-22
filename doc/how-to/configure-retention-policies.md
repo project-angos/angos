@@ -25,7 +25,7 @@ sequenceDiagram
 
     S->>M: Evaluate manifest
     M->>M: Check protection status
-    alt Index child OR Referrer of a live subject
+    alt Index child OR Referrer of a live subject, unless a superseded scan report
         M-->>S: KEEP (protected)
     else Not protected
         M->>R: Evaluate rules
@@ -39,9 +39,9 @@ sequenceDiagram
 
 **Protected manifests** are pinned by a parent and reclaimed with it rather than judged on their own:
 - Child manifests of a multi-platform index, while the index resolves
-- Referrers (signatures, SBOMs, scan reports) of a subject, while the subject resolves
+- Referrers (signatures, SBOMs, scan reports) of a subject, while the subject resolves, except a scan report a newer angos report has superseded
 
-An image is judged by the rules whatever refers to it. Once it is deleted, its referrers have no subject left and are judged as untagged content in the same run.
+An image is judged by the rules whatever refers to it. Once it is deleted, its referrers have no subject left and are judged as untagged content in the same run. A scan report angos attached that a newer one has superseded is judged as untagged content while its image lives, so a [report refresh](scan-images.md#step-7-refresh-reports-on-a-schedule) leaves as much report history as the rules keep.
 
 **Retention subjects** are tagged manifests, untagged (orphan) manifests, and grant-only blobs. A grant-only blob is one a namespace uploaded whose manifest never landed (a lost replication race, a dead-lettered push, or an abandoned client); it is evaluated like any untagged content, with no tag and `pushed_at` set to the upload time, once it is past prune's `-u` in-flight window. A time-based rule such as `image.pushed_at > now() - days(7)` therefore also bounds how long stranded uploads linger. With no policies configured, untagged manifests and grant-only blobs are both retained.
 

@@ -56,6 +56,21 @@ update_pull_time = false
 #    'image.pushed_at > now() - days(90)'
 #]
 
+# Optional: Index the filesystem of every image as it lands, so the web UI browses
+# it at once; a repository does the same for itself with [repository."<name>".index]
+# (see doc/how-to/explore-image-filesystems.md)
+#[global.index]
+
+# Optional: Scanner service each repository with a `scan` table sends its images to,
+# and the rules under which `angos reconcile scan` refreshes their reports
+# (see doc/how-to/scan-images.md)
+#[global.scan]
+#url = "http://scanner.internal:8766"
+#token = "scan-service-secret"
+#
+#[global.scan.refresh]
+#rules = ['image.scanned_at < now() - days(30)']   # an image is scanned again when a rule is true
+
 [blob_store.fs]
 root_dir = "./data-angos"
 
@@ -179,6 +194,12 @@ password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w" # te
 # friends need no path prefix. Unset, `?ns=` selects nothing and the local prefix
 # alone decides. Pulls only: a write naming it keeps the namespace it spelled out.
 #namespace = "docker.io"
+
+# Optional: Scan each image stored here (needs [global.scan]), and refresh the
+# reports of its pulled tags weekly, in place of the [global.scan.refresh] rules.
+#[repository."nginx".scan]
+#[repository."nginx".scan.refresh]
+#rules = ['image.scanned_at < now() - days(7) && top_pulled(20)']
 
 [repository."nginx".access_policy]
 default = "allow"

@@ -38,7 +38,7 @@ Before applying a cross-key repair, scrub confirms the inconsistency is settled 
 | Invalid names | Deletes upload directories whose namespace violates the OCI grammar (nothing can address them) |
 | Corrupt content | Deletes job records and access entries whose content does not parse |
 | Orphan blobs | Reclaims blobs with no live references, past a grace period and fenced by a `v2/gc/` run marker at apply time |
-| Filesystem listings | Reclaims the listings of layers no `index = true` repository uses, as `reconcile index` does; an image opened outside those repositories indexes again |
+| Filesystem listings | Reclaims the listings of layers no repository with an `index` table uses, as `reconcile index` does; an image opened outside those repositories indexes again |
 | Orphan jobs | Deletes queued jobs, pending or dead-lettered, whose downstream or repository is no longer configured; `reconcile` re-issues the work if the configuration returns |
 | Unrecognized keys | Moves them to `_lost_and_found/` in the same store, preserving their bytes. This covers every retired shape, including the pre-1.7 link files and the transaction engine's `.tx-*` keys |
 

@@ -179,7 +179,7 @@ pub async fn build_registry(
     .map_err(Error::from)?;
     let max_manifest_size_bytes = config.global.max_manifest_size_bytes();
     let repositories =
-        bootstrap::repositories(&config.repository, auth_cache, max_manifest_size_bytes).await?;
+        bootstrap::repositories(&config.repository, auth_cache, &config.global).await?;
 
     let event_dispatcher = EventDispatcher::from_config(&config.event_webhook)?;
 

@@ -1,17 +1,18 @@
 //! Vulnerability scanning. A push of an image manifest into a repository with
-//! `scan = true` enqueues one [`SCAN_IMAGE_KIND`] job; [`ScanJobHandler`] asks
+//! a `scan` table enqueues one [`SCAN_IMAGE_KIND`] job; [`ScanJobHandler`] asks
 //! the external scanner service for a SARIF report and pushes it back as a
 //! referrer of the image through the registry's own write path, so the report
-//! is linked, announced and replicated like any client push.
+//! is linked, announced and replicated like any client push, and
+//! `angos reconcile scan` refreshes the reports the refresh rules find due.
 
-use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
+use std::{cmp::Reverse, collections::HashMap, io::Cursor, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use angos_oci::request::{PutManifestRequest, StartUploadRequest, StartUploadTarget};
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, Reference};
@@ -21,6 +22,9 @@ use crate::{
     jobs::{
         Queue,
         store::{Error, JobEnvelope, JobHandler},
+    },
+    policy::{
+        CelRule, ManifestImage, RetentionPolicy, RetentionPolicyConfig, RuleOutcome, SystemClock,
     },
     registry::{
         Error as RegistryError, Registry,
@@ -37,13 +41,16 @@ const EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const EMPTY_CONFIG_BODY: &[u8] = b"{}";
 /// Internal-process name stamped on the events a report push emits.
 const SCAN_ACTOR: &str = "scan";
+/// Prefix of the annotations a report angos wrote carries.
+const SCAN_ANNOTATION_PREFIX: &str = "io.angos.scan.";
+const CREATED_ANNOTATION: &str = "org.opencontainers.image.created";
 
 fn default_timeout_secs() -> u64 {
     600
 }
 
-/// The `[global.scan]` section: the scanner service every `scan = true`
-/// repository's pushes are sent to.
+/// The `[global.scan]` section: the scanner service every scanning
+/// repository's pushes are sent to, and how their reports are refreshed.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScanConfig {
     /// Base URL of the scanner service; the handler posts to its `/scan`.
@@ -53,6 +60,77 @@ pub struct ScanConfig {
     /// Bound on one scan request, pull and analysis included.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// When and under which rules reports are refreshed.
+    #[serde(default)]
+    pub refresh: Option<RefreshConfig>,
+}
+
+/// A `[global.scan.refresh]` or `[repository."<name>".scan.refresh]` table:
+/// the rules under which `angos reconcile scan` scans an image again. A
+/// repository's table replaces the global one.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RefreshConfig {
+    /// CEL rules over the retention variables and `image.scanned_at`, the
+    /// time of an image's newest report; the image is scanned again when any
+    /// is true.
+    #[serde(default)]
+    pub rules: Vec<CelRule>,
+}
+
+/// A `[repository."<name>".scan]` table: the repository sends its images to
+/// the scanner, and refreshes their reports under `refresh`'s rules.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RepositoryScanConfig {
+    #[serde(default)]
+    pub refresh: Option<RefreshConfig>,
+}
+
+/// What a repository's `scan` table resolves to: its images are scanned, and
+/// their reports refreshed under `refresh` when a table lists rules.
+pub struct ScanPolicy {
+    pub refresh: Option<RetentionPolicy>,
+}
+
+/// The refresh rules a repository resolves to: its own, else the global
+/// ones. `None` when neither table lists a rule, so the repository never
+/// refreshes a report.
+pub fn refresh_rules(
+    global: Option<&RefreshConfig>,
+    repository: Option<&RefreshConfig>,
+) -> Option<RetentionPolicy> {
+    let rules = repository
+        .map(|c| &c.rules)
+        .filter(|rules| !rules.is_empty())
+        .or_else(|| global.map(|c| &c.rules).filter(|rules| !rules.is_empty()))?;
+    Some(RetentionPolicy::new(
+        &RetentionPolicyConfig {
+            rules: rules.clone(),
+        },
+        Arc::new(SystemClock),
+    ))
+}
+
+/// Whether `rules` find `image` due for a scan. A rule that cannot be
+/// evaluated selects too: a broken rule costs a scan rather than hiding a
+/// stale image.
+pub fn refresh_due(
+    rules: &RetentionPolicy,
+    image: &ManifestImage,
+    last_pushed: &[String],
+    last_pulled: &[String],
+) -> bool {
+    match rules.evaluate(image, last_pushed, last_pulled) {
+        Ok(RuleOutcome::Matched(_)) => true,
+        Ok(RuleOutcome::NoMatch) => false,
+        Ok(RuleOutcome::Indeterminate { index, message }) => {
+            warn!("Refresh rule {index} is indeterminate: {message}; scanning");
+            true
+        }
+        Err(e) => {
+            warn!("Refresh rules could not be evaluated: {e}; scanning");
+            true
+        }
+    }
 }
 
 /// JSON payload of a [`SCAN_IMAGE_KIND`] job, and the body posted to the
@@ -64,6 +142,11 @@ pub struct ScanImagePayload {
     /// Scan again even when a report already hangs off the image.
     #[serde(default)]
     pub force: bool,
+    /// When `reconcile scan` judged the image: a report created after this
+    /// makes the scan redundant, so a push between the run and the job's
+    /// execution scans once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_before: Option<DateTime<Utc>>,
 }
 
 /// A scan job keyed on `scan.{namespace}:{digest}`, so pending scans of one
@@ -85,35 +168,79 @@ pub fn is_scan_subject(manifest: &Manifest) -> bool {
         && matches!(manifest.content, Content::Image { .. })
 }
 
-/// Whether a SARIF referrer already hangs off `digest`, which makes a re-run
-/// of a scan a no-op rather than a second report.
-pub async fn already_reported(
+/// Fan-out for the referrer record reads listing an image's reports.
+const REFERRER_READ_CONCURRENCY: usize = 16;
+
+/// A report angos attached to an image: the SARIF referrer and the time its
+/// `created` annotation states.
+#[derive(Debug)]
+pub struct ScanReport {
+    pub digest: Digest,
+    pub created: Option<DateTime<Utc>>,
+}
+
+/// The reports angos attached to `digest`, newest first. A SARIF referrer
+/// without an `io.angos.scan.*` annotation was written by someone else and
+/// is not one; every report but the first is superseded, and retention
+/// judges it like any untagged manifest.
+pub async fn scan_reports(
     metadata_store: &MetadataStore,
     namespace: &Namespace,
     digest: &Digest,
-) -> Result<bool, RegistryError> {
-    let referrers: Vec<Digest> = metadata_store
+) -> Result<Vec<ScanReport>, RegistryError> {
+    let mut reports: Vec<ScanReport> = metadata_store
         .stream_referrer_digests(namespace, digest)
+        .map_ok(|referrer| async move {
+            let link = LinkKind::Referrer {
+                subject: digest.clone(),
+                referrer: referrer.clone(),
+            };
+            let descriptor = match metadata_store.read_link(namespace, &link).await {
+                Ok(metadata) => metadata.descriptor,
+                Err(RegistryError::NotFound) => None,
+                Err(e) => return Err(e),
+            };
+            Ok(descriptor
+                .filter(is_angos_report)
+                .map(|descriptor| ScanReport {
+                    digest: referrer,
+                    created: descriptor
+                        .annotations
+                        .get(CREATED_ANNOTATION)
+                        .and_then(|created| DateTime::parse_from_rfc3339(created).ok())
+                        .map(|created| created.with_timezone(&Utc)),
+                }))
+        })
+        .try_buffered(REFERRER_READ_CONCURRENCY)
+        .try_filter_map(|report| async move { Ok(report) })
         .try_collect()
         .await?;
-    for referrer in referrers {
-        let link = LinkKind::Referrer {
-            subject: digest.clone(),
-            referrer,
-        };
-        let reported = match metadata_store.read_link(namespace, &link).await {
-            Ok(metadata) => metadata
-                .descriptor
-                .and_then(|descriptor| descriptor.artifact_type)
-                .is_some_and(|artifact_type| artifact_type.as_ref() == SARIF_MEDIA_TYPE),
-            Err(RegistryError::NotFound) => false,
-            Err(e) => return Err(e),
-        };
-        if reported {
-            return Ok(true);
-        }
+    reports.sort_by_key(|report| Reverse(report.created));
+    Ok(reports)
+}
+
+/// Whether a referrer's descriptor is a report angos wrote.
+pub fn is_angos_report(descriptor: &Descriptor) -> bool {
+    descriptor
+        .artifact_type
+        .as_ref()
+        .is_some_and(|artifact_type| artifact_type.as_ref() == SARIF_MEDIA_TYPE)
+        && descriptor
+            .annotations
+            .keys()
+            .any(|key| key.starts_with(SCAN_ANNOTATION_PREFIX))
+}
+
+/// Whether a report makes a scan redundant: any report when no cutoff was
+/// set, else one created after the cutoff, since the run already judged
+/// the ones before it stale.
+fn reported_since(reports: &[ScanReport], cutoff: Option<DateTime<Utc>>) -> bool {
+    match cutoff {
+        None => !reports.is_empty(),
+        Some(cutoff) => reports
+            .iter()
+            .any(|report| report.created.is_some_and(|created| created > cutoff)),
     }
-    Ok(false)
 }
 
 /// Severity counts of a SARIF report, written as annotations of the report
@@ -291,7 +418,13 @@ impl ScanJobHandler {
         })
     }
 
-    async fn scan(&self, namespace: &Namespace, digest: &Digest, force: bool) -> Result<(), Error> {
+    async fn scan(&self, payload: &ScanImagePayload) -> Result<(), Error> {
+        let ScanImagePayload {
+            namespace,
+            digest,
+            force,
+            reported_before,
+        } = payload;
         // Gone before the job ran, or not an image after all: nothing to do,
         // and a retry would find the same.
         let Some(manifest) = read_manifest(&self.blob_store, digest)
@@ -304,11 +437,10 @@ impl ScanJobHandler {
         if !is_scan_subject(&manifest) {
             return Ok(());
         }
-        if !force
-            && already_reported(&self.metadata_store, namespace, digest)
-                .await
-                .map_err(|e| job_error(&e))?
-        {
+        let reports = scan_reports(&self.metadata_store, namespace, digest)
+            .await
+            .map_err(|e| job_error(&e))?;
+        if !force && reported_since(&reports, *reported_before) {
             debug!("Scan of {namespace}@{digest} skipped: already reported");
             return Ok(());
         }
@@ -393,10 +525,7 @@ impl ScanJobHandler {
             annotations: ScanSummary::of(report)
                 .annotations()
                 .into_iter()
-                .chain([(
-                    "org.opencontainers.image.created".to_string(),
-                    Utc::now().to_rfc3339(),
-                )])
+                .chain([(CREATED_ANNOTATION.to_string(), Utc::now().to_rfc3339())])
                 .collect(),
             artifact_type: Some(sarif.clone()),
             content: Content::Image {
@@ -476,8 +605,7 @@ impl JobHandler for ScanJobHandler {
         }
         let payload: ScanImagePayload = serde_json::from_value(envelope.payload.clone())
             .map_err(|e| Error::Execution(format!("failed to deserialize job payload: {e}")))?;
-        self.scan(&payload.namespace, &payload.digest, payload.force)
-            .await
+        self.scan(&payload).await
     }
 }
 
