@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.11.0 - Unreleased
+
+### Changed
+
+- **Breaking:** the `scan` and `index` tables are policies shaped like access policies, at both levels: `default` (`scan` or `skip`, `index` or `skip`) decides an image no rule matches and CEL `rules` over the image decide the opposite, judged as the image lands and again by `reconcile scan` and `reconcile index`; `[global.scan]` carries the scan policy beside the service settings, a repository table replaces the global one, and a table sets at least one of the two keys, so an empty table no longer opts in.
+- **Breaking:** `scan.refresh` is gone; `image.scanned_at < now() - days(30)` among the scan `rules` refreshes reports the same way, and scans a new image as it lands since it was never scanned.
+
+### Fixed
+
+- A buildx attestation manifest, an index child whose layers are in-toto statements, no longer enqueues a scan job that every scanner rejects and dead-letters.
+
 ## 1.10.0
 
 ### Added

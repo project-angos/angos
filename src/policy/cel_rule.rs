@@ -151,7 +151,7 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use crate::policy::cel_rule::{CelRule, RuleOutcome, evaluate_rules};
-    use crate::policy::{AccessPolicyConfig, RetentionPolicyConfig};
+    use crate::policy::{AccessMode, PolicyConfig, RetentionPolicyConfig};
 
     /// A value-carrying execution error must not copy the evaluated operand
     /// into the message, or a client controls what the registry logs.
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn invalid_access_policy_cel_rule_fails_at_deserialize() {
         let toml = r#"rules = ["this is (((( not valid"]"#;
-        let result: Result<AccessPolicyConfig, _> = toml::from_str(toml);
+        let result: Result<PolicyConfig<AccessMode>, _> = toml::from_str(toml);
         assert!(
             result.is_err(),
             "invalid CEL rule must fail at deserialization"
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn valid_access_policy_cel_rule_deserializes() {
         let toml = r#"rules = ["identity.username == 'admin'"]"#;
-        let result: Result<AccessPolicyConfig, _> = toml::from_str(toml);
+        let result: Result<PolicyConfig<AccessMode>, _> = toml::from_str(toml);
         assert!(
             result.is_ok(),
             "valid CEL rule must deserialize successfully"
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn empty_access_policy_cel_rule_fails_at_deserialize() {
-        assert_empty_rule_fails_at_deserialize::<AccessPolicyConfig>();
+        assert_empty_rule_fails_at_deserialize::<PolicyConfig<AccessMode>>();
     }
 
     #[test]

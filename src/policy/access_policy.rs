@@ -9,7 +9,9 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::identity::{Action, ClientIdentity};
-use crate::policy::{CelRule, Error, PolicyDecision, PolicyError, RuleOutcome, evaluate_rules};
+use crate::policy::{
+    CelRule, Error, PolicyConfig, PolicyDecision, PolicyError, RuleOutcome, evaluate_rules,
+};
 
 /// Whether an access policy defaults to allowing or denying requests.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -20,17 +22,6 @@ pub enum AccessMode {
     Deny,
     /// Access is granted unless a rule explicitly denies it.
     Allow,
-}
-
-/// Configuration for access control policies.
-///
-/// A missing `default` denies by default; an unknown key is ignored and a
-/// duplicate key is rejected (both serde defaults).
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct AccessPolicyConfig {
-    pub default: AccessMode,
-    pub rules: Vec<CelRule>,
 }
 
 impl From<AccessMode> for PolicyDecision {
@@ -52,10 +43,11 @@ pub struct AccessPolicy {
 }
 
 impl AccessPolicy {
-    /// Rules are already compiled, so this constructor is infallible.
-    pub fn new(config: AccessPolicyConfig) -> Self {
+    /// Rules are already compiled, so this constructor is infallible; a
+    /// missing `default` denies.
+    pub fn new(config: PolicyConfig<AccessMode>) -> Self {
         Self {
-            default: config.default,
+            default: config.default.unwrap_or(AccessMode::Deny),
             rules: config.rules,
         }
     }
@@ -151,8 +143,8 @@ mod tests {
 
     #[test]
     fn test_access_policy_allow_mode_no_rules() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![],
         });
         let action = Action::ApiVersion;
@@ -163,8 +155,8 @@ mod tests {
 
     #[test]
     fn test_access_policy_deny_mode_no_rules() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![],
         });
         let action = Action::ApiVersion;
@@ -175,8 +167,8 @@ mod tests {
 
     #[test]
     fn test_access_policy_allow_mode_with_deny_rule() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![rule("identity.username == 'forbidden'")],
         });
 
@@ -198,8 +190,8 @@ mod tests {
 
     #[test]
     fn test_access_policy_deny_mode_with_allow_rule() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![rule("identity.username == 'admin'")],
         });
 
@@ -249,8 +241,8 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        let replicator_only = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let replicator_only = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![
                 rule("identity.username != null && request.action == 'start-upload'"),
                 rule("identity.id == 'replicator' && request.action == 'mount-blob'"),
@@ -268,8 +260,8 @@ mod tests {
             false
         )));
 
-        let deny_non_replicator = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let deny_non_replicator = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![rule(
                 "request.action == 'mount-blob' && identity.id != 'replicator'",
             )],
@@ -321,8 +313,8 @@ mod tests {
 
         // The `has()` guard keeps the rule from raising the fail-closed "no
         // such key" error on a from-less mount.
-        let only_from_trusted = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let only_from_trusted = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![rule(
                 "request.action == 'mount-blob' && has(request.from) && request.from == 'team/base'",
             )],
@@ -341,8 +333,8 @@ mod tests {
             &only_from_trusted.evaluate(&no_from, &client, false)
         ));
 
-        let deny_untrusted_source = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let deny_untrusted_source = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![rule(
                 "request.action == 'mount-blob' && has(request.from) && request.from == 'other/evil'",
             )],
@@ -364,25 +356,29 @@ mod tests {
 
     #[test]
     fn test_access_policy_default_toml_allow() {
-        let config: AccessPolicyConfig = toml::from_str("default = \"allow\"").unwrap();
-        assert_eq!(config.default, AccessMode::Allow);
+        let config: PolicyConfig<AccessMode> = toml::from_str("default = \"allow\"").unwrap();
+        assert_eq!(config.default, Some(AccessMode::Allow));
     }
 
     #[test]
     fn test_access_policy_default_toml_deny() {
-        let config: AccessPolicyConfig = toml::from_str("default = \"deny\"").unwrap();
-        assert_eq!(config.default, AccessMode::Deny);
+        let config: PolicyConfig<AccessMode> = toml::from_str("default = \"deny\"").unwrap();
+        assert_eq!(config.default, Some(AccessMode::Deny));
     }
 
     #[test]
     fn test_access_policy_default_toml_missing_is_deny() {
-        let config: AccessPolicyConfig = toml::from_str("").unwrap();
-        assert_eq!(config.default, AccessMode::Deny);
+        let config: PolicyConfig<AccessMode> = toml::from_str("").unwrap();
+        assert_eq!(config.default, None, "denies once built");
+        assert!(matches!(
+            AccessPolicy::new(config).default,
+            AccessMode::Deny
+        ));
     }
 
     #[test]
     fn test_access_policy_default_toml_unknown_value_fails() {
-        let result: Result<AccessPolicyConfig, _> = toml::from_str("default = \"maybe\"");
+        let result: Result<PolicyConfig<AccessMode>, _> = toml::from_str("default = \"maybe\"");
         assert!(result.is_err());
     }
 
@@ -390,8 +386,8 @@ mod tests {
 
     #[test]
     fn non_boolean_rule_in_allow_mode_denies_fail_closed() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![rule("42")],
         });
         let action = Action::ApiVersion;
@@ -405,8 +401,8 @@ mod tests {
 
     #[test]
     fn non_boolean_rule_in_deny_mode_denies_fail_closed() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![rule("42")],
         });
         let action = Action::ApiVersion;
@@ -420,8 +416,8 @@ mod tests {
 
     #[test]
     fn non_boolean_rule_in_deny_mode_short_circuits_subsequent_allow_rules() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![rule("42"), rule("true")],
         });
         let action = Action::ApiVersion;
@@ -437,8 +433,8 @@ mod tests {
     fn failed_rule_in_allow_mode_is_indeterminate_and_denies() {
         // Allow mode: a runtime evaluation error in a DENY rule now produces
         // Indeterminate instead of silently falling through to allow.
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![rule("nonexistent_var")],
         });
         let action = Action::ApiVersion;
@@ -452,8 +448,8 @@ mod tests {
 
     #[test]
     fn failed_rule_in_allow_mode_indeterminate_carries_rule_index() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![rule("false"), rule("nonexistent_var")],
         });
         let action = Action::ApiVersion;
@@ -469,8 +465,8 @@ mod tests {
     fn failed_rule_in_deny_mode_is_indeterminate() {
         // Deny mode: an evaluation error in an ALLOW rule produces Indeterminate
         // (which callers treat as deny, i.e. fail-closed).
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![rule("nonexistent_var")],
         });
         let action = Action::ApiVersion;
@@ -486,8 +482,8 @@ mod tests {
 
     #[test]
     fn multi_rule_allow_mode_first_match_denies_second_rule_unreached() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![
                 rule("true"),  // rule 1: always triggers → Deny
                 rule("false"), // rule 2: unreachable
@@ -501,8 +497,8 @@ mod tests {
 
     #[test]
     fn multi_rule_deny_mode_first_match_allows_second_rule_unreached() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![
                 rule("true"),  // rule 1: always triggers → Allow
                 rule("false"), // rule 2: unreachable
@@ -516,16 +512,16 @@ mod tests {
 
     #[test]
     fn multi_rule_no_match_falls_through_to_default() {
-        let policy_allow = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Allow,
+        let policy_allow = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Allow),
             rules: vec![rule("false"), rule("false")],
         });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
         assert!(is_allow(&policy_allow.evaluate(&action, &identity, false)));
 
-        let policy_deny = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy_deny = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![rule("false"), rule("false")],
         });
         assert!(is_deny(&policy_deny.evaluate(&action, &identity, false)));
@@ -536,8 +532,8 @@ mod tests {
     /// every such policy would silently never fire.
     #[test]
     fn reference_is_a_string_in_the_policy_context() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![rule("request.reference == 'latest'")],
         });
         let action = Action::GetManifest {
@@ -556,8 +552,8 @@ mod tests {
     /// its own rules, and keeps deciding for every namespace that has none.
     #[test]
     fn has_repository_policy_defers_to_a_declaring_repository() {
-        let policy = AccessPolicy::new(AccessPolicyConfig {
-            default: AccessMode::Deny,
+        let policy = AccessPolicy::new(PolicyConfig {
+            default: Some(AccessMode::Deny),
             rules: vec![rule("has_repository_policy()")],
         });
         let action = Action::StartUpload {

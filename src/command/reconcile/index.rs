@@ -1,7 +1,7 @@
 //! `angos reconcile index`: enqueues an index job for every tar layer of an
-//! image in a repository with an `index` table that has no listing yet, or for
-//! every layer with `--force`, and reclaims the listings of every other
-//! layer. The running server or a worker drains the jobs. Any image indexes
+//! image its repository's index policy applies to that has no listing yet,
+//! or for every such layer with `--force`, and reclaims the listings of every
+//! other layer. The running server or a worker drains the jobs. Any image indexes
 //! itself the first time its filesystem is opened, so this is for having the
 //! listings ready ahead of that, for walking layers again after a change to
 //! what a listing holds, and for dropping what on-demand opens left behind
@@ -28,6 +28,7 @@ use crate::{
             action::Action,
             check::{self, NamespaceChecker},
             executor::{ActionSink, DryRunSink, Executor, run_job_store},
+            tags::Rankings,
             walk::for_each_key,
         },
     },
@@ -57,11 +58,11 @@ pub struct Options {
     pub force: bool,
 }
 
-/// Enqueues one index job per unlisted tar layer of the images of an
-/// repository with an `index` table; `force` drops the listing check, `enqueue`
-/// off only collects. A layer shared by several images is enqueued once per
-/// run, and `seen` ends up holding every layer those repositories use, the
-/// ones whose listing is kept.
+/// Enqueues one index job per unlisted tar layer of the images an index
+/// policy applies to; `force` drops the listing check, `enqueue` off only
+/// collects. A layer shared by several images is enqueued once per run, and
+/// `seen` ends up holding every layer those images use, the ones whose
+/// listing is kept.
 pub struct IndexChecker {
     pub blob_store: Arc<BlobStore>,
     pub metadata_store: Arc<MetadataStore>,
@@ -74,15 +75,37 @@ pub struct IndexChecker {
 #[async_trait]
 impl NamespaceChecker for IndexChecker {
     async fn check(&self, namespace: &Namespace, sink: &dyn ActionSink) -> Result<(), Error> {
-        if !self.resolver.resolve(namespace).is_some_and(|r| r.index) {
+        let Some(policy) = self
+            .resolver
+            .resolve(namespace)
+            .and_then(|repository| repository.index.as_ref())
+        else {
             return Ok(());
-        }
+        };
+        // Only the rules read the tags, so a policy without any skips them.
+        let rankings = if policy.has_rules() {
+            Some(Rankings::read(&self.metadata_store, namespace).await?)
+        } else {
+            None
+        };
+        let empty = Rankings {
+            tags: Vec::new(),
+            last_pushed: Vec::new(),
+            last_pulled: Vec::new(),
+        };
+        let rankings = rankings.as_ref().unwrap_or(&empty);
         let mut revisions = pin!(self.metadata_store.stream_revisions(namespace));
         while let Some(digest) = revisions.next().await {
             let digest = digest?;
             let Some(manifest) = read_manifest(&self.blob_store, &digest).await? else {
                 continue;
             };
+            if !rankings
+                .applies(policy, &self.metadata_store, namespace, &digest, 0)
+                .await?
+            {
+                continue;
+            }
             for layer in filesystem_layers(&manifest) {
                 let first = self
                     .seen
@@ -140,7 +163,7 @@ async fn reclaim_listings(
 }
 
 /// Walks every namespace with `checker`, then reclaims the listings of the
-/// layers it did not see in a repository with an `index` table.
+/// layers it did not see under an image an index policy applies to.
 async fn check_and_reclaim(
     checker: IndexChecker,
     metadata_store: &Arc<MetadataStore>,
@@ -154,8 +177,8 @@ async fn check_and_reclaim(
     reclaim_listings(metadata_store, &kept, sink).await
 }
 
-/// Reclaims the listings no repository with an `index` table uses, enqueueing
-/// nothing: what `angos scrub` runs after its walk.
+/// Reclaims the listings no image an index policy applies to uses,
+/// enqueueing nothing: what `angos scrub` runs after its walk.
 pub async fn reclaim_unused_listings(
     blob_store: Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
@@ -213,6 +236,8 @@ mod tests {
     use super::{IndexChecker, reclaim_listings};
     use crate::{
         command::maintenance::{action::Action, check::NamespaceChecker},
+        layer::IndexAction,
+        policy::{ImagePolicy, PolicyConfig},
         registry::{
             keys::DigestKeys,
             metadata_store::LinkKind,
@@ -253,9 +278,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let checker = |force: bool, index: bool| {
+        let checker = |force: bool, indexes: bool| {
             let mut repository = repository_with_replication("apps", Vec::new());
-            repository.index = index;
+            repository.index = indexes.then(|| {
+                ImagePolicy::new(&PolicyConfig {
+                    default: Some(IndexAction::Index),
+                    rules: Vec::new(),
+                })
+            });
             IndexChecker {
                 blob_store: stack.blob_store.clone(),
                 metadata_store: stack.metadata_store.clone(),
@@ -275,7 +305,7 @@ mod tests {
             .check(&namespace, &sink)
             .await
             .unwrap();
-        assert!(enqueued(&sink).is_empty(), "no index table, no job");
+        assert!(enqueued(&sink).is_empty(), "no index policy, no job");
 
         // Listed: only a forced run walks it again. The seeded layer holds no
         // tar, so the listing is written by hand.

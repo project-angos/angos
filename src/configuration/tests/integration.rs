@@ -165,7 +165,7 @@ fn test_repository_config() {
         Some("secret")
     );
     let access_policy = repo.access_policy.as_ref().unwrap();
-    assert_eq!(access_policy.default, AccessMode::Allow);
+    assert_eq!(access_policy.default, Some(AccessMode::Allow));
     assert_eq!(access_policy.rules.len(), 1);
     assert_eq!(repo.retention_policy.rules.len(), 1);
     assert!(repo.immutable_tags);

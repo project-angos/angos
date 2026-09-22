@@ -18,6 +18,7 @@ use crate::{
     jobs::Queue,
     layer,
     metrics_provider::metrics_provider,
+    policy::ImagePolicy,
     registry::{
         Error, Registry, Repository,
         blob_store::BlobStore,
@@ -736,10 +737,14 @@ impl Registry {
         // client push behave alike; a refresh to the same digest changes
         // nothing and so dispatches nothing.
         if changed {
-            if scan::is_scan_subject(&manifest) && repository.is_some_and(|r| r.scan.is_some()) {
+            let applies = |policy: Option<&ImagePolicy>| {
+                policy.is_some_and(|policy| policy.applies_at_push(&written_tags))
+            };
+            if scan::is_scan_subject(&manifest) && applies(repository.and_then(|r| r.scan.as_ref()))
+            {
                 self.dispatch_scan(namespace, &computed_digest).await;
             }
-            if repository.is_some_and(|r| r.index) {
+            if applies(repository.and_then(|r| r.index.as_ref())) {
                 for layer in layer::filesystem_layers(&manifest) {
                     self.dispatch_index(namespace, &layer).await;
                 }

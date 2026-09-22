@@ -6,7 +6,7 @@ title: "CEL Expressions"
 
 # CEL Expressions Reference
 
-Angos uses [CEL (Common Expression Language)](https://cel.dev/) for access control policies, retention policies and report refresh rules. This reference documents all available variables and functions.
+Angos uses [CEL (Common Expression Language)](https://cel.dev/) for access control policies, retention policies, and the scan and index policies. This reference documents all available variables and functions.
 
 ---
 
@@ -126,7 +126,7 @@ Optional `request` fields are **omitted** when unset (only `request.action` is a
 
 ## Retention Policy Variables
 
-Report refresh rules (`scan.refresh.rules`) share these variables and the retention functions below.
+The scan and index policies (`scan.rules`, `index.rules`) share these variables and the retention functions below. Judged as an image lands, `image.pushed_at` is now, `image.last_pulled_at` and `image.scanned_at` are 0, `image.tag` is each pushed tag in turn or null, and the pushed tags are the whole `top_pushed` ranking; `reconcile scan` and `reconcile index` judge the image again with its stored values.
 
 ### Image (`image`)
 
@@ -137,7 +137,7 @@ Information about the manifest being evaluated.
 | `image.tag`            | string/null | Tag name, or null if untagged      |
 | `image.pushed_at`      | int         | Push time (seconds since epoch)    |
 | `image.last_pulled_at` | int         | Last pull time (0 if never pulled) |
-| `image.scanned_at`     | int         | Time of the newest scan report; set for refresh rules, which see only reported images, and always 0 under retention |
+| `image.scanned_at`     | int         | Time of the newest scan report (0 if never scanned); set for the scan and index policies, always 0 under retention |
 
 ---
 
@@ -169,7 +169,7 @@ It is false for a namespace no `[repository]` declares and for a repository decl
 
 Rankings are per namespace and contain tag names only: an untagged image has `image.tag == null` and never matches `top_pushed` or `top_pulled`. A ranking lists the tags carrying the time it orders by, so a tag nobody ever pulled never matches `top_pulled(n)` however few tags the namespace holds, and a tag whose push time is unknown never matches `top_pushed(n)`.
 
-`top_pulled` and `image.last_pulled_at` require `update_pull_time = true`; `angos prune` refuses to start otherwise, and refresh rules using them fail validation, since pull times would never be recorded.
+`top_pulled` and `image.last_pulled_at` require `update_pull_time = true`; `angos prune` refuses to start otherwise, and a scan or index policy using them fails validation, since pull times would never be recorded.
 
 ### String Functions (CEL built-in)
 
@@ -241,20 +241,22 @@ top_pushed(10)
 top_pulled(5)
 ```
 
-### Report Refresh
+### Scan and Index Policies
 
-An image is scanned again when any rule is true; a rule states how old its newest report may get.
+A matching rule gives the image the opposite of the table's `default`, which is `skip` unless set.
 
 ```cel
-// Refresh monthly
+// No default: scan every image as it lands, and again monthly
 image.scanned_at < now() - days(30)
 
-// Refresh weekly what is still pulled
+// No default: refresh weekly the reports of what is still pulled
 image.scanned_at < now() - days(7) && image.last_pulled_at > now() - days(30)
 
-// Refresh weekly the tags deployments name, monthly the rest
-image.scanned_at < now() - days(7) && (image.tag == 'latest' || top_pulled(20))
-  || image.scanned_at < now() - days(30)
+// No default: index the tags people open as they land, the rest on first open
+image.tag == 'latest' || top_pulled(20)
+
+// default = "scan": skip nightly builds
+image.tag == 'nightly'
 ```
 
 ---
@@ -344,5 +346,5 @@ rules = [
 - Retention is fail-open by design: unexpected rule outcomes keep the manifest rather than deleting it
 - See [Configure Retention Policies, Misconfigured Rules](../how-to/configure-retention-policies.md#misconfigured-rules-and-fail-open-semantics) for details and log examples
 
-**Report refresh rules:**
-- A rule that returns a non-boolean value or fails to evaluate selects the image for a scan and emits a `warn`-level log: a broken rule costs a scan rather than hiding a due image
+**Scan and index policy rules:**
+- A rule that returns a non-boolean value or fails to evaluate applies the policy to the image, a scan or an index job, and emits a `warn`-level log: a broken rule costs work rather than hiding a finding

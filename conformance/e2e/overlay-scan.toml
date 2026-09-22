@@ -17,6 +17,7 @@ default = "allow"
 rules = ["image.tag != null"]
 
 [repository."scan".scan]
+default = "scan"
 
 [scanner]
 bind_address = "127.0.0.1"

@@ -19,9 +19,11 @@ use crate::{
         Queue,
         store::{ClaimMode, JobStore},
     },
+    layer::IndexAction,
     layer::{
         Checkpoints, IndexLayerJobHandler, Kind, classify, extract_gzip, index_stream, read_listing,
     },
+    policy::{ImagePolicy, PolicyConfig},
     registry::{
         Registry, RegistryConfig, Repository,
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -319,7 +321,7 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
     assert!(file("nope").await.is_err());
 }
 
-/// A push into a repository with an `index` table enqueues one job per tar layer,
+/// A push an index policy applies to enqueues one job per tar layer,
 /// none for the config or a zstd layer, and none at all without the flag.
 #[tokio::test]
 async fn a_push_enqueues_an_index_job_per_tar_layer_of_an_indexing_repository() {
@@ -336,7 +338,10 @@ async fn a_push_enqueues_an_index_job_per_tar_layer_of_an_indexing_repository() 
         ClaimMode::Atomic,
     ));
     let mut repository = repository_with_replication("apps", Vec::new());
-    repository.index = true;
+    repository.index = Some(ImagePolicy::new(&PolicyConfig {
+        default: Some(IndexAction::Index),
+        rules: Vec::new(),
+    }));
     let registry = Registry::new(
         stack.blob_store.clone(),
         stack.metadata_store.clone(),

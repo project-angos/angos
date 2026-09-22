@@ -630,7 +630,7 @@ pub fn repository_with_replication(
         immutable_tags: false,
         immutable_tags_exclusions: Vec::new(),
         scan: None,
-        index: false,
+        index: None,
     }
 }
 

@@ -1,10 +1,10 @@
 ---
 # Report refresh, daily at 04:00, away from the hourly prune and scrub slots.
-# It enqueues a scan for every image without a report, and for every image
-# whose newest report the [global.scan.refresh] or repository scan.refresh
-# rules find due; the server or a worker drains the jobs. Include this
-# component once [global.scan] is configured. A run that finds nothing due
-# enqueues nothing, so a daily schedule costs one read per image.
+# It enqueues a scan for every image the [global.scan] or repository scan
+# policy applies to, judged with the time of its newest report; the server or
+# a worker drains the jobs. Include this component once [global.scan] is
+# configured. A run that finds nothing due enqueues nothing, so a daily
+# schedule costs one read per image.
 apiVersion: batch/v1
 kind: CronJob
 metadata:

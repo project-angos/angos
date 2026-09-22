@@ -48,7 +48,10 @@ immutable_tags = true
 immutable_tags_exclusions = ["^latest$", "^edge$"]
 
 [repository."library".scan]
+default = "scan"
+
 [repository."library".index]
+default = "index"
 
 # ORAS artifacts, for the Files view.
 [repository."artifacts"]

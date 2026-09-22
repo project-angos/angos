@@ -56,20 +56,20 @@ update_pull_time = false
 #    'image.pushed_at > now() - days(90)'
 #]
 
-# Optional: Index the filesystem of every image as it lands, so the web UI browses
-# it at once; a repository does the same for itself with [repository."<name>".index]
-# (see doc/how-to/explore-image-filesystems.md)
+# Optional: Index the filesystem of images as they land, so the web UI browses them
+# at once. A policy shaped like an access policy: `default` for an image no rule
+# matches, the opposite for a match; a repository replaces it with its own
+# [repository."<name>".index] (see doc/how-to/explore-image-filesystems.md)
 #[global.index]
+#default = "index"
 
-# Optional: Scanner service each repository with a `scan` table sends its images to,
-# and the rules under which `angos reconcile scan` refreshes their reports
+# Optional: Scanner service scanning repositories send their images to, with the
+# policy deciding which images are scanned and when their reports are refreshed
 # (see doc/how-to/scan-images.md)
 #[global.scan]
 #url = "http://scanner.internal:8766"
 #token = "scan-service-secret"
-#
-#[global.scan.refresh]
-#rules = ['image.scanned_at < now() - days(30)']   # an image is scanned again when a rule is true
+#rules = ['image.scanned_at < now() - days(30)']   # no default: a match scans, so new images and stale reports
 
 [blob_store.fs]
 root_dir = "./data-angos"
@@ -195,10 +195,9 @@ password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w" # te
 # alone decides. Pulls only: a write naming it keeps the namespace it spelled out.
 #namespace = "docker.io"
 
-# Optional: Scan each image stored here (needs [global.scan]), and refresh the
-# reports of its pulled tags weekly, in place of the [global.scan.refresh] rules.
+# Optional: Scan the pulled tags stored here and refresh their reports weekly,
+# in place of the [global.scan] policy (needs [global.scan]).
 #[repository."nginx".scan]
-#[repository."nginx".scan.refresh]
 #rules = ['image.scanned_at < now() - days(7) && top_pulled(20)']
 
 [repository."nginx".access_policy]

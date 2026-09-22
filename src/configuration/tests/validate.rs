@@ -313,39 +313,33 @@ fn scan_error(extra: &str) -> String {
 }
 
 #[test]
-fn scan_tables_parse_at_both_levels() {
+fn scan_and_index_policies_parse_at_both_levels() {
     let config = load_config(
         r#"
     [global.scan]
     url = "http://scanner:8766"
-
-    [global.scan.refresh]
     rules = ["image.scanned_at < now() - days(30)"]
 
-    [repository."apps".scan.refresh]
-    rules = ["image.scanned_at < now() - days(7)"]
+    [global.index]
+    default = "index"
 
-    [repository."web".scan]
+    [repository."apps".scan]
+    default = "scan"
+
+    [repository."apps".index]
+    rules = ["image.tag == 'latest'"]
     "#,
     );
-    let refresh = config
-        .global
-        .scan
-        .as_ref()
-        .unwrap()
-        .refresh
-        .as_ref()
-        .unwrap();
-    assert_eq!(refresh.rules.len(), 1);
+    let scan = &config.global.scan.as_ref().unwrap().policy;
     assert_eq!(
-        config.repository["apps"].refresh().map(|r| r.rules.len()),
-        Some(1)
+        scan.default, None,
+        "a service table without a default skips"
     );
-    let web = config.repository["web"].scan.as_ref().unwrap();
-    assert!(
-        web.refresh.is_none(),
-        "an empty scan table opts in without refresh rules"
-    );
+    assert_eq!(scan.rules.len(), 1);
+    assert!(config.global.index.as_ref().unwrap().is_set());
+    let apps = &config.repository["apps"];
+    assert!(apps.scan.as_ref().unwrap().default.is_some());
+    assert_eq!(apps.index.as_ref().unwrap().rules.len(), 1);
 }
 
 #[test]
@@ -353,6 +347,7 @@ fn a_repository_scan_table_requires_the_scanner() {
     let config = config_toml(
         r#"
     [repository."apps".scan]
+    default = "scan"
     "#,
     );
     match Configuration::load_from_str(&config) {
@@ -369,42 +364,42 @@ fn a_repository_scan_table_requires_the_scanner() {
 }
 
 #[test]
-fn a_repository_refresh_table_lists_at_least_one_rule() {
+fn a_scan_or_index_table_decides_something() {
     let msg = scan_error(
         r#"
-    [repository."apps".scan.refresh]
-    rules = []
+    [repository."apps".scan]
     "#,
     );
     assert!(
-        msg.contains(r#"repository."apps".scan.refresh.rules must list at least one rule"#),
+        msg.contains(r#"repository."apps".scan sets neither default nor rules"#),
         "{msg}"
     );
-}
-
-#[test]
-fn refresh_rules_reading_pull_times_require_update_pull_time() {
     let msg = scan_error(
-        r#"
-    [global.scan.refresh]
-    rules = ["image.last_pulled_at > now() - days(7)"]
-    "#,
-    );
-    assert!(
-        msg.contains("global.scan.refresh.rules use last_pulled_at or top_pulled"),
-        "{msg}"
-    );
-}
-
-#[test]
-fn a_global_index_table_parses() {
-    let config = load_config(
-        r#"
+        r"
     [global.index]
+    ",
+    );
+    assert!(
+        msg.contains("global.index sets neither default nor rules"),
+        "{msg}"
+    );
+}
 
+#[test]
+fn policy_rules_reading_pull_times_require_update_pull_time() {
+    let msg = scan_error(r#"rules = ["image.last_pulled_at > now() - days(7)"]"#);
+    assert!(
+        msg.contains("global.scan.rules use last_pulled_at or top_pulled"),
+        "{msg}"
+    );
+    let msg = scan_error(
+        r#"
     [repository."apps".index]
+    rules = ["top_pulled(5)"]
     "#,
     );
-    assert!(config.global.index.is_some());
-    assert!(config.repository["apps"].index.is_some());
+    assert!(
+        msg.contains(r#"repository."apps".index.rules use last_pulled_at or top_pulled"#),
+        "{msg}"
+    );
 }

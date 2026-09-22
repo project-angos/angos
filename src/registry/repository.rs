@@ -17,11 +17,13 @@ use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient};
 
 use crate::{
     configuration::RegexPattern,
-    layer::IndexConfig,
-    policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
+    layer::IndexAction,
+    policy::{
+        AccessMode, ImagePolicy, PolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock,
+    },
     registry::Error,
     replication::{ReplicationDownstream, ReplicationDownstreamConfig},
-    scan::{RefreshConfig, RepositoryScanConfig, ScanPolicy, refresh_rules},
+    scan::ScanAction,
 };
 
 /// Fallback per-manifest blob-push concurrency when a downstream omits
@@ -209,7 +211,7 @@ pub struct Config {
     pub upstream: Vec<RegistryClientConfig>,
     #[serde(default)]
     pub downstream: Vec<ReplicationDownstreamConfig>,
-    pub access_policy: Option<AccessPolicyConfig>,
+    pub access_policy: Option<PolicyConfig<AccessMode>>,
     #[serde(default)]
     pub retention_policy: RetentionPolicyConfig,
     #[serde(default)]
@@ -219,13 +221,12 @@ pub struct Config {
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
-    /// Present, each image manifest pushed here is sent to the scanner
-    /// service, and its reports are refreshed under the table's rules.
-    pub scan: Option<RepositoryScanConfig>,
-    /// Present, the filesystem of each image manifest pushed here is indexed
-    /// as it lands, rather than the first time someone browses it; a
-    /// `[global.index]` table does the same for every repository.
-    pub index: Option<IndexConfig>,
+    /// Which of the images pushed here are sent to the scanner service, and
+    /// when their reports are refreshed; in place of `[global.scan]`'s policy.
+    pub scan: Option<PolicyConfig<ScanAction>>,
+    /// Which of the images pushed here have their filesystem indexed as they
+    /// land rather than when first browsed; in place of `[global.index]`.
+    pub index: Option<PolicyConfig<IndexAction>>,
 }
 
 impl Config {
@@ -237,12 +238,6 @@ impl Config {
         self.authorization_webhook
             .as_deref()
             .filter(|name| !name.is_empty())
-    }
-
-    /// The repository's own report refresh table, when its `scan` table has
-    /// one.
-    pub fn refresh(&self) -> Option<&RefreshConfig> {
-        self.scan.as_ref()?.refresh.as_ref()
     }
 }
 
@@ -256,10 +251,12 @@ pub struct Repository {
     pub retention_policy: RetentionPolicy,
     pub immutable_tags: bool,
     pub immutable_tags_exclusions: Vec<RegexPattern>,
-    /// Present, the repository's images are scanned, and their reports
-    /// refreshed under the rules it carries.
-    pub scan: Option<ScanPolicy>,
-    pub index: bool,
+    /// Which images are scanned, and when their reports are refreshed;
+    /// `None` scans nothing.
+    pub scan: Option<ImagePolicy>,
+    /// Which images have their filesystem indexed as they land; `None`
+    /// indexes on demand only.
+    pub index: Option<ImagePolicy>,
 }
 
 impl Repository {
@@ -324,10 +321,8 @@ impl Repository {
             retention_policy,
             immutable_tags: config.immutable_tags,
             immutable_tags_exclusions: config.immutable_tags_exclusions.clone(),
-            scan: config.scan.as_ref().map(|_| ScanPolicy {
-                refresh: refresh_rules(None, config.refresh()),
-            }),
-            index: config.index.is_some(),
+            scan: config.scan.as_ref().map(ImagePolicy::new),
+            index: config.index.as_ref().map(ImagePolicy::new),
         })
     }
 

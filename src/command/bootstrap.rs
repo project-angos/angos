@@ -12,6 +12,7 @@ use crate::{
     configuration::{Configuration, GlobalConfig, ResolvedStorageConfig},
     event_webhook::{self, dispatcher::EventDispatcher},
     jobs::store::{self as job_store, JobStore},
+    policy::ImagePolicy,
     registry::{
         self, Registry, RegistryConfig, Repository,
         blob_store::BlobStore,
@@ -19,7 +20,6 @@ use crate::{
         prime_pull_through, repository,
         repository_resolver::{OverlapError, RepositoryResolver},
     },
-    scan::refresh_rules,
 };
 
 /// Errors produced by the shared CLI bootstrap helpers.
@@ -151,16 +151,19 @@ pub fn registry(
     Ok(registry)
 }
 
-/// `global` supplies the manifest size bound, the `[global.scan.refresh]`
-/// table a repository without refresh rules of its own falls back to, and the
-/// `[global.index]` table that indexes every repository.
+/// `global` supplies the manifest size bound and the scan and index policies
+/// a repository without tables of its own follows.
 pub async fn repositories(
     configs: &HashMap<String, repository::Config>,
     auth_cache: &Arc<Cache>,
     global: &GlobalConfig,
 ) -> Result<Arc<RepositoryResolver>, Error> {
     let max_manifest_size_bytes = global.max_manifest_size_bytes();
-    let refresh = global.scan.as_ref().and_then(|scan| scan.refresh.as_ref());
+    let global_scan = global
+        .scan
+        .as_ref()
+        .filter(|scan| scan.policy.is_set())
+        .map(|scan| &scan.policy);
     let mut map = HashMap::with_capacity(configs.len());
     for (name, config) in configs {
         let mut repository = Repository::new(name, config, auth_cache, max_manifest_size_bytes)
@@ -169,10 +172,12 @@ pub async fn repositories(
                 name: name.clone(),
                 source: Box::new(source),
             })?;
-        if let Some(scan) = &mut repository.scan {
-            scan.refresh = refresh_rules(refresh, config.refresh());
+        if repository.scan.is_none() {
+            repository.scan = global_scan.map(ImagePolicy::new);
         }
-        repository.index |= global.index.is_some();
+        if repository.index.is_none() {
+            repository.index = global.index.as_ref().map(ImagePolicy::new);
+        }
         map.insert(name.clone(), repository);
     }
     for repository in map
@@ -196,10 +201,10 @@ mod tests {
         command::maintenance::Error as MaintenanceError,
         command::server::Error as ServerError,
         configuration::GlobalConfig,
-        layer::IndexConfig,
+        layer::IndexAction,
         metrics_provider::metrics_provider,
-        policy::{AccessMode, AccessPolicyConfig},
-        registry::{self, repository},
+        policy::{AccessMode, PolicyConfig},
+        registry::{self, repository, repository_resolver::RepositoryResolver},
         test_fixtures::client::test_client_config,
     };
 
@@ -240,9 +245,9 @@ mod tests {
     #[tokio::test]
     async fn repository_with_default_config_succeeds() {
         let repo_config = repository::Config {
-            access_policy: Some(AccessPolicyConfig {
-                default: AccessMode::Allow,
-                ..AccessPolicyConfig::default()
+            access_policy: Some(PolicyConfig {
+                default: Some(AccessMode::Allow),
+                ..PolicyConfig::default()
             }),
             ..repository::Config::default()
         };
@@ -253,33 +258,43 @@ mod tests {
         assert!(result.unwrap().get("test-repo").is_some());
     }
 
-    /// `[global.index]` indexes every repository, its own table or not.
+    /// `[global.index]` is the policy of every repository without an `index`
+    /// table of its own, which keeps its own.
     #[tokio::test]
-    async fn a_global_index_table_indexes_every_repository() {
+    async fn the_global_index_policy_covers_repositories_without_their_own() {
+        let policy = |default| PolicyConfig {
+            default: Some(default),
+            rules: Vec::new(),
+        };
         let configs = HashMap::from([
             ("plain".to_string(), repository::Config::default()),
             (
-                "indexed".to_string(),
+                "own".to_string(),
                 repository::Config {
-                    index: Some(IndexConfig {}),
+                    index: Some(policy(IndexAction::Skip)),
                     ..repository::Config::default()
                 },
             ),
         ]);
         let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let global = GlobalConfig {
-            index: Some(IndexConfig {}),
+            index: Some(policy(IndexAction::Index)),
             ..GlobalConfig::default()
         };
+        let indexes = |resolver: &RepositoryResolver, name: &str| {
+            resolver
+                .get(name)
+                .and_then(|r| r.index.as_ref())
+                .is_some_and(|policy| policy.applies_at_push(&[]))
+        };
         let resolver = repositories(&configs, &cache, &global).await.unwrap();
-        assert!(resolver.get("plain").is_some_and(|r| r.index));
-        assert!(resolver.get("indexed").is_some_and(|r| r.index));
+        assert!(indexes(&resolver, "plain"), "the global policy applies");
+        assert!(!indexes(&resolver, "own"), "a repository's own policy wins");
 
         let resolver = repositories(&configs, &cache, &GlobalConfig::default())
             .await
             .unwrap();
-        assert!(resolver.get("plain").is_some_and(|r| !r.index));
-        assert!(resolver.get("indexed").is_some_and(|r| r.index));
+        assert!(resolver.get("plain").is_some_and(|r| r.index.is_none()));
     }
 
     #[tokio::test]
@@ -297,9 +312,9 @@ mod tests {
         configs.insert(
             "team".to_string(),
             repository::Config {
-                access_policy: Some(AccessPolicyConfig {
-                    default: AccessMode::Allow,
-                    ..AccessPolicyConfig::default()
+                access_policy: Some(PolicyConfig {
+                    default: Some(AccessMode::Allow),
+                    ..PolicyConfig::default()
                 }),
                 ..repository::Config::default()
             },
@@ -307,9 +322,9 @@ mod tests {
         configs.insert(
             "team/app".to_string(),
             repository::Config {
-                access_policy: Some(AccessPolicyConfig {
-                    default: AccessMode::Allow,
-                    ..AccessPolicyConfig::default()
+                access_policy: Some(PolicyConfig {
+                    default: Some(AccessMode::Allow),
+                    ..PolicyConfig::default()
                 }),
                 ..repository::Config::default()
             },

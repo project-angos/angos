@@ -27,7 +27,7 @@ use crate::{
     event_webhook::{config::EventWebhookConfig, dispatcher::EventDispatcher, event::Event},
     identity::{Action, ClientIdentity, RequestScheme},
     metrics_provider,
-    policy::AccessPolicyConfig,
+    policy::{AccessMode, PolicyConfig},
     registry::{
         Error as RegistryError, Registry, RegistryConfig, Repository,
         metadata_store::{MetadataStore, Settings},
@@ -38,7 +38,7 @@ use crate::{
 };
 #[derive(Default)]
 pub struct TestConfigOptions<'a> {
-    pub access_policy: Option<AccessPolicyConfig>,
+    pub access_policy: Option<PolicyConfig<AccessMode>>,
     pub webhooks: Vec<TestWebhook<'a>>,
 }
 
