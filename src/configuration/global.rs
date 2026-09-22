@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use bytesize::ByteSize;
 use serde::Deserialize;
@@ -7,7 +7,9 @@ use crate::{
     configuration::{RegexPattern, TrustedProxy},
     jobs::store::JobQueueConfig,
     policy::{AccessMode, PolicyConfig, RetentionPolicyConfig},
-    registry::metadata_store::{DEFAULT_ATIME_AUDIT_WINDOW_SECS, DEFAULT_GC_GRACE_SECS},
+    registry::metadata_store::{
+        AtimeRetention, DEFAULT_ATIME_AUDIT_HISTORY_LIMIT, DEFAULT_GC_GRACE_SECS,
+    },
     registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY},
 };
 use crate::{layer::IndexAction, scan::ScanConfig};
@@ -103,11 +105,22 @@ pub struct GlobalConfig {
     /// maintenance against a store with no live traffic.
     #[serde(default = "default_gc_grace_secs")]
     pub gc_grace_secs: u64,
-    /// How long superseded access entries are retained as pull history, in
-    /// seconds. Raising it grows the number of keys under `!atime/` in
-    /// proportion to pull volume.
-    #[serde(default = "default_atime_audit_window_secs")]
-    pub atime_audit_window_secs: u64,
+    /// Age in seconds past which scrub packs a superseded access entry into a
+    /// compacted chunk. With neither this nor `atime_audit_max_entries` set,
+    /// it defaults to one hour.
+    #[serde(default)]
+    pub atime_audit_window_secs: Option<u64>,
+    /// Live access entries kept per target before scrub packs the older ones
+    /// into a compacted chunk.
+    #[serde(default)]
+    pub atime_audit_max_entries: Option<NonZeroU32>,
+    /// Pulls a target's history keeps and serves; scrub trims compacted pulls
+    /// past it.
+    #[serde(default = "default_atime_audit_history_limit")]
+    pub atime_audit_history_limit: NonZeroU32,
+    /// Age in seconds past which scrub drops compacted pulls.
+    #[serde(default)]
+    pub atime_audit_history_max_age_secs: Option<u64>,
     /// Proxy IPs or CIDR networks whose `X-Forwarded-For`/`X-Real-IP` headers
     /// are honored as the client IP. From any other peer those headers are
     /// ignored and the socket address is used, so clients cannot spoof IP-gated
@@ -132,8 +145,8 @@ fn default_gc_grace_secs() -> u64 {
     DEFAULT_GC_GRACE_SECS
 }
 
-fn default_atime_audit_window_secs() -> u64 {
-    DEFAULT_ATIME_AUDIT_WINDOW_SECS
+fn default_atime_audit_history_limit() -> NonZeroU32 {
+    DEFAULT_ATIME_AUDIT_HISTORY_LIMIT
 }
 
 fn default_max_concurrent_requests() -> NonZeroUsize {
@@ -208,7 +221,10 @@ impl Default for GlobalConfig {
             namespace_walk_concurrency: default_namespace_walk_concurrency(),
             listing_read_concurrency: default_listing_read_concurrency(),
             gc_grace_secs: default_gc_grace_secs(),
-            atime_audit_window_secs: default_atime_audit_window_secs(),
+            atime_audit_window_secs: None,
+            atime_audit_max_entries: None,
+            atime_audit_history_limit: default_atime_audit_history_limit(),
+            atime_audit_history_max_age_secs: None,
             trusted_proxies: Vec::new(),
         }
     }
@@ -226,15 +242,29 @@ impl GlobalConfig {
     pub fn blob_stream_frame_size_bytes(&self) -> usize {
         usize::try_from(self.blob_stream_frame_size.as_u64()).unwrap_or(usize::MAX)
     }
+
+    pub fn atime_retention(&self) -> AtimeRetention {
+        let (window_secs, max_entries) =
+            match (self.atime_audit_window_secs, self.atime_audit_max_entries) {
+                (None, None) => (AtimeRetention::default().window_secs, None),
+                gates => gates,
+            };
+        AtimeRetention {
+            window_secs,
+            max_entries,
+            history_limit: self.atime_audit_history_limit,
+            history_max_age_secs: self.atime_audit_history_max_age_secs,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU32, NonZeroUsize};
 
     use bytesize::ByteSize;
 
-    use crate::configuration::GlobalConfig;
+    use crate::{configuration::GlobalConfig, registry::metadata_store::AtimeRetention};
 
     #[test]
     fn default_values_match_configuration_defaults() {
@@ -256,11 +286,26 @@ mod tests {
             config.allow_missing_manifest_references,
             "manifest-reference validation is permissive by default"
         );
-        assert_eq!(config.atime_audit_window_secs, 3600);
+        assert_eq!(config.atime_retention(), AtimeRetention::default());
         assert!(config.authorization_webhook.is_none());
         assert!(
             config.trusted_proxies.is_empty(),
             "forwarded headers must be ignored by default"
+        );
+    }
+
+    /// A count gate alone replaces the default age gate rather than adding
+    /// to it.
+    #[test]
+    fn a_lone_max_entries_drops_the_default_window() {
+        let config = toml::from_str::<GlobalConfig>("atime_audit_max_entries = 50").unwrap();
+        assert_eq!(
+            config.atime_retention(),
+            AtimeRetention {
+                window_secs: None,
+                max_entries: NonZeroU32::new(50),
+                ..AtimeRetention::default()
+            }
         );
     }
 
@@ -278,6 +323,8 @@ mod tests {
             immutable_tags_exclusions = ["latest", "dev"]
             allow_missing_manifest_references = false
             atime_audit_window_secs = 86400
+            atime_audit_history_limit = 5000
+            atime_audit_history_max_age_secs = 31536000
             authorization_webhook = "my-webhook"
             trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]
             "#,
@@ -301,7 +348,15 @@ mod tests {
         assert!(config.update_pull_time);
         assert!(config.immutable_tags);
         assert!(!config.allow_missing_manifest_references);
-        assert_eq!(config.atime_audit_window_secs, 86400);
+        assert_eq!(
+            config.atime_retention(),
+            AtimeRetention {
+                window_secs: Some(86400),
+                max_entries: None,
+                history_limit: NonZeroU32::new(5000).unwrap(),
+                history_max_age_secs: Some(31_536_000),
+            }
+        );
         assert_eq!(config.immutable_tags_exclusions.len(), 2);
         assert_eq!(config.immutable_tags_exclusions[0].as_source(), "latest");
         assert_eq!(config.immutable_tags_exclusions[1].as_source(), "dev");

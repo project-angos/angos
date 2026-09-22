@@ -18,14 +18,11 @@
 
 	let { namespace, target, open = false }: Props = $props();
 
-	// The registry caps the listing; at exactly the cap, older pulls exist that
-	// the response does not carry.
-	const CAP = 100;
-
 	let expanded = $state(untrack(() => open));
 	let loading = $state(false);
 	let error: string | null = $state(null);
 	let history: PullHistoryBody | null = $state(null);
+	let loadingMore = $state(false);
 
 	// Listing a namespace renders one of these per manifest, so the request is
 	// held until it is asked for, rather than fanning out on load. The result
@@ -43,6 +40,18 @@
 		}
 	}
 
+	async function loadMore() {
+		if (!history?.next || loadingMore) return;
+		loadingMore = true;
+		const result = await fetchPullHistory(namespace, target, history.next);
+		loadingMore = false;
+		if (result.error || !result.data) {
+			error = result.error;
+		} else {
+			history = { ...result.data, entries: [...history.entries, ...result.data.entries] };
+		}
+	}
+
 	function toggle() {
 		expanded = !expanded;
 		if (expanded) load();
@@ -55,9 +64,11 @@
 
 	// The retention is only known once the registry has answered, so the label
 	// states it from the response rather than from a compiled-in assumption.
-	const title = $derived.by(() =>
-		history ? `Pull history (retained ${formatRetention(history.window_secs)})` : 'Pull history'
-	);
+	const title = $derived.by(() => {
+		if (!history) return 'Pull history';
+		const age = history.max_age_secs === undefined ? '' : `, up to ${formatRetention(history.max_age_secs)}`;
+		return `Pull history (last ${history.limit} pulls${age})`;
+	});
 </script>
 
 {#snippet toggleAction()}
@@ -94,31 +105,32 @@
 					{:else}
 						<tr>
 							<!-- Not "never pulled": recording is off unless the
-							     operator enables it, and only the newest entry
-							     outlives the window. -->
+							     operator enables it. -->
 							<td colspan="3" class="empty">
-								No pulls recorded in the retention window (last
-								{formatRetention(history.window_secs)}). Pull recording requires
+								No pulls recorded. Pull recording requires
 								<code>update_pull_time</code> to be enabled.
 							</td>
 						</tr>
 					{/each}
 				</tbody>
-				{#if history.entries.length >= CAP}
-					<tfoot>
-						<tr>
-							<td colspan="3">
-								Showing the newest {CAP} pulls; older ones are not listed.
-							</td>
-						</tr>
-					</tfoot>
-				{/if}
 			</table>
+			{#if history.next}
+				<div class="load-more">
+					<button class="secondary" onclick={loadMore} disabled={loadingMore}>Load more</button>
+				</div>
+			{/if}
 		{/if}
 	{/if}
 </Card>
 
 <style>
+	.load-more {
+		display: flex;
+		justify-content: center;
+		padding: 0.625rem;
+		border-top: 1px solid var(--border);
+	}
+
 	.method {
 		margin-right: 0.4rem;
 	}

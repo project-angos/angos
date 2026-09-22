@@ -410,24 +410,27 @@ default; with it disabled every target reports an empty list.
 ```json
 {
   "target": "1.25.0",
-  "window_secs": 3600,
+  "limit": 1000,
   "entries": [
     {
       "client": "alice",
       "at": "2026-01-02T08:30:00Z"
     }
-  ]
+  ],
+  "next": 100
 }
 ```
 
-`target` echoes the requested reference and `window_secs` reports the configured
-[`atime_audit_window_secs`](configuration.md#global-options-global) retention. Anonymous pulls are recorded as
+`target` echoes the requested reference; `limit` and `max_age_secs` report the configured
+[`atime_audit_history_limit` and `atime_audit_history_max_age_secs`](configuration.md#global-options-global),
+the latter omitted when unset. Anonymous pulls are recorded as
 `anonymous`. A target with no recorded pulls returns an empty `entries` list rather than `404`;
 the endpoint does not check that the target exists.
 
-At most 100 entries are returned and the endpoint does not paginate. Only the newest entry is
-retained indefinitely — scrub collects superseded entries once they age past `window_secs` — so
-this is a bounded audit window, not a complete pull history.
+The optional `n` (default 100) and `offset` (default 0) query parameters page through the
+history; `next` is the offset of the following page and is omitted on the last one. Live and
+compacted entries read as one timeline. Only the newest entry is retained indefinitely: scrub
+drops compacted pulls past `limit` or `max_age_secs`, so this is a bounded audit log.
 
 This endpoint is gated by the same `list-revisions` CEL action as
 [List Revisions](#list-revisions).

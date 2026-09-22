@@ -11,7 +11,7 @@
 //! interface's own vocabulary; these convert into the job engine's copies at
 //! the boundary.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, num::NonZeroU16};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -148,14 +148,23 @@ pub struct AccessEntry {
 #[derive(Serialize, Debug)]
 pub struct PullsBody {
     pub target: String,
-    pub window_secs: u64,
+    /// Pulls the history keeps at most.
+    pub limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_age_secs: Option<u64>,
     pub entries: Vec<AccessEntry>,
+    /// The offset of the next page, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<u32>,
 }
 
 #[derive(Debug)]
 pub struct ListPullsRequest {
     pub namespace: Namespace,
     pub reference: Reference,
+    /// Pulls to skip, newest first.
+    pub offset: u32,
+    pub n: Option<NonZeroU16>,
 }
 
 // ---- Layer filesystem index -----------------------------------------------

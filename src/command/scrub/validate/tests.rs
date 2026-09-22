@@ -1,5 +1,6 @@
 use std::{
     io::Cursor,
+    num::NonZeroU32,
     sync::{Arc, Mutex, atomic::Ordering},
 };
 
@@ -30,7 +31,7 @@ use crate::{
         Error as RegistryError,
         blob_store::BlobStore,
         keys::{DigestKeys, NamespaceKeys, REF_ROOT},
-        metadata_store::{AccessEntry, LinkKind, MetadataStore, Settings},
+        metadata_store::{AccessEntry, AtimeRetention, LinkKind, MetadataStore, Settings},
         test_utils::{
             RegistryTestCase, create_test_registry_with, for_each_backend, fs_test_stack,
             media_type, put_blob_direct, upload_blob,
@@ -1524,6 +1525,16 @@ async fn the_atime_collector_keeps_the_newest_and_prunes_old_superseded_entries(
             2,
             "the newest entry and the young superseded one stay; the one past the window goes"
         );
+        let (history, _) = metadata_store
+            .read_access_entries(&namespace, &tag_link, 0, 10)
+            .await
+            .unwrap();
+        let clients: Vec<&str> = history.iter().map(|entry| entry.client.as_str()).collect();
+        assert_eq!(
+            clients,
+            ["alice", "bob", "carol"],
+            "the entry past the window is packed, not lost"
+        );
         let rev_page = metadata_store
             .object_store()
             .list(&rev_dir, 10, None)
@@ -1586,6 +1597,208 @@ async fn an_undecodable_atime_entry_is_deleted() {
         assert_ne!(
             surviving, corrupt,
             "the corrupt entry must be the one deleted"
+        );
+    })
+    .await;
+}
+
+/// The metadata store over `test_case`'s objects with `retention`.
+fn with_retention(
+    test_case: &dyn RegistryTestCase,
+    retention: AtimeRetention,
+) -> Arc<MetadataStore> {
+    Arc::new(MetadataStore::new(
+        test_case.metadata_store().object_store().clone(),
+        Settings {
+            atime_retention: retention,
+            ..Settings::default()
+        },
+    ))
+}
+
+async fn scrub_with(test_case: &dyn RegistryTestCase, store: &Arc<MetadataStore>) {
+    let blob_store = test_case.blob_store();
+    let sink: Arc<dyn ActionSink> =
+        Arc::new(Executor::new_for_test(blob_store.clone(), store.clone()));
+    run_passes(&blob_store, store, sink).await;
+}
+
+/// A count gate alone packs everything past the newest `max_entries` into one
+/// chunk, and a leftover of a pack whose retire never landed is dropped rather
+/// than packed twice.
+#[tokio::test]
+async fn the_count_gate_packs_the_tail_into_one_chunk_once() {
+    for_each_backend(async |test_case| {
+        let namespace = Namespace::new("test-repo/atime-count").unwrap();
+        push_healthy_image(test_case, &namespace).await;
+        let tag_link = LinkKind::Tag(Tag::new("v1").unwrap());
+        let store = with_retention(
+            test_case,
+            AtimeRetention {
+                window_secs: None,
+                max_entries: NonZeroU32::new(2),
+                ..AtimeRetention::default()
+            },
+        );
+        let dir = namespace.atime_dir(&tag_link).unwrap();
+        let compacted = namespace.atime_compacted_dir(&tag_link).unwrap();
+        let now = Utc::now();
+        let pulls = ["alice", "bob", "carol", "dave", "erin"];
+        for (minutes, client) in (0..).zip(pulls) {
+            put_atime_entry(
+                &store,
+                &namespace,
+                &tag_link,
+                client,
+                now - Duration::minutes(minutes),
+            )
+            .await;
+        }
+
+        scrub_with(test_case, &store).await;
+        let live = store.object_store().list(&dir, 10, None).await.unwrap();
+        assert_eq!(live.items.len(), 2, "only the newest two entries stay live");
+        let chunks = store
+            .object_store()
+            .list(&compacted, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(chunks.items.len(), 1, "one run packs one chunk");
+
+        // A packed entry reappears, as if its retire had not landed.
+        put_atime_entry(
+            &store,
+            &namespace,
+            &tag_link,
+            "dave",
+            now - Duration::minutes(3),
+        )
+        .await;
+        scrub_with(test_case, &store).await;
+
+        let (history, more) = store
+            .read_access_entries(&namespace, &tag_link, 0, 10)
+            .await
+            .unwrap();
+        let clients: Vec<&str> = history.iter().map(|entry| entry.client.as_str()).collect();
+        assert_eq!(
+            clients, pulls,
+            "the history reads as one timeline, no duplicate"
+        );
+        assert!(!more);
+        let (page, more) = store
+            .read_access_entries(&namespace, &tag_link, 1, 2)
+            .await
+            .unwrap();
+        let clients: Vec<&str> = page.iter().map(|entry| entry.client.as_str()).collect();
+        assert_eq!(
+            clients,
+            ["bob", "carol"],
+            "a page spans live entries and chunks"
+        );
+        assert!(more);
+    })
+    .await;
+}
+
+/// Chunks past the history age or limit go, and a chunk straddling either
+/// keeps only its fitting entries.
+#[tokio::test]
+async fn chunks_are_trimmed_to_the_history_age_and_limit() {
+    for_each_backend(async |test_case| {
+        let namespace = Namespace::new("test-repo/atime-expiry").unwrap();
+        push_healthy_image(test_case, &namespace).await;
+        let tag_link = LinkKind::Tag(Tag::new("v1").unwrap());
+        let now = Utc::now();
+        let packing = with_retention(
+            test_case,
+            AtimeRetention {
+                window_secs: Some(0),
+                ..AtimeRetention::default()
+            },
+        );
+        // Three runs leave three chunks: 400, 40 and 4 days old.
+        for days in [400, 40, 4] {
+            put_atime_entry(
+                &packing,
+                &namespace,
+                &tag_link,
+                "old",
+                now - Duration::days(days),
+            )
+            .await;
+            put_atime_entry(
+                &packing,
+                &namespace,
+                &tag_link,
+                "new",
+                now - Duration::days(days - 1),
+            )
+            .await;
+            scrub_with(test_case, &packing).await;
+        }
+        let compacted = namespace.atime_compacted_dir(&tag_link).unwrap();
+        let chunks = packing
+            .object_store()
+            .list(&compacted, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(chunks.items.len(), 3);
+
+        let aged = with_retention(
+            test_case,
+            AtimeRetention {
+                window_secs: Some(0),
+                history_max_age_secs: Some(365 * 86400),
+                ..AtimeRetention::default()
+            },
+        );
+        scrub_with(test_case, &aged).await;
+        let chunks = aged
+            .object_store()
+            .list(&compacted, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(chunks.items.len(), 2, "the year-old chunk goes");
+        let clients = async |store: &Arc<MetadataStore>| {
+            let (history, _) = store
+                .read_access_entries(&namespace, &tag_link, 0, 10)
+                .await
+                .unwrap();
+            history
+                .into_iter()
+                .map(|entry| entry.client)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            clients(&aged).await,
+            ["new", "old", "new", "old"],
+            "the 40-day chunk sheds its 399-day pull"
+        );
+
+        let capped = with_retention(
+            test_case,
+            AtimeRetention {
+                window_secs: Some(0),
+                history_limit: NonZeroU32::new(2).unwrap(),
+                ..AtimeRetention::default()
+            },
+        );
+        scrub_with(test_case, &capped).await;
+        let chunks = capped
+            .object_store()
+            .list(&compacted, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            chunks.items.len(),
+            1,
+            "the live entry and the newest chunk fill the limit"
+        );
+        assert_eq!(
+            clients(&capped).await,
+            ["new", "old"],
+            "the newest chunk is cut to the limit"
         );
     })
     .await;

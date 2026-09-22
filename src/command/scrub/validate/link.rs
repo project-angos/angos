@@ -2,6 +2,7 @@
 //! `referenced_by` back-links, blob-index grant reconciliation, tag targets,
 //! referrer liveness, and the invalid-name gates.
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 
@@ -13,7 +14,7 @@ use crate::{
     command::{
         maintenance::{
             Error,
-            action::{Action, WalkedStore},
+            action::{Action, AtimeCompaction, WalkedStore},
         },
         scrub::validate::Validator,
     },
@@ -21,7 +22,7 @@ use crate::{
         Error as RegistryError,
         content_discovery::holds_manifest_content,
         manifest::referenced_digests,
-        metadata_store::{AccessEntry, LinkKind},
+        metadata_store::{AccessEntry, AtimeRetention, LIST_PAGE, LinkKind},
     },
 };
 
@@ -111,7 +112,7 @@ impl Validator {
         }
     }
 
-    /// One tag's access-entry directory, collected once per (namespace, tag).
+    /// One tag's access entries, compacted once per (namespace, tag).
     pub async fn collect_tag_atime_entries(
         &self,
         namespace_raw: &str,
@@ -120,12 +121,11 @@ impl Validator {
         let (Ok(namespace), Ok(tag)) = (Namespace::new(namespace_raw), Tag::new(tag_raw)) else {
             return Ok(());
         };
-        self.collect_atime_entries(&namespace.tag_atime_entry_dir(&tag))
+        self.collect_atime_entries(&namespace, &LinkKind::Tag(tag))
             .await
     }
 
-    /// One revision's access-entry directory, collected once per (namespace,
-    /// digest).
+    /// One revision's access entries, compacted once per (namespace, digest).
     pub async fn collect_revision_atime_entries(
         &self,
         namespace_raw: &str,
@@ -134,59 +134,198 @@ impl Validator {
         let Ok(namespace) = Namespace::new(namespace_raw) else {
             return Ok(());
         };
-        self.collect_atime_entries(&namespace.revision_atime_entry_dir(digest))
+        self.collect_atime_entries(&namespace, &LinkKind::Digest(digest.clone()))
             .await
     }
 
-    /// Collect one atime entry directory: the newest decodable entry always
-    /// stays, since retention needs the last access durably. An undecodable
-    /// body goes, and a superseded entry goes once past the audit window.
-    async fn collect_atime_entries(&self, dir: &str) -> Result<(), Error> {
+    /// Compact one target's access entries. The newest decodable entry always
+    /// stays, since retention needs the last access durably, and an
+    /// undecodable body goes. Every other entry past a gate is packed into one
+    /// new chunk, written before those entries retire; an entry past the
+    /// history bounds is deleted outright, and older chunks are trimmed to
+    /// them.
+    async fn collect_atime_entries(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+    ) -> Result<(), Error> {
+        let (Some(dir), Some(compacted)) = (
+            namespace.atime_dir(link),
+            namespace.atime_compacted_dir(link),
+        ) else {
+            return Ok(());
+        };
         if !self.claim(format!("atime-entries:{dir}")) {
             return Ok(());
         }
-        let window = i64::try_from(self.metadata_store.atime_audit_window_secs).unwrap_or(i64::MAX);
-        let mut kept_newest = false;
+        let AtimeRetention {
+            window_secs,
+            max_entries,
+            history_limit,
+            history_max_age_secs,
+        } = self.metadata_store.atime_retention;
+        let now = Utc::now();
+        let limit = usize::try_from(history_limit.get()).unwrap_or(usize::MAX);
+
+        let chunks = self.list_names(&compacted).await?;
+        // A chunk is named after its newest entry, and entries list newest
+        // first, so every entry at or past the newest chunk's name is already
+        // packed: a leftover of a run whose retires did not all land.
+        let packed_through = chunks.first().cloned();
+
+        let mut kept = 0_usize;
+        let mut chunk_name = None;
+        // Packing stops at the history limit, which bounds both.
+        let mut packed = Vec::new();
+        let mut packed_keys = Vec::new();
         let mut token = None;
         loop {
             let page = self
                 .metadata_store
                 .object_store()
-                .list(dir, 1000, token)
+                .list(&dir, LIST_PAGE, token)
                 .await
                 .map_err(RegistryError::from)?;
+            // Nothing the new chunk holds, so these go at once.
+            let mut dropped = Vec::new();
             for name in &page.items {
                 let Some(at) = parse_atime_entry(name) else {
                     continue;
                 };
                 let key = format!("{dir}/{name}");
-                match self.metadata_store.object_store().get(&key).await {
-                    Ok(raw) => {
-                        if serde_json::from_slice::<AccessEntry>(&raw).is_err() {
-                            warn!("scrub: access entry '{key}' does not parse; deleting");
-                            self.delete_corrupt(WalkedStore::Metadata, &key).await?;
-                            continue;
-                        }
-                    }
+                let raw = match self.metadata_store.object_store().get(&key).await {
+                    Ok(raw) => raw,
                     Err(StorageError::NotFound) => continue,
                     Err(e) => return Err(RegistryError::from(e).into()),
-                }
-                if !kept_newest {
-                    // The listing sorts newest first, so the first decodable
-                    // entry is the last access.
-                    kept_newest = true;
+                };
+                let Ok(entry) = serde_json::from_slice::<AccessEntry>(&raw) else {
+                    warn!("scrub: access entry '{key}' does not parse; deleting");
+                    self.delete_corrupt(WalkedStore::Metadata, &key).await?;
+                    continue;
+                };
+                let ranked_out = max_entries
+                    .is_some_and(|max| kept >= usize::try_from(max.get()).unwrap_or(usize::MAX));
+                if kept == 0 || !(older_than(now, at, window_secs) || ranked_out) {
+                    kept += 1;
                     continue;
                 }
-                if Utc::now().signed_duration_since(at).num_seconds() >= window {
-                    self.emit(Action::RetireAtimeKey { key }).await?;
+                if packed_through.as_ref().is_none_or(|through| name < through)
+                    && !older_than(now, at, history_max_age_secs)
+                    && kept + packed.len() < limit
+                {
+                    chunk_name.get_or_insert_with(|| name.clone());
+                    packed.push(entry);
+                    packed_keys.push(key);
+                } else {
+                    dropped.push(key);
                 }
+            }
+            if !dropped.is_empty() {
+                self.emit(Action::CompactAtime(AtimeCompaction {
+                    chunk: None,
+                    retired: dropped,
+                }))
+                .await?;
             }
             token = page.next_token;
             if token.is_none() {
                 break;
             }
         }
-        Ok(())
+
+        if let Some(name) = chunk_name {
+            let body = serde_json::to_vec(&packed).map_err(RegistryError::from)?;
+            self.emit(Action::CompactAtime(AtimeCompaction {
+                chunk: Some((format!("{compacted}/{name}"), Bytes::from(body))),
+                retired: packed_keys,
+            }))
+            .await?;
+        }
+        self.trim_chunks(&compacted, chunks, kept + packed.len(), now)
+            .await
+    }
+
+    /// Trim the chunks of `compacted` to the history bounds once `live` newer
+    /// pulls are counted: a chunk wholly past them goes, and the one straddling
+    /// them is rewritten with its fitting entries. Trimming only drops a
+    /// chunk's older tail, so its name stays its newest entry's.
+    async fn trim_chunks(
+        &self,
+        compacted: &str,
+        chunks: Vec<String>,
+        live: usize,
+        now: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        let AtimeRetention {
+            history_limit,
+            history_max_age_secs,
+            ..
+        } = self.metadata_store.atime_retention;
+        let limit = usize::try_from(history_limit.get()).unwrap_or(usize::MAX);
+        let mut total = live;
+        let mut dropped = Vec::new();
+        for name in chunks {
+            let Some(at) = parse_atime_entry(&name) else {
+                continue;
+            };
+            let key = format!("{compacted}/{name}");
+            if total >= limit || older_than(now, at, history_max_age_secs) {
+                dropped.push(key);
+                continue;
+            }
+            let raw = match self.metadata_store.object_store().get(&key).await {
+                Ok(raw) => raw,
+                Err(StorageError::NotFound) => continue,
+                Err(e) => return Err(RegistryError::from(e).into()),
+            };
+            let Ok(mut chunk) = serde_json::from_slice::<Vec<AccessEntry>>(&raw) else {
+                warn!("scrub: compacted access chunk '{key}' does not parse; deleting");
+                self.delete_corrupt(WalkedStore::Metadata, &key).await?;
+                continue;
+            };
+            let fitting = chunk
+                .iter()
+                .take_while(|entry| !older_than(now, entry.at, history_max_age_secs))
+                .count()
+                .min(limit - total);
+            total += fitting;
+            if fitting < chunk.len() {
+                chunk.truncate(fitting);
+                let body = serde_json::to_vec(&chunk).map_err(RegistryError::from)?;
+                self.emit(Action::CompactAtime(AtimeCompaction {
+                    chunk: Some((key, Bytes::from(body))),
+                    retired: Vec::new(),
+                }))
+                .await?;
+            }
+        }
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        self.emit(Action::CompactAtime(AtimeCompaction {
+            chunk: None,
+            retired: dropped,
+        }))
+        .await
+    }
+
+    /// Every key name under `dir`, in listing order.
+    async fn list_names(&self, dir: &str) -> Result<Vec<String>, Error> {
+        let mut names = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self
+                .metadata_store
+                .object_store()
+                .list(dir, LIST_PAGE, token)
+                .await
+                .map_err(RegistryError::from)?;
+            names.extend(page.items);
+            token = page.next_token;
+            if token.is_none() {
+                return Ok(names);
+            }
+        }
     }
 
     /// The shared tail of both tag shapes: the target must have blob bytes,
@@ -564,4 +703,11 @@ impl Validator {
         .await?;
         Ok(GrantState::Recorded)
     }
+}
+
+/// Whether `at` is at least `secs` before `now`; never, without a bound.
+fn older_than(now: DateTime<Utc>, at: DateTime<Utc>, secs: Option<u64>) -> bool {
+    secs.is_some_and(|secs| {
+        now.signed_duration_since(at).num_seconds() >= i64::try_from(secs).unwrap_or(i64::MAX)
+    })
 }

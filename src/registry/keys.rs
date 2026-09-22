@@ -137,6 +137,10 @@ pub fn parse_atime_entry(name: &str) -> Option<DateTime<Utc>> {
         .and_then(DateTime::from_timestamp_millis)
 }
 
+/// What follows an atime entry directory's `!` terminator on its compacted
+/// sibling.
+pub const ATIME_COMPACTED: &str = "compacted";
+
 /// The store roots. They live together because the maintenance walk matches
 /// all six in one dispatch.
 pub const BLOBS_ROOT: &str = "v2/blobs";
@@ -340,6 +344,11 @@ pub trait NamespaceKeys {
     /// pull-tracked.
     fn atime_entry_path(&self, link: &LinkKind, at: DateTime<Utc>, client: &str) -> Option<String>;
 
+    /// Directory holding `link`'s compacted access entries, a sibling of its
+    /// entry directory. Each chunk is named after its newest entry, so chunks
+    /// list newest first too.
+    fn atime_compacted_dir(&self, link: &LinkKind) -> Option<String>;
+
     /// The namespace's catalog index key: empty, write-once, one per
     /// namespace. The `!` terminator is what lets `a` and `a/b` coexist on FS
     /// (a file cannot also be a directory) while keeping the flat listing in
@@ -430,6 +439,10 @@ impl NamespaceKeys for Namespace {
             self.atime_dir(link)?,
             &identity.hash()[..8]
         ))
+    }
+
+    fn atime_compacted_dir(&self, link: &LinkKind) -> Option<String> {
+        Some(format!("{}{ATIME_COMPACTED}", self.atime_dir(link)?))
     }
 
     fn revision_atime_entry_dir(&self, digest: &Digest) -> String {
@@ -731,6 +744,10 @@ mod tests {
         assert_eq!(
             ns.revision_atime_entry_dir(&digest),
             format!("v2/ns/org/app!atime/rev/sha256/{HASH_A}!")
+        );
+        assert_eq!(
+            ns.atime_compacted_dir(&LinkKind::Tag(tag)).unwrap(),
+            "v2/ns/org/app!atime/tag/v1!compacted"
         );
     }
 

@@ -344,10 +344,14 @@ async fn dispatch_route<'a>(
         Route::Angos(AngosEndpoint::ListPulls {
             namespace,
             reference,
+            offset,
+            n,
         }) => Ok(registry
             .list_pulls(ListPullsRequest {
                 namespace,
                 reference,
+                offset,
+                n,
             })
             .await?
             .into_response()?),

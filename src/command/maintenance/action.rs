@@ -1,5 +1,7 @@
 use std::fmt;
 
+use bytes::Bytes;
+
 use angos_oci::{Digest, Namespace, Tag, UploadSessionId};
 
 use crate::{
@@ -28,6 +30,13 @@ impl fmt::Display for WalkedStore {
             WalkedStore::Metadata => write!(f, "metadata store"),
         }
     }
+}
+
+/// One step of a target's access-entry compaction: a chunk to write, if
+/// any, and the entry and chunk keys to retire once it lands.
+pub struct AtimeCompaction {
+    pub chunk: Option<(String, Bytes)>,
+    pub retired: Vec<String>,
 }
 
 /// A single mutation a maintenance check decided to perform, produced through
@@ -163,11 +172,8 @@ pub enum Action {
         store: WalkedStore,
         key: String,
     },
-    /// Delete a superseded access-time entry past the audit window; already
-    /// age-gated by the walk.
-    RetireAtimeKey {
-        key: String,
-    },
+    /// Write one target's access chunk, then retire the keys it supersedes.
+    CompactAtime(AtimeCompaction),
 }
 
 impl fmt::Display for Action {
@@ -341,9 +347,14 @@ impl fmt::Display for Action {
             Action::DeleteCorruptObject { store, key } => {
                 write!(f, "delete corrupt {store} object '{key}'")
             }
-            Action::RetireAtimeKey { key } => {
-                write!(f, "retire access-time key '{key}'")
-            }
+            Action::CompactAtime(AtimeCompaction { chunk, retired }) => match chunk {
+                Some((key, _)) => write!(
+                    f,
+                    "write access chunk '{key}' and retire {} access-time keys",
+                    retired.len()
+                ),
+                None => write!(f, "retire {} access-time keys", retired.len()),
+            },
         }
     }
 }

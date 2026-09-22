@@ -57,14 +57,16 @@ export interface PullEntry {
 }
 
 /**
- * One target's recorded pulls, newest first and capped by the registry.
- * `window_secs` is the operator-configured retention: entries superseded by a
- * newer one are collected past it, so this is a window, not a full history.
+ * One page of a target's recorded pulls, newest first. `limit` and
+ * `max_age_secs` are the operator-configured history bounds; `next` is the
+ * offset of the following page, when there is one.
  */
 export interface PullHistory {
 	target: string;
-	window_secs: number;
+	limit: number;
+	max_age_secs?: number;
 	entries: PullEntry[];
+	next?: number;
 }
 
 export interface ReferrersPage {
@@ -238,11 +240,12 @@ export async function fetchRevisions(namespace: string): Promise<FetchResult<Rev
 // which is what tells the two apart; the endpoint takes exactly one of them.
 export async function fetchPullHistory(
 	namespace: string,
-	target: string
+	target: string,
+	offset = 0
 ): Promise<FetchResult<PullHistory>> {
 	const param = target.includes(':') ? 'digest' : 'tag';
 	return fetchJson<PullHistory>(
-		`/v2/${namespace}/_angos/pulls/list?${param}=${encodeURIComponent(target)}`
+		`/v2/${namespace}/_angos/pulls/list?${param}=${encodeURIComponent(target)}&offset=${offset}`
 	);
 }
 

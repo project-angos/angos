@@ -14,8 +14,8 @@ use crate::{
     jobs::{JobState, Queue, store::JOBS_ROOT},
     registry::{
         keys::{
-            BLOBS_ROOT, CAT_ROOT, DigestKeys, GC_ROOT, LAYERS_ROOT, NS_ROOT, REF_ROOT, REPOS_ROOT,
-            TagEntry, parse_atime_entry,
+            ATIME_COMPACTED, BLOBS_ROOT, CAT_ROOT, DigestKeys, GC_ROOT, LAYERS_ROOT, NS_ROOT,
+            REF_ROOT, REPOS_ROOT, TagEntry, parse_atime_entry,
         },
         metadata_store::LinkKind,
     },
@@ -49,6 +49,11 @@ pub enum KeyCategory {
     /// `v2/ns/{ns}!atime/rev/{alg}/{hash}!/{ord}.{suffix}` (metadata store):
     /// one append-only revision access entry.
     RevisionAtimeEntry { namespace: String, digest: Digest },
+    /// `v2/ns/{ns}!atime/tag/{tag}!compacted/{ord}.{suffix}` or
+    /// `v2/ns/{ns}!atime/rev/{alg}/{hash}!compacted/{ord}.{suffix}` (metadata
+    /// store): one chunk of compacted access entries, trimmed by its target's
+    /// entry collection.
+    AtimeChunk,
     /// `v2/ns/{ns}!rev/{alg}/{prefix}/{hash}` (metadata store): the immutable
     /// record of a stored manifest revision.
     RevisionRecord { namespace: String, digest: Digest },
@@ -290,8 +295,23 @@ fn categorize_ns(rest: &str) -> KeyCategory {
 }
 
 /// `tag/{tag}!/{ord}.{suffix}` or `rev/{alg}/{hash}!/{ord}.{suffix}`: one
-/// append-only access entry.
+/// append-only access entry. `tag/{tag}!compacted/{ord}.{suffix}` or
+/// `rev/{alg}/{hash}!compacted/{ord}.{suffix}`: one compacted chunk.
 fn categorize_atime(namespace: &str, rest: &str) -> KeyCategory {
+    if let Some((target, chunk)) = rest.split_once(&format!("!{ATIME_COMPACTED}/")) {
+        let target_valid = match target.split_once('/') {
+            Some(("tag", tag)) => Tag::new(tag).is_ok(),
+            Some(("rev", digest)) => digest
+                .split_once('/')
+                .is_some_and(|(algorithm, hash)| parse_digest(algorithm, hash).is_some()),
+            _ => false,
+        };
+        return if target_valid && parse_atime_entry(chunk).is_some() {
+            KeyCategory::AtimeChunk
+        } else {
+            KeyCategory::Unknown
+        };
+    }
     if let Some(tag_rest) = rest.strip_prefix("tag/") {
         if let Some((tag, entry)) = tag_rest.split_once("!/")
             && Tag::new(tag).is_ok()
@@ -542,6 +562,10 @@ mod tests {
                 digest: digest_a(),
             }
         );
+        for link in [LinkKind::Tag(tag.clone()), LinkKind::Digest(digest_a())] {
+            let chunk = format!("{}/{name}", ns.atime_compacted_dir(&link).unwrap());
+            assert_eq!(categorize(&chunk), KeyCategory::AtimeChunk, "key {chunk:?}");
+        }
         // The retired single keys are no shape this version knows.
         let unknown = [
             format!("v2/ns/org/app!atime/rev/sha256/{HASH_A}"),
@@ -550,6 +574,9 @@ mod tests {
             "v2/ns/org/app!atime/tag/v1.0!/junk".to_string(),
             format!("v2/ns/org/app!atime/rev/sha3/{HASH_A}!/{name}"),
             format!("v2/ns/org/app!atime/rev/sha256/{HASH_A}!/junk.entry"),
+            format!("v2/ns/org/app!atime/tag/-bad!compacted/{name}"),
+            "v2/ns/org/app!atime/tag/v1!compacted/junk".to_string(),
+            format!("v2/ns/org/app!atime/rev/sha3/{HASH_A}!compacted/{name}"),
         ];
         for key in unknown {
             assert_eq!(categorize(&key), KeyCategory::Unknown, "key {key:?}");
