@@ -36,6 +36,7 @@ mod tests;
 use crate::{
     auth::{authenticator, oidc, webhook},
     event_webhook::config::EventWebhookConfig,
+    policy::rules_use_pull_time,
     registry::{blob_store, repository},
 };
 
@@ -138,8 +139,44 @@ impl Configuration {
             &self.event_webhook,
             self.global.scan.is_some(),
         )?;
+        validate_scan_refresh(&self.global, &self.repository)?;
         Ok(self)
     }
+}
+
+/// Refuses a repository refresh table listing no rule, and rules reading pull
+/// times that are never recorded.
+fn validate_scan_refresh(
+    global: &GlobalConfig,
+    repositories: &HashMap<String, repository::Config>,
+) -> Result<(), Error> {
+    let global_refresh = global.scan.as_ref().and_then(|scan| scan.refresh.as_ref());
+    if let Some(name) = repositories
+        .iter()
+        .find_map(|(name, repo)| repo.refresh()?.rules.is_empty().then_some(name))
+    {
+        return Err(Error::InvalidFormat(format!(
+            "repository.\"{name}\".scan.refresh.rules must list at least one rule"
+        )));
+    }
+    let rules = global_refresh
+        .into_iter()
+        .map(|refresh| ("global.scan.refresh".to_string(), refresh.rules.as_slice()))
+        .chain(repositories.iter().filter_map(|(name, repo)| {
+            Some((
+                format!("repository.\"{name}\".scan.refresh"),
+                repo.refresh()?.rules.as_slice(),
+            ))
+        }));
+    for (name, rules) in rules {
+        if rules_use_pull_time(rules) && !global.update_pull_time {
+            return Err(Error::InvalidFormat(format!(
+                "{name}.rules use last_pulled_at or top_pulled but update_pull_time is disabled, \
+                 so pull times are never recorded"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a UI sign-in pointed at an OIDC provider that is not configured,
@@ -280,9 +317,9 @@ fn validate_repositories(
     scan_configured: bool,
 ) -> Result<(), Error> {
     for (repo_name, repo) in repositories {
-        if repo.scan && !scan_configured {
+        if repo.scan.is_some() && !scan_configured {
             return Err(Error::InvalidFormat(format!(
-                "repository '{repo_name}' sets scan = true but [global.scan] is not configured"
+                "repository '{repo_name}' has a scan table but [global.scan] is not configured"
             )));
         }
         let context = format!("referenced in '{repo_name}' repository");

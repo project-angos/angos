@@ -1,6 +1,6 @@
 use crate::{
     configuration::{Configuration, Error},
-    test_fixtures::configuration::config_toml,
+    test_fixtures::configuration::{config_toml, load_config},
 };
 
 #[test]
@@ -295,4 +295,103 @@ fn listing_read_concurrency_defaults_and_loads() {
     let raised =
         Configuration::load_from_str(&config_toml("listing_read_concurrency = 64")).unwrap();
     assert_eq!(raised.global.listing_read_concurrency.get(), 64);
+}
+
+/// Loads the minimal configuration with a scanner and `extra` appended.
+fn scan_error(extra: &str) -> String {
+    let config = config_toml(&format!(
+        r#"
+    [global.scan]
+    url = "http://scanner:8766"
+    {extra}
+    "#
+    ));
+    match Configuration::load_from_str(&config) {
+        Err(Error::InvalidFormat(msg)) => msg,
+        other => panic!("Expected InvalidFormat error, got {other:?}"),
+    }
+}
+
+#[test]
+fn scan_tables_parse_at_both_levels() {
+    let config = load_config(
+        r#"
+    [global.scan]
+    url = "http://scanner:8766"
+
+    [global.scan.refresh]
+    rules = ["image.scanned_at < now() - days(30)"]
+
+    [repository."apps".scan.refresh]
+    rules = ["image.scanned_at < now() - days(7)"]
+
+    [repository."web".scan]
+    "#,
+    );
+    let refresh = config
+        .global
+        .scan
+        .as_ref()
+        .unwrap()
+        .refresh
+        .as_ref()
+        .unwrap();
+    assert_eq!(refresh.rules.len(), 1);
+    assert_eq!(
+        config.repository["apps"].refresh().map(|r| r.rules.len()),
+        Some(1)
+    );
+    let web = config.repository["web"].scan.as_ref().unwrap();
+    assert!(
+        web.refresh.is_none(),
+        "an empty scan table opts in without refresh rules"
+    );
+}
+
+#[test]
+fn a_repository_scan_table_requires_the_scanner() {
+    let config = config_toml(
+        r#"
+    [repository."apps".scan]
+    "#,
+    );
+    match Configuration::load_from_str(&config) {
+        Err(Error::InvalidFormat(msg)) => {
+            assert!(
+                msg.contains(
+                    "repository 'apps' has a scan table but [global.scan] is not configured"
+                ),
+                "{msg}"
+            );
+        }
+        other => panic!("Expected InvalidFormat error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_repository_refresh_table_lists_at_least_one_rule() {
+    let msg = scan_error(
+        r#"
+    [repository."apps".scan.refresh]
+    rules = []
+    "#,
+    );
+    assert!(
+        msg.contains(r#"repository."apps".scan.refresh.rules must list at least one rule"#),
+        "{msg}"
+    );
+}
+
+#[test]
+fn refresh_rules_reading_pull_times_require_update_pull_time() {
+    let msg = scan_error(
+        r#"
+    [global.scan.refresh]
+    rules = ["image.last_pulled_at > now() - days(7)"]
+    "#,
+    );
+    assert!(
+        msg.contains("global.scan.refresh.rules use last_pulled_at or top_pulled"),
+        "{msg}"
+    );
 }

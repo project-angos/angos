@@ -18,13 +18,11 @@ use crate::{
             server_context::tests::create_test_event,
         },
     },
-    configuration::Configuration,
+    configuration::{Configuration, GlobalConfig},
     metrics_provider::init_for_tests,
     policy::{AccessMode, AccessPolicyConfig},
     registry::{
-        Registry, RegistryConfig,
-        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        repository,
+        Registry, RegistryConfig, repository,
         test_utils::{response_json, test_job_store},
     },
     test_fixtures::client::test_client_config,
@@ -101,7 +99,7 @@ async fn test_build_repository_with_upstream() {
     };
     let cache = angos_cache::Config::Memory.to_backend().unwrap();
     let configs = HashMap::from([("cached-repo".to_string(), repo_config)]);
-    let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
+    let result = bootstrap::repositories(&configs, &cache, &GlobalConfig::default()).await;
 
     assert!(result.is_ok());
 }
@@ -123,7 +121,7 @@ async fn test_build_repositories_multiple() {
     let cache_config = angos_cache::Config::Memory;
     let cache = cache_config.to_backend().unwrap();
 
-    let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
+    let result = bootstrap::repositories(&configs, &cache, &GlobalConfig::default()).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -199,13 +197,9 @@ async fn test_build_registry_components_integration() {
         config.global.atime_audit_window_secs,
     )
     .unwrap();
-    let repositories = bootstrap::repositories(
-        &config.repository,
-        &auth_cache,
-        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-    )
-    .await
-    .unwrap();
+    let repositories = bootstrap::repositories(&config.repository, &auth_cache, &config.global)
+        .await
+        .unwrap();
 
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,

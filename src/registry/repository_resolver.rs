@@ -148,7 +148,7 @@ mod tests {
             ),
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
-            scan: false,
+            scan: None,
             index: false,
         }
     }

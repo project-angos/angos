@@ -205,12 +205,13 @@ By default reconciliation is additive: it enqueues a replication push for each d
 
 #### reconcile scan
 
-Enqueue a scan job for every image manifest of a `scan = true` repository that carries no report, so images pushed before scanning was enabled, or whose scan failed past its retries, get one. The running server or a worker drains the jobs; the command returns once they are enqueued. See [Scan Images](../how-to/scan-images.md).
+Enqueue a scan job for every image manifest of a scanning repository that carries no report, so images pushed before scanning was enabled, or whose scan failed past its retries, get one, and for every image whose newest report the repository's refresh rules find due, so a scheduled run keeps reports current. The running server or a worker drains the jobs; the command returns once they are enqueued. See [Scan Images](../how-to/scan-images.md).
 
 | Option      | Short | Description                                              |
 |-------------|-------|----------------------------------------------------------|
 | `--dry-run` | `-d`  | Preview what would be enqueued without changes           |
 | `--force`   |       | Scan every image again, attaching a fresh report to each |
+| `--concurrency <N>` | | Namespaces checked concurrently (default 25); each adds a small fixed tag-read fan-out when refresh rules apply |
 
 #### reconcile index
 
@@ -230,10 +231,10 @@ angos reconcile replication --dry-run
 # Reconcile every replicated repository with its downstreams
 angos reconcile replication
 
-# Give every unreported image a scan
+# Give every unreported image a scan, and every due one under the refresh rules
 angos reconcile scan
 
-# Re-scan everything after a scanner database update
+# Scan everything again after a scanner database update
 angos reconcile scan --force
 
 # Index the layers of every image nobody has opened yet, and reclaim the

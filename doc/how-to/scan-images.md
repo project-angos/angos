@@ -15,7 +15,7 @@ Run a vulnerability scanner on every push and keep its report next to the image 
 
 ## How It Works
 
-1. A push of an image manifest into a repository with `scan = true` enqueues a scan job, keyed on the image digest so repeated pushes coalesce.
+1. A push of an image manifest into a repository with a `scan` table enqueues a scan job, keyed on the image digest so repeated pushes coalesce.
 2. The job's handler, in `angos worker` or in the server's own job loops, asks the scanner service for a report.
 3. `angos scanner`, on the scanner host, pulls the image under its own identity, runs the scanner you named, and answers with the SARIF report.
 4. The handler pushes the report back as a referrer of the image, an OCI artifact manifest whose `subject` is the image, through the registry's own write path. It lists under `/v2/<name>/referrers/<digest>`, replicates with the image, shows in the web UI, and is checked at admission by tools such as Kyverno or the sigstore policy-controller.
@@ -50,11 +50,10 @@ The report is pushed by the registry's job handler, not by the scanner, so the i
 url = "http://scanner.internal:8766"
 token = "scan-service-secret"
 
-[repository."apps"]
-scan = true
+[repository."apps".scan]
 ```
 
-Each `scan = true` repository sends its image pushes to the service at `url`. A pull-through cache repository may carry the flag too: each image manifest a cache miss stores is scanned once, and the report is local metadata that retention reclaims with the cached image. On a busy general-purpose mirror that is one scan per upstream digest pulled, so weigh the scanner time before enabling it there.
+Each repository with a `scan` table, even an empty one, sends its image pushes to the service at `url`. A pull-through cache repository may carry the table too: each image manifest a cache miss stores is scanned once, and the report is local metadata that retention reclaims with the cached image. On a busy general-purpose mirror that is one scan per upstream digest pulled, so weigh the scanner time before enabling it there.
 
 ## Step 3: Run the Scanner Service
 
@@ -142,13 +141,59 @@ The web UI shows it on the manifest's Vulnerabilities tab, whichever scanner wro
 
 ## Step 6: Scan What Was Already There
 
-Enabling `scan = true` covers pushes from then on. Give the images already in the repository a report with:
+A `scan` table covers pushes from then on. Give the images already in the repository a report with:
 
 ```bash
 angos -c config.toml reconcile scan
 ```
 
-It enqueues one job per image manifest without a report; `--dry-run` lists them, and `--force` scans every image again, which is how a scanner database update reaches images scanned before it. The server or a worker drains the jobs as usual.
+It enqueues one job per image manifest without a report, and one per image the refresh rules of Step 7 find due; `--dry-run` lists them, and `--force` scans every image again, attaching a fresh report to each. The server or a worker drains the jobs as usual.
+
+## Step 7: Refresh Reports on a Schedule
+
+A report ages as the scanner's database learns new vulnerabilities. The `refresh` table has `angos reconcile scan` scan an image again once its newest report is due, as its rules define it:
+
+```toml
+[global.scan.refresh]
+rules = ["image.scanned_at < now() - days(30)"]
+
+[repository."apps".scan.refresh]
+rules = [
+  "image.scanned_at < now() - days(7) && (image.tag == 'latest' || top_pulled(20))",
+]
+```
+
+`rules` are CEL expressions over the [retention variables](../reference/cel-expressions.md#retention-policy-variables) plus `image.scanned_at`, the time of the image's newest report: the image is scanned again when any rule is true, so a rule states how old a report may get, and can narrow that to the tags that matter. A repository's rules replace the global ones, and a repository without rules of its own or inherited never refreshes a report. A repository table lists at least one rule, and a rule using `last_pulled_at` or `top_pulled` needs `update_pull_time = true`, as retention does. A tagged image is judged under each of its tags and an untagged one with `image.tag == null`, as retention judges them.
+
+Nothing runs the pass on its own: schedule `angos reconcile scan` like `prune`, with a CronJob or a systemd timer, at the cadence the rules call for. A run reads every image of the scanning repositories once, one manifest read and one referrer listing each, enqueues a scan for each one without a report or whose newest report is due, and logs how many; a run that finds nothing due enqueues nothing, and a scan enqueued twice coalesces on the image. A daily run refreshes a report within a day of its rule coming true:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: registry-scan-refresh
+spec:
+  schedule: "0 4 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: refresh
+              image: ghcr.io/project-angos/angos:latest
+              args: ["-c", "/config/config.toml", "reconcile", "scan"]
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                  readOnly: true
+          volumes:
+            - name: config
+              secret:
+                secretName: registry-config
+          restartPolicy: OnFailure
+```
+
+A new report supersedes the older ones, and retention reclaims them: `angos prune` judges a superseded report like any untagged manifest, `pushed_at` being when it was attached, so `image.pushed_at > now() - days(30)` keeps a month of report history, a tag-only policy reclaims it at the next run, and a registry without retention rules keeps it. Only the newest report of an image stays shielded by it, as every report or attestation angos did not write does. The web UI shows the newest report by its `created` annotation either way.
 
 ---
 
@@ -164,7 +209,7 @@ It enqueues one job per image manifest without a report; `--dry-run` lists them,
 
 ## Retention
 
-A report follows its image: `angos prune` skips it while the image resolves and reclaims it with the image. Attaching a report never keeps an image alive. See [Configure Retention Policies](configure-retention-policies.md).
+A report follows its image: `angos prune` skips it while the image resolves and reclaims it with the image. Attaching a report never keeps an image alive. A report a newer angos report has superseded is the exception: prune judges it by the retention rules like any untagged manifest. See [Configure Retention Policies](configure-retention-policies.md).
 
 ---
 
@@ -175,6 +220,6 @@ Angos does not block a pull on a scan result. Enforce at admission, where the sa
 ## Reference
 
 - [CLI Reference](../reference/cli.md#scanner) - The `scanner` subcommand and the worker's `scan` queue
-- [Configuration Reference](../reference/configuration.md#scanning-globalscan) - The `[global.scan]`, `scan` and `[scanner]` options
+- [Configuration Reference](../reference/configuration.md#scanning-globalscan) - The `[global.scan]`, `scan` and `[scanner]` tables
 - [API Endpoints Reference](../reference/api-endpoints.md#list-jobs) - The jobs admin API
 - [Web UI Reference](../reference/ui.md) - Attestation badges

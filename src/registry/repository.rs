@@ -20,6 +20,7 @@ use crate::{
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::Error,
     replication::{ReplicationDownstream, ReplicationDownstreamConfig},
+    scan::{RefreshConfig, RepositoryScanConfig, ScanPolicy, refresh_rules},
 };
 
 /// Fallback per-manifest blob-push concurrency when a downstream omits
@@ -217,9 +218,9 @@ pub struct Config {
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
-    /// Whether each image manifest pushed here is sent to the scanner service.
-    #[serde(default)]
-    pub scan: bool,
+    /// Present, each image manifest pushed here is sent to the scanner
+    /// service, and its reports are refreshed under the table's rules.
+    pub scan: Option<RepositoryScanConfig>,
     /// Whether the filesystem of each image manifest pushed here is indexed
     /// right away, rather than the first time someone browses it.
     #[serde(default)]
@@ -236,6 +237,12 @@ impl Config {
             .as_deref()
             .filter(|name| !name.is_empty())
     }
+
+    /// The repository's own report refresh table, when its `scan` table has
+    /// one.
+    pub fn refresh(&self) -> Option<&RefreshConfig> {
+        self.scan.as_ref()?.refresh.as_ref()
+    }
 }
 
 pub struct Repository {
@@ -248,7 +255,9 @@ pub struct Repository {
     pub retention_policy: RetentionPolicy,
     pub immutable_tags: bool,
     pub immutable_tags_exclusions: Vec<RegexPattern>,
-    pub scan: bool,
+    /// Present, the repository's images are scanned, and their reports
+    /// refreshed under the rules it carries.
+    pub scan: Option<ScanPolicy>,
     pub index: bool,
 }
 
@@ -314,7 +323,9 @@ impl Repository {
             retention_policy,
             immutable_tags: config.immutable_tags,
             immutable_tags_exclusions: config.immutable_tags_exclusions.clone(),
-            scan: config.scan,
+            scan: config.scan.as_ref().map(|_| ScanPolicy {
+                refresh: refresh_rules(None, config.refresh()),
+            }),
             index: config.index,
         })
     }

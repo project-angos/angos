@@ -11,7 +11,8 @@
 //! # Available Variables
 //!
 //! CEL expressions have access to:
-//! - `image`: Manifest information (`tag`, `pushed_at`, `last_pulled_at`)
+//! - `image`: Manifest information (`tag`, `pushed_at`, `last_pulled_at`,
+//!   `scanned_at`)
 //!
 //! # Helper Functions
 //!
@@ -38,14 +39,12 @@ pub struct RetentionPolicyConfig {
     pub rules: Vec<CelRule>,
 }
 
-impl RetentionPolicyConfig {
-    /// True when any rule reads pull-time data (`image.last_pulled_at` or
-    /// `top_pulled`), which is only recorded when `update_pull_time` is enabled.
-    pub fn uses_pull_time(&self) -> bool {
-        self.rules.iter().any(|rule| {
-            rule.source.contains("last_pulled_at") || rule.source.contains("top_pulled")
-        })
-    }
+/// Whether any of `rules` reads pull-time data, `image.last_pulled_at` or
+/// `top_pulled`, which is only recorded when `update_pull_time` is enabled.
+pub fn rules_use_pull_time(rules: &[CelRule]) -> bool {
+    rules
+        .iter()
+        .any(|rule| rule.source.contains("last_pulled_at") || rule.source.contains("top_pulled"))
 }
 
 /// Manifest image information used in retention decisions.
@@ -56,6 +55,9 @@ pub struct ManifestImage {
     pub pushed_at: i64,
     /// Seconds since the Unix epoch, `0` for an image never pulled.
     pub last_pulled_at: i64,
+    /// Seconds since the Unix epoch of the newest scan report, `0` for an
+    /// image never scanned. Set by `reconcile scan`; retention reads it as `0`.
+    pub scanned_at: i64,
 }
 
 impl ManifestImage {
@@ -74,6 +76,7 @@ impl ManifestImage {
             tag,
             pushed_at: pushed_at.unwrap_or(now).timestamp().max(0),
             last_pulled_at: last_pulled_at.map_or(0, |t| t.timestamp().max(0)),
+            scanned_at: 0,
         }
     }
 }
@@ -140,9 +143,7 @@ impl RetentionPolicy {
             return Ok(true);
         }
 
-        let context = self.build_context(manifest, last_pushed, last_pulled)?;
-
-        match evaluate_rules(&self.rules, &context) {
+        match self.evaluate(manifest, last_pushed, last_pulled)? {
             RuleOutcome::Matched(index) => {
                 debug!("Retention rule {index} matched");
                 Ok(true)
@@ -157,6 +158,18 @@ impl RetentionPolicy {
                 Ok(true)
             }
         }
+    }
+
+    /// Runs the rules over `manifest` and answers the raw outcome, for a
+    /// caller whose reading of an indeterminate rule differs from retention's.
+    pub fn evaluate(
+        &self,
+        manifest: &ManifestImage,
+        last_pushed: &[String],
+        last_pulled: &[String],
+    ) -> Result<RuleOutcome, Error> {
+        let context = self.build_context(manifest, last_pushed, last_pulled)?;
+        Ok(evaluate_rules(&self.rules, &context))
     }
 
     fn build_context<'a>(
@@ -531,7 +544,10 @@ mod tests {
             let config = RetentionPolicyConfig {
                 rules: vec![CelRule::compile(source).unwrap()],
             };
-            assert!(config.uses_pull_time(), "{source} must be detected");
+            assert!(
+                rules_use_pull_time(&config.rules),
+                "{source} must be detected"
+            );
         }
 
         let push_only = RetentionPolicyConfig {
@@ -540,7 +556,7 @@ mod tests {
                 CelRule::compile("image.pushed_at > now() - days(30)").unwrap(),
             ],
         };
-        assert!(!push_only.uses_pull_time());
+        assert!(!rules_use_pull_time(&push_only.rules));
     }
 
     /// The two absences resolve differently and both are operator-visible:

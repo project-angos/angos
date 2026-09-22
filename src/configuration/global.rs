@@ -77,7 +77,8 @@ pub struct GlobalConfig {
     pub event_webhooks: Vec<String>,
     #[serde(default)]
     pub job_queue: Option<JobQueueConfig>,
-    /// The scanner service pushes to `scan = true` repositories are sent to.
+    /// The scanner service pushes to scanning repositories are sent to, and
+    /// how their reports are refreshed.
     #[serde(default)]
     pub scan: Option<ScanConfig>,
     /// Seconds to keep draining in-flight work on shutdown before forcing exit.

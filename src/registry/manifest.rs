@@ -736,7 +736,7 @@ impl Registry {
         // client push behave alike; a refresh to the same digest changes
         // nothing and so dispatches nothing.
         if changed {
-            if scan::is_scan_subject(&manifest) && repository.is_some_and(|r| r.scan) {
+            if scan::is_scan_subject(&manifest) && repository.is_some_and(|r| r.scan.is_some()) {
                 self.dispatch_scan(namespace, &computed_digest).await;
             }
             if repository.is_some_and(|r| r.index) {
@@ -1379,6 +1379,7 @@ impl Registry {
             namespace: namespace.clone(),
             digest: digest.clone(),
             force: false,
+            reported_before: None,
         };
         let outcome = match scan::build_envelope(&payload) {
             Ok(envelope) => self

@@ -1,11 +1,11 @@
-use std::{cmp::Reverse, collections::VecDeque, pin::pin, sync::Arc};
+use std::{collections::VecDeque, pin::pin, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use futures_util::{StreamExt, TryStreamExt};
 use tracing::{debug, error};
 
-use angos_oci::{Content, Digest, Namespace, Tag};
+use angos_oci::{Content, Digest, Namespace};
 
 use crate::{
     command::maintenance::{
@@ -13,6 +13,7 @@ use crate::{
         action::Action,
         check::NamespaceChecker,
         executor::{ActionSink, object_younger_than_grace},
+        tags::{TagWithMetadata, live_tags, rank_by},
     },
     policy::{ManifestImage, RetentionPolicy},
     registry::{
@@ -20,23 +21,11 @@ use crate::{
         blob_store::BlobStore,
         keys::DigestKeys,
         manifest::read_manifest,
-        metadata_store::{BlobIndex, LinkKind, LinkMetadata, MetadataStore},
+        metadata_store::{BlobIndex, LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
+    scan::{is_angos_report, scan_reports},
 };
-
-/// Fan-out for the per-tag link-metadata reads feeding the retention rankings.
-/// Fixed rather than derived from `--concurrency`, which already bounds the
-/// namespace walk: one knob for both would square the in-flight reads.
-const TAG_METADATA_CONCURRENCY: usize = 16;
-
-struct TagWithMetadata {
-    name: Tag,
-    metadata: LinkMetadata,
-    /// The tag's last pull, read from its access entries rather than carried
-    /// on the metadata the tag resolves to.
-    pulled_at: Option<DateTime<Utc>>,
-}
 
 pub struct RetentionChecker {
     blob_store: Arc<BlobStore>,
@@ -274,9 +263,9 @@ impl NamespaceChecker for RetentionChecker {
     async fn check(&self, namespace: &Namespace, sink: &dyn ActionSink) -> Result<(), Error> {
         debug!("Checking retention policies on '{namespace}'");
 
-        let tag_metadata = self.fetch_tag_metadata(namespace).await?;
-        let last_pushed = Self::rank_by(&tag_metadata, |t| t.metadata.created_at);
-        let last_pulled = Self::rank_by(&tag_metadata, |t| t.pulled_at);
+        let tag_metadata = live_tags(&self.metadata_store, namespace).await?;
+        let last_pushed = rank_by(&tag_metadata, |t| t.metadata.created_at);
+        let last_pulled = rank_by(&tag_metadata, |t| t.pulled_at);
 
         let tags = self.get_deletable_tags(namespace, &tag_metadata, &last_pushed, &last_pulled);
         self.emit_delete_tags(namespace, &tags, sink).await?;
@@ -287,47 +276,6 @@ impl NamespaceChecker for RetentionChecker {
 }
 
 impl RetentionChecker {
-    /// Reads every tag's link metadata, up to `TAG_METADATA_CONCURRENCY` at a
-    /// time.
-    async fn fetch_tag_metadata(
-        &self,
-        namespace: &Namespace,
-    ) -> Result<Vec<TagWithMetadata>, Error> {
-        // The listing resolves each tag, so only the pull history is read.
-        self.metadata_store
-            .stream_live_tags(namespace, None)
-            .err_into::<Error>()
-            .map_ok(|(tag, metadata)| async move {
-                let pulled_at = self
-                    .metadata_store
-                    .read_access_time(namespace, &LinkKind::Tag(tag.clone()))
-                    .await?;
-                Ok(TagWithMetadata {
-                    name: tag,
-                    metadata,
-                    pulled_at,
-                })
-            })
-            .try_buffered(TAG_METADATA_CONCURRENCY)
-            .try_collect()
-            .await
-    }
-
-    /// Ranks tags most recent first, leaving out those carrying no such time.
-    /// A never-pulled tag is not one of the "n most recently pulled", and
-    /// ranking it would make `top_pulled(n)` retain untouched tags forever.
-    fn rank_by(
-        tags: &[TagWithMetadata],
-        key: impl Fn(&TagWithMetadata) -> Option<DateTime<Utc>>,
-    ) -> Vec<String> {
-        let mut ranked: Vec<(Reverse<DateTime<Utc>>, String)> = tags
-            .iter()
-            .filter_map(|t| Some((Reverse(key(t)?), t.name.to_string())))
-            .collect();
-        ranked.sort_by_key(|t| t.0);
-        ranked.into_iter().map(|(_, name)| name).collect()
-    }
-
     fn get_deletable_tags<'a>(
         &self,
         namespace: &Namespace,
@@ -572,7 +520,9 @@ impl RetentionChecker {
 
     /// Pinned by a parent, so reclaimed with it rather than judged on its own:
     /// an index child while the index resolves, or a referrer while its
-    /// subject does.
+    /// subject does. A scan report a newer angos report has superseded is the
+    /// exception: its subject lives on, and the rules judge the old report
+    /// like any untagged manifest.
     async fn is_protected(
         &self,
         namespace: &Namespace,
@@ -600,12 +550,49 @@ impl RetentionChecker {
                 .read_link(namespace, &LinkKind::Digest(subject.clone()))
                 .await
             {
-                Ok(_) => return Ok(true),
+                Ok(_) => {
+                    if !self
+                        .is_superseded_report(namespace, subject, digest)
+                        .await?
+                    {
+                        return Ok(true);
+                    }
+                }
                 Err(RegistryError::NotFound) => {}
                 Err(e) => return Err(e.into()),
             }
         }
         Ok(false)
+    }
+
+    /// Whether `referrer` is a scan report angos attached to `subject` that a
+    /// newer one has superseded. Its own record says whether it is a report
+    /// at all, so only a report pays for listing its siblings.
+    async fn is_superseded_report(
+        &self,
+        namespace: &Namespace,
+        subject: &Digest,
+        referrer: &Digest,
+    ) -> Result<bool, Error> {
+        let link = LinkKind::Referrer {
+            subject: subject.clone(),
+            referrer: referrer.clone(),
+        };
+        let is_report = match self.metadata_store.read_link(namespace, &link).await {
+            Ok(metadata) => metadata
+                .descriptor
+                .is_some_and(|descriptor| is_angos_report(&descriptor)),
+            Err(RegistryError::NotFound) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !is_report {
+            return Ok(false);
+        }
+        let reports = scan_reports(&self.metadata_store, namespace, subject).await?;
+        Ok(reports
+            .iter()
+            .skip(1)
+            .any(|report| report.digest == *referrer))
     }
 
     /// Any index entry matching `predicate` whose backing link still resolves.
@@ -650,7 +637,7 @@ mod tests {
     use url::Url;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-    use angos_oci::{Digest, Namespace};
+    use angos_oci::{Digest, Namespace, Tag};
     use angos_storage::{
         Error as StorageError, ObjectStore,
         test_util::{HookedStore, StoreHook, StoreOp},
@@ -661,6 +648,7 @@ mod tests {
             maintenance::{
                 action::Action,
                 executor::{Executor, RETENTION_ACTOR},
+                tags::TAG_METADATA_CONCURRENCY,
             },
             prune::checker::*,
         },
@@ -674,10 +662,11 @@ mod tests {
         registry::{
             Registry, RegistryConfig,
             blob_store::BlobStore,
+            metadata_store::LinkMetadata,
             repository_resolver::RepositoryResolver,
             test_utils::{
-                self, FSRegistryTestCase, RegistryTestCase, drop_links, for_each_backend,
-                metadata_store_over, put_blob_direct, seed_links,
+                self, FSRegistryTestCase, RegistryTestCase, angos_report, drop_links,
+                for_each_backend, metadata_store_over, put_blob_direct, seed_links,
             },
         },
     };
@@ -770,14 +759,14 @@ mod tests {
             tag_with_times("middle", Some(t2), None),
         ];
 
-        let ranked = RetentionChecker::rank_by(&tags, |t| t.metadata.created_at);
+        let ranked = rank_by(&tags, |t| t.metadata.created_at);
 
         assert_eq!(ranked, vec!["newest", "middle", "oldest"]);
     }
 
     #[test]
     fn rank_by_empty_slice_returns_empty() {
-        let ranked = RetentionChecker::rank_by(&[], |t| t.metadata.created_at);
+        let ranked = rank_by(&[], |t| t.metadata.created_at);
         assert!(ranked.is_empty());
     }
 
@@ -791,7 +780,7 @@ mod tests {
             tag_with_times("beta", Some(pushed), None),
         ];
 
-        let ranked = RetentionChecker::rank_by(&tags, |t| t.metadata.created_at);
+        let ranked = rank_by(&tags, |t| t.metadata.created_at);
 
         assert_eq!(ranked, vec!["beta".to_string()]);
     }
@@ -806,8 +795,8 @@ mod tests {
             tag_with_times("new", Some(t3), None),
         ];
 
-        let last_pushed = RetentionChecker::rank_by(&tags, |t| t.metadata.created_at);
-        let last_pulled = RetentionChecker::rank_by(&tags, |t| t.pulled_at);
+        let last_pushed = rank_by(&tags, |t| t.metadata.created_at);
+        let last_pulled = rank_by(&tags, |t| t.pulled_at);
 
         assert_eq!(last_pushed[0], "new");
         assert_eq!(last_pushed[1], "old");
@@ -826,8 +815,8 @@ mod tests {
             tag_with_times("pulled", Some(pushed), Some(pulled)),
         ];
 
-        let last_pushed = RetentionChecker::rank_by(&tags, |t| t.metadata.created_at);
-        let last_pulled = RetentionChecker::rank_by(&tags, |t| t.pulled_at);
+        let last_pushed = rank_by(&tags, |t| t.metadata.created_at);
+        let last_pulled = rank_by(&tags, |t| t.pulled_at);
 
         assert_eq!(last_pushed.len(), 2);
         assert_eq!(last_pulled, vec!["pulled".to_string()]);
@@ -843,8 +832,8 @@ mod tests {
             tag_with_times("b", Some(pushed_time), Some(pulled_time)),
         ];
 
-        let last_pushed = RetentionChecker::rank_by(&tags, |t| t.metadata.created_at);
-        let last_pulled = RetentionChecker::rank_by(&tags, |t| t.pulled_at);
+        let last_pushed = rank_by(&tags, |t| t.metadata.created_at);
+        let last_pulled = rank_by(&tags, |t| t.pulled_at);
 
         assert_eq!(last_pushed[0], "a");
         assert_eq!(last_pulled[0], "b");
@@ -1274,6 +1263,68 @@ mod tests {
         .await;
     }
 
+    /// Of a live image's scan reports only the newest stays shielded; an
+    /// older one is judged by the rules like any untagged manifest.
+    #[tokio::test]
+    async fn a_superseded_scan_report_is_judged_by_the_rules() {
+        for_each_backend(async |test_case| {
+            let namespace = Namespace::new("test-repo/app").unwrap();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let subject = test_utils::put_blob_body(&blob_store, TEST_MANIFEST).await;
+            let mut reports = Vec::new();
+            for created in ["2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"] {
+                let (body, descriptor) = angos_report(&subject, created);
+                let report = test_utils::put_blob_body(&blob_store, &body).await;
+                // The record is create-if-absent, so the descriptor lands
+                // before the scenario's bare one.
+                metadata_store
+                    .put_referrer(&namespace, &subject, &report, Some(&descriptor))
+                    .await
+                    .unwrap();
+                setup_referrer_scenario(
+                    &metadata_store,
+                    &namespace,
+                    &subject,
+                    &report,
+                    Some(("latest", &subject)),
+                )
+                .await;
+                reports.push(report);
+            }
+
+            let executor = make_executor(blob_store, metadata_store.clone());
+            keep_tagged_checker(test_case)
+                .check(&namespace, &executor)
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(&namespace, &LinkKind::Digest(reports[0].clone()))
+                    .await
+                    .is_err(),
+                "the superseded report is untagged content the rules reclaim"
+            );
+            assert!(
+                metadata_store
+                    .read_link(&namespace, &LinkKind::Digest(reports[1].clone()))
+                    .await
+                    .is_ok(),
+                "the newest report follows its live image"
+            );
+            assert!(
+                metadata_store
+                    .read_link(&namespace, &LinkKind::Digest(subject))
+                    .await
+                    .is_ok(),
+                "the tagged image is retained"
+            );
+        })
+        .await;
+    }
+
     /// A tagged referrer, such as a cosign fallback tag, no longer pins the
     /// untagged image it signs.
     #[tokio::test]
@@ -1654,7 +1705,7 @@ mod tests {
             ),
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
-            scan: false,
+            scan: None,
             index: false,
         }
     }
@@ -2025,14 +2076,9 @@ mod tests {
                 peak: peak.clone(),
             },
         ));
-        let checker = RetentionChecker::new(
-            case.blob_store(),
-            metadata_store_over(hooked),
-            Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap()),
-            None,
-        );
-
-        let tags = checker.fetch_tag_metadata(&namespace).await.unwrap();
+        let tags = live_tags(&metadata_store_over(hooked), &namespace)
+            .await
+            .unwrap();
 
         assert_eq!(tags.len(), links.len(), "every tag must be read");
         let peak = peak.load(Ordering::SeqCst);

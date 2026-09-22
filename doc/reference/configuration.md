@@ -447,7 +447,7 @@ Repository namespace keys must not overlap: a key like `team` and a key like `te
 | `namespace`                 | string   | none     | Registry namespace this repository mirrors (`docker.io`), as a client names it in the `?ns=` proxy parameter. A request naming it is served from this repository whatever path it asks for; see [Upstream Selection](../explanation/pull-through-caching.md#upstream-selection-and-the-ns-parameter) |
 | `immutable_tags`            | bool     | `false`  | Enable immutable tags for this repository. The effective flag is this value OR `global.immutable_tags`, so a repository can add immutability but never opt out of a global `true` |
 | `immutable_tags_exclusions` | [string] | inherits | Replaces the global exclusion list when non-empty |
-| `scan` | bool | `false` | Send each image manifest pushed here, or stored by a cache miss in a pull-through repository, to the scanner service |
+| `scan` | table | - | Send each image manifest pushed here, or stored by a cache miss in a pull-through repository, to the scanner service; see [Scan](#scan-repositorynamespacescan) |
 | `index` | bool | `false` | Index the filesystem of each image manifest pushed here, or stored by a cache miss, as it lands, so the web UI browses it at once; without the flag an image is indexed the first time someone opens its filesystem |
 | `authorization_webhook`     | string   | inherits | Webhook name (empty to disable) |
 | `event_webhooks`            | [string] | inherits | Event webhook names              |
@@ -504,6 +504,16 @@ Same as `global.access_policy`.
 
 Same as `global.retention_policy`.
 
+### Scan (`repository."<namespace>".scan`)
+
+Present, even empty, the repository sends each image manifest pushed here, or stored by a cache miss, to the scanner service. Requires [`global.scan`](#scanning-globalscan).
+
+### Report Refresh (`repository."<namespace>".scan.refresh`)
+
+| Option  | Type     | Default  | Description                                                  |
+|---------|----------|----------|--------------------------------------------------------------|
+| `rules` | [string] | required | The rules this repository's reports are refreshed under, in place of [`global.scan.refresh`](#report-refresh-globalscanrefresh)'s; at least one |
+
 ---
 
 ## Event Webhooks (`event_webhook.<name>`)
@@ -534,7 +544,7 @@ Webhooks are enabled by referencing their names:
 
 ## Scanning (`global.scan`)
 
-The scanner service each `scan = true` repository sends its image pushes to.
+The scanner service each repository with a `scan` table sends its image pushes to.
 
 | Option         | Type   | Default | Description                                                  |
 |----------------|--------|---------|--------------------------------------------------------------|
@@ -542,7 +552,17 @@ The scanner service each `scan = true` repository sends its image pushes to.
 | `token`        | string | -       | Bearer token the service expects, when it checks one         |
 | `timeout_secs` | u64    | `600`   | Bound on one scan request, pull and analysis included        |
 
-A repository opts in with `scan = true`; setting it without `[global.scan]` fails validation. `max_concurrent_scan_jobs` in `[global]` sizes the scan queue's worker pool.
+A repository opts in with a `scan` table; one without `[global.scan]` fails validation. `max_concurrent_scan_jobs` in `[global]` sizes the scan queue's worker pool.
+
+### Report Refresh (`global.scan.refresh`)
+
+Scans an image again once its newest report is due under the rules, when `angos reconcile scan` runs; a CronJob or a timer schedules it. A repository replaces the rules with [`repository."<namespace>".scan.refresh`](#report-refresh-repositorynamespacescanrefresh). See [Scan Images](../how-to/scan-images.md#step-7-refresh-reports-on-a-schedule).
+
+| Option  | Type     | Default | Description                                                  |
+|---------|----------|---------|--------------------------------------------------------------|
+| `rules` | [string] | `[]`    | CEL rules over the [retention variables](cel-expressions.md#retention-policy-variables) and `image.scanned_at`, the time of the image's newest report; the image is scanned again when any is true. Empty, only repositories with rules of their own refresh. `last_pulled_at` and `top_pulled` require `update_pull_time = true` |
+
+A report a newer one supersedes is judged by the retention rules like any untagged manifest; see [Configure Retention Policies](../how-to/configure-retention-policies.md).
 
 ## Scanner Service (`scanner`)
 

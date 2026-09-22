@@ -60,7 +60,7 @@ fn classify(
             let payload: ScanImagePayload = serde_json::from_value(payload)?;
             let configured = resolver
                 .resolve(&payload.namespace)
-                .is_some_and(|repository| repository.scan);
+                .is_some_and(|repository| repository.scan.is_some());
             Ok((!configured).then(|| {
                 format!(
                     "namespace '{}' is not configured for scanning",
@@ -320,7 +320,7 @@ mod tests {
             ),
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
-            scan: false,
+            scan: None,
             index: false,
         }
     }
