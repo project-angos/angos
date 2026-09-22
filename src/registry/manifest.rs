@@ -738,7 +738,7 @@ impl Registry {
         // nothing and so dispatches nothing.
         if changed {
             let applies = |policy: Option<&ImagePolicy>| {
-                policy.is_some_and(|policy| policy.applies_at_push(&written_tags))
+                policy.is_some_and(|policy| policy.applies_at_push(namespace, &written_tags))
             };
             if scan::is_scan_subject(&manifest) && applies(repository.and_then(|r| r.scan.as_ref()))
             {

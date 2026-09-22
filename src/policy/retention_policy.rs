@@ -11,8 +11,8 @@
 //! # Available Variables
 //!
 //! CEL expressions have access to:
-//! - `image`: Manifest information (`tag`, `pushed_at`, `last_pulled_at`,
-//!   `scanned_at`)
+//! - `image`: Manifest information (`namespace`, `tag`, `pushed_at`,
+//!   `last_pulled_at`, `scanned_at`)
 //!
 //! # Helper Functions
 //!
@@ -29,6 +29,8 @@ use cel_interpreter::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use angos_oci::Namespace;
 
 use crate::policy::{CelRule, Error, RuleOutcome, clock::Clock, evaluate_rules};
 
@@ -50,6 +52,7 @@ pub fn rules_use_pull_time(rules: &[CelRule]) -> bool {
 /// Manifest image information used in retention decisions.
 #[derive(Debug, Default, Serialize)]
 pub struct ManifestImage {
+    pub namespace: String,
     pub tag: Option<String>,
     /// Seconds since the Unix epoch, pre-epoch dates saturated to zero.
     pub pushed_at: i64,
@@ -67,12 +70,14 @@ impl ManifestImage {
     /// pull time reaches CEL as `0`.
     #[must_use]
     pub fn new(
+        namespace: &Namespace,
         tag: Option<String>,
         pushed_at: Option<DateTime<Utc>>,
         last_pulled_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Self {
         Self {
+            namespace: namespace.to_string(),
             tag,
             pushed_at: pushed_at.unwrap_or(now).timestamp().max(0),
             last_pulled_at: last_pulled_at.map_or(0, |t| t.timestamp().max(0)),
@@ -259,6 +264,26 @@ mod tests {
         policy_with_clock(rules, Arc::new(FixedClock(now)))
     }
 
+    fn ns() -> Namespace {
+        Namespace::new("app").unwrap()
+    }
+
+    #[test]
+    fn namespace_is_exposed_to_rules() {
+        let policy = policy(&["image.namespace.startsWith('prod/')"]);
+        let image = |namespace: &str| {
+            ManifestImage::new(
+                &Namespace::new(namespace).unwrap(),
+                None,
+                None,
+                None,
+                Utc::now(),
+            )
+        };
+        assert!(policy.should_retain(&image("prod/api"), &[], &[]).unwrap());
+        assert!(!policy.should_retain(&image("dev/api"), &[], &[]).unwrap());
+    }
+
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
     }
@@ -387,7 +412,7 @@ mod tests {
     #[test]
     fn negative_timestamp_saturates_to_zero() {
         let pre_epoch = DateTime::from_timestamp(-100, 0).unwrap();
-        let image = ManifestImage::new(None, Some(pre_epoch), Some(pre_epoch), fixed_now());
+        let image = ManifestImage::new(&ns(), None, Some(pre_epoch), Some(pre_epoch), fixed_now());
         assert_eq!((image.pushed_at, image.last_pulled_at), (0, 0));
     }
 
@@ -566,7 +591,7 @@ mod tests {
     fn absent_timestamps_resolve_to_now_and_zero() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
-        let never_pulled = ManifestImage::new(None, None, None, now);
+        let never_pulled = ManifestImage::new(&ns(), None, None, None, now);
         assert_eq!(
             never_pulled.last_pulled_at, 0,
             "never pulled must be an absence, not a timestamp at the epoch"
@@ -577,8 +602,14 @@ mod tests {
 
         let pushed = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
         let pulled = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
-        let known = serde_json::to_value(ManifestImage::new(None, Some(pushed), Some(pulled), now))
-            .unwrap();
+        let known = serde_json::to_value(ManifestImage::new(
+            &ns(),
+            None,
+            Some(pushed),
+            Some(pulled),
+            now,
+        ))
+        .unwrap();
         assert_eq!(known["pushed_at"], pushed.timestamp());
         assert_eq!(known["last_pulled_at"], pulled.timestamp());
     }

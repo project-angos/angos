@@ -188,7 +188,6 @@ async fn sweep_grants_for_blob(ctx: &GrantSweep<'_>, blob: &Digest) -> Result<()
         Err(RegistryError::NotFound) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    let subject = ManifestImage::new(None, Some(last_modified), None, Utc::now());
     let grant = LinkKind::Blob(blob.clone());
     for (namespace, links) in index {
         // An unresolved namespace is being cleared by the orphan-namespace
@@ -227,6 +226,7 @@ async fn sweep_grants_for_blob(ctx: &GrantSweep<'_>, blob: &Digest) -> Result<()
         {
             continue;
         }
+        let subject = ManifestImage::new(&namespace, None, Some(last_modified), None, ctx.now);
         let global = check_policy(ctx.global_policy, &subject, &[], &[])?;
         let repo = check_policy(repository_policy(repository), &subject, &[], &[])?;
         if policies_retain(&global, &repo) {
@@ -335,6 +335,7 @@ impl RetentionChecker {
         debug!("'{namespace}': Checking tag '{}' for retention", tag.name);
 
         let manifest = ManifestImage::new(
+            namespace,
             Some(tag.name.to_string()),
             tag.metadata.created_at,
             tag.pulled_at,
@@ -451,6 +452,7 @@ impl RetentionChecker {
                         .read_access_time(namespace, &LinkKind::Digest(digest.clone()))
                         .await?;
                     Some(ManifestImage::new(
+                        namespace,
                         None,
                         metadata.created_at,
                         pulled_at,
@@ -1657,7 +1659,13 @@ mod tests {
     }
 
     fn make_manifest(tag: &Tag) -> ManifestImage {
-        ManifestImage::new(Some(tag.to_string()), None, None, DateTime::UNIX_EPOCH)
+        ManifestImage::new(
+            &Namespace::new("app").unwrap(),
+            Some(tag.to_string()),
+            None,
+            None,
+            DateTime::UNIX_EPOCH,
+        )
     }
 
     #[test]
@@ -1747,7 +1755,13 @@ mod tests {
     /// An image with no push or pull time, the shape a revision record with
     /// no `created_at` resolves to.
     fn dummy_image() -> ManifestImage {
-        ManifestImage::new(None, None, None, Utc::now())
+        ManifestImage::new(
+            &Namespace::new("app").unwrap(),
+            None,
+            None,
+            None,
+            Utc::now(),
+        )
     }
 
     #[test]
