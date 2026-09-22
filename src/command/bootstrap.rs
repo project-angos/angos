@@ -196,6 +196,8 @@ mod tests {
 
     use wiremock::MockServer;
 
+    use angos_oci::Namespace;
+
     use crate::{
         command::bootstrap::{Error, repositories},
         command::maintenance::Error as MaintenanceError,
@@ -285,7 +287,7 @@ mod tests {
             resolver
                 .get(name)
                 .and_then(|r| r.index.as_ref())
-                .is_some_and(|policy| policy.applies_at_push(&[]))
+                .is_some_and(|policy| policy.applies_at_push(&Namespace::new(name).unwrap(), &[]))
         };
         let resolver = repositories(&configs, &cache, &global).await.unwrap();
         assert!(indexes(&resolver, "plain"), "the global policy applies");

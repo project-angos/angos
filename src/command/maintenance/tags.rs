@@ -109,7 +109,7 @@ impl Rankings {
         let image = |tag: Option<String>,
                      pushed_at: Option<DateTime<Utc>>,
                      pulled_at: Option<DateTime<Utc>>| {
-            let mut image = ManifestImage::new(tag, pushed_at, pulled_at, now);
+            let mut image = ManifestImage::new(namespace, tag, pushed_at, pulled_at, now);
             image.scanned_at = scanned_at;
             image
         };

@@ -571,26 +571,27 @@ fn a_policy_default_decides_and_a_rule_flips_it() {
     };
     let latest = [Tag::new("latest").unwrap()];
     let v1 = [Tag::new("v1").unwrap()];
-    assert!(policy(Some(ScanAction::Scan), &[]).applies_at_push(&[]));
-    assert!(!policy(Some(ScanAction::Skip), &[]).applies_at_push(&[]));
+    let ns = Namespace::new("app").unwrap();
+    assert!(policy(Some(ScanAction::Scan), &[]).applies_at_push(&ns, &[]));
+    assert!(!policy(Some(ScanAction::Skip), &[]).applies_at_push(&ns, &[]));
     assert!(
-        !policy(None, &[]).applies_at_push(&latest),
+        !policy(None, &[]).applies_at_push(&ns, &latest),
         "no default is skip"
     );
 
     let scan_latest = policy(None, &["image.tag == 'latest'"]);
-    assert!(scan_latest.applies_at_push(&latest));
-    assert!(!scan_latest.applies_at_push(&v1));
+    assert!(scan_latest.applies_at_push(&ns, &latest));
+    assert!(!scan_latest.applies_at_push(&ns, &v1));
     assert!(
-        !policy(Some(ScanAction::Scan), &["image.tag == 'latest'"]).applies_at_push(&latest),
+        !policy(Some(ScanAction::Scan), &["image.tag == 'latest'"]).applies_at_push(&ns, &latest),
         "with a scanning default a matching rule skips"
     );
     assert!(
-        policy(None, &["image.scanned_at < now() - days(30)"]).applies_at_push(&v1),
+        policy(None, &["image.scanned_at < now() - days(30)"]).applies_at_push(&ns, &v1),
         "a fresh image was never scanned"
     );
     assert!(
-        policy(Some(ScanAction::Skip), &["image.tag.size() > 3"]).applies_at_push(&[]),
+        policy(Some(ScanAction::Skip), &["image.tag.size() > 3"]).applies_at_push(&ns, &[]),
         "a rule that cannot be evaluated applies the policy"
     );
 

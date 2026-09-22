@@ -7,7 +7,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tracing::warn;
 
-use angos_oci::Tag;
+use angos_oci::{Namespace, Tag};
 
 use crate::policy::{
     ManifestImage, PolicyConfig, RetentionPolicy, RetentionPolicyConfig, RuleOutcome, SystemClock,
@@ -62,14 +62,18 @@ impl ImagePolicy {
     /// The decision for a manifest as it lands: pushed now, never pulled,
     /// never scanned, judged under each of `tags` in turn or untagged with
     /// none, the pushed tags being the whole push ranking.
-    pub fn applies_at_push(&self, tags: &[Tag]) -> bool {
+    pub fn applies_at_push(&self, namespace: &Namespace, tags: &[Tag]) -> bool {
         let now = Utc::now();
         if tags.is_empty() {
-            return self.applies(&ManifestImage::new(None, Some(now), None, now), &[], &[]);
+            return self.applies(
+                &ManifestImage::new(namespace, None, Some(now), None, now),
+                &[],
+                &[],
+            );
         }
         let ranking: Vec<String> = tags.iter().map(ToString::to_string).collect();
         tags.iter().any(|tag| {
-            let image = ManifestImage::new(Some(tag.to_string()), Some(now), None, now);
+            let image = ManifestImage::new(namespace, Some(tag.to_string()), Some(now), None, now);
             self.applies(&image, &ranking, &[])
         })
     }

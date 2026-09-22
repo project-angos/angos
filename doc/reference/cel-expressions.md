@@ -134,6 +134,7 @@ Information about the manifest being evaluated.
 
 | Variable               | Type        | Description                        |
 |------------------------|-------------|------------------------------------|
+| `image.namespace`      | string      | Namespace of the manifest, e.g. `team/app` |
 | `image.tag`            | string/null | Tag name, or null if untagged      |
 | `image.pushed_at`      | int         | Push time (seconds since epoch)    |
 | `image.last_pulled_at` | int         | Last pull time (0 if never pulled) |
@@ -230,6 +231,9 @@ image.last_pulled_at > now() - days(7)
 
 // Keep latest tag
 image.tag == 'latest'
+
+// Keep production images for 90 days
+image.namespace.startsWith('prod/') && image.pushed_at > now() - days(90)
 
 // Keep semantic version tags
 image.tag != null && image.tag.matches('^v?[0-9]+\\.[0-9]+\\.[0-9]+$')
