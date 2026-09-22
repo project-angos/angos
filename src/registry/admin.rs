@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    num::NonZeroU16,
 };
 
 use chrono::{DateTime, Utc};
@@ -33,9 +34,9 @@ use crate::{
     },
 };
 
-/// Most pull-history entries one listing returns; the directory is unbounded,
-/// so the newest page is all the UI gets.
-const PULL_HISTORY_PAGE: u16 = 100;
+/// Pull-history entries a page returns when the request names no `n`; the
+/// `unwrap` is const-evaluated.
+const PULL_HISTORY_PAGE: NonZeroU16 = NonZeroU16::new(100).unwrap();
 
 /// Bounds the per-namespace stat fan-out so a repository with many namespaces
 /// does not open one request per namespace at once.
@@ -363,26 +364,38 @@ impl Registry {
         let ListPullsRequest {
             namespace,
             reference,
+            offset,
+            n,
         } = request;
-        let entries = self
+        let n = n.unwrap_or(PULL_HISTORY_PAGE);
+        let (entries, more) = self
             .metadata_store
             .read_access_entries(
                 &namespace,
                 &LinkKind::from_reference(&reference),
-                PULL_HISTORY_PAGE,
+                usize::try_from(offset).unwrap_or(usize::MAX),
+                usize::from(n.get()),
             )
-            .await?
+            .await?;
+        let next =
+            more.then(|| offset.saturating_add(u32::try_from(entries.len()).unwrap_or(u32::MAX)));
+        let entries = entries
             .into_iter()
             .map(|entry| AccessEntry {
                 client: entry.client,
+                client_ip: entry.client_ip,
+                method: entry.method,
                 at: entry.at,
             })
             .collect();
 
+        let retention = self.metadata_store.atime_retention;
         Ok(PullsBody {
             target: reference.to_string(),
-            window_secs: self.metadata_store.atime_audit_window_secs,
+            limit: retention.history_limit.get(),
+            max_age_secs: retention.history_max_age_secs,
             entries,
+            next,
         })
     }
 
@@ -1570,6 +1583,8 @@ mod tests {
     ) {
         let body = serde_json::to_vec(&AccessEntry {
             client: client.to_string(),
+            client_ip: None,
+            method: None,
             at,
         })
         .unwrap();
@@ -1584,7 +1599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_history_lists_a_tag_newest_first_with_the_configured_window() {
+    async fn pull_history_lists_a_tag_newest_first_with_the_configured_limit() {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -1618,6 +1633,8 @@ mod tests {
                 .handle_list_pulls(ListPullsRequest {
                     namespace: namespace.clone(),
                     reference: Reference::Tag(tag.clone()),
+                    offset: 0,
+                    n: None,
                 })
                 .await
                 .unwrap()
@@ -1626,7 +1643,8 @@ mod tests {
             let body = response_json(response).await;
 
             assert_eq!(body["target"], "v1");
-            assert_eq!(body["window_secs"], 3600);
+            assert_eq!(body["limit"], 1000);
+            assert!(body.get("next").is_none(), "one page holds both pulls");
             let clients: Vec<&str> = body["entries"]
                 .as_array()
                 .unwrap()
@@ -1943,6 +1961,8 @@ mod tests {
                 .handle_list_pulls(ListPullsRequest {
                     namespace: namespace.clone(),
                     reference: Reference::Digest(target.clone()),
+                    offset: 0,
+                    n: None,
                 })
                 .await
                 .unwrap()
@@ -1967,6 +1987,8 @@ mod tests {
                 .handle_list_pulls(ListPullsRequest {
                     namespace: Namespace::new("test-repo/quiet").unwrap(),
                     reference: Reference::Tag(Tag::new("never").unwrap()),
+                    offset: 0,
+                    n: None,
                 })
                 .await
                 .unwrap()

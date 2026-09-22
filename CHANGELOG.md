@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `image.namespace` joins the CEL variables of the retention, scan and index policies.
+- Scrub packs old pull history into compacted chunks instead of deleting it, keeping up to `[global] atime_audit_history_limit` pulls per target (default 1000), optionally bounded in age by `atime_audit_history_max_age_secs`.
+- `[global] atime_audit_max_entries` packs live pull entries past a count, alone or alongside `atime_audit_window_secs`.
+- The pulls endpoint pages with `offset` and `n`, and the web UI loads older pulls on demand.
+- The pull history records the client's IP address and how it authenticated (`basic`, `token`, `oidc`, `kubernetes`, `mtls`, `internal` or `anonymous`), which the web UI shows in an address column and as a pill beside the client; pulls recorded before the upgrade carry neither.
+
+### Changed
+
+- The pulls endpoint reports the history bounds as `limit` and `max_age_secs` in place of `window_secs`.
+
+### Fixed
+
+- The pull history names OIDC and mTLS callers where it recorded them as `anonymous`: a Kubernetes service account as `<provider>:<namespace>/<service account>`, another OIDC token as `<provider>:<email, preferred_username or sub>`, and a client certificate by its common name. Webhook payloads are unchanged.
 
 ## 1.11.0
 

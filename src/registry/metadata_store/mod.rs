@@ -5,7 +5,7 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     sync::Arc,
 };
 
@@ -132,9 +132,9 @@ pub struct MetadataStore {
     /// live, and how long a collector's range marker outlives its last
     /// refresh. Writers and collectors over the same store share the value.
     pub gc_grace_secs: u64,
-    /// How long superseded access entries are kept as pull history before
-    /// scrub collects them.
-    pub atime_audit_window_secs: u64,
+    /// Which superseded access entries scrub compacts, and how many pulls the
+    /// history keeps.
+    pub atime_retention: AtimeRetention,
     /// How long a released reclamation marker keeps blocking writers.
     release_linger_ms: i64,
 }
@@ -150,6 +150,34 @@ pub const DEFAULT_GC_GRACE_SECS: u64 = 300;
 /// Default retention for superseded access entries.
 pub const DEFAULT_ATIME_AUDIT_WINDOW_SECS: u64 = 3600;
 
+/// Default number of pulls a target's history keeps and serves; the `unwrap`
+/// is const-evaluated.
+pub const DEFAULT_ATIME_AUDIT_HISTORY_LIMIT: NonZeroU32 = NonZeroU32::new(1000).unwrap();
+
+/// How a target's pull history is kept. A superseded access entry older than
+/// `window_secs` or ranked past `max_entries`, whichever is set, is packed
+/// into a compacted chunk; the newest entry never is. At most `history_limit`
+/// pulls are served, and compacted pulls past it or older than
+/// `history_max_age_secs` are dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AtimeRetention {
+    pub window_secs: Option<u64>,
+    pub max_entries: Option<NonZeroU32>,
+    pub history_limit: NonZeroU32,
+    pub history_max_age_secs: Option<u64>,
+}
+
+impl Default for AtimeRetention {
+    fn default() -> Self {
+        Self {
+            window_secs: Some(DEFAULT_ATIME_AUDIT_WINDOW_SECS),
+            max_entries: None,
+            history_limit: DEFAULT_ATIME_AUDIT_HISTORY_LIMIT,
+            history_max_age_secs: None,
+        }
+    }
+}
+
 /// Default linger of a released reclamation marker, which has to outlast a
 /// writer's whole backoff budget plus one listing.
 pub const DEFAULT_RELEASE_LINGER_MS: i64 = 5_000;
@@ -164,8 +192,8 @@ pub struct Settings {
     /// The reclamation grace period, in seconds; tests and offline maintenance
     /// runs shrink it to exercise reclamation immediately.
     pub gc_grace_secs: u64,
-    /// How long superseded access entries are retained as pull history.
-    pub atime_audit_window_secs: u64,
+    /// Which superseded access entries scrub compacts.
+    pub atime_retention: AtimeRetention,
     /// How long a released reclamation marker keeps blocking writers; tests
     /// shrink it so they do not sleep out the real one.
     pub release_linger_ms: i64,
@@ -176,7 +204,7 @@ impl Default for Settings {
         Self {
             namespace_walk_concurrency: pagination::NAMESPACE_WALK_CONCURRENCY,
             gc_grace_secs: DEFAULT_GC_GRACE_SECS,
-            atime_audit_window_secs: DEFAULT_ATIME_AUDIT_WINDOW_SECS,
+            atime_retention: AtimeRetention::default(),
             release_linger_ms: DEFAULT_RELEASE_LINGER_MS,
         }
     }
@@ -191,7 +219,7 @@ impl MetadataStore {
             object,
             namespace_walk_concurrency: settings.namespace_walk_concurrency,
             gc_grace_secs: settings.gc_grace_secs,
-            atime_audit_window_secs: settings.atime_audit_window_secs,
+            atime_retention: settings.atime_retention,
             release_linger_ms: settings.release_linger_ms,
         }
     }

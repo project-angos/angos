@@ -8,6 +8,8 @@
 //! `_angos/ui/config` path is intentionally *not* claimed: it is the host's UI
 //! concern, not part of this service.
 
+use std::num::NonZeroU16;
+
 use http::Method;
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -32,10 +34,12 @@ pub enum Endpoint {
     ListRevisions { namespace: Namespace },
     /// `GET /v2/<name>/_angos/uploads/list`.
     ListUploads { namespace: Namespace },
-    /// `GET /v2/<name>/_angos/pulls/list?tag=|digest=`.
+    /// `GET /v2/<name>/_angos/pulls/list?tag=|digest=&offset=&n=`.
     ListPulls {
         namespace: Namespace,
         reference: Reference,
+        offset: u32,
+        n: Option<NonZeroU16>,
     },
     /// `GET /v2/<name>/_angos/layers/<digest>/entries`.
     ListLayerEntries {
@@ -211,10 +215,20 @@ fn repository_extension(
     match path {
         "revisions/list" => Some(Endpoint::ListRevisions { namespace }),
         "uploads/list" => Some(Endpoint::ListUploads { namespace }),
-        "pulls/list" => Some(Endpoint::ListPulls {
-            namespace,
-            reference: parse_pulls_reference(params)?,
-        }),
+        "pulls/list" => {
+            let PullsQuery {
+                tag,
+                digest,
+                offset,
+                n,
+            } = parse_query(params)?;
+            Some(Endpoint::ListPulls {
+                namespace,
+                reference: pulls_reference(tag, digest)?,
+                offset: offset.unwrap_or(0),
+                n,
+            })
+        }
         _ => None,
     }
 }
@@ -229,12 +243,13 @@ struct LayerFileQuery {
 struct PullsQuery {
     tag: Option<Tag>,
     digest: Option<Digest>,
+    offset: Option<u32>,
+    n: Option<NonZeroU16>,
 }
 
-/// Parses `?tag=`/`?digest=` strictly: an unparseable or ambiguous target is
+/// Takes `?tag=`/`?digest=` strictly: an unparseable or ambiguous target is
 /// refused rather than silently narrowed to one of the two.
-fn parse_pulls_reference(params: Option<&str>) -> Option<Reference> {
-    let PullsQuery { tag, digest } = parse_query(params)?;
+fn pulls_reference(tag: Option<Tag>, digest: Option<Digest>) -> Option<Reference> {
     match (tag, digest) {
         (Some(tag), None) => Some(Reference::Tag(tag)),
         (None, Some(digest)) => Some(Reference::Digest(digest)),
@@ -353,9 +368,12 @@ mod tests {
             Some(Endpoint::ListPulls {
                 namespace,
                 reference,
+                offset,
+                n,
             }) => {
                 assert_eq!(namespace, "myrepo/app");
                 assert_eq!(reference.to_string(), "v1");
+                assert_eq!((offset, n), (0, None));
             }
             other => panic!("expected ListPulls, got {other:?}"),
         }
@@ -368,6 +386,16 @@ mod tests {
         ) {
             Some(Endpoint::ListPulls { reference, .. }) => {
                 assert_eq!(reference.to_string(), digest);
+            }
+            other => panic!("expected ListPulls, got {other:?}"),
+        }
+        match parse(
+            &Method::GET,
+            "/v2/myrepo/_angos/pulls/list",
+            Some("tag=v1&offset=200&n=50"),
+        ) {
+            Some(Endpoint::ListPulls { offset, n, .. }) => {
+                assert_eq!((offset, n), (200, NonZeroU16::new(50)));
             }
             other => panic!("expected ListPulls, got {other:?}"),
         }
@@ -386,6 +414,8 @@ mod tests {
             Some("tag=-bad"),
             Some("digest=sha256:nothex"),
             Some("tag="),
+            // An empty page would name itself as the next one.
+            Some("tag=v1&n=0"),
         ] {
             assert!(
                 parse(&Method::GET, "/v2/myrepo/_angos/pulls/list", query).is_none(),

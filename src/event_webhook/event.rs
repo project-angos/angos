@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use angos_oci::{Digest, Namespace, Reference, Tag};
 
-use crate::identity::ClientIdentity;
+use crate::identity::{ClientIdentity, OidcClaims};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -38,7 +38,7 @@ impl EventKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct EventActor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -52,6 +52,10 @@ pub struct EventActor {
     /// from each other.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub internal: Option<String>,
+    /// The credential that named this caller and who it names, for the pull
+    /// history. Not serialized: the webhook payload keeps its fields.
+    #[serde(skip)]
+    pub principal: Option<(&'static str, String)>,
 }
 
 impl EventActor {
@@ -62,6 +66,7 @@ impl EventActor {
             username: None,
             client_ip: None,
             internal: Some(process.to_string()),
+            principal: None,
         }
     }
 
@@ -71,26 +76,71 @@ impl EventActor {
         self.internal.is_none()
     }
 
-    /// The name access-time audit entries record for this actor: the
-    /// username, else the token id, else the internal process name.
+    /// The name access-time audit entries record for this actor: who its
+    /// credential names, else the internal process name.
     pub fn audit_name(&self) -> &str {
-        self.username
-            .as_deref()
-            .or(self.id.as_deref())
+        self.principal
+            .as_ref()
+            .map(|(_, name)| name.as_str())
             .or(self.internal.as_deref())
             .unwrap_or("anonymous")
+    }
+
+    /// How the actor [`Self::audit_name`] names authenticated.
+    pub fn audit_method(&self) -> &'static str {
+        match (&self.principal, &self.internal) {
+            (Some((method, _)), _) => method,
+            (None, Some(_)) => "internal",
+            (None, None) => "anonymous",
+        }
     }
 }
 
 impl From<ClientIdentity> for EventActor {
     fn from(identity: ClientIdentity) -> Self {
+        // Only basic auth and registry tokens carry a username or id.
+        let named = if identity.from_registry_token {
+            "token"
+        } else {
+            "basic"
+        };
+        let principal = identity
+            .username
+            .clone()
+            .or_else(|| identity.id.clone())
+            .map(|name| (named, name))
+            .or_else(|| identity.oidc.as_ref().and_then(oidc_principal))
+            .or_else(|| {
+                let cn = identity.certificate.common_names.first()?;
+                Some(("mtls", cn.clone()))
+            });
         Self {
             id: identity.id,
             username: identity.username,
             client_ip: identity.client_ip,
             internal: None,
+            principal,
         }
     }
+}
+
+/// `<provider>:<namespace>/<service account>` for a Kubernetes service
+/// account token, else `<provider>:<who>`, preferring a human-readable claim
+/// over the often opaque `sub`.
+fn oidc_principal(oidc: &OidcClaims) -> Option<(&'static str, String)> {
+    let claim = |name: &str| oidc.claims.get(name).and_then(serde_json::Value::as_str);
+    let provider = &oidc.provider_name;
+    let sub = claim("sub")?;
+    if let Some((namespace, account)) = sub
+        .strip_prefix("system:serviceaccount:")
+        .and_then(|rest| rest.split_once(':'))
+    {
+        return Some(("kubernetes", format!("{provider}:{namespace}/{account}")));
+    }
+    let who = claim("email")
+        .or_else(|| claim("preferred_username"))
+        .unwrap_or(sub);
+    Some(("oidc", format!("{provider}:{who}")))
 }
 
 /// What an event names. The kind picks the variant, so an event carries
@@ -338,7 +388,7 @@ mod tests {
 
     use crate::{
         event_webhook::event::{Event, EventActor, EventKind, EventSubject},
-        identity::ClientIdentity,
+        identity::{ClientIdentity, OidcClaims},
     };
 
     const FIXTURE_DIGEST: &str =
@@ -369,6 +419,62 @@ mod tests {
         assert_eq!(actor.username, None);
         assert_eq!(actor.client_ip, None);
         assert_eq!(actor.internal, None);
+    }
+
+    fn oidc_identity(claims: serde_json::Value) -> ClientIdentity {
+        ClientIdentity {
+            oidc: Some(OidcClaims {
+                provider_name: "cluster".to_string(),
+                claims: serde_json::from_value(claims).unwrap(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn audit_name_labels_credentials_without_a_username() {
+        let name = |identity| {
+            let actor = EventActor::from(identity);
+            format!("{} {}", actor.audit_method(), actor.audit_name())
+        };
+
+        let k8s = oidc_identity(serde_json::json!({
+            "sub": "system:serviceaccount:ci:builder",
+            "email": "ignored@example.com",
+        }));
+        assert_eq!(name(k8s), "kubernetes cluster:ci/builder");
+
+        let human = oidc_identity(serde_json::json!({ "sub": "42", "email": "a@example.com" }));
+        assert_eq!(name(human), "oidc cluster:a@example.com");
+
+        let bare = oidc_identity(serde_json::json!({ "sub": "repo:org/app:ref:main" }));
+        assert_eq!(name(bare), "oidc cluster:repo:org/app:ref:main");
+
+        let mut cert = ClientIdentity::default();
+        cert.certificate.common_names = vec!["node-1".to_string()];
+        assert_eq!(name(cert), "mtls node-1");
+
+        let mut named = oidc_identity(serde_json::json!({ "sub": "42" }));
+        named.username = Some("alice".to_string());
+        assert_eq!(name(named), "basic alice");
+
+        let token = ClientIdentity {
+            username: Some("bob".to_string()),
+            from_registry_token: true,
+            ..Default::default()
+        };
+        assert_eq!(name(token), "token bob");
+
+        assert_eq!(name(ClientIdentity::default()), "anonymous anonymous");
+        let internal = EventActor::internal("cache");
+        assert_eq!(internal.audit_method(), "internal");
+        assert_eq!(internal.audit_name(), "cache");
+    }
+
+    #[test]
+    fn principal_stays_out_of_the_webhook_payload() {
+        let actor = EventActor::from(oidc_identity(serde_json::json!({ "sub": "42" })));
+        assert_eq!(serde_json::to_value(&actor).unwrap(), serde_json::json!({}));
     }
 
     #[test]

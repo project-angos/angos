@@ -263,6 +263,7 @@ impl From<&Route> for Action {
                 AngosEndpoint::ListPulls {
                     namespace,
                     reference,
+                    ..
                 } => Action::ListPulls {
                     namespace: namespace.clone(),
                     reference: reference.clone(),

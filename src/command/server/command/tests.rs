@@ -194,7 +194,7 @@ async fn test_build_registry_components_integration() {
         &config.resolve_registry_storage(),
         config.global.namespace_walk_concurrency,
         config.global.gc_grace_secs,
-        config.global.atime_audit_window_secs,
+        config.global.atime_retention(),
     )
     .unwrap();
     let repositories = bootstrap::repositories(&config.repository, &auth_cache, &config.global)

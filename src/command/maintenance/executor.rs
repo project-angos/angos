@@ -10,7 +10,7 @@ use angos_storage::{Error as StorageError, ObjectStore};
 
 use crate::{
     command::maintenance::{
-        action::{Action, LOST_AND_FOUND_PREFIX, WalkedStore},
+        action::{Action, AtimeCompaction, LOST_AND_FOUND_PREFIX, WalkedStore},
         error::Error,
     },
     event_webhook::event::EventActor,
@@ -653,6 +653,20 @@ impl Executor {
         Ok(())
     }
 
+    /// Store the chunk before retiring the entries it packs, so a run that
+    /// fails midway never loses a pull.
+    async fn compact_atime(&self, compaction: AtimeCompaction) -> Result<(), Error> {
+        let AtimeCompaction { chunk, retired } = compaction;
+        let store = self.metadata_store.object_store();
+        if let Some((key, body)) = chunk {
+            store.put(&key, body).await.map_err(RegistryError::from)?;
+        }
+        for key in retired {
+            store.delete(&key).await.map_err(RegistryError::from)?;
+        }
+        Ok(())
+    }
+
     /// Delete an exact walked key: an expected-shape object with unreadable
     /// content, or an unrecognized key under `--delete-unknown`.
     async fn delete_walked_key(&self, store: WalkedStore, key: String) -> Result<(), Error> {
@@ -766,9 +780,7 @@ impl ActionSink for Executor {
             Action::QuarantineKey { store, key } => self.quarantine_key(store, key).await,
             Action::DeleteCorruptObject { store, key }
             | Action::DeleteUnknownKey { store, key } => self.delete_walked_key(store, key).await,
-            Action::RetireAtimeKey { key } => {
-                self.delete_walked_key(WalkedStore::Metadata, key).await
-            }
+            Action::CompactAtime(compaction) => self.compact_atime(compaction).await,
         }
     }
 }

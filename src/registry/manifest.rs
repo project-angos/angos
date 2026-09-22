@@ -264,7 +264,8 @@ impl Registry {
         actor: Option<EventActor>,
         request: HeadManifestRequest,
     ) -> Result<ManifestDescriptor, Error> {
-        let client = actor.as_ref().map_or("anonymous", EventActor::audit_name);
+        let anonymous = EventActor::default();
+        let client = actor.as_ref().unwrap_or(&anonymous);
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
         match repository.filter(|repository| repository.is_pull_through()) {
             Some(upstream) => {
@@ -284,7 +285,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         reference: &Reference,
-        client: &str,
+        client: &EventActor,
     ) -> Result<ManifestDescriptor, Error> {
         let meta = self
             .head_local_manifest(namespace, reference)
@@ -302,7 +303,7 @@ impl Registry {
         upstream: &Repository,
         request: &HeadManifestRequest,
         is_tag_immutable: bool,
-        client: &str,
+        client: &EventActor,
     ) -> Result<ManifestDescriptor, Error> {
         let local = self
             .head_local_manifest(&request.namespace, &request.reference)
@@ -369,7 +370,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         link: &LinkKind,
-        client: &str,
+        client: &EventActor,
     ) -> Result<LinkMetadata, Error> {
         let metadata = self.metadata_store.read_link(namespace, link).await?;
         self.record_manifest_pull(namespace, link, client).await?;
@@ -385,13 +386,19 @@ impl Registry {
         &self,
         namespace: &Namespace,
         link: &LinkKind,
-        client: &str,
+        client: &EventActor,
     ) -> Result<(), Error> {
         if !self.update_pull_time {
             return Ok(());
         }
         self.metadata_store
-            .put_access_entry(namespace, link, client)
+            .put_access_entry(
+                namespace,
+                link,
+                client.audit_name(),
+                client.client_ip.as_deref(),
+                Some(client.audit_method()),
+            )
             .await
     }
 
@@ -441,7 +448,7 @@ impl Registry {
         namespace: &Namespace,
         reference: Reference,
         is_tag_immutable: bool,
-        client: &str,
+        client: &EventActor,
     ) -> Result<ManifestGet, Error> {
         let request = GetManifestRequest {
             namespace: namespace.clone(),
@@ -463,7 +470,7 @@ impl Registry {
         &self,
         request: &GetManifestRequest,
         allow_redirect: bool,
-        client: &str,
+        client: &EventActor,
     ) -> Result<ManifestGet, Error> {
         let GetManifestRequest {
             namespace,
@@ -494,7 +501,7 @@ impl Registry {
         request: &GetManifestRequest,
         is_tag_immutable: bool,
         allow_redirect: bool,
-        client: &str,
+        client: &EventActor,
     ) -> Result<ManifestGet, Error> {
         let GetManifestRequest {
             namespace,
@@ -583,7 +590,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         reference: &Reference,
-        client: &str,
+        client: &EventActor,
     ) -> Result<ManifestGet, Error> {
         let blob_link = LinkKind::from_reference(reference);
         let link = self
@@ -1047,7 +1054,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         reference: &Reference,
-        client: &str,
+        client: &EventActor,
     ) -> Result<Option<ManifestGet>, Error> {
         let blob_link = LinkKind::from_reference(reference);
         // Read without stamping: this probe abandons the redirect on a backend
@@ -1088,7 +1095,8 @@ impl Registry {
         request: GetManifestRequest,
         allow_redirect: bool,
     ) -> Result<ManifestGet, Error> {
-        let client = actor.as_ref().map_or("anonymous", EventActor::audit_name);
+        let anonymous = EventActor::default();
+        let client = actor.as_ref().unwrap_or(&anonymous);
         let repository = self.get_repository_for_namespace(&request.namespace).ok();
         let repository_name = repository_name(repository);
 
@@ -1819,7 +1827,7 @@ mod tests {
                     namespace,
                     Reference::Tag(Tag::new(tag).unwrap()),
                     false,
-                    "test-client",
+                    &EventActor::default(),
                 )
                 .await
                 .unwrap();
@@ -2292,7 +2300,7 @@ mod tests {
                 &attacker,
                 Reference::Digest(child_digest.clone()),
                 false,
-                "test-client",
+                &EventActor::default(),
             )
             .await
             .map(|_| ());
@@ -2354,7 +2362,7 @@ mod tests {
                 &namespace,
                 Reference::Tag(Tag::new("latest").unwrap()),
                 false,
-                "test-client",
+                &EventActor::default(),
             )
             .await
             .expect("the pushed manifest must be pullable by tag");
@@ -2432,7 +2440,7 @@ mod tests {
                 &namespace,
                 Reference::Tag(Tag::new("latest").unwrap()),
                 false,
-                "test-client",
+                &EventActor::default(),
             )
             .await
             .expect("an upstream omitting Docker-Content-Digest must not fail the pull");
@@ -2497,7 +2505,7 @@ mod tests {
                     &namespace,
                     Reference::Tag(Tag::new("latest").unwrap()),
                     immutable_tag,
-                    "test-client",
+                    &EventActor::default(),
                 )
                 .await
                 .expect("the pull must be served")
@@ -2568,7 +2576,7 @@ mod tests {
                 &namespace,
                 Reference::Digest(requested.clone()),
                 false,
-                "test-client",
+                &EventActor::default(),
             )
             .await
             .expect("a by-digest pull must survive a missing Docker-Content-Digest");
@@ -2634,7 +2642,7 @@ mod tests {
                 namespace,
                 Reference::Tag(tag),
                 false,
-                "test-client",
+                &EventActor::default(),
             )
             .await
             .expect("the aborted delete must leave the tag resolvable");
@@ -2686,7 +2694,7 @@ mod tests {
                 &namespace,
                 Reference::Tag(tag),
                 false,
-                "test-client",
+                &EventActor::default(),
             )
             .await
             .expect_err("a failing metadata store must not read as a successful lookup");
@@ -2722,7 +2730,7 @@ mod tests {
                     namespace,
                     Reference::Tag(Tag::new(tag).unwrap()),
                     false,
-                    "test-client",
+                    &EventActor::default(),
                 )
                 .await
                 .unwrap();
@@ -2739,7 +2747,7 @@ mod tests {
                     namespace,
                     Reference::Digest(response.digest.clone()),
                     false,
-                    "test-client",
+                    &EventActor::default(),
                 )
                 .await
                 .unwrap();
@@ -2951,7 +2959,7 @@ mod tests {
                         namespace,
                         Reference::Tag(Tag::new(tag).unwrap()),
                         false,
-                        "test-client",
+                        &EventActor::default(),
                     )
                     .await
                     .is_err()
@@ -2975,7 +2983,7 @@ mod tests {
                         namespace,
                         Reference::Digest(response.digest.clone()),
                         false,
-                        "test-client",
+                        &EventActor::default(),
                     )
                     .await
                     .is_err()
@@ -3093,7 +3101,7 @@ mod tests {
                     namespace,
                     Reference::Tag(fresh),
                     false,
-                    "test-client",
+                    &EventActor::default(),
                 )
                 .await;
             assert!(
@@ -3563,7 +3571,7 @@ mod tests {
                     namespace,
                     Reference::Tag(Tag::new(tag).unwrap()),
                     false,
-                    "test-client",
+                    &EventActor::default(),
                 )
                 .await
                 .expect("get manifest failed");
@@ -3640,7 +3648,7 @@ mod tests {
                             namespace,
                             Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
                             false,
-                            "test-client",
+                            &EventActor::default(),
                         )
                         .await
                         .is_err(),
@@ -3657,7 +3665,7 @@ mod tests {
                             namespace,
                             Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
                             false,
-                            "test-client",
+                            &EventActor::default(),
                         )
                         .await
                         .is_ok(),

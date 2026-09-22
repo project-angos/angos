@@ -4,7 +4,7 @@
 //! entries (inverted-millis ordinal plus a per-client suffix), so a listing
 //! yields newest first and same-millisecond stamps from distinct clients
 //! coexist. Each body records who pulled and when, making the directory a
-//! rolling audit log scrub trims past the audit window.
+//! rolling audit log scrub packs into compacted chunks past its gates.
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -16,13 +16,19 @@ use angos_oci::Namespace;
 use crate::registry::{
     Error,
     keys::{NamespaceKeys, parse_atime_entry},
-    metadata_store::{LinkKind, MetadataStore},
+    metadata_store::{LIST_PAGE, LinkKind, MetadataStore},
 };
 
-/// The stored body of one access entry: who pulled and when.
+/// The stored body of one access entry: who pulled, from where, and when.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AccessEntry {
     pub client: String,
+    /// Absent on entries recorded before the address was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
+    /// How the client authenticated. Absent on entries recorded before it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     pub at: DateTime<Utc>,
 }
 
@@ -41,6 +47,8 @@ impl MetadataStore {
         namespace: &Namespace,
         link: &LinkKind,
         client: &str,
+        client_ip: Option<&str>,
+        method: Option<&str>,
     ) -> Result<(), Error> {
         // Identities come from token claims, which have no length bound of
         // their own. The body and the key's suffix must record the same one,
@@ -55,6 +63,8 @@ impl MetadataStore {
         };
         let entry = serde_json::to_vec(&AccessEntry {
             client: client.to_string(),
+            client_ip: client_ip.map(str::to_string),
+            method: method.map(str::to_string),
             at,
         })?;
         self.object_store()
@@ -63,34 +73,101 @@ impl MetadataStore {
             .map_err(Error::from)
     }
 
-    /// The newest recorded pulls of `link`, newest first, at most `limit`.
-    /// Only tags and revisions are pull-tracked, so every other kind has no
-    /// entries. The entry directory is append-only, so an entry deleted or
-    /// corrupted mid-listing is skipped rather than failing the read.
+    /// One page of `link`'s recorded pulls, newest first: its live entries,
+    /// then its compacted chunks, `n` past the first `offset`, never past the
+    /// configured history limit. The flag tells whether more follow. Only tags
+    /// and revisions are pull-tracked, so every other kind has no entries. An
+    /// entry or chunk deleted or corrupted mid-listing is skipped rather than
+    /// failing the read.
     pub async fn read_access_entries(
         &self,
         namespace: &Namespace,
         link: &LinkKind,
-        limit: u16,
-    ) -> Result<Vec<AccessEntry>, Error> {
-        let Some(dir) = namespace.atime_dir(link) else {
-            return Ok(Vec::new());
+        offset: usize,
+        n: usize,
+    ) -> Result<(Vec<AccessEntry>, bool), Error> {
+        let (Some(dir), Some(compacted)) = (
+            namespace.atime_dir(link),
+            namespace.atime_compacted_dir(link),
+        ) else {
+            return Ok((Vec::new(), false));
         };
-        let page = self.object_store().list(&dir, limit, None).await?;
+        let limit = usize::try_from(self.atime_retention.history_limit.get()).unwrap_or(usize::MAX);
+        let page_len = offset.saturating_add(n).min(limit).saturating_sub(offset);
+        // One past the page tells whether another follows.
+        let wanted = if offset.saturating_add(page_len) < limit {
+            page_len + 1
+        } else {
+            page_len
+        };
+        let mut skip = offset;
+        let mut entries = Vec::new();
 
-        // `buffered` keeps the listing's newest-first order.
-        Ok(stream::iter(page.items)
-            .map(|name| {
-                let key = format!("{dir}/{name}");
-                async move {
-                    let raw = self.object_store().get(&key).await.ok()?;
-                    serde_json::from_slice::<AccessEntry>(&raw).ok()
+        // Live entries are skipped by name, so skipping costs no reads.
+        let mut token = None;
+        while entries.len() < wanted {
+            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
+            let skipped = skip.min(page.items.len());
+            skip -= skipped;
+            let names = page
+                .items
+                .into_iter()
+                .skip(skipped)
+                .take(wanted - entries.len());
+            // `buffered` keeps the listing's newest-first order.
+            let read: Vec<AccessEntry> = stream::iter(names)
+                .map(|name| {
+                    let key = format!("{dir}/{name}");
+                    async move {
+                        let raw = self.object_store().get(&key).await.ok()?;
+                        serde_json::from_slice::<AccessEntry>(&raw).ok()
+                    }
+                })
+                .buffered(ENTRY_READ_CONCURRENCY)
+                .filter_map(|entry| async move { entry })
+                .collect()
+                .await;
+            entries.extend(read);
+            token = page.next_token;
+            if token.is_none() {
+                break;
+            }
+        }
+
+        let mut token = None;
+        while entries.len() < wanted {
+            let page = self
+                .object_store()
+                .list(&compacted, LIST_PAGE, token)
+                .await?;
+            for name in page.items {
+                let Ok(raw) = self
+                    .object_store()
+                    .get(&format!("{compacted}/{name}"))
+                    .await
+                else {
+                    continue;
+                };
+                let Ok(chunk) = serde_json::from_slice::<Vec<AccessEntry>>(&raw) else {
+                    continue;
+                };
+                let skipped = skip.min(chunk.len());
+                skip -= skipped;
+                let remaining = wanted - entries.len();
+                entries.extend(chunk.into_iter().skip(skipped).take(remaining));
+                if entries.len() >= wanted {
+                    break;
                 }
-            })
-            .buffered(ENTRY_READ_CONCURRENCY)
-            .filter_map(|entry| async move { entry })
-            .collect()
-            .await)
+            }
+            token = page.next_token;
+            if token.is_none() {
+                break;
+            }
+        }
+
+        let more = entries.len() > page_len;
+        entries.truncate(page_len);
+        Ok((entries, more))
     }
 
     /// `link`'s last recorded pull: the newest entry of its atime directory,
@@ -208,6 +285,8 @@ mod tests {
     ) {
         let body = serde_json::to_vec(&AccessEntry {
             client: client.to_string(),
+            client_ip: None,
+            method: None,
             at,
         })
         .unwrap();
@@ -249,7 +328,7 @@ mod tests {
         .await;
 
         backend
-            .put_access_entry(&namespace, &tag, "alice")
+            .put_access_entry(&namespace, &tag, "alice", Some("10.0.0.7"), Some("basic"))
             .await
             .unwrap();
 
@@ -263,6 +342,8 @@ mod tests {
             .unwrap();
         let entry: AccessEntry = serde_json::from_slice(&raw).unwrap();
         assert_eq!(entry.client, "alice", "the body must carry the actor");
+        assert_eq!(entry.client_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(entry.method.as_deref(), Some("basic"));
 
         put_entry_at(
             &backend,
@@ -302,7 +383,7 @@ mod tests {
 
         for client in ["alice", "bob"] {
             backend
-                .put_access_entry(&namespace, &tag, client)
+                .put_access_entry(&namespace, &tag, client, None, None)
                 .await
                 .unwrap();
         }
@@ -333,7 +414,7 @@ mod tests {
 
         let mut stamps = Vec::new();
         for _ in 0..10 {
-            stamps.push(backend.put_access_entry(&namespace, &tag, "racer"));
+            stamps.push(backend.put_access_entry(&namespace, &tag, "racer", None, None));
         }
         for stamp in stamps {
             stamp.await.unwrap();

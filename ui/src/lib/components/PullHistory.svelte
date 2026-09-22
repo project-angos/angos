@@ -18,14 +18,11 @@
 
 	let { namespace, target, open = false }: Props = $props();
 
-	// The registry caps the listing; at exactly the cap, older pulls exist that
-	// the response does not carry.
-	const CAP = 100;
-
 	let expanded = $state(untrack(() => open));
 	let loading = $state(false);
 	let error: string | null = $state(null);
 	let history: PullHistoryBody | null = $state(null);
+	let loadingMore = $state(false);
 
 	// Listing a namespace renders one of these per manifest, so the request is
 	// held until it is asked for, rather than fanning out on load. The result
@@ -43,6 +40,18 @@
 		}
 	}
 
+	async function loadMore() {
+		if (!history?.next || loadingMore) return;
+		loadingMore = true;
+		const result = await fetchPullHistory(namespace, target, history.next);
+		loadingMore = false;
+		if (result.error || !result.data) {
+			error = result.error;
+		} else {
+			history = { ...result.data, entries: [...history.entries, ...result.data.entries] };
+		}
+	}
+
 	function toggle() {
 		expanded = !expanded;
 		if (expanded) load();
@@ -55,9 +64,11 @@
 
 	// The retention is only known once the registry has answered, so the label
 	// states it from the response rather than from a compiled-in assumption.
-	const title = $derived.by(() =>
-		history ? `Pull history (retained ${formatRetention(history.window_secs)})` : 'Pull history'
-	);
+	const title = $derived.by(() => {
+		if (!history) return 'Pull history';
+		const age = history.max_age_secs === undefined ? '' : `, up to ${formatRetention(history.max_age_secs)}`;
+		return `Pull history (last ${history.limit} pulls${age})`;
+	});
 </script>
 
 {#snippet toggleAction()}
@@ -75,38 +86,77 @@
 				<thead>
 					<tr>
 						<th>Client</th>
+						<th class="col-medium">IP address</th>
 						<th class="col-medium">Pulled</th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each history.entries as entry}
 						<tr>
-							<td>{entry.client}</td>
+							<td>
+								{#if entry.method}
+									<span class="badge method {entry.method}">{entry.method}</span>
+								{/if}
+								{#if entry.method !== 'anonymous'}{entry.client}{/if}
+							</td>
+							<td>{entry.client_ip ?? '—'}</td>
 							<td title={entry.at}>{formatTimeAgo(entry.at)}</td>
 						</tr>
 					{:else}
 						<tr>
 							<!-- Not "never pulled": recording is off unless the
-							     operator enables it, and only the newest entry
-							     outlives the window. -->
-							<td colspan="2" class="empty">
-								No pulls recorded in the retention window (last
-								{formatRetention(history.window_secs)}). Pull recording requires
+							     operator enables it. -->
+							<td colspan="3" class="empty">
+								No pulls recorded. Pull recording requires
 								<code>update_pull_time</code> to be enabled.
 							</td>
 						</tr>
 					{/each}
 				</tbody>
-				{#if history.entries.length >= CAP}
-					<tfoot>
-						<tr>
-							<td colspan="2">
-								Showing the newest {CAP} pulls; older ones are not listed.
-							</td>
-						</tr>
-					</tfoot>
-				{/if}
 			</table>
+			{#if history.next}
+				<div class="load-more">
+					<button class="secondary" onclick={loadMore} disabled={loadingMore}>Load more</button>
+				</div>
+			{/if}
 		{/if}
 	{/if}
 </Card>
+
+<style>
+	.load-more {
+		display: flex;
+		justify-content: center;
+		padding: 0.625rem;
+		border-top: 1px solid var(--border);
+	}
+
+	.method {
+		margin-right: 0.4rem;
+	}
+
+	.method.kubernetes {
+		background: var(--chip-blue-bg);
+		color: var(--chip-blue-fg);
+	}
+
+	.method.oidc {
+		background: var(--chip-cyan-bg);
+		color: var(--chip-cyan-fg);
+	}
+
+	.method.mtls {
+		background: var(--chip-green-bg);
+		color: var(--chip-green-fg);
+	}
+
+	.method.token {
+		background: var(--chip-purple-bg);
+		color: var(--chip-purple-fg);
+	}
+
+	.method.anonymous {
+		background: var(--chip-orange-bg);
+		color: var(--chip-orange-fg);
+	}
+</style>

@@ -231,6 +231,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
     let repository = resolver.resolve(&namespace).unwrap();
     let accepted = [MediaRange::from(MediaType::oci_manifest())];
     let latest = Tag::new("latest").unwrap();
+    let client = crate::event_webhook::event::EventActor::default();
     let pull = || {
         registry.get_manifest_direct(
             Some(repository),
@@ -238,7 +239,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
             &namespace,
             Reference::Tag(latest.clone()),
             false,
-            "test-client",
+            &client,
         )
     };
 
