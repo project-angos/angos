@@ -1,0 +1,9 @@
+---
+# Schedules `angos reconcile replication` daily. Pair it with the
+# [[repository."<name>".downstream]] sections in base/config.toml; without
+# one the run has nothing to compare.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - cronjob.yaml

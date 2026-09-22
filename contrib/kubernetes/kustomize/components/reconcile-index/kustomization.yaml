@@ -1,0 +1,9 @@
+---
+# Schedules `angos reconcile index` daily. Pair it with [global.index] or
+# the repositories' `index` tables in base/config.toml; without one the run
+# only reclaims the listings on-demand opens created.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - cronjob.yaml

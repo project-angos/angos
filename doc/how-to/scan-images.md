@@ -193,6 +193,8 @@ spec:
           restartPolicy: OnFailure
 ```
 
+The kustomize contrib ships this CronJob as its `reconcile-scan` component.
+
 A new report supersedes the older ones, and retention reclaims them: `angos prune` judges a superseded report like any untagged manifest, `pushed_at` being when it was attached, so `image.pushed_at > now() - days(30)` keeps a month of report history, a tag-only policy reclaims it at the next run, and a registry without retention rules keeps it. Only the newest report of an image stays shielded by it, as every report or attestation angos did not write does. The web UI shows the newest report by its `created` annotation either way.
 
 ---

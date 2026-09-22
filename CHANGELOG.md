@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Report refresh: `angos reconcile scan` scans an image again when a CEL rule of `[global.scan.refresh]`, or of the `[repository."<name>".scan.refresh]` table replacing it, finds its newest report due, so a scheduled run keeps reports current.
 - `image.scanned_at`, the time of an image's newest scan report, joins the CEL variables.
 - `[global.index]` indexes the filesystem of every repository's images as they land, where the repository `index` table does so for one.
+- The kustomize contrib gains `reconcile-replication`, `reconcile-scan` and `reconcile-index` components, a daily CronJob for each `reconcile` pass to include once the configuration it acts on exists.
 
 ### Changed
 
