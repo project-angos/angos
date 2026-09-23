@@ -216,8 +216,7 @@ The table sets at least one of the two keys.
 ## Cache (`cache`)
 
 What the registry caches: the JWKS and discovery documents of each OIDC provider,
-the bearer tokens it holds against pull-through upstreams, and webhook
-authorization decisions. All of it is derived and bounded by a TTL, so the
+and the bearer tokens it holds against pull-through upstreams. All of it is derived and bounded by a TTL, so the
 default in-memory cache is safe across any number of replicas: nothing in it
 decides what a replica serves. Redis is optional, and shares those entries so a
 new replica starts warm and every replica refetches a JWKS once rather than
@@ -307,7 +306,7 @@ Optional. Defaults to same backend as blob store.
 
 Unknown keys under any section are ignored, so configs carrying knobs of
 removed subsystems (`lock_strategy`, `conditional_operations`,
-`access_time_debounce_secs`, `link_cache_ttl`) keep loading. Remove them at
+`access_time_debounce_secs`, `link_cache_ttl`, `cache_ttl`) keep loading. Remove them at
 your convenience.
 
 ### Filesystem (`metadata_store.fs`)
@@ -455,7 +454,6 @@ rules = [
 | `client_private_key`        | string   | -        | Client key for mTLS                    |
 | `server_ca_bundle`          | string   | -        | CA bundle for server verification      |
 | `forward_headers`           | [string] | `[]`     | Headers to forward from client         |
-| `cache_ttl`                 | u64      | `60`     | Response cache duration (0 to disable) |
 
 `url` and `forward_headers` are validated when the configuration is loaded.
 If either `client_certificate_bundle` or `client_private_key` is set, both

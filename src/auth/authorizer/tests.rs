@@ -30,9 +30,7 @@ use crate::{
 #[test]
 fn test_authorizer_new_minimal() {
     let config = minimal_config();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let authorizer = Authorizer::new(&config, &cache);
+    let authorizer = Authorizer::new(&config);
 
     assert!(authorizer.is_ok());
     let authorizer = authorizer.unwrap();
@@ -51,9 +49,7 @@ fn test_authorizer_new_with_repository_config() {
         "#,
     );
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let authorizer = Authorizer::new(&config, &cache);
+    let authorizer = Authorizer::new(&config);
 
     assert!(authorizer.is_ok());
     let authorizer = authorizer.unwrap();
@@ -73,9 +69,7 @@ fn empty_repository_webhook_reference_builds_without_a_webhook() {
             authorization_webhook = ""
         "#,
     );
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let authorizer = Authorizer::new(&config, &cache).expect("blank webhook ref must build");
+    let authorizer = Authorizer::new(&config).expect("blank webhook ref must build");
     let repo = authorizer
         .repositories
         .get("myrepo")
@@ -318,8 +312,7 @@ async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
 
 /// Builds the authorizer and registry pair every `authorize_request` test needs.
 async fn authorizer_and_registry(config: &Configuration) -> (Authorizer, Arc<Registry>) {
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let authorizer = Authorizer::new(config, &cache).unwrap();
+    let authorizer = Authorizer::new(config).unwrap();
     let registry = create_pull_through_registry(config).await;
     (authorizer, registry)
 }
@@ -789,8 +782,7 @@ async fn authorize_mount_source_requires_read_on_the_source() {
                 default = "allow"
             "#,
         );
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let authorizer = Authorizer::new(&config).unwrap();
 
         let parts = parts_with_uri("/v2/");
         let mut reader = ClientIdentity::new(None);

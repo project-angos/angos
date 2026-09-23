@@ -45,7 +45,7 @@ impl ServerContext {
         registry: Arc<Registry>,
     ) -> Result<Self, Error> {
         let authenticator = Arc::new(Authenticator::new(config, cache)?);
-        let authorizer = Arc::new(Authorizer::new(config, cache)?);
+        let authorizer = Arc::new(Authorizer::new(config)?);
         let token_issuer = config
             .auth
             .token_service

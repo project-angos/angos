@@ -35,13 +35,13 @@ sequenceDiagram
     else CEL passes
         R->>W: GET /authorize
         alt 2xx response
-            W-->>R: Allow (cached)
+            W-->>R: Allow
             R-->>C: 200 OK
         else 401 or 403
-            W-->>R: Explicit deny (cached)
+            W-->>R: Explicit deny
             R-->>C: 403 Forbidden
         else 429, 5xx, or other non-2xx
-            W-->>R: Unavailable (fail closed, not cached)
+            W-->>R: Unavailable (fail closed)
             R-->>C: 403 Forbidden
         end
     end
@@ -49,14 +49,16 @@ sequenceDiagram
 
 ### Response Classification
 
-| Status              | Decision       | Cached? |
-|---------------------|----------------|---------|
-| 2xx                 | Allow          | Yes     |
-| 401, 403            | Explicit deny  | Yes     |
-| 429, 5xx, other 4xx | Unavailable    | No      |
-| Transport error     | Unavailable    | No      |
+| Status              | Decision       |
+|---------------------|----------------|
+| 2xx                 | Allow          |
+| 401, 403            | Explicit deny  |
+| 429, 5xx, other 4xx | Unavailable    |
+| Transport error     | Unavailable    |
 
-Unavailable responses fail the in-flight request closed but do not write to the cache, so the next request re-probes the webhook. As soon as the webhook returns 2xx or 401/403, normal caching resumes.
+Every request is authorized by the webhook: decisions are not cached, so the
+webhook sees the load of the registry and a revoked grant takes effect on the
+next request.
 
 ---
 
@@ -165,8 +167,7 @@ The registry sends GET requests with headers containing request context.
 | `X-Registry-OIDC-Subject`   | The token's `sub` claim, if it has one |
 
 An OIDC caller carries the two OIDC headers and no username, so a webhook
-deciding per user must read `X-Registry-OIDC-Subject`. Every header here enters
-the decision cache key, so two subjects never share one cached answer.
+deciding per user must read `X-Registry-OIDC-Subject`.
 
 ---
 
@@ -183,25 +184,6 @@ forward_headers = [
   "X-Request-ID",
   "Authorization"
 ]
-```
-
----
-
-## Response Caching
-
-Webhook responses are cached to reduce load:
-
-```toml
-[auth.webhook.cached]
-url = "https://auth.example.com/authorize"
-timeout_ms = 1000
-cache_ttl = 60  # Cache for 60 seconds (default)
-```
-
-Disable caching:
-
-```toml
-cache_ttl = 0
 ```
 
 ---
@@ -310,10 +292,6 @@ Prometheus metrics:
 # Request rate by result
 rate(webhook_authorization_requests_total[5m])
 
-# Cache hit rate
-sum(rate(webhook_authorization_requests_total{result=~"cached_.*"}[5m])) /
-sum(rate(webhook_authorization_requests_total[5m]))
-
 # Webhook latency
 histogram_quantile(0.95, rate(webhook_authorization_duration_seconds_bucket[5m]))
 
@@ -325,12 +303,10 @@ The `result` label values on `webhook_authorization_requests_total` are:
 
 | Value            | Meaning                                                          |
 |------------------|------------------------------------------------------------------|
-| `allow`          | Webhook returned 2xx; decision cached                            |
-| `deny`           | Webhook returned 401 or 403; explicit denial cached              |
-| `unavailable`    | Webhook returned 429, 5xx, or other non-decision status; not cached |
-| `transport_error`| Network/TLS failure reaching the webhook; not cached             |
-| `cached_allow`   | Decision served from cache (allow)                               |
-| `cached_deny`    | Decision served from cache (deny)                                |
+| `allow`          | Webhook returned 2xx                                             |
+| `deny`           | Webhook returned 401 or 403                                      |
+| `unavailable`    | Webhook returned 429, 5xx, or other non-decision status          |
+| `transport_error`| Network/TLS failure reaching the webhook                         |
 
 ---
 

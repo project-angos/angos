@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 
 use http::{Method, request::Builder};
 use reqwest::{Client, redirect::Policy};
@@ -11,7 +11,6 @@ use wiremock::{
 use angos_oci::{Namespace, Reference, Tag};
 
 use crate::metrics_provider::init_for_tests;
-use angos_cache::Cache;
 
 use crate::{
     auth::Error,
@@ -48,7 +47,6 @@ fn test_config_deserialize() {
     assert!(config.client_private_key.is_none());
     assert!(config.server_ca_bundle.is_none());
     assert!(config.forward_headers.is_empty());
-    assert_eq!(config.cache_ttl, 60);
 
     let valid_config = r#"
         url = "https://example.com"
@@ -67,7 +65,6 @@ fn test_config_deserialize() {
     assert!(config.client_private_key.is_none());
     assert!(config.server_ca_bundle.is_none());
     assert!(config.forward_headers.is_empty());
-    assert_eq!(config.cache_ttl, 60);
 }
 
 #[test]
@@ -248,7 +245,6 @@ fn build_test_config(
         client_private_key,
         server_ca_bundle,
         forward_headers: vec!["X-Custom-Header".to_string()],
-        cache_ttl: 60,
     }
 }
 
@@ -266,14 +262,10 @@ fn build_test_client(config: &Config) -> Result<Client, String> {
         .build()
 }
 
-fn build_test_webhook(
-    name: String,
-    config: Config,
-    cache: Arc<Cache>,
-) -> Result<WebhookAuthorizer, Error> {
+fn build_test_webhook(name: String, config: Config) -> Result<WebhookAuthorizer, Error> {
     init_for_tests();
     let client = build_test_client(&config).map_err(Error::Initialization)?;
-    WebhookAuthorizer::new(name, config, client, cache)
+    WebhookAuthorizer::new(name, config, client)
 }
 
 #[test]
@@ -294,11 +286,7 @@ fn test_new_invalid_mtls() {
         Some(cert_file_path),
         Some(key_file_path),
     );
-    let webhook = build_test_webhook(
-        "test".to_string(),
-        config,
-        angos_cache::Config::Memory.to_backend().unwrap(),
-    );
+    let webhook = build_test_webhook("test".to_string(), config);
 
     assert!(matches!(webhook, Err(Error::Initialization(_))));
 }
@@ -311,11 +299,7 @@ fn test_new_rejects_incomplete_mtls_config() {
         Some(PathBuf::from("certificate.pem")),
         None,
     );
-    let webhook = build_test_webhook(
-        "test".to_string(),
-        config,
-        angos_cache::Config::Memory.to_backend().unwrap(),
-    );
+    let webhook = build_test_webhook("test".to_string(), config);
 
     assert!(
         matches!(webhook, Err(Error::Initialization(msg)) if msg.contains("client_private_key"))
@@ -340,11 +324,7 @@ fn test_new_mtls() {
         Some(cert_file_path),
         Some(key_file_path),
     );
-    let webhook = build_test_webhook(
-        "test".to_string(),
-        config,
-        angos_cache::Config::Memory.to_backend().unwrap(),
-    );
+    let webhook = build_test_webhook("test".to_string(), config);
 
     assert!(webhook.is_ok());
 }
@@ -352,11 +332,7 @@ fn test_new_mtls() {
 #[test]
 fn test_new_simple() {
     let config = build_test_config(Url::parse("https://example.com").unwrap(), None, None, None);
-    let webhook = build_test_webhook(
-        "test".to_string(),
-        config,
-        angos_cache::Config::Memory.to_backend().unwrap(),
-    );
+    let webhook = build_test_webhook("test".to_string(), config);
 
     assert!(webhook.is_ok());
 }
@@ -373,8 +349,7 @@ async fn test_authorize_success() {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -396,8 +371,7 @@ async fn test_authorize_denied() {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -422,8 +396,7 @@ async fn test_authorize_with_bearer_token() {
         "test-token".to_string(),
     )));
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -449,8 +422,7 @@ async fn test_authorize_with_basic_auth() {
         password: Secret::new("testpass".to_string()),
     });
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -472,8 +444,7 @@ async fn test_authorize_sends_correct_headers() {
         .await;
 
     let config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -489,37 +460,11 @@ async fn test_authorize_sends_correct_headers() {
 }
 
 #[tokio::test]
-async fn test_authorize_uses_cache() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
-    config.auth = None;
-
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
-    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
-}
-
-#[tokio::test]
 async fn test_authorize_returns_err_on_unreachable_url() {
     let mut config = build_test_config(Url::parse("http://127.0.0.1:1").unwrap(), None, None, None);
     config.auth = None;
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -535,68 +480,17 @@ async fn test_authorize_returns_err_on_unreachable_url() {
     );
 }
 
-#[tokio::test]
-async fn test_authorize_does_not_cache_transport_errors() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-    let request_parts = parts_with_uri("https://example.com/v2/");
-
-    // First call: point at an unreachable port to produce TransportError.
-    let mut unreachable_config =
-        build_test_config(Url::parse("http://127.0.0.1:1").unwrap(), None, None, None);
-    unreachable_config.auth = None;
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let unreachable_webhook =
-        build_test_webhook("test".to_string(), unreachable_config, cache.clone()).unwrap();
-
-    let first = unreachable_webhook
-        .authorize(&action, &identity, &request_parts)
-        .await;
-    assert!(
-        first.is_err(),
-        "unreachable URL must produce Err, not Ok(false)"
-    );
-
-    // Second call: same cache, but now using the live mock server.
-    // If transport failures had been cached as Deny the result would be false
-    // without a network call, causing the mock's expect(1) assertion to fail.
-    let mut live_config =
-        build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
-    live_config.auth = None;
-    let live_webhook = build_test_webhook("test".to_string(), live_config, cache).unwrap();
-
-    let second = live_webhook
-        .authorize(&action, &identity, &request_parts)
-        .await;
-    assert!(
-        second.unwrap(),
-        "second call must reach the live server, not return a cached denial"
-    );
-}
-
 fn build_webhook_against(mock_server: &MockServer) -> WebhookAuthorizer {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    build_test_webhook("test".to_string(), config, cache).unwrap()
+    build_test_webhook("test".to_string(), config).unwrap()
 }
 
-// Webhook returns `status` exactly once (the mock's `expect(1)` enforces it).
-// First call must return Ok(false); second call must hit the cache and return
-// Ok(false) without re-contacting the webhook.
-async fn assert_cacheable_explicit_deny(status: u16) {
+// 401/403 are decisions the webhook made: Ok(false), not Err.
+async fn assert_explicit_deny(status: u16) {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(status))
-        .expect(1)
         .mount(&mock_server)
         .await;
 
@@ -609,24 +503,13 @@ async fn assert_cacheable_explicit_deny(status: u16) {
         !webhook.authorize(&action, &identity, &parts).await.unwrap(),
         "status {status} must be an explicit deny"
     );
-    assert!(
-        !webhook.authorize(&action, &identity, &parts).await.unwrap(),
-        "second call must be served from cache"
-    );
 }
 
-// Webhook returns `status` once, then 200 on every subsequent call. First call
-// must return Err (unavailable, not cached); second call must reach the webhook
-// again and be allowed.
-async fn assert_unavailable_not_cached(status: u16) {
+// Any other status is an unavailable webhook: Err, not Ok(false).
+async fn assert_unavailable_fails_closed(status: u16) {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(status))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
         .mount(&mock_server)
         .await;
 
@@ -639,195 +522,36 @@ async fn assert_unavailable_not_cached(status: u16) {
         webhook.authorize(&action, &identity, &parts).await.is_err(),
         "status {status} must return Err, not Ok(false)"
     );
-    assert!(
-        webhook.authorize(&action, &identity, &parts).await.unwrap(),
-        "after status {status} the next call must reach the webhook again and be allowed"
-    );
 }
 
 #[tokio::test]
-async fn test_authorize_403_is_explicit_deny_and_cacheable() {
-    assert_cacheable_explicit_deny(403).await;
+async fn test_authorize_403_is_explicit_deny() {
+    assert_explicit_deny(403).await;
 }
 
 #[tokio::test]
-async fn test_authorize_401_is_explicit_deny_and_cacheable() {
-    assert_cacheable_explicit_deny(401).await;
+async fn test_authorize_401_is_explicit_deny() {
+    assert_explicit_deny(401).await;
 }
 
 #[tokio::test]
-async fn test_authorize_500_is_unavailable_and_not_cached() {
-    assert_unavailable_not_cached(500).await;
+async fn test_authorize_500_is_unavailable() {
+    assert_unavailable_fails_closed(500).await;
 }
 
 #[tokio::test]
-async fn test_authorize_503_is_unavailable_and_not_cached() {
-    assert_unavailable_not_cached(503).await;
+async fn test_authorize_503_is_unavailable() {
+    assert_unavailable_fails_closed(503).await;
 }
 
 #[tokio::test]
-async fn test_authorize_429_is_unavailable_and_not_cached() {
-    assert_unavailable_not_cached(429).await;
+async fn test_authorize_429_is_unavailable() {
+    assert_unavailable_fails_closed(429).await;
 }
 
 #[tokio::test]
-async fn test_authorize_404_is_unavailable_and_not_cached() {
-    assert_unavailable_not_cached(404).await;
-}
-
-// Build a Config with non-default timeout_ms or cache_ttl.
-fn build_test_config_with(url: Url, timeout_ms: u64, cache_ttl: u64) -> Config {
-    Config {
-        url,
-        timeout_ms,
-        auth: None,
-        client_certificate_bundle: None,
-        client_private_key: None,
-        server_ca_bundle: None,
-        forward_headers: vec![],
-        cache_ttl,
-    }
-}
-
-#[tokio::test]
-// Verifies authorization succeeds even when the cache store returns an error.
-async fn webhook_authorization_succeeds_despite_cache_store_error() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
-    config.auth = None;
-
-    let failing_backend = angos_cache::stub::Backend::new();
-    failing_backend.set_store_error(Some("injected store failure".to_string()));
-    let failing_cache = Arc::new(Cache::Stub(failing_backend.clone()));
-    let webhook = build_test_webhook("test".to_string(), config, failing_cache.clone()).unwrap();
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    assert!(
-        webhook.authorize(&action, &identity, &parts).await.unwrap(),
-        "cache store error must not fail authorization"
-    );
-    assert_eq!(
-        failing_backend.store_calls(),
-        1,
-        "store_value must be attempted exactly once"
-    );
-}
-
-#[tokio::test]
-// A timed-out request must not write to the cache. The next call must reach
-// the real backend instead of returning a stale cached denial.
-async fn test_authorize_timeout_does_not_cache_and_retries() {
-    let slow_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
-        .expect(1)
-        .mount(&slow_server)
-        .await;
-
-    let shared_cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    // First call: very short timeout causes a transport error.
-    let slow_webhook = build_test_webhook(
-        "test".to_string(),
-        build_test_config_with(Url::parse(&slow_server.uri()).unwrap(), 100, 60),
-        shared_cache.clone(),
-    )
-    .unwrap();
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    let first = slow_webhook.authorize(&action, &identity, &parts).await;
-    assert!(first.is_err(), "timed-out request must return Err");
-
-    // Second call: live server with the same cache. If the timeout had been
-    // cached the live server would never be hit and the mock's expect(1) on
-    // the live server would fail.
-    let live_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&live_server)
-        .await;
-
-    let live_webhook = build_test_webhook(
-        "test".to_string(),
-        build_test_config_with(Url::parse(&live_server.uri()).unwrap(), 1000, 60),
-        shared_cache,
-    )
-    .unwrap();
-
-    let second = live_webhook.authorize(&action, &identity, &parts).await;
-    assert!(
-        second.unwrap(),
-        "after a timeout the next call must reach the live server: no stale cache entry"
-    );
-}
-
-#[tokio::test]
-// After cache_ttl seconds the cached authorization decision must be discarded
-// and the next call must hit the network again.
-async fn test_authorize_cache_entry_expires_and_refetches() {
-    let mock_server = MockServer::start().await;
-
-    // First request returns 200 (allow); subsequent requests return 403 (deny).
-    // Using up_to_n_times(1) means the 200 response is consumed on the first
-    // network call; the fallback mock then serves 403 for any later calls.
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&mock_server)
-        .await;
-
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let webhook = build_test_webhook(
-        "test".to_string(),
-        build_test_config_with(Url::parse(&mock_server.uri()).unwrap(), 1000, 1),
-        cache,
-    )
-    .unwrap();
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    // First call: goes to the network, gets 200, caches the allow decision.
-    assert!(
-        webhook.authorize(&action, &identity, &parts).await.unwrap(),
-        "first call must be allowed"
-    );
-
-    // Immediate second call: served from cache, still allow, no network hop.
-    assert!(
-        webhook.authorize(&action, &identity, &parts).await.unwrap(),
-        "second call must be served from cache"
-    );
-
-    // Wait for the 1-second TTL to expire.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-
-    // Third call: cache expired, goes to network again, gets the fallback 403.
-    assert!(
-        !webhook.authorize(&action, &identity, &parts).await.unwrap(),
-        "after TTL expiry authorization must fetch fresh from network and get deny"
-    );
+async fn test_authorize_404_is_unavailable() {
+    assert_unavailable_fails_closed(404).await;
 }
 
 /// HTTP/1.1 sends origin-form targets, so the URI carries no scheme and only
@@ -869,4 +593,20 @@ fn build_headers_reports_http_without_a_listener_scheme() {
     let headers = build_headers(&[], &action, &ClientIdentity::new(None), &parts).unwrap();
 
     assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "http");
+}
+
+/// `cache_ttl` configured a decision cache that is gone; a configuration
+/// carrying it must keep loading, like every other key of a removed subsystem.
+#[test]
+fn cache_ttl_parses_and_is_ignored() {
+    let config: Config = toml::from_str(
+        r#"
+        url = "https://example.com"
+        timeout_ms = 1000
+        bearer_token = "hello-token"
+        cache_ttl = 60
+    "#,
+    )
+    .expect("a configuration carrying cache_ttl must still load");
+    assert_eq!(config.timeout_ms, 1000);
 }

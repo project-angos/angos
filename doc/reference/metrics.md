@@ -173,23 +173,18 @@ Total webhook authorization requests.
 
 **Labels:**
 - `webhook`: Name of the webhook
-- `result`: `allow` and `deny` for a `2xx` or a `401`/`403` answer, both cached for
-  `cache_ttl`; `cached_allow` and `cached_deny` when the decision came from the cache;
-  `unavailable` when the webhook answered any other status and `transport_error` when it could
-  not be reached. Both of the last two deny the request and cache nothing, so a transient outage
-  never pins a denial.
+- `result`: `allow` and `deny` for a `2xx` or a `401`/`403` answer; `unavailable` when the
+  webhook answered any other status and `transport_error` when it could not be reached. Both
+  of the last two deny the request. Every request is authorized by the webhook, so this counter
+  also gives the webhook's request rate.
 
 **Example:**
 ```promql
 # Webhook hit rate
 sum by (webhook) (rate(webhook_authorization_requests_total[5m]))
 
-# Cache effectiveness
-sum(rate(webhook_authorization_requests_total{result=~"cached_.*"}[5m])) /
-sum(rate(webhook_authorization_requests_total[5m]))
-
 # Denial rate by webhook
-sum by (webhook) (rate(webhook_authorization_requests_total{result=~".*deny"}[5m]))
+sum by (webhook) (rate(webhook_authorization_requests_total{result="deny"}[5m]))
 
 # Fail-closed denials: the webhook is down or misbehaving
 sum by (webhook) (rate(webhook_authorization_requests_total{result=~"unavailable|transport_error"}[5m]))
@@ -529,12 +524,8 @@ sum by (method) (rate(auth_attempts_total[5m]))
 ### Authorization Webhooks
 
 ```promql
-# Webhook cache hit rate
-100 * sum(rate(webhook_authorization_requests_total{result=~"cached_.*"}[5m])) /
-sum(rate(webhook_authorization_requests_total[5m]))
-
 # Webhook error rate (denials)
-100 * sum(rate(webhook_authorization_requests_total{result=~".*deny"}[5m])) /
+100 * sum(rate(webhook_authorization_requests_total{result="deny"}[5m])) /
 sum(rate(webhook_authorization_requests_total[5m]))
 ```
 

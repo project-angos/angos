@@ -98,8 +98,8 @@ Angos implements fail-closed authorization for critical security decisions:
 |--------------------------------------------|-----------------------------------------|
 | No policies defined                        | Access denied (fail-closed)             |
 | No authentication provided                 | Proceeds as anonymous identity          |
-| Webhook timeout or unreachable             | Access denied (fail-closed), not cached |
-| Webhook 429 / 5xx                          | Access denied (fail-closed), not cached |
+| Webhook timeout or unreachable             | Access denied (fail-closed)             |
+| Webhook 429 / 5xx                          | Access denied (fail-closed)             |
 | Webhook not configured                     | Not evaluated, access continues         |
 | Invalid mTLS certificate                   | TLS handshake fails                     |
 | No client cert, `client_auth = "required"` | TLS handshake fails                     |

@@ -953,3 +953,30 @@ rules = ["image.scanned_at < now() - days(30)"]
 [repository."apps".index]
 default = "index"
 ```
+
+---
+
+## 1.11.x → 1.12.0
+
+### The Webhook Decision Cache Is Gone
+
+An authorization webhook's answer was cached for `cache_ttl` seconds under a
+digest of the headers forwarded to it, so a repeated request was decided
+without asking. Every request now reaches the webhook, and `cache_ttl` joins
+the ignored keys.
+
+**Who is affected:** deployments with an `[auth.webhook.<name>]` table. The key
+is ignored rather than refused, so configurations keep loading. The webhook now
+sees the registry's full authorized-request rate, where it previously saw one
+request per distinct forwarded context per TTL; a slow webhook is now on the
+latency path of every request. In exchange a revoked grant takes effect on the
+next request instead of up to `cache_ttl` later.
+
+The `cached_allow` and `cached_deny` values of the `result` label on
+`webhook_authorization_requests_total` are gone with it; a dashboard or alert
+matching `result=~"cached_.*"` or `result=~".*deny"` needs updating.
+
+#### Migration
+
+None. Remove `cache_ttl` at your convenience. If the webhook cannot take the
+load, put the caching in front of it rather than in the registry.

@@ -339,10 +339,10 @@ sequenceDiagram
 - Identity context (username, certificate info)
 
 **Response interpretation:**
-- 2xx → Allow (cached)
-- 401 or 403 → Explicit deny (cached)
-- 429, 5xx, or other non-2xx → Unavailable: fail closed for this request, not cached; the next request re-probes the webhook. Visible as `result="unavailable"` on `webhook_authorization_requests_total`.
-- Timeout/transport error → Unavailable (fail-closed, not cached). Distinguishable from HTTP unavailability via `result="transport_error"` on the same metric.
+- 2xx → Allow
+- 401 or 403 → Explicit deny
+- 429, 5xx, or other non-2xx → Unavailable: fail closed for this request. Visible as `result="unavailable"` on `webhook_authorization_requests_total`.
+- Timeout/transport error → Unavailable (fail-closed). Distinguishable from HTTP unavailability via `result="transport_error"` on the same metric.
 
 ---
 

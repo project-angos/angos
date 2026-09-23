@@ -5,7 +5,6 @@ use serde_json::Value;
 
 use crate::{
     auth::Error,
-    auth::sha256_hex,
     identity::{Action, ClientIdentity, RequestScheme},
 };
 
@@ -90,9 +89,8 @@ pub fn build_headers(
     for org in &identity.certificate.organizations {
         headers.append(X_REGISTRY_CERTIFICATE_O, build_header_value(org)?);
     }
-    // Without these an OIDC caller reaches the webhook anonymous, and since the
-    // cache key digests exactly these headers, every OIDC user would share one
-    // decision.
+    // Without these an OIDC caller reaches the webhook anonymous, so it could
+    // not tell one OIDC user from another.
     if let Some(oidc) = &identity.oidc {
         headers.insert(
             X_REGISTRY_OIDC_PROVIDER,
@@ -104,7 +102,7 @@ pub fn build_headers(
     }
 
     // Operator-selected client headers, forwarded verbatim. A repeated header
-    // carries every one of its values, which the cache key then covers.
+    // carries every one of its values.
     for name in forward_headers {
         for value in parts.headers.get_all(name) {
             headers.append(build_header_name(name)?, value.clone());
@@ -114,49 +112,20 @@ pub fn build_headers(
     Ok(headers)
 }
 
-/// Cache key for a webhook decision: a digest over the exact set of forwarded
-/// request headers. Keying off the forwarded context (not just identity and
-/// action) means the key covers everything the webhook can decide on, so a
-/// cached allow can never be replayed across a different host, URI, or
-/// operator-forwarded header. Entries are length-prefixed and sorted for a
-/// canonical, order-independent digest.
-pub fn build_cache_key(name: &str, headers: &HeaderMap) -> String {
-    let mut entries: Vec<(&[u8], &[u8])> = headers
-        .iter()
-        .map(|(header, value)| (header.as_str().as_bytes(), value.as_bytes()))
-        .collect();
-    entries.sort_unstable();
-
-    let mut material = Vec::new();
-    for (header, value) in entries {
-        material.extend_from_slice(&(header.len() as u64).to_le_bytes());
-        material.extend_from_slice(header);
-        material.extend_from_slice(&(value.len() as u64).to_le_bytes());
-        material.extend_from_slice(value);
-    }
-    format!("webhook:{name}:{}", sha256_hex(material))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, str::FromStr};
+    use std::collections::HashMap;
 
-    use http::{HeaderMap, HeaderName, HeaderValue, Request, request::Parts};
+    use http::{Request, request::Parts};
     use serde_json::json;
 
     use angos_oci::{Namespace, Reference, Tag};
 
-    use crate::auth::webhook::headers::{build_cache_key, build_headers};
+    use crate::auth::webhook::headers::build_headers;
     use crate::identity::{Action, ClientIdentity, OidcClaims, RequestScheme};
 
     fn anonymous() -> ClientIdentity {
         ClientIdentity::new(None)
-    }
-
-    fn identity_with_username(username: &str) -> ClientIdentity {
-        let mut id = ClientIdentity::new(None);
-        id.username = Some(username.to_string());
-        id
     }
 
     fn identity_with_oidc(provider_name: &str, subject: &str) -> ClientIdentity {
@@ -177,25 +146,6 @@ mod tests {
         builder.body(()).unwrap().into_parts().0
     }
 
-    /// Cache key as the authorizer computes it: a digest of the headers
-    /// forwarded to the webhook.
-    fn key_for(
-        name: &str,
-        forward: &[String],
-        action: &Action,
-        identity: &ClientIdentity,
-        parts: &Parts,
-    ) -> String {
-        build_cache_key(
-            name,
-            &build_headers(forward, action, identity, parts).unwrap(),
-        )
-    }
-
-    fn simple_key(name: &str, action: &Action, identity: &ClientIdentity) -> String {
-        key_for(name, &[], action, identity, &parts_with_headers(&[]))
-    }
-
     fn get_manifest(tag: &str) -> Action {
         Action::GetManifest {
             namespace: Namespace::new("library/nginx").unwrap(),
@@ -211,135 +161,6 @@ mod tests {
         parts.extensions.insert(RequestScheme::Https);
         let headers = build_headers(&[], &get_manifest("v1"), &anonymous(), &parts).unwrap();
         assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "https");
-    }
-
-    #[test]
-    fn same_inputs_produce_same_key() {
-        let action = Action::ApiVersion;
-        let identity = anonymous();
-        assert_eq!(
-            simple_key("wh", &action, &identity),
-            simple_key("wh", &action, &identity)
-        );
-    }
-
-    #[test]
-    fn different_action_produces_different_key() {
-        let identity = anonymous();
-        assert_ne!(
-            simple_key("wh", &Action::ApiVersion, &identity),
-            simple_key("wh", &get_manifest("latest"), &identity)
-        );
-    }
-
-    #[test]
-    fn different_identity_produces_different_key() {
-        let action = Action::ApiVersion;
-        assert_ne!(
-            simple_key("wh", &action, &anonymous()),
-            simple_key("wh", &action, &identity_with_username("alice"))
-        );
-    }
-
-    #[test]
-    fn different_webhook_name_produces_different_key() {
-        let action = Action::ApiVersion;
-        let identity = anonymous();
-        assert_ne!(
-            simple_key("webhook-a", &action, &identity),
-            simple_key("webhook-b", &action, &identity)
-        );
-    }
-
-    #[test]
-    fn key_contains_webhook_prefix_and_name() {
-        let key = simple_key("my-hook", &Action::ApiVersion, &anonymous());
-        assert!(
-            key.starts_with("webhook:my-hook:"),
-            "key must be prefixed with 'webhook:<name>:': {key}"
-        );
-    }
-
-    #[test]
-    fn key_uses_bounded_sha256_digest() {
-        let key = simple_key("my-hook", &Action::ApiVersion, &anonymous());
-        let digest = key.strip_prefix("webhook:my-hook:").unwrap();
-        assert_eq!(digest.len(), 64);
-        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn key_does_not_expose_forwarded_values_in_plaintext() {
-        // The key is a digest, so a sensitive forwarded value never appears
-        // verbatim in it.
-        let key = key_for(
-            "my-hook",
-            &["X-Secret".to_string()],
-            &Action::ApiVersion,
-            &identity_with_username("secret-user"),
-            &parts_with_headers(&[("X-Secret", "topsecret-value")]),
-        );
-        assert!(!key.contains("secret-user"), "key was: {key}");
-        assert!(!key.contains("topsecret-value"), "key was: {key}");
-    }
-
-    #[test]
-    fn different_reference_same_namespace_produces_different_key() {
-        let identity = anonymous();
-        assert_ne!(
-            simple_key("wh", &get_manifest("latest"), &identity),
-            simple_key("wh", &get_manifest("v1.0.0"), &identity)
-        );
-    }
-
-    // Regression guards: a cached decision must not replay across a
-    // forwarded context the webhook could have decided on differently.
-
-    #[test]
-    fn different_forwarded_host_produces_different_key() {
-        let action = Action::ApiVersion;
-        let identity = anonymous();
-        assert_ne!(
-            key_for(
-                "wh",
-                &[],
-                &action,
-                &identity,
-                &parts_with_headers(&[("Host", "a.example")])
-            ),
-            key_for(
-                "wh",
-                &[],
-                &action,
-                &identity,
-                &parts_with_headers(&[("Host", "b.example")])
-            ),
-            "a cached allow must not replay across a different Host"
-        );
-    }
-
-    #[test]
-    fn different_forwarded_header_value_produces_different_key() {
-        let action = Action::ApiVersion;
-        let identity = anonymous();
-        let forward = ["X-Tenant".to_string()];
-        assert_ne!(
-            key_for(
-                "wh",
-                &forward,
-                &action,
-                &identity,
-                &parts_with_headers(&[("X-Tenant", "tenant-a")])
-            ),
-            key_for(
-                "wh",
-                &forward,
-                &action,
-                &identity,
-                &parts_with_headers(&[("X-Tenant", "tenant-b")])
-            ),
-            "a cached allow must not replay across a different forwarded header"
-        );
     }
 
     #[test]
@@ -365,30 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn an_extra_value_on_a_forwarded_header_produces_a_different_key() {
-        let action = Action::ApiVersion;
-        let identity = anonymous();
-        let forward = ["X-Tenant".to_string()];
-        assert_ne!(
-            key_for(
-                "wh",
-                &forward,
-                &action,
-                &identity,
-                &parts_with_headers(&[("X-Tenant", "tenant-a")])
-            ),
-            key_for(
-                "wh",
-                &forward,
-                &action,
-                &identity,
-                &parts_with_headers(&[("X-Tenant", "tenant-a"), ("X-Tenant", "tenant-b")])
-            ),
-            "a cached allow must not replay onto a request carrying an extra value"
-        );
-    }
-
-    #[test]
     fn an_oidc_identity_reaches_the_webhook() {
         let headers = build_headers(
             &[],
@@ -405,20 +202,6 @@ mod tests {
         assert_eq!(
             headers.get("X-Registry-OIDC-Subject").unwrap(),
             "repo:myorg/myapp:ref:refs/heads/main"
-        );
-    }
-
-    #[test]
-    fn two_oidc_subjects_do_not_share_one_cached_decision() {
-        let action = Action::ApiVersion;
-        assert_ne!(
-            simple_key("wh", &action, &identity_with_oidc("gh", "alice")),
-            simple_key("wh", &action, &identity_with_oidc("gh", "bob"))
-        );
-        assert_ne!(
-            simple_key("wh", &action, &identity_with_oidc("gh", "alice")),
-            simple_key("wh", &action, &identity_with_oidc("okta", "alice")),
-            "one subject name must not span two providers"
         );
     }
 
@@ -441,23 +224,5 @@ mod tests {
 
         assert_eq!(headers.get("X-Registry-OIDC-Provider").unwrap(), "gh");
         assert!(headers.get("X-Registry-OIDC-Subject").is_none());
-    }
-
-    #[test]
-    fn key_is_independent_of_header_insertion_order() {
-        let build = |pairs: &[(&str, &str)]| {
-            let mut map = HeaderMap::new();
-            for (name, value) in pairs {
-                map.append(
-                    HeaderName::from_str(name).unwrap(),
-                    HeaderValue::from_str(value).unwrap(),
-                );
-            }
-            build_cache_key("wh", &map)
-        };
-        assert_eq!(
-            build(&[("a-header", "1"), ("b-header", "2")]),
-            build(&[("b-header", "2"), ("a-header", "1")])
-        );
     }
 }
