@@ -67,7 +67,7 @@
 	const title = $derived.by(() => {
 		if (!history) return 'Pull history';
 		const age = history.max_age_secs === undefined ? '' : `, up to ${formatRetention(history.max_age_secs)}`;
-		return `Pull history (last ${history.limit} pulls${age})`;
+		return `Pull history (last ${history.max_pulls} pulls${age})`;
 	});
 </script>
 

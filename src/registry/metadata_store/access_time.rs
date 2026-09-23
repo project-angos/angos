@@ -15,7 +15,7 @@ use angos_oci::Namespace;
 
 use crate::registry::{
     Error,
-    keys::{NamespaceKeys, parse_atime_entry},
+    keys::{NamespaceKeys, atime_entry_name, parse_atime_entry},
     metadata_store::{LIST_PAGE, LinkKind, MetadataStore},
 };
 
@@ -34,6 +34,10 @@ pub struct AccessEntry {
 
 /// Longest client identity an access entry records.
 const MAX_CLIENT_CHARS: usize = 256;
+
+/// Most entries one compacted chunk holds. Scrub merges into the newest chunk
+/// until it is full, so every older chunk holds exactly this many.
+pub const ATIME_CHUNK_CAP: usize = 1000;
 
 /// Fan-out for reading one page of entry bodies.
 const ENTRY_READ_CONCURRENCY: usize = 16;
@@ -92,7 +96,7 @@ impl MetadataStore {
         ) else {
             return Ok((Vec::new(), false));
         };
-        let limit = usize::try_from(self.atime_retention.history_limit.get()).unwrap_or(usize::MAX);
+        let limit = usize::try_from(self.pull_history.max_pulls.get()).unwrap_or(usize::MAX);
         let page_len = offset.saturating_add(n).min(limit).saturating_sub(offset);
         // One past the page tells whether another follows.
         let wanted = if offset.saturating_add(page_len) < limit {
@@ -100,6 +104,10 @@ impl MetadataStore {
         } else {
             page_len
         };
+        let chunks = self.list_names(&compacted).await?;
+        // Live entries at or past the newest chunk's name are already packed:
+        // leftovers of a scrub whose retires did not all land.
+        let packed_through = chunks.first();
         let mut skip = offset;
         let mut entries = Vec::new();
 
@@ -107,13 +115,14 @@ impl MetadataStore {
         let mut token = None;
         while entries.len() < wanted {
             let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            let skipped = skip.min(page.items.len());
-            skip -= skipped;
-            let names = page
+            let names: Vec<String> = page
                 .items
                 .into_iter()
-                .skip(skipped)
-                .take(wanted - entries.len());
+                .filter(|name| packed_through.is_none_or(|through| name < through))
+                .collect();
+            let skipped = skip.min(names.len());
+            skip -= skipped;
+            let names = names.into_iter().skip(skipped).take(wanted - entries.len());
             // `buffered` keeps the listing's newest-first order.
             let read: Vec<AccessEntry> = stream::iter(names)
                 .map(|name| {
@@ -134,35 +143,33 @@ impl MetadataStore {
             }
         }
 
-        let mut token = None;
-        while entries.len() < wanted {
-            let page = self
-                .object_store()
-                .list(&compacted, LIST_PAGE, token)
-                .await?;
-            for name in page.items {
-                let Ok(raw) = self
-                    .object_store()
-                    .get(&format!("{compacted}/{name}"))
-                    .await
-                else {
-                    continue;
-                };
-                let Ok(chunk) = serde_json::from_slice::<Vec<AccessEntry>>(&raw) else {
-                    continue;
-                };
-                let skipped = skip.min(chunk.len());
-                skip -= skipped;
-                let remaining = wanted - entries.len();
-                entries.extend(chunk.into_iter().skip(skipped).take(remaining));
-                if entries.len() >= wanted {
-                    break;
-                }
-            }
-            token = page.next_token;
-            if token.is_none() {
+        // The oldest entry a chunk held so far: a chunk no older is the stale
+        // source of a scrub merge whose retire did not land.
+        let mut covered: Option<String> = None;
+        for name in &chunks {
+            if entries.len() >= wanted {
                 break;
             }
+            if covered.as_ref().is_some_and(|covered| name <= covered) {
+                continue;
+            }
+            let Ok(raw) = self
+                .object_store()
+                .get(&format!("{compacted}/{name}"))
+                .await
+            else {
+                continue;
+            };
+            let Ok(chunk) = serde_json::from_slice::<Vec<AccessEntry>>(&raw) else {
+                continue;
+            };
+            covered = chunk
+                .last()
+                .map(|entry| atime_entry_name(entry.at, &entry.client));
+            let skipped = skip.min(chunk.len());
+            skip -= skipped;
+            let remaining = wanted - entries.len();
+            entries.extend(chunk.into_iter().skip(skipped).take(remaining));
         }
 
         let more = entries.len() > page_len;

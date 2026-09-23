@@ -21,7 +21,7 @@ use crate::{
             executor::{ActionSink, Executor},
             walk::{self, WalkStats},
         },
-        scrub::validate::{Pass, Validator},
+        scrub::validate::{Pass, Validator, link::chunk_writes},
     },
     jobs::{
         Queue,
@@ -30,8 +30,11 @@ use crate::{
     registry::{
         Error as RegistryError,
         blob_store::BlobStore,
-        keys::{DigestKeys, NamespaceKeys, REF_ROOT},
-        metadata_store::{AccessEntry, AtimeRetention, LinkKind, MetadataStore, Settings},
+        keys::{DigestKeys, NamespaceKeys, REF_ROOT, atime_entry_name},
+        metadata_store::{
+            AccessEntry, LinkKind, MetadataStore, PullHistoryConfig, Settings,
+            access_time::ATIME_CHUNK_CAP,
+        },
         test_utils::{
             RegistryTestCase, create_test_registry_with, for_each_backend, fs_test_stack,
             media_type, put_blob_direct, upload_blob,
@@ -1602,15 +1605,15 @@ async fn an_undecodable_atime_entry_is_deleted() {
     .await;
 }
 
-/// The metadata store over `test_case`'s objects with `retention`.
-fn with_retention(
+/// The metadata store over `test_case`'s objects with `pull_history`.
+fn with_history(
     test_case: &dyn RegistryTestCase,
-    retention: AtimeRetention,
+    pull_history: PullHistoryConfig,
 ) -> Arc<MetadataStore> {
     Arc::new(MetadataStore::new(
         test_case.metadata_store().object_store().clone(),
         Settings {
-            atime_retention: retention,
+            pull_history,
             ..Settings::default()
         },
     ))
@@ -1623,7 +1626,7 @@ async fn scrub_with(test_case: &dyn RegistryTestCase, store: &Arc<MetadataStore>
     run_passes(&blob_store, store, sink).await;
 }
 
-/// A count gate alone packs everything past the newest `max_entries` into one
+/// A count gate alone packs everything past the newest `compact_after_pulls` into one
 /// chunk, and a leftover of a pack whose retire never landed is dropped rather
 /// than packed twice.
 #[tokio::test]
@@ -1632,12 +1635,11 @@ async fn the_count_gate_packs_the_tail_into_one_chunk_once() {
         let namespace = Namespace::new("test-repo/atime-count").unwrap();
         push_healthy_image(test_case, &namespace).await;
         let tag_link = LinkKind::Tag(Tag::new("v1").unwrap());
-        let store = with_retention(
+        let store = with_history(
             test_case,
-            AtimeRetention {
-                window_secs: None,
-                max_entries: NonZeroU32::new(2),
-                ..AtimeRetention::default()
+            PullHistoryConfig {
+                compact_after_pulls: NonZeroU32::new(2),
+                ..PullHistoryConfig::default()
             },
         );
         let dir = namespace.atime_dir(&tag_link).unwrap();
@@ -1701,6 +1703,56 @@ async fn the_count_gate_packs_the_tail_into_one_chunk_once() {
     .await;
 }
 
+/// An access entry body for `client` at `at`.
+fn access_entry(client: &str, at: DateTime<Utc>) -> AccessEntry {
+    AccessEntry {
+        client: client.to_string(),
+        client_ip: None,
+        method: None,
+        at,
+    }
+}
+
+/// Plant one compacted chunk of `pulls`, newest first, named after its
+/// newest.
+async fn put_chunk(
+    store: &Arc<MetadataStore>,
+    namespace: &Namespace,
+    link: &LinkKind,
+    pulls: &[(&str, DateTime<Utc>)],
+) {
+    let entries: Vec<AccessEntry> = pulls
+        .iter()
+        .map(|(client, at)| access_entry(client, *at))
+        .collect();
+    let (client, at) = pulls[0];
+    store
+        .object_store()
+        .put(
+            &format!(
+                "{}/{}",
+                namespace.atime_compacted_dir(link).unwrap(),
+                atime_entry_name(at, client)
+            ),
+            Bytes::from(serde_json::to_vec(&entries).unwrap()),
+        )
+        .await
+        .unwrap();
+}
+
+/// The clients of `link`'s first ten recorded pulls, newest first.
+async fn pull_clients(
+    store: &Arc<MetadataStore>,
+    namespace: &Namespace,
+    link: &LinkKind,
+) -> Vec<String> {
+    let (history, _) = store
+        .read_access_entries(namespace, link, 0, 10)
+        .await
+        .unwrap();
+    history.into_iter().map(|entry| entry.client).collect()
+}
+
 /// Chunks past the history age or limit go, and a chunk straddling either
 /// keeps only its fitting entries.
 #[tokio::test]
@@ -1709,48 +1761,32 @@ async fn chunks_are_trimmed_to_the_history_age_and_limit() {
         let namespace = Namespace::new("test-repo/atime-expiry").unwrap();
         push_healthy_image(test_case, &namespace).await;
         let tag_link = LinkKind::Tag(Tag::new("v1").unwrap());
+        let store = test_case.metadata_store();
         let now = Utc::now();
-        let packing = with_retention(
-            test_case,
-            AtimeRetention {
-                window_secs: Some(0),
-                ..AtimeRetention::default()
-            },
-        );
-        // Three runs leave three chunks: 400, 40 and 4 days old.
-        for days in [400, 40, 4] {
-            put_atime_entry(
-                &packing,
-                &namespace,
-                &tag_link,
-                "old",
-                now - Duration::days(days),
-            )
-            .await;
-            put_atime_entry(
-                &packing,
-                &namespace,
-                &tag_link,
-                "new",
-                now - Duration::days(days - 1),
-            )
-            .await;
-            scrub_with(test_case, &packing).await;
-        }
+        let days = |days| now - Duration::days(days);
+        put_atime_entry(&store, &namespace, &tag_link, "new", days(3)).await;
+        put_chunk(
+            &store,
+            &namespace,
+            &tag_link,
+            &[("old", days(4)), ("new", days(39))],
+        )
+        .await;
+        put_chunk(
+            &store,
+            &namespace,
+            &tag_link,
+            &[("old", days(40)), ("new", days(399))],
+        )
+        .await;
+        put_chunk(&store, &namespace, &tag_link, &[("old", days(400))]).await;
         let compacted = namespace.atime_compacted_dir(&tag_link).unwrap();
-        let chunks = packing
-            .object_store()
-            .list(&compacted, 10, None)
-            .await
-            .unwrap();
-        assert_eq!(chunks.items.len(), 3);
 
-        let aged = with_retention(
+        let aged = with_history(
             test_case,
-            AtimeRetention {
-                window_secs: Some(0),
-                history_max_age_secs: Some(365 * 86400),
-                ..AtimeRetention::default()
+            PullHistoryConfig {
+                max_age_secs: Some(365 * 86400),
+                ..PullHistoryConfig::default()
             },
         );
         scrub_with(test_case, &aged).await;
@@ -1760,28 +1796,17 @@ async fn chunks_are_trimmed_to_the_history_age_and_limit() {
             .await
             .unwrap();
         assert_eq!(chunks.items.len(), 2, "the year-old chunk goes");
-        let clients = async |store: &Arc<MetadataStore>| {
-            let (history, _) = store
-                .read_access_entries(&namespace, &tag_link, 0, 10)
-                .await
-                .unwrap();
-            history
-                .into_iter()
-                .map(|entry| entry.client)
-                .collect::<Vec<_>>()
-        };
         assert_eq!(
-            clients(&aged).await,
+            pull_clients(&aged, &namespace, &tag_link).await,
             ["new", "old", "new", "old"],
             "the 40-day chunk sheds its 399-day pull"
         );
 
-        let capped = with_retention(
+        let capped = with_history(
             test_case,
-            AtimeRetention {
-                window_secs: Some(0),
-                history_limit: NonZeroU32::new(2).unwrap(),
-                ..AtimeRetention::default()
+            PullHistoryConfig {
+                max_pulls: NonZeroU32::new(2).unwrap(),
+                ..PullHistoryConfig::default()
             },
         );
         scrub_with(test_case, &capped).await;
@@ -1790,16 +1815,133 @@ async fn chunks_are_trimmed_to_the_history_age_and_limit() {
             .list(&compacted, 10, None)
             .await
             .unwrap();
+        assert_eq!(chunks.items.len(), 1, "the chunk past the limit goes");
         assert_eq!(
-            chunks.items.len(),
-            1,
-            "the live entry and the newest chunk fill the limit"
-        );
-        assert_eq!(
-            clients(&capped).await,
+            pull_clients(&capped, &namespace, &tag_link).await,
             ["new", "old"],
             "the newest chunk is cut to the limit"
         );
     })
     .await;
+}
+
+/// Each run merges what it packs into the newest chunk while it has room,
+/// instead of adding a chunk per run.
+#[tokio::test]
+async fn successive_runs_merge_into_the_newest_chunk() {
+    for_each_backend(async |test_case| {
+        let namespace = Namespace::new("test-repo/atime-merge").unwrap();
+        push_healthy_image(test_case, &namespace).await;
+        let tag_link = LinkKind::Tag(Tag::new("v1").unwrap());
+        let store = with_history(
+            test_case,
+            PullHistoryConfig {
+                compact_after_secs: Some(0),
+                ..PullHistoryConfig::default()
+            },
+        );
+        let compacted = namespace.atime_compacted_dir(&tag_link).unwrap();
+        let now = Utc::now();
+        let minutes = |minutes| now - Duration::minutes(minutes);
+
+        for (client, at) in [("carol", minutes(3)), ("bob", minutes(2))] {
+            put_atime_entry(&store, &namespace, &tag_link, client, at).await;
+        }
+        scrub_with(test_case, &store).await;
+        put_atime_entry(&store, &namespace, &tag_link, "alice", minutes(1)).await;
+        scrub_with(test_case, &store).await;
+
+        let chunks = store
+            .object_store()
+            .list(&compacted, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            chunks.items.len(),
+            1,
+            "the second run merged into the first chunk"
+        );
+        assert_eq!(
+            pull_clients(&store, &namespace, &tag_link).await,
+            ["alice", "bob", "carol"]
+        );
+    })
+    .await;
+}
+
+/// A merge whose retires did not land leaves its source chunk and packed
+/// entries behind: reads skip them, and the next scrub retires them.
+#[tokio::test]
+async fn a_stale_merge_source_is_skipped_then_retired() {
+    for_each_backend(async |test_case| {
+        let namespace = Namespace::new("test-repo/atime-stale").unwrap();
+        push_healthy_image(test_case, &namespace).await;
+        let tag_link = LinkKind::Tag(Tag::new("v1").unwrap());
+        let store = test_case.metadata_store();
+        let now = Utc::now();
+        let minutes = |minutes| now - Duration::minutes(minutes);
+        put_atime_entry(&store, &namespace, &tag_link, "newest", now).await;
+        // The merged chunk, its stale source, and a packed entry still live.
+        put_chunk(
+            &store,
+            &namespace,
+            &tag_link,
+            &[("a", minutes(1)), ("b", minutes(2)), ("c", minutes(3))],
+        )
+        .await;
+        put_chunk(
+            &store,
+            &namespace,
+            &tag_link,
+            &[("b", minutes(2)), ("c", minutes(3))],
+        )
+        .await;
+        put_atime_entry(&store, &namespace, &tag_link, "a", minutes(1)).await;
+
+        let expected = ["newest", "a", "b", "c"];
+        assert_eq!(pull_clients(&store, &namespace, &tag_link).await, expected);
+        scrub_with(test_case, &store).await;
+
+        let compacted = namespace.atime_compacted_dir(&tag_link).unwrap();
+        let chunks = store
+            .object_store()
+            .list(&compacted, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(chunks.items.len(), 1, "the stale source is retired");
+        let dir = namespace.atime_dir(&tag_link).unwrap();
+        let live = store.object_store().list(&dir, 10, None).await.unwrap();
+        assert_eq!(live.items.len(), 1, "the packed leftover is retired");
+        assert_eq!(pull_clients(&store, &namespace, &tag_link).await, expected);
+    })
+    .await;
+}
+
+/// Packed entries split into full chunks with the remainder in the newest,
+/// written oldest first and each named after its newest entry.
+#[test]
+fn chunk_writes_fill_every_chunk_but_the_newest() {
+    let now = Utc::now();
+    let entries: Vec<AccessEntry> = (0..2500)
+        .map(|second| access_entry("alice", now - Duration::seconds(second)))
+        .collect();
+
+    let writes = chunk_writes("dir", &entries).unwrap();
+
+    let chunks: Vec<(String, Vec<AccessEntry>)> = writes
+        .into_iter()
+        .map(|(key, body)| (key, serde_json::from_slice(&body).unwrap()))
+        .collect();
+    let sizes: Vec<usize> = chunks.iter().map(|(_, chunk)| chunk.len()).collect();
+    assert_eq!(sizes, [ATIME_CHUNK_CAP, ATIME_CHUNK_CAP, 500]);
+    for (key, chunk) in &chunks {
+        assert_eq!(
+            *key,
+            format!("dir/{}", atime_entry_name(chunk[0].at, &chunk[0].client))
+        );
+    }
+    assert!(
+        chunks.windows(2).all(|pair| pair[0].0 > pair[1].0),
+        "the oldest chunk comes first"
+    );
 }

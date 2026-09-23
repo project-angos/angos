@@ -32,10 +32,10 @@ impl fmt::Display for WalkedStore {
     }
 }
 
-/// One step of a target's access-entry compaction: a chunk to write, if
-/// any, and the entry and chunk keys to retire once it lands.
+/// One step of a target's access-entry compaction: the chunks to write, in
+/// order, and the entry and chunk keys to retire once they land.
 pub struct AtimeCompaction {
-    pub chunk: Option<(String, Bytes)>,
+    pub chunks: Vec<(String, Bytes)>,
     pub retired: Vec<String>,
 }
 
@@ -172,7 +172,7 @@ pub enum Action {
         store: WalkedStore,
         key: String,
     },
-    /// Write one target's access chunk, then retire the keys it supersedes.
+    /// Write one target's access chunks, then retire the keys they supersede.
     CompactAtime(AtimeCompaction),
 }
 
@@ -347,14 +347,12 @@ impl fmt::Display for Action {
             Action::DeleteCorruptObject { store, key } => {
                 write!(f, "delete corrupt {store} object '{key}'")
             }
-            Action::CompactAtime(AtimeCompaction { chunk, retired }) => match chunk {
-                Some((key, _)) => write!(
-                    f,
-                    "write access chunk '{key}' and retire {} access-time keys",
-                    retired.len()
-                ),
-                None => write!(f, "retire {} access-time keys", retired.len()),
-            },
+            Action::CompactAtime(AtimeCompaction { chunks, retired }) => write!(
+                f,
+                "write {} access chunks and retire {} access-time keys",
+                chunks.len(),
+                retired.len()
+            ),
         }
     }
 }

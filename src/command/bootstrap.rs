@@ -16,7 +16,7 @@ use crate::{
     registry::{
         self, Registry, RegistryConfig, Repository,
         blob_store::BlobStore,
-        metadata_store::{AtimeRetention, MetadataStore, Settings},
+        metadata_store::{MetadataStore, PullHistoryConfig, Settings},
         prime_pull_through, repository,
         repository_resolver::{OverlapError, RepositoryResolver},
     },
@@ -81,7 +81,7 @@ pub fn metadata_store(
     config: &ResolvedStorageConfig,
     namespace_walk_concurrency: NonZeroUsize,
     gc_grace_secs: u64,
-    atime_retention: AtimeRetention,
+    pull_history: PullHistoryConfig,
 ) -> Result<Arc<MetadataStore>, Error> {
     let store = build_object_store(config)?;
 
@@ -90,7 +90,7 @@ pub fn metadata_store(
         Settings {
             namespace_walk_concurrency,
             gc_grace_secs,
-            atime_retention,
+            pull_history,
             // No configuration knob: the linger is bounded by the writer
             // backoff the store itself defines.
             ..Settings::default()
@@ -119,7 +119,7 @@ pub async fn maintenance_context(config: &Configuration) -> Result<MaintenanceCo
         &config.resolve_registry_storage(),
         config.global.namespace_walk_concurrency,
         config.global.gc_grace_secs,
-        config.global.atime_retention(),
+        config.global.pull_history,
     )?;
     let repositories = repositories(&config.repository, &auth_cache, &config.global).await?;
     Ok(MaintenanceContext {

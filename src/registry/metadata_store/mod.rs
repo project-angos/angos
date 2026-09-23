@@ -132,9 +132,8 @@ pub struct MetadataStore {
     /// live, and how long a collector's range marker outlives its last
     /// refresh. Writers and collectors over the same store share the value.
     pub gc_grace_secs: u64,
-    /// Which superseded access entries scrub compacts, and how many pulls the
-    /// history keeps.
-    pub atime_retention: AtimeRetention,
+    /// How pull history is kept and compacted.
+    pub pull_history: PullHistoryConfig,
     /// How long a released reclamation marker keeps blocking writers.
     release_linger_ms: i64,
 }
@@ -147,33 +146,47 @@ pub const LIST_PAGE: u16 = 1000;
 /// adjacent-request gap on a write path plus clock skew.
 pub const DEFAULT_GC_GRACE_SECS: u64 = 300;
 
-/// Default retention for superseded access entries.
-pub const DEFAULT_ATIME_AUDIT_WINDOW_SECS: u64 = 3600;
+/// Default age past which a superseded access entry is compacted, when no
+/// compaction gate is configured.
+pub const DEFAULT_COMPACT_AFTER_SECS: u64 = 3600;
 
-/// Default number of pulls a target's history keeps and serves; the `unwrap`
-/// is const-evaluated.
-pub const DEFAULT_ATIME_AUDIT_HISTORY_LIMIT: NonZeroU32 = NonZeroU32::new(1000).unwrap();
+/// Default number of pulls a target's history keeps; the `unwrap` is
+/// const-evaluated.
+pub const DEFAULT_MAX_PULLS: NonZeroU32 = NonZeroU32::new(1000).unwrap();
 
-/// How a target's pull history is kept. A superseded access entry older than
-/// `window_secs` or ranked past `max_entries`, whichever is set, is packed
-/// into a compacted chunk; the newest entry never is. At most `history_limit`
-/// pulls are served, and compacted pulls past it or older than
-/// `history_max_age_secs` are dropped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AtimeRetention {
-    pub window_secs: Option<u64>,
-    pub max_entries: Option<NonZeroU32>,
-    pub history_limit: NonZeroU32,
-    pub history_max_age_secs: Option<u64>,
+/// `[global.pull_history]`: how each tag's and revision's pull history is
+/// kept. A superseded access entry older than `compact_after_secs` or ranked
+/// past `compact_after_pulls` is packed into a compacted chunk; the newest
+/// entry never is. At most `max_pulls` pulls are kept, none older than
+/// `max_age_secs`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PullHistoryConfig {
+    pub max_pulls: NonZeroU32,
+    pub max_age_secs: Option<u64>,
+    pub compact_after_secs: Option<u64>,
+    pub compact_after_pulls: Option<NonZeroU32>,
 }
 
-impl Default for AtimeRetention {
+impl Default for PullHistoryConfig {
     fn default() -> Self {
         Self {
-            window_secs: Some(DEFAULT_ATIME_AUDIT_WINDOW_SECS),
-            max_entries: None,
-            history_limit: DEFAULT_ATIME_AUDIT_HISTORY_LIMIT,
-            history_max_age_secs: None,
+            max_pulls: DEFAULT_MAX_PULLS,
+            max_age_secs: None,
+            compact_after_secs: None,
+            compact_after_pulls: None,
+        }
+    }
+}
+
+impl PullHistoryConfig {
+    /// The compaction age gate: the configured one, or the default when
+    /// neither gate is set.
+    #[must_use]
+    pub fn compaction_age_secs(&self) -> Option<u64> {
+        match (self.compact_after_secs, self.compact_after_pulls) {
+            (None, None) => Some(DEFAULT_COMPACT_AFTER_SECS),
+            (secs, _) => secs,
         }
     }
 }
@@ -192,8 +205,8 @@ pub struct Settings {
     /// The reclamation grace period, in seconds; tests and offline maintenance
     /// runs shrink it to exercise reclamation immediately.
     pub gc_grace_secs: u64,
-    /// Which superseded access entries scrub compacts.
-    pub atime_retention: AtimeRetention,
+    /// How pull history is kept and compacted.
+    pub pull_history: PullHistoryConfig,
     /// How long a released reclamation marker keeps blocking writers; tests
     /// shrink it so they do not sleep out the real one.
     pub release_linger_ms: i64,
@@ -204,7 +217,7 @@ impl Default for Settings {
         Self {
             namespace_walk_concurrency: pagination::NAMESPACE_WALK_CONCURRENCY,
             gc_grace_secs: DEFAULT_GC_GRACE_SECS,
-            atime_retention: AtimeRetention::default(),
+            pull_history: PullHistoryConfig::default(),
             release_linger_ms: DEFAULT_RELEASE_LINGER_MS,
         }
     }
@@ -219,13 +232,27 @@ impl MetadataStore {
             object,
             namespace_walk_concurrency: settings.namespace_walk_concurrency,
             gc_grace_secs: settings.gc_grace_secs,
-            atime_retention: settings.atime_retention,
+            pull_history: settings.pull_history,
             release_linger_ms: settings.release_linger_ms,
         }
     }
 
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object
+    }
+
+    /// Every key name under `dir`, in listing order.
+    pub async fn list_names(&self, dir: &str) -> Result<Vec<String>, Error> {
+        let mut names = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self.object.list(dir, LIST_PAGE, token).await?;
+            names.extend(page.items);
+            token = page.next_token;
+            if token.is_none() {
+                return Ok(names);
+            }
+        }
     }
 
     /// Write one link of any kind: the repair path's "make this link exist". The reference key lands first and is
