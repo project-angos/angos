@@ -23,8 +23,9 @@ pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4)
 pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 /// Worker concurrency for the scan queue; a scan is minutes of scanner work.
 pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
-/// One layer inflates at a time per process by default: it is CPU-bound.
-pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+/// Worker concurrency for the index queue: opening an image asks for all its
+/// layers at once, each job inflating one on a core.
+pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 // A config struct is naturally flag-heavy; the bool count is not an API smell.
 #[allow(clippy::struct_excessive_bools)]

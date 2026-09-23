@@ -53,6 +53,12 @@ pub enum Endpoint {
         path: String,
         download: bool,
     },
+    /// `GET /v2/<name>/_angos/layers/<digest>/details?path=`.
+    GetLayerFileDetails {
+        namespace: Namespace,
+        digest: Digest,
+        path: String,
+    },
     /// `GET /v2/_angos/jobs/list`.
     ListJobs {
         queue: Queue,
@@ -87,6 +93,7 @@ impl Endpoint {
             Endpoint::ListPulls { .. } => "list-pulls",
             Endpoint::ListLayerEntries { .. } => "list-layer-entries",
             Endpoint::GetLayerFile { .. } => "get-layer-file",
+            Endpoint::GetLayerFileDetails { .. } => "get-layer-file-details",
             Endpoint::ListJobs { .. } => "list-jobs",
             Endpoint::ListFailedJobs { .. } => "list-failed-jobs",
             Endpoint::RetryJob { .. } => "retry-job",
@@ -193,7 +200,8 @@ fn repository_extension(
         return None;
     }
 
-    // `layers/<digest>/entries` and `layers/<digest>/file?path=`.
+    // `layers/<digest>/entries`, `layers/<digest>/file?path=` and
+    // `layers/<digest>/details?path=`.
     if let Some(rest) = path.strip_prefix("layers/") {
         let (digest, module) = rest.split_once('/')?;
         let digest: Digest = digest.parse().ok()?;
@@ -206,6 +214,14 @@ fn repository_extension(
                     digest,
                     path: path?,
                     download: download.is_some(),
+                })
+            }
+            "details" => {
+                let LayerFileQuery { path, .. } = parse_query(params)?;
+                Some(Endpoint::GetLayerFileDetails {
+                    namespace,
+                    digest,
+                    path: path?,
                 })
             }
             _ => None,
@@ -344,6 +360,14 @@ mod tests {
                 Some("path=etc/hosts&download")
             ),
             Some(Endpoint::GetLayerFile { download: true, .. })
+        ));
+        assert!(matches!(
+            parse(
+                &Method::GET,
+                &format!("/v2/app/_angos/layers/{d}/details"),
+                Some("path=usr/bin/env")
+            ),
+            Some(Endpoint::GetLayerFileDetails { .. })
         ));
     }
 

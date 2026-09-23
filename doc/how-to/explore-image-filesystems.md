@@ -15,11 +15,11 @@ Browse what an image contains, layer by layer, and open any file, from the web U
 
 ## How It Works
 
-1. A layer is a tar stream, usually gzipped. An `index` job walks it once and keeps, by the layer digest, a listing of its entries with their offsets and, for a gzipped layer, an inflater checkpoint every 4 MiB of output.
+1. A layer is a tar stream, usually gzipped. An `index` job walks it once and keeps, by the layer digest, a listing of its entries with their offsets, each file's SHA-256, SHA-512 and media type and, for a gzipped layer, an inflater checkpoint every 4 MiB of output.
 2. The manifest page fetches the listing of each layer and merges them the way a runtime does: an entry replaces the lower layers' one, a whiteout removes a path, an opaque marker empties a directory.
 3. Opening a file decodes the layer from the nearest checkpoint to the file's offset, so a file deep in a large layer costs a few megabytes of decoding, not the whole layer.
 
-The listing is derived from the blob and shared like it: two images with the same layer share one listing, and it goes when the blob is reclaimed, or when `angos reconcile index` runs while no image an index policy applies to uses the layer. zstd-compressed layers are not indexed.
+A listing an older version wrote may lack the files' digests, media types or secrets; it is served as it is while an `index` job walks its layer again, and the tab says so and swaps in the new listing when the job is done. The listing is derived from the blob and shared like it: two images with the same layer share one listing, and it goes when the blob is reclaimed, or when `angos reconcile index` runs while no image an index policy applies to uses the layer. zstd-compressed layers are not indexed.
 
 ---
 
@@ -29,7 +29,9 @@ Open any image manifest in the web UI. Its page ends with a Filesystem panel. An
 
 ## Step 2: Browse
 
-Folders open on click, as a tree in the list view or as tiles walked with the folder path in the icon view. The layer column names the layer that last set each entry, `L1` being the lowest. Check one or more layers in the layers menu to see only what those layers added, changed or removed, the removed paths struck through, or type in the filter to narrow the tree to matching paths.
+Folders open on click, as a tree in the Tree view or as tiles walked with the folder path in the Icons view. The layer column names the layer that last set each entry, `L1` being the lowest. Check one or more layers in the layers menu to see only what those layers added, changed or removed, the removed paths struck through, or type in the filter to narrow the tree to matching paths.
+
+The keyboard walks every view: the arrow keys move through the list, left and right also fold and unfold a folder of the tree, Enter opens what is under the cursor, and Backspace climbs out of a folder of the Icons view.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-dark.png" />
@@ -39,9 +41,49 @@ Folders open on click, as a tree in the list view or as tiles walked with the fo
 
 ## Step 3: Open a File
 
-Click a file to read it under the tree, up to 512 KiB, or download it whatever its size. A hard link opens its target. A symlink shows where it points and, clicked, is followed there, through any links on the way; one that leads out of the image says so.
+Click a file to open it beside the list, which stays in view while the list scrolls: its layer, media type, size, mode, owner, modification date and digests over its text with numbered lines, syntax colored when its media type names a known language. A markdown file shows rendered, an image as the picture, an ELF binary its type, architecture, linking, the libraries it needs, its RELRO and whether its stack is executable, entry point and build ID, and a PEM file lists its certificates, subject, issuer, names and expiry, the expired ones flagged; Source shows any of them as text. Diff compares the file with its version in the layer below, or above for the lowest, when another layer holds one. A file larger than 512 KiB shows its first 512 KiB; Download fetches it whole. When several layers hold the path, their chips switch between the versions. A hard link opens its target. A symlink shows where it points and, clicked, is followed there, through any links on the way; one that leads out of the image says so. Esc or the close button puts the file away; on a phone it takes the whole screen until then.
 
-## Step 4: Index on Push
+The open file is in the URL, `#filesystem/usr/bin/entrypoint`, with `@L2` after the path for a version a later layer overwrote, so a link opens it and the browser's back button returns to the file before.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-diff-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-diff-light.png" />
+  <img alt="Filesystem tab, the packages a later layer added to /etc/apk/world" src="../images/ui-filesystem-diff-light.png" />
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-elf-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-elf-light.png" />
+  <img alt="Filesystem tab, the nginx binary's type, libraries and hardening" src="../images/ui-filesystem-elf-light.png" />
+</picture>
+
+## Step 4: Check Secrets, Permissions and Wasted Space
+
+The **Secrets** view, offered when there are any, lists the files that hold a private key, a GitHub, GitLab, Slack or Stripe token, an AWS access key ID, or AWS, Docker, npm, Git, netrc or kubeconfig credentials, anywhere in a text file of any layer, with the lines they are on: one a later layer removed is gone from the running image but still ships in its own layer, for anyone who pulls it. Opening one shows its text with those lines marked, scrolled to the first.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-secrets-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-secrets-light.png" />
+  <img alt="Filesystem tab, Secrets view with a deleted SSH key open" src="../images/ui-filesystem-secrets-light.png" />
+</picture>
+
+The **Permissions** view, offered when there are any, lists what the image runs with raised privileges or lets anyone change: setuid and setgid files, files granted Linux capabilities such as `cap_net_bind_service`, and world-writable files and folders, a sticky one such as `/tmp` aside. A folder opens in the tree.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-permissions-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-permissions-light.png" />
+  <img alt="Filesystem tab, Permissions view with a file granted a capability open" src="../images/ui-filesystem-permissions-light.png" />
+</picture>
+
+The **Waste** view measures, against the image's uncompressed size, the bytes of files a later layer overwrote or removed, which still weigh in their own layer, and the bytes spent on copies of identical files. Its two lists, the largest first, tell a file replaced from one rewritten unchanged, such as by a `chmod` or `chown` in a later step, or removed. An overwritten or removed file opens as its own layer still holds it.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/ui-filesystem-waste-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="../images/ui-filesystem-waste-light.png" />
+  <img alt="Filesystem tab, Waste view" src="../images/ui-filesystem-waste-light.png" />
+</picture>
+
+## Step 5: Index on Push
 
 Indexing on first open is fine for a registry browsed now and then. A repository whose images are opened as soon as they land indexes them as they land:
 
@@ -59,9 +101,9 @@ default = "index"
 
 An `index` table is a policy shaped like an access policy, the same as a `scan` table: `default` is `index` or `skip`, `skip` when absent, and `rules` over the [retention variables](../reference/cel-expressions.md#retention-policy-variables) give a matching image the opposite, judged as the image lands under its pushed tags and again by `reconcile index`. `rules = ["image.tag == 'latest' || top_pulled(20)"]` with no `default` indexes the tags people open and leaves the rest to their first open.
 
-Each image manifest pushed there, or stored by a cache miss in a pull-through repository, enqueues one `index` job per layer. `angos worker` drains the queue, sized by `max_concurrent_index_jobs` (default 1, since a job inflates a whole layer), and the server drains it in-process without a durable queue. The jobs list under the `index` queue of the Jobs page.
+Each image manifest pushed there, or stored by a cache miss in a pull-through repository, enqueues one `index` job per layer. `angos worker` drains the queue, sized by `max_concurrent_index_jobs` (default 4, a job inflating one layer on one core), and the server drains it in-process without a durable queue. The jobs list under the `index` queue of the Jobs page.
 
-## Step 5: Index What Was Already There
+## Step 6: Index What Was Already There
 
 The policy covers images from then on. To have the listings of the images already in the repository ready before anyone opens them:
 

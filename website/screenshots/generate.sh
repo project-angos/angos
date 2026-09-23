@@ -2,8 +2,8 @@
 # Regenerates doc/images/ui-*.png: builds angos, runs it and its scanner on a
 # temporary directory with the config.toml next to this script, seeds it with
 # public images and artifacts, then shoot.mjs screenshots every web UI view in
-# light and dark. Needs cargo, node, oras, curl, jq, nc and trivy (SCANNER=grype
-# for Grype); the first run also downloads Playwright's Chromium.
+# light and dark. Needs cargo, node, oras, curl, jq, nc, openssl, python3 and trivy
+# (SCANNER=grype for Grype); the first run also downloads Playwright's Chromium.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -52,6 +52,54 @@ oras push "$target/artifacts/charts/demo:1.0,latest" --artifact-type application
   --annotation org.opencontainers.image.description="An ORAS artifact, as the UI lists its files" \
   --annotation org.opencontainers.image.version=1.0 \
   README.md:text/markdown LICENSE:text/plain
+
+# An image leaking credentials, for the Secrets view, its last layer deleting
+# the SSH key its second one ships. The key and AWS secret are made here and
+# the rest are placeholders, so nothing secret-shaped is committed.
+mkdir -p leaky/1/app/uploads leaky/1/usr/local/bin leaky/2/root/.ssh leaky/2/root/.aws leaky/3/root/.ssh leaky/3/root/.docker
+printf 'require("http").createServer().listen(8080)\n' >leaky/1/app/server.js
+# A setuid script, a launcher granted cap_net_bind_service to serve on port 80,
+# and an upload folder anyone can write, for the Permissions view.
+printf '#!/bin/sh\ntar -czf /var/backups/app.tgz /app\n' >leaky/1/usr/local/bin/backup
+printf '#!/bin/sh\nPORT=80 exec node /app/server.js\n' >leaky/1/usr/local/bin/serve
+chmod 4755 leaky/1/usr/local/bin/backup
+chmod 755 leaky/1/usr/local/bin/serve
+chmod 777 leaky/1/app/uploads
+openssl genpkey -algorithm ed25519 -out leaky/2/root/.ssh/id_ed25519
+printf '//registry.npmjs.org/:_authToken=npm_placeholder\n' >leaky/2/root/.npmrc
+printf '[default]\naws_access_key_id = placeholder\naws_secret_access_key = %s\n' "$(openssl rand -base64 30)" >leaky/2/root/.aws/credentials
+: >leaky/3/root/.ssh/.wh.id_ed25519
+printf '{\n\t"auths": {\n\t\t"registry.example.com": {\n\t\t\t"auth": "%s"\n\t\t}\n\t}\n}\n' "$(printf ci:placeholder | base64)" >leaky/3/root/.docker/config.json
+# Python's tarfile packs the layers owned by root, with the capability as the
+# PAX xattr record a Linux build writes, which macOS's tar cannot set.
+python3 - <<'PY'
+import tarfile
+
+# vfs_cap_data revision 2, effective, permitting bit 10: cap_net_bind_service.
+capability = bytes.fromhex("01000002" "00040000" + "00" * 12).decode()
+
+
+def owned(info):
+    info.uid = info.gid = 0
+    info.uname = info.gname = "root"
+    if info.name == "./usr/local/bin/serve":
+        info.pax_headers = {"SCHILY.xattr.security.capability": capability}
+    return info
+
+
+for n in (1, 2, 3):
+    with tarfile.open(f"leaky-{n}.tar.gz", "w:gz", format=tarfile.PAX_FORMAT) as layer:
+        layer.add(f"leaky/{n}", arcname=".", filter=owned)
+PY
+diff_ids=()
+for n in 1 2 3; do
+  diff_ids+=("\"sha256:$(gzip -dc "leaky-$n.tar.gz" | shasum -a 256 | cut -d' ' -f1)\"")
+done
+printf '{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[%s]}}' "$(IFS=,; echo "${diff_ids[*]}")" >leaky.json
+oras push --config leaky.json:application/vnd.oci.image.config.v1+json "$target/apps/webapp:1.0" \
+  leaky-1.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip \
+  leaky-2.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip \
+  leaky-3.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip
 
 # One pull through the cache, so its namespace has content.
 oras manifest fetch --platform linux/amd64 "$target/docker.io/library/busybox:1.36" >/dev/null

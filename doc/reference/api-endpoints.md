@@ -442,21 +442,31 @@ GET /v2/{namespace}/_angos/layers/{algorithm}:{hex}/entries
 ```
 
 The filesystem listing of one layer: every tar entry in order, with its kind, size, mode,
-owner, modification time, link target and the offset of its data in the uncompressed stream.
+owner, modification time, link target, the offset of its data in the uncompressed stream and
+the Linux `capabilities` its `security.capability` extended attribute permits, such as
+`cap_net_bind_service`, plus for a file its `content`: SHA-256 and SHA-512 in hex, a media type and, when the file
+holds credentials, its `secrets`.
 The first request for a layer that was never indexed enqueues the index job and answers
 `202 Accepted` with `{"status": "indexing"}`; ask again once it ran. On a pull-through
 namespace, a layer the upstream has and the cache does not is fetched first, behind the
-same `202`. A layer the namespace does not own is `404`, like the blob itself.
+same `202`. A listing an older version wrote, its `content` missing or judged by older
+rules, is served as it is, with `refreshing` set, while an index job walks the layer again;
+ask again until it is not. A layer the namespace does not own is `404`, like the blob
+itself. The listing is gzipped for a client whose `Accept-Encoding` takes it.
 
 **Response:**
 ```json
 {
+  "refreshing": false,
   "compressed": true,
   "uncompressed_size": 7340032,
   "entries": [
     { "path": "etc", "kind": "dir", "size": 0, "mode": 493, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 512 },
-    { "path": "etc/os-release", "kind": "file", "size": 164, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 1536 },
-    { "path": "etc/motd", "kind": "whiteout", "size": 0, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 2560 }
+    { "path": "etc/os-release", "kind": "file", "size": 10, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 1536,
+      "content": { "sha256": "c8fa7610cf5d4ab2dfb774392e4fd5d789579c9aa357616b3879633e184d2a05", "sha512": "8881e1b6d16c746ad2d0f7e48a2c8cef43a10a342f8a07c19d22df46c0619d3ef0584f201366adaa85d9c07f7352671627816420b673a06f76779d0845d3af26", "mime_type": "text/plain" } },
+    { "path": "root/.docker/config.json", "kind": "file", "size": 96, "mode": 384, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 3072,
+      "content": { "sha256": "…", "sha512": "…", "mime_type": "application/json", "secrets": [{ "kind": "registry-auth", "line": 4 }] } },
+    { "path": "etc/motd", "kind": "whiteout", "size": 0, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 3584 }
   ]
 }
 ```
@@ -464,6 +474,30 @@ same `202`. A layer the namespace does not own is `404`, like the blob itself.
 `kind` is one of `file`, `dir`, `symlink`, `hardlink`, `whiteout`, `opaque` or `other`; a
 whiteout names the path the layer removes from the ones below it, an opaque marker the
 directory it empties. Paths are normalised without a leading `./` or trailing `/`.
+
+A file's `mime_type` is `application/x-executable` for an ELF binary and
+`application/x-pem-file` for one opening with a PEM block, otherwise follows the extension, then the interpreter of a `#!` line, and falls back to `text/plain`, or
+`application/octet-stream` when its first 8 KiB hold a NUL byte.
+
+`secrets` lists, in line order, each credential anywhere in a text file, one whose first
+8 KiB hold no NUL byte, as its `kind` and the `line` it is on from 1; a line is read up to
+its first 64 KiB:
+
+- `private-key`: a PEM, OpenSSH or PGP private key block opening a line or set as a JSON
+  `private_key`, with base64 key material after its `BEGIN` line.
+- `aws-credentials`: an `aws_secret_access_key` line set to a 40-character key.
+- `aws-access-key`, `github-token`, `gitlab-token`, `slack-token` and `stripe-key`: an `AKIA`
+  or `ASIA`; `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or `github_pat_`; `glpat-`; `xoxb-` or
+  `xoxp-`; `sk_live_` or `rk_live_` token that mixes letters and digits.
+- `registry-auth`: the `auth` entry of a Docker `config.json`.
+- `kubeconfig`: a `client-key-data` set to base64, or a `token` in a file named
+  `kubeconfig`, `*.kubeconfig` or `.kube/config`.
+- `npm-token`, `git-credentials` and `netrc`: an `.npmrc` `_auth`, `_authToken` or
+  `:_password` set to a value, a `.git-credentials` URL with a user and a password, and a
+  `.netrc` password, each only in a file of that name, since documentation quotes their lines.
+
+A value holding `EXAMPLE`, as AWS's documentation shows, does not count. A hard link carries
+no `content`: its target does.
 
 ### Layer File
 
@@ -473,12 +507,55 @@ GET /v2/{namespace}/_angos/layers/{algorithm}:{hex}/file?path={path}&download
 ```
 
 The bytes of one file of the layer, `path` as the listing spells it; a hard link serves its
-target. The content type is guessed from the name, and `download` adds a
-`Content-Disposition: attachment` header. A gzipped layer is decoded from the nearest of the
-checkpoints the index job recorded, every 4 MiB of output, rather than from its start. A path
-that is not a file, or a layer not yet indexed, is `404`.
+target. The content type is the listing's media type, guessed from the name for a listing
+without one, and `download` adds a `Content-Disposition: attachment` header. A
+`Range: bytes=…` header gets `206 Partial Content` with that part of the file only. The
+response carries `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`, so
+an HTML or SVG file opened from a link runs no script on the registry's origin. A gzipped
+layer is decoded from the nearest of the checkpoints the index job recorded, every 4 MiB of
+output, rather than from its start. A path that is not a file, or a layer not yet indexed,
+is `404`.
 
-Both endpoints are gated by the `get-blob` CEL action of the layer's namespace.
+### Layer File Details
+
+```
+GET /v2/{namespace}/_angos/layers/{algorithm}:{hex}/details?path={path}
+```
+
+What one file of the layer holds once decoded, `path` as for the file endpoint. An ELF binary
+gets `elf`: its type, architecture, entry point, loader, the libraries it needs, the name a
+shared library answers to, its GNU build ID, its `relro` (`full` when every symbol binds at
+load, `partial`, or `none`) and whether its stack is executable. Past the header, only the program headers,
+loader, notes, dynamic section and the stretch of string table naming the libraries are read,
+so a large binary costs a few small reads. A file whose first 64 KiB hold a
+`-----BEGIN CERTIFICATE-----` line gets `certificates`: every PEM block of its first 4 MiB in
+order, a certificate with its subject, issuer, validity and DNS and IPv4 names, anything else
+by its label. Any other file answers `{}`. A path that is not a file, or a layer not yet
+indexed, is `404`.
+
+**Response:**
+```json
+{
+  "elf": {
+    "type": "PIE executable", "machine": "x86-64", "bits": 64, "endian": "little", "entry": "0x1040",
+    "interpreter": "/lib/ld-musl-x86_64.so.1", "dynamic": true,
+    "needed": ["libc.musl-x86_64.so.1", "libz.so.1"], "soname": null, "build_id": "deadbeef",
+    "relro": "full", "executable_stack": false
+  }
+}
+```
+
+```json
+{
+  "certificates": [
+    { "label": "CERTIFICATE", "certificate": { "subject": "CN=example.com", "issuer": "CN=example.com",
+      "not_before": "2026-01-01T00:00:00Z", "not_after": "2027-01-01T00:00:00Z", "names": ["example.com"] } },
+    { "label": "PRIVATE KEY" }
+  ]
+}
+```
+
+The three endpoints are gated by the `get-blob` CEL action of the layer's namespace.
 
 ### List Uploads
 

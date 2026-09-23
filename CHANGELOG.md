@@ -12,6 +12,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub packs old pull history into compacted chunks of up to 1000 pulls instead of deleting it, keeping up to `[global.pull_history] max_pulls` pulls per target (default 1000), optionally bounded in age by `max_age_secs`.
 - `[global.pull_history] compact_after_pulls` compacts pulls past a count, alone or alongside `compact_after_secs`.
 - The pulls endpoint pages with `offset` and `n`, and the web UI loads older pulls on demand.
+- Layer listings record each file's SHA-256, SHA-512 and media type, gzipped for a client that takes it; a listing an older version wrote is indexed again when first read.
+- Layer listings flag each private key, GitHub, GitLab, Slack or Stripe token, AWS access key ID, or AWS, Docker, npm, Git, netrc or kubeconfig credential anywhere in a text file, with its line, and record each file's Linux capabilities.
+- The Filesystem tab opens a file beside the tree, linkable and keyboard-driven, with syntax colors, rendered markdown, images, certificates, ELF details and hardening, a diff against other layers, and its secrets' lines marked.
+- The Filesystem tab lists every layer's secrets, the setuid, setgid, capability-granted and world-writable files, and the bytes wasted on overwritten, removed or duplicate files.
+- The Filesystem tab says when it shows a listing an older version indexed, and swaps in the new one once the layer is indexed again.
+- The layer file endpoint answers a `Range` request with `206 Partial Content`.
+- A layer details endpoint decodes an ELF binary's header, hardening and libraries and a PEM file's certificates.
 - The pull history records the client's IP address and how it authenticated (`basic`, `token`, `oidc`, `kubernetes`, `mtls`, `internal` or `anonymous`), which the web UI shows in an address column and as a pill beside the client; pulls recorded before the upgrade carry neither.
 
 ### Changed
@@ -19,10 +26,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** `[global] atime_audit_window_secs` is now `[global.pull_history] compact_after_secs`; the old key is ignored.
 - **Breaking:** an authorization webhook decides every request: its answer is no longer cached for `cache_ttl`, which joins the ignored keys, and the `cached_allow` and `cached_deny` values of the `result` label on `webhook_authorization_requests_total` are gone. A revoked grant takes effect on the next request, and the webhook sees the registry's full authorized-request rate.
 - The pulls endpoint reports the history bounds as `max_pulls` and `max_age_secs` in place of `window_secs`.
+- `max_concurrent_index_jobs` defaults to 4, up from 1.
 
 ### Fixed
 
 - The pull history names OIDC and mTLS callers where it recorded them as `anonymous`: a Kubernetes service account as `<provider>:<namespace>/<service account>`, another OIDC token as `<provider>:<email, preferred_username or sub>`, and a client certificate by its common name. Webhook payloads are unchanged.
+
+### Security
+
+- The layer file endpoint sandboxes its responses, so an image's HTML or SVG opened from a link runs no script on the registry's origin.
 
 ## 1.11.0
 

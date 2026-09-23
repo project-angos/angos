@@ -36,21 +36,24 @@ impl AcceptMediaRange {
     /// re-sends these upstream and must not relay a malformed `Accept`.
     fn new(member: &str) -> Option<Self> {
         let value = MediaRange::new(member.trim()).ok()?;
-        // A member names its weight in a `q` parameter. Without one it is
-        // offered at full weight; one angos cannot read is not a weight it may
-        // invent, so the member sorts last instead.
-        let quality = value
-            .as_str()
-            .split(';')
-            .skip(1)
-            .filter_map(|parameter| parameter.trim().split_once('='))
-            .find(|(name, _)| name.trim().eq_ignore_ascii_case(QUALITY_PARAM))
-            .map_or(1000, |(_, quality)| {
-                parse_quality(quality.trim()).unwrap_or(0)
-            });
-
+        let quality = quality(value.as_str());
         Some(Self { quality, value })
     }
+}
+
+/// The weight, out of 1000, a header member names in its `q` parameter. Without
+/// one it is offered at full weight; one angos cannot read is not a weight it
+/// may invent, so it weighs nothing.
+#[must_use]
+pub fn quality(member: &str) -> u16 {
+    member
+        .split(';')
+        .skip(1)
+        .filter_map(|parameter| parameter.trim().split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case(QUALITY_PARAM))
+        .map_or(1000, |(_, quality)| {
+            parse_quality(quality.trim()).unwrap_or(0)
+        })
 }
 
 /// The media ranges an `Accept` header offers, most preferred first.

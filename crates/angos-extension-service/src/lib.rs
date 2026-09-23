@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
+use angos_oci::http_range::{RequestRange, ResponseRange};
 use angos_oci::{
     Descriptor, Digest, MediaType, Namespace, Platform, Reference, Tag, UploadSessionId,
 };
@@ -195,11 +196,55 @@ pub struct LayerEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
     pub offset: u64,
+    /// Set on files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<FileContent>,
+    /// The Linux capabilities its `security.capability` attribute permits.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
+/// A file's digests, hex-encoded, its media type, and the credentials its
+/// first bytes give away.
+#[derive(Serialize, Debug, Clone)]
+pub struct FileContent {
+    pub sha256: String,
+    pub sha512: String,
+    pub mime_type: String,
+    /// In line order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<Secret>,
+}
+
+/// A credential, and the line it is on from 1.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Secret {
+    pub kind: SecretKind,
+    pub line: usize,
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretKind {
+    PrivateKey,
+    AwsCredentials,
+    RegistryAuth,
+    NpmToken,
+    GitCredentials,
+    Netrc,
+    GithubToken,
+    GitlabToken,
+    SlackToken,
+    StripeKey,
+    AwsAccessKey,
+    Kubeconfig,
 }
 
 /// A layer's entries in tar order.
 #[derive(Serialize, Debug)]
 pub struct LayerListing {
+    /// An older version wrote it: a job is walking the layer again.
+    pub refreshing: bool,
     pub compressed: bool,
     pub uncompressed_size: u64,
     pub entries: Vec<LayerEntry>,
@@ -209,6 +254,8 @@ pub struct LayerListing {
 pub struct LayerEntriesRequest {
     pub namespace: Namespace,
     pub digest: Digest,
+    /// Whether the client takes a gzipped listing.
+    pub gzip: bool,
 }
 
 /// The listing of a layer, or a signal that it is still being indexed. The two
@@ -216,7 +263,11 @@ pub struct LayerEntriesRequest {
 /// never also indexing.
 pub enum LayerEntries {
     Indexing,
-    Ready(LayerListing),
+    /// The [`LayerListing`] as JSON, gzipped when `gzip` is set.
+    Ready {
+        body: Vec<u8>,
+        gzip: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -226,16 +277,77 @@ pub struct LayerFileRequest {
     pub path: String,
     /// Whether to answer with a download disposition rather than inline.
     pub download: bool,
+    /// A `Range` asking for part of the file only.
+    pub range: Option<RequestRange>,
+}
+
+#[derive(Debug)]
+pub struct LayerFileDetailsRequest {
+    pub namespace: Namespace,
+    pub digest: Digest,
+    pub path: String,
+}
+
+/// What a file of a layer holds that its bytes spell only once decoded: an ELF
+/// binary's header and libraries, or a PEM file's certificates.
+#[derive(Serialize, Debug, Default)]
+pub struct LayerFileDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elf: Option<ElfDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificates: Option<Vec<PemBlock>>,
+}
+
+/// What `file` would say of an ELF binary, and the libraries it needs.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ElfDetails {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub machine: String,
+    pub bits: u8,
+    pub endian: String,
+    pub entry: String,
+    /// The dynamic loader it names, absent for a static binary or a shared object.
+    pub interpreter: Option<String>,
+    pub dynamic: bool,
+    pub needed: Vec<String>,
+    /// The name a shared library answers to.
+    pub soname: Option<String>,
+    pub build_id: Option<String>,
+    /// How much of the relocations turn read-only once loaded: `full`,
+    /// `partial` or `none`.
+    pub relro: String,
+    pub executable_stack: bool,
+}
+
+/// One block of a PEM file: a certificate decoded, anything else by its label.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PemBlock {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<Certificate>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct Certificate {
+    pub subject: String,
+    pub issuer: String,
+    pub not_before: DateTime<Utc>,
+    pub not_after: DateTime<Utc>,
+    /// The DNS names and IPv4 addresses it is for.
+    pub names: Vec<String>,
 }
 
 /// One file streamed out of a layer: the reader delivers exactly `size` bytes,
-/// so a large file never buffers in full. `content_type` is the guessed media
-/// type the response carries, and `download` asks for an attachment disposition.
+/// so a large file never buffers in full. `content_type` is the media type the
+/// response carries, `download` asks for an attachment disposition, and `range`
+/// is the part of the file served when one was asked for.
 pub struct LayerFile<R> {
     pub path: String,
     pub content_type: String,
     pub size: u64,
     pub download: bool,
+    pub range: Option<ResponseRange>,
     pub reader: R,
 }
 
@@ -387,6 +499,12 @@ pub trait AngosExtensionService: Send + Sync {
         &self,
         request: LayerFileRequest,
     ) -> Result<LayerFile<Self::Body>, Self::Error>;
+
+    /// `GET /v2/{namespace}/_angos/layers/{digest}/details`.
+    async fn get_layer_file_details(
+        &self,
+        request: LayerFileDetailsRequest,
+    ) -> Result<LayerFileDetails, Self::Error>;
 
     /// `GET /v2/_angos/jobs/list`.
     async fn list_jobs(&self, request: ListJobsRequest) -> Result<JobsBody, Self::Error>;

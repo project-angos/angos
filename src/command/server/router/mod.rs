@@ -283,6 +283,15 @@ impl From<&Route> for Action {
                     path: path.clone(),
                     download: *download,
                 },
+                AngosEndpoint::GetLayerFileDetails {
+                    namespace,
+                    digest,
+                    path,
+                } => Action::GetLayerFileDetails {
+                    namespace: namespace.clone(),
+                    digest: digest.clone(),
+                    path: path.clone(),
+                },
                 AngosEndpoint::ListJobs { queue, n, after } => Action::ListJobs {
                     queue: jobs::Queue::from(*queue),
                     n: *n,

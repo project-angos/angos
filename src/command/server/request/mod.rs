@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use hyper::{
     HeaderMap,
     body::Incoming,
-    header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RANGE},
+    header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RANGE},
 };
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
@@ -67,6 +67,22 @@ impl<'a> RequestHeaders<'a> {
         !value.is_empty()
             && !value.eq_ignore_ascii_case("0")
             && !value.eq_ignore_ascii_case("false")
+    }
+
+    /// Whether `Accept-Encoding` takes `gzip`, which a zero weight refuses.
+    pub fn accepts_gzip(&self) -> bool {
+        self.headers
+            .get_all(ACCEPT_ENCODING)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|coding| {
+                coding
+                    .split(';')
+                    .next()
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("gzip"))
+                    && server::quality(coding) > 0
+            })
     }
 
     pub fn content_type(&self) -> Result<Option<MediaType>, Error> {
