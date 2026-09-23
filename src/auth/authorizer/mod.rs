@@ -15,7 +15,6 @@ use crate::{
     policy::{AccessPolicy, PolicyDecision},
     registry::{Registry, Repository},
 };
-use angos_cache::Cache;
 use angos_mtls_client::MtlsClientBuilder;
 
 const ACCESS_DENIED: &str = "Access denied";
@@ -38,10 +37,10 @@ struct AuthorizerRepository {
 type WebhookClientFiles = (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>);
 
 impl Authorizer {
-    pub fn new(config: &Configuration, cache: &Arc<Cache>) -> Result<Self, Error> {
+    pub fn new(config: &Configuration) -> Result<Self, Error> {
         let global_access_policy = AccessPolicy::new(config.global.access_policy.clone());
 
-        let webhook_authorizers = build_webhooks(config, cache)?;
+        let webhook_authorizers = build_webhooks(config)?;
 
         let global_authorization_webhook = config
             .global
@@ -230,7 +229,6 @@ impl Authorizer {
 
 fn build_webhooks(
     config: &Configuration,
-    cache: &Arc<Cache>,
 ) -> Result<HashMap<String, Arc<WebhookAuthorizer>>, Error> {
     let mut webhooks = HashMap::with_capacity(config.auth.webhook.len());
     let mut clients: HashMap<WebhookClientFiles, Client> = HashMap::new();
@@ -249,11 +247,10 @@ fn build_webhooks(
             clients.insert(client_config, client.clone());
             client
         };
-        let authorizer =
-            WebhookAuthorizer::new(name.clone(), webhook_config.clone(), client, cache.clone())
-                .map_err(|e| {
-                    Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
-                })?;
+        let authorizer = WebhookAuthorizer::new(name.clone(), webhook_config.clone(), client)
+            .map_err(|e| {
+                Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
+            })?;
         webhooks.insert(name.clone(), Arc::new(authorizer));
     }
     Ok(webhooks)

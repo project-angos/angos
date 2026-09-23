@@ -22,8 +22,6 @@ pub struct Config {
     pub server_ca_bundle: Option<PathBuf>,
     #[serde(default)]
     pub forward_headers: Vec<String>,
-    #[serde(default = "Config::default_cache_ttl")]
-    pub cache_ttl: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -50,10 +48,6 @@ impl WebhookAuth {
 }
 
 impl Config {
-    fn default_cache_ttl() -> u64 {
-        60
-    }
-
     pub fn validate(&self) -> Result<(), String> {
         if self.client_certificate_bundle.is_some() != self.client_private_key.is_some() {
             return Err(

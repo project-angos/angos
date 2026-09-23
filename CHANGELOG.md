@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 1.11.1 - UNRELEASED
+## 1.12.0 - UNRELEASED
 
 ### Added
 
@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - **Breaking:** `[global] atime_audit_window_secs` is now `[global.pull_history] compact_after_secs`; the old key is ignored.
+- **Breaking:** an authorization webhook decides every request: its answer is no longer cached for `cache_ttl`, which joins the ignored keys, and the `cached_allow` and `cached_deny` values of the `result` label on `webhook_authorization_requests_total` are gone. A revoked grant takes effect on the next request, and the webhook sees the registry's full authorized-request rate.
 - The pulls endpoint reports the history bounds as `max_pulls` and `max_age_secs` in place of `window_secs`.
 
 ### Fixed
