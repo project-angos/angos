@@ -149,7 +149,7 @@ pub struct AccessEntry {
 pub struct PullsBody {
     pub target: String,
     /// Pulls the history keeps at most.
-    pub limit: u32,
+    pub max_pulls: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_age_secs: Option<u64>,
     pub entries: Vec<AccessEntry>,

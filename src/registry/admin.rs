@@ -389,11 +389,11 @@ impl Registry {
             })
             .collect();
 
-        let retention = self.metadata_store.atime_retention;
+        let history = self.metadata_store.pull_history;
         Ok(PullsBody {
             target: reference.to_string(),
-            limit: retention.history_limit.get(),
-            max_age_secs: retention.history_max_age_secs,
+            max_pulls: history.max_pulls.get(),
+            max_age_secs: history.max_age_secs,
             entries,
             next,
         })
@@ -1643,7 +1643,7 @@ mod tests {
             let body = response_json(response).await;
 
             assert_eq!(body["target"], "v1");
-            assert_eq!(body["limit"], 1000);
+            assert_eq!(body["max_pulls"], 1000);
             assert!(body.get("next").is_none(), "one page holds both pulls");
             let clients: Vec<&str> = body["entries"]
                 .as_array()

@@ -137,6 +137,17 @@ pub fn parse_atime_entry(name: &str) -> Option<DateTime<Utc>> {
         .and_then(DateTime::from_timestamp_millis)
 }
 
+/// The name of the access entry `client` records at `at`, `<ord>.<suffix>`:
+/// `<ord>` is the same inverted-millis ordinal a tag entry carries, so entries
+/// list newest first, and `<suffix>` is the first 8 hex of the client
+/// identity's sha256, so two clients stamping in the same millisecond land on
+/// distinct entries instead of one overwriting the other's audit record.
+pub fn atime_entry_name(at: DateTime<Utc>, client: &str) -> String {
+    let identity = Digest::sha256_of_bytes(client.as_bytes());
+    let ord = u64::MAX - 1 - at.timestamp_millis().max(0).unsigned_abs();
+    format!("{ord:016x}.{}", &identity.hash()[..8])
+}
+
 /// What follows an atime entry directory's `!` terminator on its compacted
 /// sibling.
 pub const ATIME_COMPACTED: &str = "compacted";
@@ -336,12 +347,7 @@ pub trait NamespaceKeys {
     fn atime_dir(&self, link: &LinkKind) -> Option<String>;
 
     /// The access entry a pull of `link` at `at` by `client` records, named
-    /// `<ord>.<suffix>`: `<ord>` is the same inverted-millis ordinal a tag
-    /// entry carries, so entries list newest first, and `<suffix>` is the
-    /// first 8 hex of the client identity's sha256, so two clients stamping in
-    /// the same millisecond land on distinct entries instead of one
-    /// overwriting the other's audit record. `None` for a kind that is not
-    /// pull-tracked.
+    /// by [`atime_entry_name`]. `None` for a kind that is not pull-tracked.
     fn atime_entry_path(&self, link: &LinkKind, at: DateTime<Utc>, client: &str) -> Option<String>;
 
     /// Directory holding `link`'s compacted access entries, a sibling of its
@@ -432,12 +438,10 @@ impl NamespaceKeys for Namespace {
     }
 
     fn atime_entry_path(&self, link: &LinkKind, at: DateTime<Utc>, client: &str) -> Option<String> {
-        let identity = Digest::sha256_of_bytes(client.as_bytes());
-        let ord = u64::MAX - 1 - at.timestamp_millis().max(0).unsigned_abs();
         Some(format!(
-            "{}/{ord:016x}.{}",
+            "{}/{}",
             self.atime_dir(link)?,
-            &identity.hash()[..8]
+            atime_entry_name(at, client)
         ))
     }
 

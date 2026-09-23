@@ -653,12 +653,12 @@ impl Executor {
         Ok(())
     }
 
-    /// Store the chunk before retiring the entries it packs, so a run that
-    /// fails midway never loses a pull.
+    /// Store the chunks, in order, before retiring what they pack, so a run
+    /// that fails midway never loses a pull.
     async fn compact_atime(&self, compaction: AtimeCompaction) -> Result<(), Error> {
-        let AtimeCompaction { chunk, retired } = compaction;
+        let AtimeCompaction { chunks, retired } = compaction;
         let store = self.metadata_store.object_store();
-        if let Some((key, body)) = chunk {
+        for (key, body) in chunks {
             store.put(&key, body).await.map_err(RegistryError::from)?;
         }
         for key in retired {

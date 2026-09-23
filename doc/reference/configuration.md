@@ -123,10 +123,6 @@ listener.
 | `namespace_walk_concurrency`| usize > 0| `128`    | Concurrent directory scans a catalog / upload-namespace walk keeps in flight, hiding per-request backend latency on S3. Zero is refused. |
 | `listing_read_concurrency`  | usize > 0| `16`     | Concurrent reads an admin listing behind the web UI keeps in flight per request: revision records, referrer descriptors, job records. Raise it on a high-latency store to shorten the manifest view's load; zero is refused. |
 | `gc_grace_secs`             | u64      | `300`    | Reclamation grace period, used by the serving process and scrub alike: young keys read as live, the push path re-checks the collector after this long, and gc run markers derive their TTL from it. Lower it only in a maintenance config for offline runs against a store with no live traffic; the serving processes must keep a value that exceeds clock skew plus the longest write stall. |
-| `atime_audit_window_secs`   | u64      | `3600`   | Age past which scrub packs a superseded access entry into a compacted chunk of the target's pull history. The default applies only when `atime_audit_max_entries` is unset too. Raising it grows the number of keys under `!atime/` in proportion to pull volume. |
-| `atime_audit_max_entries`   | u32 > 0  | unset    | Live access entries kept per target before scrub packs the older ones into a compacted chunk. Set with `atime_audit_window_secs`, an entry past either gate is packed. |
-| `atime_audit_history_limit` | u32 > 0  | `1000`   | Pulls a target's history keeps and the pulls endpoint serves; scrub trims compacted pulls past it. |
-| `atime_audit_history_max_age_secs` | u64 | unset | Age past which scrub drops compacted pulls (e.g. `31536000` keeps a year). |
 | `trusted_proxies`           | [string] | `[]`     | Proxy IPs or CIDR networks (e.g. `"10.0.0.1"`, `"10.0.0.0/8"`) whose `X-Forwarded-For`/`X-Real-IP` headers are honored as the client IP. From any other peer those headers are ignored and the socket address is used. The set must name proxies only: a range that also covers clients lets them spoof the forwarded header. |
 
 `max_manifest_size`, `max_blob_size` and `blob_stream_frame_size` must be greater than zero.
@@ -190,6 +186,19 @@ Every policy table has this shape: `access_policy`, [`scan`](#scanning-globalsca
 | Option  | Type     | Default | Description                   |
 |---------|----------|---------|-------------------------------|
 | `rules` | [string] | `[]`    | CEL expressions for retention |
+
+### Pull History (`global.pull_history`)
+
+How each tag's and revision's pull history is kept once [`update_pull_time`](#global-options-global) records it. Scrub compacts older pulls into chunks of up to 1000 and trims the history to its bounds; the newest pull is always kept, since retention reads it.
+
+| Option                | Type    | Default | Description |
+|-----------------------|---------|---------|-------------|
+| `max_pulls`           | u32 > 0 | `1000`  | Pulls kept per target, which the pulls endpoint pages through. |
+| `max_age_secs`        | u64     | unset   | Age past which a pull leaves the history (e.g. `31536000` keeps a year). |
+| `compact_after_secs`  | u64     | `3600`  | Age past which a pull is compacted. The default applies only when `compact_after_pulls` is unset too. |
+| `compact_after_pulls` | u32 > 0 | unset   | Newest pulls kept uncompacted per target. Set with `compact_after_secs`, a pull past either is compacted. |
+
+Compaction changes only how pulls are stored: each uncompacted pull is one key under `!atime/`, so the `compact_after_*` gates bound that key count, while `max_pulls` and `max_age_secs` bound what the history holds.
 
 ### Index (`global.index`)
 

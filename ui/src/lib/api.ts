@@ -57,13 +57,13 @@ export interface PullEntry {
 }
 
 /**
- * One page of a target's recorded pulls, newest first. `limit` and
+ * One page of a target's recorded pulls, newest first. `max_pulls` and
  * `max_age_secs` are the operator-configured history bounds; `next` is the
  * offset of the following page, when there is one.
  */
 export interface PullHistory {
 	target: string;
-	limit: number;
+	max_pulls: number;
 	max_age_secs?: number;
 	entries: PullEntry[];
 	next?: number;

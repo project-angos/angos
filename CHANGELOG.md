@@ -9,14 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `image.namespace` joins the CEL variables of the retention, scan and index policies.
-- Scrub packs old pull history into compacted chunks instead of deleting it, keeping up to `[global] atime_audit_history_limit` pulls per target (default 1000), optionally bounded in age by `atime_audit_history_max_age_secs`.
-- `[global] atime_audit_max_entries` packs live pull entries past a count, alone or alongside `atime_audit_window_secs`.
+- Scrub packs old pull history into compacted chunks of up to 1000 pulls instead of deleting it, keeping up to `[global.pull_history] max_pulls` pulls per target (default 1000), optionally bounded in age by `max_age_secs`.
+- `[global.pull_history] compact_after_pulls` compacts pulls past a count, alone or alongside `compact_after_secs`.
 - The pulls endpoint pages with `offset` and `n`, and the web UI loads older pulls on demand.
 - The pull history records the client's IP address and how it authenticated (`basic`, `token`, `oidc`, `kubernetes`, `mtls`, `internal` or `anonymous`), which the web UI shows in an address column and as a pill beside the client; pulls recorded before the upgrade carry neither.
 
 ### Changed
 
-- The pulls endpoint reports the history bounds as `limit` and `max_age_secs` in place of `window_secs`.
+- **Breaking:** `[global] atime_audit_window_secs` is now `[global.pull_history] compact_after_secs`; the old key is ignored.
+- The pulls endpoint reports the history bounds as `max_pulls` and `max_age_secs` in place of `window_secs`.
 
 ### Fixed
 
