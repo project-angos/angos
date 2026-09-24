@@ -139,6 +139,13 @@ pub enum Action {
         path: String,
         download: bool,
     },
+    /// What one file of a layer holds once decoded, read like the file.
+    #[serde(rename = "get-blob")]
+    GetLayerFileDetails {
+        namespace: Namespace,
+        digest: Digest,
+        path: String,
+    },
     #[serde(rename = "delete-blob")]
     DeleteBlob {
         namespace: Namespace,
@@ -276,7 +283,8 @@ impl Action {
             Action::GetBlob { .. }
             | Action::HeadBlob { .. }
             | Action::ListLayerEntries { .. }
-            | Action::GetLayerFile { .. } => "get-blob",
+            | Action::GetLayerFile { .. }
+            | Action::GetLayerFileDetails { .. } => "get-blob",
             Action::DeleteBlob { .. } => "delete-blob",
             Action::GetManifest { .. } | Action::HeadManifest { .. } => "get-manifest",
             Action::PutManifest { .. } => "put-manifest",
@@ -359,6 +367,9 @@ impl Action {
             | Action::HeadBlob { namespace, digest }
             | Action::ListLayerEntries { namespace, digest }
             | Action::GetLayerFile {
+                namespace, digest, ..
+            }
+            | Action::GetLayerFileDetails {
                 namespace, digest, ..
             }
             | Action::DeleteBlob { namespace, digest }

@@ -1,7 +1,10 @@
 use chrono::{TimeZone, Utc};
 use hyper::{
-    Request,
-    header::{ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderName, RANGE},
+    HeaderMap, Request,
+    header::{
+        ACCEPT, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderName,
+        HeaderValue, RANGE,
+    },
 };
 
 use angos_oci::http_range::{ByteWindow, RequestRange};
@@ -551,4 +554,19 @@ fn wildcard_accept_members_survive_and_malformed_ones_are_dropped() {
     let accepted = RequestHeaders::new(&parts.headers).accepted_content_types();
     let result: Vec<&str> = accepted.iter().map(MediaRange::as_str).collect();
     assert_eq!(result, vec!["*/*", "application/*", "application/json"]);
+}
+
+#[test]
+fn accepts_gzip_honours_a_zero_quality() {
+    let accepts = |value: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_str(value).unwrap());
+        RequestHeaders::new(&headers).accepts_gzip()
+    };
+    assert!(accepts("gzip, deflate, br, zstd"));
+    assert!(accepts("br;q=1.0, GZIP;q=0.5"));
+    assert!(!accepts("gzip;q=0"));
+    assert!(!accepts("gzip; Q = 0"));
+    assert!(!accepts("br, x-gzip2"));
+    assert!(!RequestHeaders::new(&HeaderMap::new()).accepts_gzip());
 }

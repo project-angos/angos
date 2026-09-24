@@ -54,6 +54,10 @@ default = "scan"
 default = "index"
 
 # ORAS artifacts, for the Files view.
+# The image leaking credentials, indexed on push so the shots find its secrets.
+[repository."apps".index]
+default = "index"
+
 [repository."artifacts"]
 
 # The nginx images and the artifacts replicate to a downstream that accepts

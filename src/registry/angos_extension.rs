@@ -50,6 +50,34 @@ impl From<layer::Kind> for ext::EntryKind {
     }
 }
 
+impl From<layer::SecretKind> for ext::SecretKind {
+    fn from(kind: layer::SecretKind) -> Self {
+        match kind {
+            layer::SecretKind::PrivateKey => ext::SecretKind::PrivateKey,
+            layer::SecretKind::AwsCredentials => ext::SecretKind::AwsCredentials,
+            layer::SecretKind::RegistryAuth => ext::SecretKind::RegistryAuth,
+            layer::SecretKind::NpmToken => ext::SecretKind::NpmToken,
+            layer::SecretKind::GitCredentials => ext::SecretKind::GitCredentials,
+            layer::SecretKind::Netrc => ext::SecretKind::Netrc,
+            layer::SecretKind::GithubToken => ext::SecretKind::GithubToken,
+            layer::SecretKind::GitlabToken => ext::SecretKind::GitlabToken,
+            layer::SecretKind::SlackToken => ext::SecretKind::SlackToken,
+            layer::SecretKind::StripeKey => ext::SecretKind::StripeKey,
+            layer::SecretKind::AwsAccessKey => ext::SecretKind::AwsAccessKey,
+            layer::SecretKind::Kubeconfig => ext::SecretKind::Kubeconfig,
+        }
+    }
+}
+
+impl From<layer::Secret> for ext::Secret {
+    fn from(secret: layer::Secret) -> Self {
+        ext::Secret {
+            kind: secret.kind.into(),
+            line: secret.line,
+        }
+    }
+}
+
 impl From<layer::Entry> for ext::LayerEntry {
     fn from(entry: layer::Entry) -> Self {
         ext::LayerEntry {
@@ -62,6 +90,13 @@ impl From<layer::Entry> for ext::LayerEntry {
             mtime: entry.mtime,
             link: entry.link,
             offset: entry.offset,
+            content: entry.content.map(|content| ext::FileContent {
+                sha256: content.sha256,
+                sha512: content.sha512,
+                mime_type: content.mime_type,
+                secrets: content.secrets.into_iter().map(Into::into).collect(),
+            }),
+            capabilities: entry.capabilities,
         }
     }
 }
@@ -69,6 +104,7 @@ impl From<layer::Entry> for ext::LayerEntry {
 impl From<layer::Listing> for ext::LayerListing {
     fn from(listing: layer::Listing) -> Self {
         ext::LayerListing {
+            refreshing: listing.is_outdated(),
             compressed: listing.compressed,
             uncompressed_size: listing.uncompressed_size,
             entries: listing.entries.into_iter().map(Into::into).collect(),
@@ -120,6 +156,13 @@ impl ext::AngosExtensionService for Registry {
         request: ext::LayerFileRequest,
     ) -> Result<ext::LayerFile<Self::Body>, Error> {
         self.handle_get_layer_file(request).await
+    }
+
+    async fn get_layer_file_details(
+        &self,
+        request: ext::LayerFileDetailsRequest,
+    ) -> Result<ext::LayerFileDetails, Error> {
+        self.handle_get_layer_file_details(request).await
     }
 
     async fn list_jobs(&self, request: ext::ListJobsRequest) -> Result<ext::JobsBody, Error> {

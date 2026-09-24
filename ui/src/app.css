@@ -962,15 +962,509 @@ select:focus-visible {
 	color: var(--muted);
 }
 
-.fs-content pre {
-	max-height: 32rem;
+/* The browser beside the open file, which stays in view while the list scrolls. */
+.card:has(.fs-split) {
+	overflow: visible;
+}
+
+.fs-split.open {
+	display: grid;
+	grid-template-columns: minmax(15rem, 2fr) minmax(0, 3fr);
+}
+
+.fs-split.open .fs-extra {
+	display: none;
+}
+
+.fs-pane {
+	min-width: 0;
+	overflow-x: auto;
+	outline: none;
+}
+
+.fs-split.open .fs-pane {
+	border-right: 1px solid var(--border);
+}
+
+/* Beside an open file the lists give their columns up to the paths. */
+.fs-split.open .fs-pane table:not(.fs-tree) th {
+	width: auto;
+}
+
+.fs-split.open .waste-bar {
+	display: none;
+}
+
+/* A name too long for its column ends in an ellipsis rather than widening the tree. */
+.fs-tree {
+	table-layout: fixed;
+}
+
+.fs-tree .fs-name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.fs-pane > table {
+	border: 0;
 	border-radius: 0;
 }
 
-/* A note in place of the file's text keeps the panel's padding. */
-.fs-content p {
+/* The row the list's focus rests on shows it by its shade. */
+.fs-pane tr:focus {
+	outline: none;
+}
+
+.fs-pane:focus-within tr.cursor:not(.selected) td,
+.fs-pane:focus-within tr:not(.selected):has(.cursor) td,
+.fs-pane:focus-within .waste-copy:has(.cursor) {
+	background: var(--hover-strong);
+}
+
+.fs-pane:focus-within .fs-tile.cursor {
+	box-shadow: var(--shadow-ring);
+}
+
+tr.selected td {
+	background: var(--accent-soft);
+}
+
+button.link.fs-path {
+	font-family: var(--font-mono);
+	font-size: 0.8125rem;
+	font-weight: 400;
+	text-align: left;
+	white-space: normal;
+	word-break: break-all;
+}
+
+.fs-toggle-meta {
+	margin-left: 0.25rem;
+	color: var(--faint);
+	font-weight: 400;
+}
+
+/* The file fills its column, as tall as the list up to the window, which
+   leaves it room to stay in view while a longer list scrolls. */
+.fs-preview {
+	position: sticky;
+	top: 3rem;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	max-height: calc(100vh - 3rem);
+	background: var(--surface);
+}
+
+.fs-preview-head {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	gap: 0.4rem;
+	padding: 0.625rem 0.875rem;
+	border-bottom: 1px solid var(--border);
+}
+
+.fs-preview-title {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+
+/* The name stays whole while the folder path gives way first. */
+.fs-preview-path {
+	display: flex;
+	flex: 1;
+	min-width: 0;
+	font: 500 0.875rem var(--font-mono);
+}
+
+.fs-preview-dir,
+.fs-preview-name {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.fs-preview-dir {
+	flex: 0 100 auto;
+	color: var(--muted);
+}
+
+.fs-preview-name {
+	flex: 0 1 auto;
+}
+
+.fs-close {
+	display: inline-flex;
+	padding: 0.3rem;
+	background: none;
+	box-shadow: none;
+	color: var(--muted);
+}
+
+.fs-close:hover {
+	background: var(--hover);
+	color: var(--text);
+}
+
+.fs-close svg {
+	width: 1rem;
+	height: 1rem;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 2;
+	stroke-linecap: round;
+}
+
+.fs-preview-meta,
+.fs-preview-digests {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.25rem 0.75rem;
+	font-size: 0.8125rem;
+	color: var(--muted);
+}
+
+.fs-versions {
+	display: inline-flex;
+	gap: 0.25rem;
+}
+
+button.badge.fs-version {
+	box-shadow: none;
+	cursor: pointer;
+}
+
+button.badge.fs-version.active {
+	background: var(--accent-soft);
+	color: var(--accent-hover);
+}
+
+.fs-preview-body {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	min-height: 0;
+}
+
+.fs-preview-body > p {
 	margin: 0;
 	padding: 0.75rem 0.875rem;
+}
+
+/* A file shown as what it means: rendered markdown, or its certificates. */
+.fs-rich {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+}
+
+.fs-rich > table {
+	border: 0;
+	border-radius: 0;
+}
+
+.fs-markdown {
+	padding: 0.25rem 1.25rem 1rem;
+	line-height: 1.6;
+	overflow-wrap: anywhere;
+}
+
+.fs-markdown :is(h1, h2, h3, h4) {
+	margin: 1.25rem 0 0.5rem;
+	font-size: 1.05rem;
+}
+
+.fs-markdown h1 {
+	font-size: 1.3rem;
+}
+
+.fs-markdown blockquote {
+	margin: 0;
+	padding-left: 1rem;
+	border-left: 3px solid var(--border-strong);
+	color: var(--muted);
+}
+
+.fs-markdown pre code {
+	padding: 0;
+	background: none;
+}
+
+/* Library names wrap between each other, never inside one. */
+/* A library name stays whole, over the details table's breakable code. */
+.fs-rich .fs-libraries code {
+	white-space: nowrap;
+	word-break: normal;
+}
+
+/* An image centred in its pane, as large as it fits. */
+.fs-image {
+	display: grid;
+	place-items: center;
+	padding: 1rem;
+}
+
+.fs-image img {
+	max-width: 100%;
+}
+
+/* A unified diff, one row per line, as wide as its longest. */
+.fs-diff {
+	display: grid;
+	font: 0.8125rem/1.6 var(--font-mono);
+	white-space: pre;
+}
+
+.fs-diff > div {
+	padding: 0 0.875rem;
+}
+
+.fs-hunk {
+	background: var(--subtle);
+	color: var(--muted);
+}
+
+.fs-add {
+	background: var(--ok-bg);
+}
+
+.fs-del {
+	background: var(--danger-bg);
+}
+
+/* Line numbers in a gutter that stays put when the text scrolls across. */
+.fs-code {
+	display: flex;
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	background: var(--sidebar);
+}
+
+.fs-code pre {
+	overflow: visible;
+	border-radius: 0;
+	background: none;
+}
+
+.fs-gutter {
+	position: sticky;
+	left: 0;
+	padding-right: 0.75rem;
+	border-right: 1px solid var(--border);
+	background: var(--sidebar) !important;
+	color: var(--faint);
+	text-align: right;
+	user-select: none;
+}
+
+.fs-text {
+	position: relative;
+	flex: 1;
+	isolation: isolate;
+}
+
+/* Flush with the card, over the toolbar. */
+.fs-notice {
+	margin: 0;
+	border-width: 0 0 1px;
+	border-radius: 0;
+}
+
+/* A secret's line, across the gutter and behind the text. */
+.fs-mark {
+	position: absolute;
+	left: 0;
+	right: 0;
+	z-index: -1;
+	height: 1lh;
+	background: var(--danger-bg);
+	pointer-events: none;
+}
+
+.fs-preview-body > .fs-truncated {
+	border-top: 1px solid var(--border);
+	font-size: 0.8125rem;
+}
+
+/* The header wraps to two rows here, and the pane sticks under both. */
+@media (max-width: 48rem) {
+	.fs-preview {
+		top: 5rem;
+		max-height: calc(100vh - 5rem);
+	}
+}
+
+/* A phone gives the open file the whole screen, its close button leading back. */
+@media (max-width: 40rem) {
+	.fs-split.open {
+		display: block;
+	}
+
+	.fs-preview {
+		position: fixed;
+		inset: 0;
+		z-index: 20;
+		max-height: none;
+	}
+}
+
+/* Syntax colors from the chip palette, so they follow the theme. */
+.hljs-comment,
+.hljs-quote {
+	color: var(--faint);
+	font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-doctag {
+	color: var(--chip-purple-fg);
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-addition {
+	color: var(--chip-green-fg);
+}
+
+.hljs-number,
+.hljs-literal,
+.hljs-symbol,
+.hljs-bullet {
+	color: var(--chip-orange-fg);
+}
+
+.hljs-title,
+.hljs-section,
+.hljs-name {
+	color: var(--chip-blue-fg);
+}
+
+.hljs-built_in,
+.hljs-type,
+.hljs-selector-class,
+.hljs-selector-id {
+	color: var(--chip-cyan-fg);
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-property {
+	color: var(--chip-yellow-fg);
+}
+
+.hljs-meta {
+	color: var(--muted);
+}
+
+.hljs-code {
+	color: var(--chip-cyan-fg);
+}
+
+.hljs-link {
+	color: var(--link);
+}
+
+.hljs-deletion {
+	color: var(--chip-red-fg);
+}
+
+.hljs-emphasis {
+	font-style: italic;
+}
+
+.hljs-strong {
+	font-weight: 600;
+}
+
+/* Wasted space: a meter of the image's bytes, then the largest offenders. */
+.waste-summary {
+	display: grid;
+	gap: 0.5rem;
+	padding: 0.75rem 0.875rem;
+	border-bottom: 1px solid var(--border);
+	background: var(--subtle);
+}
+
+.waste-summary p {
+	margin: 0;
+}
+
+.waste-head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem;
+}
+
+.waste-meter {
+	display: flex;
+	height: 0.5rem;
+	border-radius: 999px;
+	background: var(--hover-strong);
+	overflow: hidden;
+}
+
+.waste-overwritten {
+	background: var(--warn-fg);
+}
+
+.waste-duplicates {
+	background: var(--chip-purple-fg);
+}
+
+.waste-legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem 1.25rem;
+}
+
+.waste-swatch {
+	display: inline-block;
+	width: 0.5rem;
+	height: 0.5rem;
+	margin-right: 0.4rem;
+	border-radius: 2px;
+}
+
+.waste-copy {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.1rem 0;
+}
+
+.waste-bar {
+	display: inline-block;
+	width: 4rem;
+	height: 0.375rem;
+	margin-right: 0.5rem;
+	border-radius: 999px;
+	background: var(--hover-strong);
+	vertical-align: middle;
+	overflow: hidden;
+}
+
+.waste-bar > span {
+	display: block;
+	height: 100%;
+	background: var(--warn-fg);
+}
+
+.waste-bar.duplicates > span {
+	background: var(--chip-purple-fg);
+}
+
+.badge.waste-unchanged {
+	background: var(--chip-yellow-bg);
+	color: var(--chip-yellow-fg);
 }
 
 /* ===== STATES ===== */
@@ -1167,6 +1661,11 @@ a.tag-standalone:hover {
 
 .severity {
 	text-transform: capitalize;
+}
+
+/* A secret's label is written as it reads: "npm token", "AWS credentials". */
+.severity.secret {
+	text-transform: none;
 }
 
 .severity-critical {

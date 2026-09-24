@@ -178,6 +178,14 @@ fn test_action_serialization_cel_compatibility() {
             },
         ),
         (
+            "get-blob",
+            Action::GetLayerFileDetails {
+                namespace: ns(),
+                digest: digest(),
+                path: "usr/bin/env".to_string(),
+            },
+        ),
+        (
             "get-manifest",
             Action::HeadManifest {
                 namespace: ns(),
@@ -256,6 +264,7 @@ fn assert_action_variant_covered(action: &Action) {
         | Action::HeadBlob { .. }
         | Action::ListLayerEntries { .. }
         | Action::GetLayerFile { .. }
+        | Action::GetLayerFileDetails { .. }
         | Action::DeleteBlob { .. }
         | Action::GetManifest { .. }
         | Action::HeadManifest { .. }

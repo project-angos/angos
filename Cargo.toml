@@ -69,7 +69,7 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 
 [package]
 name = "angos"
-version = "1.11.0"
+version = "1.12.0"
 edition = "2024"
 
 [profile.release]
@@ -99,6 +99,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 bytesize = { workspace = true, features = ["serde"] }
 cel-interpreter = "0.10"
+flate2 = "1.1"
 chrono = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
@@ -147,7 +148,6 @@ zeroize = { workspace = true }
 [dev-dependencies]
 angos-cache = { workspace = true, features = ["test-util"] }
 angos-oci = { workspace = true, features = ["test-util"] }
-flate2 = "1.1"
 angos-s3-client = { workspace = true, features = ["test-util"] }
 angos-storage = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }

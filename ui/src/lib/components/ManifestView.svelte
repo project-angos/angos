@@ -112,10 +112,11 @@
 		...(reports.length > 0 ? [{ id: 'vulnerabilities', label: 'Vulnerabilities', count: vulnTotal }] : []),
 		...(fsLayers.length > 0 ? [{ id: 'filesystem', label: 'Filesystem' }] : [])
 	]);
-	// The anchor is the tab's id, followed for Vulnerabilities by the platform shown.
+	// The anchor is the tab's id, followed by what the tab shows: a platform for
+	// Vulnerabilities, a file for Filesystem.
 	const anchor = $derived(page.url.hash.slice(1));
 	const active = $derived(anchor.split('/', 1)[0]);
-	const platform = $derived(anchor.slice(active.length + 1));
+	const rest = $derived(anchor.slice(active.length + 1));
 	// An anchor naming a tab this manifest lacks falls back to OCI.
 	const current = $derived(tabs.some((tab) => tab.id === active) ? active : 'oci');
 
@@ -479,7 +480,7 @@
 		<PullHistory namespace={path} target={reference} open />
 	{/key}
 {:else if current === 'vulnerabilities'}
-	<VulnTab namespace={path} {reports} {platform} ownManifest={isReport ? manifest : null} ownDigest={digest} />
+	<VulnTab namespace={path} {reports} platform={rest} ownManifest={isReport ? manifest : null} ownDigest={digest} />
 {:else if current === 'filesystem'}
-	<LayerBrowser namespace={path} layers={fsLayers} />
+	<LayerBrowser namespace={path} layers={fsLayers} anchor={rest} />
 {/if}

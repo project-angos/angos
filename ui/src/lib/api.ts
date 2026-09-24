@@ -377,9 +377,43 @@ export interface LayerEntry {
 	mtime: number;
 	link?: string;
 	offset: number;
+	/** Set on files; missing from a listing indexed before it existed. */
+	content?: FileContent;
+	/** The Linux capabilities its `security.capability` attribute permits. */
+	capabilities?: string[];
+}
+
+export type SecretKind =
+	| 'private-key'
+	| 'aws-credentials'
+	| 'registry-auth'
+	| 'npm-token'
+	| 'git-credentials'
+	| 'netrc'
+	| 'github-token'
+	| 'gitlab-token'
+	| 'slack-token'
+	| 'stripe-key'
+	| 'aws-access-key'
+	| 'kubeconfig';
+
+export interface FileContent {
+	sha256: string;
+	sha512: string;
+	mime_type: string;
+	/** What the file's first bytes give away, in line order. */
+	secrets?: Secret[];
+}
+
+/** A credential, and the line it is on from 1. */
+export interface Secret {
+	kind: SecretKind;
+	line: number;
 }
 
 export interface LayerListing {
+	/** An older version indexed it; the registry is indexing the layer again. */
+	refreshing: boolean;
 	compressed: boolean;
 	uncompressed_size: number;
 	entries: LayerEntry[];
@@ -405,6 +439,54 @@ export async function fetchLayerEntries(namespace: string, digest: string): Prom
 	} catch (e) {
 		return { listing: null, pending: false, error: e instanceof Error ? e.message : 'Request failed' };
 	}
+}
+
+/** What `file` would say of an ELF binary, and the libraries it needs. */
+export interface ElfDetails {
+	type: string;
+	machine: string;
+	bits: number;
+	endian: string;
+	entry: string;
+	/** The dynamic loader it names, absent for a static binary or a shared object. */
+	interpreter: string | null;
+	dynamic: boolean;
+	needed: string[];
+	/** The name a shared library answers to. */
+	soname: string | null;
+	build_id: string | null;
+	/** How much of the relocations turn read-only once loaded. */
+	relro: 'full' | 'partial' | 'none';
+	executable_stack: boolean;
+}
+
+/** A PEM block: a certificate decoded, anything else by its label alone. */
+export interface PemBlock {
+	label: string;
+	certificate?: Certificate;
+}
+
+export interface Certificate {
+	subject: string;
+	issuer: string;
+	not_before: string;
+	not_after: string;
+	/** The DNS names and IPv4 addresses the certificate is for. */
+	names: string[];
+}
+
+/** What a file holds once the registry decodes it. */
+export interface LayerFileDetails {
+	elf?: ElfDetails;
+	certificates?: PemBlock[];
+}
+
+export function fetchLayerFileDetails(
+	namespace: string,
+	digest: string,
+	path: string
+): Promise<FetchResult<LayerFileDetails>> {
+	return fetchJson(`/v2/${namespace}/_angos/layers/${digest}/details?${new URLSearchParams({ path })}`);
 }
 
 // Carries no bearer either, for the reason `blobUrl` gives.

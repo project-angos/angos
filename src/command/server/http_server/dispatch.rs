@@ -11,7 +11,7 @@ use angos_docker_extension_service::{
 };
 use angos_extension_service::{
     AngosExtensionService, DeleteJobRequest, Endpoint as AngosEndpoint, LayerEntriesRequest,
-    LayerFileRequest, ListJobsRequest, ListPullsRequest, RetryJobRequest,
+    LayerFileDetailsRequest, LayerFileRequest, ListJobsRequest, ListPullsRequest, RetryJobRequest,
 };
 use angos_oci::Namespace;
 use angos_oci::request::{
@@ -321,7 +321,11 @@ async fn dispatch_route<'a>(
             Ok(registry.list_revisions(namespace).await?.into_response()?)
         }
         Route::Angos(AngosEndpoint::ListLayerEntries { namespace, digest }) => Ok(registry
-            .list_layer_entries(LayerEntriesRequest { namespace, digest })
+            .list_layer_entries(LayerEntriesRequest {
+                namespace,
+                digest,
+                gzip: headers.accepts_gzip(),
+            })
             .await?
             .into_response()?),
         Route::Angos(AngosEndpoint::GetLayerFile {
@@ -335,9 +339,22 @@ async fn dispatch_route<'a>(
                 digest,
                 path,
                 download,
+                range: headers.blob_range()?,
             })
             .await?
             .into_response(registry.blob_stream_frame_size())?),
+        Route::Angos(AngosEndpoint::GetLayerFileDetails {
+            namespace,
+            digest,
+            path,
+        }) => Ok(registry
+            .get_layer_file_details(LayerFileDetailsRequest {
+                namespace,
+                digest,
+                path,
+            })
+            .await?
+            .into_response()?),
         Route::Angos(AngosEndpoint::ListUploads { namespace }) => {
             Ok(registry.list_uploads(namespace).await?.into_response()?)
         }

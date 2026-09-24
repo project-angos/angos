@@ -1,5 +1,5 @@
 import { base } from '$app/paths';
-import type { ManifestEntry, Platform, Manifest, Descriptor, ReferrerInfo, LayerEntry, LayerEntryKind, LayerListing } from './api';
+import type { ManifestEntry, Platform, Manifest, Descriptor, ReferrerInfo, LayerEntry, LayerEntryKind, LayerListing, Secret, SecretKind } from './api';
 
 export type AttestationType = 'slsa' | 'sbom' | 'signature' | 'vuln' | 'artifact';
 
@@ -515,13 +515,36 @@ export interface FsDeletion {
 	layer: number;
 }
 
+/** A file's bytes, still stored in its layer, that a later layer overwrote or removed. */
+export interface FsWaste {
+	/** The file as its layer holds it, gone from the tree. */
+	node: FsNode;
+	size: number;
+	by: number;
+	/** `unchanged` when the file was overwritten with the same bytes. */
+	change: 'replaced' | 'unchanged' | 'removed';
+}
+
 export interface FsTree {
 	root: FsNode;
 	deletions: FsDeletion[];
+	/** Largest first. */
+	wasted: FsWaste[];
 }
 
 function fsDir(name: string, path: string, layer: number): FsNode {
 	return { name, path, kind: 'dir', entry: null, layer, children: new Map() };
+}
+
+/** Records the bytes of every file under a node that layer `by` drops, `next` taking its place. */
+function fsDrop(node: FsNode, by: number, next: LayerEntry | null, wasted: FsWaste[]) {
+	const size = node.kind === 'file' ? (node.entry?.size ?? 0) : 0;
+	if (size > 0) {
+		const sha256 = node.entry?.content?.sha256;
+		const change = !next ? 'removed' : sha256 && sha256 === next.content?.sha256 ? 'unchanged' : 'replaced';
+		wasted.push({ node, size, by, change });
+	}
+	for (const child of node.children.values()) fsDrop(child, by, null, wasted);
 }
 
 /**
@@ -532,6 +555,7 @@ function fsDir(name: string, path: string, layer: number): FsNode {
 export function mergeLayers(listings: LayerListing[]): FsTree {
 	const root = fsDir('', '', -1);
 	const deletions: FsDeletion[] = [];
+	const wasted: FsWaste[] = [];
 	const parentOf = (path: string, layer: number): FsNode => {
 		let node = root;
 		const parts = path.split('/');
@@ -552,16 +576,23 @@ export function mergeLayers(listings: LayerListing[]): FsTree {
 				const dir = parentOf(`${entry.path}/x`, layer);
 				for (const child of dir.children.values()) {
 					deletions.push({ path: child.path, layer });
+					fsDrop(child, layer, null, wasted);
 				}
 				dir.children.clear();
 				continue;
 			}
 			const parent = parentOf(entry.path, layer);
+			const existing = parent.children.get(name);
 			if (entry.kind === 'whiteout') {
-				if (parent.children.delete(name)) deletions.push({ path: entry.path, layer });
+				if (existing) {
+					parent.children.delete(name);
+					deletions.push({ path: entry.path, layer });
+					fsDrop(existing, layer, null, wasted);
+				}
 				continue;
 			}
-			const existing = parent.children.get(name);
+			const merged = entry.kind === 'dir' && existing?.kind === 'dir';
+			if (existing && !merged) fsDrop(existing, layer, entry, wasted);
 			parent.children.set(name, {
 				name,
 				path: entry.path,
@@ -569,19 +600,80 @@ export function mergeLayers(listings: LayerListing[]): FsTree {
 				entry,
 				layer,
 				// A directory listed again keeps what lower layers put in it.
-				children: entry.kind === 'dir' && existing?.kind === 'dir' ? existing.children : new Map()
+				children: merged ? existing.children : new Map()
 			});
 		}
 	});
-	return { root, deletions };
+	wasted.sort((a, b) => b.size - a.size);
+	return { root, deletions, wasted };
 }
 
-/** `0o755` as `rwxr-xr-x`. */
+/** Files of the merged tree holding the same bytes. */
+export interface FsDuplicate {
+	size: number;
+	nodes: FsNode[];
+}
+
+/** The tree's sets of identical files, the most bytes spent on copies first. */
+export function fsDuplicates(root: FsNode): FsDuplicate[] {
+	const sets = new Map<string, FsDuplicate>();
+	const walk = (node: FsNode) => {
+		const sha256 = node.kind === 'file' && node.entry?.size ? node.entry.content?.sha256 : undefined;
+		if (sha256 && node.entry) {
+			const set = sets.get(sha256) ?? { size: node.entry.size, nodes: [] };
+			set.nodes.push(node);
+			sets.set(sha256, set);
+		}
+		node.children.forEach(walk);
+	};
+	walk(root);
+	return [...sets.values()].filter((set) => set.nodes.length > 1).sort((a, b) => fsCopies(b) - fsCopies(a));
+}
+
+export type FsRisk = 'setuid' | 'setgid' | 'capabilities' | 'world-writable';
+
+export interface FsRisky {
+	node: FsNode;
+	risks: FsRisk[];
+}
+
+/**
+ * What the image runs with raised privileges or lets anyone change, by path:
+ * setuid and setgid files, files granted Linux capabilities, and
+ * world-writable files and folders, a sticky folder such as `/tmp` aside.
+ */
+export function fsRisks(root: FsNode): FsRisky[] {
+	const found: FsRisky[] = [];
+	const walk = (node: FsNode) => {
+		const mode = node.entry?.mode ?? 0;
+		const file = node.kind === 'file' || node.kind === 'hardlink';
+		const risks: FsRisk[] = [];
+		if (file && mode & 0o4000) risks.push('setuid');
+		if (file && mode & 0o2000) risks.push('setgid');
+		if (file && node.entry?.capabilities?.length) risks.push('capabilities');
+		if ((file || (node.kind === 'dir' && !(mode & 0o1000))) && mode & 0o002) risks.push('world-writable');
+		if (risks.length > 0) found.push({ node, risks });
+		node.children.forEach(walk);
+	};
+	walk(root);
+	return found.sort((a, b) => a.node.path.localeCompare(b.node.path));
+}
+
+/** The bytes spent on a set's copies beyond the first. */
+export function fsCopies(set: FsDuplicate): number {
+	return set.size * (set.nodes.length - 1);
+}
+
+/** `0o4755` as `rwsr-xr-x`: setuid, setgid and sticky show on the execute bit, as `ls` shows them. */
 export function formatMode(mode: number): string {
-	const bits = 'rwxrwxrwx';
-	return bits
+	return 'rwxrwxrwx'
 		.split('')
-		.map((bit, i) => ((mode >> (8 - i)) & 1 ? bit : '-'))
+		.map((bit, i) => {
+			const set = (mode >> (8 - i)) & 1;
+			if (i % 3 !== 2 || !((mode >> (11 - (i - 2) / 3)) & 1)) return set ? bit : '-';
+			const letter = i === 8 ? 't' : 's';
+			return set ? letter : letter.toUpperCase();
+		})
 		.join('');
 }
 
@@ -609,6 +701,48 @@ export function fsMatches(matcher: FsMatcher, node: FsNode): boolean {
 /** A node stays in a narrowed tree when it or anything under it matches. */
 export function fsVisible(matcher: FsMatcher, node: FsNode): boolean {
 	return fsMatches(matcher, node) || [...node.children.values()].some((c) => fsVisible(matcher, c));
+}
+
+/** The rows the tree view shows, in order: a narrowed tree opens itself, as `FsRow` does. */
+export function fsRows(root: FsNode, expanded: Set<string>, matcher: FsMatcher): FsNode[] {
+	const filtering = matcher.layers.size > 0 || matcher.text !== '';
+	const rows: FsNode[] = [];
+	const walk = (node: FsNode) => {
+		for (const child of sortedChildren(node)) {
+			if (filtering && !fsVisible(matcher, child)) continue;
+			rows.push(child);
+			if (child.kind === 'dir' && (matcher.text !== '' || expanded.has(child.path))) walk(child);
+		}
+	};
+	walk(root);
+	return rows;
+}
+
+/** Whether two nodes are the same layer's entry at the same path. */
+export function fsSame(a: FsNode | null, b: FsNode | null): boolean {
+	return !!a && !!b && a.layer === b.layer && a.path === b.path;
+}
+
+export const SECRET_LABELS: Record<SecretKind, string> = {
+	'private-key': 'Private key',
+	'aws-credentials': 'AWS credentials',
+	'registry-auth': 'Registry login',
+	'npm-token': 'npm token',
+	'git-credentials': 'Git credentials',
+	netrc: 'netrc login',
+	'github-token': 'GitHub token',
+	'gitlab-token': 'GitLab token',
+	'slack-token': 'Slack token',
+	'stripe-key': 'Stripe key',
+	'aws-access-key': 'AWS access key ID',
+	kubeconfig: 'Kubernetes credentials'
+};
+
+/** A file's secrets by kind, each with the lines it is on. */
+export function secretKinds(secrets: Secret[]): [SecretKind, number[]][] {
+	const kinds = new Map<SecretKind, number[]>();
+	for (const { kind, line } of secrets) kinds.set(kind, [...(kinds.get(kind) ?? []), line]);
+	return [...kinds];
 }
 
 /** The parent folder's path, `''` at the top. */

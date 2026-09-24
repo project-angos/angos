@@ -10,11 +10,10 @@ const out = process.argv[2];
 
 const exact = (page, selector, text) => page.locator(selector, { hasText: new RegExp(`^${text}$`) });
 const expandAnnotations = (page) => page.locator('.toggle-annotations').first().click();
-const openFile = async (page) => {
-	for (const name of ['docker-entrypoint.d', '15-local-resolvers.envsh']) {
-		await exact(page, '.fs-label', name).click();
-	}
-};
+// An open file's pane is at most as tall as the window: one as tall as the page
+// shows it the way a tall screen does.
+const fitWindow = async (page) =>
+	page.setViewportSize({ width: 1316, height: await page.evaluate(() => document.body.scrollHeight) });
 
 const VIEWS = [
 	{ name: 'repositories', url: '/' },
@@ -31,7 +30,36 @@ const VIEWS = [
 	{ name: 'manifest-index', url: '/library/alpine:3.19' },
 	{ name: 'pull-history', url: '/library/nginx:1.25-alpine#history' },
 	{ name: 'vulnerabilities', url: '/library/alpine:3.19#vulnerabilities/linux/amd64' },
-	{ name: 'filesystem', url: '/library/nginx:1.25-alpine#filesystem', prepare: openFile },
+	{
+		name: 'filesystem',
+		url: '/library/nginx:1.25-alpine#filesystem/docker-entrypoint.d/15-local-resolvers.envsh',
+		prepare: fitWindow
+	},
+	{
+		// The packages the image's last layer added over the nginx install.
+		name: 'filesystem-diff',
+		url: '/library/nginx:1.25-alpine#filesystem/etc/apk/world',
+		prepare: async (page) => {
+			await page.getByRole('button', { name: 'Diff' }).click();
+			await page.locator('.fs-diff').waitFor();
+			// The link opened /etc, too long a folder to keep the shot short; the
+			// click that folds it leaves the keyboard's shade on its row.
+			await exact(page, '.fs-label', 'etc').click();
+			await page.evaluate(() => document.activeElement.blur());
+			await fitWindow(page);
+		}
+	},
+	{
+		// A dynamic binary: what it needs and how it is hardened.
+		name: 'filesystem-elf',
+		url: '/library/nginx:1.25-alpine#filesystem/usr/sbin/nginx',
+		prepare: async (page) => {
+			// The link opened /usr/sbin, too long a folder to keep the shot short.
+			await exact(page, '.fs-label', 'usr').click();
+			await page.evaluate(() => document.activeElement.blur());
+			await fitWindow(page);
+		}
+	},
 	{
 		name: 'filesystem-icons',
 		url: '/library/nginx:1.25-alpine#filesystem',
@@ -49,6 +77,29 @@ const VIEWS = [
 			await page.locator('details.menu summary').click();
 			await page.locator('.menu-panel input[type=checkbox]').last().check();
 		}
+	},
+	{
+		// The SSH key the last layer deleted, open beside every leak it found.
+		name: 'filesystem-secrets',
+		url: '/apps/webapp:1.0#filesystem/root/.ssh/id_ed25519@L2',
+		prepare: async (page) => {
+			await page.getByRole('button', { name: 'Secrets' }).click();
+			await fitWindow(page);
+		}
+	},
+	{
+		// The launcher granted a capability, beside the setuid script and the folder anyone can write.
+		name: 'filesystem-permissions',
+		url: '/apps/webapp:1.0#filesystem/usr/local/bin/serve',
+		prepare: async (page) => {
+			await page.getByRole('button', { name: 'Permissions' }).click();
+			await fitWindow(page);
+		}
+	},
+	{
+		name: 'filesystem-waste',
+		url: '/library/nginx:1.25-alpine#filesystem',
+		prepare: (page) => page.getByRole('button', { name: 'Waste' }).click()
 	},
 	{ name: 'oras-files', url: '/artifacts/charts/demo:1.0', prepare: expandAnnotations },
 	{ name: 'jobs', url: '/jobs/replication' }

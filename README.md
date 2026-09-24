@@ -1,38 +1,49 @@
 <div align="center">
 
+<img src="doc/images/angos-hero.svg" alt="Angos logo" width="96" height="96">
+
 # Angos
 
-<img src="doc/images/angos-hero.svg" alt="Angos Logo" width="120" height="120">
+A container registry that's simple to run and a pleasure to use.
 
-A fully OCI-compliant and Docker-compatible container registry.
-
-**[Website](https://project-angos.github.io/angos/)** | **[Documentation](doc/)** | **[Quick Start](doc/tutorials/quickstart.md)**
+**[Website](https://project-angos.github.io/angos/)** · **[Documentation](doc/)** · **[Quick Start](doc/tutorials/quickstart.md)**
 
 </div>
 
-## Key Features
+Angos is an OCI registry you configure in one file and run without a database. Its web UI shows
+what is inside every image, layer by layer, with scan reports and pull history alongside.
 
-- Online garbage collection, and scrub/prune maintenance alongside a live server
-- Pull-through cache
-- Bi-directional replication to downstream registries
-- Immutable tags with configurable exclusions
-- Access control policies (CEL-based)
-- Retention policies
-- Native mTLS support
-- OIDC authentication (GitHub Actions, Google, Okta, and more)
-- Token service exchanging a client credential for a registry-signed bearer token
-- Webhook authorization for external policy decisions
-- Event webhooks with required, optional, or async delivery
-- Vulnerability scanning on push with Trivy or Grype, the report kept as an OCI referrer
-- Web UI for browsing and managing images, with each image's merged filesystem explorable layer by layer
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/images/ui-tour-dark.png">
+  <img alt="A tour of the web UI, one view after another" src="doc/images/ui-tour-light.png">
+</picture>
 
-## Properties
+<sub>The web UI in turn: an image's merged filesystem, the secrets found in its layers, a file compared with
+the layer below, a vulnerability report, and pull history.</sub>
 
-- Resource efficient: Asynchronous, streaming operations
-- Secure: mTLS, OIDC/JWT authentication, authorization policies (CEL and webhooks)
-- Scalable: Light footprint, S3-compatible storage, lock-free write coordination
-- Easy to operate: Online garbage collection, auto-reload of configuration and certificates
-- Cross-platform: Portable on most mainstream operating systems just by recompiling
+## Little to look after
+
+There is no database or lock service to run beside Angos. Everything it knows lives in the storage
+that holds your images, a directory or an S3 bucket.
+
+- **Servers are disposable**: start another instance on the same storage and it serves everything the last one did.
+- **Scale by adding replicas**: replicas share the same bucket, with nothing to coordinate them.
+- **Maintenance while it serves**: garbage collection, scrub and prune run beside the live registry.
+- **Changes without restarts**: the configuration and TLS certificates reload when their files change.
+
+## Features
+
+- **OCI 1.1 compliant**: Docker, Podman, containerd and any OCI tool, with referrers for signatures and SBOMs
+- **Pull-through cache**: mirror Docker Hub, ghcr.io or any upstream; immutable tags skip the upstream check
+- **Replication**: mirror repositories to downstream registries in both directions, with a durable retry queue
+- **Access policies**: CEL expressions decide who may push, pull or delete, per repository, with optional webhook authorization
+- **Passwordless CI**: OIDC from GitHub Actions, Kubernetes or any issuer, a token service, and mTLS client certificates
+- **Retention**: keep tags by age, semver pattern, or recent pushes and pulls
+- **Immutable tags**: protect release tags from being overwritten, with exclusions
+- **Vulnerability scanning**: Trivy or Grype on push, the report kept next to the image as an OCI referrer
+- **Event webhooks**: required, optional or asynchronous delivery of push and delete events
+- **Web UI**: browse repositories, manifests, referrers, pull history and image filesystems
+- Written in Rust, with no unsafe code
 
 ## Quick Start
 
