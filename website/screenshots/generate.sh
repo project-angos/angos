@@ -2,8 +2,9 @@
 # Regenerates doc/images/ui-*.png: builds angos, runs it and its scanner on a
 # temporary directory with the config.toml next to this script, seeds it with
 # public images and artifacts, then shoot.mjs screenshots every web UI view in
-# light and dark. Needs cargo, node, oras, curl, jq, nc, openssl, python3 and trivy
-# (SCANNER=grype for Grype); the first run also downloads Playwright's Chromium.
+# light and dark, and ffmpeg cuts the README's tour from them. Needs cargo, node,
+# oras, curl, jq, nc, openssl, python3, ffmpeg and trivy (SCANNER=grype for
+# Grype); the first run also downloads Playwright's Chromium.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -119,3 +120,17 @@ for _ in 1 2 3; do
 done
 
 node "$here/shoot.mjs" "$root/doc/images"
+
+# The README's tour of the website hero's views: GitHub runs no script there, so
+# an animated PNG per theme stands in for the carousel. Each view is cut to one
+# frame from the top, as on the website, and shows for 3.5 s.
+for theme in light dark; do
+  bg=$([ "$theme" = light ] && echo ffffff || echo 191919)
+  n=0
+  for view in filesystem filesystem-secrets filesystem-diff vulnerabilities pull-history; do
+    n=$((n + 1))
+    ffmpeg -loglevel error -y -i "$root/doc/images/ui-$view-$theme.png" \
+      -vf "scale=1316:-1:flags=lanczos,crop=iw:'min(ih,782)':0:0,pad=1316:782:0:0:color=0x$bg" "$work/tour-$n.png"
+  done
+  ffmpeg -loglevel error -y -framerate 2/7 -i "$work/tour-%d.png" -plays 0 -f apng "$root/doc/images/ui-tour-$theme.png"
+done
