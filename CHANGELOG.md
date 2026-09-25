@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.12.1 - UNRELEASED
+
+### Fixed
+
+- A blob stored as an empty object under a non-empty digest reads as missing, so it is fetched or pushed again.
+- Moving an object by server-side copy checks the copy's size and retries before deleting the source.
+- Completing an S3 upload that never opened a multipart puts its bytes instead of copying them.
+
 ## 1.12.0
 
 ### Added

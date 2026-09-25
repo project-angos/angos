@@ -32,7 +32,8 @@ use tokio_util::io::StreamReader;
 
 use crate::{
     BoxedReader, ByteStream, Children, ChildrenPage, Error, KeyStream, ObjectMeta, ObjectStore,
-    Page, object::dir_prefix,
+    Page,
+    object::{dir_prefix, verified_move},
 };
 
 /// Filename prefix for the temp files [`atomic_write`] creates next to their
@@ -534,7 +535,7 @@ impl ObjectStore for Backend {
         })
     }
 
-    async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {
+    async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error> {
         let src = self.full_path(source);
         let dst = self.full_path(destination);
         ensure_parent(&dst).await?;
@@ -543,15 +544,17 @@ impl ObjectStore for Backend {
         // Stream src -> temp -> atomic rename. `std::io::copy` uses a small
         // internal buffer, so the object body is never held in memory in full
         // (a multi-GB blob would otherwise spike RSS by its whole size).
-        match spawn_blocking(move || -> Result<(), Error> {
+        match spawn_blocking(move || -> Result<u64, Error> {
             let mut reader = File::open(&src).map_err(|e| backend_error("copy from", &src, &e))?;
+            let mut copied = 0;
             staged_file(&parent, sync, |file| {
-                io::copy(&mut reader, file).map(|_| ())
+                copied = io::copy(&mut reader, file)?;
+                Ok(())
             })
             .map_err(|e| backend_error("copy to", &dst, &e))?
             .persist(&dst)
             .map_err(|e| backend_error("copy to", &dst, &e.error))?;
-            Ok(())
+            Ok(copied)
         })
         .await
         {
@@ -575,8 +578,7 @@ impl ObjectStore for Backend {
         }
         // Rename can fail across filesystems (`EXDEV`) or transiently; fall back
         // to the (streamed) copy + delete that the trait default would do.
-        self.copy(source, destination).await?;
-        self.delete(source).await
+        verified_move(self, source, destination).await
     }
 
     async fn create_upload(&self, key: &str) -> Result<(), Error> {

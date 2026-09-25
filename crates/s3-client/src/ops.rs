@@ -233,18 +233,21 @@ impl Backend {
         .await
     }
 
+    /// Copies `source` to `destination`, returning the source's size.
+    ///
     /// # Errors
     /// Forwards [`Error`] from the underlying single-shot or multipart
     /// copy: HTTP failures, S3 protocol errors (including 404 on the
     /// source), or a tripped circuit breaker.
-    pub async fn copy_object(&self, source: &str, destination: &str) -> Result<(), Error> {
+    pub async fn copy_object(&self, source: &str, destination: &str) -> Result<u64, Error> {
         let source_size = self.object_size(source).await?;
         if source_size <= self.multipart_copy_threshold {
-            self.copy_object_single(source, destination).await
+            self.copy_object_single(source, destination).await?;
         } else {
             self.copy_object_multipart(source, destination, source_size)
-                .await
+                .await?;
         }
+        Ok(source_size)
     }
 
     async fn copy_object_single(&self, source: &str, destination: &str) -> Result<(), Error> {

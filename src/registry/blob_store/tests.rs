@@ -10,7 +10,7 @@ use angos_storage::test_util::frame;
 use crate::registry::{
     Error,
     blob_store::{upload_session::HashStart, *},
-    keys::NamespaceKeys,
+    keys::{DigestKeys, NamespaceKeys},
     test_utils::{FSRegistryTestCase, RegistryTestCase, for_each_backend},
 };
 
@@ -404,6 +404,39 @@ async fn session_state_is_one_json_record() {
         leftover.is_empty(),
         "completion must leave no session keys: {leftover:?}"
     );
+}
+
+#[tokio::test]
+async fn a_truncated_blob_reads_as_unknown() {
+    for_each_backend(async |tc| {
+        let store = tc.blob_store();
+        let digest = Digest::sha256_of_bytes(b"blob content");
+        store
+            .object_store()
+            .put(&digest.blob_path(), Bytes::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(store.size(&digest).await, Err(Error::BlobUnknown)));
+        assert!(matches!(store.read(&digest).await, Err(Error::BlobUnknown)));
+        assert!(matches!(
+            store.reader(&digest, None).await,
+            Err(Error::BlobUnknown)
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_empty_blob_reads_as_present() {
+    for_each_backend(async |tc| {
+        let store = tc.blob_store();
+        let digest = seed_blob(&store, b"").await;
+
+        assert_eq!(store.size(&digest).await.unwrap(), 0);
+        assert!(store.read(&digest).await.unwrap().is_empty());
+    })
+    .await;
 }
 
 /// An append that fails after durably writing bytes leaves the staging object

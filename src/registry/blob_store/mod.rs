@@ -20,7 +20,7 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use angos_oci::{Algorithm, Digest};
 use angos_storage::Error as StorageError;
@@ -47,6 +47,16 @@ fn blob_error(error: StorageError) -> Error {
         StorageError::NotFound => Error::BlobUnknown,
         backend @ StorageError::Backend(_) => backend.into(),
     }
+}
+
+/// An empty object under a non-empty content's digest (a faulty S3 copy can
+/// leave one) reads as unknown, so it is refetched or re-pushed.
+fn present_size(digest: &Digest, size: u64) -> Result<u64, Error> {
+    if size == 0 && *digest != Digest::from_bytes(digest.algorithm(), []) {
+        warn!("Blob {digest} is stored as an empty object, treating it as missing");
+        return Err(Error::BlobUnknown);
+    }
+    Ok(size)
 }
 
 /// Fan-out for the per-shard page chains behind [`BlobStore::stream_blobs`].
@@ -174,19 +184,24 @@ impl BlobStore {
 
     #[instrument(skip(self))]
     pub async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
-        self.object
+        let body = self
+            .object
             .get(&digest.blob_path())
             .await
-            .map_err(blob_error)
+            .map_err(blob_error)?;
+        present_size(digest, body.len() as u64)?;
+        Ok(body)
     }
 
     #[instrument(skip(self))]
     pub async fn size(&self, digest: &Digest) -> Result<u64, Error> {
-        self.object
+        let size = self
+            .object
             .head(&digest.blob_path())
             .await
-            .map(|meta| meta.size)
-            .map_err(blob_error)
+            .map_err(blob_error)?
+            .size;
+        present_size(digest, size)
     }
 
     /// The blob bytes' last-modified time, or `None` when the backend records
@@ -207,10 +222,12 @@ impl BlobStore {
         digest: &Digest,
         start_offset: Option<u64>,
     ) -> Result<(BoxedReader, u64), Error> {
-        self.object
+        let (reader, size) = self
+            .object
             .get_stream(&digest.blob_path(), start_offset)
             .await
-            .map_err(blob_error)
+            .map_err(blob_error)?;
+        Ok((reader, present_size(digest, size)?))
     }
 
     #[instrument(skip(self))]

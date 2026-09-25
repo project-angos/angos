@@ -380,7 +380,7 @@ macro_rules! object_store_conformance {
                     .put("cp/src", Bytes::from_static(b"payload"))
                     .await
                     .unwrap();
-                store.copy("cp/src", "cp/dst").await.unwrap();
+                assert_eq!(store.copy("cp/src", "cp/dst").await.unwrap(), 7);
                 assert_eq!(store.get("cp/dst").await.unwrap(), b"payload");
                 assert_eq!(store.get("cp/src").await.unwrap(), b"payload");
             }
