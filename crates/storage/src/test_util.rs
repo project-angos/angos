@@ -188,7 +188,7 @@ macro_rules! delegate_object_store {
                     .await
             }
 
-            async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {
+            async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error> {
                 self.hook
                     .before(StoreOp::Copy {
                         source,

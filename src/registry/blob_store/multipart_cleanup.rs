@@ -259,7 +259,7 @@ mod tests {
         ) -> Result<ChildrenPage, StorageError> {
             unimplemented!("not reached by orphan listing")
         }
-        async fn copy(&self, _source: &str, _destination: &str) -> Result<(), StorageError> {
+        async fn copy(&self, _source: &str, _destination: &str) -> Result<u64, StorageError> {
             unimplemented!("not reached by orphan listing")
         }
         async fn create_upload(&self, _key: &str) -> Result<(), StorageError> {

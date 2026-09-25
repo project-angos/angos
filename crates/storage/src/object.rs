@@ -3,6 +3,7 @@ use std::{borrow::Cow, pin::Pin};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
+use tracing::warn;
 
 use crate::{
     BoxedReader,
@@ -197,20 +198,19 @@ pub trait ObjectStore: Send + Sync {
         }
     }
 
-    /// Server-side copy from `source` to `destination`. Backends choose
-    /// whether to issue a single-shot copy or a multipart copy based on
-    /// source size and backend-specific thresholds.
-    async fn copy(&self, source: &str, destination: &str) -> Result<(), Error>;
+    /// Server-side copy from `source` to `destination`, returning the source's
+    /// size. Backends choose whether to issue a single-shot copy or a
+    /// multipart copy based on source size and backend-specific thresholds.
+    async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error>;
 
-    /// Move `source` to `destination`. The default is a `copy` followed by a
-    /// `delete` of the source, which is correct for every backend. Backends
-    /// with a cheaper primitive (notably a same-filesystem `rename`, which is
-    /// atomic and never reads the object body into memory) should override
-    /// this, so a large staged blob promoted to its canonical location is
-    /// moved without buffering the whole object.
+    /// Move `source` to `destination`. The default is a size-checked `copy`
+    /// then a `delete` of the source, which is correct for every backend.
+    /// Backends with a cheaper primitive (notably a same-filesystem `rename`,
+    /// which is atomic and never reads the object body into memory) should
+    /// override this, so a large staged blob promoted to its canonical
+    /// location is moved without buffering the whole object.
     async fn move_object(&self, source: &str, destination: &str) -> Result<(), Error> {
-        self.copy(source, destination).await?;
-        self.delete(source).await
+        verified_move(self, source, destination).await
     }
 
     /// Begin/clear a fresh upload at `key`. Idempotent: discards any leaked
@@ -254,5 +254,146 @@ pub trait ObjectStore: Send + Sync {
         _upload_id_marker: Option<&str>,
     ) -> Result<MultipartUploadPage, Error> {
         Ok(MultipartUploadPage::default())
+    }
+}
+
+const MOVE_COPY_ATTEMPTS: usize = 3;
+
+/// `copy` then `delete`, redoing the copy until the destination's size matches
+/// the source's: some S3 providers report success for a copy that landed an
+/// empty object. Fails with the source left in place if no attempt matches.
+pub async fn verified_move<S: ObjectStore + ?Sized>(
+    store: &S,
+    source: &str,
+    destination: &str,
+) -> Result<(), Error> {
+    let (mut expected, mut landed) = (0, 0);
+    for attempt in 1..=MOVE_COPY_ATTEMPTS {
+        expected = store.copy(source, destination).await?;
+        landed = store.head(destination).await?.size;
+        if landed == expected {
+            return store.delete(source).await;
+        }
+        warn!(
+            "Copy of '{source}' to '{destination}' landed {landed} of {expected} bytes \
+             (attempt {attempt}/{MOVE_COPY_ATTEMPTS})"
+        );
+    }
+    Err(Error::Backend(format!(
+        "copy of '{source}' to '{destination}' landed {landed} bytes, expected {expected}"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    use crate::{
+        Error, ObjectStore, fs,
+        test_util::{HookedStore, StoreHook, StoreOp},
+    };
+
+    use super::MOVE_COPY_ATTEMPTS;
+
+    /// Empties `destination` before its first `truncations` size checks, like
+    /// a copy that reported success but landed an empty object.
+    struct TruncateDestination {
+        inner: Arc<dyn ObjectStore>,
+        destination: &'static str,
+        truncations: usize,
+        checks: AtomicUsize,
+        copies: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StoreHook for TruncateDestination {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), Error> {
+            match op {
+                StoreOp::Copy { .. } => {
+                    self.copies.fetch_add(1, Ordering::SeqCst);
+                }
+                StoreOp::Head { key }
+                    if key == self.destination
+                        && self.checks.fetch_add(1, Ordering::SeqCst) < self.truncations =>
+                {
+                    self.inner.put(key, Bytes::new()).await?;
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    /// The hooked store and its copy counter.
+    fn hooked(
+        dir: &TempDir,
+        truncations: usize,
+    ) -> (
+        HookedStore<Arc<dyn ObjectStore>, TruncateDestination>,
+        Arc<AtomicUsize>,
+    ) {
+        let inner: Arc<dyn ObjectStore> = Arc::new(fs::Backend::builder(dir.path()).build());
+        let copies = Arc::new(AtomicUsize::new(0));
+        let hook = TruncateDestination {
+            inner: Arc::clone(&inner),
+            destination: "mv/dst",
+            truncations,
+            checks: AtomicUsize::new(0),
+            copies: Arc::clone(&copies),
+        };
+        (HookedStore::new(inner, hook), copies)
+    }
+
+    #[tokio::test]
+    async fn a_move_redoes_a_copy_that_landed_the_wrong_size() {
+        let dir = TempDir::new().unwrap();
+        let (store, copies) = hooked(&dir, 1);
+        store
+            .put("mv/src", Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        store.move_object("mv/src", "mv/dst").await.unwrap();
+
+        assert_eq!(store.get("mv/dst").await.unwrap(), b"payload");
+        assert_eq!(store.head("mv/src").await.unwrap_err(), Error::NotFound);
+        assert_eq!(
+            copies.load(Ordering::SeqCst),
+            2,
+            "the copy must be redone once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_move_that_never_lands_the_right_size_keeps_its_source() {
+        let dir = TempDir::new().unwrap();
+        let (store, copies) = hooked(&dir, usize::MAX);
+        store
+            .put("mv/src", Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let error = store
+            .move_object("mv/src", "mv/dst")
+            .await
+            .expect_err("a move whose copies all land the wrong size must fail");
+
+        assert!(
+            matches!(&error, Error::Backend(message) if message.contains("expected 7")),
+            "the error must name the expected size, got: {error}"
+        );
+        assert_eq!(copies.load(Ordering::SeqCst), MOVE_COPY_ATTEMPTS);
+        assert_eq!(
+            store.get("mv/src").await.unwrap(),
+            b"payload",
+            "the source must survive to redo the move from"
+        );
     }
 }

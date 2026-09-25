@@ -20,7 +20,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, query_param},
+    matchers::{body_bytes, header_exists, method, path, query_param},
 };
 
 use super::{MAX_PART_SIZE, MIN_PART_SIZE, next_part_number, plan_known_length_parts, staged_key};
@@ -967,4 +967,55 @@ async fn list_children_bounds_on_the_bare_name_and_drops_the_named_child() {
         "the directory named by start_after must not be re-emitted"
     );
     assert_eq!(page.objects, vec!["v2".to_string()]);
+}
+
+#[tokio::test]
+async fn complete_upload_puts_a_small_upload_without_a_copy() {
+    let server = MockServer::start().await;
+    let config = S3Config {
+        key_prefix: "pu".to_string(),
+        ..mock_config(server.uri())
+    };
+
+    Mock::given(header_exists("x-amz-copy-source"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .expect(0)
+        .mount(&server)
+        .await;
+    // No multipart upload is open for the key.
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <ListMultipartUploadsResult>
+              <IsTruncated>false</IsTruncated>
+            </ListMultipartUploadsResult>"#,
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path("/test-bucket/pu/blob/staged/0"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-length", "5"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/test-bucket/pu/blob/staged/0"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-bucket/pu/blob/data"))
+        .and(body_bytes(b"hello".to_vec()))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(S3Backend::new(&config).expect("s3 client"));
+    Backend::builder(client)
+        .build()
+        .complete_upload("blob/data")
+        .await
+        .expect("a small upload must complete");
 }

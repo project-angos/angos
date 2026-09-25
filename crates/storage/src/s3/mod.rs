@@ -27,7 +27,7 @@
 //!   deleted. Returns the new total size (`sum(parts) + remainder`).
 //! - `complete_upload` recovers the same state, then: with no upload id and no
 //!   remainder it `PutObject(empty)`s `key`; with no upload id but a remainder
-//!   it `copy_object`s the staged remainder to `key`; otherwise it flushes the
+//!   it `PutObject`s the staged remainder at `key`; otherwise it flushes the
 //!   final remainder as the last part and `CompleteMultipartUpload`s, then
 //!   cleans up the staged objects.
 //! - `abort_upload` searches every in-flight multipart upload at `key` and
@@ -443,7 +443,7 @@ impl ObjectStore for Backend {
         range_scan::scan_all_keys(&self.client, prefix, self.range_concurrency)
     }
 
-    async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {
+    async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error> {
         Ok(self.client.copy_object(source, destination).await?)
     }
 
@@ -559,9 +559,10 @@ impl ObjectStore for Backend {
                 Err(e) => return Err(e),
             },
             (None, _) => {
-                // Small upload: promote the staged remainder to the canonical
-                // key and clean up.
-                self.client.copy_object(&read_key, key).await?;
+                // Small upload: `PUT` the staged remainder at the canonical key,
+                // as a server-side copy can report success over an empty object.
+                let data = self.client.read(&read_key).await?;
+                self.client.put_object(key, Bytes::from(data)).await?;
                 let _ = self.client.delete_object(&read_key).await;
             }
             (Some(upload_id), staged) => {
