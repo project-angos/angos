@@ -73,7 +73,9 @@ impl FsRegistryFixture {
         };
         let mut webhooks = HashMap::new();
         webhooks.insert("test-hook".to_string(), webhook);
-        let dispatcher = EventDispatcher::new(webhooks).expect("dispatcher build");
+        let dispatcher =
+            EventDispatcher::new(webhooks, vec!["test-hook".to_string()], HashMap::new())
+                .expect("dispatcher build");
 
         let FsTestStack {
             dir,

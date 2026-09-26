@@ -1504,7 +1504,9 @@ mod tests {
         };
         let mut webhooks = HashMap::new();
         webhooks.insert("retention-hook".to_string(), webhook);
-        let dispatcher = EventDispatcher::new(webhooks).expect("dispatcher build");
+        let dispatcher =
+            EventDispatcher::new(webhooks, vec!["retention-hook".to_string()], HashMap::new())
+                .expect("dispatcher build");
 
         let test_case = FSRegistryTestCase::new();
         let namespace = &Namespace::new("test-repo/app").unwrap();

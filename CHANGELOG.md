@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Describing an ELF file reads its first loader and dynamic section and at most four note segments, so a forged program header table cannot turn one request into thousands of storage reads.
 - Replicating an index pushes each child manifest once, one at a time, so an index naming the same manifests many times no longer multiplies the work and memory at every nesting level.
 - `angos prune` keeps an untagged manifest that a tag or index named after the run judged it, and never deletes a tag younger than `gc_grace_secs` along with a manifest.
+- An event reaches only the webhooks `global.event_webhooks` or its repository's `event_webhooks` names, instead of every defined webhook receiving every repository's events.
 
 ## 1.12.0
 

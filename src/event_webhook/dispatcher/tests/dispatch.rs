@@ -11,7 +11,7 @@ use super::common::{
 use crate::{
     configuration::RegexPattern,
     event_webhook::{config::DeliveryPolicy, dispatcher::EventDispatcher, event::EventKind},
-    metrics_provider::metrics_provider,
+    metrics_provider::{init_for_tests, metrics_provider},
 };
 
 #[test]
@@ -35,14 +35,14 @@ fn event_dispatcher_builder_constructs_from_configs() {
     hook2.events = vec![EventKind::TagCreate];
     webhooks.insert("hook2".to_string(), hook2);
 
-    let dispatcher = EventDispatcher::new(webhooks);
+    let dispatcher = EventDispatcher::new(webhooks, Vec::new(), HashMap::new());
     assert!(dispatcher.is_ok());
 }
 
 #[test]
 fn event_dispatcher_builder_empty_configs() {
     let webhooks = HashMap::new();
-    let dispatcher = EventDispatcher::new(webhooks);
+    let dispatcher = EventDispatcher::new(webhooks, Vec::new(), HashMap::new());
     assert!(dispatcher.is_ok());
 }
 
@@ -136,6 +136,46 @@ async fn dispatch_skips_webhook_for_non_matching_event_kind() {
     let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
+}
+
+/// An event reaches the webhooks its repository names, else the global ones,
+/// so a webhook no list names never fires.
+#[tokio::test]
+async fn dispatch_reaches_only_the_webhooks_the_repository_enables() {
+    init_for_tests();
+    let (audit, slack, unused) = (
+        MockServer::start().await,
+        MockServer::start().await,
+        MockServer::start().await,
+    );
+    for (server, deliveries) in [(&audit, 1), (&slack, 1), (&unused, 0)] {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(deliveries)
+            .mount(server)
+            .await;
+    }
+    let webhooks = [("audit", &audit), ("slack", &slack), ("unused", &unused)]
+        .into_iter()
+        .map(|(name, server)| {
+            let config =
+                create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0);
+            (name.to_string(), config)
+        })
+        .collect();
+    let dispatcher = EventDispatcher::new(
+        webhooks,
+        vec!["slack".to_string()],
+        HashMap::from([("docker-hub".to_string(), vec!["audit".to_string()])]),
+    )
+    .unwrap();
+
+    // `docker-hub` names its own; a namespace under no repository gets the global.
+    let named = create_test_event();
+    let mut unmatched = create_test_event();
+    unmatched.repository = String::new();
+    dispatcher.dispatch(&named).await.unwrap();
+    dispatcher.dispatch(&unmatched).await.unwrap();
 }
 
 #[tokio::test]

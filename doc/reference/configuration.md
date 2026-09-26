@@ -473,7 +473,7 @@ Repository namespace keys must not overlap: a key like `team` and a key like `te
 | `scan` | table | - | Which images pushed here, or stored by a cache miss in a pull-through repository, are sent to the scanner service, and when their reports are refreshed; see [Scan](#scan-repositorynamespacescan) |
 | `index` | table | - | Which images pushed here, or stored by a cache miss, have their filesystem indexed as they land, so the web UI browses them at once; see [Index](#index-repositorynamespaceindex) |
 | `authorization_webhook`     | string   | inherits | Webhook name (empty to disable) |
-| `event_webhooks`            | [string] | inherits | Event webhook names              |
+| `event_webhooks`            | [string] | inherits | Replaces the global event webhook names when non-empty |
 
 ### Upstream (`repository."<namespace>".upstream`)
 
