@@ -3,6 +3,7 @@
 	import { base } from '$app/paths';
 	import { getRegistryName } from '$lib/config.svelte';
 	import {
+		PAGE,
 		fetchJobs,
 		fetchFailedJobs,
 		retryJob,
@@ -22,7 +23,6 @@
 
 	let { data }: { data: JobsParams } = $props();
 
-	const PAGE = 100;
 
 	const queue = $derived(data.queue);
 
@@ -275,12 +275,5 @@
 		gap: 0.375rem;
 		align-items: center;
 		justify-content: flex-end;
-	}
-
-	.load-more {
-		display: flex;
-		justify-content: center;
-		padding: 0.625rem;
-		border-top: 1px solid var(--border);
 	}
 </style>

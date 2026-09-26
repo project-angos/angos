@@ -980,3 +980,21 @@ matching `result=~"cached_.*"` or `result=~".*deny"` needs updating.
 
 None. Remove `cache_ttl` at your convenience. If the webhook cannot take the
 load, put the caching in front of it rather than in the registry.
+
+---
+
+## 1.12.x → 1.12.1
+
+### Extension Listings Are Paged (Breaking Change)
+
+`repositories/list`, `namespaces/list`, `revisions/list` and `uploads/list`
+serve 150 rows unless `n` asks for more, with `total` and `next` beside them.
+
+**Who is affected:** scripts reading one of these listings whole, such as
+`curl .../revisions/list | jq`, which now see the first 150 rows only.
+
+#### Migration
+
+Pass `n` (up to 65535), or follow `next` as `offset` until it is absent. A
+revision page counts top-level revisions, each followed by the revisions it
+holds.

@@ -34,6 +34,33 @@ pub struct NoContent;
 
 // ---- Repository / namespace listings --------------------------------------
 
+/// The direction a listing is sorted in, `?order=`.
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
+/// A page of a listing, `?offset=&n=`: `n` rows from `offset`, `n` defaulting
+/// to the server's page size.
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(default)]
+pub struct PageRequest {
+    pub offset: u32,
+    pub n: Option<NonZeroU16>,
+}
+
+/// The column the revision listing is sorted by, `?sort=`.
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RevisionSort {
+    #[default]
+    Tag,
+    Digest,
+}
+
 #[derive(Serialize, Debug)]
 pub struct RepositoryInfo {
     pub name: String,
@@ -46,6 +73,11 @@ pub struct RepositoryInfo {
 #[derive(Serialize, Debug)]
 pub struct RepositoriesBody {
     pub repositories: Vec<RepositoryInfo>,
+    /// Rows across every page.
+    pub total: usize,
+    /// The offset of the next page, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<u32>,
 }
 
 #[derive(Serialize, Debug)]
@@ -65,6 +97,21 @@ pub struct NamespacesBody {
     pub immutable_tags: bool,
     /// The immutable-tag exclusion patterns in their source form.
     pub immutable_tags_exclusions: Vec<String>,
+    /// Rows across every page.
+    pub total: usize,
+    /// The offset of the next page, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListNamespacesRequest {
+    pub repository: Namespace,
+    /// Lists only the namespaces nested below this one, which must be the
+    /// repository or one of its namespaces.
+    pub under: Option<Namespace>,
+    pub order: SortOrder,
+    pub page: PageRequest,
 }
 
 // ---- Manifest (revision) listing ------------------------------------------
@@ -116,7 +163,26 @@ pub struct ManifestEntry {
 #[derive(Serialize, Debug)]
 pub struct RevisionsBody {
     pub name: String,
+    /// The page's top-level revisions, each followed by the revisions it holds.
     pub manifests: Vec<ManifestEntry>,
+    /// Top-level revisions across every page.
+    pub total: usize,
+    /// The offset of the next page, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<u32>,
+}
+
+/// What a revision listing serves: a page of the top-level revisions, or one
+/// revision wherever it sits. Either way each comes with the revisions it
+/// holds, its platform manifests and referrers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionSelection {
+    Page {
+        sort: RevisionSort,
+        order: SortOrder,
+        page: PageRequest,
+    },
+    Digest(Digest),
 }
 
 // ---- Uploads / pull history -----------------------------------------------
@@ -133,6 +199,11 @@ pub struct UploadEntry {
 pub struct UploadsBody {
     pub name: String,
     pub uploads: Vec<UploadEntry>,
+    /// Rows across every page.
+    pub total: usize,
+    /// The offset of the next page, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<u32>,
 }
 
 /// One recorded pull: who pulled, from where, and when.
@@ -353,9 +424,6 @@ pub struct LayerFile<R> {
 
 // ---- Durable-job administration -------------------------------------------
 
-/// Page size for the durable job-queue listings when the client sends no `?n=`.
-pub const DEFAULT_JOBS_PAGE: u16 = 100;
-
 /// The queue a job belongs to, the job-administration interface's own copy of
 /// the engine's queue set.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,26 +532,37 @@ pub trait AngosExtensionService: Send + Sync {
     type Body: AsyncRead + Send + 'static;
     type Error;
 
-    /// `GET /v2/_angos/repositories/list`. Serves the repositories `visibility`
-    /// admits, each counting only the namespaces it admits.
+    /// `GET /v2/_angos/repositories/list?order=&offset=&n=`. Serves the
+    /// repositories `visibility` admits, each counting only the namespaces it
+    /// admits.
     async fn list_repositories(
         &self,
+        order: SortOrder,
+        page: PageRequest,
         visibility: &dyn NamespaceVisibility,
     ) -> Result<RepositoriesBody, Self::Error>;
 
-    /// `GET /v2/_angos/namespaces/list?repository=`. Serves the namespaces
-    /// `visibility` admits.
+    /// `GET /v2/_angos/namespaces/list?repository=&under=&order=&offset=&n=`.
+    /// Serves the namespaces `visibility` admits.
     async fn list_namespaces(
         &self,
-        repository: Namespace,
+        request: ListNamespacesRequest,
         visibility: &dyn NamespaceVisibility,
     ) -> Result<NamespacesBody, Self::Error>;
 
-    /// `GET /v2/<name>/_angos/revisions/list`.
-    async fn list_revisions(&self, namespace: Namespace) -> Result<RevisionsBody, Self::Error>;
+    /// `GET /v2/<name>/_angos/revisions/list?sort=&order=&offset=&n=|digest=`.
+    async fn list_revisions(
+        &self,
+        namespace: Namespace,
+        selection: RevisionSelection,
+    ) -> Result<RevisionsBody, Self::Error>;
 
-    /// `GET /v2/<name>/_angos/uploads/list`.
-    async fn list_uploads(&self, namespace: Namespace) -> Result<UploadsBody, Self::Error>;
+    /// `GET /v2/<name>/_angos/uploads/list?offset=&n=`.
+    async fn list_uploads(
+        &self,
+        namespace: Namespace,
+        page: PageRequest,
+    ) -> Result<UploadsBody, Self::Error>;
 
     /// `GET /v2/<name>/_angos/pulls/list?tag=|digest=`.
     async fn list_pulls(&self, request: ListPullsRequest) -> Result<PullsBody, Self::Error>;

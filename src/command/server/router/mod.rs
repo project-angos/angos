@@ -250,14 +250,14 @@ impl From<&Route> for Action {
             },
 
             Route::Angos(endpoint) => match endpoint {
-                AngosEndpoint::ListRepositories => Action::ListRepositories,
-                AngosEndpoint::ListNamespaces { repository } => Action::ListNamespaces {
-                    repository: repository.clone(),
+                AngosEndpoint::ListRepositories { .. } => Action::ListRepositories,
+                AngosEndpoint::ListNamespaces(request) => Action::ListNamespaces {
+                    repository: request.repository.clone(),
                 },
-                AngosEndpoint::ListRevisions { namespace } => Action::ListRevisions {
+                AngosEndpoint::ListRevisions { namespace, .. } => Action::ListRevisions {
                     namespace: namespace.clone(),
                 },
-                AngosEndpoint::ListUploads { namespace } => Action::ListUploads {
+                AngosEndpoint::ListUploads { namespace, .. } => Action::ListUploads {
                     namespace: namespace.clone(),
                 },
                 AngosEndpoint::ListPulls {

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import type { UploadEntry } from '$lib/api';
+	import type { RevisionSort, SortOrder, UploadEntry } from '$lib/api';
 	import {
 		formatSize,
 		formatTimeAgo,
@@ -12,6 +12,7 @@
 	} from '$lib/utils';
 	import Card from './Card.svelte';
 	import DeleteButton from './DeleteButton.svelte';
+	import SortHeader from './SortHeader.svelte';
 	import TreeRow from './TreeRow.svelte';
 
 	interface Props {
@@ -37,6 +38,20 @@
 		/** One row's checkbox: picks, drops, spares or takes back. */
 		toggleManifestSelection: (digest: string) => void;
 		getdeleteconfirmlabel: (digests: string[]) => string;
+		manifestSort: RevisionSort;
+		manifestOrder: SortOrder;
+		/** A re-sort is loading: the sorted column's header spins. */
+		sortingManifests: boolean;
+		onsortmanifests: (sort: RevisionSort) => void;
+		/** Uploads across every page; `uploads` holds those loaded. */
+		uploadsTotal: number;
+		/** Whether a listing holds a page past those loaded. */
+		moreUploads: boolean;
+		moreManifests: boolean;
+		/** The listing whose next page is loading. */
+		loadingMore: string | null;
+		onloadmoreuploads: () => void;
+		onloadmoremanifests: () => void;
 	}
 
 	let {
@@ -59,7 +74,17 @@
 		oncancelselecteduploads,
 		onmanifestselectionchange,
 		toggleManifestSelection,
-		getdeleteconfirmlabel
+		getdeleteconfirmlabel,
+		manifestSort,
+		manifestOrder,
+		sortingManifests,
+		onsortmanifests,
+		uploadsTotal,
+		moreUploads,
+		moreManifests,
+		loadingMore,
+		onloadmoreuploads,
+		onloadmoremanifests
 	}: Props = $props();
 
 	// Select-all covers the rows on screen at depth zero; a nested row is
@@ -101,7 +126,7 @@
 </script>
 
 {#if uploads.length > 0}
-	<Card title="Uploads in progress" count={uploads.length} variant="warning">
+	<Card title="Uploads in progress" count={uploadsTotal} variant="warning">
 		{#snippet headerActions()}
 			{#if selectedUploads.size > 0}
 				<DeleteButton
@@ -165,6 +190,11 @@
 				{/each}
 			</tbody>
 		</table>
+		{#if moreUploads}
+			<div class="load-more">
+				<button class="secondary" onclick={onloadmoreuploads} disabled={loadingMore === 'uploads'}>Load more</button>
+			</div>
+		{/if}
 	</Card>
 {/if}
 
@@ -184,8 +214,18 @@
 					</label>
 				</th>
 			{/if}
-			<th>Digest</th>
-			<th>Tags / Platform</th>
+			<SortHeader
+				label="Digest"
+				order={manifestSort === 'digest' ? manifestOrder : null}
+				busy={sortingManifests && manifestSort === 'digest'}
+				onsort={() => onsortmanifests('digest')}
+			/>
+			<SortHeader
+				label="Tags / Platform"
+				order={manifestSort === 'tag' ? manifestOrder : null}
+				busy={sortingManifests && manifestSort === 'tag'}
+				onsort={() => onsortmanifests('tag')}
+			/>
 			<th>Pushed</th>
 			<th>Pulled</th>
 			<th class="col-actions">Actions</th>
@@ -221,6 +261,11 @@
 		{/if}
 	</tbody>
 </table>
+{#if moreManifests}
+	<div class="load-more">
+		<button class="secondary" onclick={onloadmoremanifests} disabled={loadingMore === 'manifests'}>Load more</button>
+	</div>
+{/if}
 
 <style>
 </style>

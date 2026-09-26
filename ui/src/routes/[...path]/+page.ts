@@ -1,6 +1,6 @@
 import { redirect } from '@sveltejs/kit';
 import { base } from '$app/paths';
-import { fetchRepositories } from '$lib/api';
+import { fetchRepositoryNames } from '$lib/api';
 import { resolveRepository } from '$lib/utils';
 import type { PageLoad } from './$types';
 
@@ -36,8 +36,7 @@ export const load: PageLoad = async ({ params }): Promise<BrowseParams> => {
 	}
 
 	const path = [...segments.slice(0, -1), tail].filter(Boolean).join('/');
-	const result = await fetchRepositories();
-	const names = result.data?.repositories.map((repository) => repository.name) ?? [];
+	const names = (await fetchRepositoryNames()).data ?? [];
 
 	return { path, repository: resolveRepository(names, path), reference, repositoryNames: names };
 };

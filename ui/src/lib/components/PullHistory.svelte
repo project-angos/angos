@@ -124,13 +124,6 @@
 </Card>
 
 <style>
-	.load-more {
-		display: flex;
-		justify-content: center;
-		padding: 0.625rem;
-		border-top: 1px solid var(--border);
-	}
-
 	.method {
 		margin-right: 0.4rem;
 	}

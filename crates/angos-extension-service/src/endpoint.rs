@@ -16,7 +16,9 @@ use serde::{Deserialize, de::DeserializeOwned};
 use angos_oci::path::API_PREFIX;
 use angos_oci::{Digest, Namespace, Reference, Tag};
 
-use crate::{JobState, Queue};
+use crate::{
+    JobState, ListNamespacesRequest, PageRequest, Queue, RevisionSelection, RevisionSort, SortOrder,
+};
 
 /// The two forms the extension is reached under. The spec fixes the
 /// `_<extension>` shape; the name itself is angos's.
@@ -26,14 +28,20 @@ const REPOSITORY_EXTENSION: &str = "/_angos/";
 /// An `_angos/` operation and the values its path and query carry.
 #[derive(Clone, Debug)]
 pub enum Endpoint {
-    /// `GET /v2/_angos/repositories/list`.
-    ListRepositories,
-    /// `GET /v2/_angos/namespaces/list?repository=`.
-    ListNamespaces { repository: Namespace },
-    /// `GET /v2/<name>/_angos/revisions/list`.
-    ListRevisions { namespace: Namespace },
-    /// `GET /v2/<name>/_angos/uploads/list`.
-    ListUploads { namespace: Namespace },
+    /// `GET /v2/_angos/repositories/list?order=&offset=&n=`.
+    ListRepositories { order: SortOrder, page: PageRequest },
+    /// `GET /v2/_angos/namespaces/list?repository=&under=&order=&offset=&n=`.
+    ListNamespaces(ListNamespacesRequest),
+    /// `GET /v2/<name>/_angos/revisions/list?sort=&order=&offset=&n=|digest=`.
+    ListRevisions {
+        namespace: Namespace,
+        selection: RevisionSelection,
+    },
+    /// `GET /v2/<name>/_angos/uploads/list?offset=&n=`.
+    ListUploads {
+        namespace: Namespace,
+        page: PageRequest,
+    },
     /// `GET /v2/<name>/_angos/pulls/list?tag=|digest=&offset=&n=`.
     ListPulls {
         namespace: Namespace,
@@ -86,8 +94,8 @@ impl Endpoint {
     #[must_use]
     pub fn endpoint_name(&self) -> &'static str {
         match self {
-            Endpoint::ListRepositories => "list-repositories",
-            Endpoint::ListNamespaces { .. } => "list-namespaces",
+            Endpoint::ListRepositories { .. } => "list-repositories",
+            Endpoint::ListNamespaces(_) => "list-namespaces",
             Endpoint::ListRevisions { .. } => "list-revisions",
             Endpoint::ListUploads { .. } => "list-uploads",
             Endpoint::ListPulls { .. } => "list-pulls",
@@ -123,6 +131,26 @@ fn parse_query<T: DeserializeOwned>(params: Option<&str>) -> Option<T> {
 #[derive(Deserialize)]
 struct NamespacesQuery {
     repository: Namespace,
+    under: Option<Namespace>,
+    #[serde(default)]
+    order: SortOrder,
+}
+
+/// The query of a listing sorted on one column.
+#[derive(Deserialize)]
+struct OrderQuery {
+    #[serde(default)]
+    order: SortOrder,
+}
+
+/// A `digest` selects that revision, so `sort`, `order` and the page go unread.
+#[derive(Deserialize)]
+struct RevisionsQuery {
+    #[serde(default)]
+    sort: RevisionSort,
+    #[serde(default)]
+    order: SortOrder,
+    digest: Option<Digest>,
 }
 
 #[derive(Deserialize)]
@@ -145,10 +173,25 @@ fn default_jobs_queue() -> Queue {
 fn registry_extension(method: &Method, path: &str, params: Option<&str>) -> Option<Endpoint> {
     match *method {
         Method::GET => match path {
-            "repositories/list" => Some(Endpoint::ListRepositories),
+            "repositories/list" => {
+                let OrderQuery { order } = parse_query(params)?;
+                Some(Endpoint::ListRepositories {
+                    order,
+                    page: parse_query(params)?,
+                })
+            }
             "namespaces/list" => {
-                let NamespacesQuery { repository } = parse_query(params)?;
-                Some(Endpoint::ListNamespaces { repository })
+                let NamespacesQuery {
+                    repository,
+                    under,
+                    order,
+                } = parse_query(params)?;
+                Some(Endpoint::ListNamespaces(ListNamespacesRequest {
+                    repository,
+                    under,
+                    order,
+                    page: parse_query(params)?,
+                }))
             }
             "jobs/list" => {
                 let JobsQuery {
@@ -229,8 +272,29 @@ fn repository_extension(
     }
 
     match path {
-        "revisions/list" => Some(Endpoint::ListRevisions { namespace }),
-        "uploads/list" => Some(Endpoint::ListUploads { namespace }),
+        "revisions/list" => {
+            let RevisionsQuery {
+                sort,
+                order,
+                digest,
+            } = parse_query(params)?;
+            let selection = match digest {
+                Some(digest) => RevisionSelection::Digest(digest),
+                None => RevisionSelection::Page {
+                    sort,
+                    order,
+                    page: parse_query(params)?,
+                },
+            };
+            Some(Endpoint::ListRevisions {
+                namespace,
+                selection,
+            })
+        }
+        "uploads/list" => Some(Endpoint::ListUploads {
+            namespace,
+            page: parse_query(params)?,
+        }),
         "pulls/list" => {
             let PullsQuery {
                 tag,
@@ -287,7 +351,21 @@ mod tests {
     fn registry_listings() {
         assert!(matches!(
             parse(&Method::GET, "/v2/_angos/repositories/list", None),
-            Some(Endpoint::ListRepositories)
+            Some(Endpoint::ListRepositories {
+                order: SortOrder::Asc,
+                page: PageRequest { offset: 0, n: None },
+            })
+        ));
+        assert!(matches!(
+            parse(
+                &Method::GET,
+                "/v2/_angos/repositories/list",
+                Some("order=desc&offset=100&n=50")
+            ),
+            Some(Endpoint::ListRepositories {
+                order: SortOrder::Desc,
+                page: PageRequest { offset: 100, n: Some(n) },
+            }) if n.get() == 50
         ));
         assert!(matches!(
             parse(
@@ -295,8 +373,77 @@ mod tests {
                 "/v2/_angos/namespaces/list",
                 Some("repository=team")
             ),
-            Some(Endpoint::ListNamespaces { .. })
+            Some(Endpoint::ListNamespaces(ListNamespacesRequest {
+                under: None,
+                order: SortOrder::Asc,
+                ..
+            }))
         ));
+        assert!(matches!(
+            parse(
+                &Method::GET,
+                "/v2/_angos/namespaces/list",
+                Some("repository=team&under=team/app&order=desc&offset=2")
+            ),
+            Some(Endpoint::ListNamespaces(ListNamespacesRequest {
+                under: Some(under),
+                order: SortOrder::Desc,
+                page: PageRequest { offset: 2, n: None },
+                ..
+            })) if under.as_ref() == "team/app"
+        ));
+    }
+
+    #[test]
+    fn revisions_select_a_page_or_one_digest() {
+        let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(matches!(
+            parse(
+                &Method::GET,
+                "/v2/team/app/_angos/revisions/list",
+                Some("sort=digest&order=desc&n=10")
+            ),
+            Some(Endpoint::ListRevisions {
+                selection: RevisionSelection::Page {
+                    sort: RevisionSort::Digest,
+                    order: SortOrder::Desc,
+                    page: PageRequest {
+                        offset: 0,
+                        n: Some(_)
+                    },
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(
+                &Method::GET,
+                "/v2/team/app/_angos/revisions/list",
+                Some(&format!("digest={d}&offset=5"))
+            ),
+            Some(Endpoint::ListRevisions {
+                selection: RevisionSelection::Digest(digest),
+                ..
+            }) if digest.to_string() == d
+        ));
+    }
+
+    #[test]
+    fn listings_reject_malformed_queries() {
+        for (path, query) in [
+            ("/v2/_angos/repositories/list", "order=up"),
+            ("/v2/_angos/repositories/list", "n=0"),
+            ("/v2/_angos/namespaces/list", "repository=team&order=up"),
+            ("/v2/_angos/namespaces/list", "repository=team&under=Team"),
+            ("/v2/myrepo/_angos/revisions/list", "sort=size"),
+            ("/v2/myrepo/_angos/revisions/list", "digest=sha256:abc"),
+            ("/v2/myrepo/_angos/uploads/list", "offset=-1"),
+        ] {
+            assert!(
+                parse(&Method::GET, path, Some(query)).is_none(),
+                "{path}?{query} must not route"
+            );
+        }
     }
 
     #[test]

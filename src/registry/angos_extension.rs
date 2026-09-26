@@ -119,25 +119,35 @@ impl ext::AngosExtensionService for Registry {
 
     async fn list_repositories(
         &self,
+        order: ext::SortOrder,
+        page: ext::PageRequest,
         visibility: &dyn ext::NamespaceVisibility,
     ) -> Result<ext::RepositoriesBody, Error> {
-        self.handle_list_repositories(visibility).await
+        self.handle_list_repositories(order, page, visibility).await
     }
 
     async fn list_namespaces(
         &self,
-        repository: Namespace,
+        request: ext::ListNamespacesRequest,
         visibility: &dyn ext::NamespaceVisibility,
     ) -> Result<ext::NamespacesBody, Error> {
-        self.handle_list_namespaces(&repository, visibility).await
+        self.handle_list_namespaces(request, visibility).await
     }
 
-    async fn list_revisions(&self, namespace: Namespace) -> Result<ext::RevisionsBody, Error> {
-        self.handle_list_revisions(&namespace).await
+    async fn list_revisions(
+        &self,
+        namespace: Namespace,
+        selection: ext::RevisionSelection,
+    ) -> Result<ext::RevisionsBody, Error> {
+        self.handle_list_revisions(&namespace, selection).await
     }
 
-    async fn list_uploads(&self, namespace: Namespace) -> Result<ext::UploadsBody, Error> {
-        self.handle_list_uploads(&namespace).await
+    async fn list_uploads(
+        &self,
+        namespace: Namespace,
+        page: ext::PageRequest,
+    ) -> Result<ext::UploadsBody, Error> {
+        self.handle_list_uploads(&namespace, page).await
     }
 
     async fn list_pulls(&self, request: ext::ListPullsRequest) -> Result<ext::PullsBody, Error> {
