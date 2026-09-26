@@ -7,8 +7,9 @@ use std::cmp::Reverse;
 use http::{
     HeaderMap,
     header::{
-        ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue,
-        InvalidHeaderValue, LINK, LOCATION, RANGE,
+        ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_SECURITY_POLICY,
+        CONTENT_TYPE, HeaderValue, InvalidHeaderValue, LINK, LOCATION, RANGE,
+        X_CONTENT_TYPE_OPTIONS,
     },
 };
 
@@ -192,6 +193,14 @@ pub fn split_uploads_start_path(api_path: &str) -> Option<&str> {
     api_path.strip_suffix(UPLOADS)
 }
 
+/// Keeps pushed bytes inert in a browser: served on the registry's origin,
+/// where the web UI keeps its session, they must run no script whatever type
+/// they claim.
+pub fn sandbox(headers: &mut HeaderMap) {
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+}
+
 /// Headers a blob answer carries whether or not it has a body: `Accept-Ranges`
 /// among them, so a `HEAD` advertises the ranges a `GET` will serve.
 ///
@@ -203,6 +212,7 @@ pub fn blob_headers(digest: &Digest, size: u64) -> Result<HeaderMap, InvalidHead
     headers.insert(DOCKER_CONTENT_DIGEST, HeaderValue::try_from(digest)?);
     headers.insert(CONTENT_LENGTH, size.into());
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    sandbox(&mut headers);
 
     Ok(headers)
 }
@@ -313,7 +323,8 @@ pub fn upload_progress_headers(
 }
 
 /// `Docker-Content-Digest` and `Content-Length` for a served manifest, plus its
-/// `Content-Type` when one is recorded.
+/// `Content-Type` when one is recorded. That type is the pusher's choice, so
+/// the answer is sandboxed.
 ///
 /// # Errors
 ///
@@ -329,6 +340,7 @@ pub fn manifest_headers(
     if let Some(media_type) = media_type {
         headers.insert(CONTENT_TYPE, HeaderValue::try_from(media_type.to_string())?);
     }
+    sandbox(&mut headers);
 
     Ok(headers)
 }
@@ -549,6 +561,20 @@ mod tests {
 
         let headers = manifest_headers(None, &digest(), 7).unwrap();
         assert!(!headers.contains_key(CONTENT_TYPE));
+    }
+
+    /// A manifest claiming `text/html` or a blob holding HTML must run no
+    /// script when a browser opens it on the web UI's origin.
+    #[test]
+    fn served_manifests_and_blobs_are_sandboxed() {
+        let html = MediaType::new("text/html").unwrap();
+        for headers in [
+            manifest_headers(Some(&html), &digest(), 1).unwrap(),
+            blob_headers(&digest(), 1).unwrap(),
+        ] {
+            assert_eq!(headers[&CONTENT_SECURITY_POLICY], "sandbox");
+            assert_eq!(headers[&X_CONTENT_TYPE_OPTIONS], "nosniff");
+        }
     }
 
     #[test]
