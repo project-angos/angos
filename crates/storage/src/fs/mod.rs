@@ -9,13 +9,14 @@
 //!
 //! Uploads use an append-mode file at the upload `key`: no staging artifacts,
 //! no multipart protocol, no caller-held session. `complete_upload` is a no-op
-//! because the data is already at `key`; the caller's transactional move to the
-//! canonical location is the only finalisation step.
+//! because the data is already at `key`; `promote_upload` copies the verified
+//! bytes to the canonical location, since an append that is still in flight
+//! keeps writing to the file it opened.
 
 use std::{
     collections::VecDeque,
     fs::{File, FileType},
-    io::{self, ErrorKind, SeekFrom, Write},
+    io::{self, ErrorKind, Read, SeekFrom, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -254,6 +255,44 @@ fn staged_file(
         temp.as_file().sync_all()?;
     }
     Ok(temp)
+}
+
+/// Stream `src` into a temp file and rename it onto `dst`; `std::io::copy`
+/// buffers little, so a multi-GB blob never sits in memory. `exact` copies
+/// that many bytes and refuses to publish fewer.
+async fn copy_into_place(
+    src: PathBuf,
+    dst: PathBuf,
+    sync: bool,
+    exact: Option<u64>,
+) -> Result<u64, Error> {
+    ensure_parent(&dst).await?;
+    let parent = dst.parent().unwrap_or_else(|| Path::new(".")).to_owned();
+    match spawn_blocking(move || -> Result<u64, Error> {
+        let reader = File::open(&src).map_err(|e| backend_error("copy from", &src, &e))?;
+        let mut copied = 0;
+        let temp = staged_file(&parent, sync, |file| {
+            copied = io::copy(&mut reader.take(exact.unwrap_or(u64::MAX)), file)?;
+            Ok(())
+        })
+        .map_err(|e| backend_error("copy to", &dst, &e))?;
+        if let Some(size) = exact
+            && copied != size
+        {
+            return Err(Error::Backend(format!(
+                "copy of {} ended at {copied} bytes, expected {size}",
+                src.display()
+            )));
+        }
+        temp.persist(&dst)
+            .map_err(|e| backend_error("copy to", &dst, &e.error))?;
+        Ok(copied)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(Error::Backend(format!("copy task panicked: {e}"))),
+    }
 }
 
 async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Error> {
@@ -536,31 +575,13 @@ impl ObjectStore for Backend {
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error> {
-        let src = self.full_path(source);
-        let dst = self.full_path(destination);
-        ensure_parent(&dst).await?;
-        let parent = dst.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-        let sync = self.sync_to_disk;
-        // Stream src -> temp -> atomic rename. `std::io::copy` uses a small
-        // internal buffer, so the object body is never held in memory in full
-        // (a multi-GB blob would otherwise spike RSS by its whole size).
-        match spawn_blocking(move || -> Result<u64, Error> {
-            let mut reader = File::open(&src).map_err(|e| backend_error("copy from", &src, &e))?;
-            let mut copied = 0;
-            staged_file(&parent, sync, |file| {
-                copied = io::copy(&mut reader, file)?;
-                Ok(())
-            })
-            .map_err(|e| backend_error("copy to", &dst, &e))?
-            .persist(&dst)
-            .map_err(|e| backend_error("copy to", &dst, &e.error))?;
-            Ok(copied)
-        })
+        copy_into_place(
+            self.full_path(source),
+            self.full_path(destination),
+            self.sync_to_disk,
+            None,
+        )
         .await
-        {
-            Ok(result) => result,
-            Err(e) => Err(Error::Backend(format!("copy task panicked: {e}"))),
-        }
     }
 
     async fn move_object(&self, source: &str, destination: &str) -> Result<(), Error> {
@@ -621,13 +642,25 @@ impl ObjectStore for Backend {
     async fn complete_upload(&self, key: &str) -> Result<(), Error> {
         // Ensure the staging file exists (an upload completed with no writes
         // still produces an empty object at `key`), then no-op: the data already
-        // lives at `key`. The caller's transactional move (Mutation::Move)
-        // promotes it to the canonical location.
+        // lives at `key` until `promote_upload` publishes it.
         match self.head(key).await {
             Ok(_) => Ok(()),
             Err(Error::NotFound) => self.put(key, Bytes::new()).await,
             Err(e) => Err(e),
         }
+    }
+
+    async fn promote_upload(&self, key: &str, destination: &str, size: u64) -> Result<(), Error> {
+        // Never a rename: a write that opened the staging file before the
+        // promotion would keep appending to the published blob through it.
+        copy_into_place(
+            self.full_path(key),
+            self.full_path(destination),
+            self.sync_to_disk,
+            Some(size),
+        )
+        .await?;
+        self.delete(key).await
     }
 
     async fn abort_upload(&self, key: &str) -> Result<(), Error> {

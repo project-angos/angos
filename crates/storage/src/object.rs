@@ -232,9 +232,18 @@ pub trait ObjectStore: Send + Sync {
 
     /// Finalise the upload at `key`: the assembled object becomes visible at
     /// `key` via the read methods (an empty object when nothing was written).
-    /// The caller is responsible for moving it to its eventual canonical
-    /// location.
+    /// The caller verifies it, then publishes it with
+    /// [`ObjectStore::promote_upload`].
     async fn complete_upload(&self, key: &str) -> Result<(), Error>;
+
+    /// Publish the completed upload at `key` as `destination`, then remove
+    /// it. `size` is the length the caller verified, and a backend whose
+    /// upload an in-flight write can still grow must publish exactly that
+    /// many bytes. The default [`verified_move`] suits a backend whose
+    /// completed upload no longer changes.
+    async fn promote_upload(&self, key: &str, destination: &str, _size: u64) -> Result<(), Error> {
+        verified_move(self, key, destination).await
+    }
 
     /// Discard the upload at `key` and all backend state it owns (in-progress
     /// multipart(s) for `key` on S3, plus any staged remainder). Idempotent

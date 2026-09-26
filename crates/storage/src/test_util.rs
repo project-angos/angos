@@ -96,9 +96,9 @@ pub trait StoreHook: Send + Sync {
 /// wrapped store.
 ///
 /// Implemented for an `Arc<dyn ObjectStore>` inner; coerce the wrapped store
-/// accordingly at construction. `move_object` is intentionally left on the
-/// trait default (copy plus delete), so hooks observe moves through their
-/// constituent writes.
+/// accordingly at construction. `move_object` and `promote_upload` are
+/// intentionally left on the trait default (copy plus delete), so hooks
+/// observe moves through their constituent writes.
 #[derive(Debug)]
 pub struct HookedStore<S, H> {
     inner: S,

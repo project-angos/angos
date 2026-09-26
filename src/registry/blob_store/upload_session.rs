@@ -359,7 +359,9 @@ impl BlobStore {
         }
 
         let blob_key = digest.blob_path();
-        self.object.move_object(&upload_key, &blob_key).await?;
+        self.object
+            .promote_upload(&upload_key, &blob_key, hashed_size)
+            .await?;
 
         // Best-effort sweep; scrub reclaims whatever is left.
         let container = namespace.upload_container_path(session_id);

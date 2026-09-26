@@ -109,6 +109,7 @@ root_dir = "/var/registry/data"  # Can be same as blob store
 - Single-instance only: no multi-replica support without a shared storage
 - No built-in redundancy or high availability
 - Shared filesystem (NFS, EFS) not recommended for production (see below)
+- Completing a blob upload copies its bytes into place, a reflink on XFS or btrfs but a full second write on ext4
 
 ### Durability Options
 
@@ -509,7 +510,7 @@ startup probe checks the backend's create-if-absent is honest before
 put-settle-verify sequence (with a logged warning) when it is not. A blob upload session persists as its assembled
 `data` object plus one `session.json` record (last activity, committed offset,
 hasher checkpoint) under `v2/repositories/<namespace>/_uploads/<uuid>/`;
-`complete` moves the staged blob to its content-addressed key as an idempotent
-effect, and a crash mid-promotion leaves a re-drivable state that the caller's
+`complete` publishes exactly the verified bytes at its content-addressed key as
+an idempotent effect, and a crash mid-promotion leaves a re-drivable state that the caller's
 retry or scrub reconciles. A session with no `session.json` cannot complete, so
 `angos prune` reaps it whatever its age.
