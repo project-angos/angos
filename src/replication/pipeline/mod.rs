@@ -92,9 +92,22 @@ pub struct PushContext<'a> {
 /// Returns [`Error::InvalidManifest`] when `body` does not parse, and
 /// [`Error::Client`] when a local read or downstream call fails with anything
 /// other than an LWW-superseded 409.
-#[instrument(skip(ctx, body))]
 pub async fn push_manifest(
     ctx: &PushContext<'_>,
+    digest: &Digest,
+    tag: Option<&str>,
+    body: Vec<u8>,
+) -> Result<PushOutcome, Error> {
+    // One set for the whole job: a manifest several indexes name is pushed once.
+    push_reached(ctx, &mut HashSet::new(), digest, tag, body).await
+}
+
+/// [`push_manifest`] for a manifest the job reached, recording in `pushed`
+/// the child manifests it pushes.
+#[instrument(name = "push_manifest", skip(ctx, pushed, body))]
+async fn push_reached(
+    ctx: &PushContext<'_>,
+    pushed: &mut HashSet<Digest>,
     digest: &Digest,
     tag: Option<&str>,
     body: Vec<u8>,
@@ -135,7 +148,7 @@ pub async fn push_manifest(
         return Ok(PushOutcome::Converged);
     }
 
-    push_child_manifests(ctx, &manifest, digest).await?;
+    push_child_manifests(ctx, pushed, &manifest, digest).await?;
 
     push_blobs(ctx, &manifest).await?;
 
@@ -216,11 +229,12 @@ pub async fn push_manifest(
     Ok(PushOutcome::Pushed)
 }
 
-/// Push every child manifest of an index, overlapping independent children up
-/// to `max_concurrent_pushes`. The caller awaits this before the parent PUT, so
-/// the parent index never lands before its children.
+/// Push every child manifest of an index the job has not pushed yet, one at a
+/// time and depth first, so each lands before any index naming it. The caller
+/// awaits this before the parent PUT.
 async fn push_child_manifests(
     ctx: &PushContext<'_>,
+    pushed: &mut HashSet<Digest>,
     manifest: &Manifest,
     digest: &Digest,
 ) -> Result<(), Error> {
@@ -234,41 +248,34 @@ async fn push_child_manifests(
             "index '{digest}' nests deeper than {MAX_INDEX_DEPTH} levels"
         )));
     }
-    let children: Vec<Digest> = manifests.iter().map(|child| child.digest.clone()).collect();
     let child_ctx = &PushContext {
         index_depth: ctx.index_depth + 1,
         ..*ctx
     };
 
-    let results = stream::iter(children)
-        .map(|child| async move {
-            // A manifest PUT only checks that a child's bytes exist, never that
-            // they parse, so a child may name a layer of any size; the size
-            // comes with the stream and is the cheap question, asked first.
-            let (mut reader, size) = ctx.blob_store.reader(&child, None).await.map_err(|e| {
-                Error::Internal(format!("failed to open local manifest blob '{child}': {e}"))
-            })?;
-            if size > DEFAULT_MAX_MANIFEST_SIZE_BYTES as u64 {
-                return Err(Error::InvalidManifest(format!(
-                    "index child '{child}' is {size} bytes, over the \
-                     {DEFAULT_MAX_MANIFEST_SIZE_BYTES}-byte manifest limit"
-                )));
-            }
-            let mut child_body = Vec::new();
-            reader.read_to_end(&mut child_body).await.map_err(|e| {
-                Error::Internal(format!("failed to read local manifest blob '{child}': {e}"))
-            })?;
-            Box::pin(push_manifest(child_ctx, &child, None, child_body))
-                .await
-                .map(|_| ())
-        })
-        // Config rejects 0; the floor guards direct builder misuse.
-        .buffer_unordered(ctx.downstream.max_concurrent_pushes.max(1))
-        .collect::<Vec<_>>()
-        .await;
-
-    // Drained fully before failing, so siblings are not stranded mid-transfer.
-    results.into_iter().collect()
+    for child in manifests.iter().map(|child| &child.digest) {
+        if !pushed.insert(child.clone()) {
+            continue;
+        }
+        // A manifest PUT only checks that a child's bytes exist, never that
+        // they parse, so a child may name a layer of any size; the size comes
+        // with the stream and is the cheap question, asked first.
+        let (mut reader, size) = ctx.blob_store.reader(child, None).await.map_err(|e| {
+            Error::Internal(format!("failed to open local manifest blob '{child}': {e}"))
+        })?;
+        if size > DEFAULT_MAX_MANIFEST_SIZE_BYTES as u64 {
+            return Err(Error::InvalidManifest(format!(
+                "index child '{child}' is {size} bytes, over the \
+                 {DEFAULT_MAX_MANIFEST_SIZE_BYTES}-byte manifest limit"
+            )));
+        }
+        let mut child_body = Vec::new();
+        reader.read_to_end(&mut child_body).await.map_err(|e| {
+            Error::Internal(format!("failed to read local manifest blob '{child}': {e}"))
+        })?;
+        Box::pin(push_reached(child_ctx, pushed, child, None, child_body)).await?;
+    }
+    Ok(())
 }
 
 /// HEAD-before-PUT every referenced blob; transfer only the absent ones.

@@ -589,8 +589,8 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
 
 #[tokio::test]
 async fn index_lands_after_all_children_when_fanned_out() {
-    // Children push concurrently; the parent index must still land only
-    // after every child, and no child may be dropped by the fan-out.
+    // The parent index must land only after every child, and no child may be
+    // dropped.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
     let (blob_store, metadata_store, store, _dir) = test_blob_store();
@@ -662,6 +662,98 @@ async fn index_lands_after_all_children_when_fanned_out() {
             "every child manifest must be pushed"
         );
     }
+    drop(mock_server);
+}
+
+/// A manifest named by several indexes, or several times by one, is pushed
+/// once per job: repeats would otherwise multiply at every nesting level.
+#[tokio::test]
+async fn a_manifest_named_many_times_is_pushed_once() {
+    metrics_provider::init_for_tests();
+    let mock_server = MockServer::start().await;
+    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+
+    let leaf = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "layers": [],
+    }))
+    .unwrap();
+    let leaf_digest = put_blob_direct(&store, &leaf).await;
+    // Two sibling indexes, each naming the leaf five times, then a root naming
+    // each sibling five times.
+    let index = |label: &str, digest: &Digest, size: usize| {
+        let child = json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": digest.to_string(),
+            "size": size,
+        });
+        serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": vec![child; 5],
+            "annotations": { "label": label },
+        }))
+        .unwrap()
+    };
+    let (a, b) = (
+        index("a", &leaf_digest, leaf.len()),
+        index("b", &leaf_digest, leaf.len()),
+    );
+    let (a_digest, b_digest) = (
+        put_blob_direct(&store, &a).await,
+        put_blob_direct(&store, &b).await,
+    );
+    let mut children = vec![
+        json!({ "mediaType": "application/vnd.oci.image.index.v1+json", "digest": a_digest.to_string(), "size": a.len() });
+        5
+    ];
+    children.extend(vec![
+        json!({ "mediaType": "application/vnd.oci.image.index.v1+json", "digest": b_digest.to_string(), "size": b.len() });
+        5
+    ]);
+    let root = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": children,
+    }))
+    .unwrap();
+    let root_digest = put_blob_direct(&store, &root).await;
+
+    for reference in [&leaf_digest, &a_digest, &b_digest] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{reference}")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+    }
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let namespace = Namespace::new(NAMESPACE).unwrap();
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
+    push_manifest(&ctx, &root_digest, Some("v1"), root)
+        .await
+        .unwrap();
+
+    let puts: Vec<String> = mock_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .map(|r| r.url.path().to_string())
+        .collect();
+    let at = |reference: &str| puts.iter().position(|p| p.ends_with(reference));
+    let leaf_at = at(&leaf_digest.to_string());
+    assert!(leaf_at < at(&a_digest.to_string()) && leaf_at < at(&b_digest.to_string()));
+    assert_eq!(at("/manifests/v1"), Some(puts.len() - 1));
     drop(mock_server);
 }
 
