@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Moving an object by server-side copy checks the copy's size and retries before deleting the source.
 - Completing an S3 upload that never opened a multipart puts its bytes instead of copying them.
 - Completing a filesystem upload publishes a copy of the verified bytes, so a chunk still being written can no longer alter the stored blob.
+- Manifests and blobs are served with `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`, so a pushed HTML body runs no script on the web UI's origin.
 
 ## 1.12.0
 

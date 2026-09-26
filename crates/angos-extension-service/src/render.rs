@@ -1,8 +1,7 @@
 //! Spec-correct hyper rendering for the `_angos/` responses, behind `hyper`.
 
 use http::header::{
-    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_SECURITY_POLICY,
-    CONTENT_TYPE, VARY, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, VARY,
 };
 use http::{HeaderMap, HeaderValue, Response, StatusCode};
 use serde::Serialize;
@@ -131,10 +130,7 @@ impl<R: AsyncRead + Send + 'static> LayerFile<R> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::try_from(self.content_type)?);
         headers.insert(CONTENT_LENGTH, self.size.into());
-        // The bytes are the image's: opened from a link, its HTML or SVG must run
-        // no script on the registry's origin, where the web UI keeps its session.
-        headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
-        headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+        server::sandbox(&mut headers);
         if self.download {
             let name = self
                 .path

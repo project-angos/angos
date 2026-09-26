@@ -36,6 +36,8 @@ GET  /v2/{namespace}/blobs/{digest}
 
 Check existence or download a blob by digest. A blob is visible only within namespaces that own it;
 a digest that exists in storage but is not linked to the requested namespace returns `BLOB_UNKNOWN`.
+The answer carries `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`, so a
+blob opened from a link runs no script on the registry's origin.
 
 `GET` supports a single byte range through the `Range` header:
 
@@ -141,7 +143,8 @@ HEAD /v2/{namespace}/manifests/{reference}
 GET  /v2/{namespace}/manifests/{reference}
 ```
 
-Check existence or download a manifest. `{reference}` can be a tag or digest.
+Check existence or download a manifest. `{reference}` can be a tag or digest. As for blobs, the
+answer is sandboxed, since its `Content-Type` is whatever media type the manifest was pushed with.
 
 When manifest redirects are enabled (`global.enable_manifest_redirect`, default `true`) and the blob store supports presigned URLs, `GET` may answer with a `307` redirect. As for blobs, an `X-Angos-No-Redirect` header with any non-empty value other than `0` or `false` forces an inline body instead.
 
