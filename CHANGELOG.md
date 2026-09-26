@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Completing an S3 upload that never opened a multipart puts its bytes instead of copying them.
 - Completing a filesystem upload publishes a copy of the verified bytes, so a chunk still being written can no longer alter the stored blob.
 - Manifests and blobs are served with `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`, so a pushed HTML body runs no script on the web UI's origin.
+- An image index with a child descriptor that does not parse is refused with `MANIFEST_INVALID` instead of being stored as an image manifest that references nothing.
 
 ## 1.12.0
 

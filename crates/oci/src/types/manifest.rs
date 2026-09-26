@@ -1,6 +1,6 @@
 use std::{collections::HashMap, mem};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::types::constants::IN_TOTO_PREDICATE_TYPE;
 use crate::types::{Descriptor, Digest, Error, MediaType};
@@ -17,7 +17,7 @@ pub const OCI_MANIFEST_SCHEMA_VERSION: i32 = 2;
 /// Flattened into the manifest object, so `Index` is chosen for a document
 /// carrying `manifests` and `Image` for every other one. Each variant emits
 /// only its own array, which is the one the spec requires of that shape.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum Content {
     Index {
@@ -26,11 +26,34 @@ pub enum Content {
     Image {
         /// Boxed: a descriptor is by far the largest thing either variant
         /// carries, and inline it would make every `Content` the size of one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         config: Option<Box<Descriptor>>,
-        #[serde(default)]
         layers: Vec<Descriptor>,
     },
+}
+
+/// Every array either shape may carry, read before the shape is chosen.
+#[derive(Deserialize)]
+struct ContentFields {
+    manifests: Option<Vec<Descriptor>>,
+    config: Option<Box<Descriptor>>,
+    #[serde(default)]
+    layers: Vec<Descriptor>,
+}
+
+impl<'de> Deserialize<'de> for Content {
+    /// The shape follows `manifests` alone: an index whose child does not parse
+    /// fails, rather than reading as an image manifest with nothing to pin.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = ContentFields::deserialize(deserializer)?;
+        Ok(match fields.manifests {
+            Some(manifests) => Content::Index { manifests },
+            None => Content::Image {
+                config: fields.config,
+                layers: fields.layers,
+            },
+        })
+    }
 }
 
 impl Content {
@@ -513,6 +536,24 @@ mod tests {
                 "a single-shape manifest must be accepted: {body}"
             );
         }
+    }
+
+    /// A child that does not parse fails the index rather than demoting it to
+    /// an image manifest with no reference to check or pin.
+    #[test]
+    fn an_index_with_an_invalid_child_is_refused() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [
+                { "mediaType": MEDIA_TYPE_MANIFEST, "digest": format!("sha256:{VALID_HASH}"), "size": 3 },
+                { "mediaType": MEDIA_TYPE_MANIFEST, "digest": format!("sha256:{VALID_HASH}"), "size": 3, "platform": { "os": "linux" } },
+            ],
+        }))
+        .unwrap();
+
+        assert!(Manifest::from_pushed(&body, None).is_err());
+        assert!(Manifest::from_slice(&body).is_err());
     }
 
     /// The pushed `Content-Type` and the body's own `mediaType` must agree,
