@@ -317,9 +317,13 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListRevisions { namespace }) => {
-            Ok(registry.list_revisions(namespace).await?.into_response()?)
-        }
+        Route::Angos(AngosEndpoint::ListRevisions {
+            namespace,
+            selection,
+        }) => Ok(registry
+            .list_revisions(namespace, selection)
+            .await?
+            .into_response()?),
         Route::Angos(AngosEndpoint::ListLayerEntries { namespace, digest }) => Ok(registry
             .list_layer_entries(LayerEntriesRequest {
                 namespace,
@@ -355,9 +359,10 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListUploads { namespace }) => {
-            Ok(registry.list_uploads(namespace).await?.into_response()?)
-        }
+        Route::Angos(AngosEndpoint::ListUploads { namespace, page }) => Ok(registry
+            .list_uploads(namespace, page)
+            .await?
+            .into_response()?),
         Route::Angos(AngosEndpoint::ListPulls {
             namespace,
             reference,
@@ -372,14 +377,14 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListRepositories) => Ok(registry
-            .list_repositories(&|namespace: &Namespace| {
+        Route::Angos(AngosEndpoint::ListRepositories { order, page }) => Ok(registry
+            .list_repositories(order, page, &|namespace: &Namespace| {
                 context.catalog_lists_namespace(namespace, identity)
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListNamespaces { repository }) => Ok(registry
-            .list_namespaces(repository, &|namespace: &Namespace| {
+        Route::Angos(AngosEndpoint::ListNamespaces(request)) => Ok(registry
+            .list_namespaces(request, &|namespace: &Namespace| {
                 context.catalog_lists_namespace(namespace, identity)
             })
             .await?

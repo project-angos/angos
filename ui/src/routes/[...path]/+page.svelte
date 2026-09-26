@@ -1,8 +1,9 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { base } from '$app/paths';
 	import { getRegistryName } from '$lib/config.svelte';
-	import { fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo } from '$lib/api';
+	import { PAGE, fetchRevision, fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, type FetchResult, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo, type RevisionSort, type SortOrder } from '$lib/api';
 	import { buildTree, buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, isInteractiveTarget, pathUrl, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '$lib/utils';
 	import LoadingState from '$lib/components/LoadingState.svelte';
 	import ErrorState from '$lib/components/ErrorState.svelte';
@@ -12,6 +13,7 @@
 	import Card from '$lib/components/Card.svelte';
 	import CopyButton from '$lib/components/CopyButton.svelte';
 	import DeleteButton from '$lib/components/DeleteButton.svelte';
+	import SortHeader from '$lib/components/SortHeader.svelte';
 	import type { BrowseParams } from './+page';
 
 	let { data }: { data: BrowseParams } = $props();
@@ -58,6 +60,21 @@
 	let childReferrersNext: Map<string, string> = $state(new Map());
 	let loadingReferrers: string | null = $state(null);
 
+	let namespaceOrder: SortOrder = $state('asc');
+	let manifestSort: RevisionSort = $state('tag');
+	let manifestOrder: SortOrder = $state('asc');
+	// The table a re-sort is reloading, whose header spins meanwhile.
+	let sorting: 'namespaces' | 'manifests' | null = $state(null);
+	// Where each paged listing continues, and the rows it holds across pages.
+	let namespacesNext: number | undefined = $state(undefined);
+	let namespacesTotal = $state(0);
+	let manifestsNext: number | undefined = $state(undefined);
+	let manifestsTotal = $state(0);
+	let uploadsNext: number | undefined = $state(undefined);
+	let uploadsTotal = $state(0);
+	// The listing whose next page is loading.
+	let loadingMore: 'namespaces' | 'manifests' | 'uploads' | null = $state(null);
+
 	let loading = $state(true);
 	let error: string | null = $state(null);
 	// Failures of an action taken on the current view, shown as a banner so the
@@ -76,8 +93,8 @@
 	// manifests, and a nested name may have both.
 	const summary = $derived.by(() => {
 		const parts = [];
-		if (children.length > 0) parts.push(`${children.length} namespace${children.length === 1 ? '' : 's'}`);
-		if (rows.length > 0) parts.push(`${rows.length} manifest${rows.length === 1 ? '' : 's'}`);
+		if (namespacesTotal > 0) parts.push(`${namespacesTotal} namespace${namespacesTotal === 1 ? '' : 's'}`);
+		if (manifestsTotal > 0) parts.push(`${manifestsTotal} manifest${manifestsTotal === 1 ? '' : 's'}`);
 		return parts.join(', ') || 'Nothing here yet';
 	});
 
@@ -92,19 +109,37 @@
 		expanded = newExpanded;
 	}
 
+	// Reloads on navigation only: a re-sort reloads on its own.
 	$effect(() => {
 		actionError = null;
-		if (data.reference !== null) {
-			loadManifest(data.path, data.reference);
-		} else {
-			loadBrowse(data.path);
-		}
+		const { path, reference } = data;
+		untrack(() => {
+			if (reference !== null) {
+				loadManifest(path, reference);
+			} else {
+				loadBrowse(path);
+			}
+		});
 	});
+
+	function sortNamespaces() {
+		namespaceOrder = namespaceOrder === 'asc' ? 'desc' : 'asc';
+		sorting = 'namespaces';
+		loadBrowse(data.path, true, true);
+	}
+
+	function sortManifests(sort: RevisionSort) {
+		manifestOrder = sort === manifestSort && manifestOrder === 'asc' ? 'desc' : 'asc';
+		manifestSort = sort;
+		sorting = 'manifests';
+		loadBrowse(data.path, true);
+	}
 
 	// `background` refreshes without blanking the view, which is what an action
 	// taken on that view wants: swapping it for a spinner reads as the whole
-	// page reloading when only one row changed.
-	async function loadBrowse(namespace: string, background = false) {
+	// page reloading when only one row changed. `relist` fetches the namespace
+	// listing again, which a background refresh otherwise skips.
+	async function loadBrowse(namespace: string, background = false, relist = !background) {
 		const token = ++loadToken;
 		loading = !background;
 		error = null;
@@ -117,17 +152,18 @@
 			immutableTags = false;
 		}
 		// Above every repository there is nothing to list but the repository
-		// names, which the route already resolved. A background refresh skips the
+		// names, which the route already resolved. An action's refresh skips the
 		// listing entirely: it is by far the most expensive of the three calls, at
 		// one store walk plus three backend listings per namespace, and the action
 		// that triggered it touched this namespace, whose descendants it lists are
-		// all unaffected.
+		// all unaffected. A background refresh keeps as many rows as are loaded.
+		const n = (loaded: number) => (background ? Math.max(loaded, PAGE) : PAGE);
 		const [revisionsResult, uploadsResult, namespacesResult] = await Promise.all([
-			fetchRevisions(namespace),
-			fetchUploads(namespace),
-			background || data.repository === null
+			fetchRevisions(namespace, manifestSort, manifestOrder, 0, n(rows.length)),
+			fetchUploads(namespace, 0, n(uploads.length)),
+			!relist || data.repository === null
 				? Promise.resolve(null)
-				: fetchNamespaces(data.repository)
+				: fetchNamespaces(data.repository, namespace, namespaceOrder, 0, n(children.length))
 		]);
 		if (token !== loadToken) return;
 		if (revisionsResult.error) {
@@ -135,18 +171,24 @@
 		} else if (revisionsResult.data) {
 			manifests = revisionsResult.data.manifests ?? [];
 			rows = buildTreeRows(buildTree(manifests));
+			manifestsNext = revisionsResult.data.next;
+			manifestsTotal = revisionsResult.data.total;
 		}
 		uploads = uploadsResult.data?.uploads ?? [];
+		uploadsNext = uploadsResult.data?.next;
+		uploadsTotal = uploadsResult.data?.total ?? 0;
 		if (uploadsResult.error) {
 			actionError = `Could not list uploads (${uploadsResult.error}).`;
 		}
-		if (!background) {
+		if (relist) {
 			children = descendantNamespaces(
 				namespacesResult
 					? (namespacesResult.data?.namespaces ?? [])
 					: data.repositoryNames.map((name) => ({ name })),
 				namespace
 			);
+			namespacesNext = namespacesResult?.data?.next;
+			namespacesTotal = namespacesResult?.data?.total ?? children.length;
 		}
 		if (namespacesResult?.data) {
 			pullThroughCache = namespacesResult.data.pull_through_cache;
@@ -160,6 +202,73 @@
 		sparedManifests = new Set();
 		selectingManifests = false;
 		loading = false;
+		sorting = null;
+		loadingMore = null;
+	}
+
+	// Appends a listing's next page, unless a newer load replaced the view
+	// meanwhile.
+	async function loadMore<T>(
+		listing: 'namespaces' | 'manifests' | 'uploads',
+		fetchPage: () => Promise<FetchResult<T>>,
+		append: (page: T) => void
+	) {
+		const token = loadToken;
+		loadingMore = listing;
+		const result = await fetchPage();
+		if (loadingMore === listing) loadingMore = null;
+		if (token !== loadToken) return;
+		if (result.data) {
+			append(result.data);
+		} else {
+			actionError = `Loading more ${listing} failed (${result.error}).`;
+		}
+	}
+
+	function loadMoreNamespaces() {
+		if (namespacesNext === undefined || data.repository === null) return;
+		const repository = data.repository;
+		const offset = namespacesNext;
+		loadMore(
+			'namespaces',
+			() => fetchNamespaces(repository, data.path, namespaceOrder, offset, PAGE),
+			(page) => {
+				children = [...children, ...descendantNamespaces(page.namespaces, data.path)];
+				namespacesNext = page.next;
+				namespacesTotal = page.total;
+			}
+		);
+	}
+
+	function loadMoreManifests() {
+		if (manifestsNext === undefined) return;
+		const offset = manifestsNext;
+		loadMore(
+			'manifests',
+			() => fetchRevisions(data.path, manifestSort, manifestOrder, offset, PAGE),
+			(page) => {
+				// A platform manifest two indexes hold arrives with each; one copy stays.
+				const loaded = new Set(manifests.map((m) => m.digest));
+				manifests = [...manifests, ...page.manifests.filter((m) => !loaded.has(m.digest))];
+				rows = buildTreeRows(buildTree(manifests));
+				manifestsNext = page.next;
+				manifestsTotal = page.total;
+			}
+		);
+	}
+
+	function loadMoreUploads() {
+		if (uploadsNext === undefined) return;
+		const offset = uploadsNext;
+		loadMore(
+			'uploads',
+			() => fetchUploads(data.path, offset, PAGE),
+			(page) => {
+				uploads = [...uploads, ...page.uploads];
+				uploadsNext = page.next;
+				uploadsTotal = page.total;
+			}
+		);
 	}
 
 	async function loadManifest(namespace: string, reference: string, background = false) {
@@ -185,7 +294,7 @@
 		digest = result.digest;
 
 		if (digest) {
-			const revisionsResult = await fetchRevisions(namespace);
+			const revisionsResult = await fetchRevision(namespace, digest);
 			if (token !== loadToken) return;
 			if (revisionsResult.data) {
 				manifests = revisionsResult.data.manifests;
@@ -523,11 +632,19 @@
 	{/if}
 
 	{#if children.length > 0}
-		<Card title="Namespaces" count={children.length}>
+		<Card title="Namespaces" count={namespacesTotal}>
 			<table>
 				<thead>
 					<tr>
-						<th>Namespace</th>
+						<!-- Above every repository the rows are repository names, which the
+						     namespace listing does not serve. -->
+						<SortHeader
+							label="Namespace"
+							order={namespaceOrder}
+							busy={sorting === 'namespaces'}
+							onsort={sortNamespaces}
+							disabled={data.repository === null}
+						/>
 						<th class="col-medium">Tags</th>
 						<th class="col-medium">Manifests</th>
 						<th class="col-medium">Uploads</th>
@@ -545,6 +662,11 @@
 					{/each}
 				</tbody>
 			</table>
+			{#if namespacesNext !== undefined}
+				<div class="load-more">
+					<button class="secondary" onclick={loadMoreNamespaces} disabled={loadingMore === 'namespaces'}>Load more</button>
+				</div>
+			{/if}
 		</Card>
 	{/if}
 
@@ -572,6 +694,16 @@
 		onmanifestselectionchange={(selected) => selectedManifests = selected}
 		{toggleManifestSelection}
 		getdeleteconfirmlabel={deleteConfirmLabel}
+		{manifestSort}
+		{manifestOrder}
+		sortingManifests={sorting === 'manifests'}
+		onsortmanifests={sortManifests}
+		{uploadsTotal}
+		moreUploads={uploadsNext !== undefined}
+		moreManifests={manifestsNext !== undefined}
+		{loadingMore}
+		onloadmoreuploads={loadMoreUploads}
+		onloadmoremanifests={loadMoreManifests}
 	/>
 	{/if}
 {/if}

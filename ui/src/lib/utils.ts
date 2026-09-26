@@ -318,12 +318,6 @@ export function buildTree(manifests: ManifestEntry[]): TreeNode[] {
 		}
 	}
 
-	roots.sort((a, b) => {
-		if (a.manifest.tags.length > 0 && b.manifest.tags.length === 0) return -1;
-		if (a.manifest.tags.length === 0 && b.manifest.tags.length > 0) return 1;
-		return 0;
-	});
-
 	return roots;
 }
 
@@ -467,8 +461,7 @@ export function descendantNamespaces(
 			tag_count: entry.tag_count,
 			manifest_count: entry.manifest_count,
 			upload_count: entry.upload_count
-		}))
-		.sort((a, b) => a.label.localeCompare(b.label));
+		}));
 }
 
 /**

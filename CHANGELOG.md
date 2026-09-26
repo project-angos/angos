@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.12.1 - UNRELEASED
 
+### Added
+
+- The repository, namespace and revision listings take `order=asc|desc` and the revision listing `sort=tag|digest`, which the web UI's sortable column headers use.
+- The repository, namespace, revision and upload listings page with `offset` and `n` and report `total` and `next`, and the web UI loads further pages on demand.
+- The namespace listing takes `under` to list only what nests below a namespace, and the revision listing `digest` to list one revision with what it holds.
+
+### Changed
+
+- The revision listing orders manifests by their first tag, untagged ones last.
+- Every listing serves 150 entries unless `n` asks otherwise, from 100 for the catalog, tags, referrers, jobs and pull history, and the repository, namespace, revision and upload listings no longer serve everything at once.
+
 ### Fixed
 
 - A blob stored as an empty object under a non-empty digest reads as missing, so it is fetched or pushed again.

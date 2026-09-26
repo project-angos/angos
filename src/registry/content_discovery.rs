@@ -47,9 +47,9 @@ fn matches_filter(referrer: &Descriptor, artifact_type: Option<&MediaType>) -> b
 /// Fan-out for resolving referrer candidates, each an independent manifest read.
 pub const REFERRER_RESOLVE_CONCURRENCY: usize = 10;
 
-/// Default page size when a listing omits `n`, shared with the HTTP handlers so
-/// the `Link` they build echoes the size actually used.
-pub const DEFAULT_PAGE_SIZE: u16 = 100;
+/// Default page size of every listing that omits `n`, and of the referrers,
+/// which take none; the `Link` a paged listing builds echoes it.
+pub const DEFAULT_PAGE_SIZE: u16 = 150;
 
 impl Registry {
     /// One page of namespaces the caller may list, advertising the next through

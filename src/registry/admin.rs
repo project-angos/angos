@@ -2,9 +2,11 @@
 //! plus the durable job list/retry/delete endpoints.
 
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     future::Future,
     num::NonZeroU16,
+    ops::Range,
 };
 
 use chrono::{DateTime, Utc};
@@ -13,10 +15,11 @@ use tokio::try_join;
 use tracing::{instrument, warn};
 
 use angos_extension_service::{
-    AccessEntry, DEFAULT_JOBS_PAGE, DeleteJobRequest, FailedJobEntry, FailedJobsBody, JobEntry,
-    JobsBody, ListJobsRequest, ListPullsRequest, ManifestEntry, NamespaceInfo, NamespaceVisibility,
-    NamespacesBody, NoContent, ParentRef, PullsBody, ReferrerInfo, RepositoriesBody,
-    RepositoryInfo, RetryJobRequest, RevisionsBody, UploadEntry, UploadsBody,
+    AccessEntry, DeleteJobRequest, FailedJobEntry, FailedJobsBody, JobEntry, JobsBody,
+    ListJobsRequest, ListNamespacesRequest, ListPullsRequest, ManifestEntry, NamespaceInfo,
+    NamespaceVisibility, NamespacesBody, NoContent, PageRequest, ParentRef, PullsBody,
+    ReferrerInfo, RepositoriesBody, RepositoryInfo, RetryJobRequest, RevisionSelection,
+    RevisionSort, RevisionsBody, SortOrder, UploadEntry, UploadsBody,
 };
 use angos_oci::{
     Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType, Namespace, Platform,
@@ -33,10 +36,6 @@ use crate::{
         metadata_store::{LinkKind, LinkMetadata},
     },
 };
-
-/// Pull-history entries a page returns when the request names no `n`; the
-/// `unwrap` is const-evaluated.
-const PULL_HISTORY_PAGE: NonZeroU16 = NonZeroU16::new(100).unwrap();
 
 /// Bounds the per-namespace stat fan-out so a repository with many namespaces
 /// does not open one request per namespace at once.
@@ -175,10 +174,115 @@ fn parent_refs_for(
         .unwrap_or_default()
 }
 
+/// `ordering` as a listing sorted in `order` reads it.
+fn directed(ordering: Ordering, order: SortOrder) -> Ordering {
+    match order {
+        SortOrder::Asc => ordering,
+        SortOrder::Desc => ordering.reverse(),
+    }
+}
+
+/// The rows of `total` that `page` covers, and the next page's offset while
+/// rows remain past it.
+fn page_range(total: usize, page: PageRequest) -> (Range<usize>, Option<u32>) {
+    let start = usize::try_from(page.offset)
+        .unwrap_or(usize::MAX)
+        .min(total);
+    let end = start
+        .saturating_add(usize::from(
+            page.n.map_or(DEFAULT_PAGE_SIZE, NonZeroU16::get),
+        ))
+        .min(total);
+    let next = (end < total).then(|| u32::try_from(end).unwrap_or(u32::MAX));
+    (start..end, next)
+}
+
+/// Which of `entries` a revision listing serves, in order, with the top-level
+/// count and the next page's offset. A top-level entry is one no other holds,
+/// as the web UI nests them: each selected one is followed by what it holds,
+/// its platform manifests and referrers, so a page renders whole.
+fn select_revisions(
+    entries: &[ManifestEntry],
+    selection: &RevisionSelection,
+) -> (Vec<usize>, usize, Option<u32>) {
+    let position: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.digest.as_str(), index))
+        .collect();
+    // A self-reference holds nothing, or the entry would list nowhere.
+    let mut holds: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+    for (index, entry) in entries.iter().enumerate() {
+        for parent in &entry.parents {
+            if let Some(&holder) = position.get(parent.digest.as_str())
+                && holder != index
+            {
+                holds[holder].push(index);
+            }
+        }
+        for referrer in &entry.referrers {
+            if let Some(&held) = position.get(referrer.digest.as_str())
+                && held != index
+            {
+                holds[index].push(held);
+            }
+        }
+    }
+
+    let (tops, total, next) = match selection {
+        RevisionSelection::Digest(digest) => {
+            let tops: Vec<usize> = position
+                .get(digest.to_string().as_str())
+                .copied()
+                .into_iter()
+                .collect();
+            let total = tops.len();
+            (tops, total, None)
+        }
+        &RevisionSelection::Page { sort, order, page } => {
+            let held: HashSet<usize> = holds.iter().flatten().copied().collect();
+            let mut tops: Vec<usize> = (0..entries.len())
+                .filter(|index| !held.contains(index))
+                .collect();
+            // A tag sort keeps the untagged last in either order, in revision
+            // order.
+            tops.sort_by(|&a, &b| {
+                let (a, b) = (&entries[a], &entries[b]);
+                match sort {
+                    RevisionSort::Digest => directed(a.digest.cmp(&b.digest), order),
+                    RevisionSort::Tag => match (a.tags.first(), b.tags.first()) {
+                        (Some(a), Some(b)) => directed(a.cmp(b), order),
+                        (a, b) => a.is_none().cmp(&b.is_none()),
+                    },
+                }
+            });
+            let total = tops.len();
+            let (range, next) = page_range(total, page);
+            (tops[range].to_vec(), total, next)
+        }
+    };
+
+    // An entry two selected ones hold is served once, under the first.
+    let mut served = Vec::new();
+    let mut seen = HashSet::new();
+    for top in tops {
+        let mut pending = vec![top];
+        while let Some(index) = pending.pop() {
+            if seen.insert(index) {
+                served.push(index);
+                pending.extend(holds[index].iter().rev());
+            }
+        }
+    }
+    (served, total, next)
+}
+
 impl Registry {
     #[instrument(skip(self, visibility))]
     pub async fn handle_list_repositories(
         &self,
+        order: SortOrder,
+        page: PageRequest,
         visibility: &dyn NamespaceVisibility,
     ) -> Result<RepositoriesBody, Error> {
         // One walk bucketed in memory: listing per repository would re-scan the
@@ -209,38 +313,64 @@ impl Registry {
             });
         }
 
-        repositories.sort_by(|a, b| a.name.cmp(&b.name));
+        repositories.sort_by(|a, b| directed(a.name.cmp(&b.name), order));
+        let total = repositories.len();
+        let (range, next) = page_range(total, page);
 
-        Ok(RepositoriesBody { repositories })
+        Ok(RepositoriesBody {
+            repositories: repositories.drain(range).collect(),
+            total,
+            next,
+        })
     }
 
     #[instrument(skip(self, visibility))]
     pub async fn handle_list_namespaces(
         &self,
-        repository: &Namespace,
+        request: ListNamespacesRequest,
         visibility: &dyn NamespaceVisibility,
     ) -> Result<NamespacesBody, Error> {
+        let ListNamespacesRequest {
+            repository,
+            under,
+            order,
+            page,
+        } = request;
+        let scope = under.as_ref().unwrap_or(&repository);
         let repository = repository.as_ref();
-        let namespace_names = self.list_repository_namespaces(repository).await?;
+        if !namespace_belongs_to(scope.as_ref(), repository) {
+            return Err(Error::NameUnknown);
+        }
+        let namespace_names = self
+            .list_repository_namespaces(repository, scope.as_ref())
+            .await?;
 
         // A directory whose name is not a valid namespace is a storage artifact
         // scrub removes; dropping it keeps one bad name from failing the listing.
         // Filtering here rather than after the counts keeps a namespace the
         // caller may not see from costing three reads.
-        let visible: Vec<Namespace> = namespace_names
+        let mut visible: Vec<Namespace> = namespace_names
             .into_iter()
             .filter_map(|name| Namespace::new(&name).ok())
             .filter(|name| visibility.allows(name))
             .collect();
 
-        // Nothing visible answers as an absent repository, so an empty listing
-        // cannot tell a repository that holds nothing from one held back, and
-        // the upstreams and tag rules below stay with the content they describe.
+        // Nothing visible in scope answers as an absent repository, so an empty
+        // listing cannot tell a repository that holds nothing from one held
+        // back, and the upstreams and tag rules below stay with the content
+        // they describe.
         if visible.is_empty() {
             return Err(Error::NameUnknown);
         }
+        // `under` lists what nests below it, not itself.
+        visible.retain(|name| Some(name) != under.as_ref());
+        visible.sort_by(|a, b| directed(a.cmp(b), order));
+        let total = visible.len();
+        let (range, next) = page_range(total, page);
 
-        let mut namespaces: Vec<NamespaceInfo> = stream::iter(visible)
+        // Counting the page alone is what paging saves: the counts are three
+        // enumerations per namespace, the names one walk for the whole scope.
+        let namespaces: Vec<NamespaceInfo> = stream::iter(visible.drain(range))
             .map(|name| async move {
                 // The three counts read disjoint prefixes, so they go out together
                 // rather than paying one round trip after another per namespace.
@@ -260,11 +390,9 @@ impl Registry {
                     upload_count,
                 })
             })
-            .buffer_unordered(NAMESPACE_STAT_CONCURRENCY)
+            .buffered(NAMESPACE_STAT_CONCURRENCY)
             .try_collect()
             .await?;
-
-        namespaces.sort_by(|a, b| a.name.cmp(&b.name));
 
         let config = self.get_repository_config(repository);
 
@@ -279,6 +407,8 @@ impl Registry {
                 .iter()
                 .map(|pattern| pattern.as_source().to_string())
                 .collect(),
+            total,
+            next,
         })
     }
 
@@ -286,6 +416,7 @@ impl Registry {
     pub async fn handle_list_revisions(
         &self,
         namespace: &Namespace,
+        selection: RevisionSelection,
     ) -> Result<RevisionsBody, Error> {
         // Materialized once: every step below needs the full revision set. The
         // three walks are independent, so they go out together.
@@ -337,7 +468,7 @@ impl Registry {
         let (child_to_parents, docker_referrers) = self
             .build_parent_and_referrer_maps(&all_revisions, &media_types)
             .await;
-        let manifests = self
+        let (manifests, total, next) = self
             .build_manifest_entries(
                 namespace,
                 all_revisions,
@@ -349,12 +480,15 @@ impl Registry {
                     child_to_parents,
                     docker_referrers,
                 },
+                &selection,
             )
             .await;
 
         Ok(RevisionsBody {
             name: namespace.to_string(),
             manifests,
+            total,
+            next,
         })
     }
 
@@ -367,14 +501,14 @@ impl Registry {
             offset,
             n,
         } = request;
-        let n = n.unwrap_or(PULL_HISTORY_PAGE);
+        let n = n.map_or(DEFAULT_PAGE_SIZE, NonZeroU16::get);
         let (entries, more) = self
             .metadata_store
             .read_access_entries(
                 &namespace,
                 &LinkKind::from_reference(&reference),
                 usize::try_from(offset).unwrap_or(usize::MAX),
-                usize::from(n.get()),
+                usize::from(n),
             )
             .await?;
         let next =
@@ -400,17 +534,23 @@ impl Registry {
     }
 
     #[instrument(skip(self))]
-    pub async fn handle_list_uploads(&self, namespace: &Namespace) -> Result<UploadsBody, Error> {
+    pub async fn handle_list_uploads(
+        &self,
+        namespace: &Namespace,
+        page: PageRequest,
+    ) -> Result<UploadsBody, Error> {
         let mut session_ids: Vec<UploadSessionId> = self
             .blob_store
             .stream_uploads(namespace)
             .try_collect()
             .await?;
         session_ids.sort();
+        let total = session_ids.len();
+        let (range, next) = page_range(total, page);
 
         // `buffered` keeps the sorted order; an upload whose summary read fails
         // (reaped mid-listing) is skipped.
-        let all_uploads: Vec<UploadEntry> = stream::iter(session_ids)
+        let uploads: Vec<UploadEntry> = stream::iter(session_ids.drain(range))
             .map(|session_id| async move {
                 let summary = self
                     .blob_store
@@ -430,7 +570,9 @@ impl Registry {
 
         Ok(UploadsBody {
             name: namespace.to_string(),
-            uploads: all_uploads,
+            uploads,
+            total,
+            next,
         })
     }
 
@@ -441,7 +583,7 @@ impl Registry {
     pub async fn handle_list_jobs(&self, request: ListJobsRequest) -> Result<JobsBody, Error> {
         let ListJobsRequest { queue, n, after } = request;
         let queue = Queue::from(queue);
-        let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
+        let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
         let page = self
             .job_queue
             .list_pending_page(queue, n, after.as_deref())
@@ -483,7 +625,7 @@ impl Registry {
     ) -> Result<FailedJobsBody, Error> {
         let ListJobsRequest { queue, n, after } = request;
         let queue = Queue::from(queue);
-        let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
+        let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
         let page = self
             .job_queue
             .list_failed_page(queue, n, after.as_deref())
@@ -668,12 +810,16 @@ impl Registry {
         info
     }
 
+    /// The entries `selection` serves, with the top-level count and the next
+    /// page's offset. Pull times, the one per-entry read, are read for those
+    /// entries alone.
     async fn build_manifest_entries(
         &self,
         namespace: &Namespace,
         all_revisions: Vec<Digest>,
         inputs: ListingInputs,
-    ) -> Vec<ManifestEntry> {
+        selection: &RevisionSelection,
+    ) -> (Vec<ManifestEntry>, usize, Option<u32>) {
         let ListingInputs {
             digest_to_tags,
             records,
@@ -682,16 +828,8 @@ impl Registry {
             child_to_parents,
             mut docker_referrers,
         } = inputs;
-        // Pull times exist only while pulls are recorded: with recording off
-        // every read below would list an empty directory.
-        let tag_pulls = if self.update_pull_time {
-            self.newest_tag_pulls(namespace, &digest_to_tags).await
-        } else {
-            HashMap::new()
-        };
 
-        // `buffered` below keeps the revision order.
-        let seeds: Vec<_> = all_revisions
+        let (digests, entries): (Vec<Digest>, Vec<ManifestEntry>) = all_revisions
             .into_iter()
             .map(|digest| {
                 let tags = digest_to_tags.get(&digest).cloned().unwrap_or_default();
@@ -712,66 +850,75 @@ impl Registry {
                     referrers.extend(listed_infos);
                     referrers_next = listed.next;
                 }
-                let pushed_at = records.get(&digest).and_then(|record| record.created_at);
-                let reads_pull_time = self.update_pull_time && !leaves.contains(&digest);
-                (
-                    digest,
+                let entry = ManifestEntry {
+                    digest: digest.to_string(),
                     tags,
                     parents,
                     referrers,
                     referrers_next,
-                    pushed_at,
-                    reads_pull_time,
-                )
+                    pushed_at: records.get(&digest).and_then(|record| record.created_at),
+                    last_pulled_at: None,
+                };
+                (digest, entry)
             })
+            .unzip();
+
+        let (served, total, next) = select_revisions(&entries, selection);
+        let mut slots: Vec<_> = digests.into_iter().zip(entries).map(Some).collect();
+        let served: Vec<(Digest, ManifestEntry)> = served
+            .into_iter()
+            .filter_map(|index| slots[index].take())
             .collect();
 
-        let tag_pulls = &tag_pulls;
-        stream::iter(seeds)
-            .map(
-                |(digest, tags, parents, referrers, referrers_next, pushed_at, reads_pull_time)| async move {
-                    // A revision's last pull lives in its access entries.
-                    let last_pulled_at = if reads_pull_time {
-                        self.metadata_store
-                            .read_access_time(namespace, &LinkKind::Digest(digest.clone()))
-                            .await
-                            .ok()
-                            .flatten()
-                    } else {
-                        None
-                    };
-                    // A pull naming a tag stamps that tag alone, never the
-                    // revision it resolves to, so a manifest only ever fetched
-                    // by tag has no revision atime at all. Folding its tags in
-                    // is what makes the reported time the manifest's last pull
-                    // rather than its last pull by digest.
-                    //
-                    // A tag that later moves to another manifest carries its
-                    // pull history to the new target, which then reports a pull
-                    // that happened against the old one. Acceptable for an
-                    // advisory timestamp, and the alternative is stamping the
-                    // revision on every tag pull, doubling writes on the
-                    // hottest path.
-                    let last_pulled_at = tags
-                        .iter()
-                        .filter_map(|tag| tag_pulls.get(tag).copied())
-                        .chain(last_pulled_at)
-                        .max();
-
-                    ManifestEntry {
-                        digest: digest.to_string(),
-                        tags,
-                        parents,
-                        referrers,
-                        referrers_next,
-                        pushed_at,
-                        last_pulled_at,
-                    }
-                },
-            )
+        // Pull times exist only while pulls are recorded: with recording off
+        // every read below would list an empty directory.
+        if !self.update_pull_time {
+            let entries = served.into_iter().map(|(_, entry)| entry).collect();
+            return (entries, total, next);
+        }
+        let tags = served
+            .iter()
+            .flat_map(|(_, entry)| entry.tags.clone())
+            .collect();
+        let tag_pulls = &self.newest_tag_pulls(namespace, tags).await;
+        let leaves = &leaves;
+        let entries = stream::iter(served)
+            .map(|(digest, mut entry)| async move {
+                // A revision's last pull lives in its access entries; a leaf
+                // shows no pull time.
+                let last_pulled_at = if leaves.contains(&digest) {
+                    None
+                } else {
+                    self.metadata_store
+                        .read_access_time(namespace, &LinkKind::Digest(digest))
+                        .await
+                        .ok()
+                        .flatten()
+                };
+                // A pull naming a tag stamps that tag alone, never the
+                // revision it resolves to, so a manifest only ever fetched
+                // by tag has no revision atime at all. Folding its tags in
+                // is what makes the reported time the manifest's last pull
+                // rather than its last pull by digest.
+                //
+                // A tag that later moves to another manifest carries its
+                // pull history to the new target, which then reports a pull
+                // that happened against the old one. Acceptable for an
+                // advisory timestamp, and the alternative is stamping the
+                // revision on every tag pull, doubling writes on the
+                // hottest path.
+                entry.last_pulled_at = entry
+                    .tags
+                    .iter()
+                    .filter_map(|tag| tag_pulls.get(tag).copied())
+                    .chain(last_pulled_at)
+                    .max();
+                entry
+            })
             .buffered(self.listing_read_concurrency.get())
             .collect()
-            .await
+            .await;
+        (entries, total, next)
     }
 
     /// Each subject's referrers as the listing serves them. A subject carrying
@@ -842,9 +989,8 @@ impl Registry {
     async fn newest_tag_pulls(
         &self,
         namespace: &Namespace,
-        digest_to_tags: &HashMap<Digest, Vec<Tag>>,
+        tags: Vec<Tag>,
     ) -> HashMap<Tag, DateTime<Utc>> {
-        let tags: Vec<Tag> = digest_to_tags.values().flatten().cloned().collect();
         stream::iter(tags)
             .map(|tag| async move {
                 let at = self
@@ -890,12 +1036,17 @@ impl Registry {
             }))
     }
 
-    async fn list_repository_namespaces(&self, repository: &str) -> Result<Vec<Namespace>, Error> {
+    /// The namespaces under `scope`, which lies in `repository`.
+    async fn list_repository_namespaces(
+        &self,
+        repository: &str,
+        scope: &str,
+    ) -> Result<Vec<Namespace>, Error> {
         if !self.resolver.contains_key(repository) {
             return Err(Error::NameUnknown);
         }
 
-        self.collect_namespaces(Some(repository)).await
+        self.collect_namespaces(Some(scope)).await
     }
 
     /// Every namespace across both stores, sorted and deduplicated; `scope`
@@ -925,8 +1076,26 @@ mod tests {
     /// Listing tests that are not about visibility admit every namespace.
     const ALL_VISIBLE: fn(&Namespace) -> bool = |_| true;
 
+    /// The first page of a revision listing in its default order.
+    const FIRST_REVISIONS: RevisionSelection = RevisionSelection::Page {
+        sort: RevisionSort::Tag,
+        order: SortOrder::Asc,
+        page: PageRequest { offset: 0, n: None },
+    };
+
+    /// The first page of `repository`'s namespaces in their default order.
+    fn namespaces_of(repository: &str) -> ListNamespacesRequest {
+        ListNamespacesRequest {
+            repository: Namespace::new(repository).unwrap(),
+            under: None,
+            order: SortOrder::Asc,
+            page: PageRequest::default(),
+        }
+    }
+
     use std::{
         collections::HashMap,
+        num::NonZeroU16,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -939,6 +1108,10 @@ mod tests {
     use serde_json::Value;
     use tokio::time::sleep;
 
+    use angos_extension_service::{
+        ListNamespacesRequest, ManifestEntry, NamespacesBody, PageRequest, ParentRef, ReferrerInfo,
+        RevisionSelection, RevisionSort, SortOrder,
+    };
     use angos_oci::{
         DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, Platform, Reference, Tag,
         UploadSessionId,
@@ -950,7 +1123,10 @@ mod tests {
 
     use crate::registry::{
         Error as RegistryError, Registry,
-        admin::{ListPullsRequest, analyze_manifest, extract_docker_referrer, parent_refs_for},
+        admin::{
+            ListPullsRequest, analyze_manifest, extract_docker_referrer, parent_refs_for,
+            select_revisions,
+        },
         keys::NamespaceKeys,
         metadata_store::{AccessEntry, LinkKind, MetadataStore},
         test_utils::{
@@ -1033,7 +1209,7 @@ mod tests {
         let registry = create_test_registry(case.blob_store(), metadata_store_over(hooked));
 
         registry
-            .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+            .handle_list_namespaces(namespaces_of("test-repo"), &ALL_VISIBLE)
             .await
             .unwrap();
 
@@ -1267,7 +1443,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+                .handle_list_namespaces(namespaces_of("test-repo"), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1299,7 +1475,7 @@ mod tests {
             );
 
             let response = registry
-                .handle_list_repositories(&ALL_VISIBLE)
+                .handle_list_repositories(SortOrder::Asc, PageRequest::default(), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1332,7 +1508,6 @@ mod tests {
             .await
             .unwrap();
 
-            let repository = Namespace::new("test-repo").unwrap();
             let hide_all: fn(&Namespace) -> bool = |_| false;
             // Admits the namespaces but not the repository's own name, which is
             // how a policy written about namespaces reads: the repository must
@@ -1342,7 +1517,7 @@ mod tests {
             assert!(
                 matches!(
                     registry
-                        .handle_list_namespaces(&repository, &hide_all)
+                        .handle_list_namespaces(namespaces_of("test-repo"), &hide_all)
                         .await,
                     Err(RegistryError::NameUnknown)
                 ),
@@ -1350,7 +1525,7 @@ mod tests {
             );
             let body = response_json(
                 registry
-                    .handle_list_repositories(&hide_all)
+                    .handle_list_repositories(SortOrder::Asc, PageRequest::default(), &hide_all)
                     .await
                     .unwrap()
                     .into_response()
@@ -1364,7 +1539,7 @@ mod tests {
 
             let body = response_json(
                 registry
-                    .handle_list_namespaces(&repository, &namespaces_only)
+                    .handle_list_namespaces(namespaces_of("test-repo"), &namespaces_only)
                     .await
                     .unwrap()
                     .into_response()
@@ -1379,7 +1554,11 @@ mod tests {
 
             let body = response_json(
                 registry
-                    .handle_list_repositories(&namespaces_only)
+                    .handle_list_repositories(
+                        SortOrder::Asc,
+                        PageRequest::default(),
+                        &namespaces_only,
+                    )
                     .await
                     .unwrap()
                     .into_response()
@@ -1412,7 +1591,7 @@ mod tests {
             .unwrap();
 
             let response = registry
-                .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+                .handle_list_namespaces(namespaces_of("test-repo"), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1434,6 +1613,188 @@ mod tests {
         .await;
     }
 
+    fn listed(
+        digest: &Digest,
+        tags: &[&str],
+        parents: &[&Digest],
+        referrers: &[&Digest],
+    ) -> ManifestEntry {
+        ManifestEntry {
+            digest: digest.to_string(),
+            tags: tags.iter().map(|tag| Tag::new(tag).unwrap()).collect(),
+            parents: parents
+                .iter()
+                .map(|parent| ParentRef {
+                    digest: parent.to_string(),
+                    tags: Vec::new(),
+                    platform: None,
+                })
+                .collect(),
+            referrers: referrers
+                .iter()
+                .map(|referrer| ReferrerInfo {
+                    digest: referrer.to_string(),
+                    artifact_type: None,
+                    annotations: HashMap::new(),
+                })
+                .collect(),
+            referrers_next: None,
+            pushed_at: None,
+            last_pulled_at: None,
+        }
+    }
+
+    /// Pages count top-level revisions, and each carries the platform manifest
+    /// it holds and that manifest's referrer, however the rows are ordered.
+    #[test]
+    fn select_revisions_pages_top_level_entries_with_what_they_hold() {
+        let (index, child, attestation, top, untagged) = (
+            digest("1"),
+            digest("2"),
+            digest("3"),
+            digest("4"),
+            digest("5"),
+        );
+        let entries = [
+            listed(&index, &["b"], &[], &[]),
+            listed(&child, &[], &[&index], &[&attestation]),
+            listed(&attestation, &[], &[], &[]),
+            listed(&top, &["a"], &[], &[]),
+            listed(&untagged, &[], &[], &[]),
+        ];
+        let page = |offset, n| RevisionSelection::Page {
+            sort: RevisionSort::Tag,
+            order: SortOrder::Asc,
+            page: PageRequest {
+                offset,
+                n: NonZeroU16::new(n),
+            },
+        };
+
+        assert_eq!(
+            select_revisions(&entries, &page(0, 2)),
+            (vec![3, 0, 1, 2], 3, Some(2))
+        );
+        assert_eq!(select_revisions(&entries, &page(2, 2)), (vec![4], 3, None));
+        assert_eq!(
+            select_revisions(&entries, &RevisionSelection::Digest(child)),
+            (vec![1, 2], 1, None),
+            "a held revision is served on its own, with what it holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespaces_page_through_the_scope_under_a_namespace() {
+        let case = FSRegistryTestCase::new();
+        let registry = case.registry();
+        for name in ["test-repo/a", "test-repo/b", "test-repo/b/c", "test-repo/d"] {
+            let namespace = Namespace::new(name).unwrap();
+            seed_tagged_revision(&registry.metadata_store, &namespace, &digest("d1"), &["v1"])
+                .await;
+        }
+        let names = |body: &NamespacesBody| -> Vec<String> {
+            body.namespaces.iter().map(|ns| ns.name.clone()).collect()
+        };
+
+        let mut request = namespaces_of("test-repo");
+        request.page.n = NonZeroU16::new(2);
+        let body = registry
+            .handle_list_namespaces(request.clone(), &ALL_VISIBLE)
+            .await
+            .unwrap();
+        assert_eq!(names(&body), ["test-repo/a", "test-repo/b"]);
+        assert_eq!((body.total, body.next), (4, Some(2)));
+
+        request.page.offset = 2;
+        let body = registry
+            .handle_list_namespaces(request, &ALL_VISIBLE)
+            .await
+            .unwrap();
+        assert_eq!(names(&body), ["test-repo/b/c", "test-repo/d"]);
+        assert_eq!(body.next, None);
+
+        let mut request = namespaces_of("test-repo");
+        request.under = Some(Namespace::new("test-repo/b").unwrap());
+        let body = registry
+            .handle_list_namespaces(request.clone(), &ALL_VISIBLE)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&body),
+            ["test-repo/b/c"],
+            "under lists below it, not itself"
+        );
+        assert_eq!(body.total, 1);
+
+        request.under = Some(Namespace::new("other-repo/b").unwrap());
+        assert!(
+            matches!(
+                registry.handle_list_namespaces(request, &ALL_VISIBLE).await,
+                Err(RegistryError::NameUnknown)
+            ),
+            "under must lie in the repository"
+        );
+    }
+
+    /// The fixture's digest order is its tag order reversed, so each sort is told apart.
+    #[tokio::test]
+    async fn revisions_sort_by_digest_or_first_tag() {
+        let case = FSRegistryTestCase::new();
+        let registry = case.registry();
+        let namespace = Namespace::new("test-repo/sorted").unwrap();
+        let (untagged, beta, alpha) = (digest("a1"), digest("b2"), digest("c3"));
+        seed_tagged_revision(&registry.metadata_store, &namespace, &untagged, &[]).await;
+        seed_tagged_revision(
+            &registry.metadata_store,
+            &namespace,
+            &beta,
+            &["beta", "zulu"],
+        )
+        .await;
+        seed_tagged_revision(&registry.metadata_store, &namespace, &alpha, &["alpha"]).await;
+
+        for (sort, order, expected) in [
+            (
+                RevisionSort::Tag,
+                SortOrder::Asc,
+                [&alpha, &beta, &untagged],
+            ),
+            (
+                RevisionSort::Tag,
+                SortOrder::Desc,
+                [&beta, &alpha, &untagged],
+            ),
+            (
+                RevisionSort::Digest,
+                SortOrder::Asc,
+                [&untagged, &beta, &alpha],
+            ),
+            (
+                RevisionSort::Digest,
+                SortOrder::Desc,
+                [&alpha, &beta, &untagged],
+            ),
+        ] {
+            let body = registry
+                .handle_list_revisions(
+                    &namespace,
+                    RevisionSelection::Page {
+                        sort,
+                        order,
+                        page: PageRequest::default(),
+                    },
+                )
+                .await
+                .unwrap();
+            let listed: Vec<&str> = body.manifests.iter().map(|m| m.digest.as_str()).collect();
+            assert_eq!(
+                listed,
+                expected.map(ToString::to_string),
+                "{sort:?} {order:?}"
+            );
+        }
+    }
+
     /// On split backends upload sessions exist only on the blob store, so the
     /// listing must discover an upload-only namespace there.
     #[tokio::test]
@@ -1449,7 +1810,7 @@ mod tests {
             .unwrap();
 
         let response = registry
-            .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+            .handle_list_namespaces(namespaces_of("test-repo"), &ALL_VISIBLE)
             .await
             .unwrap()
             .into_response()
@@ -1482,7 +1843,7 @@ mod tests {
 
             let body = response_json(
                 registry
-                    .handle_list_uploads(&namespace)
+                    .handle_list_uploads(&namespace, PageRequest::default())
                     .await
                     .unwrap()
                     .into_response()
@@ -1512,7 +1873,7 @@ mod tests {
             create_test_blob(registry, &other, b"hidden content").await;
 
             let response = registry
-                .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+                .handle_list_namespaces(namespaces_of("test-repo"), &ALL_VISIBLE)
                 .await
                 .unwrap()
                 .into_response()
@@ -1557,7 +1918,7 @@ mod tests {
             .unwrap();
 
         let response = registry
-            .handle_list_namespaces(&Namespace::new("test-repo").unwrap(), &ALL_VISIBLE)
+            .handle_list_namespaces(namespaces_of("test-repo"), &ALL_VISIBLE)
             .await
             .expect("one invalid directory must not fail the listing")
             .into_response()
@@ -1726,7 +2087,7 @@ mod tests {
 
             let body = response_json(
                 registry
-                    .handle_list_revisions(&namespace)
+                    .handle_list_revisions(&namespace, FIRST_REVISIONS)
                     .await
                     .unwrap()
                     .into_response()
@@ -1779,7 +2140,7 @@ mod tests {
 
     async fn last_pulled_of(registry: &Registry, namespace: &Namespace, target: &Digest) -> Value {
         let response = registry
-            .handle_list_revisions(&namespace.clone())
+            .handle_list_revisions(&namespace.clone(), FIRST_REVISIONS)
             .await
             .unwrap()
             .into_response()

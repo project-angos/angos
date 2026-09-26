@@ -80,6 +80,18 @@ export interface UploadEntry {
 	started_at: string;
 }
 
+export type SortOrder = 'asc' | 'desc';
+export type RevisionSort = 'tag' | 'digest';
+
+/** Rows the UI asks a listing for at a time. */
+export const PAGE = 150;
+
+/** A listing's `total` rows across every page, and where the next page starts. */
+interface Paged {
+	total: number;
+	next?: number;
+}
+
 export interface RepositoryInfo {
 	name: string;
 	namespace_count: number;
@@ -95,11 +107,11 @@ export interface NamespaceInfo {
 	upload_count: number;
 }
 
-interface RepositoriesResponse {
+interface RepositoriesResponse extends Paged {
 	repositories: RepositoryInfo[];
 }
 
-interface NamespacesResponse {
+interface NamespacesResponse extends Paged {
 	repository: string;
 	namespaces: NamespaceInfo[];
 	pull_through_cache: boolean;
@@ -108,12 +120,13 @@ interface NamespacesResponse {
 	immutable_tags_exclusions: string[];
 }
 
-interface RevisionsResponse {
+/** `total` counts the top-level revisions; `manifests` also holds what each one holds. */
+interface RevisionsResponse extends Paged {
 	name: string;
 	manifests: ManifestEntry[];
 }
 
-interface UploadsResponse {
+interface UploadsResponse extends Paged {
 	name: string;
 	uploads: UploadEntry[];
 }
@@ -163,7 +176,7 @@ const MANIFEST_ACCEPT_HEADER = [
 	'application/vnd.docker.distribution.manifest.list.v2+json'
 ].join(', ');
 
-interface FetchResult<T> {
+export interface FetchResult<T> {
 	data: T | null;
 	error: string | null;
 }
@@ -221,18 +234,67 @@ async function postAction(url: string): Promise<string | null> {
 	}
 }
 
-export async function fetchRepositories(): Promise<FetchResult<RepositoriesResponse>> {
-	return fetchJson<RepositoriesResponse>('/v2/_angos/repositories/list');
-}
-
-export async function fetchNamespaces(repository: string): Promise<FetchResult<NamespacesResponse>> {
-	return fetchJson<NamespacesResponse>(
-		`/v2/_angos/namespaces/list?repository=${encodeURIComponent(repository)}`
+export async function fetchRepositories(
+	order: SortOrder,
+	offset: number,
+	n: number
+): Promise<FetchResult<RepositoriesResponse>> {
+	return fetchJson<RepositoriesResponse>(
+		`/v2/_angos/repositories/list?order=${order}&offset=${offset}&n=${n}`
 	);
 }
 
-export async function fetchRevisions(namespace: string): Promise<FetchResult<RevisionsResponse>> {
-	return fetchJson<RevisionsResponse>(`/v2/${namespace}/_angos/revisions/list`);
+/** Every repository's name, page after page: a browse path resolves against all of them. */
+export async function fetchRepositoryNames(): Promise<FetchResult<string[]>> {
+	const names: string[] = [];
+	let offset: number | undefined = 0;
+	while (offset !== undefined) {
+		const result = await fetchRepositories('asc', offset, PAGE);
+		if (!result.data) {
+			return { data: null, error: result.error };
+		}
+		names.push(...result.data.repositories.map((repository) => repository.name));
+		offset = result.data.next;
+	}
+	return { data: names, error: null };
+}
+
+/** The namespaces nested below `under`, which lies in `repository`. */
+export async function fetchNamespaces(
+	repository: string,
+	under: string,
+	order: SortOrder,
+	offset: number,
+	n: number
+): Promise<FetchResult<NamespacesResponse>> {
+	const params = new URLSearchParams({
+		repository,
+		under,
+		order,
+		offset: String(offset),
+		n: String(n)
+	});
+	return fetchJson<NamespacesResponse>(`/v2/_angos/namespaces/list?${params}`);
+}
+
+export async function fetchRevisions(
+	namespace: string,
+	sort: RevisionSort,
+	order: SortOrder,
+	offset: number,
+	n: number
+): Promise<FetchResult<RevisionsResponse>> {
+	return fetchJson<RevisionsResponse>(
+		`/v2/${namespace}/_angos/revisions/list?sort=${sort}&order=${order}&offset=${offset}&n=${n}`
+	);
+}
+
+/** One revision with what it holds, its platform manifests and referrers. */
+export async function fetchRevision(
+	namespace: string,
+	digest: string
+): Promise<FetchResult<RevisionsResponse>> {
+	return fetchJson<RevisionsResponse>(`/v2/${namespace}/_angos/revisions/list?digest=${digest}`);
 }
 
 // The registry keys pull records by the reference they were pulled through, so
@@ -249,8 +311,14 @@ export async function fetchPullHistory(
 	);
 }
 
-export async function fetchUploads(namespace: string): Promise<FetchResult<UploadsResponse>> {
-	return fetchJson<UploadsResponse>(`/v2/${namespace}/_angos/uploads/list`);
+export async function fetchUploads(
+	namespace: string,
+	offset: number,
+	n: number
+): Promise<FetchResult<UploadsResponse>> {
+	return fetchJson<UploadsResponse>(
+		`/v2/${namespace}/_angos/uploads/list?offset=${offset}&n=${n}`
+	);
 }
 
 function jobsQuery(queue: JobQueue, n: number, after?: string): string {

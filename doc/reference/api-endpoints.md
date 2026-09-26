@@ -221,7 +221,7 @@ GET /v2/{namespace}/tags/list
 List tags for a namespace.
 
 Query parameters:
-- `n` - Maximum number of results
+- `n` - Maximum number of results (default 150)
 - `last` - Pagination marker
 
 A namespace holding no manifest content at all returns `NAME_UNKNOWN` (HTTP 404), so a client can probe existence here. A namespace whose tags were all deleted still holds its revisions and returns `200` with an empty list, until those are deleted too.
@@ -237,7 +237,7 @@ GET /v2/_catalog
 List repositories. A Docker Registry V2 endpoint the OCI distribution specification does not define; angos serves it at its long-standing path.
 
 Query parameters:
-- `n` - Maximum number of results
+- `n` - Maximum number of results (default 150)
 - `last` - Pagination marker
 
 The returned names are derived directly from stored content: a namespace is listed exactly when it holds at least one revision or tag, and stops being listed as soon as the last one is deleted.
@@ -254,7 +254,7 @@ List manifests that reference a subject digest.
 
 Query parameters:
 - `artifactType` - Filter by artifact type
-- `last` - Pagination marker. The specification paginates this endpoint through the `Link` header alone, so this is the cursor Angos puts in the `Link` it advertises rather than one a client composes; it takes no page-size parameter, and Angos sizes the page at 100
+- `last` - Pagination marker. The specification paginates this endpoint through the `Link` header alone, so this is the cursor Angos puts in the `Link` it advertises rather than one a client composes; it takes no page-size parameter, and Angos sizes the page at 150
 
 A malformed request is rejected with `DIGEST_INVALID` (HTTP 400): a digest that is not valid syntax, or an `artifactType` that is not a media type. A registry serving this endpoint must never answer `404` to it, so an unreadable request is a bad one rather than an unserved path, unlike the other listings.
 
@@ -262,7 +262,7 @@ Referrers a client recorded under the fallback tag (`<algorithm>-<hex>`, an inde
 
 On a pull-through repository the listing merges the upstream's referrers with the cached ones, since nothing fills a referrer index on its own and an uncached subject would otherwise report none. An upstream that cannot be reached is left out rather than failing the request, so the cached referrers are still served. The `artifactType` filter is applied to both.
 
-A subject with more referrers than the page size is served one page at a time, with the next page advertised in a `Link` header carrying `rel="next"`; the link repeats the `artifactType` filter so following it keeps the listing filtered, percent-encoding it so a `+json` suffix survives the round trip. A page holds 100 entries whenever that many matches remain: the candidates resolve until it is filled, so a filter that drops a long stretch makes a page cost more reads rather than answer short.
+A subject with more referrers than the page size is served one page at a time, with the next page advertised in a `Link` header carrying `rel="next"`; the link repeats the `artifactType` filter so following it keeps the listing filtered, percent-encoding it so a `+json` suffix survives the round trip. A page holds 150 entries whenever that many matches remain: the candidates resolve until it is filled, so a filter that drops a long stretch makes a page cost more reads rather than answer short.
 
 Merging a pull-through listing needs both sides whole, so each page re-reads the upstream's referrers in full: paginating a widely referenced subject on a mirror costs one upstream enumeration per page.
 
@@ -276,6 +276,16 @@ These sit in the extension namespace the distribution spec reserves, whose shape
 
 > **Note:** the top-level `/_ext/` prefix is not served; clients must use the `/v2/_angos/...` equivalents. [Upgrade Angos](../how-to/upgrade.md#extension-api-moved-into-the-reserved-namespace-breaking-change) maps each pre-1.5.0 path to its replacement.
 
+### Listing Pages
+
+The repository, namespace, revision and upload listings are paged. `offset` (default 0) skips rows
+and `n` (1 to 65535, default 150) caps the page. Each response carries `total`, the rows across
+every page, and `next`, the `offset` of the following page, present only when one follows. A
+malformed `offset`, `n`, `sort` or `order` returns `404` rather than falling back to the default.
+
+A page is cut from the whole listing sorted in memory, since storage lists keys in ascending order
+only; paging bounds the per-row reads, not the walk that finds the rows.
+
 ### List Repositories
 
 ```
@@ -284,7 +294,11 @@ GET /v2/_angos/repositories/list
 
 List the configured repositories with their namespace counts.
 
-The listing takes no `n` or `last`: it serves every repository in one response. It is filtered by access policy, as the catalog is. Visible content is the criterion: a
+Query parameters:
+- `order` - `asc` (default) or `desc`, by name
+- `offset`, `n` - The [page](#listing-pages)
+
+It is filtered by access policy, as the catalog is. Visible content is the criterion: a
 repository is listed only while it holds at least one namespace the caller could list tags under,
 and `namespace_count` counts those alone. A repository holding nothing, holding nothing the caller
 may see, or not configured at all are therefore one answer, so the listing tells no one what exists
@@ -301,7 +315,8 @@ beyond what they may read. The authorization webhook is not consulted for this f
       "upstream_urls": ["https://registry-1.docker.io"],
       "immutable_tags": true
     }
-  ]
+  ],
+  "total": 1
 }
 ```
 
@@ -313,20 +328,27 @@ GET /v2/_angos/namespaces/list?repository={repository}
 
 List namespaces within a repository, with the repository's effective configuration.
 
-The listing takes no `n` or `last` either, serving a repository's namespaces in one response. It is
-filtered by access policy: only the namespaces the caller could list tags under are returned. A repository holding none of them answers `404 NAME_UNKNOWN`, exactly as one that holds
+Query parameters:
+- `repository` - The repository to list (required)
+- `under` - Lists only the namespaces nested below this one, which must be the repository or one of its namespaces
+- `order` - `asc` (default) or `desc`, by name
+- `offset`, `n` - The [page](#listing-pages)
+
+The listing is filtered by access policy: only the namespaces the caller could list tags under are
+returned. A repository holding none of them (none at or below `under`, when given) answers `404 NAME_UNKNOWN`, exactly as one that holds
 nothing or is not configured at all, so neither its existence nor its upstreams and tag rules are
 revealed. A configured repository is therefore not listable until it holds content the caller may
 see; pushing to it does not depend on that. The authorization webhook is not consulted for this
 filtering.
 
-Names are served from the `v2/cat` index alone, reading only the repository's own key range. A
+Names are served from the `v2/cat` index alone, reading only the key range of the repository, or of `under`. A
 namespace emptied since its last write can therefore still be listed, with zero counts, until
 `angos scrub` reaps its index key.
 
-Each namespace's counts are a full enumeration of its tags, revisions, and upload sessions. The
-three are issued together per namespace, and the namespaces themselves are counted concurrently, so
-the listing costs one round of enumerations rather than one after another.
+Each namespace's counts are a full enumeration of its tags, revisions, and upload sessions, taken for
+the page's namespaces alone. The three are issued together per namespace, and the namespaces
+themselves are counted concurrently, so the page costs one round of enumerations rather than one
+after another.
 
 **Response:**
 ```json
@@ -343,7 +365,8 @@ the listing costs one round of enumerations rather than one after another.
   "pull_through_cache": true,
   "upstream_urls": ["https://registry-1.docker.io"],
   "immutable_tags": false,
-  "immutable_tags_exclusions": []
+  "immutable_tags_exclusions": [],
+  "total": 1
 }
 ```
 
@@ -353,14 +376,25 @@ the listing costs one round of enumerations rather than one after another.
 GET /v2/{namespace}/_angos/revisions/list
 ```
 
-List all manifest revisions with tags, parent relationships, and referrers.
+List manifest revisions with tags, parent relationships, and referrers.
+
+Query parameters:
+- `sort` - `tag` (default), each revision's first tag with untagged revisions last in either order, or `digest`
+- `order` - `asc` (default) or `desc`
+- `offset`, `n` - The [page](#listing-pages), counted in top-level revisions
+- `digest` - Lists that revision instead of a page, wherever it sits; `sort`, `order` and the page are ignored
+
+A page holds top-level revisions, those no other revision holds, each followed by the revisions it
+holds: an index's platform manifests, and the referrers of either. `total` counts top-level
+revisions. A revision held from two pages is listed on each.
 
 A revision that is itself another's referrer is listed as a leaf: the web UI shows it under its
 subject with no push or pull time, so neither `pushed_at` nor `last_pulled_at` is reported for it.
 `last_pulled_at` is reported for the rest only while `update_pull_time` records pulls. The listing
 reads one record per root revision, one descriptor per referrer, and a manifest body only for an
 index, with the fan-out set by `listing_read_concurrency`; its cost is set by the number of roots
-and referrers rather than by a round trip per manifest field.
+and referrers rather than by a round trip per manifest field. Pull times are read for the page's
+revisions alone.
 
 **Response:**
 ```json
@@ -369,7 +403,7 @@ and referrers rather than by a round trip per manifest field.
   "manifests": [
     {
       "digest": "sha256:abc123...",
-      "tags": ["latest", "1.25.0"],
+      "tags": ["1.25.0", "latest"],
       "parents": [
         {
           "digest": "sha256:def456...",
@@ -386,11 +420,12 @@ and referrers rather than by a round trip per manifest field.
       "pushed_at": "2026-01-01T12:00:00Z",
       "last_pulled_at": "2026-01-02T08:30:00Z"
     }
-  ]
+  ],
+  "total": 1
 }
 ```
 
-`parents` and `referrers` are omitted when empty; `pushed_at` and `last_pulled_at` are omitted when not recorded.
+`tags` is in ascending order. `parents` and `referrers` are omitted when empty; `pushed_at` and `last_pulled_at` are omitted when not recorded.
 
 ### List Pulls
 
@@ -427,7 +462,7 @@ unset. Anonymous pulls are recorded as
 `anonymous`. A target with no recorded pulls returns an empty `entries` list rather than `404`;
 the endpoint does not check that the target exists.
 
-The optional `n` (default 100) and `offset` (default 0) query parameters page through the
+The optional `n` (default 150) and `offset` (default 0) query parameters page through the
 history; `next` is the offset of the following page and is omitted on the last one. Live and
 compacted entries read as one timeline. Only the newest entry is retained indefinitely: scrub
 drops compacted pulls past `max_pulls` or `max_age_secs`, so this is a bounded audit log.
@@ -563,7 +598,10 @@ The three endpoints are gated by the `get-blob` CEL action of the layer's namesp
 GET /v2/{namespace}/_angos/uploads/list
 ```
 
-List blob uploads in progress.
+List blob uploads in progress, by session ID.
+
+Query parameters:
+- `offset`, `n` - The [page](#listing-pages)
 
 **Response:**
 ```json
@@ -575,7 +613,8 @@ List blob uploads in progress.
       "size": 1048576,
       "started_at": "2026-01-01T12:00:00Z"
     }
-  ]
+  ],
+  "total": 1
 }
 ```
 
@@ -590,7 +629,7 @@ List pending and in-flight jobs on a durable job queue (see
 admin API).
 
 Query parameters:
-- `n` - Maximum number of results (default 100)
+- `n` - Maximum number of results (default 150)
 - `after` - Pagination cursor: the `next` value from the previous page
 - `queue` - Queue to administer: `cache` (default) or `replication`
 
