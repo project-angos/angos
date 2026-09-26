@@ -20,7 +20,10 @@ const TEST_DIGEST: &str = "sha256:abc1230000000000000000000000000000000000000000
 
 pub fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventDispatcher {
     metrics_provider::init_for_tests();
-    EventDispatcher::new(webhooks).expect("dispatcher should build in tests")
+    // Every webhook enabled for every repository: most tests exercise delivery alone.
+    let global = webhooks.keys().cloned().collect();
+    EventDispatcher::new(webhooks, global, HashMap::new())
+        .expect("dispatcher should build in tests")
 }
 
 /// Dispatcher over exactly one webhook registered as `name`; the remaining

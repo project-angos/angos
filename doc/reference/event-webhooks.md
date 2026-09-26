@@ -35,6 +35,8 @@ Webhooks are enabled by referencing their names in global or repository configur
 | `global`                              | `event_webhooks` | [string] | Webhook names for all repositories |
 | `repository."<namespace>"`            | `event_webhooks` | [string] | Webhook names for this repository  |
 
+A repository that names any webhook gets those instead of the global ones; one naming none, and a namespace under no repository, gets the global ones. A webhook no list names receives nothing.
+
 ---
 
 ## Delivery Semantics
@@ -197,13 +199,13 @@ Any `2xx` status code is considered success. All other status codes are treated 
 
 ## Repository Filters
 
-When `repository_filter` is set, events are only delivered if the event's repository name matches at least one regex pattern. Patterns use Rust regex syntax.
+When `repository_filter` is set, events are only delivered if the event's repository name matches at least one regex pattern. The name is the `[repository."<name>"]` key the event's namespace falls under, the payload's `repository`, and is empty for a namespace under no repository. Patterns use Rust regex syntax.
 
-| Pattern          | Matches                            |
-|------------------|------------------------------------|
-| `^production/.*` | `production/api`, `production/web` |
-| `^library/.*`    | `library/nginx`, `library/redis`.  |
-| `.*`             | Everything                         |
+| Pattern                  | Matches                                   |
+|--------------------------|-------------------------------------------|
+| `^production$`           | the `production` repository               |
+| `^(staging\|production)$` | the `staging` and `production` repositories |
+| `.*`                     | Everything                                |
 
 Without `repository_filter`, all repositories match.
 

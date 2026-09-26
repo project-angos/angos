@@ -38,6 +38,8 @@ event_webhooks = ["notifications"]
 event_webhooks = ["notifications"]
 ```
 
+A repository naming any webhook gets those instead of the global ones, and a webhook no list names receives nothing.
+
 ---
 
 ## Delivery Policies
@@ -196,14 +198,14 @@ func verifySignature(secret string, body []byte, signatureHeader string) bool {
 
 ## Repository Filters
 
-Scope webhooks to specific repositories using regex patterns:
+Scope webhooks to specific repositories using regex patterns over the repository name (the `[repository."<name>"]` key):
 
 ```toml
 [event_webhook.production-only]
 url = "https://hooks.example.com/production"
 policy = "required"
 events = ["manifest.push", "manifest.delete"]
-repository_filter = ["^production/.*"]
+repository_filter = ["^production$"]
 ```
 
 Multiple patterns are OR-matched (any pattern matching triggers delivery):
@@ -213,7 +215,7 @@ Multiple patterns are OR-matched (any pattern matching triggers delivery):
 url = "https://hooks.example.com/important"
 policy = "optional"
 events = ["manifest.push"]
-repository_filter = ["^production/.*", "^staging/.*", "^library/.*"]
+repository_filter = ["^production$", "^staging$", "^library$"]
 ```
 
 Without `repository_filter`, the webhook receives events from all repositories.

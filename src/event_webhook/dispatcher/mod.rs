@@ -21,7 +21,7 @@ use url::Url;
 mod tests;
 
 use crate::{
-    configuration::RegexPattern,
+    configuration::{Configuration, RegexPattern},
     event_webhook::{
         Error,
         config::{DeliveryPolicy, EventWebhookConfig},
@@ -33,6 +33,9 @@ use angos_secret::Secret;
 
 pub struct EventDispatcher {
     endpoints: HashMap<String, WebhookEndpoint>,
+    /// The webhooks an event goes to: those its repository names, else these.
+    global: Vec<String>,
+    repositories: HashMap<String, Vec<String>>,
     shutdown: AtomicBool,
     /// Tracked rather than owned: a `JoinSet` aborts what it holds when it is
     /// dropped, and a configuration reload drops the dispatcher it displaces,
@@ -203,14 +206,20 @@ fn format_retry_failure(attempts: u32, errors: (&str, &str)) -> String {
 }
 
 impl EventDispatcher {
-    /// Build a dispatcher over the full webhook map (name → config); each
-    /// config is resolved into its endpoint's individual fields here.
+    /// Build a dispatcher over the full webhook map (name → config), each
+    /// config resolved into its endpoint's individual fields here. An event
+    /// reaches the webhooks its repository names in `repositories`, else those
+    /// named in `global`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Initialization`] when a webhook's HTTP client cannot
     /// be constructed.
-    pub fn new(webhooks: HashMap<String, EventWebhookConfig>) -> Result<Self, Error> {
+    pub fn new(
+        webhooks: HashMap<String, EventWebhookConfig>,
+        global: Vec<String>,
+        repositories: HashMap<String, Vec<String>>,
+    ) -> Result<Self, Error> {
         let mut endpoints = HashMap::with_capacity(webhooks.len());
 
         for (name, config) in webhooks {
@@ -240,6 +249,8 @@ impl EventDispatcher {
 
         Ok(Self {
             endpoints,
+            global,
+            repositories,
             shutdown: AtomicBool::new(false),
             in_flight: TaskTracker::new(),
             delivery_backoff: Backoff::exponential(
@@ -249,16 +260,25 @@ impl EventDispatcher {
         })
     }
 
-    /// Build the dispatcher from the configured webhook map, `None` when no
-    /// webhook is defined. The single construction seam shared by the server
-    /// and the maintenance commands.
-    pub fn from_config(
-        webhooks: &HashMap<String, EventWebhookConfig>,
-    ) -> Result<Option<Arc<Self>>, Error> {
-        if webhooks.is_empty() {
+    /// Build the dispatcher from the configuration, `None` when no webhook is
+    /// defined. The single construction seam shared by the server and the
+    /// maintenance commands.
+    pub fn from_config(config: &Configuration) -> Result<Option<Arc<Self>>, Error> {
+        if config.event_webhook.is_empty() {
             return Ok(None);
         }
-        let dispatcher = Self::new(webhooks.clone())?;
+        // A repository naming no webhook inherits the global ones.
+        let repositories = config
+            .repository
+            .iter()
+            .filter(|(_, repository)| !repository.event_webhooks.is_empty())
+            .map(|(name, repository)| (name.clone(), repository.event_webhooks.clone()))
+            .collect();
+        let dispatcher = Self::new(
+            config.event_webhook.clone(),
+            config.global.event_webhooks.clone(),
+            repositories,
+        )?;
         Ok(Some(Arc::new(dispatcher)))
     }
 
@@ -310,14 +330,21 @@ impl EventDispatcher {
         }
     }
 
-    /// Deliver `event` to every matching endpoint. A required-policy failure
-    /// is surfaced only after all endpoints got their delivery, so one failing
-    /// webhook cannot starve the others.
+    /// Deliver `event` to every matching webhook its repository enables. A
+    /// required-policy failure is surfaced only after all endpoints got their
+    /// delivery, so one failing webhook cannot starve the others.
     pub async fn dispatch(&self, event: &Event) -> Result<(), Error> {
         let (body, event_kind_header) = serialize_event(event)?;
+        let enabled = self
+            .repositories
+            .get(&event.repository)
+            .unwrap_or(&self.global);
 
         let mut first_required_failure = None;
-        for (name, endpoint) in &self.endpoints {
+        for (name, endpoint) in enabled
+            .iter()
+            .filter_map(|name| self.endpoints.get_key_value(name))
+        {
             if !endpoint.matches_event(event.kind(), &event.repository) {
                 continue;
             }
