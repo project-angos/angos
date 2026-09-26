@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - An image index with a child descriptor that does not parse is refused with `MANIFEST_INVALID` instead of being stored as an image manifest that references nothing.
 - Describing an ELF file reads its first loader and dynamic section and at most four note segments, so a forged program header table cannot turn one request into thousands of storage reads.
 - Replicating an index pushes each child manifest once, one at a time, so an index naming the same manifests many times no longer multiplies the work and memory at every nesting level.
+- `angos prune` keeps an untagged manifest that a tag or index named after the run judged it, and never deletes a tag younger than `gc_grace_secs` along with a manifest.
 
 ## 1.12.0
 

@@ -327,20 +327,18 @@ impl MetadataStore {
         .try_flatten()
     }
 
-    /// The tags in `namespace` currently pointing at `digest`, resolved from
-    /// the tag entries alone; bodies are never read. The walk gates the
-    /// digest-delete LWW guard, so it must not omit a tag re-pointed on
-    /// another replica.
+    /// The tags in `namespace` currently pointing at `digest`, with their
+    /// winning entries, resolved from the tag entries alone; bodies are never
+    /// read. The walk gates the digest-delete LWW guard, so it must not omit a
+    /// tag re-pointed on another replica.
     #[instrument(skip(self))]
     pub async fn find_tags_pointing_at(
         &self,
         namespace: &Namespace,
         digest: &Digest,
-    ) -> Result<Vec<Tag>, Error> {
+    ) -> Result<Vec<(Tag, LinkMetadata)>, Error> {
         self.stream_live_tags(namespace, None)
-            .try_filter_map(|(tag, metadata)| {
-                ready(Ok((metadata.target == *digest).then_some(tag)))
-            })
+            .try_filter(|(_, metadata)| ready(metadata.target == *digest))
             .try_collect()
             .await
     }
