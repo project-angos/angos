@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{TryStreamExt, stream};
 use tempfile::TempDir;
+use tokio::sync::oneshot;
 
 use crate::tests::object_store_conformance;
-use crate::{ObjectStore, fs::Backend, test_util::frame};
+use crate::{ByteStream, Error, ObjectStore, fs::Backend, test_util::frame};
 
 fn backend(dir: &TempDir) -> Backend {
     Backend::builder(dir.path()).build()
@@ -59,6 +62,47 @@ async fn delete_prunes_empty_ancestors_up_to_root() {
         "empty ancestors must be pruned after a single-key delete"
     );
     assert!(dir.path().join("tags/live/current").exists());
+}
+
+/// A write that opened the staging file before the promotion, or appended
+/// after the caller's size check, must not reach the promoted blob.
+#[tokio::test]
+async fn promote_upload_publishes_only_verified_bytes() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(backend(&dir));
+    store.create_upload("up/data").await.unwrap();
+    store
+        .write_upload("up/data", frame("verified"), Some(8))
+        .await
+        .unwrap();
+
+    // An in-flight PATCH: its file is open, its body held back.
+    let (opened_tx, opened_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let body: ByteStream = Box::pin(stream::once(async move {
+        let _ = opened_tx.send(());
+        let _ = release_rx.await;
+        Ok(Bytes::from_static(b"late"))
+    }));
+    let writer = tokio::spawn({
+        let store = store.clone();
+        async move { store.write_upload("up/data", body, Some(4)).await }
+    });
+    opened_rx.await.unwrap();
+    store
+        .write_upload("up/data", frame("tail"), Some(4))
+        .await
+        .unwrap();
+
+    store
+        .promote_upload("up/data", "blob/data", 8)
+        .await
+        .unwrap();
+    release_tx.send(()).unwrap();
+    writer.await.unwrap().unwrap();
+
+    assert_eq!(store.get("blob/data").await.unwrap(), b"verified");
+    assert!(matches!(store.head("up/data").await, Err(Error::NotFound)));
 }
 
 /// `move_object`'s rename fast path must sweep the source's now-empty parent

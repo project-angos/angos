@@ -418,8 +418,9 @@ impl Registry {
 
         let bounded = self.bound_blob_stream(summary.size, request.content_length, stream);
         // PATCH only needs the running size, the digest being finalized at the
-        // PUT. Concurrent PATCHes on one session are unserialized, and the
-        // PUT's digest check catches any interleaving.
+        // PUT. Concurrent PATCHes on one session are unserialized: the PUT's
+        // size check rejects an interleaving, and it promotes only the bytes it
+        // verified.
         let (_, size) = self
             .blob_store
             .append_upload(

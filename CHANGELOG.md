@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A blob stored as an empty object under a non-empty digest reads as missing, so it is fetched or pushed again.
 - Moving an object by server-side copy checks the copy's size and retries before deleting the source.
 - Completing an S3 upload that never opened a multipart puts its bytes instead of copying them.
+- Completing a filesystem upload publishes a copy of the verified bytes, so a chunk still being written can no longer alter the stored blob.
 
 ## 1.12.0
 
