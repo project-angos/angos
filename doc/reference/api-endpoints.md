@@ -564,8 +564,8 @@ What one file of the layer holds once decoded, `path` as for the file endpoint. 
 gets `elf`: its type, architecture, entry point, loader, the libraries it needs, the name a
 shared library answers to, its GNU build ID, its `relro` (`full` when every symbol binds at
 load, `partial`, or `none`) and whether its stack is executable. Past the header, only the program headers,
-loader, notes, dynamic section and the stretch of string table naming the libraries are read,
-so a large binary costs a few small reads. A file whose first 64 KiB hold a
+the first loader and dynamic section, up to four note segments and the stretch of string table naming
+the libraries are read, each capped at 1 MiB, so any binary costs a few small reads. A file whose first 64 KiB hold a
 `-----BEGIN CERTIFICATE-----` line gets `certificates`: every PEM block of its first 4 MiB in
 order, a certificate with its subject, issuer, validity and DNS and IPv4 names, anything else
 by its label. Any other file answers `{}`. A path that is not a file, or a layer not yet

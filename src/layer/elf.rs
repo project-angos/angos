@@ -13,6 +13,8 @@ pub const HEAD_LEN: u64 = 64 * 1024;
 const SEGMENT_LIMIT: u64 = 1024 * 1024;
 /// What is read of each library name, longer than any real one.
 const NAME_LIMIT: u64 = 256;
+/// Note segments searched for a build ID; real binaries carry two or three.
+const NOTE_SEGMENTS: usize = 4;
 const MAGIC: &[u8] = b"\x7fELF";
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -130,37 +132,35 @@ where
         })
         .collect();
 
+    // The first loader and dynamic section, as the kernel takes them: a forged
+    // table repeating a segment must not cost a read per entry.
+    let first = |kind| segments.iter().find(|segment| segment.kind == kind);
     let mut interpreter = None;
-    let mut build_id = None;
+    if let Some(segment) = first(PT_INTERP) {
+        let bytes = bytes_at(head, &read, segment.offset, segment.size).await?;
+        interpreter = Some(name(&bytes, 0));
+    }
     let mut linking = Linking::default();
-    for segment in &segments {
-        match segment.kind {
-            PT_INTERP => {
-                let bytes = bytes_at(head, &read, segment.offset, segment.size).await?;
-                interpreter = Some(name(&bytes, 0));
-            }
-            PT_NOTE if build_id.is_none() => {
-                let bytes = bytes_at(head, &read, segment.offset, segment.size).await?;
-                build_id = gnu_build_id(layout, &bytes);
-            }
-            PT_DYNAMIC => {
-                let bytes = bytes_at(head, &read, segment.offset, segment.size).await?;
-                linking = read_dynamic(layout, head, &bytes, &segments, &read).await?;
-            }
-            _ => {}
+    if let Some(segment) = first(PT_DYNAMIC) {
+        let bytes = bytes_at(head, &read, segment.offset, segment.size).await?;
+        linking = read_dynamic(layout, head, &bytes, &segments, &read).await?;
+    }
+    let mut build_id = None;
+    let notes = segments.iter().filter(|segment| segment.kind == PT_NOTE);
+    for segment in notes.take(NOTE_SEGMENTS) {
+        let bytes = bytes_at(head, &read, segment.offset, segment.size).await?;
+        build_id = gnu_build_id(layout, &bytes);
+        if build_id.is_some() {
+            break;
         }
     }
-    let has = |kind| segments.iter().any(|segment| segment.kind == kind);
-    let relro = match (has(PT_GNU_RELRO), linking.bind_now) {
+    let relro = match (first(PT_GNU_RELRO).is_some(), linking.bind_now) {
         (false, _) => "none",
         (true, false) => "partial",
         (true, true) => "full",
     };
     // Without a PT_GNU_STACK, the loader makes the stack executable.
-    let executable_stack = segments
-        .iter()
-        .find(|segment| segment.kind == PT_GNU_STACK)
-        .is_none_or(|segment| segment.flags & PF_X != 0);
+    let executable_stack = first(PT_GNU_STACK).is_none_or(|segment| segment.flags & PF_X != 0);
     Ok(Some(ElfDetails {
         // A shared object naming a loader is a position-independent executable.
         kind: match kind {
@@ -188,7 +188,7 @@ where
         endian: if layout.little { "little" } else { "big" }.to_string(),
         entry: format!("{entry:#x}"),
         interpreter,
-        dynamic: has(PT_DYNAMIC),
+        dynamic: first(PT_DYNAMIC).is_some(),
         needed: linking.needed,
         soname: linking.soname,
         build_id,

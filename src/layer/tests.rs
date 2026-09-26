@@ -808,6 +808,35 @@ async fn describe_reads_an_elf_binary_past_its_head() {
     assert_eq!(none.await, Ok(None));
 }
 
+/// A forged table repeating every segment a detail is read from costs one
+/// read for the loader, one for the dynamic section and four for notes, not
+/// one per entry.
+#[tokio::test]
+async fn describe_reads_a_bounded_number_of_segments() {
+    let count = 900;
+    let mut head = vec![0; 64 + 56 * count];
+    head[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    head[32..40].copy_from_slice(&64u64.to_le_bytes());
+    head[54..56].copy_from_slice(&56u16.to_le_bytes());
+    head[56..58].copy_from_slice(&u16::try_from(count).unwrap().to_le_bytes());
+    for index in 0..count {
+        let at = 64 + index * 56;
+        let kind = [3u32, 4, 2][index % 3];
+        head[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        head[at + 8..at + 16].copy_from_slice(&(1u64 << 30).to_le_bytes());
+        head[at + 32..at + 40].copy_from_slice(&16u64.to_le_bytes());
+    }
+    let reads = RefCell::new(0);
+    let details = elf::describe(&head, |_, length| {
+        *reads.borrow_mut() += 1;
+        async move { Ok::<_, ()>(vec![0; usize::try_from(length).unwrap()]) }
+    })
+    .await
+    .unwrap();
+    assert!(details.is_some());
+    assert_eq!(*reads.borrow(), 6);
+}
+
 #[test]
 fn pem_blocks_decode_certificates_and_name_the_rest() {
     let text = format!("{}{}", tls::server_cert_pem(), tls::server_key_pem());
