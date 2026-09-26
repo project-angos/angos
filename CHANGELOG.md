@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Manifests and blobs are served with `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`, so a pushed HTML body runs no script on the web UI's origin.
 - An image index with a child descriptor that does not parse is refused with `MANIFEST_INVALID` instead of being stored as an image manifest that references nothing.
 - Describing an ELF file reads its first loader and dynamic section and at most four note segments, so a forged program header table cannot turn one request into thousands of storage reads.
+- Replicating an index pushes each child manifest once, one at a time, so an index naming the same manifests many times no longer multiplies the work and memory at every nesting level.
 
 ## 1.12.0
 
