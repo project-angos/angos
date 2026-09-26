@@ -445,7 +445,8 @@ impl Executor {
     /// delete path, which also reclaims the manifest's bytes once unreferenced.
     /// Age-gated like [`Self::delete_orphan_blob`]: every producer of this
     /// action classifies a revision as orphaned the moment its record exists,
-    /// which is before the tag or index that will reference it lands.
+    /// which is before the tag or index that will reference it lands, and a
+    /// tag or index naming an old revision may land after it was judged.
     async fn delete_orphan_manifest(
         &self,
         namespace: Namespace,
@@ -463,6 +464,16 @@ impl Executor {
             .unwrap_or(false)
         {
             info!("skipping orphan manifest deletion: '{digest}' is younger than the grace period");
+            return Ok(());
+        }
+        if self
+            .metadata_store
+            .referenced_within_grace(&namespace, &digest)
+            .await?
+        {
+            info!(
+                "skipping orphan manifest deletion: '{namespace}@{digest}' was tagged or referenced within the grace period"
+            );
             return Ok(());
         }
 
@@ -787,7 +798,11 @@ impl ActionSink for Executor {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        fs::File,
+        str::FromStr,
+        time::{Duration, SystemTime},
+    };
 
     use bytes::Bytes;
     use chrono::{DateTime, TimeDelta};
@@ -1226,16 +1241,7 @@ mod tests {
         .await
         .unwrap();
 
-        // The same store, read through a grace period the record cannot have
-        // outlived.
-        let graced = Arc::new(MetadataStore::new(
-            metadata_store.object_store().clone(),
-            Settings {
-                gc_grace_secs: 300,
-                ..Settings::default()
-            },
-        ));
-        let executor = Executor::new_for_test(blob_store.clone(), graced);
+        let executor = Executor::new_for_test(blob_store.clone(), graced(&metadata_store));
 
         executor
             .apply(Action::DeleteOrphanManifest {
@@ -1251,6 +1257,130 @@ mod tests {
                 .await
                 .is_ok(),
             "a revision younger than the grace is still being pushed and must survive"
+        );
+    }
+
+    /// The same store, read through a grace period nothing a test just wrote
+    /// can have outlived.
+    fn graced(metadata_store: &MetadataStore) -> Arc<MetadataStore> {
+        Arc::new(MetadataStore::new(
+            metadata_store.object_store().clone(),
+            Settings {
+                gc_grace_secs: 300,
+                ..Settings::default()
+            },
+        ))
+    }
+
+    /// Ages the FS object at `key` past any grace period.
+    fn age(case: &FSRegistryTestCase, key: &str) {
+        File::options()
+            .write(true)
+            .open(case.temp_dir().path().join(key))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    /// An old untagged revision with only its own reference key.
+    async fn old_revision(case: &FSRegistryTestCase, namespace: &Namespace) -> Digest {
+        let metadata_store = case.metadata_store();
+        let digest = put_blob_direct(metadata_store.object_store(), b"an old manifest").await;
+        let link = LinkKind::Digest(digest.clone());
+        seed_links(
+            &metadata_store,
+            namespace,
+            &[(link.clone(), digest.clone())],
+        )
+        .await
+        .unwrap();
+        age(case, &namespace.revision_record_path(&digest));
+        age(case, &digest.blob_ref_path(namespace, &link));
+        digest
+    }
+
+    /// Retention judges a run's revisions long before it deletes them, so a
+    /// tag landing on an old revision in between must keep both.
+    #[tokio::test]
+    async fn executor_keeps_an_old_manifest_tagged_since_it_was_judged() {
+        let case = FSRegistryTestCase::new();
+        let metadata_store = case.metadata_store();
+        let namespace = Namespace::new("test-repo/retagged").unwrap();
+        let digest = old_revision(&case, &namespace).await;
+        let tag = LinkKind::Tag(Tag::new("prod").unwrap());
+        seed_links(
+            &metadata_store,
+            &namespace,
+            &[(tag.clone(), digest.clone())],
+        )
+        .await
+        .unwrap();
+
+        Executor::new_for_test(case.blob_store(), graced(&metadata_store))
+            .apply(Action::DeleteOrphanManifest {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+            })
+            .await
+            .unwrap();
+
+        let revision = LinkKind::Digest(digest.clone());
+        assert!(
+            metadata_store
+                .read_link(&namespace, &revision)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            metadata_store
+                .read_link(&namespace, &tag)
+                .await
+                .unwrap()
+                .target,
+            digest
+        );
+    }
+
+    /// A tag whose reference key the check missed, as it misses a push landing
+    /// just after it, is younger than the grace, so the cascade leaves it.
+    #[tokio::test]
+    async fn executor_orphan_manifest_delete_spares_a_tag_younger_than_the_grace() {
+        let case = FSRegistryTestCase::new();
+        let metadata_store = case.metadata_store();
+        let namespace = Namespace::new("test-repo/raced").unwrap();
+        let digest = old_revision(&case, &namespace).await;
+        let tag = LinkKind::Tag(Tag::new("prod").unwrap());
+        seed_links(
+            &metadata_store,
+            &namespace,
+            &[(tag.clone(), digest.clone())],
+        )
+        .await
+        .unwrap();
+        age(&case, &digest.blob_ref_path(&namespace, &tag));
+
+        Executor::new_for_test(case.blob_store(), graced(&metadata_store))
+            .apply(Action::DeleteOrphanManifest {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+            })
+            .await
+            .unwrap();
+
+        let revision = LinkKind::Digest(digest.clone());
+        assert!(
+            metadata_store
+                .read_link(&namespace, &revision)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            metadata_store
+                .read_link(&namespace, &tag)
+                .await
+                .unwrap()
+                .target,
+            digest
         );
     }
 

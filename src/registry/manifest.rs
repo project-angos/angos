@@ -882,10 +882,16 @@ impl Registry {
             .referrer_subject(resolved_repository, reference)
             .await?;
 
-        // A digest delete cascades to every pointing tag, and a replicated
+        // A digest delete cascades to the pointing tags, and a replicated
         // delete is gated on last-writer-wins before anything is written.
         let existed_before = self
-            .delete_manifest_links(resolved_repository, namespace, reference, source_ts)
+            .delete_manifest_links(
+                resolved_repository,
+                namespace,
+                reference,
+                source_ts,
+                client_initiated,
+            )
             .await?;
 
         let target = match reference {
@@ -1006,16 +1012,27 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
         source_ts: Option<DateTime<Utc>>,
+        client_initiated: bool,
     ) -> Result<bool, Error> {
         // Every tag the delete drops: the reference itself, or the tags a
-        // digest delete cascades to.
+        // digest delete cascades to. Maintenance drops only a tag it could
+        // have judged: one younger than the grace was pushed after it.
+        let grace = i64::try_from(self.metadata_store.gc_grace_secs).unwrap_or(i64::MAX);
         let dropped_tags: Vec<Tag> = match reference {
             Reference::Tag(tag) => vec![tag.clone()],
-            Reference::Digest(digest) => {
-                self.metadata_store
-                    .find_tags_pointing_at(namespace, digest)
-                    .await?
-            }
+            Reference::Digest(digest) => self
+                .metadata_store
+                .find_tags_pointing_at(namespace, digest)
+                .await?
+                .into_iter()
+                .filter(|(_, metadata)| {
+                    client_initiated
+                        || metadata.created_at.is_none_or(|at| {
+                            Utc::now().signed_duration_since(at).num_seconds() >= grace
+                        })
+                })
+                .map(|(tag, _)| tag)
+                .collect(),
         };
         // Only a digest delete cascades, so only its pointing tags can make
         // the reference count as present.

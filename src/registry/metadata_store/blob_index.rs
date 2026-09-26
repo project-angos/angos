@@ -289,22 +289,10 @@ impl MetadataStore {
                 if matches!(link, LinkKind::Blob(_)) {
                     return Ok(true);
                 }
-                let full_key = format!("{dir}/{key}");
-                match self.object_store().head(&full_key).await {
-                    Ok(meta) => {
-                        // No timestamp to gate on, so never guess in favour
-                        // of deletion.
-                        let Some(modified) = meta.last_modified else {
-                            return Ok(true);
-                        };
-                        let age = Utc::now().signed_duration_since(modified);
-                        if age.num_seconds() < i64::try_from(self.gc_grace_secs).unwrap_or(i64::MAX)
-                        {
-                            return Ok(true);
-                        }
-                    }
-                    Err(StorageError::NotFound) => continue,
-                    Err(e) => return Err(e.into()),
+                match self.key_within_grace(&format!("{dir}/{key}")).await? {
+                    Some(true) => return Ok(true),
+                    Some(false) => {}
+                    None => continue,
                 }
                 let Ok(namespace) = Namespace::new(&raw) else {
                     // A key angos cannot address is left to quarantine, and
@@ -321,6 +309,44 @@ impl MetadataStore {
             }
         }
         Ok(false)
+    }
+
+    /// Whether one of `namespace`'s reference keys for `digest` is younger than
+    /// the grace period. A push naming the digest, by tag or from an index,
+    /// rewrites its key before anything else, so a young one marks a push that
+    /// an earlier judgement of the digest may not have seen.
+    pub async fn referenced_within_grace(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+    ) -> Result<bool, Error> {
+        let dir = digest.blob_ref_namespace_dir(namespace);
+        let mut token = None;
+        loop {
+            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
+            for entry in &page.items {
+                if self.key_within_grace(&format!("{dir}/{entry}")).await? == Some(true) {
+                    return Ok(true);
+                }
+            }
+            token = page.next_token;
+            if token.is_none() {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Whether the key at `key` is younger than the grace period, or carries no
+    /// timestamp, which never counts in favour of deletion; `None` once gone.
+    async fn key_within_grace(&self, key: &str) -> Result<Option<bool>, Error> {
+        match self.object_store().head(key).await {
+            Ok(meta) => Ok(Some(meta.last_modified.is_none_or(|modified| {
+                Utc::now().signed_duration_since(modified).num_seconds()
+                    < i64::try_from(self.gc_grace_secs).unwrap_or(i64::MAX)
+            }))),
+            Err(StorageError::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Delete every reference key of a reclaimed blob. Only the collector
