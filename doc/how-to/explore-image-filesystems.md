@@ -17,7 +17,7 @@ Browse what an image contains, layer by layer, and open any file, from the web U
 
 1. A layer is a tar stream, usually gzipped. An `index` job walks it once and keeps, by the layer digest, a listing of its entries with their offsets, each file's SHA-256, SHA-512 and media type and, for a gzipped layer, an inflater checkpoint every 4 MiB of output.
 2. The manifest page fetches the listing of each layer and merges them the way a runtime does: an entry replaces the lower layers' one, a whiteout removes a path, an opaque marker empties a directory.
-3. Opening a file decodes the layer from the nearest checkpoint to the file's offset, so a file deep in a large layer costs a few megabytes of decoding, not the whole layer.
+3. Opening a file reads only the chunk of the listing holding its path and the chunk of checkpoints before its offset, then decodes the layer from the nearest checkpoint, so a file deep in a large layer costs about a megabyte of listing and a few megabytes of decoding, not the whole layer.
 
 A listing an older version wrote may lack the files' digests, media types or secrets; it is served as it is while an `index` job walks its layer again, and the tab says so and swaps in the new listing when the job is done. The listing is derived from the blob and shared like it: two images with the same layer share one listing, and it goes when the blob is reclaimed, or when `angos reconcile index` runs while no image an index policy applies to uses the layer. zstd-compressed layers are not indexed.
 

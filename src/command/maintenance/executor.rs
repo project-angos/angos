@@ -891,7 +891,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let store = metadata_store.object_store();
             let layer = Digest::sha256_of_bytes(b"listed layer");
-            for key in [layer.layer_entries_path(), layer.layer_checkpoints_path()] {
+            for key in [layer.layer_listing_path(), layer.layer_checkpoints_path(0)] {
                 store.put(&key, Bytes::from_static(b"{}")).await.unwrap();
             }
 
@@ -901,7 +901,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            for key in [layer.layer_entries_path(), layer.layer_checkpoints_path()] {
+            for key in [layer.layer_listing_path(), layer.layer_checkpoints_path(0)] {
                 assert!(store.get(&key).await.is_err(), "{key} must be gone");
             }
         })

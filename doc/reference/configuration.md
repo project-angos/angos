@@ -108,6 +108,8 @@ listener.
 | `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes are handled in parallel by each `angos worker`, the server's in-process drain, and the `angos reconcile replication` end-of-run drain. |
 | `max_concurrent_scan_jobs` | usize | `2` | Worker concurrency for the scan queue |
 | `max_concurrent_index_jobs` | usize | `4` | Worker concurrency for the layer index queue; a job inflates one layer on one core |
+| `max_index_size`            | string   | `"50GiB"` | Uncompressed bytes an index job reads of one layer, which bounds how long it runs; a larger layer is not indexed |
+| `max_index_entries`         | usize    | `500000` | Entries one layer listing may hold, about 1 KiB of memory each while indexing; a layer with more is not indexed |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `max_blob_size`             | string   | `"100GiB"` | Maximum total size of a single blob upload; a larger upload is rejected with `BLOB_UPLOAD_INVALID` (HTTP 413) |
 | `blob_stream_frame_size`    | string   | `"128KiB"` | Read buffer each frame of a streamed blob response is filled from; larger frames cost fewer allocations and body writes per blob served, at one buffer per in-flight response |
@@ -125,7 +127,7 @@ listener.
 | `gc_grace_secs`             | u64      | `300`    | Reclamation grace period, used by the serving process and scrub alike: young keys read as live, the push path re-checks the collector after this long, and gc run markers derive their TTL from it. Lower it only in a maintenance config for offline runs against a store with no live traffic; the serving processes must keep a value that exceeds clock skew plus the longest write stall. |
 | `trusted_proxies`           | [string] | `[]`     | Proxy IPs or CIDR networks (e.g. `"10.0.0.1"`, `"10.0.0.0/8"`) whose `X-Forwarded-For`/`X-Real-IP` headers are honored as the client IP. From any other peer those headers are ignored and the socket address is used. The set must name proxies only: a range that also covers clients lets them spoof the forwarded header. |
 
-`max_manifest_size`, `max_blob_size` and `blob_stream_frame_size` must be greater than zero.
+`max_manifest_size`, `max_blob_size`, `max_index_size` and `blob_stream_frame_size` must be greater than zero.
 
 #### `allow_missing_manifest_references`
 

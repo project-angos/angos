@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    io::{Cursor, Read, Write},
+    io::{self, Cursor, Read, Write},
     sync::Arc,
 };
 
@@ -29,8 +29,9 @@ use crate::{
         NpmToken, PrivateKey, RegistryAuth, SlackToken, StripeKey,
     },
     layer::{
-        Checkpoints, IndexLayerJobHandler, IndexLayerPayload, Kind, SecretKind, SecretScanner,
-        classify, elf, extract_gzip, index_stream, mime_type, pem, read_listing,
+        Checkpoints, IndexLayerJobHandler, IndexLayerPayload, IndexLimits, Kind, Listing,
+        SecretKind, SecretScanner, classify, elf, extract_gzip, index_stream, mime_type, pem,
+        read_entries, read_listing,
     },
     policy::{ImagePolicy, PolicyConfig},
     registry::{
@@ -43,6 +44,12 @@ use crate::{
         },
     },
     test_fixtures::{client::test_client_config, tls},
+};
+
+/// No bound: the tests below exercise what indexing records, not what it refuses.
+const LIMITS: IndexLimits = IndexLimits {
+    max_size: u64::MAX,
+    max_entries: usize::MAX,
 };
 
 /// A layer as a build produces it: directories, files, links, whiteouts and
@@ -325,53 +332,63 @@ fn capabilities_come_from_the_security_xattr() {
             .append_data(&mut header, path, b"\x7fELF".as_slice())
             .unwrap();
     }
-    let (listing, _) = index_stream(Cursor::new(builder.into_inner().unwrap())).unwrap();
-    assert_eq!(listing.entries[0].capabilities, ["cap_net_raw", "cap_bpf"]);
-    assert!(listing.entries[1].capabilities.is_empty());
+    let (_, entries) = index_stream(
+        Cursor::new(builder.into_inner().unwrap()),
+        LIMITS,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(entries[0].capabilities, ["cap_net_raw", "cap_bpf"]);
+    assert!(entries[1].capabilities.is_empty());
 }
 
-/// The listing carries every entry with its kind and offset, the checkpoints
-/// let a file past the first megabytes be read without decoding them again,
-/// and a plain tar lists the same with no checkpoints.
+/// The listing carries every entry, sorted by path, with its kind and offset,
+/// the checkpoints let a file past the first megabytes be read without
+/// decoding them again, and a plain tar lists the same with no checkpoints.
 #[test]
 fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     let tar = layer_tar(6 * 1024 * 1024);
     let compressed = gzip(&tar);
-    let (listing, checkpoints) = index_stream(Cursor::new(&compressed)).unwrap();
+    let mut chunks = Vec::new();
+    let (listing, entries) = index_stream(Cursor::new(&compressed), LIMITS, |_, chunk| {
+        chunks.push(chunk);
+        Ok(())
+    })
+    .unwrap();
     assert!(listing.compressed);
     assert_eq!(listing.uncompressed_size, tar.len() as u64);
-    let kinds: Vec<(&str, Kind)> = listing
-        .entries
+    assert_eq!(listing.chunks, ["etc/motd"]);
+    let kinds: Vec<(&str, Kind)> = entries
         .iter()
         .map(|entry| (entry.path.as_str(), entry.kind))
         .collect();
+    assert!(
+        kinds[2].0.starts_with("opt/") && kinds[2].0.ends_with("/deep.txt"),
+        "long names survive: {}",
+        kinds[2].0
+    );
     assert_eq!(
-        kinds[..8],
+        [&kinds[..2], &kinds[3..]].concat(),
         [
+            ("etc/motd", Kind::Whiteout),
             ("filler.bin", Kind::File),
             ("usr", Kind::Dir),
             ("usr/bin", Kind::Dir),
             ("usr/bin/hello", Kind::File),
-            ("usr/bin/hi", Kind::Symlink),
             ("usr/bin/hello-again", Kind::Hardlink),
-            ("etc/motd", Kind::Whiteout),
+            ("usr/bin/hi", Kind::Symlink),
             ("var/cache", Kind::Opaque),
         ]
     );
-    assert!(
-        kinds[8].0.ends_with("/deep.txt"),
-        "long names survive: {}",
-        kinds[8].0
-    );
-    let hello = &listing.entries[3];
+    let hello = &entries[5];
     assert_eq!(hello.size, 21);
     assert_eq!(hello.mode, 0o644);
     assert_eq!(
         &tar[usize::try_from(hello.offset).unwrap()..usize::try_from(hello.offset).unwrap() + 21],
         b"#!/bin/sh\necho hello\n"
     );
-    assert_eq!(listing.entries[4].link.as_deref(), Some("hello"));
-    assert_eq!(listing.entries[5].link.as_deref(), Some("usr/bin/hello"));
+    assert_eq!(entries[6].link.as_deref(), Some("usr/bin/hello"));
+    assert_eq!(entries[7].link.as_deref(), Some("hello"));
     let content = hello.content.as_ref().expect("a file carries its content");
     assert_eq!(
         content.sha256,
@@ -383,18 +400,17 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     );
     assert_eq!(content.mime_type, "application/x-sh");
     assert!(
-        listing.entries[1..8]
+        entries
             .iter()
             .filter(|entry| entry.kind != Kind::File)
             .all(|entry| entry.content.is_none()),
         "only files carry content"
     );
 
-    assert!(
-        !checkpoints.is_empty(),
-        "6 MiB of filler must produce a checkpoint"
-    );
-    let stored = Checkpoints::from_inflater(checkpoints);
+    let chunk = listing
+        .checkpoint_chunk(hello.offset)
+        .expect("6 MiB of filler must produce a checkpoint before the file");
+    let stored = Checkpoints::from_inflater(chunks.swap_remove(chunk));
     let checkpoint = stored
         .before(hello.offset)
         .expect("a checkpoint before the file");
@@ -416,10 +432,73 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     .unwrap();
     assert_eq!(out, b"#!/bin/sh\necho hello\n");
 
-    let (plain, none) = index_stream(Cursor::new(&tar)).unwrap();
+    let (plain, plain_entries) = index_stream(Cursor::new(&tar), LIMITS, |_, _| {
+        Err(io::Error::other("a plain tar has no checkpoints"))
+    })
+    .unwrap();
     assert!(!plain.compressed);
-    assert!(none.is_empty());
-    assert_eq!(plain.entries, listing.entries);
+    assert!(plain.checkpoints.is_empty());
+    assert_eq!(plain_entries, entries);
+}
+
+/// A read resumes from the chunk holding the last checkpoint at or before it,
+/// and before the first one from the stream start; a path is looked up in the
+/// chunk of entries whose range holds it.
+#[test]
+fn a_read_finds_the_chunk_holding_it() {
+    let listing = Listing {
+        version: 0,
+        compressed: true,
+        uncompressed_size: 0,
+        chunks: vec!["bin".to_string(), "usr/lib".to_string()],
+        checkpoints: vec![4, 132, 260],
+    };
+    let checkpoints: Vec<Option<usize>> = [0, 4, 131, 132, 1000]
+        .into_iter()
+        .map(|offset| listing.checkpoint_chunk(offset))
+        .collect();
+    assert_eq!(checkpoints, [None, Some(0), Some(0), Some(1), Some(2)]);
+    let entries: Vec<Option<usize>> = ["app", "bin", "usr", "usr/lib", "var"]
+        .into_iter()
+        .map(|path| listing.entry_chunk(path))
+        .collect();
+    assert_eq!(entries, [None, Some(0), Some(0), Some(1), Some(1)]);
+}
+
+/// A layer past its size or entry count is refused, and so is a long name the
+/// tar reader would load whole ahead of its entry, however large the limits.
+#[test]
+fn indexing_refuses_a_layer_past_its_limits() {
+    let refused = |tar: &[u8], limits| {
+        index_stream(Cursor::new(tar), limits, |_, _| Ok(()))
+            .map(|_| ())
+            .map_err(|e| e.kind())
+            == Err(io::ErrorKind::FileTooLarge)
+    };
+    let tar = gzip(&layer_tar(1024 * 1024));
+    let small = IndexLimits {
+        max_size: 64 * 1024,
+        ..LIMITS
+    };
+    let few = IndexLimits {
+        max_entries: 1,
+        ..LIMITS
+    };
+    assert!(refused(&tar, small));
+    assert!(refused(&tar, few));
+
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut long_name = tar::Header::new_gnu();
+    long_name.set_entry_type(tar::EntryType::GNULongName);
+    long_name.set_size(2 * 1024 * 1024);
+    long_name.set_cksum();
+    builder
+        .append(&long_name, io::repeat(b'a').take(2 * 1024 * 1024))
+        .unwrap();
+    builder
+        .append_data(&mut tar::Header::new_gnu(), "file", io::empty())
+        .unwrap();
+    assert!(refused(&builder.into_inner().unwrap(), LIMITS));
 }
 
 /// The job stores the listing and its checkpoints by the layer digest, and a
@@ -434,13 +513,21 @@ async fn the_job_indexes_a_stored_layer_once() {
         .put_blob(&digest, compressed.into())
         .await
         .unwrap();
-    let handler = IndexLayerJobHandler::new(stack.blob_store.clone(), stack.metadata_store.clone());
+    let handler = IndexLayerJobHandler::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        LIMITS,
+    );
     handler.index(&digest, false).await.unwrap();
     let listing = read_listing(&stack.metadata_store, &digest)
         .await
         .unwrap()
         .expect("a listing");
-    assert_eq!(listing.entries.len(), 9);
+    assert_eq!(listing.chunks.len(), 1);
+    let entries = read_entries(&stack.metadata_store, &digest, 0)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 9);
     handler.index(&digest, false).await.unwrap();
 
     let gone = Digest::sha256_of_bytes(b"never stored");
@@ -497,17 +584,20 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
     let response = entries(&namespace).await.unwrap().into_response().unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(job_store.count_pending(Queue::Index, 0).await.unwrap(), 1);
-    IndexLayerJobHandler::new(stack.blob_store.clone(), stack.metadata_store.clone())
-        .index(&digest, false)
-        .await
-        .unwrap();
+    IndexLayerJobHandler::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        LIMITS,
+    )
+    .index(&digest, false)
+    .await
+    .unwrap();
     let response = entries(&namespace).await.unwrap().into_response().unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let listing: crate::layer::Listing = serde_json::from_slice(&body).unwrap();
-    assert_eq!(listing.entries.len(), 9);
-    let flags: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(flags["refreshing"], false);
+    let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing["entries"].as_array().map(Vec::len), Some(9));
+    assert_eq!(listing["refreshing"], false);
 
     let file = |path: &str| {
         registry.handle_get_layer_file(LayerFileRequest {
@@ -571,25 +661,33 @@ async fn an_older_listing_is_served_and_walked_again() {
         .grant(&namespace, &digest)
         .await
         .unwrap();
-    let handler = IndexLayerJobHandler::new(stack.blob_store.clone(), stack.metadata_store.clone());
+    let handler = IndexLayerJobHandler::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        LIMITS,
+    );
     handler.index(&digest, false).await.unwrap();
     let mut listing = read_listing(&stack.metadata_store, &digest)
         .await
         .unwrap()
         .expect("a listing");
     listing.version = 0;
-    for entry in &mut listing.entries {
-        entry.content = None;
-    }
-    stack
-        .metadata_store
-        .object_store()
-        .put(
-            &digest.layer_entries_path(),
-            serde_json::to_vec(&listing).unwrap().into(),
-        )
+    let mut entries = read_entries(&stack.metadata_store, &digest, 0)
         .await
         .unwrap();
+    for entry in &mut entries {
+        entry.content = None;
+    }
+    let store = stack.metadata_store.object_store();
+    for (key, body) in [
+        (digest.layer_listing_path(), serde_json::to_vec(&listing)),
+        (
+            digest.layer_entries_chunk_path(0),
+            serde_json::to_vec(&entries),
+        ),
+    ] {
+        store.put(&key, body.unwrap().into()).await.unwrap();
+    }
 
     let job_store = Arc::new(JobStore::new(
         stack.store.clone(),
@@ -617,10 +715,16 @@ async fn an_older_listing_is_served_and_walked_again() {
     let zipped = response.into_body().collect().await.unwrap().to_bytes();
     let mut json = Vec::new();
     GzDecoder::new(&zipped[..]).read_to_end(&mut json).unwrap();
-    let served: crate::layer::Listing = serde_json::from_slice(&json).unwrap();
-    assert_eq!(served, listing, "the outdated listing, served as it is");
-    let flags: serde_json::Value = serde_json::from_slice(&json).unwrap();
-    assert_eq!(flags["refreshing"], true);
+    let served: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let served_entries = served["entries"].as_array().expect("entries");
+    assert_eq!(served_entries.len(), 9);
+    assert!(
+        served_entries
+            .iter()
+            .all(|entry| entry["content"].is_null()),
+        "the outdated listing, served as it is"
+    );
+    assert_eq!(served["refreshing"], true);
 
     let claimed = job_store
         .claim_one(Queue::Index)
@@ -631,13 +735,11 @@ async fn an_older_listing_is_served_and_walked_again() {
     let payload: IndexLayerPayload = serde_json::from_value(claimed.envelope.payload).unwrap();
     // No need to force it: the outdated listing counts as none.
     handler.index(&digest, payload.force).await.unwrap();
-    let listing = read_listing(&stack.metadata_store, &digest)
+    let entries = read_entries(&stack.metadata_store, &digest, 0)
         .await
-        .unwrap()
-        .expect("a listing");
+        .unwrap();
     assert!(
-        listing
-            .entries
+        entries
             .iter()
             .filter(|entry| entry.kind == Kind::File)
             .all(|entry| entry.content.is_some())
@@ -662,10 +764,22 @@ async fn the_file_endpoint_serves_a_range() {
         .grant(&namespace, &digest)
         .await
         .unwrap();
-    IndexLayerJobHandler::new(stack.blob_store.clone(), stack.metadata_store.clone())
-        .index(&digest, false)
-        .await
-        .unwrap();
+    IndexLayerJobHandler::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        LIMITS,
+    )
+    .index(&digest, false)
+    .await
+    .unwrap();
+    // Without its chunk the read would still succeed, decoding from the start.
+    assert!(
+        stack
+            .store
+            .exists(&digest.layer_checkpoints_path(0))
+            .await
+            .unwrap()
+    );
     let job_store = Arc::new(JobStore::new(
         stack.store.clone(),
         "index-test",
@@ -713,6 +827,100 @@ async fn the_file_endpoint_serves_a_range() {
         file("bytes=21-").await,
         Err(RegistryError::RangeNotSatisfiable)
     ));
+}
+
+/// A layer of more entries than one chunk holds finds each file, and a hard
+/// link's target, in the chunk its path falls in.
+#[tokio::test]
+async fn a_file_is_found_across_entry_chunks() {
+    let stack = fs_test_stack();
+    let namespace = Namespace::new("apps/web").unwrap();
+    let mut builder = tar::Builder::new(Vec::new());
+    for index in 0..5000 {
+        let body = format!("file {index}\n");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        builder
+            .append_data(&mut header, format!("data/{index:05}"), body.as_bytes())
+            .unwrap();
+    }
+    // Sorting first, in the first chunk, to a file in the last one.
+    let mut link = tar::Header::new_gnu();
+    link.set_entry_type(tar::EntryType::Link);
+    link.set_size(0);
+    link.set_mode(0o644);
+    link.set_uid(0);
+    link.set_gid(0);
+    link.set_mtime(0);
+    builder
+        .append_link(&mut link, "a-link", "data/04999")
+        .unwrap();
+    let compressed = gzip(&builder.into_inner().unwrap());
+    let digest = Digest::sha256_of_bytes(&compressed);
+    stack
+        .blob_store
+        .put_blob(&digest, compressed.into())
+        .await
+        .unwrap();
+    stack
+        .metadata_store
+        .grant(&namespace, &digest)
+        .await
+        .unwrap();
+    IndexLayerJobHandler::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        LIMITS,
+    )
+    .index(&digest, false)
+    .await
+    .unwrap();
+    let listing = read_listing(&stack.metadata_store, &digest)
+        .await
+        .unwrap()
+        .expect("a listing");
+    assert_eq!(listing.chunks.len(), 3);
+    let job_store = Arc::new(JobStore::new(
+        stack.store.clone(),
+        "index-test",
+        ClaimMode::Atomic,
+    ));
+    let registry = Registry::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        single_repo_resolver("apps", repository_with_replication("apps", Vec::new())),
+        RegistryConfig::new(job_store),
+    );
+
+    for (path, expected) in [
+        ("data/00000", "file 0\n"),
+        ("data/02048", "file 2048\n"),
+        ("data/04999", "file 4999\n"),
+        ("a-link", "file 4999\n"),
+    ] {
+        let body = registry
+            .handle_get_layer_file(LayerFileRequest {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+                path: path.to_string(),
+                download: false,
+                range: None,
+            })
+            .await
+            .unwrap()
+            .into_response(registry.blob_stream_frame_size())
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], expected.as_bytes(), "{path}");
+    }
 }
 
 /// A 64-bit x86-64 PIE, `size` bytes long, its dynamic section at
@@ -886,10 +1094,14 @@ async fn details_describe_binaries_and_certificates() {
         .grant(&namespace, &digest)
         .await
         .unwrap();
-    IndexLayerJobHandler::new(stack.blob_store.clone(), stack.metadata_store.clone())
-        .index(&digest, false)
-        .await
-        .unwrap();
+    IndexLayerJobHandler::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        LIMITS,
+    )
+    .index(&digest, false)
+    .await
+    .unwrap();
     let job_store = Arc::new(JobStore::new(
         stack.store.clone(),
         "index-test",

@@ -29,6 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Replicating an index pushes each child manifest once, one at a time, so an index naming the same manifests many times no longer multiplies the work and memory at every nesting level.
 - `angos prune` keeps an untagged manifest that a tag or index named after the run judged it, and never deletes a tag younger than `gc_grace_secs` along with a manifest.
 - An event reaches only the webhooks `global.event_webhooks` or its repository's `event_webhooks` names, instead of every defined webhook receiving every repository's events.
+- Layer indexing refuses a layer past the new `max_index_size` or `max_index_entries`, or holding a long name or PAX header over 1 MiB, rather than taking it into memory.
+- A layer listing keeps its entries, sorted by path, and its checkpoints in chunks of about 1 MiB, so indexing never holds the checkpoints whole and opening a file reads one chunk of each instead of the whole listing.
 
 ## 1.12.0
 

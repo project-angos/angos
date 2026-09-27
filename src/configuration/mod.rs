@@ -301,6 +301,12 @@ fn validate_global(
         ));
     }
 
+    if global.max_index_size.as_u64() == 0 {
+        return Err(Error::InvalidFormat(
+            "global.max_index_size must be greater than zero".to_string(),
+        ));
+    }
+
     // A zero-capacity read buffer reads nothing, which would end every blob
     // body at once rather than fail.
     if global.blob_stream_frame_size.as_u64() == 0 {

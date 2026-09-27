@@ -199,8 +199,16 @@ fn categorize_layer(rest: &str) -> KeyCategory {
         return KeyCategory::Unknown;
     };
 
+    // Chunks are `entries.<n>` and `checkpoints.<n>`; the whole `entries` and
+    // `checkpoints` objects an older version wrote are retired layouts.
+    let chunk = |name: &str| {
+        name.split_once('.').is_some_and(|(kind, n)| {
+            matches!(kind, "entries" | "checkpoints") && n.parse::<usize>().is_ok()
+        })
+    };
     match *tail {
-        ["entries" | "checkpoints"] => KeyCategory::LayerListing { digest },
+        ["listing"] => KeyCategory::LayerListing { digest },
+        [name] if chunk(name) => KeyCategory::LayerListing { digest },
         _ => KeyCategory::Unknown,
     }
 }
@@ -779,7 +787,12 @@ mod tests {
     #[test]
     fn layer_listings_are_recognized_and_other_layer_keys_are_not() {
         let digest = Digest::sha256_of_bytes(b"layer");
-        for key in [digest.layer_entries_path(), digest.layer_checkpoints_path()] {
+        for key in [
+            digest.layer_listing_path(),
+            digest.layer_entries_chunk_path(0),
+            digest.layer_checkpoints_path(0),
+            digest.layer_checkpoints_path(12),
+        ] {
             assert_eq!(
                 categorize(&key),
                 KeyCategory::LayerListing {
@@ -787,10 +800,19 @@ mod tests {
                 }
             );
         }
-        assert_eq!(
-            categorize(&format!("{}/other", digest.layer_dir())),
-            KeyCategory::Unknown
-        );
+        // The whole entries and checkpoints objects are retired, left for quarantine.
+        for name in [
+            "other",
+            "entries",
+            "checkpoints",
+            "checkpoints.x",
+            "other.1",
+        ] {
+            assert_eq!(
+                categorize(&format!("{}/{name}", digest.layer_dir())),
+                KeyCategory::Unknown
+            );
+        }
         assert_eq!(
             categorize("v2/layers/sha256/ab/short/entries"),
             KeyCategory::Unknown

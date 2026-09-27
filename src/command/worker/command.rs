@@ -21,7 +21,7 @@ use crate::{
         runner::execute_one,
         store::{self as job_store, ClaimMode, JobHandler, JobRetryPolicy, JobStore},
     },
-    layer::IndexLayerJobHandler,
+    layer::{IndexLayerJobHandler, IndexLimits},
     registry::{
         Registry, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -238,6 +238,7 @@ struct WorkerContext {
     retry_policy: JobRetryPolicy,
     claim_mode: ClaimMode,
     scan: Option<ScanConfig>,
+    index_limits: IndexLimits,
 }
 
 impl WorkerContext {
@@ -279,6 +280,7 @@ impl WorkerContext {
             retry_policy,
             claim_mode,
             scan: config.global.scan.clone(),
+            index_limits: config.global.index_limits(),
         })
     }
 
@@ -322,6 +324,7 @@ impl WorkerContext {
             Queue::Index => Arc::new(IndexLayerJobHandler::new(
                 self.blob_store.clone(),
                 self.metadata_store.clone(),
+                self.index_limits,
             )),
         };
 
@@ -344,6 +347,7 @@ mod tests {
     use super::{WorkerContext, resolve_queues};
     use crate::{
         cache_fill::CACHE_FETCH_BLOB_KIND,
+        configuration::global::GlobalConfig,
         jobs::{
             Queue,
             store::{ClaimMode, JobEnvelope, JobRetryPolicy, JobStore},
@@ -436,6 +440,7 @@ mod tests {
             repositories,
             registry,
             scan: None,
+            index_limits: GlobalConfig::default().index_limits(),
         };
         (context, dir)
     }
