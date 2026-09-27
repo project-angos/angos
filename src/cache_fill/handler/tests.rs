@@ -40,7 +40,8 @@ async fn cache_fill_grant_emits_blob_push_with_internal_actor() {
     };
     let mut webhooks = HashMap::new();
     webhooks.insert("cache-hook".to_string(), webhook);
-    let dispatcher = EventDispatcher::new(webhooks).expect("dispatcher build");
+    let dispatcher = EventDispatcher::new(webhooks, vec!["cache-hook".to_string()], HashMap::new())
+        .expect("dispatcher build");
 
     let FsTestStack {
         dir: _dir,

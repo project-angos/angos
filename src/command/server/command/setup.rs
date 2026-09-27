@@ -181,7 +181,7 @@ pub async fn build_registry(
     let repositories =
         bootstrap::repositories(&config.repository, auth_cache, &config.global).await?;
 
-    let event_dispatcher = EventDispatcher::from_config(&config.event_webhook)?;
+    let event_dispatcher = EventDispatcher::from_config(config)?;
 
     // With [global.job_queue] the jobs survive a restart and `angos worker`
     // drains them; without it the queue lives beside the metadata store and

@@ -998,3 +998,21 @@ serve 150 rows unless `n` asks for more, with `total` and `next` beside them.
 Pass `n` (up to 65535), or follow `next` as `offset` until it is absent. A
 revision page counts top-level revisions, each followed by the revisions it
 holds.
+
+### Event Webhooks Fire Only Where Referenced (Breaking Change)
+
+An event reaches only the webhooks `global.event_webhooks` or its repository's
+`event_webhooks` names, a repository naming any replacing the global list, as
+documented. Every `[event_webhook.<name>]` used to receive every repository's
+events, the lists being only validated.
+
+**Who is affected:** deployments defining a webhook no `event_webhooks` list
+names, which stops receiving events, and those whose repository list was meant
+to add to the global one. A `required` webhook now holds up only the operations
+it is enabled for.
+
+#### Migration
+
+Name every webhook that must keep receiving all events in
+`global.event_webhooks`, and repeat the global names in a repository list that
+should keep them.

@@ -138,7 +138,7 @@ pub fn registry(
     resolver: Arc<RepositoryResolver>,
     job_store: Arc<JobStore>,
 ) -> Result<Arc<Registry>, Error> {
-    let dispatcher = EventDispatcher::from_config(&config.event_webhook)?;
+    let dispatcher = EventDispatcher::from_config(config)?;
     let registry = Registry::new(
         blob_store,
         metadata_store,

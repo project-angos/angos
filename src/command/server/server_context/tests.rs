@@ -129,7 +129,7 @@ pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
         max_manifest_size_bytes: config.global.max_manifest_size_bytes(),
         global_immutable_tags: config.global.immutable_tags,
         global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
-        event_dispatcher: EventDispatcher::from_config(&config.event_webhook).unwrap(),
+        event_dispatcher: EventDispatcher::from_config(config).unwrap(),
         ..RegistryConfig::new(test_job_store(&metadata_store))
     };
 
