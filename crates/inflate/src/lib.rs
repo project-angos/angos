@@ -15,7 +15,10 @@
 //! symbol, the bit buffer and input cursor in locals, an 11-bit lookup with
 //! a bit-by-bit fallback. It decodes a real layer at `miniz_oxide`'s speed.
 
-use std::io::{self, Read};
+use std::{
+    io::{self, Read},
+    mem,
+};
 
 /// The LZ77 window a block may reference, and so what a checkpoint carries.
 pub const WINDOW: usize = 32 * 1024;
@@ -501,8 +504,10 @@ impl<R: Read> Inflater<R> {
         self.pos
     }
 
-    pub fn into_checkpoints(self) -> Vec<Checkpoint> {
-        self.checkpoints
+    /// The checkpoints recorded since the last call, once at least `at_least`
+    /// of them wait, so a long stream can hand them on as they accumulate.
+    pub fn take_checkpoints(&mut self, at_least: usize) -> Option<Vec<Checkpoint>> {
+        (self.checkpoints.len() >= at_least.max(1)).then(|| mem::take(&mut self.checkpoints))
     }
 
     /// Reads and discards `n` bytes of output.
@@ -964,7 +969,7 @@ mod tests {
         let mut inflater = Inflater::new(Cursor::new(compressed), every).unwrap();
         let mut out = Vec::new();
         inflater.read_to_end(&mut out).unwrap();
-        (out, inflater.into_checkpoints())
+        (out, inflater.take_checkpoints(1).unwrap_or_default())
     }
 
     #[test]

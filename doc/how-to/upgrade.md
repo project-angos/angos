@@ -1016,3 +1016,18 @@ it is enabled for.
 Name every webhook that must keep receiving all events in
 `global.event_webhooks`, and repeat the global names in a repository list that
 should keep them.
+
+### Layer Listings Are Indexed Again
+
+A layer's listing is a small `listing` object with its entries, sorted by
+path, in about 1 MiB `entries.<n>` chunks and its checkpoints in 1 MiB
+`checkpoints.<n>` chunks, where it held both whole in `entries` and
+`checkpoints`. Those are no longer read, so every layer is unindexed: the
+layer view answers `202 Accepted` and walks the layer again the first time it
+is opened, and its files are `404` until then. `angos scrub` moves the old
+objects to `_lost_and_found/`.
+
+#### Migration
+
+Run `angos reconcile index` after upgrading to walk the layers of indexing
+repositories again in the background, rather than on their first open.

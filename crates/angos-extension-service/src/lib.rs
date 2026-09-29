@@ -311,7 +311,7 @@ pub enum SecretKind {
     Kubeconfig,
 }
 
-/// A layer's entries in tar order.
+/// A layer's entries, sorted by path.
 #[derive(Serialize, Debug)]
 pub struct LayerListing {
     /// An older version wrote it: a job is walking the layer again.

@@ -479,7 +479,7 @@ This endpoint is gated by the same `list-revisions` CEL action as
 GET /v2/{namespace}/_angos/layers/{algorithm}:{hex}/entries
 ```
 
-The filesystem listing of one layer: every tar entry in order, with its kind, size, mode,
+The filesystem listing of one layer: every tar entry, sorted by path, with its kind, size, mode,
 owner, modification time, link target, the offset of its data in the uncompressed stream and
 the Linux `capabilities` its `security.capability` extended attribute permits, such as
 `cap_net_bind_service`, plus for a file its `content`: SHA-256 and SHA-512 in hex, a media type and, when the file
@@ -500,11 +500,11 @@ itself. The listing is gzipped for a client whose `Accept-Encoding` takes it.
   "uncompressed_size": 7340032,
   "entries": [
     { "path": "etc", "kind": "dir", "size": 0, "mode": 493, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 512 },
+    { "path": "etc/motd", "kind": "whiteout", "size": 0, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 3584 },
     { "path": "etc/os-release", "kind": "file", "size": 10, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 1536,
       "content": { "sha256": "c8fa7610cf5d4ab2dfb774392e4fd5d789579c9aa357616b3879633e184d2a05", "sha512": "8881e1b6d16c746ad2d0f7e48a2c8cef43a10a342f8a07c19d22df46c0619d3ef0584f201366adaa85d9c07f7352671627816420b673a06f76779d0845d3af26", "mime_type": "text/plain" } },
     { "path": "root/.docker/config.json", "kind": "file", "size": 96, "mode": 384, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 3072,
-      "content": { "sha256": "…", "sha512": "…", "mime_type": "application/json", "secrets": [{ "kind": "registry-auth", "line": 4 }] } },
-    { "path": "etc/motd", "kind": "whiteout", "size": 0, "mode": 420, "uid": 0, "gid": 0, "mtime": 1700000000, "offset": 3584 }
+      "content": { "sha256": "…", "sha512": "…", "mime_type": "application/json", "secrets": [{ "kind": "registry-auth", "line": 4 }] } }
   ]
 }
 ```

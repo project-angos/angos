@@ -10,7 +10,10 @@ use crate::{
     registry::metadata_store::{DEFAULT_GC_GRACE_SECS, PullHistoryConfig},
     registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY},
 };
-use crate::{layer::IndexAction, scan::ScanConfig};
+use crate::{
+    layer::{IndexAction, IndexLimits},
+    scan::ScanConfig,
+};
 
 /// Default Tokio worker-thread count; the `unwrap` is const-evaluated.
 const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -26,6 +29,8 @@ pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::new(2).
 /// Worker concurrency for the index queue: opening an image asks for all its
 /// layers at once, each job inflating one on a core.
 pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Entries a layer listing may hold, about half a GiB of listing in memory.
+const DEFAULT_MAX_INDEX_ENTRIES: NonZeroUsize = NonZeroUsize::new(500_000).unwrap();
 
 // A config struct is naturally flag-heavy; the bool count is not an API smell.
 #[allow(clippy::struct_excessive_bools)]
@@ -42,6 +47,13 @@ pub struct GlobalConfig {
     pub max_concurrent_scan_jobs: NonZeroUsize,
     #[serde(default = "default_max_concurrent_index_jobs")]
     pub max_concurrent_index_jobs: NonZeroUsize,
+    /// Uncompressed bytes an index job reads of one layer, which bounds how
+    /// long it runs; a larger layer is not indexed.
+    #[serde(default = "default_max_index_size")]
+    pub max_index_size: ByteSize,
+    /// Entries one layer listing may hold; a layer with more is not indexed.
+    #[serde(default = "default_max_index_entries")]
+    pub max_index_entries: NonZeroUsize,
     #[serde(default = "default_max_manifest_size")]
     pub max_manifest_size: ByteSize,
     #[serde(default = "default_max_blob_size")]
@@ -151,6 +163,14 @@ fn default_max_concurrent_replication_jobs() -> NonZeroUsize {
     DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS
 }
 
+fn default_max_index_size() -> ByteSize {
+    ByteSize::gib(50)
+}
+
+fn default_max_index_entries() -> NonZeroUsize {
+    DEFAULT_MAX_INDEX_ENTRIES
+}
+
 fn default_max_manifest_size() -> ByteSize {
     ByteSize::mib(5)
 }
@@ -183,6 +203,8 @@ impl Default for GlobalConfig {
             max_concurrent_replication_jobs: default_max_concurrent_replication_jobs(),
             max_concurrent_scan_jobs: default_max_concurrent_scan_jobs(),
             max_concurrent_index_jobs: default_max_concurrent_index_jobs(),
+            max_index_size: default_max_index_size(),
+            max_index_entries: default_max_index_entries(),
             max_manifest_size: default_max_manifest_size(),
             max_blob_size: default_max_blob_size(),
             blob_stream_frame_size: default_blob_stream_frame_size(),
@@ -220,6 +242,13 @@ impl GlobalConfig {
 
     pub fn blob_stream_frame_size_bytes(&self) -> usize {
         usize::try_from(self.blob_stream_frame_size.as_u64()).unwrap_or(usize::MAX)
+    }
+
+    pub fn index_limits(&self) -> IndexLimits {
+        IndexLimits {
+            max_size: self.max_index_size.as_u64(),
+            max_entries: self.max_index_entries.get(),
+        }
     }
 }
 

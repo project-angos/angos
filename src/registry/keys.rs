@@ -174,11 +174,15 @@ pub trait DigestKeys {
     /// Directory holding what the filesystem indexer derived from the layer.
     fn layer_dir(&self) -> String;
 
-    /// The layer's entry listing, whose presence marks the layer indexed.
-    fn layer_entries_path(&self) -> String;
+    /// The layer's listing, whose presence marks the layer indexed.
+    fn layer_listing_path(&self) -> String;
 
-    /// The inflater's checkpoints into the layer.
-    fn layer_checkpoints_path(&self) -> String;
+    /// One chunk of the layer's entries, sorted by path and numbered in order.
+    fn layer_entries_chunk_path(&self, chunk: usize) -> String;
+
+    /// One chunk of the inflater's checkpoints into the layer, numbered in
+    /// stream order.
+    fn layer_checkpoints_path(&self, chunk: usize) -> String;
 
     /// Directory holding every reference key for the digest, one key per
     /// (namespace, link), rooted outside the blob store's `v2/blobs/` tree.
@@ -232,12 +236,16 @@ impl DigestKeys for Digest {
         )
     }
 
-    fn layer_entries_path(&self) -> String {
-        format!("{}/entries", self.layer_dir())
+    fn layer_listing_path(&self) -> String {
+        format!("{}/listing", self.layer_dir())
     }
 
-    fn layer_checkpoints_path(&self) -> String {
-        format!("{}/checkpoints", self.layer_dir())
+    fn layer_entries_chunk_path(&self, chunk: usize) -> String {
+        format!("{}/entries.{chunk}", self.layer_dir())
+    }
+
+    fn layer_checkpoints_path(&self, chunk: usize) -> String {
+        format!("{}/checkpoints.{chunk}", self.layer_dir())
     }
 
     fn blob_ref_dir(&self) -> String {

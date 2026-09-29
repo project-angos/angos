@@ -312,8 +312,8 @@ mod tests {
         let store = stack.metadata_store.object_store();
         store
             .put(
-                &layer.layer_entries_path(),
-                Bytes::from_static(br#"{"compressed":false,"uncompressed_size":0,"entries":[]}"#),
+                &layer.layer_listing_path(),
+                Bytes::from_static(br#"{"compressed":false,"uncompressed_size":0,"chunks":[]}"#),
             )
             .await
             .unwrap();
@@ -335,11 +335,11 @@ mod tests {
         let stray = Digest::sha256_of_bytes(b"stray layer");
         for layer in [&kept, &stray] {
             store
-                .put(&layer.layer_entries_path(), Bytes::from_static(b"{}"))
+                .put(&layer.layer_listing_path(), Bytes::from_static(b"{}"))
                 .await
                 .unwrap();
             store
-                .put(&layer.layer_checkpoints_path(), Bytes::from_static(b"{}"))
+                .put(&layer.layer_checkpoints_path(0), Bytes::from_static(b"{}"))
                 .await
                 .unwrap();
         }

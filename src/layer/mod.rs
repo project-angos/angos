@@ -7,6 +7,7 @@
 //! job per layer; any other image is indexed the first time someone asks.
 
 use std::{
+    cell::Cell,
     ffi::OsStr,
     io::{self, BufRead, BufReader, Read, Write},
     mem,
@@ -19,6 +20,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha512};
+use tokio::runtime::Handle;
 use tokio_util::io::SyncIoBridge;
 use tracing::{debug, info};
 
@@ -58,11 +60,20 @@ impl From<IndexAction> for bool {
 /// Output between two checkpoints: what opening a file costs at most in
 /// decoding, against 32 KiB of stored window per checkpoint.
 const CHECKPOINT_EVERY: u64 = 4 * 1024 * 1024;
+/// What the tar reader may take to reach the next entry: its header and any
+/// long name or PAX header ahead of it, which it loads whole.
+const ADVANCE_LIMIT: u64 = 1024 * 1024;
+/// Checkpoints stored per object, 1 MiB of windows: what indexing holds in
+/// memory whatever the layer's size, and what opening a file reads.
+const CHUNK_CHECKPOINTS: usize = 32;
+/// Entries stored per object, about 1 MiB of listing: what finding one file
+/// reads.
+const CHUNK_ENTRIES: usize = 2048;
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 /// What indexing records; bump it when that changes, so older listings are
 /// walked again.
-const LISTING_VERSION: u32 = 3;
+const LISTING_VERSION: u32 = 4;
 /// A file's first bytes, where a NUL makes it binary, as the web UI judges.
 const SNIFF_LEN: usize = 8192;
 /// What is scanned of a line for secrets; the rest of a longer one is not.
@@ -714,8 +725,9 @@ fn capabilities(value: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// A layer's entries in tar order, stored as JSON by the layer digest and
-/// served as-is to the web UI.
+/// What indexing a layer recorded, stored as JSON by the layer digest: its
+/// entries, sorted by path, live in chunks beside it, so reading one entry
+/// takes one chunk rather than the whole listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listing {
     /// The [`LISTING_VERSION`] that wrote it, 0 before there was one.
@@ -724,7 +736,11 @@ pub struct Listing {
     /// Whether the layer is gzipped, which is when checkpoints exist.
     pub compressed: bool,
     pub uncompressed_size: u64,
-    pub entries: Vec<Entry>,
+    /// The path each stored chunk of entries starts at.
+    pub chunks: Vec<String>,
+    /// The output offset each stored chunk of checkpoints starts at.
+    #[serde(default)]
+    pub checkpoints: Vec<u64>,
 }
 
 impl Listing {
@@ -732,10 +748,25 @@ impl Listing {
     pub fn is_outdated(&self) -> bool {
         self.version < LISTING_VERSION
     }
+
+    /// The chunk of entries that holds `path`, if any does.
+    pub fn entry_chunk(&self, path: &str) -> Option<usize> {
+        self.chunks
+            .partition_point(|start| start.as_str() <= path)
+            .checked_sub(1)
+    }
+
+    /// The chunk holding the last checkpoint at or before `offset`; `None`
+    /// means decoding from the start.
+    pub fn checkpoint_chunk(&self, offset: u64) -> Option<usize> {
+        self.checkpoints
+            .partition_point(|&start| start <= offset)
+            .checked_sub(1)
+    }
 }
 
-/// The inflater's checkpoints, stored next to the listing with each window
-/// base64-encoded.
+/// One chunk of the inflater's checkpoints, stored next to the listing with
+/// each window base64-encoded.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Checkpoints {
     pub items: Vec<StoredCheckpoint>,
@@ -782,16 +813,72 @@ impl Checkpoints {
     }
 }
 
-/// The tar stream behind a layer: inflated, or the bytes as they are.
-enum Source<R: Read> {
-    Gzip(Box<Inflater<BufReader<R>>>),
+/// How much of a layer indexing takes on; past either bound the layer is
+/// refused rather than indexed.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexLimits {
+    /// Uncompressed bytes, which bound the time an index job takes.
+    pub max_size: u64,
+    pub max_entries: usize,
+}
+
+/// The uncompressed bytes the tar walk has taken, and how far it may go.
+struct Budget {
+    taken: Cell<u64>,
+    ceiling: Cell<u64>,
+    max_size: u64,
+}
+
+/// The tar walk's view of the stream, refused past the budget's ceiling.
+struct Capped<'a, R> {
+    inner: R,
+    budget: &'a Budget,
+}
+
+impl<R: Read> Read for Capped<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let (taken, ceiling) = (self.budget.taken.get(), self.budget.ceiling.get());
+        // One byte past the ceiling tells an overrun from a stream ending there.
+        let room =
+            usize::try_from(ceiling.saturating_sub(taken).saturating_add(1)).unwrap_or(usize::MAX);
+        let len = buf.len().min(room);
+        let n = self.inner.read(&mut buf[..len])?;
+        self.budget.taken.set(taken + n as u64);
+        if taken + n as u64 <= ceiling {
+            return Ok(n);
+        }
+        let message = if ceiling < self.budget.max_size {
+            format!("an entry's headers run past {ADVANCE_LIMIT} bytes")
+        } else {
+            format!(
+                "the layer runs past {} bytes uncompressed",
+                self.budget.max_size
+            )
+        };
+        Err(io::Error::new(io::ErrorKind::FileTooLarge, message))
+    }
+}
+
+/// Hands one chunk of checkpoints on to be stored.
+type ChunkSink<'a> = &'a mut dyn FnMut(Vec<Checkpoint>) -> io::Result<()>;
+
+/// The tar stream behind a layer: inflated, its checkpoints handed on a chunk
+/// at a time, or the bytes as they are.
+enum Source<'a, R: Read> {
+    Gzip(Box<Inflater<BufReader<R>>>, ChunkSink<'a>),
     Plain(BufReader<R>, u64),
 }
 
-impl<R: Read> Read for Source<R> {
+impl<R: Read> Read for Source<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Source::Gzip(inflater) => inflater.read(buf),
+            Source::Gzip(inflater, sink) => {
+                let n = inflater.read(buf)?;
+                if let Some(chunk) = inflater.take_checkpoints(CHUNK_CHECKPOINTS) {
+                    sink(chunk)?;
+                }
+                Ok(n)
+            }
             Source::Plain(reader, count) => {
                 let n = reader.read(buf)?;
                 *count += n as u64;
@@ -838,13 +925,28 @@ fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, Kind)> {
     Some((path.to_string(), kind))
 }
 
-/// Walks one layer's tar stream, from the start, into its listing and the
-/// checkpoints taken along the way. Blocking: run it off the async threads.
-pub fn index_stream<R: Read>(input: R) -> io::Result<(Listing, Vec<Checkpoint>)> {
+/// Walks one layer's tar stream, from the start, into its listing and its
+/// entries sorted by path, handing `store_chunk` each numbered chunk of the
+/// checkpoints taken along the way, and failing with
+/// [`io::ErrorKind::FileTooLarge`] past `limits`. Blocking: run it off the
+/// async threads.
+pub fn index_stream<R: Read>(
+    input: R,
+    limits: IndexLimits,
+    mut store_chunk: impl FnMut(usize, Vec<Checkpoint>) -> io::Result<()>,
+) -> io::Result<(Listing, Vec<Entry>)> {
     let mut reader = BufReader::new(input);
     let compressed = reader.fill_buf()?.starts_with(&GZIP_MAGIC);
+    let mut starts = Vec::new();
+    let mut sink = |chunk: Vec<Checkpoint>| {
+        starts.push(chunk.first().map_or(0, |checkpoint| checkpoint.out_offset));
+        store_chunk(starts.len() - 1, chunk)
+    };
     let mut source = if compressed {
-        Source::Gzip(Box::new(Inflater::new(reader, CHECKPOINT_EVERY)?))
+        Source::Gzip(
+            Box::new(Inflater::new(reader, CHECKPOINT_EVERY)?),
+            &mut sink,
+        )
     } else {
         Source::Plain(reader, 0)
     };
@@ -852,8 +954,25 @@ pub fn index_stream<R: Read>(input: R) -> io::Result<(Listing, Vec<Checkpoint>)>
     let mut entries = Vec::new();
     // Scoped: the archive borrows the source, which is read again below.
     {
-        let mut archive = tar::Archive::new(&mut source);
-        for entry in archive.entries()? {
+        let budget = Budget {
+            taken: Cell::new(0),
+            ceiling: Cell::new(limits.max_size),
+            max_size: limits.max_size,
+        };
+        let mut archive = tar::Archive::new(Capped {
+            inner: &mut source,
+            budget: &budget,
+        });
+        let mut walk = archive.entries()?;
+        loop {
+            // A file's data is read to its end below, so reaching the next
+            // entry takes only headers, which a forged size cannot inflate.
+            let advance = budget.taken.get().saturating_add(ADVANCE_LIMIT);
+            budget.ceiling.set(advance.min(limits.max_size));
+            let Some(entry) = walk.next() else {
+                break;
+            };
+            budget.ceiling.set(limits.max_size);
             let mut entry = entry?;
             let capabilities = entry_capabilities(&mut entry)?;
             let header = entry.header();
@@ -883,23 +1002,39 @@ pub fn index_stream<R: Read>(input: R) -> io::Result<(Listing, Vec<Checkpoint>)>
             if kind == Kind::File {
                 item.content = Some(inspect(&item.path, &mut entry)?);
             }
+            if entries.len() == limits.max_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    format!("the layer holds more than {} entries", limits.max_entries),
+                ));
+            }
             entries.push(item);
         }
     }
 
-    let (uncompressed_size, checkpoints) = match source {
-        Source::Gzip(inflater) => (inflater.position(), inflater.into_checkpoints()),
-        Source::Plain(_, count) => (count, Vec::new()),
+    let uncompressed_size = match source {
+        Source::Gzip(mut inflater, sink) => {
+            if let Some(chunk) = inflater.take_checkpoints(1) {
+                sink(chunk)?;
+            }
+            inflater.position()
+        }
+        Source::Plain(_, count) => count,
     };
-    Ok((
-        Listing {
-            version: LISTING_VERSION,
-            compressed,
-            uncompressed_size,
-            entries,
-        },
-        checkpoints,
-    ))
+    // Stable, so a path the tar repeats keeps its last entry last.
+    entries.sort_by(|a: &Entry, b: &Entry| a.path.cmp(&b.path));
+    let chunks = entries
+        .chunks(CHUNK_ENTRIES)
+        .filter_map(|chunk| chunk.first().map(|entry| entry.path.clone()))
+        .collect();
+    let listing = Listing {
+        version: LISTING_VERSION,
+        compressed,
+        uncompressed_size,
+        chunks,
+        checkpoints: starts,
+    };
+    Ok((listing, entries))
 }
 
 /// Feeds `size` bytes of a gzipped layer's uncompressed stream, starting at
@@ -941,7 +1076,7 @@ pub async fn read_listing(
 ) -> Result<Option<Listing>, RegistryError> {
     match metadata_store
         .object_store()
-        .get(&digest.layer_entries_path())
+        .get(&digest.layer_listing_path())
         .await
     {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -950,13 +1085,28 @@ pub async fn read_listing(
     }
 }
 
+/// Reads chunk `chunk` of a layer's stored entries.
+pub async fn read_entries(
+    metadata_store: &MetadataStore,
+    digest: &Digest,
+    chunk: usize,
+) -> Result<Vec<Entry>, RegistryError> {
+    let bytes = metadata_store
+        .object_store()
+        .get(&digest.layer_entries_chunk_path(chunk))
+        .await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Reads chunk `chunk` of a layer's stored checkpoints.
 pub async fn read_checkpoints(
     metadata_store: &MetadataStore,
     digest: &Digest,
+    chunk: usize,
 ) -> Result<Checkpoints, RegistryError> {
     match metadata_store
         .object_store()
-        .get(&digest.layer_checkpoints_path())
+        .get(&digest.layer_checkpoints_path(chunk))
         .await
     {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -968,6 +1118,7 @@ pub async fn read_checkpoints(
 pub struct IndexLayerJobHandler {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
+    limits: IndexLimits,
 }
 
 fn job_error(error: &RegistryError) -> Error {
@@ -975,10 +1126,15 @@ fn job_error(error: &RegistryError) -> Error {
 }
 
 impl IndexLayerJobHandler {
-    pub fn new(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new(
+        blob_store: Arc<BlobStore>,
+        metadata_store: Arc<MetadataStore>,
+        limits: IndexLimits,
+    ) -> Self {
         Self {
             blob_store,
             metadata_store,
+            limits,
         }
     }
 
@@ -1003,29 +1159,40 @@ impl IndexLayerJobHandler {
             }
             Err(e) => return Err(job_error(&e)),
         };
-        let (listing, checkpoints) =
-            tokio::task::spawn_blocking(move || index_stream(SyncIoBridge::new(reader)))
+        let limits = self.limits;
+        // Each chunk is stored as the walk passes it, so a layer's checkpoints
+        // never sit in memory whole.
+        let (runtime, chunks, layer) = (Handle::current(), store.clone(), digest.clone());
+        let store_chunk = move |chunk: usize, checkpoints: Vec<Checkpoint>| {
+            let body = serde_json::to_vec(&Checkpoints::from_inflater(checkpoints))?;
+            runtime
+                .block_on(chunks.put(&layer.layer_checkpoints_path(chunk), Bytes::from(body)))
+                .map_err(io::Error::other)
+        };
+        let (listing, entries) = tokio::task::spawn_blocking(move || {
+            index_stream(SyncIoBridge::new(reader), limits, store_chunk)
+        })
+        .await
+        .map_err(|e| Error::Execution(format!("index task failed: {e}")))?
+        .map_err(|e| match e.kind() {
+            // The same bytes pass the same limits on every attempt.
+            io::ErrorKind::FileTooLarge => {
+                Error::Terminal(format!("layer {digest} is too large to index: {e}"))
+            }
+            _ => Error::Execution(format!("indexing layer {digest} failed: {e}")),
+        })?;
+        for (chunk, entries) in entries.chunks(CHUNK_ENTRIES).enumerate() {
+            let body = serde_json::to_vec(entries).map_err(|e| Error::Execution(e.to_string()))?;
+            store
+                .put(&digest.layer_entries_chunk_path(chunk), Bytes::from(body))
                 .await
-                .map_err(|e| Error::Execution(format!("index task failed: {e}")))?
-                .map_err(|e| {
-                    Error::Execution(format!("layer {digest} is not a tar stream: {e}"))
-                })?;
-        let entries = listing.entries.len();
-        let checkpoints = Checkpoints::from_inflater(checkpoints);
-        store
-            .put(
-                &digest.layer_checkpoints_path(),
-                Bytes::from(
-                    serde_json::to_vec(&checkpoints)
-                        .map_err(|e| Error::Execution(e.to_string()))?,
-                ),
-            )
-            .await
-            .map_err(|e| job_error(&e.into()))?;
+                .map_err(|e| job_error(&e.into()))?;
+        }
+        let entries = entries.len();
         // The listing lands last: its presence is what marks the layer indexed.
         store
             .put(
-                &digest.layer_entries_path(),
+                &digest.layer_listing_path(),
                 Bytes::from(
                     serde_json::to_vec(&listing).map_err(|e| Error::Execution(e.to_string()))?,
                 ),
@@ -1033,8 +1200,8 @@ impl IndexLayerJobHandler {
             .await
             .map_err(|e| job_error(&e.into()))?;
         info!(
-            "Indexed layer {digest}: {entries} entries, {} checkpoints",
-            checkpoints.items.len()
+            "Indexed layer {digest}: {entries} entries, {} checkpoint chunks",
+            listing.checkpoints.len()
         );
         Ok(())
     }

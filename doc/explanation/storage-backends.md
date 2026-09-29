@@ -399,7 +399,7 @@ This makes the catalog **deterministic and strongly consistent**: a namespace ap
 
 #### Retired Layouts
 
-Every shape earlier versions wrote is gone from the read paths: the per-namespace `refs/{namespace}.json` blob-index shards, the `current/link` / revision / referrer / layer / config / index-child link files under `v2/repositories/`, the single-key access times, the `startedat` and `hashstates/` upload artifacts, the namespace-registry objects (`_registry/namespaces.json`, `_registry/ns/*.json`), and the transaction engine's `.tx-*` keys. None is read, written or converted; `angos scrub` moves any it finds to `_lost_and_found/` as a key matching no known layout. Converting them is a pre-upgrade step on 1.6.x, described in the [upgrade guide](../how-to/upgrade.md).
+Every shape earlier versions wrote is gone from the read paths: the per-namespace `refs/{namespace}.json` blob-index shards, the `current/link` / revision / referrer / layer / config / index-child link files under `v2/repositories/`, the single-key access times, the `startedat` and `hashstates/` upload artifacts, the namespace-registry objects (`_registry/namespaces.json`, `_registry/ns/*.json`), and the transaction engine's `.tx-*` keys. None is read, written or converted; `angos scrub` moves any it finds to `_lost_and_found/` as a key matching no known layout. Converting them is a pre-upgrade step on 1.6.x, described in the [upgrade guide](../how-to/upgrade.md). A layer's whole `entries` and `checkpoints` objects are retired the same way, with no conversion: its listing is now a small `listing` object beside `entries.<n>` and `checkpoints.<n>` chunks, and the layer is indexed again.
 
 #### Blob Index Convergence
 

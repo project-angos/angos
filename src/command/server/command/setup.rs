@@ -16,7 +16,7 @@ use crate::{
         runner::claim_loop,
         store::{self as job_store, ClaimMode, JobHandler, JobStore, QueueDepthRefresh},
     },
-    layer::IndexLayerJobHandler,
+    layer::{IndexLayerJobHandler, IndexLimits},
     registry::{
         Registry, RegistryConfig, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -103,6 +103,7 @@ fn spawn_in_process_loops(
     metadata_store: &Arc<MetadataStore>,
     event_dispatcher: Option<Arc<EventDispatcher>>,
     counts: &LoopCounts,
+    index_limits: IndexLimits,
 ) -> InProcessLoops {
     let loops = InProcessLoops::none();
 
@@ -110,6 +111,7 @@ fn spawn_in_process_loops(
     let index_handler: Arc<dyn JobHandler> = Arc::new(IndexLayerJobHandler::new(
         blob_store.clone(),
         metadata_store.clone(),
+        index_limits,
     ));
     loops.spawn(job_store, &index_handler, Queue::Index, counts.index);
 
@@ -219,6 +221,7 @@ pub async fn build_registry(
                     replication: config.global.max_concurrent_replication_jobs,
                     index: config.global.max_concurrent_index_jobs,
                 },
+                config.global.index_limits(),
             );
             (job_store, None, loops)
         };
@@ -289,7 +292,7 @@ mod tests {
     use crate::{
         configuration::global::{
             DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
-            DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
+            DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS, GlobalConfig,
         },
         jobs::{
             Queue,
@@ -346,6 +349,7 @@ mod tests {
                 replication: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
                 index: DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
             },
+            GlobalConfig::default().index_limits(),
         );
         let registry = Registry::new(
             blob_store,

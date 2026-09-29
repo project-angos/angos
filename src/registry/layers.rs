@@ -8,7 +8,7 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use flate2::{Compression, write::GzEncoder};
-use futures_util::stream;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use tokio::io::{AsyncRead, AsyncReadExt, empty};
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
@@ -23,9 +23,9 @@ use angos_oci::{Digest, Namespace};
 
 use crate::{
     jobs::Queue,
-    layer::{self, Checkpoints, Entry, IndexLayerPayload, Kind, Listing, elf, pem},
+    layer::{self, Entry, IndexLayerPayload, Kind, Listing, elf, pem},
     metrics_provider::metrics_provider,
-    registry::{Error, Registry},
+    registry::{Error, Registry, angos_extension::layer_listing},
 };
 
 /// The boxed reader a layer file streams through. The gzip decode path is
@@ -84,8 +84,14 @@ impl Registry {
         if listing.is_outdated() {
             self.dispatch_index(&namespace, &digest).await;
         }
+        // Every chunk: the web UI merges whole layers.
+        let entries: Vec<Entry> = stream::iter(0..listing.chunks.len())
+            .map(|chunk| layer::read_entries(&self.metadata_store, &digest, chunk))
+            .buffered(self.listing_read_concurrency.get())
+            .try_concat()
+            .await?;
         // Megabytes to serialize and compress: off the async threads.
-        let body = spawn_blocking(move || encode(&listing.into(), gzip))
+        let body = spawn_blocking(move || encode(&layer_listing(&listing, entries), gzip))
             .await
             .map_err(|e| Error::Internal(e.to_string()))??;
         Ok(LayerEntries::Ready { body, gzip })
@@ -108,7 +114,10 @@ impl Registry {
         let listing = layer::read_listing(&self.metadata_store, &digest)
             .await?
             .ok_or(Error::NotFound)?;
-        let entry = file_entry(&listing.entries, &path).ok_or(Error::NotFound)?;
+        let entry = self
+            .file_entry(&digest, &listing, &path)
+            .await?
+            .ok_or(Error::NotFound)?;
         let range = match range {
             Some(range) => range.resolve(entry.size)?,
             None => None,
@@ -128,10 +137,7 @@ impl Registry {
             |content| content.mime_type.clone(),
         );
 
-        let checkpoints = self.checkpoints(&listing, &digest).await?;
-        let reader = self
-            .stream_reader(&digest, checkpoints.as_ref(), offset, size)
-            .await?;
+        let reader = self.stream_reader(&digest, &listing, offset, size).await?;
         Ok(LayerFile {
             path,
             content_type,
@@ -159,16 +165,17 @@ impl Registry {
         let listing = layer::read_listing(&self.metadata_store, &digest)
             .await?
             .ok_or(Error::NotFound)?;
-        let entry = file_entry(&listing.entries, &path).ok_or(Error::NotFound)?;
-        let checkpoints = self.checkpoints(&listing, &digest).await?;
+        let entry = self
+            .file_entry(&digest, &listing, &path)
+            .await?
+            .ok_or(Error::NotFound)?;
         let read = |offset: u64, length: u64| {
             // As many bytes as the file holds past `offset`, at most `length`.
             let size = length.min(entry.size.saturating_sub(offset));
-            let checkpoints = checkpoints.as_ref();
-            let digest = &digest;
+            let (digest, listing) = (&digest, &listing);
             async move {
                 let mut bytes = Vec::new();
-                self.stream_reader(digest, checkpoints, entry.offset + offset, size)
+                self.stream_reader(digest, listing, entry.offset + offset, size)
                     .await?
                     .read_to_end(&mut bytes)
                     .await?;
@@ -196,19 +203,45 @@ impl Registry {
         Ok(LayerFileDetails::default())
     }
 
-    /// A gzipped layer's inflater checkpoints; `None` for a plain one, read as
-    /// it is.
-    async fn checkpoints(
+    /// The entry whose bytes `path` names: a file, or the file a hard link
+    /// points at.
+    async fn file_entry(
         &self,
-        listing: &Listing,
         digest: &Digest,
-    ) -> Result<Option<Checkpoints>, Error> {
-        if !listing.compressed {
+        listing: &Listing,
+        path: &str,
+    ) -> Result<Option<Entry>, Error> {
+        let Some(entry) = self.layer_entry(digest, listing, path, |_| true).await? else {
             return Ok(None);
+        };
+        match (entry.kind, entry.link.as_deref()) {
+            (Kind::File, _) => Ok(Some(entry)),
+            (Kind::Hardlink, Some(target)) => {
+                let target = target.trim_start_matches("./").trim_matches('/');
+                self.layer_entry(digest, listing, target, |entry| entry.kind == Kind::File)
+                    .await
+            }
+            _ => Ok(None),
         }
-        Ok(Some(
-            layer::read_checkpoints(&self.metadata_store, digest).await?,
-        ))
+    }
+
+    /// The last entry at `path` that `wanted` takes, read out of the one chunk
+    /// of entries holding that path.
+    async fn layer_entry(
+        &self,
+        digest: &Digest,
+        listing: &Listing,
+        path: &str,
+        wanted: impl Fn(&Entry) -> bool,
+    ) -> Result<Option<Entry>, Error> {
+        let Some(chunk) = listing.entry_chunk(path) else {
+            return Ok(None);
+        };
+        Ok(layer::read_entries(&self.metadata_store, digest, chunk)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|entry| entry.path == path && wanted(entry)))
     }
 
     /// `size` bytes of the layer's uncompressed stream from `offset`, decoded
@@ -216,18 +249,24 @@ impl Registry {
     async fn stream_reader(
         &self,
         digest: &Digest,
-        checkpoints: Option<&Checkpoints>,
+        listing: &Listing,
         offset: u64,
         size: u64,
     ) -> Result<LayerFileReader, Error> {
         if size == 0 {
             return Ok(Box::pin(empty()));
         }
-        let Some(checkpoints) = checkpoints else {
+        if !listing.compressed {
             let (reader, _) = self.blob_store.reader(digest, Some(offset)).await?;
             return Ok(Box::pin(reader.take(size)));
+        }
+        // Only the chunk of checkpoints holding the one nearest `offset` is read.
+        let checkpoint = match listing.checkpoint_chunk(offset) {
+            Some(chunk) => layer::read_checkpoints(&self.metadata_store, digest, chunk)
+                .await?
+                .before(offset),
+            None => None,
         };
-        let checkpoint = checkpoints.before(offset);
         let start = checkpoint
             .as_ref()
             .map_or(0, |checkpoint| checkpoint.in_offset);
@@ -303,25 +342,4 @@ fn encode(listing: &LayerListing, gzip: bool) -> Result<Vec<u8>, Error> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&json)?;
     Ok(encoder.finish()?)
-}
-
-/// The entry whose bytes `path` names: a file, or the file a hard link
-/// points at.
-fn file_entry<'a>(entries: &'a [Entry], path: &str) -> Option<&'a Entry> {
-    let entry = entries.iter().rev().find(|entry| entry.path == path)?;
-    match entry.kind {
-        Kind::File => Some(entry),
-        Kind::Hardlink => {
-            let target = entry
-                .link
-                .as_deref()?
-                .trim_start_matches("./")
-                .trim_matches('/');
-            entries
-                .iter()
-                .rev()
-                .find(|entry| entry.path == target && entry.kind == Kind::File)
-        }
-        _ => None,
-    }
 }

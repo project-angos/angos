@@ -101,14 +101,13 @@ impl From<layer::Entry> for ext::LayerEntry {
     }
 }
 
-impl From<layer::Listing> for ext::LayerListing {
-    fn from(listing: layer::Listing) -> Self {
-        ext::LayerListing {
-            refreshing: listing.is_outdated(),
-            compressed: listing.compressed,
-            uncompressed_size: listing.uncompressed_size,
-            entries: listing.entries.into_iter().map(Into::into).collect(),
-        }
+/// The wire listing of a layer: its stored listing and every entry of it.
+pub fn layer_listing(listing: &layer::Listing, entries: Vec<layer::Entry>) -> ext::LayerListing {
+    ext::LayerListing {
+        refreshing: listing.is_outdated(),
+        compressed: listing.compressed,
+        uncompressed_size: listing.uncompressed_size,
+        entries: entries.into_iter().map(Into::into).collect(),
     }
 }
 
