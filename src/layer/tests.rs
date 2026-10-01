@@ -31,7 +31,6 @@ use crate::{
     layer::{
         Checkpoints, IndexLayerJobHandler, IndexLayerPayload, IndexLimits, Kind, Listing,
         SecretKind, SecretScanner, classify, elf, extract_gzip, index_stream, mime_type, pem,
-        read_entries, read_listing,
     },
     policy::{ImagePolicy, PolicyConfig},
     registry::{
@@ -519,21 +518,23 @@ async fn the_job_indexes_a_stored_layer_once() {
         LIMITS,
     );
     handler.index(&digest, false).await.unwrap();
-    let listing = read_listing(&stack.metadata_store, &digest)
+    let listing = stack
+        .metadata_store
+        .read_listing(&digest)
         .await
         .unwrap()
         .expect("a listing");
     assert_eq!(listing.chunks.len(), 1);
-    let entries = read_entries(&stack.metadata_store, &digest, 0)
-        .await
-        .unwrap();
+    let entries = stack.metadata_store.read_entries(&digest, 0).await.unwrap();
     assert_eq!(entries.len(), 9);
     handler.index(&digest, false).await.unwrap();
 
     let gone = Digest::sha256_of_bytes(b"never stored");
     handler.index(&gone, false).await.unwrap();
     assert!(
-        read_listing(&stack.metadata_store, &gone)
+        stack
+            .metadata_store
+            .read_listing(&gone)
             .await
             .unwrap()
             .is_none()
@@ -667,27 +668,27 @@ async fn an_older_listing_is_served_and_walked_again() {
         LIMITS,
     );
     handler.index(&digest, false).await.unwrap();
-    let mut listing = read_listing(&stack.metadata_store, &digest)
+    let mut listing = stack
+        .metadata_store
+        .read_listing(&digest)
         .await
         .unwrap()
         .expect("a listing");
     listing.version = 0;
-    let mut entries = read_entries(&stack.metadata_store, &digest, 0)
-        .await
-        .unwrap();
+    let mut entries = stack.metadata_store.read_entries(&digest, 0).await.unwrap();
     for entry in &mut entries {
         entry.content = None;
     }
-    let store = stack.metadata_store.object_store();
-    for (key, body) in [
-        (digest.layer_listing_path(), serde_json::to_vec(&listing)),
-        (
-            digest.layer_entries_chunk_path(0),
-            serde_json::to_vec(&entries),
-        ),
-    ] {
-        store.put(&key, body.unwrap().into()).await.unwrap();
-    }
+    stack
+        .metadata_store
+        .put_entries(&digest, 0, &entries)
+        .await
+        .unwrap();
+    stack
+        .metadata_store
+        .put_listing(&digest, &listing)
+        .await
+        .unwrap();
 
     let job_store = Arc::new(JobStore::new(
         stack.store.clone(),
@@ -735,9 +736,7 @@ async fn an_older_listing_is_served_and_walked_again() {
     let payload: IndexLayerPayload = serde_json::from_value(claimed.envelope.payload).unwrap();
     // No need to force it: the outdated listing counts as none.
     handler.index(&digest, payload.force).await.unwrap();
-    let entries = read_entries(&stack.metadata_store, &digest, 0)
-        .await
-        .unwrap();
+    let entries = stack.metadata_store.read_entries(&digest, 0).await.unwrap();
     assert!(
         entries
             .iter()
@@ -879,7 +878,9 @@ async fn a_file_is_found_across_entry_chunks() {
     .index(&digest, false)
     .await
     .unwrap();
-    let listing = read_listing(&stack.metadata_store, &digest)
+    let listing = stack
+        .metadata_store
+        .read_listing(&digest)
         .await
         .unwrap()
         .expect("a listing");

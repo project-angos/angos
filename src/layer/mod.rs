@@ -17,7 +17,6 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha512};
 use tokio::runtime::Handle;
@@ -31,10 +30,7 @@ use crate::{
         Queue,
         store::{Error, JobEnvelope, JobHandler},
     },
-    registry::{
-        Error as RegistryError, blob_store::BlobStore, keys::DigestKeys,
-        metadata_store::MetadataStore,
-    },
+    registry::{Error as RegistryError, blob_store::BlobStore, metadata_store::MetadataStore},
 };
 
 pub use angos_inflate::{Checkpoint, Inflater};
@@ -1069,52 +1065,6 @@ pub fn extract_gzip<R: Read>(
     Ok(())
 }
 
-/// Reads a layer's stored listing; `None` when it was never indexed.
-pub async fn read_listing(
-    metadata_store: &MetadataStore,
-    digest: &Digest,
-) -> Result<Option<Listing>, RegistryError> {
-    match metadata_store
-        .object_store()
-        .get(&digest.layer_listing_path())
-        .await
-    {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(angos_storage::Error::NotFound) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Reads chunk `chunk` of a layer's stored entries.
-pub async fn read_entries(
-    metadata_store: &MetadataStore,
-    digest: &Digest,
-    chunk: usize,
-) -> Result<Vec<Entry>, RegistryError> {
-    let bytes = metadata_store
-        .object_store()
-        .get(&digest.layer_entries_chunk_path(chunk))
-        .await?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-/// Reads chunk `chunk` of a layer's stored checkpoints.
-pub async fn read_checkpoints(
-    metadata_store: &MetadataStore,
-    digest: &Digest,
-    chunk: usize,
-) -> Result<Checkpoints, RegistryError> {
-    match metadata_store
-        .object_store()
-        .get(&digest.layer_checkpoints_path(chunk))
-        .await
-    {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(angos_storage::Error::NotFound) => Ok(Checkpoints::default()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 pub struct IndexLayerJobHandler {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
@@ -1142,9 +1092,10 @@ impl IndexLayerJobHandler {
     /// when `force`; a layer whose bytes are gone has nothing to index and the
     /// job is done.
     pub async fn index(&self, digest: &Digest, force: bool) -> Result<(), Error> {
-        let store = self.metadata_store.object_store();
         if !force
-            && read_listing(&self.metadata_store, digest)
+            && self
+                .metadata_store
+                .read_listing(digest)
                 .await
                 .map_err(|e| job_error(&e))?
                 .is_some_and(|listing| !listing.is_outdated())
@@ -1162,11 +1113,15 @@ impl IndexLayerJobHandler {
         let limits = self.limits;
         // Each chunk is stored as the walk passes it, so a layer's checkpoints
         // never sit in memory whole.
-        let (runtime, chunks, layer) = (Handle::current(), store.clone(), digest.clone());
+        let (runtime, store, layer) = (
+            Handle::current(),
+            self.metadata_store.clone(),
+            digest.clone(),
+        );
         let store_chunk = move |chunk: usize, checkpoints: Vec<Checkpoint>| {
-            let body = serde_json::to_vec(&Checkpoints::from_inflater(checkpoints))?;
+            let checkpoints = Checkpoints::from_inflater(checkpoints);
             runtime
-                .block_on(chunks.put(&layer.layer_checkpoints_path(chunk), Bytes::from(body)))
+                .block_on(store.put_checkpoints(&layer, chunk, &checkpoints))
                 .map_err(io::Error::other)
         };
         let (listing, entries) = tokio::task::spawn_blocking(move || {
@@ -1182,23 +1137,16 @@ impl IndexLayerJobHandler {
             _ => Error::Execution(format!("indexing layer {digest} failed: {e}")),
         })?;
         for (chunk, entries) in entries.chunks(CHUNK_ENTRIES).enumerate() {
-            let body = serde_json::to_vec(entries).map_err(|e| Error::Execution(e.to_string()))?;
-            store
-                .put(&digest.layer_entries_chunk_path(chunk), Bytes::from(body))
+            self.metadata_store
+                .put_entries(digest, chunk, entries)
                 .await
-                .map_err(|e| job_error(&e.into()))?;
+                .map_err(|e| job_error(&e))?;
         }
         let entries = entries.len();
-        // The listing lands last: its presence is what marks the layer indexed.
-        store
-            .put(
-                &digest.layer_listing_path(),
-                Bytes::from(
-                    serde_json::to_vec(&listing).map_err(|e| Error::Execution(e.to_string()))?,
-                ),
-            )
+        self.metadata_store
+            .put_listing(digest, &listing)
             .await
-            .map_err(|e| job_error(&e.into()))?;
+            .map_err(|e| job_error(&e))?;
         info!(
             "Indexed layer {digest}: {entries} entries, {} checkpoint chunks",
             listing.checkpoints.len()

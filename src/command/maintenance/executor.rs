@@ -222,11 +222,7 @@ impl Executor {
                 }
                 self.metadata_store.delete_blob_references(&digest).await?;
                 // The layer listing is derived from the bytes and goes with them.
-                self.metadata_store
-                    .object_store()
-                    .delete_prefix(&digest.layer_dir())
-                    .await?;
-                Ok(())
+                self.metadata_store.delete_listing(&digest).await
             })
             .await
             .map_err(Error::from)
@@ -546,11 +542,7 @@ impl Executor {
     }
 
     async fn reclaim_listing(&self, digest: Digest) -> Result<(), Error> {
-        self.metadata_store
-            .object_store()
-            .delete_prefix(&digest.layer_dir())
-            .await
-            .map_err(|e| Error::from(RegistryError::from(e)))
+        Ok(self.metadata_store.delete_listing(&digest).await?)
     }
 
     async fn enqueue_replication_delete(

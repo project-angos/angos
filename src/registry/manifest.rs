@@ -22,7 +22,6 @@ use crate::{
     registry::{
         Error, Registry, Repository,
         blob_store::BlobStore,
-        keys::NamespaceKeys,
         metadata_store::{LinkKind, LinkMetadata},
         record_pull_through, repository_name,
     },
@@ -871,11 +870,16 @@ impl Registry {
         let events = Event::delete_manifest(namespace, &repository, reference, actor.as_ref());
         self.dispatch_events(&events).await?;
 
-        // Read while the manifest is still here: once gone, neither this job nor
-        // its retries can name the subject holding the referrer's descriptor.
-        let subject = self
-            .referrer_subject(resolved_repository, reference)
-            .await?;
+        // Read while the manifest is still here: once gone, neither the
+        // referrer record nor the delete job can name its subject. A faulted
+        // read aborts the delete before anything is written.
+        let subject = match reference {
+            Reference::Digest(digest) => read_manifest(&self.blob_store, digest)
+                .await?
+                .and_then(|manifest| manifest.subject)
+                .map(|subject| subject.digest),
+            Reference::Tag(_) => None,
+        };
 
         // A digest delete cascades to the pointing tags, and a replicated
         // delete is gated on last-writer-wins before anything is written.
@@ -884,6 +888,7 @@ impl Registry {
                 resolved_repository,
                 namespace,
                 reference,
+                subject.as_ref(),
                 source_ts,
                 client_initiated,
             )
@@ -910,25 +915,6 @@ impl Registry {
         }
 
         Ok(())
-    }
-
-    /// Subject of the referrer manifest at `reference`, for the delete job to
-    /// carry. Only a replicated delete has a fallback index to prune.
-    async fn referrer_subject(
-        &self,
-        repository: Option<&Repository>,
-        reference: &Reference,
-    ) -> Result<Option<Digest>, Error> {
-        let Reference::Digest(digest) = reference else {
-            return Ok(None);
-        };
-        if repository.is_none_or(|repository| repository.replication.is_empty()) {
-            return Ok(None);
-        }
-        Ok(read_manifest(&self.blob_store, digest)
-            .await?
-            .and_then(|manifest| manifest.subject)
-            .map(|subject| subject.digest))
     }
 
     /// Whether the reference counted as present before the delete, gating the
@@ -958,20 +944,11 @@ impl Registry {
     async fn delete_revision_keys(
         &self,
         namespace: &Namespace,
-        reference: &Reference,
+        digest: &Digest,
+        subject: Option<&Digest>,
         pointing_tags: &[Tag],
         source_ts: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
-        let Reference::Digest(digest) = reference else {
-            return Ok(());
-        };
-
-        // The subject is read before anything is written, so a faulted read
-        // aborts the delete whole rather than half-way through it.
-        let subject = read_manifest(&self.blob_store, digest)
-            .await?
-            .and_then(|manifest| manifest.subject);
-
         // Every tombstone first, then the referrer back-link, and the revision
         // record last: a tag must never resolve to a manifest that is already
         // gone. The config, layer and child links need no delete at all, since
@@ -979,21 +956,14 @@ impl Registry {
         // its own once this revision is gone. Reference keys are the
         // collector's to remove, because a writer-side delete could unpin a
         // blob a concurrent push is committing.
-        let store = self.metadata_store.object_store();
+        let store = &self.metadata_store;
         for tag in pointing_tags {
-            self.metadata_store
-                .put_tag_tombstone(namespace, tag, source_ts)
-                .await?;
+            store.put_tag_tombstone(namespace, tag, source_ts).await?;
         }
         if let Some(subject) = subject {
-            store
-                .delete(&namespace.referrer_record_path(&subject.digest, digest))
-                .await?;
+            store.delete_referrer(namespace, subject, digest).await?;
         }
-        store
-            .delete(&namespace.revision_record_path(digest))
-            .await?;
-        Ok(())
+        store.delete_revision(namespace, digest).await
     }
 
     /// Deletes the reference's links, reporting whether it counted as present
@@ -1006,6 +976,7 @@ impl Registry {
         resolved_repository: Option<&Repository>,
         namespace: &Namespace,
         reference: &Reference,
+        subject: Option<&Digest>,
         source_ts: Option<DateTime<Utc>>,
         client_initiated: bool,
     ) -> Result<bool, Error> {
@@ -1049,8 +1020,8 @@ impl Registry {
                     .put_tag_tombstone(namespace, tag, source_ts)
                     .await?;
             }
-            Reference::Digest(_) => {
-                self.delete_revision_keys(namespace, reference, &dropped_tags, source_ts)
+            Reference::Digest(digest) => {
+                self.delete_revision_keys(namespace, digest, subject, &dropped_tags, source_ts)
                     .await?;
             }
         }

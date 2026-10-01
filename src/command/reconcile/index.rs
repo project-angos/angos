@@ -33,7 +33,7 @@ use crate::{
         },
     },
     configuration::Configuration,
-    layer::{IndexLayerPayload, filesystem_layers, read_listing},
+    layer::{IndexLayerPayload, filesystem_layers},
     registry::{
         blob_store::BlobStore,
         keys::{LAYERS_ROOT, parse_layer_key},
@@ -115,7 +115,7 @@ impl NamespaceChecker for IndexChecker {
                 if !first || !self.enqueue {
                     continue;
                 }
-                if !self.force && read_listing(&self.metadata_store, &layer).await?.is_some() {
+                if !self.force && self.metadata_store.read_listing(&layer).await?.is_some() {
                     continue;
                 }
                 sink.apply(Action::EnqueueIndex(IndexLayerPayload {

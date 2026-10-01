@@ -22,6 +22,7 @@ pub mod access_time;
 mod blob_index;
 mod catalog;
 mod gc;
+mod listing;
 mod record;
 pub mod tag;
 

@@ -95,6 +95,18 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Delete the revision record; a record already gone is a no-op.
+    pub async fn delete_revision(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+    ) -> Result<(), Error> {
+        self.object_store()
+            .delete(&namespace.revision_record_path(digest))
+            .await?;
+        Ok(())
+    }
+
     /// Resolve a manifest revision to link-shaped metadata.
     pub async fn resolve_revision(
         &self,

@@ -57,7 +57,7 @@ impl Registry {
             self.dispatch_cache_fill(&namespace, &digest).await;
             return Ok(LayerEntries::Indexing);
         }
-        let Some(listing) = layer::read_listing(&self.metadata_store, &digest).await? else {
+        let Some(listing) = self.metadata_store.read_listing(&digest).await? else {
             match self.blob_store.size(&digest).await {
                 Ok(_) => {}
                 // A pull-through manifest pull links its layers before their
@@ -86,7 +86,7 @@ impl Registry {
         }
         // Every chunk: the web UI merges whole layers.
         let entries: Vec<Entry> = stream::iter(0..listing.chunks.len())
-            .map(|chunk| layer::read_entries(&self.metadata_store, &digest, chunk))
+            .map(|chunk| self.metadata_store.read_entries(&digest, chunk))
             .buffered(self.listing_read_concurrency.get())
             .try_concat()
             .await?;
@@ -111,7 +111,9 @@ impl Registry {
             range,
         } = request;
         self.readable_layer(&namespace, &digest).await?;
-        let listing = layer::read_listing(&self.metadata_store, &digest)
+        let listing = self
+            .metadata_store
+            .read_listing(&digest)
             .await?
             .ok_or(Error::NotFound)?;
         let entry = self
@@ -162,7 +164,9 @@ impl Registry {
             path,
         } = request;
         self.readable_layer(&namespace, &digest).await?;
-        let listing = layer::read_listing(&self.metadata_store, &digest)
+        let listing = self
+            .metadata_store
+            .read_listing(&digest)
             .await?
             .ok_or(Error::NotFound)?;
         let entry = self
@@ -237,7 +241,9 @@ impl Registry {
         let Some(chunk) = listing.entry_chunk(path) else {
             return Ok(None);
         };
-        Ok(layer::read_entries(&self.metadata_store, digest, chunk)
+        Ok(self
+            .metadata_store
+            .read_entries(digest, chunk)
             .await?
             .into_iter()
             .rev()
@@ -262,7 +268,9 @@ impl Registry {
         }
         // Only the chunk of checkpoints holding the one nearest `offset` is read.
         let checkpoint = match listing.checkpoint_chunk(offset) {
-            Some(chunk) => layer::read_checkpoints(&self.metadata_store, digest, chunk)
+            Some(chunk) => self
+                .metadata_store
+                .read_checkpoints(digest, chunk)
                 .await?
                 .before(offset),
             None => None,
