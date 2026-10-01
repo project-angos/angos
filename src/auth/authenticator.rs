@@ -58,15 +58,10 @@ impl Authenticator {
         let oidc_validators = Self::build_oidc_validators(auth_config, cache)?;
         let basic_auth_validator = BasicAuthValidator::new(&auth_config.identity)?;
 
-        let provider_names: Vec<String> = oidc_validators
-            .iter()
-            .map(|provider| provider.name.clone())
-            .collect();
-        let identity_ids: Vec<String> = auth_config.identity.keys().cloned().collect();
         let token_validator = auth_config
             .token_service
             .as_ref()
-            .map(|config| TokenValidator::new(config, &provider_names, &identity_ids))
+            .map(|config| TokenValidator::new(config, auth_config))
             .transpose()?;
 
         Ok(Self {
@@ -1018,16 +1013,21 @@ mod tests {
             realm: None,
             ttl_secs: 3600,
         };
+        // The identity these tests issue from carries no `id`, so no
+        // `[auth.identity]` entry has to back it.
+        let auth: AuthConfig = toml::from_str(
+            r#"
+            [oidc.mock]
+            issuer = "https://issuer.test/mock"
+        "#,
+        )
+        .unwrap();
         let authenticator = Authenticator {
-            token_validator: Some(
-                // The identity these tests issue from carries no `id`, so no
-                // `[auth.identity]` entry has to back it.
-                TokenValidator::new(&config, &["mock".to_string()], &[]).unwrap(),
-            ),
+            token_validator: Some(TokenValidator::new(&config, &auth).unwrap()),
             ..make_authenticator_with_mocks(validators)
         };
 
-        (authenticator, TokenIssuer::new(&config).unwrap())
+        (authenticator, TokenIssuer::new(&config, &auth).unwrap())
     }
 
     // ---------------------------------------------------------------------------

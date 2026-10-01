@@ -427,8 +427,10 @@ passphrase. Rotating it invalidates every outstanding token; clients recover by
 fetching a new one. An issued token freezes the identity it was minted from but
 not its permissions: access policies are still evaluated per request. A token
 cannot otherwise be revoked before it expires, so `ttl_secs` is the window a
-stolen one stays usable. Removing or renaming an `auth.oidc` entry invalidates
-outstanding tokens minted from that provider. The section reloads without a
+stolen one stays usable. Removing, renaming or changing the `auth.identity`
+entry (its `username` or `password`) or `auth.oidc` entry (its `issuer`,
+`jwks_uri`, `required_audience` or `required_claims`) a token was minted from
+invalidates it. The section reloads without a
 restart, `secret_key` included, so rotating the key during an incident costs no
 downtime.
 

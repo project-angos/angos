@@ -144,7 +144,7 @@ With [`auth.token_service`](../reference/configuration.md#token-service-authtoke
 
 The token carries `identity.id`, `identity.username` and `identity.oidc`, so policies decide exactly as they did for the original credential. It never carries `identity.certificate` or `identity.client_ip`: both are read from the live request, which keeps a certificate-bound identity from becoming a replayable bearer credential and lets mTLS compose with a token.
 
-The identity is frozen, the permissions are not: policies, repository rules and webhooks are still evaluated per request against live configuration. The reverse also holds, and is the cost of the feature: a token outlives the credential it was minted from and cannot be revoked before `ttl_secs` elapses. Rotating `secret_key`, or removing the OIDC provider a token names, invalidates outstanding tokens.
+The identity is frozen, the permissions are not: policies, repository rules and webhooks are still evaluated per request against live configuration. The reverse also holds, and is the cost of the feature: a token outlives the credential it was minted from and cannot be revoked before `ttl_secs` elapses. Rotating `secret_key`, or removing or changing the credential a token was minted from, invalidates outstanding tokens.
 
 ---
 

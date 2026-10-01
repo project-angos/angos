@@ -50,7 +50,7 @@ impl ServerContext {
             .auth
             .token_service
             .as_ref()
-            .map(TokenIssuer::new)
+            .map(|token_service| TokenIssuer::new(token_service, &config.auth))
             .transpose()?;
 
         Ok(Self {

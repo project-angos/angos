@@ -8,10 +8,7 @@
 //! Issuing and validating are separate types built from one configuration: the
 //! validator joins the authentication chain, the issuer serves the endpoint.
 
-use std::{
-    collections::HashSet,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use http::{HeaderValue, request::Parts};
@@ -19,10 +16,14 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use url::Url;
 
 use crate::{
-    auth::{AuthMiddleware, AuthResult, Error, authorization::bearer_token},
+    auth::{
+        AuthMiddleware, AuthResult, Error, authenticator::AuthConfig, authorization::bearer_token,
+        sha256_hex,
+    },
     configuration::Base64String,
     identity::{ClientIdentity, OidcClaims},
 };
@@ -83,6 +84,8 @@ impl Config {
 #[derive(Debug, Deserialize, Serialize)]
 struct TokenClaims {
     exp: u64,
+    /// The [`fingerprint`] of what the token was minted from.
+    credential: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,14 +94,28 @@ struct TokenClaims {
     oidc: Option<OidcClaims>,
 }
 
+/// Hash of the `[auth.identity]` entry (username, password hash) and OIDC
+/// provider (issuer, keys, audience, required claims) behind `id` and `oidc`;
+/// a removed entry hashes as absent, so removal revokes like a change.
+fn fingerprint(auth: &AuthConfig, id: Option<&str>, oidc: Option<&OidcClaims>) -> String {
+    let identity = id
+        .and_then(|id| auth.identity.get(id))
+        .map(|c| json!([c.username, c.password.as_password_hash().to_string()]));
+    let provider = oidc
+        .and_then(|oidc| auth.oidc.get(&oidc.provider_name))
+        .map(|c| json!([c.issuer, c.jwks_uri, c.required_audience, c.required_claims]));
+    sha256_hex(json!([identity, provider]).to_string())
+}
+
 pub struct TokenIssuer {
     encoding: EncodingKey,
     ttl_secs: u64,
     configured_challenge: Option<HeaderValue>,
+    auth: AuthConfig,
 }
 
 impl TokenIssuer {
-    pub fn new(config: &Config) -> Result<Self, Error> {
+    pub fn new(config: &Config, auth: &AuthConfig) -> Result<Self, Error> {
         let key = config.signing_key()?;
         if !(1..=MAX_TTL_SECS).contains(&config.ttl_secs) {
             return Err(Error::Initialization(format!(
@@ -110,6 +127,7 @@ impl TokenIssuer {
             encoding: EncodingKey::from_secret(key),
             ttl_secs: config.ttl_secs,
             configured_challenge: config.realm.as_deref().map(build_challenge).transpose()?,
+            auth: auth.clone(),
         })
     }
 
@@ -126,6 +144,7 @@ impl TokenIssuer {
 
         let claims = TokenClaims {
             exp: now.saturating_add(self.ttl_secs),
+            credential: fingerprint(&self.auth, identity.id.as_deref(), identity.oidc.as_ref()),
             id: identity.id.clone(),
             username: identity.username.clone(),
             oidc: identity.oidc.clone(),
@@ -185,29 +204,21 @@ fn build_challenge(realm: &str) -> Result<HeaderValue, Error> {
 pub struct TokenValidator {
     decoding: DecodingKey,
     validation: Validation,
-    oidc_providers: HashSet<String>,
-    identities: HashSet<String>,
+    auth: AuthConfig,
 }
 
 impl TokenValidator {
-    /// `oidc_providers` and `identities` are the currently configured provider
-    /// names and `[auth.identity]` ids. A token naming one that has since been
-    /// removed or renamed is refused, which is the only way an operator can
-    /// invalidate tokens before they expire: whichever credential minted a
-    /// token, deleting it revokes the token too.
-    pub fn new(
-        config: &Config,
-        oidc_providers: &[String],
-        identities: &[String],
-    ) -> Result<Self, Error> {
+    /// A token whose credential `auth` no longer configures as it was at
+    /// minting is refused, which is how an operator invalidates tokens before
+    /// they expire: removing, renaming or rotating that credential revokes them.
+    pub fn new(config: &Config, auth: &AuthConfig) -> Result<Self, Error> {
         let mut validation = Validation::new(ALGORITHM);
         validation.validate_aud = false;
 
         Ok(Self {
             decoding: DecodingKey::from_secret(config.signing_key()?),
             validation,
-            oidc_providers: oidc_providers.iter().cloned().collect(),
-            identities: identities.iter().cloned().collect(),
+            auth: auth.clone(),
         })
     }
 }
@@ -233,22 +244,11 @@ impl AuthMiddleware for TokenValidator {
             .map_err(|e| Error::Unauthorized(format!("Registry token rejected: {e}")))?
             .claims;
 
-        if let Some(oidc) = &claims.oidc
-            && !self.oidc_providers.contains(&oidc.provider_name)
+        if claims.credential != fingerprint(&self.auth, claims.id.as_deref(), claims.oidc.as_ref())
         {
-            return Err(Error::Unauthorized(format!(
-                "Registry token names OIDC provider '{}', which is no longer configured",
-                oidc.provider_name
-            )));
-        }
-        // Only basic auth fills `id`, so this is the same check for the
-        // credential the OIDC one covers for a provider.
-        if let Some(id) = &claims.id
-            && !self.identities.contains(id)
-        {
-            return Err(Error::Unauthorized(format!(
-                "Registry token names identity '{id}', which is no longer configured"
-            )));
+            return Err(Error::Unauthorized(
+                "Registry token was minted from a credential since changed or removed".to_string(),
+            ));
         }
 
         identity.id = claims.id;
@@ -276,6 +276,15 @@ mod tests {
     const PROVIDER: &str = "github-actions";
     /// The `[auth.identity]` id `oidc_identity` carries.
     const IDENTITY: &str = "ci";
+    /// The credentials `oidc_identity` is minted from.
+    const AUTH: &str = r#"
+        [identity.ci]
+        username = "ci-bot"
+        password = "$argon2id$v=19$m=19456,t=2,p=1$test"
+
+        [oidc.github-actions]
+        issuer = "https://token.actions.githubusercontent.com"
+    "#;
 
     fn config() -> Config {
         Config {
@@ -293,12 +302,17 @@ mod tests {
     }
 
     fn issuer() -> TokenIssuer {
-        TokenIssuer::new(&config()).expect("valid issuer config")
+        let auth = toml::from_str(AUTH).expect("valid auth config");
+        TokenIssuer::new(&config(), &auth).expect("valid issuer config")
     }
 
     fn validator() -> TokenValidator {
-        TokenValidator::new(&config(), &[PROVIDER.to_string()], &[IDENTITY.to_string()])
-            .expect("valid validator config")
+        validator_for(AUTH)
+    }
+
+    fn validator_for(auth: &str) -> TokenValidator {
+        let auth = toml::from_str(auth).expect("valid auth config");
+        TokenValidator::new(&config(), &auth).expect("valid validator config")
     }
 
     /// Every JSON shape a provider can put in a claim, so the round trip is
@@ -401,6 +415,7 @@ mod tests {
         // Validation::new leaves a 60s leeway, so the token must be older than that.
         let claims = TokenClaims {
             exp: 1_000_000,
+            credential: String::new(),
             id: None,
             username: Some("ci-bot".to_string()),
             oidc: None,
@@ -421,7 +436,7 @@ mod tests {
             secret_key: Secret::new(vec![9; 32].into()),
             ..config()
         };
-        let (token, _) = TokenIssuer::new(&other)
+        let (token, _) = TokenIssuer::new(&other, &toml::from_str(AUTH).unwrap())
             .unwrap()
             .issue(&oidc_identity())
             .unwrap();
@@ -434,36 +449,26 @@ mod tests {
         assert!(matches!(error, Error::Unauthorized(_)));
     }
 
+    /// Removing either credential, rotating the password, renaming the user or
+    /// repointing the provider revokes the tokens minted before.
     #[tokio::test]
-    async fn rejects_a_token_naming_a_removed_provider() {
+    async fn rejects_a_token_whose_credential_changed() {
         let (token, _) = issuer().issue(&oidc_identity()).unwrap();
         let parts = parts_with_authorization(&format!("Bearer {token}"));
 
-        let validator = TokenValidator::new(&config(), &[], &[IDENTITY.to_string()]).unwrap();
-        let error = validator
-            .authenticate(&parts, &mut ClientIdentity::default())
-            .await
-            .expect_err("a token naming an unconfigured provider must be refused");
-        assert!(matches!(error, Error::Unauthorized(_)));
-    }
-
-    /// Deleting the `[auth.identity]` entry a token was minted from revokes it,
-    /// exactly as removing the OIDC provider it names does: a leaked password
-    /// is not contained until every token it minted stops working.
-    #[tokio::test]
-    async fn rejects_a_token_naming_a_removed_identity() {
-        let (token, _) = issuer().issue(&oidc_identity()).unwrap();
-        let parts = parts_with_authorization(&format!("Bearer {token}"));
-
-        let validator = TokenValidator::new(&config(), &[PROVIDER.to_string()], &[]).unwrap();
-        let error = validator
-            .authenticate(&parts, &mut ClientIdentity::default())
-            .await
-            .expect_err("a token naming an unconfigured identity must be refused");
-        assert!(
-            matches!(&error, Error::Unauthorized(msg) if msg.contains(IDENTITY)),
-            "the refusal must name the identity, got: {error:?}"
-        );
+        for (from, to) in [
+            (PROVIDER, "other"),
+            ("[identity.ci]", "[identity.other]"),
+            ("p=1$test", "p=1$rotated"),
+            ("ci-bot", "ci-robot"),
+            ("token.actions.githubusercontent.com", "other.example.com"),
+        ] {
+            let error = validator_for(&AUTH.replace(from, to))
+                .authenticate(&parts, &mut ClientIdentity::default())
+                .await
+                .expect_err("a token minted from a changed credential must be refused");
+            assert!(matches!(error, Error::Unauthorized(_)), "{to}: {error:?}");
+        }
     }
 
     /// A provider's own bearer must fall through rather than error, or the OIDC
@@ -526,8 +531,8 @@ mod tests {
             ..config()
         };
 
-        assert!(TokenIssuer::new(&config).is_err());
-        assert!(TokenValidator::new(&config, &[], &[]).is_err());
+        assert!(TokenIssuer::new(&config, &AuthConfig::default()).is_err());
+        assert!(TokenValidator::new(&config, &AuthConfig::default()).is_err());
     }
 
     #[test]
@@ -537,7 +542,7 @@ mod tests {
                 ttl_secs,
                 ..config()
             };
-            assert!(TokenIssuer::new(&config).is_err());
+            assert!(TokenIssuer::new(&config, &AuthConfig::default()).is_err());
         }
     }
 
@@ -555,7 +560,7 @@ mod tests {
                 ..config()
             };
             assert!(
-                TokenIssuer::new(&config).is_err(),
+                TokenIssuer::new(&config, &AuthConfig::default()).is_err(),
                 "{realm} must be refused"
             );
         }
@@ -567,7 +572,7 @@ mod tests {
             realm: Some("https://registry.example.com/token".to_string()),
             ..config()
         };
-        let issuer = TokenIssuer::new(&config).unwrap();
+        let issuer = TokenIssuer::new(&config, &AuthConfig::default()).unwrap();
 
         assert_eq!(
             issuer.challenge("http", "other.example.com").unwrap(),
@@ -594,7 +599,7 @@ mod tests {
             realm: Some("https://registry.example.com/registry/token".to_string()),
             ..config()
         };
-        let issuer = TokenIssuer::new(&config).unwrap();
+        let issuer = TokenIssuer::new(&config, &AuthConfig::default()).unwrap();
 
         assert_eq!(
             issuer.challenge("https", "other.example.com").unwrap(),
@@ -610,7 +615,7 @@ mod tests {
             realm: Some("https://bot:hunter2@registry.example.com/token?x=1#f".to_string()),
             ..config()
         };
-        let issuer = TokenIssuer::new(&config).unwrap();
+        let issuer = TokenIssuer::new(&config, &AuthConfig::default()).unwrap();
 
         assert_eq!(
             issuer.challenge("https", "other.example.com").unwrap(),
