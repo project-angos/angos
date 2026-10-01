@@ -76,8 +76,8 @@ impl MetadataStore {
         Ok(false)
     }
 
-    /// Whether an unexpired collector run covers any of `digests`; one
-    /// listing, nothing per blob.
+    /// Whether an unexpired collector run covers any of `digests`, reaping the
+    /// expired markers it reads on the way: one read per marker.
     pub async fn gc_blocked(&self, digests: &[&Digest]) -> Result<bool, Error> {
         let mut token = None;
         loop {
@@ -96,8 +96,8 @@ impl MetadataStore {
                     return Ok(true);
                 };
                 if run.expires_at < Utc::now() {
-                    // A released marker lingers by design and scrub leaves it
-                    // alone, so the writer that reads it expired reaps it.
+                    // A released marker lingers by design, so whoever reads it
+                    // expired reaps it.
                     let _ = self.object_store().delete(&key).await;
                     continue;
                 }

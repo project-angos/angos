@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A deleted image's blobs are reclaimed by one prune and one scrub, instead of repeated runs of each.
 - A storage error while reclaiming a blob no longer refuses pushes naming it for twice `gc_grace_secs`.
+- Scrub deletes the expired reclamation markers it leaves, so the first push after a large scrub no longer reads each one.
 
 ## 1.12.1
 
