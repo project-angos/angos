@@ -1529,8 +1529,8 @@ mod tests {
         Algorithm, MediaType, Namespace, Tag,
         header::{DOCKER_CONTENT_DIGEST, OCI_TAG},
         request::{DeleteBlobRequest, PutManifestRequest},
+        response::REPLICATION_SUPERSEDED_CODE,
     };
-    use angos_oci_client::REPLICATION_SUPERSEDED_CODE;
     use angos_storage::{
         Error as StorageError, ObjectStore,
         test_util::{HookedStore, StoreHook, StoreOp},

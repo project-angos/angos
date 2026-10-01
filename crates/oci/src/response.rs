@@ -96,6 +96,14 @@ impl Display for ErrorCode {
     }
 }
 
+// Codes outside the spec's set that angos serves: a 5xx code is unconstrained,
+// and the replication code answers an angos-to-angos write only, whose sender
+// reads it to settle convergence rather than retry.
+pub const INTERNAL_ERROR_CODE: &str = "INTERNAL_ERROR";
+pub const PROVIDER_UNAVAILABLE_CODE: &str = "PROVIDER_UNAVAILABLE";
+pub const RECLAMATION_IN_PROGRESS_CODE: &str = "RECLAMATION_IN_PROGRESS";
+pub const REPLICATION_SUPERSEDED_CODE: &str = "REPLICATION_SUPERSEDED";
+
 /// Body of any 4xx/5xx answer: the codes the spec defines, each with what the
 /// registry chose to say about it.
 #[derive(Debug, Deserialize, Serialize)]

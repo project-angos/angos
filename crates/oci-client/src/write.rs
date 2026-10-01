@@ -16,17 +16,16 @@ use tokio_util::io::ReaderStream;
 use tracing::{debug, instrument, warn};
 
 use angos_oci::client::{self, append_query};
-use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT};
+use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, X_ANGOS_SOURCE_TIMESTAMP};
 use angos_oci::request::{
     DeleteManifestRequest, MountBlobRequest, PutManifestRequest, StartUploadRequest,
 };
-use angos_oci::response::{DeleteManifestOutcome, ErrorResponse, PutManifestOutcome};
+use angos_oci::response::{
+    DeleteManifestOutcome, ErrorResponse, PutManifestOutcome, REPLICATION_SUPERSEDED_CODE,
+};
 use angos_oci::{Digest, MediaType};
 
-use crate::{
-    Error, REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP,
-    denied_if_forbidden, parse_header, without_query,
-};
+use crate::{Error, RegistryClient, denied_if_forbidden, parse_header, without_query};
 
 /// An open downstream blob-upload session: the server-assigned continuation
 /// URL plus the auth header that opened it.

@@ -35,7 +35,6 @@ use angos_secret::Secret;
 
 pub const SCAN_IMAGE_KIND: &str = "scan.image";
 pub const SARIF_MEDIA_TYPE: &str = "application/sarif+json";
-const EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const EMPTY_CONFIG_BODY: &[u8] = b"{}";
 /// Internal-process name stamped on the events a report push emits.
 const SCAN_ACTOR: &str = "scan";
@@ -467,8 +466,7 @@ impl ScanJobHandler {
             artifact_type: Some(sarif.clone()),
             content: Content::Image {
                 config: Some(Box::new(Descriptor {
-                    media_type: MediaType::new(EMPTY_CONFIG_MEDIA_TYPE)
-                        .map_err(|e| Error::Execution(e.to_string()))?,
+                    media_type: MediaType::oci_empty(),
                     digest: config_digest,
                     size: EMPTY_CONFIG_BODY.len() as u64,
                     annotations: HashMap::default(),

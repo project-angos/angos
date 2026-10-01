@@ -17,9 +17,8 @@ use angos_oci::{
     Reference, Tag,
     constants::{DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE},
 };
-use angos_oci_client::{
-    REPLICATION_SUPERSEDED_CODE, RegistryClient, UploadSession, X_ANGOS_SOURCE_TIMESTAMP,
-};
+use angos_oci::{header::X_ANGOS_SOURCE_TIMESTAMP, response::REPLICATION_SUPERSEDED_CODE};
+use angos_oci_client::{RegistryClient, UploadSession};
 
 use crate::{
     metrics_provider,
@@ -298,9 +297,7 @@ async fn referrers_fallback_put_is_timestamp_less() {
         .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
         .respond_with(move |request: &Request| {
             assert!(
-                !request
-                    .headers
-                    .contains_key(X_ANGOS_SOURCE_TIMESTAMP.to_lowercase().as_str()),
+                !request.headers.contains_key(X_ANGOS_SOURCE_TIMESTAMP),
                 "the fallback-index PUT must be timestamp-less (set merge, not LWW)"
             );
             ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())

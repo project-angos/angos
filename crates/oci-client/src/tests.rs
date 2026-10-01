@@ -10,17 +10,17 @@ use wiremock::{
     matchers::{body_bytes, header, method, path, query_param, query_param_is_missing},
 };
 
+use angos_oci::header::X_ANGOS_SOURCE_TIMESTAMP;
 use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT};
 use angos_oci::request::{
     BlobMount, DeleteManifestRequest, GetBlobRequest, GetManifestRequest, HeadBlobRequest,
     HeadManifestRequest, ListTagsRequest, MountBlobRequest, PutManifestRequest, StartUploadRequest,
 };
-use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome};
+use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome, REPLICATION_SUPERSEDED_CODE};
 use angos_oci::{Digest, MediaType, Namespace, Reference, Tag};
 
 use crate::{
-    Error, MtlsIdentity, REPLICATION_SUPERSEDED_CODE, RegistryClient, RegistryClientConfig,
-    X_ANGOS_SOURCE_TIMESTAMP,
+    Error, MtlsIdentity, RegistryClient, RegistryClientConfig,
     auth::{token_cache_key, token_index_cache_key},
     without_query,
 };

@@ -7,9 +7,10 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
-use angos_oci::header::DOCKER_CONTENT_DIGEST;
+use angos_oci::header::{DOCKER_CONTENT_DIGEST, X_ANGOS_SOURCE_TIMESTAMP};
+use angos_oci::response::REPLICATION_SUPERSEDED_CODE;
 use angos_oci::{Digest, Namespace, Tag};
-use angos_oci_client::{REPLICATION_SUPERSEDED_CODE, RegistryClient, X_ANGOS_SOURCE_TIMESTAMP};
+use angos_oci_client::RegistryClient;
 
 use crate::{
     jobs::Queue,
