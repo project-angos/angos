@@ -153,6 +153,10 @@ impl Command {
 
         if let Some(registry) = &self.registry {
             registry.shutdown().await;
+            // Reap the run markers blob reclamation released and that have
+            // since expired, so the next writer does not read them one by one;
+            // covering no digest, the check only reaps.
+            self.metadata_store.gc_blocked(&[]).await?;
         }
         info!(
             "scrub complete: {}",
@@ -183,7 +187,8 @@ mod tests {
 
     use crate::command::scrub::command::*;
     use crate::{
-        command::maintenance::action::LOST_AND_FOUND_PREFIX, registry::test_utils::seed_manifest,
+        command::maintenance::action::LOST_AND_FOUND_PREFIX,
+        registry::{keys::GC_ROOT, test_utils::seed_manifest},
     };
 
     fn scrub_config(root: &str) -> Configuration {
@@ -243,16 +248,30 @@ mod tests {
             .put("stray/junk-object", Bytes::from_static(b"junk"))
             .await
             .unwrap();
+        let expired_marker = format!("{GC_ROOT}/expired-run");
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        objects
+            .put(
+                &expired_marker,
+                Bytes::from(format!(
+                    r#"{{"start":"{digest}","end":"{digest}","expires_at":"2000-01-01T00:00:00Z","instance":"gone"}}"#
+                )),
+            )
+            .await
+            .unwrap();
 
         // Dry-run first: nothing changes.
         let mut dry = Command::new(&options(true, 2), &config).await.unwrap();
         dry.run().await.unwrap();
         assert!(objects.get("stray/junk-object").await.is_ok());
+        assert!(objects.get(&expired_marker).await.is_ok());
 
-        // Real run: the junk is quarantined with its bytes preserved.
+        // Real run: the junk is quarantined with its bytes preserved, and the
+        // expired run marker reaped rather than left to the next writer.
         let mut real = Command::new(&options(false, 4), &config).await.unwrap();
         real.run().await.unwrap();
         assert!(objects.get("stray/junk-object").await.is_err());
+        assert!(objects.get(&expired_marker).await.is_err());
         assert_eq!(
             objects
                 .get(&format!("{LOST_AND_FOUND_PREFIX}/stray/junk-object"))

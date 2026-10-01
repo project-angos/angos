@@ -568,15 +568,17 @@ async fn a_live_gc_marker_survives_the_walk() {
     for_each_backend(async |test_case| {
         let metadata_store = test_case.metadata_store();
         let digest = Digest::sha256_of_bytes(b"marker-covered blob");
-        let claim = metadata_store.gc_claim(&digest, &digest).await.unwrap();
-
-        scrub_apply(test_case).await;
-
-        assert!(
-            metadata_store.gc_blocked(&[&digest]).await.unwrap(),
-            "the live run marker must survive a scrub walk"
-        );
-        metadata_store.gc_release(claim).await.unwrap();
+        metadata_store
+            .with_gc_claim(&digest, &digest, async |_| {
+                scrub_apply(test_case).await;
+                assert!(
+                    metadata_store.gc_blocked(&[&digest]).await.unwrap(),
+                    "the live run marker must survive a scrub walk"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
     })
     .await;
 }
@@ -595,6 +597,30 @@ async fn orphan_blob_is_reclaimed() {
         assert!(
             blob_store.size(&orphan).await.is_err(),
             "a blob with no index entries must be reclaimed"
+        );
+    })
+    .await;
+}
+
+/// The reference walk removes a key whose manifest is gone, so that key is no
+/// witness against reclaiming the blob in the same run.
+#[tokio::test]
+async fn a_blob_whose_only_reference_dangles_is_reclaimed_in_one_run() {
+    for_each_backend(async |test_case| {
+        let namespace = Namespace::new("test-repo/dangling-ref").unwrap();
+        let blob_store = test_case.blob_store();
+        let metadata_store = test_case.metadata_store();
+        let blob = put_blob_direct(metadata_store.object_store(), b"deleted-manifest-body").await;
+        metadata_store
+            .insert_reference(&namespace, &blob, &LinkKind::Digest(blob.clone()))
+            .await
+            .unwrap();
+
+        scrub_apply(test_case).await;
+
+        assert!(
+            blob_store.size(&blob).await.is_err(),
+            "a blob whose only reference dangles must be reclaimed by one scrub"
         );
     })
     .await;

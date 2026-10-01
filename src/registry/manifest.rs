@@ -2,7 +2,7 @@ use std::{iter::once, slice};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::future::join_all;
+use futures_util::future::{join_all, try_join_all};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, error, instrument, warn};
 
@@ -50,8 +50,10 @@ pub enum ReferencePolicy {
 
 /// What one push writes besides its reference keys: the revision record's
 /// media type, the subject it back-links to carrying that manifest's
-/// descriptor, and the tags to point at it.
+/// descriptor, the tags to point at it, and the referenced digests whose bytes
+/// must still exist once pinned.
 struct PushedKeys<'a> {
+    stored: &'a [Digest],
     subject: Option<&'a Digest>,
     descriptor: Option<&'a Descriptor>,
     tags: &'a [Tag],
@@ -153,7 +155,7 @@ fn push_pins(
     digest: &Digest,
     tags: &[Tag],
     subject: Option<&Digest>,
-    referenced: Vec<Digest>,
+    referenced: &[Digest],
 ) -> Vec<(Digest, LinkKind)> {
     once(LinkKind::Digest(digest.clone()))
         .chain(tags.iter().map(|tag| LinkKind::Tag(tag.clone())))
@@ -164,8 +166,8 @@ fn push_pins(
         .map(|link| (digest.clone(), link))
         .chain(
             referenced
-                .into_iter()
-                .map(|target| (target, LinkKind::ReferencedBy(digest.clone()))),
+                .iter()
+                .map(|target| (target.clone(), LinkKind::ReferencedBy(digest.clone()))),
         )
         .collect()
 }
@@ -701,7 +703,7 @@ impl Registry {
         referenced.sort_unstable();
         referenced.dedup();
         let referenced = self
-            .enforce_reference_policy(namespace, &manifest, referenced, reference_policy)
+            .enforce_reference_policy(namespace, referenced, reference_policy)
             .await?;
 
         // The bytes land before any key that points at them; they sit inside
@@ -718,7 +720,7 @@ impl Registry {
             &computed_digest,
             &written_tags,
             subject.as_ref(),
-            referenced,
+            &referenced,
         );
         let (digest_moved, tag_moved) = self
             .write_pushed_keys(
@@ -726,6 +728,12 @@ impl Registry {
                 &computed_digest,
                 &pins,
                 PushedKeys {
+                    // A pull-through fill refetches whatever bytes go missing.
+                    stored: if reference_policy == ReferencePolicy::Trusted {
+                        &[]
+                    } else {
+                        &referenced
+                    },
                     subject: subject.as_ref(),
                     descriptor: descriptor.as_ref(),
                     tags: &written_tags,
@@ -773,8 +781,10 @@ impl Registry {
     /// intermediate state a legal one, and reports whether the revision record
     /// and any tag actually moved.
     ///
-    /// Reference keys land first and are cleared against collector runs, so no
-    /// record ever points at bytes being reclaimed; the revision record lands
+    /// Reference keys land first, are cleared against collector runs, and have
+    /// their bytes re-checked, since a reclaim that missed them deleted its
+    /// bytes before the clearance passed; so no record ever points at reclaimed
+    /// bytes. The revision record lands
     /// next, which is what makes the digest resolvable; the referrer back-link
     /// and the tag entries land last, so a resolvable tag always implies a
     /// complete manifest. A crash between any two leaves an over-approximated
@@ -788,6 +798,12 @@ impl Registry {
     ) -> Result<(bool, bool), Error> {
         let store = &self.metadata_store;
         store.pin_references(namespace, pins).await?;
+        try_join_all(
+            keys.stored
+                .iter()
+                .map(|digest| self.validate_manifest_reference(digest)),
+        )
+        .await?;
 
         let digest_moved = store
             .put_revision(namespace, digest, keys.media_type.clone(), keys.authored_at)
@@ -806,28 +822,6 @@ impl Registry {
                 .await?;
         }
         Ok((digest_moved, tag_moved))
-    }
-
-    /// Verifies each referenced blob's bytes exist; ownership is checked by
-    /// [`Self::enforce_reference_policy`].
-    async fn validate_manifest_references(&self, manifest: &Manifest) -> Result<(), Error> {
-        match &manifest.content {
-            Content::Image { config, layers } => {
-                if let Some(config) = config {
-                    self.validate_manifest_reference(&config.digest).await?;
-                }
-                for layer in layers {
-                    self.validate_manifest_reference(&layer.digest).await?;
-                }
-            }
-            Content::Index { manifests } => {
-                for child in manifests {
-                    self.validate_manifest_reference(&child.digest).await?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     async fn validate_manifest_reference(&self, digest: &Digest) -> Result<(), Error> {
@@ -1237,9 +1231,9 @@ impl Registry {
         Ok(())
     }
 
-    /// What the push may reference, per `policy`: Strict first verifies that
-    /// every referenced blob's bytes exist, then each policy checks that
-    /// `namespace` already owns each newly-referenced digest: Strict fails the
+    /// What the push may reference, per `policy`: each policy checks that
+    /// `namespace` already owns each newly-referenced digest, the bytes being
+    /// checked once pinned (see [`Self::write_pushed_keys`]): Strict fails the
     /// push, Permissive and Trusted keep the manifest but withhold the
     /// ownership-granting link, so the namespace gains no read access to
     /// content it never pushed. A Trusted push, the pull-through cache fill of
@@ -1248,14 +1242,9 @@ impl Registry {
     async fn enforce_reference_policy(
         &self,
         namespace: &Namespace,
-        manifest: &Manifest,
         referenced: Vec<Digest>,
         policy: ReferencePolicy,
     ) -> Result<Vec<Digest>, Error> {
-        if policy == ReferencePolicy::Strict {
-            self.validate_manifest_references(manifest).await?;
-        }
-
         let mut allowed = Vec::with_capacity(referenced.len());
         for digest in referenced {
             let unstored = policy == ReferencePolicy::Trusted
@@ -1582,7 +1571,7 @@ mod tests {
         metrics_provider,
         registry::{
             Error, Registry,
-            keys::{DigestKeys, NamespaceKeys},
+            keys::{DigestKeys, GC_ROOT, NamespaceKeys},
             manifest::*,
             metadata_store::LinkKind,
             repository::Config as RepositoryConfig,
@@ -2668,6 +2657,78 @@ mod tests {
             )
             .await
             .expect("the aborted delete must leave the tag resolvable");
+    }
+
+    /// A reclaim whose liveness listing missed the push's pins deletes the bytes
+    /// before the push's marker check passes, however long its wave took; the
+    /// push must refuse rather than commit a revision naming them.
+    #[tokio::test]
+    async fn a_push_refuses_references_reclaimed_during_its_pins() {
+        let case = FSRegistryTestCase::new();
+        let namespace = Namespace::new("test-repo/raced").unwrap();
+        let tag = Tag::new("latest").unwrap();
+        let config = br#"{"raced":true}"#;
+        let layer = b"raced layer bytes";
+        let config_digest = upload_blob(case.registry(), &namespace, config).await;
+        let layer_digest = upload_blob(case.registry(), &namespace, layer).await;
+        let (content, media_type) =
+            manifest_with_references(&config_digest, config.len(), &layer_digest, layer.len());
+
+        let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
+            case.metadata_store().object_store().clone(),
+            ReclaimOnMarkerCheck {
+                blobs: case.blob_store().object_store().clone(),
+                key: layer_digest.blob_path(),
+            },
+        ));
+        let registry =
+            create_test_registry_with(case.blob_store(), metadata_store_over(hooked), false);
+        let error = registry
+            .handle_put_manifest(
+                None,
+                PutManifestRequest {
+                    namespace: namespace.clone(),
+                    reference: Reference::Tag(tag.clone()),
+                    content_type: Some(media_type),
+                    tags: Vec::new(),
+                    source_ts: None,
+                },
+                Cursor::new(content),
+            )
+            .await
+            .err();
+
+        assert!(
+            matches!(error, Some(Error::ManifestBlobUnknown)),
+            "a push whose referenced bytes were reclaimed must be refused, got {error:?}"
+        );
+        assert!(
+            registry
+                .metadata_store
+                .read_link(&namespace, &LinkKind::Tag(tag))
+                .await
+                .is_err(),
+            "the refused push must not commit its tag"
+        );
+    }
+
+    /// Deletes one blob as a writer lists the reclamation markers, standing in
+    /// for a collector that finished between the writer's pins and its check.
+    struct ReclaimOnMarkerCheck {
+        blobs: Arc<dyn ObjectStore>,
+        key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StoreHook for ReclaimOnMarkerCheck {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            if let StoreOp::List { prefix } = op
+                && prefix == GC_ROOT
+            {
+                self.blobs.delete(&self.key).await?;
+            }
+            Ok(())
+        }
     }
 
     /// Fails every read of one object, standing in for a backend outage rather than
@@ -4292,10 +4353,7 @@ mod tests {
     }
 
     /// The push path's two steps over the digests a manifest references: the
-    /// reference gate, then the per-referrer pin for whatever it allowed. The
-    /// manifest is empty, so only the gate's ownership half applies; its
-    /// bytes-exist half is covered by
-    /// `accept_put_manifest_honors_reference_validation_flag`.
+    /// ownership gate, then the per-referrer pin for whatever it allowed.
     async fn policy_push(
         registry: &Registry,
         namespace: &Namespace,
@@ -4304,7 +4362,7 @@ mod tests {
         policy: ReferencePolicy,
     ) -> Result<(), Error> {
         let allowed = registry
-            .enforce_reference_policy(namespace, &Manifest::default(), referenced.to_vec(), policy)
+            .enforce_reference_policy(namespace, referenced.to_vec(), policy)
             .await?;
         let pins: Vec<(Digest, LinkKind)> = allowed
             .into_iter()

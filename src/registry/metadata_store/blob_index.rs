@@ -273,6 +273,29 @@ impl MetadataStore {
         }
     }
 
+    /// Whether one of `links`, `namespace`'s reference entries for `digest`,
+    /// is a manifest reference still in force: younger than the grace period
+    /// or backed by a resolving revision, since writers never remove one.
+    pub async fn manifest_references_live(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+        links: &HashSet<LinkKind>,
+    ) -> Result<bool, Error> {
+        for link in links {
+            if matches!(link, LinkKind::ReferencedBy(_))
+                && (self.reference_backed(namespace, link, digest).await?
+                    || self
+                        .key_within_grace(&digest.blob_ref_path(namespace, link))
+                        .await?
+                        == Some(true))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Collector-side liveness over the reference index: `own` pins
     /// unconditionally, and any other key pins while it is younger than the
     /// grace period or its backing link resolves. The blob-data age gate is

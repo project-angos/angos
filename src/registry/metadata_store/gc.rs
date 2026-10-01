@@ -76,8 +76,8 @@ impl MetadataStore {
         Ok(false)
     }
 
-    /// Whether an unexpired collector run covers any of `digests`; one
-    /// listing, nothing per blob.
+    /// Whether an unexpired collector run covers any of `digests`, reaping the
+    /// expired markers it reads on the way: one read per marker.
     pub async fn gc_blocked(&self, digests: &[&Digest]) -> Result<bool, Error> {
         let mut token = None;
         loop {
@@ -96,8 +96,8 @@ impl MetadataStore {
                     return Ok(true);
                 };
                 if run.expires_at < Utc::now() {
-                    // A released marker lingers by design and scrub leaves it
-                    // alone, so the writer that reads it expired reaps it.
+                    // A released marker lingers by design, so whoever reads it
+                    // expired reaps it.
                     let _ = self.object_store().delete(&key).await;
                     continue;
                 }
@@ -115,10 +115,24 @@ impl MetadataStore {
         }
     }
 
-    /// Collector side: publish a run marker covering `start..=end`. The
-    /// expiry is generous because safety rests on [`Self::gc_refresh`], not
-    /// on the timer.
-    pub async fn gc_claim(&self, start: &Digest, end: &Digest) -> Result<GcClaim, Error> {
+    /// Collector side: run `body` under a marker covering `start..=end`,
+    /// released whatever `body` returns. `body` calls [`Self::gc_refresh`]
+    /// with the claim before each irreversible delete.
+    pub async fn with_gc_claim<T>(
+        &self,
+        start: &Digest,
+        end: &Digest,
+        body: impl AsyncFnOnce(&GcClaim) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let claim = self.gc_claim(start, end).await?;
+        let result = body(&claim).await;
+        let released = self.gc_release(claim).await;
+        result.and_then(|value| released.map(|()| value))
+    }
+
+    /// Publish a run marker covering `start..=end`. The expiry is generous
+    /// because safety rests on [`Self::gc_refresh`], not on the timer.
+    async fn gc_claim(&self, start: &Digest, end: &Digest) -> Result<GcClaim, Error> {
         let claim = GcClaim {
             key: gc_run_path(&Uuid::new_v4().to_string()),
             instance: Uuid::new_v4().to_string(),
@@ -168,7 +182,7 @@ impl MetadataStore {
     /// outlast the gap between a writer's reference wave and its collector
     /// check, which is one listing plus the backoff budget above; writers reap
     /// what they read expired.
-    pub async fn gc_release(&self, claim: GcClaim) -> Result<(), Error> {
+    async fn gc_release(&self, claim: GcClaim) -> Result<(), Error> {
         let body = self.gc_run_body(
             &claim,
             Some(Utc::now() + Duration::milliseconds(self.release_linger_ms)),
@@ -322,6 +336,28 @@ mod tests {
                 .items
                 .is_empty(),
             "the writer that read the marker expired must have reaped it"
+        );
+    }
+
+    /// A failing collector body still releases its run, or writers referencing
+    /// the digest would be refused for the marker's whole TTL.
+    #[tokio::test]
+    async fn a_failed_collector_body_still_releases_its_run() {
+        let case = FSRegistryTestCase::new();
+        let store = case.metadata_store();
+        let digest = Digest::sha256_of_bytes(b"failed-run");
+
+        let result = store
+            .with_gc_claim(&digest, &digest, async |_| {
+                Err::<(), _>(Error::Internal("listing failed".to_string()))
+            })
+            .await;
+        assert!(result.is_err(), "the body's error must surface");
+
+        sleep(linger(&store) * 2).await;
+        assert!(
+            !store.gc_blocked(&[&digest]).await.unwrap(),
+            "a failed run must be released"
         );
     }
 

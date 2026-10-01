@@ -494,7 +494,10 @@ expires it a few seconds afterwards rather than removing it, so a writer whose
 reference landed after the run's last liveness listing still finds it. A
 writer that has just written its reference keys lists `v2/gc/` once: an
 unexpired run covering one of its digests means back off briefly, and an
-expired one is reaped where it is found. Freshly written blob data and fresh reference keys are
+expired one is reaped where it is found, as scrub reaps those left at the end of
+its run. A push then re-checks that the blobs it references still have their
+bytes, so a reclaim that missed its keys is caught however long they took to
+land and whatever the writer's clock says. Freshly written blob data and fresh reference keys are
 unconditionally live for a grace period, which is what lets uploads and
 pushes skip any coordination for new bytes. Deletes only remove records and
 ownership keys; the bytes wait for a collector sweep (`angos scrub`), which

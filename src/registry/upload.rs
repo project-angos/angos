@@ -2641,21 +2641,24 @@ mod tests {
             .await
             .unwrap();
 
-        let claim = store.gc_claim(&digest, &digest).await.unwrap();
-        let result = registry
-            .handle_complete_upload(
-                None,
-                CompleteUploadRequest {
-                    namespace: namespace.clone(),
-                    session_id: session_id.clone(),
-                    digest: digest.clone(),
-                    content_range: None,
-                    content_length: Some(content.len() as u64),
-                },
-                Cursor::new(content.to_vec()),
-            )
-            .await;
-        store.gc_release(claim).await.unwrap();
+        let result = store
+            .with_gc_claim(&digest, &digest, async |_| {
+                Ok(registry
+                    .handle_complete_upload(
+                        None,
+                        CompleteUploadRequest {
+                            namespace: namespace.clone(),
+                            session_id: session_id.clone(),
+                            digest: digest.clone(),
+                            content_range: None,
+                            content_length: Some(content.len() as u64),
+                        },
+                        Cursor::new(content.to_vec()),
+                    )
+                    .await)
+            })
+            .await
+            .unwrap();
 
         assert!(
             matches!(result, Err(Error::ReclamationInProgress(_))),
