@@ -568,15 +568,17 @@ async fn a_live_gc_marker_survives_the_walk() {
     for_each_backend(async |test_case| {
         let metadata_store = test_case.metadata_store();
         let digest = Digest::sha256_of_bytes(b"marker-covered blob");
-        let claim = metadata_store.gc_claim(&digest, &digest).await.unwrap();
-
-        scrub_apply(test_case).await;
-
-        assert!(
-            metadata_store.gc_blocked(&[&digest]).await.unwrap(),
-            "the live run marker must survive a scrub walk"
-        );
-        metadata_store.gc_release(claim).await.unwrap();
+        metadata_store
+            .with_gc_claim(&digest, &digest, async |_| {
+                scrub_apply(test_case).await;
+                assert!(
+                    metadata_store.gc_blocked(&[&digest]).await.unwrap(),
+                    "the live run marker must survive a scrub walk"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
     })
     .await;
 }

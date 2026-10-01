@@ -207,41 +207,27 @@ impl Executor {
             return Ok(());
         }
 
-        let claim = self.metadata_store.gc_claim(&digest, &digest).await?;
-        // Fence, then re-verify under the published marker.
-        if !self.metadata_store.gc_refresh(&claim).await?
-            || self.metadata_store.blob_references_live(&digest).await?
-        {
-            info!("skipping orphan blob deletion: '{digest}' became live under the marker");
-            return self
-                .metadata_store
-                .gc_release(claim)
-                .await
-                .map_err(Error::from);
-        }
-        match self.blob_store.delete_blob(&digest).await {
-            Ok(()) | Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {}
-            Err(e) => {
-                let _ = self.metadata_store.gc_release(claim).await;
-                return Err(Error::from(e));
-            }
-        }
-        if let Err(e) = self.metadata_store.delete_blob_references(&digest).await {
-            let _ = self.metadata_store.gc_release(claim).await;
-            return Err(Error::from(e));
-        }
-        // The layer listing is derived from the bytes and goes with them.
-        if let Err(e) = self
-            .metadata_store
-            .object_store()
-            .delete_prefix(&digest.layer_dir())
-            .await
-        {
-            let _ = self.metadata_store.gc_release(claim).await;
-            return Err(Error::from(RegistryError::from(e)));
-        }
         self.metadata_store
-            .gc_release(claim)
+            .with_gc_claim(&digest, &digest, async |claim| {
+                // Fence, then re-verify under the published marker.
+                if !self.metadata_store.gc_refresh(claim).await?
+                    || self.metadata_store.blob_references_live(&digest).await?
+                {
+                    info!("skipping orphan blob deletion: '{digest}' became live under the marker");
+                    return Ok(());
+                }
+                match self.blob_store.delete_blob(&digest).await {
+                    Ok(()) | Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {}
+                    Err(e) => return Err(e),
+                }
+                self.metadata_store.delete_blob_references(&digest).await?;
+                // The layer listing is derived from the bytes and goes with them.
+                self.metadata_store
+                    .object_store()
+                    .delete_prefix(&digest.layer_dir())
+                    .await?;
+                Ok(())
+            })
             .await
             .map_err(Error::from)
     }
