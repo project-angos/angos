@@ -600,6 +600,30 @@ async fn orphan_blob_is_reclaimed() {
     .await;
 }
 
+/// The reference walk removes a key whose manifest is gone, so that key is no
+/// witness against reclaiming the blob in the same run.
+#[tokio::test]
+async fn a_blob_whose_only_reference_dangles_is_reclaimed_in_one_run() {
+    for_each_backend(async |test_case| {
+        let namespace = Namespace::new("test-repo/dangling-ref").unwrap();
+        let blob_store = test_case.blob_store();
+        let metadata_store = test_case.metadata_store();
+        let blob = put_blob_direct(metadata_store.object_store(), b"deleted-manifest-body").await;
+        metadata_store
+            .insert_reference(&namespace, &blob, &LinkKind::Digest(blob.clone()))
+            .await
+            .unwrap();
+
+        scrub_apply(test_case).await;
+
+        assert!(
+            blob_store.size(&blob).await.is_err(),
+            "a blob whose only reference dangles must be reclaimed by one scrub"
+        );
+    })
+    .await;
+}
+
 /// Blob GC reads one listing of the blob's reference directory, while the
 /// reference walk reaches those same keys through a whole-store scan. When the
 /// two disagree the listing must not win: a backend that drops a key from a

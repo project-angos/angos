@@ -344,9 +344,10 @@ impl Executor {
             Err(RegistryError::NotFound) => return Ok(()),
             Err(e) => return Err(Error::from(e)),
         };
-        if links
-            .iter()
-            .any(|link| matches!(link, LinkKind::ReferencedBy(_)))
+        if self
+            .metadata_store
+            .manifest_references_live(&namespace, &blob, &links)
+            .await?
         {
             info!(
                 "skipping orphan grant revoke: a manifest reference appeared for '{namespace}/{blob}'"

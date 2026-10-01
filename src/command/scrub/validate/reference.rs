@@ -28,44 +28,12 @@ impl Validator {
             warn!("scrub: reference key '{key}' names invalid namespace '{namespace_raw}'");
             return Ok(());
         };
-        // Witness for blob GC, an enumeration independent of the per-blob listing.
-        self.record_reference_seen(digest);
-
-        match self.blob_store.size(digest).await {
-            Ok(_) => {}
-            Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
-                // Normal for an in-flight upload or a lazily filled cache
-                // entry; the age-gated purge is prune's job.
-                debug!("scrub: reference key '{key}' references byteless blob '{digest}'");
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        // The blob's own ownership key carries the grant itself.
-        if matches!(link, LinkKind::Blob(_)) {
-            return Ok(());
-        }
-        // A key younger than the grace period may belong to a push between its
-        // reference wave and its commit, whose backing does not exist yet. A
-        // gone key reads as not-young, and the reverify below sees its absence.
-        if self.younger_than_grace(key).await? {
-            return Ok(());
-        }
-        // Only a confirmed-dead backing justifies removing the key; a transient
-        // read error must not.
-        if self
-            .metadata_store
-            .reference_backed(&namespace, &link, digest)
-            .await?
-        {
-            return Ok(());
-        }
-        let namespace_ref = &namespace;
-        let link_ref = &link;
-        let reverify = move || self.ref_still_dangling(key, namespace_ref, link_ref, digest);
-        if !reverify().await? {
-            return Ok(());
+        let dangling = self.ref_dangling(key, digest, &namespace, &link).await;
+        // Witness for blob GC, an enumeration independent of the per-blob
+        // listing, of every key this walk leaves in place.
+        if !matches!(dangling, Ok(true)) {
+            self.record_reference_seen(digest);
+            return dangling.map(|_| ());
         }
         self.emit(Action::RemoveBlobIndexLink {
             namespace,
@@ -75,15 +43,46 @@ impl Validator {
         .await
     }
 
-    /// Re-observe a dangling reference key: it still exists while its backing
-    /// is still dead.
-    async fn ref_still_dangling(
+    /// Whether the reference key is dangling and may be removed: its blob has
+    /// bytes, it is no ownership key, and its backing is confirmed dead twice.
+    async fn ref_dangling(
         &self,
         key: &str,
+        digest: &Digest,
         namespace: &Namespace,
         link: &LinkKind,
-        blob: &Digest,
     ) -> Result<bool, Error> {
+        match self.blob_store.size(digest).await {
+            Ok(_) => {}
+            Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
+                // Normal for an in-flight upload or a lazily filled cache
+                // entry; the age-gated purge is prune's job.
+                debug!("scrub: reference key '{key}' references byteless blob '{digest}'");
+                return Ok(false);
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // The blob's own ownership key carries the grant itself.
+        if matches!(link, LinkKind::Blob(_)) {
+            return Ok(false);
+        }
+        // A key younger than the grace period may belong to a push between its
+        // reference wave and its commit, whose backing does not exist yet. A
+        // gone key reads as not-young, and the reverify below sees its absence.
+        if self.younger_than_grace(key).await? {
+            return Ok(false);
+        }
+        // Only a confirmed-dead backing justifies removing the key; a transient
+        // read error must not.
+        if self
+            .metadata_store
+            .reference_backed(namespace, link, digest)
+            .await?
+        {
+            return Ok(false);
+        }
+        // Re-observed: the key must still exist while its backing is still dead.
         if !self
             .metadata_store
             .object_store()
@@ -95,7 +94,7 @@ impl Validator {
         }
         Ok(!self
             .metadata_store
-            .reference_backed(namespace, link, blob)
+            .reference_backed(namespace, link, digest)
             .await?)
     }
 }

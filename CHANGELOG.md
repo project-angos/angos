@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - An upstream manifest naming a blob another namespace stored no longer gives the pull-through namespace read access to it.
 - A registry token stops validating once the password, username or OIDC provider settings it was minted from change, not only once they are removed.
 
+### Fixed
+
+- A deleted image's blobs are reclaimed by one prune and one scrub, instead of repeated runs of each.
+
 ## 1.12.1
 
 ### Added

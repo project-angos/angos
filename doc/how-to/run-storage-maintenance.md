@@ -311,7 +311,7 @@ curl http://localhost:8000/v2/_angos/namespaces/list?repository=<repository> | j
 ### Storage Not Reduced
 
 - Blobs may be shared across manifests
-- Run scrub again after manifest deletion (repairs converge across runs)
+- Run scrub after prune or a manifest deletion; it reclaims the blobs they leave unreferenced
 - Check for incomplete uploads (`prune -u`)
 
 ### Unexpected Keys in `_lost_and_found/`

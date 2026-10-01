@@ -203,12 +203,13 @@ async fn sweep_grants_for_blob(ctx: &GrantSweep<'_>, blob: &Digest) -> Result<()
                 .await?;
             continue;
         }
-        // A tracked link means a manifest references the blob, so the grant is
-        // live; only a grant-only namespace is a retention subject.
+        // A manifest still referencing the blob keeps the grant live; only a
+        // grant-only namespace is a retention subject.
         if !links.contains(&grant)
-            || links
-                .iter()
-                .any(|link| matches!(link, LinkKind::ReferencedBy(_)))
+            || ctx
+                .metadata_store
+                .manifest_references_live(&namespace, blob, &links)
+                .await?
         {
             continue;
         }
@@ -2000,6 +2001,65 @@ mod tests {
                     .await
                     .is_err(),
                 "a grant no rule retains must be revoked past the window"
+            );
+        })
+        .await;
+    }
+
+    /// A deleted manifest's reference key outlives it, so only a backed one may
+    /// keep a grant out of the sweep, or reclaiming a pruned image takes a
+    /// second prune.
+    #[tokio::test]
+    async fn only_a_live_manifest_reference_keeps_a_grant_from_the_sweep() {
+        for_each_backend(async |test_case| {
+            let live = Namespace::new("test-repo/live-ref").unwrap();
+            let stale = Namespace::new("test-repo/stale-ref").unwrap();
+            let blob = seed_grant_only_blob(test_case, &live).await;
+            let metadata_store = test_case.metadata_store();
+            let grant = LinkKind::Blob(blob.clone());
+            let manifest = Digest::sha256_of_bytes(b"live-manifest");
+            metadata_store
+                .put_revision(&live, &manifest, None, None)
+                .await
+                .unwrap();
+            let pins = [
+                (&live, LinkKind::ReferencedBy(manifest)),
+                (&stale, grant.clone()),
+                (&stale, LinkKind::ReferencedBy(dummy_digest())),
+            ];
+            for (namespace, link) in pins {
+                metadata_store
+                    .insert_reference(namespace, &blob, &link)
+                    .await
+                    .unwrap();
+            }
+
+            sweep_orphan_grants(
+                &test_case.blob_store(),
+                &metadata_store,
+                &grant_resolver(),
+                Some(&keep_nothing_policy()),
+                chrono::Duration::zero(),
+                &Executor::new_for_test(test_case.blob_store(), metadata_store.clone()),
+                4,
+            )
+            .await
+            .unwrap();
+
+            let holds_grant = async |namespace| {
+                metadata_store
+                    .read_blob_index_namespace(namespace, &blob)
+                    .await
+                    .unwrap()
+                    .contains(&grant)
+            };
+            assert!(
+                holds_grant(&live).await,
+                "a backed reference must keep the grant"
+            );
+            assert!(
+                !holds_grant(&stale).await,
+                "a stale reference must not keep the grant"
             );
         })
         .await;
