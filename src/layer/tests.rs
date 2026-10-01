@@ -29,8 +29,8 @@ use crate::{
         NpmToken, PrivateKey, RegistryAuth, SlackToken, StripeKey,
     },
     layer::{
-        Checkpoints, IndexLayerJobHandler, IndexLayerPayload, IndexLimits, Kind, Listing,
-        SecretKind, SecretScanner, classify, elf, extract_gzip, index_stream, mime_type, pem,
+        Checkpoints, IndexLayerPayload, IndexLimits, Kind, Listing, SecretKind, SecretScanner,
+        classify, elf, extract_gzip, handler::IndexLayerJobHandler, index_stream, mime_type, pem,
     },
     policy::{ImagePolicy, PolicyConfig},
     registry::{

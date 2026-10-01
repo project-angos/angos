@@ -10,6 +10,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone as _, Utc};
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::{sync::Semaphore, time::sleep};
 use tokio_util::sync::CancellationToken;
@@ -21,14 +22,15 @@ use angos_storage::{
 };
 
 use crate::jobs::store::{
-    ClaimCheck, ClaimMode, ClaimedJob, CompleteOutcome, DeadLetterRecord, FailOutcome, JOBS_ROOT,
-    JobEnvelope, JobQueueConfig, JobRetryPolicy, JobState, JobStore, LockKey, MAX_REPORTED_PENDING,
-    Queue, QueueDepthRefresh, STORAGE_KEY_PREFIX_LEN, ensure_claim_support, job_claim_path,
-    job_lock_key_index_path, job_pending_path, make_storage_key, parse_lock_key_index,
-    parse_not_before, queue_depth_refresh_loop, serialize_lock_key_index, should_cancel_claim,
+    ClaimCheck, ClaimMode, ClaimedJob, CompleteOutcome, DeadLetterRecord, Error, FailOutcome,
+    JOBS_ROOT, JobEnvelope, JobQueueConfig, JobRetryPolicy, JobState, JobStore, LockKey,
+    MAX_REPORTED_PENDING, Queue, QueueDepthRefresh, STORAGE_KEY_PREFIX_LEN, ensure_claim_support,
+    job_claim_path, job_lock_key_index_path, job_pending_path, make_storage_key,
+    parse_lock_key_index, parse_not_before, queue_depth_refresh_loop, serialize_lock_key_index,
+    should_cancel_claim,
 };
 use crate::metrics_provider;
-use crate::registry::test_utils::metadata_store_over;
+use crate::registry::{Error as RegistryError, test_utils::metadata_store_over};
 
 struct Harness {
     store: Arc<JobStore>,
@@ -1015,6 +1017,44 @@ async fn delete_pending_removes_record_and_index() {
         ),
         "deleting a consumed key is a stale 404",
     );
+}
+
+// =========================================================================
+// Handler-facing helpers
+// =========================================================================
+
+/// Neither a foreign kind nor a payload that does not decode can change on
+/// retry, so both must dead-letter at once.
+#[test]
+fn a_foreign_kind_or_undecodable_payload_is_terminal() {
+    let envelope = JobEnvelope::new(Queue::Cache, "cache.fetch_blob", "lock", &json!({"a": 1}))
+        .expect("envelope");
+    assert!(
+        envelope
+            .payload::<serde_json::Value>(&["cache.fetch_blob"])
+            .is_ok()
+    );
+    assert!(matches!(
+        envelope.payload::<serde_json::Value>(&["scan.image"]),
+        Err(Error::Terminal(_))
+    ));
+    assert!(matches!(
+        envelope.payload::<u32>(&["cache.fetch_blob"]),
+        Err(Error::Terminal(_))
+    ));
+}
+
+/// An authorization denial dead-letters; any other registry error is retried.
+#[test]
+fn only_a_denied_registry_error_is_terminal() {
+    assert!(matches!(
+        Error::from(RegistryError::Denied("forbidden".to_string())),
+        Error::Terminal(_)
+    ));
+    assert!(matches!(
+        Error::from(RegistryError::BlobUnknown),
+        Error::Execution(_)
+    ));
 }
 
 // =========================================================================

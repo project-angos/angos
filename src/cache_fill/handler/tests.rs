@@ -5,16 +5,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use angos_oci::Namespace;
 
-use crate::cache_fill::handler::{CACHE_ACTOR, CacheFillJobHandler, build_envelope, job_error};
+use crate::cache_fill::handler::{CACHE_ACTOR, CacheFillJobHandler, build_envelope};
 use crate::{
     event_webhook::{
         config::{DeliveryPolicy, EventWebhookConfig},
         dispatcher::EventDispatcher,
         event::EventKind,
     },
-    jobs::store::{Error as JobError, JobHandler},
+    jobs::store::JobHandler,
     registry::{
-        Error as RegistryError,
         repository_resolver::RepositoryResolver,
         test_utils::{FsTestStack, create_test_repositories, fs_test_stack, put_blob_body},
     },
@@ -82,20 +81,4 @@ async fn cache_fill_grant_emits_blob_push_with_internal_actor() {
         event["actor"]["internal"], CACHE_ACTOR,
         "cache-fill events must carry the internal actor; got {event}"
     );
-}
-
-#[test]
-fn job_error_preserves_denied_as_terminal() {
-    // An upstream denial stays terminal so the worker dead-letters it; any other
-    // registry error collapses to the retryable `Execution`.
-    assert!(matches!(
-        job_error(RegistryError::Denied(
-            "upstream forbade the fetch".to_string()
-        )),
-        JobError::Terminal(_)
-    ));
-    assert!(matches!(
-        job_error(RegistryError::BlobUnknown),
-        JobError::Execution(_)
-    ));
 }

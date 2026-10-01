@@ -23,8 +23,8 @@ use crate::{
         },
     },
     scan::{
-        SARIF_MEDIA_TYPE, ScanAction, ScanConfig, ScanImagePayload, ScanJobHandler, ScanSummary,
-        build_envelope, scan_reports,
+        SARIF_MEDIA_TYPE, ScanAction, ScanConfig, ScanImagePayload, ScanSummary, build_envelope,
+        handler::ScanJobHandler, scan_reports,
     },
 };
 use angos_secret::Secret;

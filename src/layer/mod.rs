@@ -12,25 +12,17 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     mem,
     path::Path,
-    sync::Arc,
 };
 
-use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha512};
-use tokio::runtime::Handle;
-use tokio_util::io::SyncIoBridge;
-use tracing::{debug, info};
 
 use angos_oci::{Content, Digest, Manifest};
 
-use crate::{
-    jobs::{
-        Queue,
-        store::{Error, JobEnvelope, JobHandler},
-    },
-    registry::{Error as RegistryError, blob_store::BlobStore, metadata_store::MetadataStore},
+use crate::jobs::{
+    Queue,
+    store::{Error, JobEnvelope},
 };
 
 pub use angos_inflate::{Checkpoint, Inflater};
@@ -1062,110 +1054,6 @@ pub fn extract_gzip<R: Read>(
     Ok(())
 }
 
-pub struct IndexLayerJobHandler {
-    blob_store: Arc<BlobStore>,
-    metadata_store: Arc<MetadataStore>,
-    limits: IndexLimits,
-}
-
-fn job_error(error: &RegistryError) -> Error {
-    Error::Execution(error.to_string())
-}
-
-impl IndexLayerJobHandler {
-    pub fn new(
-        blob_store: Arc<BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-        limits: IndexLimits,
-    ) -> Self {
-        Self {
-            blob_store,
-            metadata_store,
-            limits,
-        }
-    }
-
-    /// Indexes the layer unless a current listing already exists, or again
-    /// when `force`; a layer whose bytes are gone has nothing to index and the
-    /// job is done.
-    pub async fn index(&self, digest: &Digest, force: bool) -> Result<(), Error> {
-        if !force
-            && self
-                .metadata_store
-                .read_listing(digest)
-                .await
-                .map_err(|e| job_error(&e))?
-                .is_some_and(|listing| !listing.is_outdated())
-        {
-            return Ok(());
-        }
-        let (reader, _) = match self.blob_store.reader(digest, None).await {
-            Ok(reader) => reader,
-            Err(RegistryError::BlobUnknown) => {
-                debug!("Index of {digest} skipped: the layer is gone");
-                return Ok(());
-            }
-            Err(e) => return Err(job_error(&e)),
-        };
-        let limits = self.limits;
-        // Each chunk is stored as the walk passes it, so a layer's checkpoints
-        // never sit in memory whole.
-        let (runtime, store, layer) = (
-            Handle::current(),
-            self.metadata_store.clone(),
-            digest.clone(),
-        );
-        let store_chunk = move |chunk: usize, checkpoints: Vec<Checkpoint>| {
-            let checkpoints = Checkpoints::from_inflater(checkpoints);
-            runtime
-                .block_on(store.put_checkpoints(&layer, chunk, &checkpoints))
-                .map_err(io::Error::other)
-        };
-        let (listing, entries) = tokio::task::spawn_blocking(move || {
-            index_stream(SyncIoBridge::new(reader), limits, store_chunk)
-        })
-        .await
-        .map_err(|e| Error::Execution(format!("index task failed: {e}")))?
-        .map_err(|e| match e.kind() {
-            // The same bytes pass the same limits on every attempt.
-            io::ErrorKind::FileTooLarge => {
-                Error::Terminal(format!("layer {digest} is too large to index: {e}"))
-            }
-            _ => Error::Execution(format!("indexing layer {digest} failed: {e}")),
-        })?;
-        for (chunk, entries) in entries.chunks(CHUNK_ENTRIES).enumerate() {
-            self.metadata_store
-                .put_entries(digest, chunk, entries)
-                .await
-                .map_err(|e| job_error(&e))?;
-        }
-        let entries = entries.len();
-        self.metadata_store
-            .put_listing(digest, &listing)
-            .await
-            .map_err(|e| job_error(&e))?;
-        info!(
-            "Indexed layer {digest}: {entries} entries, {} checkpoint chunks",
-            listing.checkpoints.len()
-        );
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl JobHandler for IndexLayerJobHandler {
-    async fn execute(&self, envelope: &JobEnvelope) -> Result<(), Error> {
-        if envelope.kind != INDEX_LAYER_KIND {
-            return Err(Error::Execution(format!(
-                "unsupported job kind '{}'; expected '{INDEX_LAYER_KIND}'",
-                envelope.kind,
-            )));
-        }
-        let payload: IndexLayerPayload = serde_json::from_value(envelope.payload.clone())
-            .map_err(|e| Error::Execution(format!("failed to deserialize job payload: {e}")))?;
-        self.index(&payload.digest, payload.force).await
-    }
-}
-
+pub mod handler;
 #[cfg(test)]
 mod tests;

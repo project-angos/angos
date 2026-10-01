@@ -12,7 +12,6 @@ use crate::{
     cache_fill::build_envelope,
     event_webhook::event::{Event, EventActor},
     jobs::Queue,
-    metrics_provider::metrics_provider,
     registry::{
         Error, Registry, Repository,
         blob_ownership::promote_and_grant,
@@ -260,22 +259,12 @@ impl Registry {
     /// logged and counted but never bubbles up, so a scheduling glitch cannot
     /// degrade the client response.
     pub async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
-        // Build + enqueue as one fallible step so failures share the warn + metric path.
-        let outcome = match build_envelope(namespace, digest) {
-            Ok(envelope) => self
-                .job_queue
-                .enqueue(envelope)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(e) = outcome {
-            warn!("Failed to enqueue cache job for {digest}: {e}");
-            metrics_provider()
-                .job_queue_enqueue_failures_total
-                .with_label_values(&[Queue::Cache.as_str()])
-                .inc();
-        }
+        self.enqueue_best_effort(
+            Queue::Cache,
+            build_envelope(namespace, digest),
+            &format!("cache job for {digest}"),
+        )
+        .await;
     }
 
     async fn get_local_blob(

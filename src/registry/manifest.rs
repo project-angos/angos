@@ -17,7 +17,6 @@ use crate::{
     event_webhook::event::{Event, EventActor},
     jobs::Queue,
     layer,
-    metrics_provider::metrics_provider,
     policy::ImagePolicy,
     registry::{
         Error, Registry, Repository,
@@ -1311,9 +1310,7 @@ impl Registry {
                 .await?;
         }
 
-        let repository = resolved_repository
-            .map(|r| r.name.to_string())
-            .unwrap_or_default();
+        let repository = repository_name(resolved_repository);
 
         // Intent-first emission: a performed write can never go unnotified.
         let events = Event::put_manifest(
@@ -1375,21 +1372,12 @@ impl Registry {
             force: false,
             reported_before: None,
         };
-        let outcome = match scan::build_envelope(&payload) {
-            Ok(envelope) => self
-                .job_queue
-                .enqueue(envelope)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(error) = outcome {
-            warn!("Failed to dispatch scan job for {namespace}@{digest}: {error}");
-            metrics_provider()
-                .job_queue_enqueue_failures_total
-                .with_label_values(&[Queue::Scan.as_str()])
-                .inc();
-        }
+        self.enqueue_best_effort(
+            Queue::Scan,
+            scan::build_envelope(&payload),
+            &format!("scan job for {namespace}@{digest}"),
+        )
+        .await;
     }
 
     /// Replicates a push for the path tag plus each `?tag=` created tag, so a
@@ -1479,25 +1467,12 @@ impl Registry {
                     }
                 };
                 async move {
-                    // Build + enqueue as one fallible step so failures share the warn + metric path.
-                    let outcome = match build_envelope(&payload) {
-                        Ok(envelope) => self
-                            .job_queue
-                            .enqueue(envelope)
-                            .await
-                            .map_err(|e| e.to_string()),
-                        Err(e) => Err(e.to_string()),
-                    };
-                    if let Err(error) = outcome {
-                        warn!(
-                            "Failed to dispatch replication job for {}: {error}",
-                            downstream.name
-                        );
-                        metrics_provider()
-                            .job_queue_enqueue_failures_total
-                            .with_label_values(&[Queue::Replication.as_str()])
-                            .inc();
-                    }
+                    self.enqueue_best_effort(
+                        Queue::Replication,
+                        build_envelope(&payload),
+                        &format!("replication job for {}", downstream.name),
+                    )
+                    .await;
                 }
             });
         join_all(dispatches).await;

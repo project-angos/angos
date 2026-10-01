@@ -21,13 +21,13 @@ use crate::{
         runner::execute_one,
         store::{self as job_store, ClaimMode, JobHandler, JobRetryPolicy, JobStore},
     },
-    layer::{IndexLayerJobHandler, IndexLimits},
+    layer::{IndexLimits, handler::IndexLayerJobHandler},
     registry::{
         Registry, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationJobHandler,
-    scan::{ScanConfig, ScanJobHandler},
+    scan::{ScanConfig, handler::ScanJobHandler},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]

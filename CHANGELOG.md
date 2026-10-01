@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub deletes the expired reclamation markers it leaves, so the first push after a large scrub no longer reads each one.
 - A manifest push refuses a reference whose bytes a concurrent scrub reclaimed, instead of committing an image with a missing blob.
 - The metadata and job stores apply the S3 timeouts, retries and circuit breaker they inherit from `[blob_store.s3]`, and `[metadata_store.s3]` accepts them too.
+- A denied scan or index job, and any job whose kind or payload the worker cannot read, dead-letters at once instead of using up its retries.
 
 ## 1.12.1
 

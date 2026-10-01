@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, empty};
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use tokio_util::io::{StreamReader, SyncIoBridge};
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use angos_extension_service::{
     LayerEntries, LayerEntriesRequest, LayerFile, LayerFileDetails, LayerFileDetailsRequest,
@@ -24,7 +24,6 @@ use angos_oci::{Digest, Namespace};
 use crate::{
     jobs::Queue,
     layer::{self, Entry, IndexLayerPayload, Kind, Listing, elf, pem},
-    metrics_provider::metrics_provider,
     registry::{Error, Registry, angos_extension::layer_listing},
 };
 
@@ -321,21 +320,12 @@ impl Registry {
             digest: digest.clone(),
             force: false,
         };
-        let outcome = match layer::build_envelope(&payload) {
-            Ok(envelope) => self
-                .job_queue
-                .enqueue(envelope)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(error) = outcome {
-            warn!("Failed to dispatch index job for {namespace}@{digest}: {error}");
-            metrics_provider()
-                .job_queue_enqueue_failures_total
-                .with_label_values(&[Queue::Index.as_str()])
-                .inc();
-        }
+        self.enqueue_best_effort(
+            Queue::Index,
+            layer::build_envelope(&payload),
+            &format!("index job for {namespace}@{digest}"),
+        )
+        .await;
     }
 }
 

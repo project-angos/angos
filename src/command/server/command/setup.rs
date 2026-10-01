@@ -16,13 +16,13 @@ use crate::{
         runner::claim_loop,
         store::{self as job_store, ClaimMode, JobHandler, JobStore, QueueDepthRefresh},
     },
-    layer::{IndexLayerJobHandler, IndexLimits},
+    layer::{IndexLimits, handler::IndexLayerJobHandler},
     registry::{
         Registry, RegistryConfig, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationJobHandler,
-    scan::ScanJobHandler,
+    scan::handler::ScanJobHandler,
 };
 /// A built registry and what the server owns around it: the handle its
 /// queue-depth gauges refresh from when `[global.job_queue]` is configured,

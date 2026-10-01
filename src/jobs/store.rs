@@ -19,7 +19,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use tokio::{
     select, spawn,
     task::JoinHandle,
@@ -35,7 +35,7 @@ use angos_storage::{Error as StorageError, ObjectStore, Page};
 use crate::{
     jobs::{JobState, Queue},
     metrics_provider::metrics_provider,
-    registry::metadata_store::MetadataStore,
+    registry::{Error as RegistryError, metadata_store::MetadataStore},
 };
 
 pub const JOBS_ROOT: &str = "_jobs";
@@ -158,6 +158,17 @@ pub enum Error {
     /// instead of burning its retry budget.
     #[error("terminal failure: {0}")]
     Terminal(String),
+}
+
+/// A registry outcome as a job failure: an authorization denial cannot change,
+/// so it dead-letters on the spot; anything else is retried.
+impl From<RegistryError> for Error {
+    fn from(error: RegistryError) -> Self {
+        match error {
+            RegistryError::Denied(msg) => Error::Terminal(msg),
+            other => Error::Execution(other.to_string()),
+        }
+    }
 }
 
 impl From<StorageError> for Error {
@@ -358,6 +369,20 @@ impl JobEnvelope {
             max_attempts: None,
             payload: serde_json::to_value(payload).map_err(|e| Error::Execution(e.to_string()))?,
         })
+    }
+
+    /// The payload, for a handler accepting `kinds`. Neither a foreign kind nor
+    /// a payload that does not decode can change on retry, so both are
+    /// terminal.
+    pub fn payload<T: DeserializeOwned>(&self, kinds: &[&str]) -> Result<T, Error> {
+        if !kinds.contains(&self.kind.as_str()) {
+            return Err(Error::Terminal(format!(
+                "unsupported job kind '{}'; expected one of {kinds:?}",
+                self.kind
+            )));
+        }
+        serde_json::from_value(self.payload.clone())
+            .map_err(|e| Error::Terminal(format!("failed to deserialize job payload: {e}")))
     }
 }
 

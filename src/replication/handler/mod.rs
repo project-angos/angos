@@ -421,18 +421,10 @@ impl ReplicationJobHandler {
 #[async_trait]
 impl JobHandler for ReplicationJobHandler {
     async fn execute(&self, envelope: &JobEnvelope) -> Result<(), Error> {
-        if envelope.kind != REPLICATION_PUSH_MANIFEST_KIND
-            && envelope.kind != REPLICATION_DELETE_MANIFEST_KIND
-        {
-            return Err(Error::Execution(format!(
-                "unsupported job kind '{}'; expected one of '{REPLICATION_PUSH_MANIFEST_KIND}', \
-                 '{REPLICATION_DELETE_MANIFEST_KIND}'",
-                envelope.kind,
-            )));
-        }
-
-        let job: ReplicationJob = serde_json::from_value(envelope.payload.clone())
-            .map_err(|e| Error::Execution(format!("failed to deserialize job payload: {e}")))?;
+        let job: ReplicationJob = envelope.payload(&[
+            REPLICATION_PUSH_MANIFEST_KIND,
+            REPLICATION_DELETE_MANIFEST_KIND,
+        ])?;
 
         // Mesh cycles terminate at the mutation boundary: a mutation dispatches
         // replication only when local state actually changed, so the handler

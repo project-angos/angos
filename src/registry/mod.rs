@@ -1,6 +1,6 @@
 use std::{fmt, num::NonZeroUsize, sync::Arc};
 
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 pub mod admin;
 mod angos_extension;
@@ -30,7 +30,10 @@ use angos_oci::{Namespace, Reference, Tag};
 use crate::{
     configuration::RegexPattern,
     event_webhook::{dispatcher::EventDispatcher, event::Event},
-    jobs::store::JobStore,
+    jobs::{
+        Queue,
+        store::{Error as JobError, JobEnvelope, JobStore},
+    },
     metrics_provider::metrics_provider,
     registry::{
         blob_store::BlobStore, metadata_store::MetadataStore,
@@ -262,6 +265,28 @@ impl Registry {
     /// instead, so a request never resolves the same namespace twice.
     pub fn repository_name_for(&self, namespace: &Namespace) -> String {
         repository_name(self.get_repository_for_namespace(namespace).ok())
+    }
+
+    /// Fire-and-forget enqueue of the follow-up work a write dispatches: a
+    /// failure to build or enqueue `envelope` is logged and counted on
+    /// `queue`, never the client's problem.
+    async fn enqueue_best_effort(
+        &self,
+        queue: Queue,
+        envelope: Result<JobEnvelope, JobError>,
+        what: &str,
+    ) {
+        let outcome = match envelope {
+            Ok(envelope) => self.job_queue.enqueue(envelope).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
+            warn!("Failed to enqueue {what}: {error}");
+            metrics_provider()
+                .job_queue_enqueue_failures_total
+                .with_label_values(&[queue.as_str()])
+                .inc();
+        }
     }
 }
 
