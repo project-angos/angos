@@ -534,7 +534,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned blob content";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
             let repository = registry.get_repository_for_namespace(namespace).unwrap();
 
             let head_result = registry
@@ -587,7 +587,7 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test blob content";
 
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
             registry
                 .metadata_store()
                 .grant(namespace, &digest)
@@ -630,12 +630,11 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"referenced blob content";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
 
             // A live referring revision, whose per-referrer entry is what pins
             // the blob against the delete.
-            let manifest =
-                put_blob_direct(registry.metadata_store.object_store(), b"manifest").await;
+            let manifest = put_blob_direct(&registry.blob_store, b"manifest").await;
             seed_links(
                 &registry.metadata_store,
                 namespace,
@@ -683,7 +682,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"stale referenced blob";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
             let ownership = registry.metadata_store();
             ownership.grant(namespace, &digest).await.unwrap();
 
@@ -729,8 +728,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let parent =
-                put_blob_direct(registry.metadata_store.object_store(), b"index manifest").await;
+            let parent = put_blob_direct(&registry.blob_store, b"index manifest").await;
             // Every kind is backed only while a referring manifest's revision
             // resolves, so each case names `parent`.
             seed_links(
@@ -754,8 +752,7 @@ mod tests {
 
             for link in cases {
                 let content = format!("content for {link}").into_bytes();
-                let digest =
-                    put_blob_direct(registry.metadata_store.object_store(), &content).await;
+                let digest = put_blob_direct(&registry.blob_store, &content).await;
                 registry
                     .metadata_store()
                     .grant(namespace, &digest)
@@ -819,7 +816,7 @@ mod tests {
             let first = &Namespace::new("test-repo/first").unwrap();
             let second = &Namespace::new("test-repo/second").unwrap();
             let content = b"shared blob content";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
             let ownership = registry.metadata_store();
 
             ownership.grant(first, &digest).await.unwrap();
@@ -858,7 +855,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned delete content";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
 
             let result = registry
                 .handle_delete_blob(DeleteBlobRequest {

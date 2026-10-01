@@ -46,7 +46,7 @@ pub fn run_job_store(metadata_store: &MetadataStore, prefix: &str) -> Arc<JobSto
     // Maintenance runs never probe the backend, so claims go through the
     // unconditional `create_if_absent` mode.
     Arc::new(JobStore::new(
-        metadata_store.object_store().clone(),
+        metadata_store,
         format!("{prefix}-{}", Uuid::new_v4()),
         ClaimMode::Atomic,
     ))
@@ -120,7 +120,7 @@ impl Executor {
     #[must_use]
     pub fn new_for_test(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         let job_store = Arc::new(JobStore::new(
-            metadata_store.object_store().clone(),
+            &metadata_store,
             "scrub-test",
             ClaimMode::Atomic,
         ));
@@ -797,7 +797,8 @@ mod tests {
         registry::{
             metadata_store::{LinkKind, MetadataStore, Settings},
             test_utils::{
-                FSRegistryTestCase, RegistryTestCase, for_each_backend, put_blob_direct, seed_links,
+                FSRegistryTestCase, RegistryTestCase, for_each_backend, metadata_store_over,
+                put_blob_direct, seed_links,
             },
         },
         replication::REPLICATION_DELETE_MANIFEST_KIND,
@@ -811,7 +812,11 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let raw = Arc::new(StorageFsBackend::builder(dir.path()).build());
         (
-            Arc::new(JobStore::new(raw, worker_id, ClaimMode::Atomic)),
+            Arc::new(JobStore::new(
+                &metadata_store_over(raw),
+                worker_id,
+                ClaimMode::Atomic,
+            )),
             dir,
         )
     }
@@ -820,11 +825,9 @@ mod tests {
     async fn executor_dry_run_does_not_delete_blob() {
         for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
-            let metadata_store = test_case.metadata_store();
 
             let orphan_content = b"executor dry-run test";
-            let orphan_digest =
-                put_blob_direct(metadata_store.object_store(), orphan_content).await;
+            let orphan_digest = put_blob_direct(&blob_store, orphan_content).await;
 
             let sink = DryRunSink;
             sink.apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
@@ -846,8 +849,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             let orphan_content = b"executor real-run test";
-            let orphan_digest =
-                put_blob_direct(metadata_store.object_store(), orphan_content).await;
+            let orphan_digest = put_blob_direct(&blob_store, orphan_content).await;
 
             let executor = Executor::new_for_test(blob_store.clone(), metadata_store);
 
@@ -898,7 +900,7 @@ mod tests {
 
             // Grant first (as an upload does), then the bytes land before the
             // prune-emitted removal is applied.
-            let digest = put_blob_direct(metadata_store.object_store(), b"bytes landed late").await;
+            let digest = put_blob_direct(&blob_store, b"bytes landed late").await;
             metadata_store
                 .insert_reference(&namespace, &digest, &LinkKind::Blob(digest.clone()))
                 .await
@@ -971,8 +973,8 @@ mod tests {
 
             // A pushed layer: its per-referrer entry is backed while the
             // referring manifest's revision resolves.
-            let digest = put_blob_direct(metadata_store.object_store(), b"layer re-pushed").await;
-            let parent = put_blob_direct(metadata_store.object_store(), b"parent manifest").await;
+            let digest = put_blob_direct(&blob_store, b"layer re-pushed").await;
+            let parent = put_blob_direct(&blob_store, b"parent manifest").await;
             seed_links(
                 &metadata_store,
                 &namespace,
@@ -1020,7 +1022,7 @@ mod tests {
 
             // A reference entry whose referring revision does not resolve:
             // the dangling state scrub confirms before emitting the removal.
-            let digest = put_blob_direct(metadata_store.object_store(), b"dangling entry").await;
+            let digest = put_blob_direct(&blob_store, b"dangling entry").await;
             metadata_store
                 .insert_reference(&namespace, &digest, &LinkKind::ReferencedBy(digest.clone()))
                 .await
@@ -1103,7 +1105,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("test-repo/app").unwrap();
 
-            let digest = put_blob_direct(metadata_store.object_store(), b"grant-only blob").await;
+            let digest = put_blob_direct(&blob_store, b"grant-only blob").await;
             metadata_store
                 .insert_reference(&namespace, &digest, &LinkKind::Blob(digest.clone()))
                 .await
@@ -1147,8 +1149,8 @@ mod tests {
         let namespace = Namespace::new("test-repo/ci").unwrap();
         let tag = Tag::new("latest").unwrap();
 
-        let judged = put_blob_direct(metadata_store.object_store(), b"what retention judged").await;
-        let repushed = put_blob_direct(metadata_store.object_store(), b"what CI just pushed").await;
+        let judged = put_blob_direct(&blob_store, b"what retention judged").await;
+        let repushed = put_blob_direct(&blob_store, b"what CI just pushed").await;
         // Both in the past, so the delete's own tombstone outranks them.
         let pushed_at = Utc::now() - TimeDelta::seconds(10);
         for (digest, at) in [
@@ -1211,7 +1213,7 @@ mod tests {
         let namespace = Namespace::new("test-repo/mid-push").unwrap();
 
         let content = b"a platform manifest whose index has not landed yet";
-        let digest = put_blob_direct(metadata_store.object_store(), content).await;
+        let digest = put_blob_direct(&blob_store, content).await;
         seed_links(
             &metadata_store,
             &namespace,
@@ -1255,7 +1257,7 @@ mod tests {
     fn age(case: &FSRegistryTestCase, key: &str) {
         File::options()
             .write(true)
-            .open(case.temp_dir().path().join(key))
+            .open(case.metadata_root().join(key))
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(3600))
             .unwrap();
@@ -1264,7 +1266,7 @@ mod tests {
     /// An old untagged revision with only its own reference key.
     async fn old_revision(case: &FSRegistryTestCase, namespace: &Namespace) -> Digest {
         let metadata_store = case.metadata_store();
-        let digest = put_blob_direct(metadata_store.object_store(), b"an old manifest").await;
+        let digest = put_blob_direct(&case.blob_store(), b"an old manifest").await;
         let link = LinkKind::Digest(digest.clone());
         seed_links(
             &metadata_store,
@@ -1373,7 +1375,7 @@ mod tests {
 
             // Write manifest blob and create a digest link, then delete the blob.
             let content = b"orphan manifest content for missing-blob test";
-            let digest = put_blob_direct(metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&blob_store, content).await;
             seed_links(
                 &metadata_store,
                 &namespace,
@@ -1413,7 +1415,7 @@ mod tests {
             let namespace = Namespace::new("test-repo/app").unwrap();
 
             let content = b"orphan manifest with tag - missing blob";
-            let digest = put_blob_direct(metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&blob_store, content).await;
             seed_links(
                 &metadata_store,
                 &namespace,
@@ -1455,7 +1457,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             let content = b"blob that got ownership just in time";
-            let digest = put_blob_direct(metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&blob_store, content).await;
 
             metadata_store
                 .insert_reference(
@@ -1488,7 +1490,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             let namespace = Namespace::new("test-repo/app").unwrap();
-            let digest = put_blob_direct(metadata_store.object_store(), b"granted layer").await;
+            let digest = put_blob_direct(&blob_store, b"granted layer").await;
 
             let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
             executor
@@ -1556,10 +1558,8 @@ mod tests {
 
             let namespace = Namespace::new("test-repo/referrer-exec").unwrap();
 
-            let subject_digest =
-                put_blob_direct(metadata_store.object_store(), b"subject for referrer exec").await;
-            let referrer_digest =
-                put_blob_direct(metadata_store.object_store(), b"referrer for referrer exec").await;
+            let subject_digest = put_blob_direct(&blob_store, b"subject for referrer exec").await;
+            let referrer_digest = put_blob_direct(&blob_store, b"referrer for referrer exec").await;
 
             seed_links(
                 &metadata_store,

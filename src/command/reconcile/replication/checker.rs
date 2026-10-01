@@ -375,13 +375,14 @@ mod tests {
     async fn enqueues_push_for_tag_missing_on_downstream() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        let manifest = put_blob_direct(&store, b"manifest-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"manifest-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -420,14 +421,15 @@ mod tests {
         // `.expect(1)` asserts it on `MockServer` drop.
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let content = Namespace::new("nginx/app").unwrap();
-        let manifest = put_blob_direct(&store, b"manifest-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"manifest-bytes").await;
         seed_links(
             &metadata_store,
             &content,
@@ -473,7 +475,6 @@ mod tests {
         // `.expect(1)` on each asserts it.
         let FsTestStack {
             dir: _dir,
-            store,
             metadata_store,
             blob_store,
         } = fs_test_stack();
@@ -481,7 +482,7 @@ mod tests {
 
         let content = Namespace::new("nginx/app").unwrap();
         // `v1` converges; `stray` is downstream-only and must be pruned.
-        let manifest = put_blob_direct(&store, b"converged-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"converged-bytes").await;
         seed_links(
             &metadata_store,
             &content,
@@ -520,7 +521,7 @@ mod tests {
             true,
         ));
         let job_store = Arc::new(JobStore::new(
-            metadata_store.object_store().clone(),
+            &metadata_store,
             "scrub-test",
             ClaimMode::Atomic,
         ));
@@ -567,13 +568,14 @@ mod tests {
     async fn transient_head_failure_skips_tag_without_enqueuing() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        let manifest = put_blob_direct(&store, b"manifest-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"manifest-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -643,15 +645,16 @@ mod tests {
     async fn enqueue_failure_does_not_abort_remaining_tags() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         for tag in ["v1", "v2"] {
             let body = format!("manifest-{tag}");
-            let manifest = put_blob_direct(&store, body.as_bytes()).await;
+            let manifest = put_blob_direct(&blob_store, body.as_bytes()).await;
             seed_links(
                 &metadata_store,
                 &namespace(),
@@ -742,13 +745,14 @@ mod tests {
     async fn no_action_when_downstream_digest_matches() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        let manifest = put_blob_direct(&store, b"converged-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"converged-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -787,13 +791,14 @@ mod tests {
     async fn enqueues_push_when_downstream_digest_diverges() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        let manifest = put_blob_direct(&store, b"new-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"new-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -837,13 +842,14 @@ mod tests {
         // The probe phase fans out, so no tag may be dropped by the concurrency.
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        let manifest = put_blob_direct(&store, b"new-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"new-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -894,13 +900,14 @@ mod tests {
     async fn enqueues_delete_for_downstream_only_tag() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        let manifest = put_blob_direct(&store, b"converged-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"converged-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -952,14 +959,15 @@ mod tests {
     async fn prune_rechecks_live_state_and_spares_a_tag_pushed_after_the_walk() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         // `fresh` was pushed locally after the reconcile walk read the tags.
-        let manifest = put_blob_direct(&store, b"fresh-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"fresh-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -1014,13 +1022,14 @@ mod tests {
     async fn no_delete_when_prune_disabled() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        let manifest = put_blob_direct(&store, b"converged-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"converged-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -1086,13 +1095,15 @@ mod tests {
     #[tokio::test]
     async fn unreadable_local_tag_is_skipped_but_never_pruned() {
         let FsTestStack {
-            dir: _dir, store, ..
+            dir: _dir,
+            metadata_store,
+            ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let tag = Tag::new("broken").unwrap();
         let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
-            store,
+            metadata_store.object_store().clone(),
             FailTagResolution {
                 dir: namespace().tag_entry_dir(&tag),
             },
@@ -1129,12 +1140,13 @@ mod tests {
     async fn skips_event_only_downstream() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
 
-        let manifest = put_blob_direct(&store, b"event-only-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"event-only-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -1164,13 +1176,14 @@ mod tests {
     async fn enqueues_push_for_reconcile_only_downstream() {
         let FsTestStack {
             dir: _dir,
-            store,
+
             metadata_store,
+            blob_store,
             ..
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
-        let manifest = put_blob_direct(&store, b"reconcile-only-bytes").await;
+        let manifest = put_blob_direct(&blob_store, b"reconcile-only-bytes").await;
         seed_links(
             &metadata_store,
             &namespace(),
@@ -1270,14 +1283,13 @@ mod tests {
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
         let FsTestStack {
             dir: _dir,
-            store,
             metadata_store,
             blob_store,
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, config_digest, layer_digest) =
-            seed_manifest(&store, &metadata_store, &namespace()).await;
+            seed_manifest(&blob_store, &metadata_store, &namespace()).await;
 
         mount_out_of_sync_downstream(
             &mock_server,
@@ -1294,7 +1306,7 @@ mod tests {
         ));
 
         let job_store = Arc::new(JobStore::new(
-            metadata_store.object_store().clone(),
+            &metadata_store,
             "scrub-test",
             ClaimMode::Atomic,
         ));
@@ -1380,14 +1392,13 @@ mod tests {
     async fn scrub_replicate_deletes_downstream_only_tag() {
         let FsTestStack {
             dir: _dir,
-            store,
             metadata_store,
             blob_store,
         } = fs_test_stack();
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, _config_digest, _layer_digest) =
-            seed_manifest(&store, &metadata_store, &namespace()).await;
+            seed_manifest(&blob_store, &metadata_store, &namespace()).await;
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1417,7 +1428,7 @@ mod tests {
             true,
         ));
         let job_store = Arc::new(JobStore::new(
-            metadata_store.object_store().clone(),
+            &metadata_store,
             "scrub-test",
             ClaimMode::Atomic,
         ));

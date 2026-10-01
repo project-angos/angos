@@ -231,7 +231,6 @@ async fn execute_rejects_unknown_kind() {
     metrics_provider::init_for_tests();
     let FsTestStack {
         dir: _dir,
-        store: _,
         metadata_store,
         blob_store,
     } = fs_test_stack();
@@ -267,7 +266,6 @@ async fn execute_errors_on_removed_downstream() {
     metrics_provider::init_for_tests();
     let FsTestStack {
         dir: _dir,
-        store: _,
         metadata_store,
         blob_store,
     } = fs_test_stack();
@@ -302,13 +300,16 @@ async fn execute_pushes_manifest_with_head_before_put() {
 
     let FsTestStack {
         dir: _dir,
-        store,
         metadata_store,
         blob_store,
     } = fs_test_stack();
 
-    let (manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
+    let (manifest_digest, config_digest, layer_digest) = seed_manifest(
+        &blob_store,
+        &metadata_store,
+        &Namespace::new(NAMESPACE).unwrap(),
+    )
+    .await;
 
     // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
     mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
@@ -345,13 +346,16 @@ async fn execute_maps_downstream_403_to_terminal() {
 
     let FsTestStack {
         dir: _dir,
-        store,
         metadata_store,
         blob_store,
     } = fs_test_stack();
 
-    let (_manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
+    let (_manifest_digest, config_digest, layer_digest) = seed_manifest(
+        &blob_store,
+        &metadata_store,
+        &Namespace::new(NAMESPACE).unwrap(),
+    )
+    .await;
 
     mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     Mock::given(method("PUT"))
@@ -383,7 +387,6 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
 
     let FsTestStack {
         dir: _dir,
-        store,
         metadata_store,
         blob_store,
     } = fs_test_stack();
@@ -391,7 +394,7 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
     let local_namespace = Namespace::new("nginx/app").unwrap();
     let mapped = "mirror/app";
     let (manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, &local_namespace).await;
+        seed_manifest(&blob_store, &metadata_store, &local_namespace).await;
 
     // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
     mount_blob_upload_accepted(&mock_server, mapped, &[&config_digest, &layer_digest]).await;
@@ -443,13 +446,16 @@ async fn execute_skips_blob_present_on_downstream() {
 
     let FsTestStack {
         dir: _dir,
-        store,
         metadata_store,
         blob_store,
     } = fs_test_stack();
 
-    let (manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
+    let (manifest_digest, config_digest, layer_digest) = seed_manifest(
+        &blob_store,
+        &metadata_store,
+        &Namespace::new(NAMESPACE).unwrap(),
+    )
+    .await;
 
     // Both blobs already present (200 on HEAD) -> NO upload sequence at all.
     mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
@@ -486,13 +492,16 @@ async fn execute_push_stamps_resolved_source_timestamp() {
 
     let FsTestStack {
         dir: _dir,
-        store,
         metadata_store,
         blob_store,
     } = fs_test_stack();
 
-    let (manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
+    let (manifest_digest, config_digest, layer_digest) = seed_manifest(
+        &blob_store,
+        &metadata_store,
+        &Namespace::new(NAMESPACE).unwrap(),
+    )
+    .await;
 
     let expected_ts = metadata_store
         .read_link(
@@ -544,7 +553,6 @@ async fn execute_delete_manifest_calls_downstream_delete() {
 
     let FsTestStack {
         dir: _dir,
-        store: _,
         metadata_store,
         blob_store,
     } = fs_test_stack();
@@ -570,13 +578,16 @@ async fn handler_with_downstream(
 ) -> (ReplicationJobHandler, Digest, Digest, TempDir) {
     let FsTestStack {
         dir,
-        store,
         metadata_store,
         blob_store,
     } = fs_test_stack();
 
-    let (_manifest_digest, config_digest, layer_digest) =
-        seed_manifest(&store, &metadata_store, &Namespace::new(NAMESPACE).unwrap()).await;
+    let (_manifest_digest, config_digest, layer_digest) = seed_manifest(
+        &blob_store,
+        &metadata_store,
+        &Namespace::new(NAMESPACE).unwrap(),
+    )
+    .await;
 
     let resolver = single_repo_resolver(
         REPO,
@@ -740,7 +751,6 @@ async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
 
     let FsTestStack {
         dir: _dir,
-        store: _,
         metadata_store,
         blob_store,
     } = fs_test_stack();
@@ -787,7 +797,6 @@ async fn execute_tagless_push_with_deleted_revision_is_noop_success() {
 
     let FsTestStack {
         dir: _dir,
-        store: _,
         metadata_store,
         blob_store,
     } = fs_test_stack();

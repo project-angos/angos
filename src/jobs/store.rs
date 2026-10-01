@@ -35,6 +35,7 @@ use angos_storage::{Error as StorageError, ObjectStore, Page};
 use crate::{
     jobs::{JobState, Queue},
     metrics_provider::metrics_provider,
+    registry::metadata_store::MetadataStore,
 };
 
 pub const JOBS_ROOT: &str = "_jobs";
@@ -183,7 +184,8 @@ pub enum ClaimMode {
 /// second create fails is [`ClaimMode::Atomic`], one that accepts it degrades to
 /// [`ClaimMode::Advisory`], since claims are an efficiency mechanism and
 /// correctness rests on handler idempotency. Probe IO errors fail startup.
-pub async fn ensure_claim_support(store: &Arc<dyn ObjectStore>) -> Result<ClaimMode, Error> {
+pub async fn ensure_claim_support(metadata_store: &MetadataStore) -> Result<ClaimMode, Error> {
+    let store = metadata_store.object_store();
     let key = format!("{JOBS_ROOT}/claims/.probe-{}", Uuid::new_v4());
     let first = store
         .create_if_absent(&key, Bytes::from_static(b"probe"))
@@ -583,20 +585,26 @@ pub struct JobStore {
 }
 
 impl JobStore {
-    /// Construct a `JobStore` with the default retry policy. `worker_id` is a
+    /// Construct a `JobStore` over the metadata store's backend, which the
+    /// queue always shares, with the default retry policy. `worker_id` is a
     /// structured-log tag (empty for producer-only instances) and `claim_mode`
     /// comes from [`ensure_claim_support`].
     pub fn new(
-        store: Arc<dyn ObjectStore>,
+        metadata_store: &MetadataStore,
         worker_id: impl Into<String>,
         claim_mode: ClaimMode,
     ) -> Self {
-        Self::with_retry_policy(store, worker_id, claim_mode, JobRetryPolicy::default())
+        Self::with_retry_policy(
+            metadata_store,
+            worker_id,
+            claim_mode,
+            JobRetryPolicy::default(),
+        )
     }
 
     /// [`Self::new`] with an operator-configured retry policy.
     pub fn with_retry_policy(
-        store: Arc<dyn ObjectStore>,
+        metadata_store: &MetadataStore,
         worker_id: impl Into<String>,
         claim_mode: ClaimMode,
         retry: JobRetryPolicy,
@@ -608,7 +616,7 @@ impl JobStore {
             )
         };
         Self {
-            store,
+            store: metadata_store.object_store().clone(),
             worker_id: worker_id.into(),
             claim_mode,
             retry_backoff: backoff(),

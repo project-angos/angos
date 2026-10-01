@@ -556,7 +556,7 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
         .await
         .unwrap();
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -691,7 +691,7 @@ async fn an_older_listing_is_served_and_walked_again() {
         .unwrap();
 
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -774,13 +774,14 @@ async fn the_file_endpoint_serves_a_range() {
     // Without its chunk the read would still succeed, decoding from the start.
     assert!(
         stack
-            .store
+            .metadata_store
+            .object_store()
             .exists(&digest.layer_checkpoints_path(0))
             .await
             .unwrap()
     );
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -886,7 +887,7 @@ async fn a_file_is_found_across_entry_chunks() {
         .expect("a listing");
     assert_eq!(listing.chunks.len(), 3);
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -1104,7 +1105,7 @@ async fn details_describe_binaries_and_certificates() {
     .await
     .unwrap();
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -1152,9 +1153,10 @@ async fn a_push_enqueues_an_index_job_per_tar_layer_of_an_indexing_repository() 
 
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (_, config, layer) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (_, config, layer) =
+        seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -1217,7 +1219,7 @@ async fn the_entries_endpoint_fills_the_cache_of_a_pull_through_layer() {
         .mount(&upstream)
         .await;
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "fill-test",
         ClaimMode::Atomic,
     ));

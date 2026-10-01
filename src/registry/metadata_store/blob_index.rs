@@ -428,9 +428,9 @@ mod tests {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("parallel-mixed-ns").unwrap();
 
-            let digest_a = put_blob_direct(m.object_store(), b"content-a").await;
-            let digest_b = put_blob_direct(m.object_store(), b"content-b").await;
-            let digest_c = put_blob_direct(m.object_store(), b"content-c").await;
+            let digest_a = put_blob_direct(&test_case.blob_store(), b"content-a").await;
+            let digest_b = put_blob_direct(&test_case.blob_store(), b"content-b").await;
+            let digest_c = put_blob_direct(&test_case.blob_store(), b"content-c").await;
 
             create_link(
                 &m,
@@ -512,7 +512,7 @@ mod tests {
 
             let mut digests = Vec::new();
             for i in 0..4 {
-                let digest = put_blob_direct(m.object_store(), format!("content-{i}").as_bytes()).await;
+                let digest = put_blob_direct(&test_case.blob_store(), format!("content-{i}").as_bytes()).await;
                 digests.push(digest);
             }
 
@@ -567,11 +567,12 @@ mod tests {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("tracked-duplicate-layer-ns").unwrap();
 
-            let layer_digest = put_blob_direct(m.object_store(), b"layer listed twice").await;
+            let layer_digest =
+                put_blob_direct(&test_case.blob_store(), b"layer listed twice").await;
             let first_manifest_digest =
-                put_blob_direct(m.object_store(), b"manifest c content").await;
+                put_blob_direct(&test_case.blob_store(), b"manifest c content").await;
             let second_manifest_digest =
-                put_blob_direct(m.object_store(), b"manifest d content").await;
+                put_blob_direct(&test_case.blob_store(), b"manifest d content").await;
 
             m.pin_references(
                 namespace,
@@ -612,10 +613,12 @@ mod tests {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("shared-config-delete-ns").unwrap();
 
-            let config_digest = put_blob_direct(m.object_store(), b"shared config bytes").await;
-            let first_manifest = put_blob_direct(m.object_store(), b"first sharing manifest").await;
+            let config_digest =
+                put_blob_direct(&test_case.blob_store(), b"shared config bytes").await;
+            let first_manifest =
+                put_blob_direct(&test_case.blob_store(), b"first sharing manifest").await;
             let second_manifest =
-                put_blob_direct(m.object_store(), b"second sharing manifest").await;
+                put_blob_direct(&test_case.blob_store(), b"second sharing manifest").await;
 
             for manifest in [&first_manifest, &second_manifest] {
                 m.pin_references(
@@ -672,12 +675,13 @@ mod tests {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("mixed-tracked-untracked-ns").unwrap();
 
-            let tag_digest = put_blob_direct(m.object_store(), b"tag content").await;
-            let layer_digest = put_blob_direct(m.object_store(), b"layer content mixed").await;
+            let tag_digest = put_blob_direct(&test_case.blob_store(), b"tag content").await;
+            let layer_digest =
+                put_blob_direct(&test_case.blob_store(), b"layer content mixed").await;
             let digest_link_digest =
-                put_blob_direct(m.object_store(), b"digest link content").await;
+                put_blob_direct(&test_case.blob_store(), b"digest link content").await;
             let manifest_digest =
-                put_blob_direct(m.object_store(), b"manifest content mixed").await;
+                put_blob_direct(&test_case.blob_store(), b"manifest content mixed").await;
 
             seed_links(
                 &m,
@@ -756,7 +760,7 @@ mod tests {
             let m = test_case.metadata_store();
             let other_ns = &Namespace::new("other-ns").unwrap();
             let my_ns = &Namespace::new("my-ns").unwrap();
-            let digest = put_blob_direct(m.object_store(), b"shared content").await;
+            let digest = put_blob_direct(&test_case.blob_store(), b"shared content").await;
 
             let other_tag = LinkKind::Tag(Tag::new("stable").unwrap());
             create_link(&m, other_ns, &other_tag, &digest).await;

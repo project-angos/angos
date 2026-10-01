@@ -332,8 +332,8 @@ mod tests {
         for_each_backend(async |test_case| {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("test-update-links").unwrap();
-            let digest1 = put_blob_direct(m.object_store(), b"content1").await;
-            let digest2 = put_blob_direct(m.object_store(), b"content2").await;
+            let digest1 = put_blob_direct(&test_case.blob_store(), b"content1").await;
+            let digest2 = put_blob_direct(&test_case.blob_store(), b"content2").await;
 
             let tag = LinkKind::Tag(Tag::new("v1").unwrap());
             let revision = LinkKind::Digest(digest2.clone());
@@ -379,7 +379,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let m = test_case.metadata_store();
             let namespace = Namespace::new("media-type-test").unwrap();
-            let digest = put_blob_direct(m.object_store(), b"test content").await;
+            let digest = put_blob_direct(&test_case.blob_store(), b"test content").await;
             let recorded =
                 MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap();
 

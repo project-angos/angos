@@ -972,7 +972,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let digest = put_blob_direct(m.object_store(), b"test blob content").await;
+            let digest = put_blob_direct(&test_case.blob_store(), b"test blob content").await;
 
             let tags = ["latest", "v1.0", "v2.0"];
             for tag in tags {
@@ -1052,7 +1052,7 @@ mod tests {
 
             let mut digests = Vec::new();
             for content in &manifest_contents {
-                let digest = put_blob_direct(m.object_store(), content).await;
+                let digest = put_blob_direct(&test_case.blob_store(), content).await;
                 digests.push(digest.clone());
 
                 let digest_link = LinkKind::Digest(digest.clone());

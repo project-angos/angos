@@ -190,9 +190,9 @@ pub async fn build_registry(
     // the loops spawned here drain it until the server stops them.
     let (job_store, depth_refresh, in_process_loops) =
         if let Some(jq_config) = &config.global.job_queue {
-            let claim_mode = job_store::ensure_claim_support(metadata_store.object_store()).await?;
+            let claim_mode = job_store::ensure_claim_support(&metadata_store).await?;
             let job_store: Arc<JobStore> = Arc::new(JobStore::with_retry_policy(
-                metadata_store.object_store().clone(),
+                &metadata_store,
                 "server",
                 claim_mode,
                 jq_config.retry_policy(),
@@ -206,7 +206,7 @@ pub async fn build_registry(
         } else {
             // Atomic mode: in-process draining runs no startup probe to pick one.
             let job_store: Arc<JobStore> = Arc::new(JobStore::new(
-                metadata_store.object_store().clone(),
+                &metadata_store,
                 "in-process",
                 ClaimMode::Atomic,
             ));
@@ -301,6 +301,7 @@ mod tests {
         metrics_provider::init_for_tests,
         registry::{
             Registry, RegistryConfig, Repository,
+            blob_store::BlobStore,
             manifest::DispatchTarget,
             metadata_store::MetadataStore,
             test_utils::{
@@ -318,6 +319,7 @@ mod tests {
     /// without `[global.job_queue]`.
     struct InProcessStack {
         registry: Arc<Registry>,
+        blob_store: Arc<BlobStore>,
         job_store: Arc<JobStore>,
         metadata_store: Arc<MetadataStore>,
         _loops: InProcessLoops,
@@ -328,13 +330,12 @@ mod tests {
         init_for_tests();
         let FsTestStack {
             dir,
-            store: _,
             metadata_store,
             blob_store,
         } = fs_test_stack();
         let resolver = single_repo_resolver(REPO, repository);
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(
-            metadata_store.object_store().clone(),
+            &metadata_store,
             "in-process",
             ClaimMode::Atomic,
         ));
@@ -352,13 +353,14 @@ mod tests {
             GlobalConfig::default().index_limits(),
         );
         let registry = Registry::new(
-            blob_store,
+            blob_store.clone(),
             metadata_store.clone(),
             resolver,
             RegistryConfig::new(job_store.clone()),
         );
         InProcessStack {
             registry,
+            blob_store,
             job_store,
             metadata_store,
             _loops: loops,
@@ -376,12 +378,8 @@ mod tests {
         let stack = build_stack(repository_with_downstream(REPO, client));
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
-        let (manifest_digest, config_digest, layer_digest) = seed_manifest(
-            stack.metadata_store.object_store(),
-            &stack.metadata_store,
-            &namespace,
-        )
-        .await;
+        let (manifest_digest, config_digest, layer_digest) =
+            seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
 
         for blob in [&config_digest, &layer_digest] {
             Mock::given(method("HEAD"))

@@ -79,7 +79,6 @@ impl FsRegistryFixture {
 
         let FsTestStack {
             dir,
-            store: _,
             metadata_store,
             blob_store,
         } = fs_test_stack();
@@ -567,8 +566,7 @@ async fn mount_emits_blob_push_event() {
     let source = &Namespace::new("test-repo/source").unwrap();
     let target = &Namespace::new("test-repo/target").unwrap();
 
-    let digest =
-        put_blob_direct(fixture.registry.metadata_store.object_store(), b"mountable").await;
+    let digest = put_blob_direct(&fixture.registry.blob_store, b"mountable").await;
     fixture
         .registry
         .metadata_store
@@ -618,8 +616,7 @@ async fn mount_fallback_still_emits_intent_event() {
     let target = &Namespace::new("test-repo/target").unwrap();
 
     // Present but unowned by `source`, so the mount falls back to a session.
-    let digest =
-        put_blob_direct(fixture.registry.metadata_store.object_store(), b"not owned").await;
+    let digest = put_blob_direct(&fixture.registry.blob_store, b"not owned").await;
     let mount = BlobMount {
         digest: digest.clone(),
         from: Some(source.clone()),
@@ -712,13 +709,13 @@ impl ReplicationFixture {
     fn with_repository(repository: Repository) -> Self {
         let FsTestStack {
             dir,
-            store,
             metadata_store,
             blob_store,
         } = fs_test_stack();
         let resolver = single_repo_resolver(REPLICATION_REPO, repository);
 
-        let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test", ClaimMode::Atomic));
+        let job_store: Arc<JobStore> =
+            Arc::new(JobStore::new(&metadata_store, "test", ClaimMode::Atomic));
 
         let config = RegistryConfig::new(job_store.clone());
         let registry = Registry::new(blob_store, metadata_store, resolver, config);

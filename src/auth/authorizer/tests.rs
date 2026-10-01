@@ -764,8 +764,7 @@ async fn authorize_mount_source_requires_read_on_the_source() {
         let source = &Namespace::new("test-repo/source").unwrap();
         let content = b"mount authorization blob";
 
-        let metadata_store = test_case.metadata_store();
-        let digest = put_blob_direct(metadata_store.object_store(), content).await;
+        let digest = put_blob_direct(&test_case.blob_store(), content).await;
         registry
             .metadata_store()
             .grant(source, &digest)

@@ -1799,7 +1799,7 @@ mod tests {
     /// listing must discover an upload-only namespace there.
     #[tokio::test]
     async fn namespaces_info_finds_upload_only_namespace_across_split_backends() {
-        let test_case = FSRegistryTestCase::with_split_backends();
+        let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
 
         let namespace = Namespace::new("test-repo/upload-only").unwrap();

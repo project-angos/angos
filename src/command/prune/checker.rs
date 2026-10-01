@@ -949,7 +949,7 @@ mod tests {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
-            let digest = put_blob_direct(metadata_store.object_store(), TEST_MANIFEST).await;
+            let digest = put_blob_direct(&test_case.blob_store(), TEST_MANIFEST).await;
 
             seed_links(
                 &metadata_store,
@@ -997,7 +997,7 @@ mod tests {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
-            let digest = put_blob_direct(metadata_store.object_store(), TEST_MANIFEST).await;
+            let digest = put_blob_direct(&test_case.blob_store(), TEST_MANIFEST).await;
 
             seed_links(
                 &metadata_store,
@@ -1038,8 +1038,8 @@ mod tests {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let metadata_store = test_case.metadata_store();
 
-            let child_digest = put_blob_direct(metadata_store.object_store(), TEST_MANIFEST).await;
-            let index_digest = put_blob_direct(metadata_store.object_store(), TEST_INDEX).await;
+            let child_digest = put_blob_direct(&test_case.blob_store(), TEST_MANIFEST).await;
+            let index_digest = put_blob_direct(&test_case.blob_store(), TEST_INDEX).await;
 
             setup_index_scenario(&metadata_store, &namespace, &index_digest, &child_digest).await;
 
@@ -1162,8 +1162,7 @@ mod tests {
     /// cannot catch a read of the wrong store.
     #[tokio::test]
     async fn index_child_collected_in_the_same_pass_across_split_backends() {
-        assert_index_and_child_collected_in_one_pass(&FSRegistryTestCase::with_split_backends())
-            .await;
+        assert_index_and_child_collected_in_one_pass(&FSRegistryTestCase::new()).await;
     }
 
     /// A referrer body naming `subject`, salted until its digest lists before
@@ -1418,10 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn subject_and_referrer_collected_in_the_same_pass_across_split_backends() {
-        assert_subject_and_referrer_collected_in_one_pass(
-            &FSRegistryTestCase::with_split_backends(),
-        )
-        .await;
+        assert_subject_and_referrer_collected_in_one_pass(&FSRegistryTestCase::new()).await;
     }
 
     #[tokio::test]
@@ -1532,7 +1528,7 @@ mod tests {
                 .expect("test repositories must not have overlapping prefixes"),
         );
         let job_store = Arc::new(JobStore::new(
-            metadata_store.object_store().clone(),
+            &metadata_store,
             "retention-test",
             ClaimMode::Atomic,
         ));
@@ -1602,8 +1598,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             // First revision: deleted blob, so the executor hits a missing one.
-            let digest_missing =
-                put_blob_direct(metadata_store.object_store(), TEST_MANIFEST).await;
+            let digest_missing = put_blob_direct(&blob_store, TEST_MANIFEST).await;
             seed_links(
                 &metadata_store,
                 &namespace,
@@ -1616,7 +1611,7 @@ mod tests {
             .unwrap();
             blob_store.delete_blob(&digest_missing).await.unwrap();
 
-            let digest_healthy = put_blob_direct(metadata_store.object_store(), TEST_INDEX).await;
+            let digest_healthy = put_blob_direct(&blob_store, TEST_INDEX).await;
             seed_links(
                 &metadata_store,
                 &namespace,
@@ -1866,8 +1861,7 @@ mod tests {
         namespace: &Namespace,
     ) -> Digest {
         let metadata_store = test_case.metadata_store();
-        let blob =
-            put_blob_direct(metadata_store.object_store(), b"granted-but-unreferenced").await;
+        let blob = put_blob_direct(&test_case.blob_store(), b"granted-but-unreferenced").await;
         metadata_store
             .insert_reference(namespace, &blob, &LinkKind::Blob(blob.clone()))
             .await
@@ -1897,7 +1891,7 @@ mod tests {
         let week_ago = SystemTime::now() - StdDuration::from_hours(24 * 7);
         File::options()
             .write(true)
-            .open(test_case.temp_dir().path().join(blob.blob_path()))
+            .open(test_case.blob_root().join(blob.blob_path()))
             .unwrap()
             .set_times(FileTimes::new().set_modified(week_ago))
             .unwrap();

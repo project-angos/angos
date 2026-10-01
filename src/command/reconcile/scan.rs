@@ -222,7 +222,8 @@ mod tests {
 
     /// An image with a revision record, which the walk is over.
     async fn seed_image(stack: &FsTestStack, namespace: &Namespace) -> Digest {
-        let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, namespace).await;
+        let (image, _, _) =
+            seed_manifest(&stack.blob_store, &stack.metadata_store, namespace).await;
         seed_links(
             &stack.metadata_store,
             namespace,
@@ -370,7 +371,7 @@ mod tests {
         stack.metadata_store.index_namespace(&namespace).await;
         seed_report(&stack, &namespace, &image, Utc::now() - TimeDelta::days(2)).await;
         let job_store = Arc::new(JobStore::new(
-            stack.store.clone(),
+            &stack.metadata_store,
             "reconcile-test",
             ClaimMode::Atomic,
         ));

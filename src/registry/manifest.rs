@@ -3870,7 +3870,7 @@ mod tests {
     /// store, where reads look, and not in the metadata store.
     #[tokio::test]
     async fn manifest_blob_lives_in_blob_store_with_split_backends() {
-        let test_case = FSRegistryTestCase::with_split_backends();
+        let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
         let namespace = Namespace::new("split-repo").unwrap();
 
@@ -5037,7 +5037,6 @@ mod tests {
         fn build_registry() -> (Arc<Registry>, Arc<JobStore>, TempDir) {
             let FsTestStack {
                 dir,
-                store,
                 metadata_store,
                 blob_store,
             } = fs_test_stack();
@@ -5047,7 +5046,7 @@ mod tests {
             );
 
             let job_store: Arc<JobStore> =
-                Arc::new(JobStore::new(store, "test", ClaimMode::Atomic));
+                Arc::new(JobStore::new(&metadata_store, "test", ClaimMode::Atomic));
 
             let config = RegistryConfig::new(job_store.clone());
             let registry = Registry::new(blob_store, metadata_store, resolver, config);
@@ -5666,7 +5665,6 @@ mod tests {
         fn build_registry_with(repository: Repository) -> (Arc<Registry>, Arc<JobStore>, TempDir) {
             let FsTestStack {
                 dir,
-                store,
                 metadata_store,
                 blob_store,
             } = fs_test_stack();
@@ -5674,7 +5672,7 @@ mod tests {
 
             // No drain spawned: the bare JobStore only persists envelopes; these tests assert enqueue only.
             let job_store: Arc<JobStore> =
-                Arc::new(JobStore::new(store, "test", ClaimMode::Atomic));
+                Arc::new(JobStore::new(&metadata_store, "test", ClaimMode::Atomic));
 
             let config = RegistryConfig::new(job_store.clone());
             let registry = Registry::new(blob_store, metadata_store, resolver, config);

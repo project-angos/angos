@@ -45,7 +45,6 @@ async fn cache_fill_grant_emits_blob_push_with_internal_actor() {
 
     let FsTestStack {
         dir: _dir,
-        store: _,
         metadata_store,
         blob_store,
     } = fs_test_stack();

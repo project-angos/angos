@@ -79,7 +79,7 @@ async fn a_scan_job_attaches_one_report_and_reruns_as_a_no_op() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
     let (image, _config, _layer) =
-        seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+        seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
 
     let scanner = MockServer::start().await;
     Mock::given(method("POST"))
@@ -141,7 +141,7 @@ async fn a_scan_job_attaches_one_report_and_reruns_as_a_no_op() {
 async fn a_failing_scanner_fails_the_job() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (image, _, _) = seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let scanner = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(502).set_body_string("grype exited with 1"))
@@ -188,7 +188,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
     let stack = fs_test_stack();
     let namespace = Namespace::new("mirror/web").unwrap();
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "scan-test",
         ClaimMode::Atomic,
     ));
@@ -268,9 +268,10 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
 
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (_, config, layer) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (_, config, layer) =
+        seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "scan-test",
         ClaimMode::Atomic,
     ));
@@ -325,7 +326,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
     );
 
     let other = Namespace::new("other/web").unwrap();
-    let (_, config, layer) = seed_manifest(&stack.store, &stack.metadata_store, &other).await;
+    let (_, config, layer) = seed_manifest(&stack.blob_store, &stack.metadata_store, &other).await;
     let foreign = format!(
         r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[{}],"annotations":{{"v":"3"}}}}"#,
         descriptor("application/vnd.oci.image.config.v1+json", &config),
@@ -345,7 +346,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
 async fn a_forced_scan_job_scans_a_reported_image_again() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (image, _, _) = seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let scanner = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(SARIF))
@@ -449,7 +450,7 @@ fn handler_for(
     token: Option<Secret<String>>,
 ) -> ScanJobHandler {
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "scan-test",
         ClaimMode::Atomic,
     ));
@@ -492,7 +493,7 @@ fn payload(namespace: &Namespace, digest: &Digest) -> ScanImagePayload {
 async fn reported_before_skips_only_when_a_newer_report_exists() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (image, _, _) = seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let scanner = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(SARIF))

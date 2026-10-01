@@ -268,7 +268,7 @@ mod tests {
         let stack = fs_test_stack();
         let namespace = Namespace::new("apps/web").unwrap();
         let (image, _, layer) =
-            seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+            seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
         // The walk is over revision records, which the seed helper leaves to
         // the push path.
         seed_links(

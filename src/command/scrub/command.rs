@@ -141,7 +141,7 @@ impl Command {
         .await?;
         orphan_jobs::sweep_orphan_jobs(
             &Arc::new(JobStore::new(
-                self.metadata_store.object_store().clone(),
+                &self.metadata_store,
                 "scrub-orphans",
                 ClaimMode::Atomic,
             )),
@@ -237,12 +237,7 @@ mod tests {
 
         // Seed content plus one defect through a throwaway command's stores.
         let seed = Command::new(&options(true, 2), &config).await.unwrap();
-        seed_manifest(
-            seed.metadata_store.object_store(),
-            &seed.metadata_store,
-            &namespace,
-        )
-        .await;
+        seed_manifest(&seed.blob_store, &seed.metadata_store, &namespace).await;
         let objects = seed.metadata_store.object_store();
         objects
             .put("stray/junk-object", Bytes::from_static(b"junk"))
@@ -326,12 +321,7 @@ mod tests {
             let namespace = Namespace::new("test-repo/app").unwrap();
 
             let seed = Command::new(&options(true, 1), &config).await.unwrap();
-            seed_manifest(
-                seed.metadata_store.object_store(),
-                &seed.metadata_store,
-                &namespace,
-            )
-            .await;
+            seed_manifest(&seed.blob_store, &seed.metadata_store, &namespace).await;
             seed.metadata_store
                 .object_store()
                 .put("stray/junk", Bytes::from_static(b"junk"))
