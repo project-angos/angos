@@ -6,6 +6,7 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
+use angos_mtls_client::ClientTls;
 use angos_oci::{Digest, Namespace, Tag};
 
 use crate::{
@@ -446,6 +447,7 @@ fn handler_for(
             url: scanner.uri(),
             token,
             timeout_secs: 5,
+            tls: ClientTls::default(),
             policy: PolicyConfig {
                 default: None,
                 rules: Vec::new(),

@@ -8,6 +8,7 @@ use chrono::Utc;
 use reqwest::Client;
 use tracing::{debug, info};
 
+use angos_mtls_client::MtlsClientBuilder;
 use angos_oci::request::{PutManifestRequest, StartUploadRequest, StartUploadTarget};
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, Reference};
 use angos_secret::Secret;
@@ -40,9 +41,9 @@ impl ScanJobHandler {
         metadata_store: Arc<MetadataStore>,
         config: &ScanConfig,
     ) -> Result<Self, Error> {
-        let client = Client::builder()
-            .use_rustls_tls()
-            .timeout(Duration::from_secs(config.timeout_secs))
+        let client = MtlsClientBuilder::new()
+            .with_timeout(Duration::from_secs(config.timeout_secs))
+            .with_tls(&config.tls)
             .build()
             .map_err(|e| Error::Initialization(format!("scanner client: {e}")))?;
         Ok(Self {

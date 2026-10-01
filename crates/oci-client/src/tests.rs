@@ -19,8 +19,10 @@ use angos_oci::request::{
 use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome, REPLICATION_SUPERSEDED_CODE};
 use angos_oci::{Digest, MediaType, Namespace, Reference, Tag};
 
+use angos_mtls_client::{BasicAuth, ClientTls, MtlsIdentity};
+
 use crate::{
-    Error, MtlsIdentity, RegistryClient, RegistryClientConfig,
+    Error, RegistryClient, RegistryClientConfig,
     auth::{token_cache_key, token_index_cache_key},
     without_query,
 };
@@ -36,10 +38,8 @@ fn test_client_config(url: impl Into<String>) -> RegistryClientConfig {
         max_redirect: 5,
         connect_timeout_secs: 30,
         read_timeout_secs: 300,
-        server_ca_bundle: None,
-        mtls: None,
-        username: None,
-        password: None,
+        tls: ClientTls::default(),
+        basic_auth: None,
     }
 }
 
@@ -93,37 +93,26 @@ fn client_for(mock_server: &MockServer) -> RegistryClient {
     RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
 }
 
+/// A lone username or password, a misspelled key away from the pair, would
+/// otherwise run anonymous and surface later as 401s or rate limits.
 #[test]
-fn test_new_with_username_only() {
-    let config = RegistryClientConfig {
-        username: Some("user".to_string()),
-        ..test_client_config("https://example.com")
-    };
-
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
-    assert!(client.basic_auth.is_none());
-}
-
-#[test]
-fn test_new_with_password_only() {
-    let config = RegistryClientConfig {
-        password: Some(Secret::new("pass".to_string())),
-        ..test_client_config("https://example.com")
-    };
-
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
-    assert!(client.basic_auth.is_none());
+fn a_half_credential_pair_is_rejected_at_deserialize() {
+    for half in [r#"username = "user""#, r#"password = "pass""#] {
+        let toml = format!("url = \"https://example.com\"\n{half}");
+        assert!(
+            toml::from_str::<RegistryClientConfig>(&toml).is_err(),
+            "{half} alone must be refused"
+        );
+    }
 }
 
 #[test]
 fn test_new_with_both_credentials() {
     let config = RegistryClientConfig {
-        username: Some("user".to_string()),
-        password: Some(Secret::new("pass".to_string())),
+        basic_auth: Some(BasicAuth {
+            username: "user".to_string(),
+            password: Secret::new("pass".to_string()),
+        }),
         ..test_client_config("https://example.com")
     };
 
@@ -138,8 +127,10 @@ fn test_new_with_both_credentials() {
 #[test]
 fn debug_output_redacts_basic_auth_password() {
     let config = RegistryClientConfig {
-        username: Some("user".to_string()),
-        password: Some(Secret::new("hunter2".to_string())),
+        basic_auth: Some(BasicAuth {
+            username: "user".to_string(),
+            password: Secret::new("hunter2".to_string()),
+        }),
         ..test_client_config("https://example.com")
     };
 
@@ -987,8 +978,10 @@ async fn test_basic_authentication() {
         .await;
 
     let config = RegistryClientConfig {
-        username: Some("user".to_string()),
-        password: Some(Secret::new("pass".to_string())),
+        basic_auth: Some(BasicAuth {
+            username: "user".to_string(),
+            password: Secret::new("pass".to_string()),
+        }),
         ..test_client_config(mock_server.uri())
     };
 
@@ -1208,7 +1201,10 @@ async fn test_get_blob_not_found() {
 #[test]
 fn test_new_with_invalid_ca_bundle() {
     let config = RegistryClientConfig {
-        server_ca_bundle: Some(PathBuf::from("/nonexistent/ca.pem")),
+        tls: ClientTls {
+            server_ca_bundle: Some(PathBuf::from("/nonexistent/ca.pem")),
+            identity: None,
+        },
         ..test_client_config("https://example.com")
     };
 
@@ -1229,7 +1225,7 @@ fn test_registry_client_config_cert_without_key_rejected_at_deserialize() {
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(
-        msg.contains("both client_certificate and client_private_key are required for mTLS"),
+        msg.contains("client_private_key are required for mTLS"),
         "unexpected error: {msg}"
     );
 }
@@ -1244,7 +1240,7 @@ fn test_registry_client_config_key_without_cert_rejected_at_deserialize() {
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(
-        msg.contains("both client_certificate and client_private_key are required for mTLS"),
+        msg.contains("client_private_key are required for mTLS"),
         "unexpected error: {msg}"
     );
 }
@@ -1252,10 +1248,13 @@ fn test_registry_client_config_key_without_cert_rejected_at_deserialize() {
 #[test]
 fn test_new_with_both_certificate_and_key_invalid_files() {
     let config = RegistryClientConfig {
-        mtls: Some(MtlsIdentity {
-            client_certificate: PathBuf::from("/nonexistent/cert.pem"),
-            client_private_key: PathBuf::from("/nonexistent/key.pem"),
-        }),
+        tls: ClientTls {
+            server_ca_bundle: None,
+            identity: Some(MtlsIdentity {
+                certificate: PathBuf::from("/nonexistent/cert.pem"),
+                private_key: PathBuf::from("/nonexistent/key.pem"),
+            }),
+        },
         ..test_client_config("https://example.com")
     };
 
@@ -1514,8 +1513,10 @@ async fn test_blob_upload_reuses_basic_credentials_on_patch() {
         .await;
 
     let config = RegistryClientConfig {
-        username: Some("user".to_string()),
-        password: Some(Secret::new("pass".to_string())),
+        basic_auth: Some(BasicAuth {
+            username: "user".to_string(),
+            password: Secret::new("pass".to_string()),
+        }),
         ..test_client_config(mock_server.uri())
     };
     let cache = angos_cache::Config::Memory.to_backend().unwrap();

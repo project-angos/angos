@@ -90,10 +90,11 @@ pub async fn run(options: &Options, config: Option<ScannerConfig>) -> Result<(),
         .split_once("://")
         .map_or(url, |(_, rest)| rest)
         .to_string();
-    let credentials = match (&config.registry.username, &config.registry.password) {
-        (Some(username), Some(password)) => Some((username.clone(), password.expose().clone())),
-        _ => None,
-    };
+    let credentials = config
+        .registry
+        .basic_auth
+        .as_ref()
+        .map(|auth| (auth.username.clone(), auth.password.expose().clone()));
     let permits = if options.scanner.serial() {
         if config.max_concurrent_scans.get() > 1 {
             warn!(

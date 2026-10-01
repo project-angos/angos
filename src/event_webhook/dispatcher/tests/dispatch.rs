@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -6,7 +6,8 @@ use wiremock::{
 };
 
 use super::common::{
-    build_dispatcher, create_test_event, create_test_webhook_config, single_hook_dispatcher,
+    build_dispatcher, create_test_config, create_test_event, create_test_webhook_config,
+    single_hook_dispatcher,
 };
 use crate::{
     configuration::RegexPattern,
@@ -37,6 +38,16 @@ fn event_dispatcher_builder_constructs_from_configs() {
 
     let dispatcher = EventDispatcher::new(webhooks, Vec::new(), HashMap::new());
     assert!(dispatcher.is_ok());
+}
+
+/// The client carries the webhook's TLS settings: an unreadable CA bundle
+/// fails the dispatcher instead of being ignored.
+#[test]
+fn an_unreadable_ca_bundle_fails_the_dispatcher() {
+    let mut config = create_test_config(vec![EventKind::ManifestPush], None);
+    config.tls.server_ca_bundle = Some(PathBuf::from("/nonexistent/ca.pem"));
+    let webhooks = HashMap::from([("hook".to_string(), config)]);
+    assert!(EventDispatcher::new(webhooks, Vec::new(), HashMap::new()).is_err());
 }
 
 #[test]

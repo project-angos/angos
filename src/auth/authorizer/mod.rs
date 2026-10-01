@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use http::request::Parts;
 use reqwest::{Client, redirect::Policy};
@@ -15,7 +15,7 @@ use crate::{
     policy::{AccessPolicy, PolicyDecision},
     registry::{Registry, Repository},
 };
-use angos_mtls_client::MtlsClientBuilder;
+use angos_mtls_client::{ClientTls, MtlsClientBuilder};
 
 const ACCESS_DENIED: &str = "Access denied";
 
@@ -31,10 +31,6 @@ struct AuthorizerRepository {
     access_policy: Option<AccessPolicy>,
     authorization_webhook: Option<Arc<WebhookAuthorizer>>,
 }
-
-/// The TLS files a webhook client is built from; webhooks sharing them share
-/// the client.
-type WebhookClientFiles = (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>);
 
 impl Authorizer {
     pub fn new(config: &Configuration) -> Result<Self, Error> {
@@ -231,20 +227,16 @@ fn build_webhooks(
     config: &Configuration,
 ) -> Result<HashMap<String, Arc<WebhookAuthorizer>>, Error> {
     let mut webhooks = HashMap::with_capacity(config.auth.webhook.len());
-    let mut clients: HashMap<WebhookClientFiles, Client> = HashMap::new();
+    // Webhooks with the same TLS settings share one client.
+    let mut clients: HashMap<ClientTls, Client> = HashMap::new();
     for (name, webhook_config) in &config.auth.webhook {
-        let client_config = (
-            webhook_config.server_ca_bundle.clone(),
-            webhook_config.client_certificate_bundle.clone(),
-            webhook_config.client_private_key.clone(),
-        );
-        let client = if let Some(client) = clients.get(&client_config) {
+        let client = if let Some(client) = clients.get(&webhook_config.tls) {
             client.clone()
         } else {
             let client = build_webhook_client(webhook_config).map_err(|e| {
                 Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
             })?;
-            clients.insert(client_config, client.clone());
+            clients.insert(webhook_config.tls.clone(), client.clone());
             client
         };
         let authorizer = WebhookAuthorizer::new(name.clone(), webhook_config.clone(), client)
@@ -259,13 +251,7 @@ fn build_webhooks(
 fn build_webhook_client(config: &webhook::Config) -> Result<Client, String> {
     MtlsClientBuilder::new()
         .with_redirect_policy(Policy::none())
-        .with_server_ca_bundle(config.server_ca_bundle.as_deref())
-        .with_client_certificate(
-            config
-                .client_certificate_bundle
-                .as_deref()
-                .zip(config.client_private_key.as_deref()),
-        )
+        .with_tls(&config.tls)
         .build()
 }
 

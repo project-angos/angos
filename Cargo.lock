@@ -156,8 +156,10 @@ dependencies = [
 name = "angos-mtls-client"
 version = "0.1.0"
 dependencies = [
+ "angos-secret",
  "rcgen",
  "reqwest",
+ "serde",
  "tempfile",
  "tokio",
 ]

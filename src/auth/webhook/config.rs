@@ -1,9 +1,8 @@
-use std::path::PathBuf;
-
 use reqwest::{RequestBuilder, header::AUTHORIZATION};
 use serde::Deserialize;
 use url::Url;
 
+use angos_mtls_client::ClientTls;
 use angos_secret::Secret;
 
 use crate::auth::webhook::headers::build_header_name;
@@ -17,9 +16,8 @@ pub struct Config {
     pub timeout_ms: u64,
     #[serde(flatten)]
     pub auth: Option<WebhookAuth>,
-    pub client_certificate_bundle: Option<PathBuf>,
-    pub client_private_key: Option<PathBuf>,
-    pub server_ca_bundle: Option<PathBuf>,
+    #[serde(flatten)]
+    pub tls: ClientTls,
     #[serde(default)]
     pub forward_headers: Vec<String>,
 }
@@ -49,13 +47,6 @@ impl WebhookAuth {
 
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
-        if self.client_certificate_bundle.is_some() != self.client_private_key.is_some() {
-            return Err(
-                "both client_certificate_bundle and client_private_key are required for mTLS"
-                    .to_string(),
-            );
-        }
-
         for header in &self.forward_headers {
             build_header_name(header)
                 .map_err(|e| format!("invalid forward_headers entry '{header}': {e}"))?;

@@ -29,6 +29,7 @@ use crate::{
     },
     metrics_provider::metrics_provider,
 };
+use angos_mtls_client::MtlsClientBuilder;
 use angos_secret::Secret;
 
 pub struct EventDispatcher {
@@ -223,9 +224,9 @@ impl EventDispatcher {
         let mut endpoints = HashMap::with_capacity(webhooks.len());
 
         for (name, config) in webhooks {
-            let client = Client::builder()
-                .use_rustls_tls()
-                .timeout(Duration::from_millis(config.timeout_ms))
+            let client = MtlsClientBuilder::new()
+                .with_timeout(Duration::from_millis(config.timeout_ms))
+                .with_tls(&config.tls)
                 .build()
                 .map_err(|e| {
                     Error::Initialization(format!(

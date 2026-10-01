@@ -299,15 +299,6 @@ fn build_oidc_client(name: &str, config: &oidc::Config) -> Result<Arc<Client>, E
         ))
     };
 
-    // A lone certificate or key would otherwise fetch anonymously and fail as an
-    // unauthorized issuer at runtime.
-    if config.client_certificate_bundle.is_some() != config.client_private_key.is_some() {
-        return Err(initialization_error(
-            "both client_certificate_bundle and client_private_key are required for mTLS"
-                .to_string(),
-        ));
-    }
-
     // The token itself is read per fetch since it rotates; this only refuses an
     // unreadable path at startup rather than at the first JWKS fetch.
     if let Some(path) = config.bearer_token_file.as_deref()
@@ -322,13 +313,7 @@ fn build_oidc_client(name: &str, config: &oidc::Config) -> Result<Arc<Client>, E
     // No client-level timeout: each fetch carries a per-request timeout from the
     // provider config (`http_request_timeout_secs`, `jwks_refresh_timeout_secs`).
     MtlsClientBuilder::new()
-        .with_server_ca_bundle(config.server_ca_bundle.as_deref())
-        .with_client_certificate(
-            config
-                .client_certificate_bundle
-                .as_deref()
-                .zip(config.client_private_key.as_deref()),
-        )
+        .with_tls(&config.tls)
         .build()
         .map(Arc::new)
         .map_err(initialization_error)
@@ -370,7 +355,7 @@ mod tests {
         identity::OidcClaims,
         metrics_provider,
         test_fixtures::{
-            configuration::{load_config, minimal_config},
+            configuration::{load_config, minimal_config, try_load_config},
             mtls::cert_der,
             oidc::KID,
             requests::{empty_parts, parts_with_authorization, parts_with_basic_auth},
@@ -551,7 +536,7 @@ mod tests {
         let cache = angos_cache::Config::Memory.to_backend().unwrap();
 
         assert_eq!(
-            config.auth.oidc["kube"].server_ca_bundle.as_deref(),
+            config.auth.oidc["kube"].tls.server_ca_bundle.as_deref(),
             Some(bundle_path.as_path())
         );
         assert!(Authenticator::build_oidc_validators(&config.auth, &cache).is_ok());
@@ -590,23 +575,18 @@ mod tests {
         let certificate_path = material.path().join("client.pem");
         fs::write(&certificate_path, client_cert_pem()).unwrap();
 
-        let config = load_config(&format!(
+        let error = try_load_config(&format!(
             r#"
             [auth.oidc.kube]
             issuer = "https://kubernetes.default.svc"
             client_certificate_bundle = "{}"
         "#,
             certificate_path.display()
-        ));
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-        let Err(error) = Authenticator::build_oidc_validators(&config.auth, &cache) else {
-            panic!("half a client identity must be refused rather than fetch anonymously");
-        };
+        ))
+        .expect_err("half a client identity must be refused rather than fetch anonymously");
         assert!(
-            matches!(&error, Error::Initialization(msg) if msg.contains("auth.oidc.kube")),
-            "got: {error:?}"
+            error.to_string().contains("client_private_key"),
+            "got: {error}"
         );
     }
 

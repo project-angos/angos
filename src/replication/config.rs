@@ -79,8 +79,9 @@ mod tests {
         assert_eq!(config.namespace_filter.len(), 1);
         assert_eq!(config.namespace_filter[0].as_source(), "^nginx/.*");
         assert_eq!(config.max_concurrent_pushes, NonZeroUsize::new(8));
-        assert_eq!(config.client.username.as_deref(), Some("replicator"));
-        assert_eq!(config.client.password.as_ref().unwrap().expose(), "s3cret");
+        let auth = config.client.basic_auth.as_ref().unwrap();
+        assert_eq!(auth.username, "replicator");
+        assert_eq!(auth.password.expose(), "s3cret");
         assert!(config.prune);
     }
 

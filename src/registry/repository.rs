@@ -442,6 +442,7 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    use angos_mtls_client::ClientTls;
     use std::{fs, time::Duration};
 
     use tokio::{io::AsyncReadExt, time::timeout};
@@ -653,7 +654,10 @@ mod tests {
         let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![RegistryClientConfig {
-                server_ca_bundle: Some(ca_bundle_path.clone()),
+                tls: ClientTls {
+                    server_ca_bundle: Some(ca_bundle_path.clone()),
+                    identity: None,
+                },
                 ..test_client_config("https://registry.example.test")
             }],
             ..Default::default()

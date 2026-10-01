@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use url::Url;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
+use angos_mtls_client::ClientTls;
 use angos_oci::Namespace;
 
 use crate::cache_fill::handler::{CACHE_ACTOR, CacheFillJobHandler, build_envelope};
@@ -36,6 +37,7 @@ async fn cache_fill_grant_emits_blob_push_with_internal_actor() {
         max_retries: Some(0),
         events: vec![EventKind::BlobPush],
         repository_filter: None,
+        tls: ClientTls::default(),
     };
     let mut webhooks = HashMap::new();
     webhooks.insert("cache-hook".to_string(), webhook);

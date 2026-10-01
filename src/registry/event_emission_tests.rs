@@ -13,6 +13,7 @@ use url::Url;
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
+use angos_mtls_client::ClientTls;
 use angos_oci::request::{
     BlobMount, GetBlobRequest, GetManifestRequest, MountBlobRequest, PutManifestRequest,
 };
@@ -70,6 +71,7 @@ impl FsRegistryFixture {
             max_retries: Some(0),
             events: kinds,
             repository_filter: None,
+            tls: ClientTls::default(),
         };
         let mut webhooks = HashMap::new();
         webhooks.insert("test-hook".to_string(), webhook);

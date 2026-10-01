@@ -24,6 +24,7 @@ use crate::{
         metadata_store::{LinkKind, MetadataStore},
     },
 };
+use angos_mtls_client::ClientTls;
 use angos_secret::Secret;
 
 pub const SCAN_IMAGE_KIND: &str = "scan.image";
@@ -51,6 +52,9 @@ pub struct ScanConfig {
     /// Bound on one scan request, pull and analysis included.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// CA bundle trusted, and client identity presented, on scan requests.
+    #[serde(flatten)]
+    pub tls: ClientTls,
     /// `default` and `rules`, beside the service settings.
     #[serde(flatten)]
     pub policy: PolicyConfig<ScanAction>,

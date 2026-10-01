@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.12.2 - UNRELEASED
 
+### Added
+
+- Event webhooks and the scanner client take `server_ca_bundle`, `client_certificate_bundle` and `client_private_key`, to reach an endpoint behind a private CA or one requiring a client certificate.
+
+### Changed
+
+- An upstream, downstream or scanner service configured with only one of `username` and `password` fails the configuration load instead of running anonymously.
+
 ### Security
 
 - A client can no longer spoof its IP with its own `X-Forwarded-For` line, or with `X-Real-IP` behind an unparsable `X-Forwarded-For` entry.

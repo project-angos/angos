@@ -6,8 +6,7 @@ mod error;
 mod write;
 
 use std::{
-    collections::HashSet, fmt::Display, future::Future, io, path::PathBuf, str::FromStr, sync::Arc,
-    time::Duration,
+    collections::HashSet, fmt::Display, future::Future, io, str::FromStr, sync::Arc, time::Duration,
 };
 
 use futures_util::TryStreamExt;
@@ -37,7 +36,7 @@ use angos_oci::{Content, Descriptor, Digest, Manifest, MediaRange, MediaType, Ta
 
 pub use crate::{error::Error, write::UploadSession};
 use angos_cache::Cache;
-use angos_mtls_client::MtlsClientBuilder;
+use angos_mtls_client::{BasicAuth, ClientTls, MtlsClientBuilder};
 use angos_secret::Secret;
 
 use angos_storage::BoxedReader;
@@ -100,14 +99,6 @@ fn parse_header<T: FromStr>(
         .ok_or_else(|| Error::Internal(format!("missing or invalid '{name}' response header")))
 }
 
-/// The mTLS client identity. Holding both files together is what makes a
-/// certificate without its key unrepresentable.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtlsIdentity {
-    pub client_certificate: PathBuf,
-    pub client_private_key: PathBuf,
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(try_from = "RegistryClientConfigFields")]
 pub struct RegistryClientConfig {
@@ -118,10 +109,8 @@ pub struct RegistryClientConfig {
     /// Bounds inactivity between reads during a transfer; a long but
     /// progressing blob transfer is never capped by a total deadline.
     pub read_timeout_secs: u64,
-    pub server_ca_bundle: Option<PathBuf>,
-    pub mtls: Option<MtlsIdentity>,
-    pub username: Option<String>,
-    pub password: Option<Secret<String>>,
+    pub tls: ClientTls,
+    pub basic_auth: Option<BasicAuth>,
 }
 
 #[derive(Deserialize)]
@@ -133,11 +122,8 @@ struct RegistryClientConfigFields {
     connect_timeout_secs: u64,
     #[serde(default = "RegistryClientConfig::default_read_timeout_secs")]
     read_timeout_secs: u64,
-    server_ca_bundle: Option<PathBuf>,
-    /// Named without `_bundle` to match the existing config key; renaming would
-    /// break operator configs.
-    client_certificate: Option<PathBuf>,
-    client_private_key: Option<PathBuf>,
+    #[serde(flatten)]
+    tls: ClientTls,
     username: Option<String>,
     password: Option<Secret<String>>,
 }
@@ -146,28 +132,13 @@ impl TryFrom<RegistryClientConfigFields> for RegistryClientConfig {
     type Error = String;
 
     fn try_from(fields: RegistryClientConfigFields) -> Result<Self, Self::Error> {
-        let mtls = match (fields.client_certificate, fields.client_private_key) {
-            (Some(client_certificate), Some(client_private_key)) => Some(MtlsIdentity {
-                client_certificate,
-                client_private_key,
-            }),
-            (None, None) => None,
-            _ => {
-                return Err(
-                    "both client_certificate and client_private_key are required for mTLS"
-                        .to_string(),
-                );
-            }
-        };
         Ok(Self {
             url: fields.url,
             max_redirect: fields.max_redirect,
             connect_timeout_secs: fields.connect_timeout_secs,
             read_timeout_secs: fields.read_timeout_secs,
-            server_ca_bundle: fields.server_ca_bundle,
-            mtls,
-            username: fields.username,
-            password: fields.password,
+            tls: fields.tls,
+            basic_auth: BasicAuth::from_pair(fields.username, fields.password)?,
         })
     }
 }
@@ -184,13 +155,6 @@ impl RegistryClientConfig {
     fn default_read_timeout_secs() -> u64 {
         300
     }
-}
-
-/// Resolved basic-auth credentials.
-#[derive(Clone, Debug)]
-pub struct BasicAuth {
-    pub username: String,
-    pub password: Secret<String>,
 }
 
 /// A blob body streamed from an upstream. `content_range` carries the window
@@ -255,29 +219,10 @@ impl RegistryClient {
             .with_redirect_policy(Policy::limited(config.max_redirect as usize))
             .with_connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .with_read_timeout(Duration::from_secs(config.read_timeout_secs))
-            .with_server_ca_bundle(config.server_ca_bundle.as_deref())
-            .with_client_certificate(config.mtls.as_ref().map(|m| {
-                (
-                    m.client_certificate.as_path(),
-                    m.client_private_key.as_path(),
-                )
-            }))
+            .with_tls(&config.tls)
             .build()
             .map_err(Error::Initialization)?;
-
-        let basic_auth = match (&config.username, &config.password) {
-            (Some(username), Some(password)) => Some(BasicAuth {
-                username: username.clone(),
-                password: password.clone(),
-            }),
-            (Some(_), None) | (None, Some(_)) => {
-                warn!("Username and password must be both provided");
-                None
-            }
-            _ => None,
-        };
-
-        Ok((client, basic_auth))
+        Ok((client, config.basic_auth.clone()))
     }
 
     /// Builds a registry client from a parsed [`RegistryClientConfig`]; the

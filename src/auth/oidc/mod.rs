@@ -11,6 +11,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::debug;
 
+use angos_mtls_client::ClientTls;
+
 use crate::{
     auth::{
         AuthMiddleware, AuthResult, Error,
@@ -28,15 +30,10 @@ use angos_cache::Cache;
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub issuer: String,
-    /// CA bundle trusted for the discovery and JWKS fetches.
-    #[serde(default)]
-    pub server_ca_bundle: Option<PathBuf>,
-    /// Client certificate and key presented on those same fetches.
-    /// Both or neither; a lone one is refused at startup.
-    #[serde(default)]
-    pub client_certificate_bundle: Option<PathBuf>,
-    #[serde(default)]
-    pub client_private_key: Option<PathBuf>,
+    /// CA bundle trusted, and client identity presented, on the discovery and
+    /// JWKS fetches.
+    #[serde(flatten)]
+    pub tls: ClientTls,
     /// File holding a bearer token sent on those same fetches, for an issuer
     /// authenticating callers with one. Read per fetch, so a token rotated in
     /// place (a Kubernetes projected service-account token) stays current.

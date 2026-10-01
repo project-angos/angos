@@ -627,6 +627,7 @@ impl RetentionChecker {
 
 #[cfg(test)]
 mod tests {
+    use angos_mtls_client::ClientTls;
     use std::{
         collections::HashMap,
         fs::{File, FileTimes},
@@ -1498,6 +1499,7 @@ mod tests {
             max_retries: Some(0),
             events: vec![EventKind::ManifestDelete, EventKind::TagDelete],
             repository_filter: None,
+            tls: ClientTls::default(),
         };
         let mut webhooks = HashMap::new();
         webhooks.insert("retention-hook".to_string(), webhook);
