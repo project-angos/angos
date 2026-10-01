@@ -1,6 +1,5 @@
 use std::{num::TryFromIntError, string::FromUtf8Error};
 
-use http::header::InvalidHeaderValue;
 use sha2::digest::common::hazmat::DeserializeStateError;
 use tracing::warn;
 
@@ -79,26 +78,13 @@ pub enum Error {
     Cache(#[from] angos_cache::Error),
     #[error("I/O error during operations: {0}")]
     Io(#[from] std::io::Error),
-    #[error("HTTP error during operations: {0}")]
-    Http(#[from] http::Error),
     #[error("(de)serialization error during operations: {0}")]
     Serde(#[from] serde_json::Error),
-    #[error("invalid header value: {0}")]
-    InvalidHeader(#[from] InvalidHeaderValue),
 }
 
 // A raw storage outcome carries no domain context: a call site that knows a
 // miss means a specific blob/upload/manifest 404 must intercept
 // `StorageError::NotFound` before `?` reaches this impl.
-impl From<angos_transport::RenderError> for Error {
-    fn from(error: angos_transport::RenderError) -> Self {
-        match error {
-            angos_transport::RenderError::Header(e) => Error::Http(e),
-            angos_transport::RenderError::Serialize(e) => Error::Serde(e),
-        }
-    }
-}
-
 impl From<StorageError> for Error {
     fn from(error: StorageError) -> Self {
         match error {

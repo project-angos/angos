@@ -360,7 +360,9 @@ pub async fn get_blob(
     } else {
         return Err(Error::BlobUnknown);
     };
-    Ok(served.into_response(registry.blob_stream_frame_size())?)
+    Ok(served
+        .into_response(registry.blob_stream_frame_size())
+        .expect("a served blob renders"))
 }
 
 pub async fn create_test_blob(

@@ -41,9 +41,7 @@ fn owes_a_spec_code(error: &registry::Error) -> bool {
         | registry::Error::Configuration(_)
         | registry::Error::Cache(_)
         | registry::Error::Io(_)
-        | registry::Error::Http(_)
-        | registry::Error::Serde(_)
-        | registry::Error::InvalidHeader(_) => false,
+        | registry::Error::Serde(_) => false,
     }
 }
 
