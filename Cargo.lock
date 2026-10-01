@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "angos"
-version = "1.12.1"
+version = "1.12.2"
 dependencies = [
  "angos-backoff",
  "angos-cache",

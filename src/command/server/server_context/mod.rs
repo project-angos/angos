@@ -259,25 +259,23 @@ fn build_ui_config(config: &Configuration) -> UiConfigBody {
 }
 
 /// Resolves the client IP forwarded by a trusted proxy: the rightmost
-/// `X-Forwarded-For` entry that is not itself a trusted proxy, else
-/// `X-Real-IP`. Only proxies append entries on the right; anything further
-/// left is client-supplied and must not be trusted. Each candidate must parse
-/// as an address, so a forged non-IP entry cannot reach the identity, and the
-/// result is canonical, so a mapped IPv4 reads as its dotted form.
+/// `X-Forwarded-For` entry, across every field line, that is not itself a
+/// trusted proxy, else `X-Real-IP`. Only proxies append entries on the right,
+/// some as a new field line; anything further left is client-supplied and must
+/// not be trusted. Each candidate must parse as an address, so a forged non-IP
+/// entry cannot reach the identity, and the result is canonical, so a mapped
+/// IPv4 reads as its dotted form.
 fn resolve_forwarded_ip(headers: &HeaderMap, proxies: &[TrustedProxy]) -> Option<String> {
-    if let Some(forwarded_for) = headers.get("X-Forwarded-For")
-        && let Ok(forwarded_str) = forwarded_for.to_str()
-    {
-        for entry in forwarded_str.rsplit(',') {
+    for line in headers.get_all("X-Forwarded-For").iter().rev() {
+        // A malformed entry breaks the chain, and the client may have sent
+        // `X-Real-IP` too, so nothing past it is trusted.
+        let line = line.to_str().ok()?;
+        for entry in line.rsplit(',') {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
             }
-            // A malformed entry breaks the chain: refuse to walk past it into
-            // the client-supplied entries further left.
-            let Ok(ip) = entry.parse::<IpAddr>() else {
-                break;
-            };
+            let ip = entry.parse::<IpAddr>().ok()?;
             if !proxies.iter().any(|p| p.contains(ip)) {
                 return Some(ip.to_canonical().to_string());
             }

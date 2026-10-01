@@ -680,11 +680,24 @@ fn test_resolve_forwarded_ip_missing_header() {
 }
 
 #[test]
+fn test_resolve_forwarded_ip_reads_every_field_line_last_first() {
+    // A proxy appending its own field line leaves the client's line first.
+    let mut headers = HeaderMap::new();
+    headers.append("X-Forwarded-For", "10.0.0.5".parse().unwrap());
+    headers.append("X-Forwarded-For", "203.0.113.9".parse().unwrap());
+    assert_eq!(
+        resolve_forwarded_ip(&headers, &proxies(&["10.0.0.0/8"])),
+        Some("203.0.113.9".to_string())
+    );
+}
+
+#[test]
 fn test_resolve_forwarded_ip_rejects_non_ip_entry() {
     // A forged non-IP entry must not become the client IP; it breaks the
-    // chain rather than passing through verbatim.
+    // chain rather than passing through verbatim or falling back to X-Real-IP.
     let mut headers = HeaderMap::new();
     headers.insert("X-Forwarded-For", "not-an-ip, 10.0.0.1".parse().unwrap());
+    headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
     assert_eq!(
         resolve_forwarded_ip(&headers, &proxies(&["10.0.0.0/8"])),
         None
