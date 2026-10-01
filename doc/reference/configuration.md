@@ -302,7 +302,7 @@ multipart_uniform_parts = true
 
 ## Metadata Storage (`metadata_store`)
 
-Optional. Defaults to same backend as blob store.
+Optional. Defaults to the blob store's backend and settings.
 
 ### Unknown Keys
 
@@ -320,7 +320,9 @@ your convenience.
 
 ### S3 (`metadata_store.s3`)
 
-The same connection options as `blob_store.s3`, and no others.
+The same options as `blob_store.s3`. The timeouts, retries, circuit breaker and
+`children_scan_concurrency` apply to the metadata and job stores; the multipart
+and presign options have no effect there.
 
 > **Warning:** With `update_pull_time` enabled, every stamped manifest pull adds one storage write (the append-only access entry). At scale with many concurrent pulls this adds latency and API costs; disable access time tracking if it is not needed for retention policies.
 

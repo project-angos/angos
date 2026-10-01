@@ -31,11 +31,9 @@ use crate::registry::{
     keys::{BLOBS_ROOT, DigestKeys, namespace_dir},
     pagination,
 };
-pub use config::BlobStoreConfig;
-// Production code builds backends through `BlobStoreConfig`; only tests
-// construct the inner structs.
 #[cfg(test)]
-pub use config::{FsBackendConfig, S3BackendConfig, TransportFields};
+pub use config::TransportFields;
+pub use config::{BlobStoreConfig, FsBackendConfig, S3BackendConfig};
 pub use multipart_cleanup::OrphanMultipartUpload;
 
 pub use angos_storage::BoxedReader;

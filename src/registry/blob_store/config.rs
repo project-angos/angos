@@ -7,7 +7,9 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use bytesize::ByteSize;
 use serde::Deserialize;
 
-use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3TransportConfig};
+use angos_s3_client::{
+    Backend as S3HttpBackend, BackendConfig as S3TransportConfig, Error as S3ClientError,
+};
 use angos_storage::{
     ObjectStore, PresignedStore,
     fs::Backend as StorageFsBackend,
@@ -27,14 +29,39 @@ pub struct FsBackendConfig {
     pub sync_to_disk: bool,
 }
 
-/// S3-backed blob store. Connection fields are required apart from
-/// `key_prefix`; transport fields all default.
+/// An S3-backed store, for blobs or metadata. Connection fields are required
+/// apart from `key_prefix`; transport fields all default.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct S3BackendConfig {
     #[serde(flatten)]
     pub connection: S3ConnectionConfig,
     #[serde(flatten)]
     pub transport: TransportFields,
+}
+
+impl S3BackendConfig {
+    /// The object store these settings describe, connection and transport
+    /// alike; the one place either store's S3 backend is built.
+    pub fn build(&self) -> Result<StorageS3Backend, S3ClientError> {
+        let transport = S3TransportConfig {
+            multipart_copy_threshold: self.transport.multipart_copy_threshold,
+            multipart_copy_chunk_size: self.transport.multipart_copy_chunk_size,
+            multipart_copy_jobs: self.transport.multipart_copy_jobs,
+            multipart_part_size: self.transport.multipart_part_size,
+            operation_timeout_secs: self.transport.operation_timeout_secs,
+            operation_attempt_timeout_secs: self.transport.operation_attempt_timeout_secs,
+            max_attempts: self.transport.max_attempts,
+            circuit_breaker_threshold: self.transport.circuit_breaker_threshold,
+            circuit_breaker_cooldown_secs: self.transport.circuit_breaker_cooldown_secs,
+            ..self.connection.to_client_config()
+        };
+        let http = S3HttpBackend::new(&transport)?;
+        Ok(StorageS3Backend::builder(Arc::new(http))
+            .part_size(self.transport.multipart_part_size.as_u64())
+            .uniform_parts(self.transport.multipart_uniform_parts)
+            .range_concurrency(self.transport.children_scan_concurrency)
+            .build())
+    }
 }
 
 /// Blob-store transport knobs, mirroring the non-connection fields of
@@ -102,27 +129,7 @@ impl BlobStoreConfig {
                 Ok(BlobStore::new(object, None))
             }
             BlobStoreConfig::S3(config) => {
-                let transport = S3TransportConfig {
-                    multipart_copy_threshold: config.transport.multipart_copy_threshold,
-                    multipart_copy_chunk_size: config.transport.multipart_copy_chunk_size,
-                    multipart_copy_jobs: config.transport.multipart_copy_jobs,
-                    multipart_part_size: config.transport.multipart_part_size,
-                    operation_timeout_secs: config.transport.operation_timeout_secs,
-                    operation_attempt_timeout_secs: config.transport.operation_attempt_timeout_secs,
-                    max_attempts: config.transport.max_attempts,
-                    circuit_breaker_threshold: config.transport.circuit_breaker_threshold,
-                    circuit_breaker_cooldown_secs: config.transport.circuit_breaker_cooldown_secs,
-                    ..config.connection.to_client_config()
-                };
-                let http =
-                    S3HttpBackend::new(&transport).map_err(|e| Error::Internal(e.to_string()))?;
-                let backend = Arc::new(
-                    StorageS3Backend::builder(Arc::new(http))
-                        .part_size(config.transport.multipart_part_size.as_u64())
-                        .uniform_parts(config.transport.multipart_uniform_parts)
-                        .range_concurrency(config.transport.children_scan_concurrency)
-                        .build(),
-                );
+                let backend = Arc::new(config.build().map_err(|e| Error::Internal(e.to_string()))?);
                 let object: Arc<dyn ObjectStore> = backend.clone();
                 let presign: Arc<dyn PresignedStore> = backend;
                 let ttl = Duration::from_secs(config.transport.presign_ttl_secs);
