@@ -755,8 +755,7 @@ impl Registry {
             let applies = |policy: Option<&ImagePolicy>| {
                 policy.is_some_and(|policy| policy.applies_at_push(namespace, &written_tags))
             };
-            if scan::is_scan_subject(&manifest) && applies(repository.and_then(|r| r.scan.as_ref()))
-            {
+            if manifest.is_plain_image() && applies(repository.and_then(|r| r.scan.as_ref())) {
                 self.dispatch_scan(namespace, &computed_digest).await;
             }
             if applies(repository.and_then(|r| r.index.as_ref())) {

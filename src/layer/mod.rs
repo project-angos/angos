@@ -222,16 +222,13 @@ pub fn is_filesystem_layer(media_type: &str) -> bool {
 /// The digests of a plain image manifest's walkable layers; empty for an
 /// index, a referrer or an artifact.
 pub fn filesystem_layers(manifest: &Manifest) -> Vec<Digest> {
-    if manifest.subject.is_some() || manifest.artifact_type.is_some() {
-        return Vec::new();
-    }
     match &manifest.content {
-        Content::Image { layers, .. } => layers
+        Content::Image { layers, .. } if manifest.is_plain_image() => layers
             .iter()
             .filter(|layer| is_filesystem_layer(layer.media_type.as_ref()))
             .map(|layer| layer.digest.clone())
             .collect(),
-        Content::Index { .. } => Vec::new(),
+        _ => Vec::new(),
     }
 }
 

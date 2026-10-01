@@ -105,16 +105,6 @@ pub fn build_envelope(payload: &ScanImagePayload) -> Result<JobEnvelope, Error> 
     )
 }
 
-/// A report, an attestation and an index are pushed like any manifest; only a
-/// plain image manifest is a scan subject. A buildx attestation names no
-/// subject: it is an image manifest whose in-toto layers carry a predicate type.
-pub fn is_scan_subject(manifest: &Manifest) -> bool {
-    manifest.subject.is_none()
-        && manifest.artifact_type.is_none()
-        && manifest.in_toto_predicate_type().is_none()
-        && matches!(manifest.content, Content::Image { .. })
-}
-
 /// Fan-out for the referrer record reads listing an image's reports.
 const REFERRER_READ_CONCURRENCY: usize = 16;
 
@@ -381,7 +371,7 @@ impl ScanJobHandler {
             debug!("Scan of {namespace}@{digest} skipped: the manifest is gone");
             return Ok(());
         };
-        if !is_scan_subject(&manifest) {
+        if !manifest.is_plain_image() {
             return Ok(());
         }
         let reports = scan_reports(&self.metadata_store, namespace, digest)

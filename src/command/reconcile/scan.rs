@@ -31,7 +31,7 @@ use crate::{
         blob_store::BlobStore, manifest::read_manifest, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
-    scan::{ScanImagePayload, is_scan_subject, scan_reports},
+    scan::{ScanImagePayload, scan_reports},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -92,7 +92,7 @@ impl NamespaceChecker for ScanChecker {
             let Some(manifest) = read_manifest(&self.blob_store, &digest).await? else {
                 continue;
             };
-            if !is_scan_subject(&manifest) {
+            if !manifest.is_plain_image() {
                 continue;
             }
             let payload = ScanImagePayload {

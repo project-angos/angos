@@ -6,7 +6,7 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
-use angos_oci::{Digest, Manifest, Namespace, Tag};
+use angos_oci::{Digest, Namespace, Tag};
 
 use crate::{
     jobs::{
@@ -24,7 +24,7 @@ use crate::{
     },
     scan::{
         SARIF_MEDIA_TYPE, ScanAction, ScanConfig, ScanImagePayload, ScanJobHandler, ScanSummary,
-        build_envelope, is_scan_subject, scan_reports,
+        build_envelope, scan_reports,
     },
 };
 use angos_secret::Secret;
@@ -47,28 +47,6 @@ fn scan_jobs_coalesce_on_the_image_digest() {
         envelope.lock_key.as_str(),
         format!("scan.{namespace}:{digest}")
     );
-}
-
-#[test]
-fn only_a_plain_image_manifest_is_a_scan_subject() {
-    let image = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
-    let report = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/sarif+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":2},"layers":[],"subject":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0}}"#;
-    let index = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
-    // A buildx provenance attestation: an image manifest with no subject,
-    // whose one layer is an in-toto statement.
-    let attestation = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":167},"layers":[{"mediaType":"application/vnd.in-toto+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":34184,"annotations":{"in-toto.io/predicate-type":"https://slsa.dev/provenance/v0.2"}}]}"#;
-    assert!(is_scan_subject(
-        &Manifest::from_slice(image.as_bytes()).unwrap()
-    ));
-    assert!(!is_scan_subject(
-        &Manifest::from_slice(report.as_bytes()).unwrap()
-    ));
-    assert!(!is_scan_subject(
-        &Manifest::from_slice(index.as_bytes()).unwrap()
-    ));
-    assert!(!is_scan_subject(
-        &Manifest::from_slice(attestation.as_bytes()).unwrap()
-    ));
 }
 
 /// The handler asks the scanner service for the report, pushes it as a SARIF
