@@ -42,8 +42,9 @@ pub enum ReferencePolicy {
     /// references, so they stay dangling rather than handing the namespace
     /// read access to content it never pushed.
     Permissive,
-    /// Trust every reference as owned; only pull-through cache-fill, which
-    /// fetches the content from the upstream the namespace mirrors, may use it.
+    /// Permissive, except that references with no stored bytes are linked too;
+    /// only pull-through cache-fill, which fetches that content from the
+    /// upstream the namespace mirrors, may use it.
     Trusted,
 }
 
@@ -1237,12 +1238,13 @@ impl Registry {
     }
 
     /// What the push may reference, per `policy`: Strict first verifies that
-    /// every referenced blob's bytes exist, then both Strict and Permissive
-    /// check that `namespace` already owns each newly-referenced digest:
-    /// Strict fails the push, Permissive keeps the manifest but withholds the
+    /// every referenced blob's bytes exist, then each policy checks that
+    /// `namespace` already owns each newly-referenced digest: Strict fails the
+    /// push, Permissive and Trusted keep the manifest but withhold the
     /// ownership-granting link, so the namespace gains no read access to
     /// content it never pushed. A Trusted push, the pull-through cache fill of
-    /// an upstream the namespace mirrors, pays no read at all.
+    /// an upstream the namespace mirrors, also links digests with no stored
+    /// bytes, which its blob reads then fetch from the upstream.
     async fn enforce_reference_policy(
         &self,
         namespace: &Namespace,
@@ -1250,16 +1252,19 @@ impl Registry {
         referenced: Vec<Digest>,
         policy: ReferencePolicy,
     ) -> Result<Vec<Digest>, Error> {
-        if policy == ReferencePolicy::Trusted {
-            return Ok(referenced);
-        }
         if policy == ReferencePolicy::Strict {
             self.validate_manifest_references(manifest).await?;
         }
 
         let mut allowed = Vec::with_capacity(referenced.len());
         for digest in referenced {
-            if self.metadata_store.can_read(namespace, &digest).await? {
+            let unstored = policy == ReferencePolicy::Trusted
+                && match self.blob_store.size(&digest).await {
+                    Ok(_) => false,
+                    Err(Error::BlobUnknown) => true,
+                    Err(error) => return Err(error),
+                };
+            if unstored || self.metadata_store.can_read(namespace, &digest).await? {
                 allowed.push(digest);
             } else if policy == ReferencePolicy::Strict {
                 warn!(
@@ -4491,6 +4496,32 @@ mod tests {
         assert!(
             links.contains(&LinkKind::ReferencedBy(manifest_digest)),
             "the per-referrer entry must be written"
+        );
+    }
+
+    /// An upstream manifest naming a private namespace's blob must not hand the
+    /// pull-through namespace read access to the stored bytes.
+    #[tokio::test]
+    async fn store_manifest_trusted_withholds_the_link_to_bytes_it_cannot_read() {
+        let test_case = FSRegistryTestCase::new();
+        let registry = test_case.registry();
+        let store = test_case.metadata_store();
+        let private = Namespace::new("secret/app").unwrap();
+        let cache = Namespace::new("cache/app").unwrap();
+
+        let layer_digest = upload_blob(registry, &private, b"private-layer").await;
+        policy_push(
+            registry,
+            &cache,
+            &Digest::sha256_of_bytes(b"upstream-manifest"),
+            slice::from_ref(&layer_digest),
+            ReferencePolicy::Trusted,
+        )
+        .await
+        .expect("a trusted push must commit");
+        assert!(
+            !store.can_read(&cache, &layer_digest).await.unwrap(),
+            "the cache fill must not grant read access to another namespace's bytes"
         );
     }
 

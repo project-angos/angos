@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Security
 
 - A client can no longer spoof its IP with its own `X-Forwarded-For` line, or with `X-Real-IP` behind an unparsable `X-Forwarded-For` entry.
+- An upstream manifest naming a blob another namespace stored no longer gives the pull-through namespace read access to it.
 
 ## 1.12.1
 
