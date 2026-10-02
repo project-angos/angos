@@ -37,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The web UI reads the repository names once per page load, instead of on every navigation and every hovered link.
 - Browsing a large layer's files decodes its stored listing off the request threads, so it no longer stalls other requests.
 - On the filesystem backend, a listing page reads only the directories it pages through, instead of walking and sorting everything under its prefix.
+- A blob mount without `from`, and replication's mount hint, read only the namespaces they use off the blob's reference index, instead of all of it.
 
 ## 1.12.1
 

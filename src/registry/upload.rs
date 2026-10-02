@@ -21,8 +21,8 @@ use crate::{
     },
 };
 
-/// Caps the namespaces CEL-evaluated for a from-less mount, bounding an
-/// attacker-influenceable fan-out. Candidates beyond the cap fall back to a
+/// Caps the namespaces a from-less mount reads off the blob index and
+/// CEL-evaluates, bounding an attacker-influenceable fan-out. Candidates beyond the cap fall back to a
 /// normal upload session, so no access is over-granted.
 const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
 
@@ -157,14 +157,9 @@ impl Registry {
             });
         }
 
-        let mut candidates = self
-            .metadata_store()
-            .referencing_namespaces(&mount.digest)
-            .await?;
-        // Sort before truncating so the kept candidates are deterministic.
-        candidates.sort();
-        candidates.truncate(MAX_FROM_LESS_MOUNT_CANDIDATES);
-        Ok(candidates)
+        self.metadata_store()
+            .referencing_namespaces(&mount.digest, MAX_FROM_LESS_MOUNT_CANDIDATES)
+            .await
     }
 
     /// Opens a fresh resumable upload session; `digest_algorithm` fixes what
