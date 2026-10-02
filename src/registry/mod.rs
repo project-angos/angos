@@ -8,7 +8,6 @@ pub mod blob;
 pub mod blob_ownership;
 pub mod blob_store;
 pub mod content_discovery;
-mod docker_extension;
 mod error;
 #[cfg(test)]
 mod event_emission_tests;
@@ -16,7 +15,6 @@ pub mod keys;
 pub mod layers;
 pub mod manifest;
 pub mod metadata_store;
-mod oci_service;
 pub mod pagination;
 pub mod repository;
 pub mod repository_resolver;

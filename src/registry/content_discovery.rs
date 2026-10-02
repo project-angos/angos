@@ -9,7 +9,7 @@ use futures_util::{
 };
 use tracing::{instrument, warn};
 
-use angos_docker_extension_service::{Catalog, CatalogRequest, NamespaceVisibility};
+use angos_docker_extension_service::{Catalog, CatalogRequest};
 use angos_oci::{
     Content, Descriptor, Digest, Manifest, MediaType, Namespace, client,
     request::{GetReferrersRequest, ListTagsRequest},
@@ -58,7 +58,7 @@ impl Registry {
     pub async fn handle_list_catalog(
         &self,
         request: CatalogRequest,
-        visibility: &dyn NamespaceVisibility,
+        visibility: &(dyn Fn(&Namespace) -> bool + Sync),
     ) -> Result<Catalog, Error> {
         let n = request.n.unwrap_or(DEFAULT_PAGE_SIZE);
         // The walk drops what the caller may not see before it probes a name,
@@ -66,12 +66,9 @@ impl Registry {
         // its cursor is the last one served.
         let page = self
             .metadata_store
-            .list_namespaces(
-                n,
-                request.last,
-                &|namespace| visibility.allows(namespace),
-                |namespace| holds_manifest_content(&self.metadata_store, namespace),
-            )
+            .list_namespaces(n, request.last, visibility, |namespace| {
+                holds_manifest_content(&self.metadata_store, namespace)
+            })
             .await?;
         let next = page
             .next_token

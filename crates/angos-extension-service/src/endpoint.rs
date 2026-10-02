@@ -46,8 +46,7 @@ pub enum Endpoint {
     ListPulls {
         namespace: Namespace,
         reference: Reference,
-        offset: u32,
-        n: Option<NonZeroU16>,
+        page: PageRequest,
     },
     /// `GET /v2/<name>/_angos/layers/<digest>/entries`.
     ListLayerEntries {
@@ -70,13 +69,13 @@ pub enum Endpoint {
     /// `GET /v2/_angos/jobs/list`.
     ListJobs {
         queue: Queue,
-        n: Option<u16>,
+        n: Option<NonZeroU16>,
         after: Option<String>,
     },
     /// `GET /v2/_angos/jobs/failed`.
     ListFailedJobs {
         queue: Queue,
-        n: Option<u16>,
+        n: Option<NonZeroU16>,
         after: Option<String>,
     },
     /// `POST /v2/_angos/jobs/failed?key=`.
@@ -155,7 +154,7 @@ struct RevisionsQuery {
 
 #[derive(Deserialize)]
 struct JobsQuery {
-    n: Option<u16>,
+    n: Option<NonZeroU16>,
     after: Option<String>,
     #[serde(default = "default_jobs_queue")]
     queue: Queue,
@@ -296,17 +295,11 @@ fn repository_extension(
             page: parse_query(params)?,
         }),
         "pulls/list" => {
-            let PullsQuery {
-                tag,
-                digest,
-                offset,
-                n,
-            } = parse_query(params)?;
+            let PullsQuery { tag, digest } = parse_query(params)?;
             Some(Endpoint::ListPulls {
                 namespace,
                 reference: pulls_reference(tag, digest)?,
-                offset: offset.unwrap_or(0),
-                n,
+                page: parse_query(params)?,
             })
         }
         _ => None,
@@ -323,8 +316,6 @@ struct LayerFileQuery {
 struct PullsQuery {
     tag: Option<Tag>,
     digest: Option<Digest>,
-    offset: Option<u32>,
-    n: Option<NonZeroU16>,
 }
 
 /// Takes `?tag=`/`?digest=` strictly: an unparseable or ambiguous target is
@@ -438,6 +429,9 @@ mod tests {
             ("/v2/myrepo/_angos/revisions/list", "sort=size"),
             ("/v2/myrepo/_angos/revisions/list", "digest=sha256:abc"),
             ("/v2/myrepo/_angos/uploads/list", "offset=-1"),
+            ("/v2/myrepo/_angos/pulls/list", "tag=v1&n=0"),
+            ("/v2/_angos/jobs/list", "n=0"),
+            ("/v2/_angos/jobs/failed", "n=0"),
         ] {
             assert!(
                 parse(&Method::GET, path, Some(query)).is_none(),
@@ -539,12 +533,11 @@ mod tests {
             Some(Endpoint::ListPulls {
                 namespace,
                 reference,
-                offset,
-                n,
+                page,
             }) => {
                 assert_eq!(namespace, "myrepo/app");
                 assert_eq!(reference.to_string(), "v1");
-                assert_eq!((offset, n), (0, None));
+                assert_eq!(page, PageRequest::default());
             }
             other => panic!("expected ListPulls, got {other:?}"),
         }
@@ -565,8 +558,14 @@ mod tests {
             "/v2/myrepo/_angos/pulls/list",
             Some("tag=v1&offset=200&n=50"),
         ) {
-            Some(Endpoint::ListPulls { offset, n, .. }) => {
-                assert_eq!((offset, n), (200, NonZeroU16::new(50)));
+            Some(Endpoint::ListPulls { page, .. }) => {
+                assert_eq!(
+                    page,
+                    PageRequest {
+                        offset: 200,
+                        n: NonZeroU16::new(50)
+                    }
+                );
             }
             other => panic!("expected ListPulls, got {other:?}"),
         }
@@ -609,7 +608,7 @@ mod tests {
         match parse(&Method::GET, "/v2/_angos/jobs/list", Some("n=10&after=abc")) {
             Some(Endpoint::ListJobs { queue, n, after }) => {
                 assert_eq!(queue, Queue::Cache);
-                assert_eq!(n, Some(10));
+                assert_eq!(n, NonZeroU16::new(10));
                 assert_eq!(after.as_deref(), Some("abc"));
             }
             other => panic!("expected ListJobs, got {other:?}"),

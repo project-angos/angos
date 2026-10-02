@@ -258,8 +258,7 @@ async fn needs_upstream_pull(
 
 impl Registry {
     #[instrument(skip(actor))]
-    /// The typed manifest-HEAD the [`angos_oci_service::OciService`] trait
-    /// serves.
+    /// `HEAD /v2/<name>/manifests/<reference>`: the manifest's descriptor.
     pub async fn handle_head_manifest(
         &self,
         actor: Option<EventActor>,
@@ -1068,8 +1067,7 @@ impl Registry {
     /// needs the caller's consent (a client opts out with
     /// `X-Angos-No-Redirect`) and an authoritative target.
     #[instrument(skip(self, request))]
-    /// The typed manifest-GET the [`angos_oci_service::OciService`] trait
-    /// serves.
+    /// `GET /v2/<name>/manifests/<reference>`: the manifest or a redirect to it.
     pub async fn handle_get_manifest(
         &self,
         actor: Option<EventActor>,

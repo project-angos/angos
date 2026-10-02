@@ -636,7 +636,7 @@ Query parameters:
 - `after` - Pagination cursor: the `next` value from the previous page
 - `queue` - Queue to administer: `cache` (default) or `replication`
 
-An unknown `queue` value, or any malformed query value (for example a non-numeric `n`), rejects the
+An unknown `queue` value, or any malformed query value (for example a non-numeric or zero `n`), rejects the
 request rather than silently falling back to the default `cache` queue: the `GET` listings return
 `404` and the retry/delete mutations return `400`.
 

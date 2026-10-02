@@ -17,14 +17,15 @@ use tracing::{instrument, warn};
 use angos_extension_service::{
     AccessEntry, DeleteJobRequest, FailedJobEntry, FailedJobsBody, JobEntry, JobsBody,
     ListJobsRequest, ListNamespacesRequest, ListPullsRequest, ManifestEntry, NamespaceInfo,
-    NamespaceVisibility, NamespacesBody, NoContent, PageRequest, ParentRef, PullsBody,
-    ReferrerInfo, RepositoriesBody, RepositoryInfo, RetryJobRequest, RevisionSelection,
-    RevisionSort, RevisionsBody, SortOrder, UploadEntry, UploadsBody,
+    NamespacesBody, PageRequest, ParentRef, PullsBody, ReferrerInfo, RepositoriesBody,
+    RepositoryInfo, RetryJobRequest, RevisionSelection, RevisionSort, RevisionsBody, SortOrder,
+    UploadEntry, UploadsBody,
 };
 use angos_oci::{
     Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType, Namespace, Platform,
     Tag, UploadSessionId, namespace_belongs_to, request::GetReferrersRequest,
 };
+use angos_oci_service::NoContent;
 
 use crate::{
     configuration::RegexPattern,
@@ -283,7 +284,7 @@ impl Registry {
         &self,
         order: SortOrder,
         page: PageRequest,
-        visibility: &dyn NamespaceVisibility,
+        visibility: &(dyn Fn(&Namespace) -> bool + Sync),
     ) -> Result<RepositoriesBody, Error> {
         // One walk bucketed in memory: listing per repository would re-scan the
         // whole store once per configured repository.
@@ -293,7 +294,7 @@ impl Registry {
         for name in self.resolver.keys() {
             let namespace_count = all_namespaces
                 .iter()
-                .filter(|ns| namespace_belongs_to(ns, name) && visibility.allows(ns))
+                .filter(|ns| namespace_belongs_to(ns, name) && visibility(ns))
                 .count();
             // Content the caller may see is the whole criterion, so a repository
             // that does not exist, holds nothing, or holds nothing visible are
@@ -328,7 +329,7 @@ impl Registry {
     pub async fn handle_list_namespaces(
         &self,
         request: ListNamespacesRequest,
-        visibility: &dyn NamespaceVisibility,
+        visibility: &(dyn Fn(&Namespace) -> bool + Sync),
     ) -> Result<NamespacesBody, Error> {
         let ListNamespacesRequest {
             repository,
@@ -352,7 +353,7 @@ impl Registry {
         let mut visible: Vec<Namespace> = namespace_names
             .into_iter()
             .filter_map(|name| Namespace::new(&name).ok())
-            .filter(|name| visibility.allows(name))
+            .filter(|name| visibility(name))
             .collect();
 
         // Nothing visible in scope answers as an absent repository, so an empty
@@ -498,8 +499,7 @@ impl Registry {
         let ListPullsRequest {
             namespace,
             reference,
-            offset,
-            n,
+            page: PageRequest { offset, n },
         } = request;
         let n = n.map_or(DEFAULT_PAGE_SIZE, NonZeroU16::get);
         let (entries, more) = self
@@ -583,7 +583,7 @@ impl Registry {
     pub async fn handle_list_jobs(&self, request: ListJobsRequest) -> Result<JobsBody, Error> {
         let ListJobsRequest { queue, n, after } = request;
         let queue = Queue::from(queue);
-        let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
+        let n = n.map_or(DEFAULT_PAGE_SIZE, NonZeroU16::get);
         let page = self
             .config
             .job_queue
@@ -622,7 +622,7 @@ impl Registry {
     }
 
     /// One keyset page of dead-letter jobs on `queue`; see
-    /// [`Self::get_jobs_info`] for the cursor and skip semantics.
+    /// [`Self::handle_list_jobs`] for the cursor and skip semantics.
     #[instrument(skip(self))]
     pub async fn handle_list_failed_jobs(
         &self,
@@ -630,7 +630,7 @@ impl Registry {
     ) -> Result<FailedJobsBody, Error> {
         let ListJobsRequest { queue, n, after } = request;
         let queue = Queue::from(queue);
-        let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
+        let n = n.map_or(DEFAULT_PAGE_SIZE, NonZeroU16::get);
         let page = self
             .config
             .job_queue
@@ -933,11 +933,11 @@ impl Registry {
         (entries, total, next)
     }
 
-    /// Each subject's referrers as the listing serves them. A subject carrying
-    /// the pre-API fallback tag takes the OCI listing path, which folds that
-    /// tag's index in and cuts its cursor over the same candidates the cursor
-    /// is later followed through; every other subject resolves one page of
-    /// its recorded referrers directly.
+    /// Each subject's referrers as the listing serves them. Recorded referrers
+    /// that fit one page resolve directly with no cursor; any other subject
+    /// takes the OCI listing path, merging the fallback tag and a pull-through
+    /// upstream, so the cursor the UI follows through that path cuts the same
+    /// candidates.
     async fn resolve_subject_referrers(
         &self,
         namespace: &Namespace,
@@ -945,38 +945,20 @@ impl Registry {
         referrers_by_subject: &HashMap<Digest, Vec<Digest>>,
         tag_names: &HashSet<Tag>,
     ) -> HashMap<Digest, SubjectReferrers> {
+        let upstream = self
+            .get_repository_for_namespace(namespace)
+            .ok()
+            .filter(|repository| repository.is_pull_through());
         stream::iter(subjects)
             .map(|subject| async move {
-                let listed = if tag_names.contains(&subject.referrers_fallback_tag()) {
-                    let listing = GetReferrersRequest {
-                        namespace: namespace.clone(),
-                        digest: subject.clone(),
-                        artifact_type: None,
-                        last: None,
-                    };
-                    match self.list_referrers(None, &listing).await {
-                        Ok(page) => SubjectReferrers {
-                            descriptors: page.items,
-                            next: page.next_token,
-                        },
-                        Err(_) => SubjectReferrers {
-                            descriptors: Vec::new(),
-                            next: None,
-                        },
-                    }
-                } else {
-                    let mut recorded = referrers_by_subject
-                        .get(&subject)
-                        .cloned()
-                        .unwrap_or_default();
+                let mut recorded = referrers_by_subject
+                    .get(&subject)
+                    .cloned()
+                    .unwrap_or_default();
+                let listed = if recorded.len() <= usize::from(DEFAULT_PAGE_SIZE)
+                    && !tag_names.contains(&subject.referrers_fallback_tag())
+                {
                     recorded.sort();
-                    let page_size = usize::from(DEFAULT_PAGE_SIZE);
-                    let next = recorded
-                        .get(page_size..)
-                        .filter(|rest| !rest.is_empty())
-                        .and_then(|_| recorded.get(page_size - 1))
-                        .map(ToString::to_string);
-                    recorded.truncate(page_size);
                     let subject = &subject;
                     let descriptors = stream::iter(recorded)
                         .map(|referrer| async move {
@@ -987,7 +969,27 @@ impl Registry {
                         .filter_map(|descriptor| async move { descriptor })
                         .collect()
                         .await;
-                    SubjectReferrers { descriptors, next }
+                    SubjectReferrers {
+                        descriptors,
+                        next: None,
+                    }
+                } else {
+                    let listing = GetReferrersRequest {
+                        namespace: namespace.clone(),
+                        digest: subject.clone(),
+                        artifact_type: None,
+                        last: None,
+                    };
+                    match self.list_referrers(upstream, &listing).await {
+                        Ok(page) => SubjectReferrers {
+                            descriptors: page.items,
+                            next: page.next_token,
+                        },
+                        Err(_) => SubjectReferrers {
+                            descriptors: Vec::new(),
+                            next: None,
+                        },
+                    }
                 };
                 (subject, listed)
             })
@@ -1117,35 +1119,47 @@ mod tests {
 
     use bytes::Bytes;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tokio::time::sleep;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
+    use angos_cache::Config as CacheConfig;
     use angos_extension_service::{
         ListNamespacesRequest, ManifestEntry, NamespacesBody, PageRequest, ParentRef, ReferrerInfo,
         RevisionSelection, RevisionSort, SortOrder,
     };
     use angos_oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, Platform, Reference, Tag,
-        UploadSessionId,
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, OCI_INDEX_MEDIA_TYPE,
+        Platform, Reference, Tag, UploadSessionId,
     };
     use angos_storage::{
         Error as StorageError, ObjectStore,
         test_util::{HookedStore, StoreHook, StoreOp},
     };
 
-    use crate::registry::{
-        Error as RegistryError, Registry,
-        admin::{
-            ListPullsRequest, analyze_manifest, extract_docker_referrer, parent_refs_for,
-            select_revisions,
+    use crate::{
+        registry::{
+            Error as RegistryError, Registry, RegistryConfig,
+            admin::{
+                ListPullsRequest, analyze_manifest, extract_docker_referrer, parent_refs_for,
+                select_revisions,
+            },
+            content_discovery::DEFAULT_PAGE_SIZE,
+            keys::NamespaceKeys,
+            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+            metadata_store::{AccessEntry, LinkKind, MetadataStore},
+            repository::{Config as RepositoryConfig, Repository},
+            test_utils::{
+                FSRegistryTestCase, FsTestStack, RegistryTestCase, create_test_blob,
+                create_test_registry, create_test_registry_recording_pulls, for_each_backend,
+                fs_test_stack, media_type, metadata_store_over, put_blob_body, response_json,
+                seed_links, single_repo_resolver, test_job_store,
+            },
         },
-        keys::NamespaceKeys,
-        metadata_store::{AccessEntry, LinkKind, MetadataStore},
-        test_utils::{
-            FSRegistryTestCase, RegistryTestCase, create_test_blob, create_test_registry,
-            create_test_registry_recording_pulls, for_each_backend, media_type,
-            metadata_store_over, put_blob_body, response_json, seed_links,
-        },
+        test_fixtures::client::test_client_config,
     };
 
     /// Holds every intercepted read for a beat and records whether a tag-side
@@ -2006,8 +2020,7 @@ mod tests {
                 .handle_list_pulls(ListPullsRequest {
                     namespace: namespace.clone(),
                     reference: Reference::Tag(tag.clone()),
-                    offset: 0,
-                    n: None,
+                    page: PageRequest::default(),
                 })
                 .await
                 .unwrap()
@@ -2126,6 +2139,113 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// A pull-through subject with more local referrers than one page cuts that
+    /// page over its upstream's referrers too, so the cursor the UI follows
+    /// through the referrers endpoint skips none of them.
+    #[tokio::test]
+    async fn a_paged_pull_through_subject_merges_its_upstream_on_the_first_page() {
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
+        let namespace = Namespace::new("mirror/app").unwrap();
+        let subject = Digest::sha256_of_bytes(b"subject");
+        let descriptor = |digest: &Digest| Descriptor {
+            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
+            digest: digest.clone(),
+            size: 1,
+            annotations: HashMap::new(),
+            artifact_type: None,
+            platform: None,
+        };
+        seed_links(
+            &metadata_store,
+            &namespace,
+            &[(LinkKind::Digest(subject.clone()), subject.clone())],
+        )
+        .await
+        .unwrap();
+        let page_size = usize::from(DEFAULT_PAGE_SIZE);
+        let mut local: Vec<Digest> = (0..=page_size)
+            .map(|i| Digest::sha256_of_bytes(format!("referrer {i}").as_bytes()))
+            .collect();
+        for referrer in &local {
+            metadata_store
+                .put_referrer(&namespace, &subject, referrer, Some(&descriptor(referrer)))
+                .await
+                .unwrap();
+        }
+        local.sort();
+        // Sorts before the last referrer a local-only page would serve.
+        let remote = (0..100)
+            .map(|i| Digest::sha256_of_bytes(format!("upstream {i}").as_bytes()))
+            .find(|digest| *digest < local[page_size - 1])
+            .unwrap();
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/app/referrers/{subject}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_INDEX_MEDIA_TYPE,
+                "manifests": [descriptor(&remote)],
+            })))
+            .mount(&upstream)
+            .await;
+        let repository = Repository::new(
+            "mirror",
+            &RepositoryConfig {
+                upstream: vec![test_client_config(upstream.uri())],
+                ..Default::default()
+            },
+            &CacheConfig::Memory.to_backend().unwrap(),
+            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
+        let registry = Registry::new(
+            blob_store,
+            metadata_store.clone(),
+            single_repo_resolver("mirror", repository),
+            RegistryConfig::new(test_job_store(&metadata_store)),
+        );
+
+        let body = response_json(
+            registry
+                .handle_list_revisions(&namespace, FIRST_REVISIONS)
+                .await
+                .unwrap()
+                .into_response()
+                .unwrap(),
+        )
+        .await;
+        let entry = body["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["digest"] == subject.to_string())
+            .unwrap_or_else(|| panic!("the subject must be listed: {body}"));
+
+        let mut candidates = local;
+        candidates.push(remote.clone());
+        candidates.sort();
+        let served: Vec<String> = entry["referrers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|referrer| referrer["digest"].as_str().unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = candidates[..page_size]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(served, expected, "the page must hold the upstream referrer");
+        assert_eq!(
+            entry["referrers_next"],
+            candidates[page_size - 1].to_string()
+        );
     }
 
     /// Seed one revision record and point `tags` at it, the shape a push
@@ -2334,8 +2454,7 @@ mod tests {
                 .handle_list_pulls(ListPullsRequest {
                     namespace: namespace.clone(),
                     reference: Reference::Digest(target.clone()),
-                    offset: 0,
-                    n: None,
+                    page: PageRequest::default(),
                 })
                 .await
                 .unwrap()
@@ -2360,8 +2479,7 @@ mod tests {
                 .handle_list_pulls(ListPullsRequest {
                     namespace: Namespace::new("test-repo/quiet").unwrap(),
                     reference: Reference::Tag(Tag::new("never").unwrap()),
-                    offset: 0,
-                    n: None,
+                    page: PageRequest::default(),
                 })
                 .await
                 .unwrap()

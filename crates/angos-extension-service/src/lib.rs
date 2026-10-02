@@ -2,7 +2,7 @@
 //! operators use: the repository/namespace/manifest listings, upload and pull
 //! history, the layer filesystem index, and the durable-job administration.
 //!
-//! None of this is in the OCI or Docker spec, so it lives behind its own trait,
+//! None of this is in the OCI or Docker spec, so it lives in its own crate,
 //! keeping [`angos_oci_service`](../angos_oci_service/index.html) exactly the
 //! Distribution spec. The types here are the extension's wire interface; the
 //! registry crate fills them in.
@@ -13,10 +13,8 @@
 
 use std::{collections::HashMap, num::NonZeroU16};
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncRead;
 
 use angos_oci::http_range::{RequestRange, ResponseRange};
 use angos_oci::{
@@ -28,9 +26,6 @@ pub use endpoint::{Endpoint, parse};
 
 #[cfg(feature = "hyper")]
 mod render;
-
-/// A `204 No Content`: a job the registry retried or removed, in full. No body.
-pub struct NoContent;
 
 // ---- Repository / namespace listings --------------------------------------
 
@@ -234,9 +229,8 @@ pub struct PullsBody {
 pub struct ListPullsRequest {
     pub namespace: Namespace,
     pub reference: Reference,
-    /// Pulls to skip, newest first.
-    pub offset: u32,
-    pub n: Option<NonZeroU16>,
+    /// The page of pulls, newest first.
+    pub page: PageRequest,
 }
 
 // ---- Layer filesystem index -----------------------------------------------
@@ -461,7 +455,7 @@ pub enum JobState {
 #[derive(Debug)]
 pub struct ListJobsRequest {
     pub queue: Queue,
-    pub n: Option<u16>,
+    pub n: Option<NonZeroU16>,
     pub after: Option<String>,
 }
 
@@ -515,103 +509,4 @@ pub struct FailedJobsBody {
     pub failed: Vec<FailedJobEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
-}
-
-// ---- The service ----------------------------------------------------------
-
-/// Whether a caller may see a namespace in a listing.
-///
-/// Listing authorization is the transport's, not the service's: the transport
-/// implements this over its authorizer and the service consults it per entry.
-/// Blanket-implemented for any `Fn(&Namespace) -> bool`, so a caller may pass a
-/// closure where a `&dyn NamespaceVisibility` is expected.
-pub trait NamespaceVisibility: Send + Sync {
-    fn allows(&self, namespace: &Namespace) -> bool;
-}
-
-impl<F: Fn(&Namespace) -> bool + Send + Sync> NamespaceVisibility for F {
-    fn allows(&self, namespace: &Namespace) -> bool {
-        self(namespace)
-    }
-}
-
-/// Angos's `_angos/` registry API.
-///
-/// Most endpoints are authorized at the route alone, so the service takes no
-/// actor. The two listings that span repositories are the exception: a route
-/// check cannot speak for entries the caller may not see, so they take a
-/// [`NamespaceVisibility`] and drop those. `Body` is the reader a layer-file
-/// response streams from.
-#[async_trait]
-pub trait AngosExtensionService: Send + Sync {
-    type Body: AsyncRead + Send + 'static;
-    type Error;
-
-    /// `GET /v2/_angos/repositories/list?order=&offset=&n=`. Serves the
-    /// repositories `visibility` admits, each counting only the namespaces it
-    /// admits.
-    async fn list_repositories(
-        &self,
-        order: SortOrder,
-        page: PageRequest,
-        visibility: &dyn NamespaceVisibility,
-    ) -> Result<RepositoriesBody, Self::Error>;
-
-    /// `GET /v2/_angos/namespaces/list?repository=&under=&order=&offset=&n=`.
-    /// Serves the namespaces `visibility` admits.
-    async fn list_namespaces(
-        &self,
-        request: ListNamespacesRequest,
-        visibility: &dyn NamespaceVisibility,
-    ) -> Result<NamespacesBody, Self::Error>;
-
-    /// `GET /v2/<name>/_angos/revisions/list?sort=&order=&offset=&n=|digest=`.
-    async fn list_revisions(
-        &self,
-        namespace: Namespace,
-        selection: RevisionSelection,
-    ) -> Result<RevisionsBody, Self::Error>;
-
-    /// `GET /v2/<name>/_angos/uploads/list?offset=&n=`.
-    async fn list_uploads(
-        &self,
-        namespace: Namespace,
-        page: PageRequest,
-    ) -> Result<UploadsBody, Self::Error>;
-
-    /// `GET /v2/<name>/_angos/pulls/list?tag=|digest=`.
-    async fn list_pulls(&self, request: ListPullsRequest) -> Result<PullsBody, Self::Error>;
-
-    /// `GET /v2/{namespace}/_angos/layers/{digest}/entries`.
-    async fn list_layer_entries(
-        &self,
-        request: LayerEntriesRequest,
-    ) -> Result<LayerEntries, Self::Error>;
-
-    /// `GET /v2/{namespace}/_angos/layers/{digest}/file`.
-    async fn get_layer_file(
-        &self,
-        request: LayerFileRequest,
-    ) -> Result<LayerFile<Self::Body>, Self::Error>;
-
-    /// `GET /v2/{namespace}/_angos/layers/{digest}/details`.
-    async fn get_layer_file_details(
-        &self,
-        request: LayerFileDetailsRequest,
-    ) -> Result<LayerFileDetails, Self::Error>;
-
-    /// `GET /v2/_angos/jobs/list`.
-    async fn list_jobs(&self, request: ListJobsRequest) -> Result<JobsBody, Self::Error>;
-
-    /// `GET /v2/_angos/jobs/failed`.
-    async fn list_failed_jobs(
-        &self,
-        request: ListJobsRequest,
-    ) -> Result<FailedJobsBody, Self::Error>;
-
-    /// `POST /v2/_angos/jobs/retry`.
-    async fn retry_job(&self, request: RetryJobRequest) -> Result<NoContent, Self::Error>;
-
-    /// `DELETE /v2/_angos/jobs`.
-    async fn delete_job(&self, request: DeleteJobRequest) -> Result<NoContent, Self::Error>;
 }

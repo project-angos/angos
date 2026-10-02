@@ -1,3 +1,5 @@
+use std::num::NonZeroU16;
+
 use serde::Serialize;
 
 use angos_oci::request::ManifestPutTarget;
@@ -214,7 +216,7 @@ pub enum Action {
     ListJobs {
         queue: Queue,
         #[serde(skip_serializing_if = "Option::is_none")]
-        n: Option<u16>,
+        n: Option<NonZeroU16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         after: Option<String>,
     },
@@ -222,7 +224,7 @@ pub enum Action {
     ListFailedJobs {
         queue: Queue,
         #[serde(skip_serializing_if = "Option::is_none")]
-        n: Option<u16>,
+        n: Option<NonZeroU16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         after: Option<String>,
     },

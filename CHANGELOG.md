@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - An upstream, downstream or scanner service configured with only one of `username` and `password` fails the configuration load instead of running anonymously.
+- The job listings reject `n=0`, as the other `_angos` listings do.
 
 ### Security
 
@@ -30,6 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A denied scan or index job, and any job whose kind or payload the worker cannot read, dead-letters at once instead of using up its retries.
 - The web UI shows and copies a sha512 manifest as `repo@sha512:<hex>`, the reference it is pulled by, instead of `repo:sha512:<hex>`.
 - The web UI's vulnerability table reads a finding's severity as the report badge does, so the two no longer disagree.
+- The web UI pages the referrers of a pull-through manifest with more than 150 of them without skipping upstream ones.
 
 ## 1.12.1
 
