@@ -19,6 +19,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use tokio::{
     select, spawn,
@@ -746,55 +747,38 @@ impl JobStore {
     pub async fn count_pending(&self, queue: Queue, ready_horizon_secs: u64) -> Result<u64, Error> {
         let prefix = job_pending_dir(queue.as_str());
         let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
+        let mut names = self.store.list_in_order(&prefix);
         let mut count: u64 = 0;
-        let mut token: Option<String> = None;
-        loop {
-            let page = self.store.list(&prefix, 1000, token).await?;
-            for name in &page.items {
-                let Some(stem) = name.strip_suffix(".json") else {
-                    continue;
-                };
-                // Lex order equals `not_before` order, so the first key past the
-                // cutoff ends the count.
-                if let Some(p) = stem.get(..STORAGE_KEY_PREFIX_LEN)
-                    && p > cutoff_prefix.as_str()
-                {
-                    return Ok(count.min(MAX_REPORTED_PENDING));
-                }
-                count += 1;
-                if count >= MAX_REPORTED_PENDING {
-                    return Ok(MAX_REPORTED_PENDING);
-                }
+        while count < MAX_REPORTED_PENDING
+            && let Some(name) = names.try_next().await?
+        {
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            // Lex order equals `not_before` order, so the first key past the
+            // cutoff ends the count.
+            if let Some(p) = stem.get(..STORAGE_KEY_PREFIX_LEN)
+                && p > cutoff_prefix.as_str()
+            {
+                break;
             }
-            match page.next_token {
-                Some(t) => token = Some(t),
-                None => return Ok(count),
-            }
+            count += 1;
         }
+        Ok(count)
     }
 
     /// Count dead-lettered envelopes in `queue`, capped at
     /// `MAX_REPORTED_PENDING`.
     pub async fn count_failed(&self, queue: Queue) -> Result<u64, Error> {
         let prefix = job_failed_dir(queue.as_str());
+        let mut names = self.store.list_in_order(&prefix);
         let mut count: u64 = 0;
-        let mut token: Option<String> = None;
-        loop {
-            let page = self.store.list(&prefix, 1000, token).await?;
-            for name in &page.items {
-                if name.strip_suffix(".json").is_none() {
-                    continue;
-                }
-                count += 1;
-                if count >= MAX_REPORTED_PENDING {
-                    return Ok(MAX_REPORTED_PENDING);
-                }
-            }
-            match page.next_token {
-                Some(t) => token = Some(t),
-                None => return Ok(count),
-            }
+        while count < MAX_REPORTED_PENDING
+            && let Some(name) = names.try_next().await?
+        {
+            count += u64::from(name.strip_suffix(".json").is_some());
         }
+        Ok(count)
     }
 
     /// `true` when any pending job in `queue` carries `lock_key`, via the O(1)

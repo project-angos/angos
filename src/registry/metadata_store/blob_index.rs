@@ -16,7 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::future::try_join_all;
+use futures_util::{TryStreamExt, future::try_join_all};
 use tracing::instrument;
 
 use angos_oci::{Digest, Namespace};
@@ -25,7 +25,7 @@ use angos_storage::Error as StorageError;
 use crate::registry::{
     Error,
     keys::DigestKeys,
-    metadata_store::{LIST_PAGE, LinkKind, MetadataStore},
+    metadata_store::{LinkKind, MetadataStore},
 };
 
 /// Every namespace referencing one blob, with the links each references it
@@ -46,18 +46,9 @@ impl MetadataStore {
             links.insert(LinkKind::Blob(digest.clone()));
         }
         let dir = digest.blob_ref_namespace_dir(namespace);
-        let mut token = None;
-        loop {
-            let page = store.list(&dir, LIST_PAGE, token).await?;
-            links.extend(
-                page.items
-                    .iter()
-                    .filter_map(|entry| digest.parse_blob_ref_entry(entry)),
-            );
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
+        let mut entries = store.list_all(&dir);
+        while let Some(entry) = entries.try_next().await? {
+            links.extend(digest.parse_blob_ref_entry(&entry));
         }
         Ok(links)
     }
@@ -208,22 +199,15 @@ impl MetadataStore {
     pub async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
         let mut index = BlobIndex::default();
         let dir = digest.blob_ref_dir();
-        let mut token = None;
-        loop {
-            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            for key in &page.items {
-                let Some((raw, link)) = digest.parse_blob_ref(key) else {
-                    continue;
-                };
-                let Ok(namespace) = Namespace::new(&raw) else {
-                    continue;
-                };
-                index.entry(namespace).or_default().insert(link);
-            }
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
+        let mut keys = self.object_store().list_all(&dir);
+        while let Some(key) = keys.try_next().await? {
+            let Some((raw, link)) = digest.parse_blob_ref(&key) else {
+                continue;
+            };
+            let Ok(namespace) = Namespace::new(&raw) else {
+                continue;
+            };
+            index.entry(namespace).or_default().insert(link);
         }
 
         if index.is_empty() {
@@ -302,33 +286,26 @@ impl MetadataStore {
     /// the caller's, since the bytes live in the blob store.
     pub async fn blob_references_live(&self, digest: &Digest) -> Result<bool, Error> {
         let dir = digest.blob_ref_dir();
-        let mut token = None;
-        loop {
-            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            for key in &page.items {
-                let Some((raw, link)) = digest.parse_blob_ref(key) else {
-                    continue;
-                };
-                if matches!(link, LinkKind::Blob(_)) {
-                    return Ok(true);
-                }
-                match self.key_within_grace(&format!("{dir}/{key}")).await? {
-                    Some(true) => return Ok(true),
-                    Some(false) => {}
-                    None => continue,
-                }
-                let Ok(namespace) = Namespace::new(&raw) else {
-                    // A key angos cannot address is left to quarantine, and
-                    // pins until then.
-                    return Ok(true);
-                };
-                if self.reference_backed(&namespace, &link, digest).await? {
-                    return Ok(true);
-                }
+        let mut keys = self.object_store().list_all(&dir);
+        while let Some(key) = keys.try_next().await? {
+            let Some((raw, link)) = digest.parse_blob_ref(&key) else {
+                continue;
+            };
+            if matches!(link, LinkKind::Blob(_)) {
+                return Ok(true);
             }
-            token = page.next_token;
-            if token.is_none() {
-                break;
+            match self.key_within_grace(&format!("{dir}/{key}")).await? {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => continue,
+            }
+            let Ok(namespace) = Namespace::new(&raw) else {
+                // A key angos cannot address is left to quarantine, and
+                // pins until then.
+                return Ok(true);
+            };
+            if self.reference_backed(&namespace, &link, digest).await? {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -344,19 +321,13 @@ impl MetadataStore {
         digest: &Digest,
     ) -> Result<bool, Error> {
         let dir = digest.blob_ref_namespace_dir(namespace);
-        let mut token = None;
-        loop {
-            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            for entry in &page.items {
-                if self.key_within_grace(&format!("{dir}/{entry}")).await? == Some(true) {
-                    return Ok(true);
-                }
-            }
-            token = page.next_token;
-            if token.is_none() {
-                return Ok(false);
+        let mut entries = self.object_store().list_all(&dir);
+        while let Some(entry) = entries.try_next().await? {
+            if self.key_within_grace(&format!("{dir}/{entry}")).await? == Some(true) {
+                return Ok(true);
             }
         }
+        Ok(false)
     }
 
     /// Whether the key at `key` is younger than the grace period, or carries no

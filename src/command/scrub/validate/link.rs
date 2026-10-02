@@ -4,6 +4,7 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::{TryStreamExt, stream::TryChunksError};
 use tracing::{debug, warn};
 
 use angos_oci::{Digest, Manifest, Namespace, Tag};
@@ -78,40 +79,29 @@ impl Validator {
         tag: &Tag,
     ) -> Result<(), Error> {
         let dir = namespace.tag_entry_dir(tag);
+        let mut names = self.metadata_store.object_store().list_in_order(&dir);
         let mut winner_ord = None;
-        let mut token = None;
-        loop {
-            let page = self
-                .metadata_store
-                .object_store()
-                .list(&dir, 1000, token)
-                .await
-                .map_err(RegistryError::from)?;
-            for name in &page.items {
-                let Ok(entry) = name.parse::<TagEntry>() else {
-                    continue;
-                };
-                // The listing sorts newest first, so the first parseable
-                // ordinal is the winner group's.
-                let winner = *winner_ord.get_or_insert(entry.ord());
-                if entry.ord() <= winner {
-                    continue;
-                }
-                if self.younger_than_grace(&format!("{dir}/{name}")).await? {
-                    continue;
-                }
-                self.emit(Action::DemoteTagEntry {
-                    namespace: namespace.clone(),
-                    tag: tag.clone(),
-                    entry_name: name.clone(),
-                })
-                .await?;
+        while let Some(name) = names.try_next().await.map_err(RegistryError::from)? {
+            let Ok(entry) = name.parse::<TagEntry>() else {
+                continue;
+            };
+            // The listing sorts newest first, so the first parseable ordinal
+            // is the winner group's.
+            let winner = *winner_ord.get_or_insert(entry.ord());
+            if entry.ord() <= winner {
+                continue;
             }
-            token = page.next_token;
-            if token.is_none() {
-                return Ok(());
+            if self.younger_than_grace(&format!("{dir}/{name}")).await? {
+                continue;
             }
+            self.emit(Action::DemoteTagEntry {
+                namespace: namespace.clone(),
+                tag: tag.clone(),
+                entry_name: name,
+            })
+            .await?;
         }
+        Ok(())
     }
 
     /// One tag's access entries, compacted once per (namespace, tag).
@@ -165,7 +155,13 @@ impl Validator {
         let now = Utc::now();
         let limit = usize::try_from(history.max_pulls.get()).unwrap_or(usize::MAX);
 
-        let chunks = self.metadata_store.list_names(&compacted).await?;
+        let chunks: Vec<String> = self
+            .metadata_store
+            .object_store()
+            .list_in_order(&compacted)
+            .try_collect()
+            .await
+            .map_err(RegistryError::from)?;
         // A chunk is named after its newest entry, and entries list newest
         // first, so every entry at or past the newest chunk's name is already
         // packed: a leftover of a run whose retires did not all land.
@@ -175,17 +171,19 @@ impl Validator {
         // Packing stops at the history limit, which bounds both.
         let mut packed = Vec::new();
         let mut packed_keys = Vec::new();
-        let mut token = None;
-        loop {
-            let page = self
-                .metadata_store
-                .object_store()
-                .list(&dir, LIST_PAGE, token)
-                .await
-                .map_err(RegistryError::from)?;
+        let mut pages = self
+            .metadata_store
+            .object_store()
+            .list_in_order(&dir)
+            .try_chunks(usize::from(LIST_PAGE));
+        while let Some(page) = pages
+            .try_next()
+            .await
+            .map_err(|TryChunksError(_, e)| RegistryError::from(e))?
+        {
             // Nothing the new chunk holds, so these go at once.
             let mut dropped = Vec::new();
-            for name in &page.items {
+            for name in &page {
                 let Some(at) = parse_atime_entry(name) else {
                     continue;
                 };
@@ -227,10 +225,6 @@ impl Validator {
                     retired: dropped,
                 }))
                 .await?;
-            }
-            token = page.next_token;
-            if token.is_none() {
-                break;
             }
         }
 
