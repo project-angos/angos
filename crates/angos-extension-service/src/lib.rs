@@ -242,20 +242,23 @@ pub struct ListPullsRequest {
 // ---- Layer filesystem index -----------------------------------------------
 
 /// A tar entry's kind in a layer listing.
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryKind {
     File,
     Dir,
     Symlink,
     Hardlink,
+    /// `.wh.<name>`: the lower layers' `<name>` is gone; `path` names it.
     Whiteout,
+    /// `.wh..wh..opq`: the lower layers' content of `path` is gone.
     Opaque,
     Other,
 }
 
-/// One tar entry with where its data starts in the uncompressed stream.
-#[derive(Serialize, Debug, Clone)]
+/// One tar entry, with where its data starts in the uncompressed stream; the
+/// indexer stores it as served.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct LayerEntry {
     pub path: String,
     pub kind: EntryKind,
@@ -264,50 +267,62 @@ pub struct LayerEntry {
     pub uid: u64,
     pub gid: u64,
     pub mtime: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
     pub offset: u64,
-    /// Set on files only.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Set on files only, and missing from listings indexed before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<FileContent>,
     /// The Linux capabilities its `security.capability` attribute permits.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
 }
 
 /// A file's digests, hex-encoded, its media type, and the credentials its
 /// first bytes give away.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FileContent {
     pub sha256: String,
     pub sha512: String,
     pub mime_type: String,
     /// In line order.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<Secret>,
 }
 
 /// A credential, and the line it is on from 1.
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Secret {
     pub kind: SecretKind,
     pub line: usize,
 }
 
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum SecretKind {
+    /// A PEM, OpenSSH or PGP private key block.
     PrivateKey,
+    /// An `aws_secret_access_key` line of an AWS credentials file.
     AwsCredentials,
+    /// An `auth` entry of a Docker `config.json`.
     RegistryAuth,
+    /// An `.npmrc` registry token or password.
     NpmToken,
+    /// A URL carrying a user and a password, as `.git-credentials` keeps them.
     GitCredentials,
+    /// A `.netrc` machine with its password.
     Netrc,
+    /// A GitHub personal access, OAuth or app token.
     GithubToken,
+    /// A GitLab personal access token.
     GitlabToken,
+    /// A Slack bot or user token.
     SlackToken,
+    /// A Stripe live secret or restricted key.
     StripeKey,
+    /// An AWS access key ID, long-lived or temporary.
     AwsAccessKey,
+    /// A kubeconfig's client key or bearer token.
     Kubeconfig,
 }
 

@@ -4,11 +4,12 @@
 
 use bytes::Bytes;
 
+use angos_extension_service::LayerEntry;
 use angos_oci::Digest;
 use angos_storage::Error as StorageError;
 
 use crate::{
-    layer::{Checkpoints, Entry, Listing},
+    layer::{Checkpoints, Listing},
     registry::{Error, keys::DigestKeys, metadata_store::MetadataStore},
 };
 
@@ -23,7 +24,11 @@ impl MetadataStore {
     }
 
     /// Chunk `chunk` of a layer's entries.
-    pub async fn read_entries(&self, digest: &Digest, chunk: usize) -> Result<Vec<Entry>, Error> {
+    pub async fn read_entries(
+        &self,
+        digest: &Digest,
+        chunk: usize,
+    ) -> Result<Vec<LayerEntry>, Error> {
         let bytes = self
             .object_store()
             .get(&digest.layer_entries_chunk_path(chunk))
@@ -52,7 +57,7 @@ impl MetadataStore {
         &self,
         digest: &Digest,
         chunk: usize,
-        entries: &[Entry],
+        entries: &[LayerEntry],
     ) -> Result<(), Error> {
         let body = Bytes::from(serde_json::to_vec(entries)?);
         self.object_store()

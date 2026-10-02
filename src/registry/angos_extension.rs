@@ -36,78 +36,13 @@ impl From<ext::JobState> for jobs::JobState {
     }
 }
 
-impl From<layer::Kind> for ext::EntryKind {
-    fn from(kind: layer::Kind) -> Self {
-        match kind {
-            layer::Kind::File => ext::EntryKind::File,
-            layer::Kind::Dir => ext::EntryKind::Dir,
-            layer::Kind::Symlink => ext::EntryKind::Symlink,
-            layer::Kind::Hardlink => ext::EntryKind::Hardlink,
-            layer::Kind::Whiteout => ext::EntryKind::Whiteout,
-            layer::Kind::Opaque => ext::EntryKind::Opaque,
-            layer::Kind::Other => ext::EntryKind::Other,
-        }
-    }
-}
-
-impl From<layer::SecretKind> for ext::SecretKind {
-    fn from(kind: layer::SecretKind) -> Self {
-        match kind {
-            layer::SecretKind::PrivateKey => ext::SecretKind::PrivateKey,
-            layer::SecretKind::AwsCredentials => ext::SecretKind::AwsCredentials,
-            layer::SecretKind::RegistryAuth => ext::SecretKind::RegistryAuth,
-            layer::SecretKind::NpmToken => ext::SecretKind::NpmToken,
-            layer::SecretKind::GitCredentials => ext::SecretKind::GitCredentials,
-            layer::SecretKind::Netrc => ext::SecretKind::Netrc,
-            layer::SecretKind::GithubToken => ext::SecretKind::GithubToken,
-            layer::SecretKind::GitlabToken => ext::SecretKind::GitlabToken,
-            layer::SecretKind::SlackToken => ext::SecretKind::SlackToken,
-            layer::SecretKind::StripeKey => ext::SecretKind::StripeKey,
-            layer::SecretKind::AwsAccessKey => ext::SecretKind::AwsAccessKey,
-            layer::SecretKind::Kubeconfig => ext::SecretKind::Kubeconfig,
-        }
-    }
-}
-
-impl From<layer::Secret> for ext::Secret {
-    fn from(secret: layer::Secret) -> Self {
-        ext::Secret {
-            kind: secret.kind.into(),
-            line: secret.line,
-        }
-    }
-}
-
-impl From<layer::Entry> for ext::LayerEntry {
-    fn from(entry: layer::Entry) -> Self {
-        ext::LayerEntry {
-            path: entry.path,
-            kind: entry.kind.into(),
-            size: entry.size,
-            mode: entry.mode,
-            uid: entry.uid,
-            gid: entry.gid,
-            mtime: entry.mtime,
-            link: entry.link,
-            offset: entry.offset,
-            content: entry.content.map(|content| ext::FileContent {
-                sha256: content.sha256,
-                sha512: content.sha512,
-                mime_type: content.mime_type,
-                secrets: content.secrets.into_iter().map(Into::into).collect(),
-            }),
-            capabilities: entry.capabilities,
-        }
-    }
-}
-
 /// The wire listing of a layer: its stored listing and every entry of it.
-pub fn layer_listing(listing: &layer::Listing, entries: Vec<layer::Entry>) -> ext::LayerListing {
+pub fn layer_listing(listing: &layer::Listing, entries: Vec<ext::LayerEntry>) -> ext::LayerListing {
     ext::LayerListing {
         refreshing: listing.is_outdated(),
         compressed: listing.compressed,
         uncompressed_size: listing.uncompressed_size,
-        entries: entries.into_iter().map(Into::into).collect(),
+        entries,
     }
 }
 

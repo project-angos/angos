@@ -13,7 +13,11 @@ use wiremock::{
 };
 
 use angos_extension_service::{
-    ElfDetails, LayerEntriesRequest, LayerFileDetailsRequest, LayerFileRequest,
+    ElfDetails, EntryKind, LayerEntriesRequest, LayerFileDetailsRequest, LayerFileRequest,
+    SecretKind::{
+        self, AwsAccessKey, AwsCredentials, GitCredentials, GithubToken, GitlabToken, Kubeconfig,
+        Netrc, NpmToken, PrivateKey, RegistryAuth, SlackToken, StripeKey,
+    },
 };
 use angos_oci::http_range::RequestRange;
 use angos_oci::{Digest, Namespace};
@@ -24,13 +28,9 @@ use crate::{
         store::{ClaimMode, JobStore},
     },
     layer::IndexAction,
-    layer::SecretKind::{
-        AwsAccessKey, AwsCredentials, GitCredentials, GithubToken, GitlabToken, Kubeconfig, Netrc,
-        NpmToken, PrivateKey, RegistryAuth, SlackToken, StripeKey,
-    },
     layer::{
-        Checkpoints, IndexLayerPayload, IndexLimits, Kind, Listing, SecretKind, SecretScanner,
-        classify, elf, extract_gzip, handler::IndexLayerJobHandler, index_stream, mime_type, pem,
+        Checkpoints, IndexLayerPayload, IndexLimits, Listing, SecretScanner, classify, elf,
+        extract_gzip, handler::IndexLayerJobHandler, index_stream, mime_type, pem,
     },
     policy::{ImagePolicy, PolicyConfig},
     registry::{
@@ -117,19 +117,19 @@ fn classify_names_whiteouts_and_normalises_paths() {
     let file = tar::EntryType::Regular;
     assert_eq!(
         classify("./usr/bin/", tar::EntryType::Directory),
-        Some(("usr/bin".to_string(), Kind::Dir))
+        Some(("usr/bin".to_string(), EntryKind::Dir))
     );
     assert_eq!(
         classify("etc/.wh.motd", file),
-        Some(("etc/motd".to_string(), Kind::Whiteout))
+        Some(("etc/motd".to_string(), EntryKind::Whiteout))
     );
     assert_eq!(
         classify(".wh.top", file),
-        Some(("top".to_string(), Kind::Whiteout))
+        Some(("top".to_string(), EntryKind::Whiteout))
     );
     assert_eq!(
         classify("var/cache/.wh..wh..opq", file),
-        Some(("var/cache".to_string(), Kind::Opaque))
+        Some(("var/cache".to_string(), EntryKind::Opaque))
     );
     assert_eq!(classify("./", tar::EntryType::Directory), None);
     assert_eq!(classify(".", tar::EntryType::Directory), None);
@@ -357,7 +357,7 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     assert!(listing.compressed);
     assert_eq!(listing.uncompressed_size, tar.len() as u64);
     assert_eq!(listing.chunks, ["etc/motd"]);
-    let kinds: Vec<(&str, Kind)> = entries
+    let kinds: Vec<(&str, EntryKind)> = entries
         .iter()
         .map(|entry| (entry.path.as_str(), entry.kind))
         .collect();
@@ -369,14 +369,14 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     assert_eq!(
         [&kinds[..2], &kinds[3..]].concat(),
         [
-            ("etc/motd", Kind::Whiteout),
-            ("filler.bin", Kind::File),
-            ("usr", Kind::Dir),
-            ("usr/bin", Kind::Dir),
-            ("usr/bin/hello", Kind::File),
-            ("usr/bin/hello-again", Kind::Hardlink),
-            ("usr/bin/hi", Kind::Symlink),
-            ("var/cache", Kind::Opaque),
+            ("etc/motd", EntryKind::Whiteout),
+            ("filler.bin", EntryKind::File),
+            ("usr", EntryKind::Dir),
+            ("usr/bin", EntryKind::Dir),
+            ("usr/bin/hello", EntryKind::File),
+            ("usr/bin/hello-again", EntryKind::Hardlink),
+            ("usr/bin/hi", EntryKind::Symlink),
+            ("var/cache", EntryKind::Opaque),
         ]
     );
     let hello = &entries[5];
@@ -401,7 +401,7 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     assert!(
         entries
             .iter()
-            .filter(|entry| entry.kind != Kind::File)
+            .filter(|entry| entry.kind != EntryKind::File)
             .all(|entry| entry.content.is_none()),
         "only files carry content"
     );
@@ -740,7 +740,7 @@ async fn an_older_listing_is_served_and_walked_again() {
     assert!(
         entries
             .iter()
-            .filter(|entry| entry.kind == Kind::File)
+            .filter(|entry| entry.kind == EntryKind::File)
             .all(|entry| entry.content.is_some())
     );
 }
@@ -941,7 +941,7 @@ fn elf_binary(size: usize, dynamic_at: usize) -> Vec<u8> {
     put(32, &64u64.to_le_bytes());
     put(54, &56u16.to_le_bytes());
     put(56, &6u16.to_le_bytes());
-    // Kind, flags, offset and size; each loads at `BASE` past its offset.
+    // EntryKind, flags, offset and size; each loads at `BASE` past its offset.
     let segments = [
         (3u32, 4u32, 512, interpreter.len()),
         (4, 4, 600, note.len()),

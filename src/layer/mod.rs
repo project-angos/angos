@@ -18,6 +18,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha512};
 
+use angos_extension_service::{EntryKind, FileContent, LayerEntry, Secret, SecretKind};
 use angos_oci::{Content, Digest, Manifest};
 
 use crate::jobs::{
@@ -222,89 +223,6 @@ pub fn filesystem_layers(manifest: &Manifest) -> Vec<Digest> {
             .collect(),
         _ => Vec::new(),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    File,
-    Dir,
-    Symlink,
-    Hardlink,
-    /// `.wh.<name>`: the lower layers' `<name>` is gone; `path` names it.
-    Whiteout,
-    /// `.wh..wh..opq`: the lower layers' content of `path` is gone.
-    Opaque,
-    Other,
-}
-
-/// One tar entry, with where its data starts in the uncompressed stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Entry {
-    pub path: String,
-    pub kind: Kind,
-    pub size: u64,
-    pub mode: u32,
-    pub uid: u64,
-    pub gid: u64,
-    pub mtime: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub link: Option<String>,
-    pub offset: u64,
-    /// Set on files only, and missing from listings indexed before it existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<FileContent>,
-    /// The Linux capabilities its `security.capability` attribute permits.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
-}
-
-/// A file's digests, hex-encoded, its media type, and the credentials its
-/// first bytes give away.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileContent {
-    pub sha256: String,
-    pub sha512: String,
-    pub mime_type: String,
-    /// In line order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secrets: Vec<Secret>,
-}
-
-/// A credential, and the line it is on from 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Secret {
-    pub kind: SecretKind,
-    pub line: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SecretKind {
-    /// A PEM, OpenSSH or PGP private key block.
-    PrivateKey,
-    /// An `aws_secret_access_key` line of an AWS credentials file.
-    AwsCredentials,
-    /// An `auth` entry of a Docker `config.json`.
-    RegistryAuth,
-    /// An `.npmrc` registry token or password.
-    NpmToken,
-    /// A URL carrying a user and a password, as `.git-credentials` keeps them.
-    GitCredentials,
-    /// A `.netrc` machine with its password.
-    Netrc,
-    /// A GitHub personal access, OAuth or app token.
-    GithubToken,
-    /// A GitLab personal access token.
-    GitlabToken,
-    /// A Slack bot or user token.
-    SlackToken,
-    /// A Stripe live secret or restricted key.
-    StripeKey,
-    /// An AWS access key ID, long-lived or temporary.
-    AwsAccessKey,
-    /// A kubeconfig's client key or bearer token.
-    Kubeconfig,
 }
 
 /// Digests a file's bytes as they stream past, keeping the first ones and
@@ -877,7 +795,7 @@ impl<R: Read> Read for Source<'_, R> {
 /// opaque marker of `a`; the rest keep their kind. Paths lose the `./` and
 /// trailing `/` tar spellings so the same file is named the same in every
 /// layer.
-fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, Kind)> {
+fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, EntryKind)> {
     let path = raw.trim_start_matches("./").trim_matches('/');
     if path.is_empty() || path == "." {
         return None;
@@ -891,21 +809,21 @@ fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, Kind)> {
         }
     };
     if name == ".wh..wh..opq" {
-        return Some((dir.to_string(), Kind::Opaque));
+        return Some((dir.to_string(), EntryKind::Opaque));
     }
     if let Some(target) = name.strip_prefix(".wh.") {
-        return Some((join(target), Kind::Whiteout));
+        return Some((join(target), EntryKind::Whiteout));
     }
     let kind = if tar_kind.is_dir() {
-        Kind::Dir
+        EntryKind::Dir
     } else if tar_kind.is_symlink() {
-        Kind::Symlink
+        EntryKind::Symlink
     } else if tar_kind.is_hard_link() {
-        Kind::Hardlink
+        EntryKind::Hardlink
     } else if tar_kind.is_file() || tar_kind == tar::EntryType::Continuous {
-        Kind::File
+        EntryKind::File
     } else {
-        Kind::Other
+        EntryKind::Other
     };
     Some((path.to_string(), kind))
 }
@@ -919,7 +837,7 @@ pub fn index_stream<R: Read>(
     input: R,
     limits: IndexLimits,
     mut store_chunk: impl FnMut(usize, Vec<Checkpoint>) -> io::Result<()>,
-) -> io::Result<(Listing, Vec<Entry>)> {
+) -> io::Result<(Listing, Vec<LayerEntry>)> {
     let mut reader = BufReader::new(input);
     let compressed = reader.fill_buf()?.starts_with(&GZIP_MAGIC);
     let mut starts = Vec::new();
@@ -966,12 +884,12 @@ pub fn index_stream<R: Read>(
                 continue;
             };
             let link = match kind {
-                Kind::Symlink | Kind::Hardlink => entry
+                EntryKind::Symlink | EntryKind::Hardlink => entry
                     .link_name()?
                     .map(|link| link.to_string_lossy().into_owned()),
                 _ => None,
             };
-            let mut item = Entry {
+            let mut item = LayerEntry {
                 path,
                 kind,
                 size: header.size()?,
@@ -984,7 +902,7 @@ pub fn index_stream<R: Read>(
                 content: None,
                 capabilities,
             };
-            if kind == Kind::File {
+            if kind == EntryKind::File {
                 item.content = Some(inspect(&item.path, &mut entry)?);
             }
             if entries.len() == limits.max_entries {
@@ -1007,7 +925,7 @@ pub fn index_stream<R: Read>(
         Source::Plain(_, count) => count,
     };
     // Stable, so a path the tar repeats keeps its last entry last.
-    entries.sort_by(|a: &Entry, b: &Entry| a.path.cmp(&b.path));
+    entries.sort_by(|a: &LayerEntry, b: &LayerEntry| a.path.cmp(&b.path));
     let chunks = entries
         .chunks(CHUNK_ENTRIES)
         .filter_map(|chunk| chunk.first().map(|entry| entry.path.clone()))

@@ -16,14 +16,14 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 use tracing::instrument;
 
 use angos_extension_service::{
-    LayerEntries, LayerEntriesRequest, LayerFile, LayerFileDetails, LayerFileDetailsRequest,
-    LayerFileRequest, LayerListing,
+    EntryKind, LayerEntries, LayerEntriesRequest, LayerEntry, LayerFile, LayerFileDetails,
+    LayerFileDetailsRequest, LayerFileRequest, LayerListing,
 };
 use angos_oci::{Digest, Namespace};
 
 use crate::{
     jobs::Queue,
-    layer::{self, Entry, IndexLayerPayload, Kind, Listing, elf, pem},
+    layer::{self, IndexLayerPayload, Listing, elf, pem},
     registry::{Error, Registry, angos_extension::layer_listing},
 };
 
@@ -84,7 +84,7 @@ impl Registry {
             self.dispatch_index(&namespace, &digest).await;
         }
         // Every chunk: the web UI merges whole layers.
-        let entries: Vec<Entry> = stream::iter(0..listing.chunks.len())
+        let entries: Vec<LayerEntry> = stream::iter(0..listing.chunks.len())
             .map(|chunk| self.metadata_store.read_entries(&digest, chunk))
             .buffered(self.listing_read_concurrency.get())
             .try_concat()
@@ -213,16 +213,18 @@ impl Registry {
         digest: &Digest,
         listing: &Listing,
         path: &str,
-    ) -> Result<Option<Entry>, Error> {
+    ) -> Result<Option<LayerEntry>, Error> {
         let Some(entry) = self.layer_entry(digest, listing, path, |_| true).await? else {
             return Ok(None);
         };
         match (entry.kind, entry.link.as_deref()) {
-            (Kind::File, _) => Ok(Some(entry)),
-            (Kind::Hardlink, Some(target)) => {
+            (EntryKind::File, _) => Ok(Some(entry)),
+            (EntryKind::Hardlink, Some(target)) => {
                 let target = target.trim_start_matches("./").trim_matches('/');
-                self.layer_entry(digest, listing, target, |entry| entry.kind == Kind::File)
-                    .await
+                self.layer_entry(digest, listing, target, |entry| {
+                    entry.kind == EntryKind::File
+                })
+                .await
             }
             _ => Ok(None),
         }
@@ -235,8 +237,8 @@ impl Registry {
         digest: &Digest,
         listing: &Listing,
         path: &str,
-        wanted: impl Fn(&Entry) -> bool,
-    ) -> Result<Option<Entry>, Error> {
+        wanted: impl Fn(&LayerEntry) -> bool,
+    ) -> Result<Option<LayerEntry>, Error> {
         let Some(chunk) = listing.entry_chunk(path) else {
             return Ok(None);
         };
