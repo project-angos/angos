@@ -34,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The web UI's vulnerability table reads a finding's severity as the report badge does, so the two no longer disagree.
 - The web UI pages the referrers of a pull-through manifest with more than 150 of them without skipping upstream ones.
 - Each page of the revision listing reads only the revisions it serves, instead of every record, referrer and index body in the namespace.
+- The web UI reads the repository names once per page load, instead of on every navigation and every hovered link.
 
 ## 1.12.1
 
