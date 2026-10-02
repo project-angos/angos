@@ -6,7 +6,6 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use http::request::Parts;
 use jsonwebtoken::{Algorithm, dangerous::insecure_decode};
-pub use jwk::Jwk;
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::debug;

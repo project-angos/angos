@@ -9,10 +9,14 @@ use angos_oci::{Digest, Namespace, Reference, Tag};
 use angos_storage::{Error as StorageError, ObjectStore};
 
 use crate::{
-    command::maintenance::{
-        action::{Action, AtimeCompaction, LOST_AND_FOUND_PREFIX, WalkedStore},
-        error::Error,
+    command::{
+        bootstrap,
+        maintenance::{
+            action::{Action, AtimeCompaction, LOST_AND_FOUND_PREFIX, WalkedStore},
+            error::Error,
+        },
     },
+    configuration::Configuration,
     event_webhook::event::EventActor,
     jobs::{
         JobState, Queue,
@@ -24,6 +28,7 @@ use crate::{
         blob_store::BlobStore,
         keys::{DigestKeys, NamespaceKeys},
         metadata_store::{LinkKind, MetadataStore},
+        repository_resolver::RepositoryResolver,
     },
     replication::{
         ReplicationJob, ReplicationTarget, build_envelope, build_prune_delete_envelope,
@@ -33,9 +38,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::registry::{
-    RegistryConfig, repository_resolver::RepositoryResolver, test_utils::create_test_repositories,
-};
+use crate::registry::{RegistryConfig, test_utils::create_test_repositories};
 
 /// Internal-process name stamped on the events retention deletions emit.
 pub const RETENTION_ACTOR: &str = "prune";
@@ -61,6 +64,23 @@ pub trait ActionSink: Send + Sync {
 
 /// Logs actions as dry-run without applying any mutations to storage.
 pub struct DryRunSink;
+
+/// A maintenance run's sink: a dry run only logs what it would apply,
+/// otherwise `executor` builds the sink that applies it.
+///
+/// # Errors
+///
+/// Forwards what building the executor returns.
+pub fn run_sink(
+    dry_run: bool,
+    executor: impl FnOnce() -> Result<Executor, Error>,
+) -> Result<Box<dyn ActionSink>, Error> {
+    if dry_run {
+        info!("Dry-run mode: no changes will be made to the storage");
+        return Ok(Box::new(DryRunSink));
+    }
+    Ok(Box::new(executor()?))
+}
 
 #[async_trait]
 impl ActionSink for DryRunSink {
@@ -104,6 +124,34 @@ impl Executor {
     pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
         self.registry = Some(registry);
         self
+    }
+
+    /// An executor over a fresh `prefix` run job store whose tag and manifest
+    /// deletions take the registry's standard delete path (locking, blob
+    /// reclaim, events, replication), with that registry for the run to drain
+    /// on exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be built.
+    pub fn with_run_registry(
+        config: &Configuration,
+        blob_store: &Arc<BlobStore>,
+        metadata_store: &Arc<MetadataStore>,
+        repositories: &Arc<RepositoryResolver>,
+        prefix: &str,
+    ) -> Result<(Self, Arc<Registry>), Error> {
+        let job_store = run_job_store(metadata_store, prefix);
+        let registry = bootstrap::registry(
+            config,
+            blob_store.clone(),
+            metadata_store.clone(),
+            repositories.clone(),
+            job_store.clone(),
+        )?;
+        let executor = Self::new(blob_store.clone(), metadata_store.clone(), job_store)
+            .with_registry(registry.clone());
+        Ok((executor, registry))
     }
 
     fn retention_registry(&self) -> Result<&Registry, Error> {

@@ -204,31 +204,19 @@ impl Backend {
         &self,
         path: &str,
         data: impl Into<Bytes>,
-    ) -> Result<Option<String>, Error> {
-        self.conditional_put(path, "if-none-match", "*", data.into())
-            .await
-    }
-
-    async fn conditional_put(
-        &self,
-        path: &str,
-        precondition_header: &'static str,
-        precondition_value: &str,
-        data: Bytes,
-    ) -> Result<Option<String>, Error> {
-        let headers = single_header(precondition_header, precondition_value)
-            .map_err(|e| Error::Io(e.to_string()))?;
+    ) -> Result<(), Error> {
+        let headers = single_header("if-none-match", "*").map_err(|e| Error::Io(e.to_string()))?;
         self.send_guarded(
             S3Request {
                 headers,
-                body: data,
+                body: data.into(),
                 opts: SendOpts {
                     non_idempotent: true,
                     ..SendOpts::default()
                 },
                 ..S3Request::new(Method::PUT, self.full_key(path))
             },
-            |response| Ok(header_string(&response.headers, "etag")),
+            |_| Ok(()),
         )
         .await
     }
@@ -532,31 +520,9 @@ impl Backend {
         .await
     }
 
-    /// # Errors
-    /// Forwards [`Error`] from the underlying `UploadPart` request or a
-    /// tripped circuit breaker, and reports a response carrying no `ETag`.
-    pub async fn upload_part(
-        &self,
-        path: &str,
-        upload_id: &str,
-        part_number: u32,
-        body: Bytes,
-    ) -> Result<String, Error> {
-        self.send_guarded(
-            S3Request {
-                query: part_query(upload_id, part_number),
-                body,
-                ..S3Request::new(Method::PUT, self.full_key(path))
-            },
-            |response| part_etag(&response.headers, part_number),
-        )
-        .await
-    }
-
     /// Streams a multipart part from a byte stream into reqwest's HTTP body.
     /// The body is signed as `UNSIGNED-PAYLOAD` (no full-payload SHA256 over
-    /// chunks); use [`upload_part`](Backend::upload_part) when the payload is
-    /// already in memory and signed integrity is desired.
+    /// chunks).
     ///
     /// # Errors
     /// Forwards [`Error`] from the underlying streaming `UploadPart`
@@ -1133,31 +1099,6 @@ mod tests {
         assert!(request.headers.get("authorization").is_some());
     }
 
-    /// `CompleteMultipartUpload` names every part by `ETag`, so a part upload
-    /// that reports none has to fail here. Defaulting to an empty string
-    /// deferred the rejection to the completion, which cannot say which part
-    /// was at fault.
-    #[tokio::test]
-    async fn upload_part_reports_a_response_without_an_etag() {
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/test-bucket/test/file.txt"))
-            .and(query_param("partNumber", "7"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
-        let error = mock_backend(&server)
-            .upload_part("test/file.txt", "upload-id", 7, Bytes::from_static(b"body"))
-            .await
-            .unwrap_err();
-
-        assert!(
-            error.to_string().contains('7'),
-            "the error must name the offending part, got: {error}"
-        );
-    }
-
     /// An `ETag: ""` is the same defect reaching the completion, so it is
     /// rejected alongside an absent header.
     #[tokio::test]
@@ -1169,8 +1110,9 @@ mod tests {
             .mount(&server)
             .await;
 
+        let body = stream::iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"body"))]);
         let error = mock_backend(&server)
-            .upload_part("test/file.txt", "upload-id", 1, Bytes::from_static(b"body"))
+            .upload_part_streaming("test/file.txt", "upload-id", 1, 4, body)
             .await
             .unwrap_err();
 
@@ -1333,9 +1275,10 @@ mod tests {
         open_breaker(&backend);
 
         assert!(backend.create_multipart_upload("object").await.is_err());
+        let body = stream::iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"x"))]);
         assert!(
             backend
-                .upload_part("object", "id", 1, Bytes::from_static(b"x"))
+                .upload_part_streaming("object", "id", 1, 1, body)
                 .await
                 .is_err()
         );
@@ -1392,8 +1335,9 @@ mod tests {
             if backend.circuit_breaker.check().is_err() {
                 break;
             }
+            let body = stream::iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"x"))]);
             let _ = backend
-                .upload_part("object", "id", 1, Bytes::from_static(b"x"))
+                .upload_part_streaming("object", "id", 1, 1, body)
                 .await;
         }
 

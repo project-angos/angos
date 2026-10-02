@@ -21,7 +21,7 @@ use crate::{
             Error,
             action::Action,
             check::{self, NamespaceChecker},
-            executor::{ActionSink, DryRunSink, Executor, run_job_store},
+            executor::{ActionSink, Executor, run_job_store, run_sink},
             tags::Rankings,
         },
         scrub::default_concurrency,
@@ -141,16 +141,13 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         resolver: repositories,
         force: options.force,
     };
-    let sink: Box<dyn ActionSink> = if options.dry_run {
-        info!("Dry-run mode: no changes will be made to the storage");
-        Box::new(DryRunSink)
-    } else {
-        Box::new(Executor::new(
+    let sink = run_sink(options.dry_run, || {
+        Ok(Executor::new(
             blob_store,
             metadata_store.clone(),
             run_job_store(&metadata_store, "reconcile"),
         ))
-    };
+    })?;
     check::check_namespaces(
         &metadata_store,
         &checker,

@@ -363,7 +363,7 @@ impl ObjectStore for Backend {
 
     async fn create_if_absent(&self, key: &str, data: Bytes) -> Result<bool, Error> {
         match self.client.put_object_if_not_exists(key, data).await {
-            Ok(_) => Ok(true),
+            Ok(()) => Ok(true),
             // A 412 means the key was already taken: the create lost, not an error.
             Err(S3Error::PreconditionFailed) => Ok(false),
             Err(e) => Err(e.into()),

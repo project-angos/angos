@@ -13,7 +13,7 @@ use crate::{
         bootstrap,
         maintenance::{
             Error, check,
-            executor::{ActionSink, DryRunSink, Executor, run_job_store},
+            executor::{Executor, run_job_store, run_sink},
         },
     },
     configuration::Configuration,
@@ -109,10 +109,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
     let checker = ReplicationChecker::new(metadata_store.clone(), repositories.clone());
 
     let mut drain = None;
-    let sink: Box<dyn ActionSink> = if options.dry_run {
-        info!("Dry-run mode: no changes will be made to the storage");
-        Box::new(DryRunSink)
-    } else {
+    let sink = run_sink(options.dry_run, || {
         // One store serves as producer (Executor enqueue) and consumer (drain).
         let job_store = run_job_store(&metadata_store, "reconcile");
         drain = Some(ReplicationDrain::new(
@@ -122,12 +119,12 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             &repositories,
             config.global.max_concurrent_replication_jobs,
         ));
-        Box::new(Executor::new(
+        Ok(Executor::new(
             blob_backend.clone(),
             metadata_store.clone(),
             job_store,
         ))
-    };
+    })?;
 
     // Sequential on purpose: there is no per-namespace concurrency knob here.
     check::check_namespaces(&metadata_store, &checker, sink.as_ref(), 1).await?;

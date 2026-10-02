@@ -36,7 +36,7 @@ pub struct AuthConfig {
 struct OidcProvider {
     name: String,
     issuer: String,
-    validator: Arc<dyn AuthMiddleware>,
+    validator: OidcValidator,
 }
 
 type OidcValidators = Vec<OidcProvider>;
@@ -79,16 +79,15 @@ impl Authenticator {
         let mut validators = Vec::with_capacity(auth_config.oidc.len());
 
         for (name, oidc_config) in &auth_config.oidc {
-            let validator = OidcValidator::new(
-                name.clone(),
-                oidc_config,
-                build_oidc_client(name, oidc_config)?,
-                Arc::clone(cache),
-            );
             validators.push(OidcProvider {
                 name: name.clone(),
                 issuer: oidc_config.issuer.clone(),
-                validator: Arc::new(validator),
+                validator: OidcValidator::new(
+                    name.clone(),
+                    oidc_config,
+                    build_oidc_client(name, oidc_config)?,
+                    Arc::clone(cache),
+                ),
             });
         }
 
@@ -345,17 +344,21 @@ mod tests {
         Algorithm, Argon2, Params, PasswordHasher, Version,
         password_hash::{SaltString, rand_core::OsRng},
     };
-    use async_trait::async_trait;
+    use serde_json::{Value, json};
     use tempfile::tempdir;
+    use wiremock::MockServer;
 
     use super::*;
     use crate::{
-        auth::{PeerCertificate, TokenIssuer, oidc::validator::tests::make_token},
+        auth::{
+            PeerCertificate, TokenIssuer,
+            oidc::validator::tests::{make_token, valid_claims},
+        },
         configuration::Configuration,
-        identity::OidcClaims,
         metrics_provider,
         test_fixtures::{
             configuration::{load_config, minimal_config, try_load_config},
+            mocks::{mount_jwks, static_jwks_response},
             mtls::cert_der,
             oidc::KID,
             requests::{empty_parts, parts_with_authorization, parts_with_basic_auth},
@@ -596,10 +599,6 @@ mod tests {
     /// first by name, so only the ordering can keep it out of the exchange.
     #[tokio::test]
     async fn a_bearer_only_reaches_the_provider_whose_issuer_it_names() {
-        use wiremock::MockServer;
-
-        use crate::test_fixtures::mocks::{mount_jwks, static_jwks_response};
-
         metrics_provider::init_for_tests();
         let unnamed = MockServer::start().await;
         let named = MockServer::start().await;
@@ -628,7 +627,7 @@ mod tests {
             basic_auth_validator: BasicAuthValidator::new(&config.auth.identity).unwrap(),
         };
 
-        let claims = crate::auth::oidc::validator::tests::valid_claims(&named.uri(), "unused");
+        let claims = valid_claims(&named.uri(), "unused");
         let parts = parts_with_authorization(&format!("Bearer {}", make_token(&claims, KID)));
         let mut identity = ClientIdentity::default();
 
@@ -823,64 +822,69 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Mock AuthMiddleware for unit-testing try_oidc_authentication in isolation.
+    // Real OIDC providers over wiremock issuers, for the chain's ordering.
     // ---------------------------------------------------------------------------
 
-    #[derive(Clone)]
-    enum MockOutcome {
-        Authenticated,
-        NoCredentials,
-        Fail(String),
+    /// A wiremock issuer serving `keys` as its JWKS.
+    async fn issuer_serving(keys: Value) -> MockServer {
+        let server = MockServer::start().await;
+        mount_jwks(&server, keys).await;
+        server
     }
 
-    struct MockValidator {
-        outcome: MockOutcome,
+    /// A bearer naming `issuer`, signed with the static test key.
+    fn token_from(issuer: &str) -> String {
+        make_token(&valid_claims(issuer, "unused"), KID)
     }
 
-    #[async_trait]
-    impl AuthMiddleware for MockValidator {
-        async fn authenticate(
-            &self,
-            _parts: &Parts,
-            identity: &mut ClientIdentity,
-        ) -> Result<AuthResult, Error> {
-            match &self.outcome {
-                MockOutcome::Authenticated => {
-                    identity.oidc = Some(OidcClaims {
-                        provider_name: "mock".to_string(),
-                        claims: HashMap::new(),
-                    });
-                    Ok(AuthResult::Authenticated)
-                }
-                MockOutcome::NoCredentials => Ok(AuthResult::NoCredentials),
-                MockOutcome::Fail(msg) => Err(Error::Unauthorized(msg.clone())),
-            }
-        }
+    /// The TOML of provider `name` trusting `issuer`, with its keys at `jwks`.
+    fn provider(name: &str, issuer: &str, jwks: &str) -> String {
+        format!(
+            "[auth.oidc.{name}]\nissuer = \"{issuer}\"\n\
+             jwks_uri = \"{jwks}/.well-known/jwks\"\nallowed_algorithms = [\"ES256\"]\n"
+        )
     }
 
-    fn make_authenticator_with_mocks(
-        validators: Vec<(&'static str, MockOutcome)>,
-    ) -> Authenticator {
-        let oidc_validators: OidcValidators = validators
-            .into_iter()
-            .map(|(name, outcome)| OidcProvider {
-                name: name.to_string(),
-                issuer: format!("https://issuer.test/{name}"),
-                validator: Arc::new(MockValidator { outcome }),
-            })
-            .collect();
+    /// Two providers no request in these tests holds a bearer for.
+    fn idle_providers() -> String {
+        provider(
+            "alpha",
+            "https://issuer.test/alpha",
+            "https://issuer.test/alpha",
+        ) + &provider(
+            "beta",
+            "https://issuer.test/beta",
+            "https://issuer.test/beta",
+        )
+    }
 
+    /// Providers "alpha", holding no key, and "beta", holding the key but
+    /// trusting another issuer: both refuse a token naming neither, in
+    /// distinguishable ways.
+    async fn refusing_providers() -> (String, MockServer, MockServer) {
+        let keyless = issuer_serving(json!({ "keys": [] })).await;
+        let keyed = issuer_serving(static_jwks_response()).await;
+        let providers = provider("alpha", "https://issuer.test/alpha", &keyless.uri())
+            + &provider("beta", "https://issuer.test/beta", &keyed.uri());
+        (providers, keyless, keyed)
+    }
+
+    /// An authenticator over the OIDC `providers` TOML, with no token service
+    /// and no basic identity.
+    fn authenticator_with(providers: &str) -> Authenticator {
+        let config = load_config(providers);
+        let cache = angos_cache::Config::Memory.to_backend().unwrap();
         Authenticator {
             mtls_validator: MtlsValidator,
             token_validator: None,
-            oidc_validators,
+            oidc_validators: Authenticator::build_oidc_validators(&config.auth, &cache).unwrap(),
             basic_auth_validator: BasicAuthValidator::new(&HashMap::new()).unwrap(),
         }
     }
 
     #[tokio::test]
     async fn test_try_oidc_no_providers_returns_false() {
-        let authenticator = make_authenticator_with_mocks(vec![]);
+        let authenticator = authenticator_with("");
 
         let parts = empty_parts();
         let mut identity = ClientIdentity::new(None);
@@ -895,15 +899,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_oidc_falls_through_error_to_success() {
-        // Provider "alpha" (first in sorted order) returns Err; provider "beta" returns Authenticated.
-        // The old code would have returned the error from "alpha" without ever trying "beta".
-        // With the fix, "beta" succeeds and the overall result is Ok(true).
-        let authenticator = make_authenticator_with_mocks(vec![
-            ("alpha", MockOutcome::Fail("alpha auth failed".to_string())),
-            ("beta", MockOutcome::Authenticated),
-        ]);
+        // Both providers trust the token's issuer; "alpha" sorts first and
+        // holds no key for it, so it fails before "beta" accepts.
+        metrics_provider::init_for_tests();
+        let keyless = issuer_serving(json!({ "keys": [] })).await;
+        let keyed = issuer_serving(static_jwks_response()).await;
+        let issuer = keyed.uri();
+        let authenticator = authenticator_with(
+            &(provider("alpha", &issuer, &keyless.uri()) + &provider("beta", &issuer, &issuer)),
+        );
 
-        let parts = empty_parts();
+        let parts = parts_with_authorization(&format!("Bearer {}", token_from(&issuer)));
         let mut identity = ClientIdentity::new(None);
 
         let result = authenticator
@@ -911,18 +917,24 @@ mod tests {
             .await;
 
         assert_eq!(result.unwrap(), Some(AuthMethod::Oidc));
-        assert!(identity.oidc.is_some());
+        assert!(
+            identity
+                .oidc
+                .is_some_and(|claims| claims.provider_name == "beta")
+        );
     }
 
     #[tokio::test]
     async fn test_try_oidc_returns_first_error_when_all_fail() {
         // Both providers fail; the error from the alphabetically-first provider is returned.
-        let authenticator = make_authenticator_with_mocks(vec![
-            ("alpha", MockOutcome::Fail("alpha error".to_string())),
-            ("beta", MockOutcome::Fail("beta error".to_string())),
-        ]);
+        metrics_provider::init_for_tests();
+        let (providers, _keyless, _keyed) = refusing_providers().await;
+        let authenticator = authenticator_with(&providers);
 
-        let parts = empty_parts();
+        let parts = parts_with_authorization(&format!(
+            "Bearer {}",
+            token_from("https://issuer.test/nobody")
+        ));
         let mut identity = ClientIdentity::new(None);
 
         let result = authenticator
@@ -931,17 +943,14 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(
-            matches!(&err, Error::Unauthorized(msg) if msg == "alpha error"),
+            matches!(&err, Error::Unauthorized(msg) if msg.contains("No matching key")),
             "expected alpha's error, got: {err:?}"
         );
     }
 
     #[tokio::test]
     async fn test_try_oidc_all_no_credentials_returns_false() {
-        let authenticator = make_authenticator_with_mocks(vec![
-            ("alpha", MockOutcome::NoCredentials),
-            ("beta", MockOutcome::NoCredentials),
-        ]);
+        let authenticator = authenticator_with(&idle_providers());
 
         let parts = empty_parts();
         let mut identity = ClientIdentity::new(None);
@@ -975,36 +984,20 @@ mod tests {
         BasicAuthValidator::new(&config.auth.identity).unwrap()
     }
 
-    fn make_authenticator_with_cert_and_mocks(
-        validators: Vec<(&'static str, MockOutcome)>,
-    ) -> (Authenticator, PeerCertificate) {
-        let peer_cert = PeerCertificate(Arc::new(cert_der()));
-        let authenticator = make_authenticator_with_mocks(validators);
-        (authenticator, peer_cert)
-    }
-
     /// The two halves the token service splits into, built from one config so
     /// the issued token is the one the chain's validator accepts.
-    fn make_authenticator_with_token_service(
-        validators: Vec<(&'static str, MockOutcome)>,
-    ) -> (Authenticator, TokenIssuer) {
+    fn make_authenticator_with_token_service(providers: &str) -> (Authenticator, TokenIssuer) {
         let config = token_service::Config {
             secret_key: Secret::new(vec![7; 32].into()),
             realm: None,
             ttl_secs: 3600,
         };
-        // The identity these tests issue from carries no `id`, so no
-        // `[auth.identity]` entry has to back it.
-        let auth: AuthConfig = toml::from_str(
-            r#"
-            [oidc.mock]
-            issuer = "https://issuer.test/mock"
-        "#,
-        )
-        .unwrap();
+        // The identities these tests issue from carry no `id` and no OIDC
+        // claims, so no configured credential has to back them.
+        let auth = AuthConfig::default();
         let authenticator = Authenticator {
             token_validator: Some(TokenValidator::new(&config, &auth).unwrap()),
-            ..make_authenticator_with_mocks(validators)
+            ..authenticator_with(providers)
         };
 
         (authenticator, TokenIssuer::new(&config, &auth).unwrap())
@@ -1019,10 +1012,8 @@ mod tests {
     #[tokio::test]
     async fn a_valid_token_skips_oidc_and_basic() {
         metrics_provider::init_for_tests();
-        let (authenticator, issuer) = make_authenticator_with_token_service(vec![(
-            "mock",
-            MockOutcome::Fail("must not be reached".to_string()),
-        )]);
+        // A provider reached with the token would fail the request.
+        let (authenticator, issuer) = make_authenticator_with_token_service(&idle_providers());
         let issued_from = ClientIdentity {
             username: Some("ci-bot".to_string()),
             ..Default::default()
@@ -1042,11 +1033,11 @@ mod tests {
     #[tokio::test]
     async fn a_bearer_that_is_not_ours_still_reaches_oidc() {
         metrics_provider::init_for_tests();
+        let keyed = issuer_serving(static_jwks_response()).await;
         let (authenticator, _) =
-            make_authenticator_with_token_service(vec![("mock", MockOutcome::Authenticated)]);
+            make_authenticator_with_token_service(&provider("mock", &keyed.uri(), &keyed.uri()));
 
-        let token = make_token(&HashMap::new(), KID);
-        let parts = parts_with_authorization(&format!("Bearer {token}"));
+        let parts = parts_with_authorization(&format!("Bearer {}", token_from(&keyed.uri())));
         let identity = authenticator
             .authenticate_request(&parts, None)
             .await
@@ -1058,8 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn mtls_outranks_a_registry_token() {
         metrics_provider::init_for_tests();
-        let (authenticator, issuer) =
-            make_authenticator_with_token_service(vec![("mock", MockOutcome::NoCredentials)]);
+        let (authenticator, issuer) = make_authenticator_with_token_service(&idle_providers());
         let (token, _) = issuer.issue(&ClientIdentity::default()).unwrap();
 
         let mut parts = parts_with_authorization(&format!("Bearer {token}"));
@@ -1085,13 +1075,12 @@ mod tests {
     #[tokio::test]
     async fn method_tracking_mtls_success_oidc_no_credentials_preserves_cert() {
         metrics_provider::init_for_tests();
-        let (authenticator, peer_cert) = make_authenticator_with_cert_and_mocks(vec![
-            ("alpha", MockOutcome::NoCredentials),
-            ("beta", MockOutcome::NoCredentials),
-        ]);
+        let authenticator = authenticator_with(&idle_providers());
 
         let mut parts = empty_parts();
-        parts.extensions.insert(peer_cert);
+        parts
+            .extensions
+            .insert(PeerCertificate(Arc::new(cert_der())));
 
         let identity = authenticator
             .authenticate_request(&parts, None)
@@ -1117,11 +1106,13 @@ mod tests {
     #[tokio::test]
     async fn mtls_outranks_a_successful_oidc_provider() {
         metrics_provider::init_for_tests();
-        let (authenticator, peer_cert) =
-            make_authenticator_with_cert_and_mocks(vec![("provider", MockOutcome::Authenticated)]);
+        let keyed = issuer_serving(static_jwks_response()).await;
+        let authenticator = authenticator_with(&provider("provider", &keyed.uri(), &keyed.uri()));
 
-        let mut parts = empty_parts();
-        parts.extensions.insert(peer_cert);
+        let mut parts = parts_with_authorization(&format!("Bearer {}", token_from(&keyed.uri())));
+        parts
+            .extensions
+            .insert(PeerCertificate(Arc::new(cert_der())));
 
         let identity = authenticator
             .authenticate_request(&parts, None)
@@ -1135,10 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_with_no_credentials_is_anonymous() {
         metrics_provider::init_for_tests();
-        let authenticator = make_authenticator_with_mocks(vec![
-            ("alpha", MockOutcome::NoCredentials),
-            ("beta", MockOutcome::NoCredentials),
-        ]);
+        let authenticator = authenticator_with(&idle_providers());
 
         let identity = authenticator
             .authenticate_request(&empty_parts(), None)
@@ -1153,10 +1141,10 @@ mod tests {
     #[tokio::test]
     async fn method_tracking_no_mtls_oidc_success_sets_oidc_identity() {
         metrics_provider::init_for_tests();
-        let authenticator =
-            make_authenticator_with_mocks(vec![("provider", MockOutcome::Authenticated)]);
+        let keyed = issuer_serving(static_jwks_response()).await;
+        let authenticator = authenticator_with(&provider("provider", &keyed.uri(), &keyed.uri()));
 
-        let parts = empty_parts();
+        let parts = parts_with_authorization(&format!("Bearer {}", token_from(&keyed.uri())));
 
         let identity = authenticator
             .authenticate_request(&parts, None)
@@ -1186,19 +1174,22 @@ mod tests {
     #[tokio::test]
     async fn method_tracking_mtls_success_oidc_all_fail_returns_oidc_error() {
         metrics_provider::init_for_tests();
-        let (authenticator, peer_cert) = make_authenticator_with_cert_and_mocks(vec![
-            ("alpha", MockOutcome::Fail("alpha rejected".to_string())),
-            ("beta", MockOutcome::Fail("beta rejected".to_string())),
-        ]);
+        let (providers, _keyless, _keyed) = refusing_providers().await;
+        let authenticator = authenticator_with(&providers);
 
-        let mut parts = empty_parts();
-        parts.extensions.insert(peer_cert);
+        let mut parts = parts_with_authorization(&format!(
+            "Bearer {}",
+            token_from("https://issuer.test/nobody")
+        ));
+        parts
+            .extensions
+            .insert(PeerCertificate(Arc::new(cert_der())));
 
         let result = authenticator.authenticate_request(&parts, None).await;
 
         let err = result.unwrap_err();
         assert!(
-            matches!(&err, Error::Unauthorized(msg) if msg == "alpha rejected"),
+            matches!(&err, Error::Unauthorized(msg) if msg.contains("No matching key")),
             "expected alpha's error to propagate, got: {err:?}"
         );
     }
@@ -1227,23 +1218,15 @@ mod tests {
         ));
         let basic_auth_validator = BasicAuthValidator::new(&config.auth.identity).unwrap();
 
-        let oidc_validators: OidcValidators = vec![OidcProvider {
-            name: "mock-provider".to_string(),
-            issuer: "https://issuer.test/mock-provider".to_string(),
-            validator: Arc::new(MockValidator {
-                outcome: MockOutcome::Authenticated,
-            }),
-        }];
-
+        let keyed = issuer_serving(static_jwks_response()).await;
         let authenticator = Authenticator {
-            mtls_validator: MtlsValidator,
-            token_validator: None,
-            oidc_validators,
             basic_auth_validator,
+            ..authenticator_with(&provider("mock-provider", &keyed.uri(), &keyed.uri()))
         };
 
-        // Include valid basic-auth credentials in the request.
-        let parts = parts_with_basic_auth("admin", "secret");
+        // The OIDC token rides in a Basic header under the provider's name; were
+        // basic auth tried too, that username would fail the request.
+        let parts = parts_with_basic_auth("mock-provider", &token_from(&keyed.uri()));
 
         let identity = authenticator
             .authenticate_request(&parts, None)
@@ -1269,7 +1252,7 @@ mod tests {
 
         let authenticator = Authenticator {
             basic_auth_validator: admin_basic_auth_validator(),
-            ..make_authenticator_with_mocks(vec![("provider", MockOutcome::NoCredentials)])
+            ..authenticator_with(&idle_providers())
         };
 
         let parts = parts_with_basic_auth("admin", "secret");
@@ -1289,7 +1272,7 @@ mod tests {
 
         let authenticator = Authenticator {
             basic_auth_validator: admin_basic_auth_validator(),
-            ..make_authenticator_with_mocks(vec![("provider", MockOutcome::NoCredentials)])
+            ..authenticator_with(&idle_providers())
         };
 
         let mut parts = parts_with_basic_auth("admin", "secret");

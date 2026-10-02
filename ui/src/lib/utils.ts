@@ -174,9 +174,18 @@ export function pathUrl(path: string): string {
 	return `${base}/${path}`;
 }
 
+/** A tag cannot contain a colon and a digest always does (`algorithm:hex`). */
+export function isDigest(reference: string): boolean {
+	return reference.includes(':');
+}
+
+/** `path` with `reference` as it is pulled: a digest after an at, a tag after a colon. */
+export function imageReference(path: string, reference: string): string {
+	return `${path}${isDigest(reference) ? '@' : ':'}${reference}`;
+}
+
 export function manifestUrl(path: string, reference: string): string {
-	const separator = reference.startsWith('sha256:') || reference.startsWith('sha512:') ? '@' : ':';
-	return `${base}/${path}${separator}${reference}`;
+	return `${base}/${imageReference(path, reference)}`;
 }
 
 /** The page rendering the vulnerability report stored at `digest`. */
@@ -851,9 +860,10 @@ function severityOf(rule: SarifRule | undefined, message: string): Severity {
 		const word = severityWord(tag);
 		if (word) return word;
 	}
-	const stated = message.match(/(?:Severity:|\bAn?)\s+(\w+)/);
-	if (stated) {
-		const word = severityWord(stated[1]);
+	// Every marked word pair, as the registry reads them, not only the first.
+	const words = message.split(/\s+/);
+	for (let i = 0; i + 1 < words.length; i++) {
+		const word = ['Severity:', 'A', 'An'].includes(words[i]) && severityWord(words[i + 1]);
 		if (word) return word;
 	}
 	const score = Number(rule?.properties?.['security-severity']);

@@ -14,7 +14,8 @@ use angos_mtls_client::ClientTls;
 use crate::{
     auth::Error,
     auth::oidc::{
-        Config, Jwk,
+        Config,
+        jwk::Jwk,
         validator::{
             Jwks, OpenIdConfiguration, fetch_jwks, fetch_oidc_configuration, issuer_bearer_token,
             issuer_key, validate_oidc_token, verify_jwt_with_header,

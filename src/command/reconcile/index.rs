@@ -27,7 +27,7 @@ use crate::{
             Error,
             action::Action,
             check::{self, NamespaceChecker},
-            executor::{ActionSink, DryRunSink, Executor, run_job_store},
+            executor::{ActionSink, Executor, run_job_store, run_sink},
             tags::Rankings,
             walk::for_each_key,
         },
@@ -210,16 +210,13 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         enqueue: true,
         seen: Mutex::new(HashSet::new()),
     };
-    let sink: Box<dyn ActionSink> = if options.dry_run {
-        info!("Dry-run mode: no changes will be made to the storage");
-        Box::new(DryRunSink)
-    } else {
-        Box::new(Executor::new(
+    let sink = run_sink(options.dry_run, || {
+        Ok(Executor::new(
             blob_store,
             metadata_store.clone(),
             run_job_store(&metadata_store, "reconcile"),
         ))
-    };
+    })?;
     check_and_reclaim(checker, &metadata_store, sink.as_ref()).await?;
     info!("Index reconciliation complete; the server or a worker drains the enqueued jobs");
     Ok(())

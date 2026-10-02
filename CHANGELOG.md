@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A manifest push refuses a reference whose bytes a concurrent scrub reclaimed, instead of committing an image with a missing blob.
 - The metadata and job stores apply the S3 timeouts, retries and circuit breaker they inherit from `[blob_store.s3]`, and `[metadata_store.s3]` accepts them too.
 - A denied scan or index job, and any job whose kind or payload the worker cannot read, dead-letters at once instead of using up its retries.
+- The web UI shows and copies a sha512 manifest as `repo@sha512:<hex>`, the reference it is pulled by, instead of `repo:sha512:<hex>`.
+- The web UI's vulnerability table reads a finding's severity as the report badge does, so the two no longer disagree.
 
 ## 1.12.1
 

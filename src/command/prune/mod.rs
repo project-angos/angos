@@ -8,7 +8,7 @@ use std::time::Duration as StdDuration;
 use argh::FromArgs;
 use chrono::Duration;
 use humantime::Duration as HumanDuration;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub use checker::RetentionChecker;
 
@@ -17,7 +17,7 @@ use crate::{
         bootstrap,
         maintenance::{
             Error, check,
-            executor::{ActionSink, DryRunSink, Executor, run_job_store},
+            executor::{Executor, run_sink},
         },
         scrub::default_concurrency,
     },
@@ -111,24 +111,17 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         global_policy.clone(),
     );
     let mut registry = None;
-    let sink: Box<dyn ActionSink> = if options.dry_run {
-        info!("Dry-run mode: no changes will be made to the storage");
-        Box::new(DryRunSink)
-    } else {
-        let job_store = run_job_store(&metadata_store, "prune");
-        let retention = bootstrap::registry(
+    let sink = run_sink(options.dry_run, || {
+        let (executor, retention) = Executor::with_run_registry(
             config,
-            blob_backend.clone(),
-            metadata_store.clone(),
-            repositories.clone(),
-            job_store.clone(),
+            &blob_backend,
+            &metadata_store,
+            &repositories,
+            "prune",
         )?;
-        registry = Some(retention.clone());
-        Box::new(
-            Executor::new(blob_backend.clone(), metadata_store.clone(), job_store)
-                .with_registry(retention),
-        )
-    };
+        registry = Some(retention);
+        Ok(executor)
+    })?;
 
     check::check_namespaces(
         &metadata_store,

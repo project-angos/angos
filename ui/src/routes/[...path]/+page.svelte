@@ -4,7 +4,7 @@
 	import { base } from '$app/paths';
 	import { getRegistryName } from '$lib/config.svelte';
 	import { PAGE, fetchRevision, fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, type FetchResult, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo, type RevisionSort, type SortOrder } from '$lib/api';
-	import { buildTree, buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, isInteractiveTarget, pathUrl, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '$lib/utils';
+	import { buildTree, buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, imageReference, isDigest, isInteractiveTarget, pathUrl, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '$lib/utils';
 	import LoadingState from '$lib/components/LoadingState.svelte';
 	import ErrorState from '$lib/components/ErrorState.svelte';
 	import Breadcrumb from '$lib/components/Breadcrumb.svelte';
@@ -21,9 +21,7 @@
 	const isManifestView = $derived(data.reference !== null);
 	// The page's name as it is pulled: a tag after a colon, a digest after an at.
 	const fullName = $derived(
-		data.reference === null
-			? data.path
-			: `${data.path}${data.reference.startsWith('sha256:') ? '@' : ':'}${data.reference}`
+		data.reference === null ? data.path : imageReference(data.path, data.reference)
 	);
 	// The path below the owning repository, which is what the breadcrumb splits on.
 	const relativePath = $derived(
@@ -417,9 +415,8 @@
 	}
 
 	async function deleteByReference(reference: string) {
-		// A tag cannot hold a colon; a digest always does. A tag delete keeps
-		// the manifest, so nothing cascades from it.
-		if (reference.includes(':')) {
+		// A tag delete keeps the manifest, so nothing cascades from it.
+		if (isDigest(reference)) {
 			deleting = true;
 			actionError = null;
 			const { gone, failed, total } = await deleteWithCascade([reference]);
@@ -541,7 +538,7 @@
 	...(isManifestView ? [{ label: data.reference ?? '' }] : [])
 ]} />
 
-<div class="title" class:digest={data.reference?.startsWith('sha256:')}>
+<div class="title" class:digest={data.reference !== null && isDigest(data.reference)}>
 	<h1>{data.path}{#if isManifestView}<span class="reference">{fullName.slice(data.path.length)}</span>{/if}</h1>
 	<CopyButton text={fullName} label={isManifestView ? 'Copy the reference' : 'Copy the namespace'} />
 </div>

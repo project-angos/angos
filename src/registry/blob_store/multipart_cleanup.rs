@@ -25,13 +25,10 @@ pub struct OrphanMultipartUpload {
 }
 
 /// Inverse of [`NamespaceKeys::upload_path`], parsing an upload's `data` key
-/// into `(namespace, uuid)`. The coalesce scratch key parses to the same
-/// session too, so a scratch multipart stranded by a crash is reclaimable.
+/// into `(namespace, uuid)`.
 pub fn parse_upload_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix(REPOS_ROOT)?.strip_prefix('/')?;
-    rest.strip_suffix("/data")
-        .or_else(|| rest.strip_suffix("/staged/coalesce"))?
-        .rsplit_once("/_uploads/")
+    rest.strip_suffix("/data")?.rsplit_once("/_uploads/")
 }
 
 /// Whether an upload initiated at `initiated` counts as orphaned, i.e. its age
@@ -161,12 +158,6 @@ mod tests {
         for (key, parsed) in [
             (
                 "v2/repositories/my-repo/_uploads/abc-123-def/data",
-                Some(("my-repo", "abc-123-def")),
-            ),
-            // The coalesce scratch names the same session, so one stranded by
-            // a crash is reclaimable.
-            (
-                "v2/repositories/my-repo/_uploads/abc-123-def/staged/coalesce",
                 Some(("my-repo", "abc-123-def")),
             ),
             (

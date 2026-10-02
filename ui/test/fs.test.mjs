@@ -1,6 +1,7 @@
-// The layer merge's accounting of wasted bytes and identical files, run by
-// `npm test` on Node's own runner. `utils.ts` imports `$app/paths` for its
-// links, which only SvelteKit provides, so it is stubbed.
+// The `utils.ts` helpers: the layer merge's accounting of wasted bytes and
+// identical files, how a manifest is named for pulling, and how a finding's
+// severity is read. Run by `npm test` on Node's own runner. `utils.ts` imports
+// `$app/paths` for its links, which only SvelteKit provides, so it is stubbed.
 import { register } from 'node:module';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,7 +14,9 @@ register(
 				: next(specifier, context);`
 		)
 );
-const { mergeLayers, fsDuplicates, fsRisks, formatMode } = await import('../src/lib/utils.ts');
+const { mergeLayers, fsDuplicates, fsRisks, formatMode, imageReference, parseSarif } = await import(
+	'../src/lib/utils.ts'
+);
 
 const entry = (path, kind, size = 0, sha256) => ({
 	path,
@@ -104,4 +107,18 @@ test('setuid, setgid, capable and world-writable entries are risky, a sticky fol
 	assert.equal(formatMode(0o4755), 'rwsr-xr-x');
 	assert.equal(formatMode(0o2644), 'rw-r-Sr--');
 	assert.equal(formatMode(0o1777), 'rwxrwxrwt');
+});
+
+test('a digest of any algorithm is pulled after an at, a tag after a colon', () => {
+	assert.equal(imageReference('apps/web', 'sha512:abc'), 'apps/web@sha512:abc');
+	assert.equal(imageReference('apps/web', 'sha256:abc'), 'apps/web@sha256:abc');
+	assert.equal(imageReference('apps/web', 'v1'), 'apps/web:v1');
+});
+
+// The registry reads every marked word pair, so the badge and the table agree.
+test('a severity stated after an unrelated marked word is still read', () => {
+	const report = parseSarif({
+		runs: [{ results: [{ ruleId: 'CVE-1', message: { text: 'A fix is available. Severity: HIGH' } }] }]
+	});
+	assert.equal(report.findings[0].severity, 'high');
 });
