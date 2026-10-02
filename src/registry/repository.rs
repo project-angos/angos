@@ -12,8 +12,7 @@ use angos_oci::request::{
 };
 use angos_oci::response::{ManifestHeadResponse, ManifestResponse};
 use angos_oci::{Descriptor, Digest, Error as OciError, MediaRange, Namespace, Reference};
-pub use angos_oci_client::RegistryClientConfig;
-use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient};
+use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient, RegistryClientConfig};
 
 use crate::{
     configuration::RegexPattern,
@@ -442,7 +441,6 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
-    use angos_mtls_client::ClientTls;
     use std::{fs, time::Duration};
 
     use tokio::{io::AsyncReadExt, time::timeout};
@@ -451,13 +449,15 @@ mod tests {
         matchers::{method, path},
     };
 
+    use angos_mtls_client::ClientTls;
     use angos_oci::{Digest, Namespace, Reference, Tag};
+    use angos_oci_client::RegistryClientConfig;
 
     use crate::{
         registry::{
             Error,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            repository::{Config, RegistryClientConfig, Repository},
+            repository::{Config, Repository},
         },
         replication::{ReplicationDownstreamConfig, ReplicationMode},
         test_fixtures::{client::test_client_config, webhook::ca_bundle_pem},

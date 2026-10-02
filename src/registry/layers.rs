@@ -73,7 +73,8 @@ impl Registry {
                 digest,
                 force: false,
             };
-            self.job_queue
+            self.config
+                .job_queue
                 .enqueue(layer::build_envelope(&payload)?)
                 .await?;
             return Ok(LayerEntries::Indexing);
@@ -86,7 +87,7 @@ impl Registry {
         // Every chunk: the web UI merges whole layers.
         let entries: Vec<LayerEntry> = stream::iter(0..listing.chunks.len())
             .map(|chunk| self.metadata_store.read_entries(&digest, chunk))
-            .buffered(self.listing_read_concurrency.get())
+            .buffered(self.config.listing_read_concurrency.get())
             .try_concat()
             .await?;
         // Megabytes to serialize and compress: off the async threads.

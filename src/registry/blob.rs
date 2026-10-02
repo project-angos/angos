@@ -7,6 +7,7 @@ use angos_oci::{
     request::{DeleteBlobRequest, GetBlobRequest, HeadBlobRequest},
 };
 use angos_oci_service::{Accepted, BlobDescriptor, BlobGet, BlobStream};
+use angos_storage::BoxedReader;
 
 use crate::{
     cache_fill::build_envelope,
@@ -15,7 +16,7 @@ use crate::{
     registry::{
         Error, Registry, Repository,
         blob_ownership::promote_and_grant,
-        blob_store::{BlobStore, BoxedReader, upload_session::HashStart},
+        blob_store::{BlobStore, upload_session::HashStart},
         metadata_store::{LinkKind, MetadataStore},
         record_pull_through, repository_name,
     },
@@ -241,7 +242,7 @@ impl Registry {
     ) -> Result<BlobGet<BoxedReader>, Error> {
         if request.range.is_none()
             && allow_redirect
-            && self.enable_blob_redirect
+            && self.config.enable_blob_redirect
             && self.blob_store.size(&request.digest).await.is_ok()
             && let Ok(Some(location)) = self.blob_store.presigned_url(&request.digest, None).await
         {

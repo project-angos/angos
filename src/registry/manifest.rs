@@ -389,7 +389,7 @@ impl Registry {
         link: &LinkKind,
         client: &EventActor,
     ) -> Result<(), Error> {
-        if !self.update_pull_time {
+        if !self.config.update_pull_time {
             return Ok(());
         }
         self.metadata_store
@@ -479,7 +479,7 @@ impl Registry {
             ..
         } = request;
         if allow_redirect
-            && self.enable_manifest_redirect
+            && self.config.enable_manifest_redirect
             && let Some(response) = self
                 .try_redirect_via_link(namespace, reference, client)
                 .await?
@@ -510,7 +510,7 @@ impl Registry {
             accepted_types,
         } = request;
         if allow_redirect
-            && self.enable_manifest_redirect
+            && self.config.enable_manifest_redirect
             && (matches!(reference, Reference::Digest(_)) || is_tag_immutable)
             && let Some(response) = self
                 .try_redirect_via_link(namespace, reference, client)
@@ -1290,7 +1290,7 @@ impl Registry {
         };
 
         let request_body =
-            read_limited_manifest_body(body_stream, self.max_manifest_size_bytes).await?;
+            read_limited_manifest_body(body_stream, self.config.max_manifest_size_bytes).await?;
 
         // Hashed up front: the intent events fired before the store carry the
         // content digest, the LWW tie-break compares it on equal timestamps,
@@ -1326,7 +1326,7 @@ impl Registry {
         self.check_lww_not_superseded(&namespace, written_tags, source_ts, Some(&digest))
             .await?;
 
-        let reference_policy = if self.validate_manifest_references {
+        let reference_policy = if self.config.validate_manifest_references {
             ReferencePolicy::Strict
         } else {
             ReferencePolicy::Permissive

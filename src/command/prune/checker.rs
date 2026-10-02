@@ -627,7 +627,6 @@ impl RetentionChecker {
 
 #[cfg(test)]
 mod tests {
-    use angos_mtls_client::ClientTls;
     use std::{
         collections::HashMap,
         fs::{File, FileTimes},
@@ -641,6 +640,7 @@ mod tests {
     use url::Url;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
+    use angos_mtls_client::ClientTls;
     use angos_oci::{Digest, Namespace, Tag};
     use angos_storage::{
         Error as StorageError, ObjectStore,

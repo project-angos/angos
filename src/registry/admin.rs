@@ -563,7 +563,7 @@ impl Registry {
                     started_at: summary.started_at,
                 })
             })
-            .buffered(self.listing_read_concurrency.get())
+            .buffered(self.config.listing_read_concurrency.get())
             .filter_map(|entry| async move { entry })
             .collect()
             .await;
@@ -585,15 +585,20 @@ impl Registry {
         let queue = Queue::from(queue);
         let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
         let page = self
+            .config
             .job_queue
             .list_pending_page(queue, n, after.as_deref())
             .await?;
 
         let jobs = read_job_page(
             page.items,
-            self.listing_read_concurrency.get(),
+            self.config.listing_read_concurrency.get(),
             |storage_key| async move {
-                let envelope = self.job_queue.read_pending(queue, &storage_key).await?;
+                let envelope = self
+                    .config
+                    .job_queue
+                    .read_pending(queue, &storage_key)
+                    .await?;
                 let not_before =
                     job_store::parse_not_before(&storage_key).unwrap_or(envelope.created_at);
                 Ok(JobEntry {
@@ -627,15 +632,20 @@ impl Registry {
         let queue = Queue::from(queue);
         let n = n.unwrap_or(DEFAULT_PAGE_SIZE);
         let page = self
+            .config
             .job_queue
             .list_failed_page(queue, n, after.as_deref())
             .await?;
 
         let failed = read_job_page(
             page.items,
-            self.listing_read_concurrency.get(),
+            self.config.listing_read_concurrency.get(),
             |storage_key| async move {
-                let record = self.job_queue.read_failed(queue, &storage_key).await?;
+                let record = self
+                    .config
+                    .job_queue
+                    .read_failed(queue, &storage_key)
+                    .await?;
                 Ok(FailedJobEntry {
                     storage_key,
                     id: record.envelope.id,
@@ -661,7 +671,8 @@ impl Registry {
     /// stale key surfaces as [`Error::NotFound`].
     #[instrument(skip(self))]
     pub async fn handle_retry_job(&self, request: RetryJobRequest) -> Result<NoContent, Error> {
-        self.job_queue
+        self.config
+            .job_queue
             .retry_failed(Queue::from(request.queue), &request.storage_key)
             .await?;
 
@@ -672,7 +683,8 @@ impl Registry {
     /// [`Error::NotFound`].
     #[instrument(skip(self))]
     pub async fn handle_delete_job(&self, request: DeleteJobRequest) -> Result<NoContent, Error> {
-        self.job_queue
+        self.config
+            .job_queue
             .delete_job(
                 Queue::from(request.queue),
                 JobState::from(request.state),
@@ -684,13 +696,13 @@ impl Registry {
     }
 
     fn get_repository_config(&self, name: &str) -> RepositoryConfig {
-        let global_exclusions = || self.global_immutable_tags_exclusions.clone();
+        let global_exclusions = || self.config.global_immutable_tags_exclusions.clone();
 
         let Some(repo) = self.resolver.get(name) else {
             return RepositoryConfig {
                 pull_through_cache: false,
                 upstream_urls: Vec::new(),
-                immutable_tags: self.global_immutable_tags,
+                immutable_tags: self.config.global_immutable_tags,
                 immutable_tags_exclusions: global_exclusions(),
             };
         };
@@ -708,7 +720,7 @@ impl Registry {
         RepositoryConfig {
             pull_through_cache: !upstream_urls.is_empty(),
             upstream_urls,
-            immutable_tags: repo.immutable_tags || self.global_immutable_tags,
+            immutable_tags: repo.immutable_tags || self.config.global_immutable_tags,
             immutable_tags_exclusions,
         }
     }
@@ -730,7 +742,7 @@ impl Registry {
                     .ok()?;
                 Some((digest, record))
             })
-            .buffer_unordered(self.listing_read_concurrency.get())
+            .buffer_unordered(self.config.listing_read_concurrency.get())
             .filter_map(|record| async move { record })
             .collect()
             .await
@@ -773,7 +785,7 @@ impl Registry {
                 }
                 Some((digest, analysis.parent_links, referrers))
             })
-            .buffered(self.listing_read_concurrency.get())
+            .buffered(self.config.listing_read_concurrency.get())
             .collect()
             .await;
 
@@ -872,7 +884,7 @@ impl Registry {
 
         // Pull times exist only while pulls are recorded: with recording off
         // every read below would list an empty directory.
-        if !self.update_pull_time {
+        if !self.config.update_pull_time {
             let entries = served.into_iter().map(|(_, entry)| entry).collect();
             return (entries, total, next);
         }
@@ -915,7 +927,7 @@ impl Registry {
                     .max();
                 entry
             })
-            .buffered(self.listing_read_concurrency.get())
+            .buffered(self.config.listing_read_concurrency.get())
             .collect()
             .await;
         (entries, total, next)
@@ -979,7 +991,7 @@ impl Registry {
                 };
                 (subject, listed)
             })
-            .buffer_unordered(self.listing_read_concurrency.get())
+            .buffer_unordered(self.config.listing_read_concurrency.get())
             .collect()
             .await
     }
@@ -1001,7 +1013,7 @@ impl Registry {
                     .flatten()?;
                 Some((tag, at))
             })
-            .buffered(self.listing_read_concurrency.get())
+            .buffered(self.config.listing_read_concurrency.get())
             .filter_map(|pull| async move { pull })
             .collect()
             .await

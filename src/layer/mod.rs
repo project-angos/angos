@@ -19,14 +19,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha512};
 
 use angos_extension_service::{EntryKind, FileContent, LayerEntry, Secret, SecretKind};
+use angos_inflate::{Checkpoint, Inflater};
 use angos_oci::{Content, Digest, Manifest};
 
 use crate::jobs::{
     Queue,
     store::{Error, JobEnvelope},
 };
-
-pub use angos_inflate::{Checkpoint, Inflater};
 
 pub mod elf;
 pub mod pem;

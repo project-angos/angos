@@ -328,9 +328,9 @@ impl Registry {
         S: AsyncRead + Unpin,
     {
         let remaining = if content_length.is_some() {
-            self.max_blob_size_bytes
+            self.config.max_blob_size_bytes
         } else {
-            self.max_blob_size_bytes.saturating_sub(committed)
+            self.config.max_blob_size_bytes.saturating_sub(committed)
         };
         stream.take(remaining.saturating_add(1))
     }
@@ -363,7 +363,7 @@ impl Registry {
         session_id: &UploadSessionId,
         new_total: u64,
     ) -> Result<(), Error> {
-        let limit = self.max_blob_size_bytes;
+        let limit = self.config.max_blob_size_bytes;
         if new_total > limit {
             self.abort_upload_quietly(namespace, session_id).await;
             return Err(Error::BlobBodyTooLarge {
