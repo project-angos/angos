@@ -19,7 +19,10 @@ use reqwest::{
     redirect::Policy,
 };
 use serde::Deserialize;
-use tokio::{io::AsyncReadExt, sync::Mutex};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    sync::Mutex,
+};
 use tokio_util::io::StreamReader;
 use tracing::{debug, instrument, warn};
 use url::Url;
@@ -38,8 +41,6 @@ pub use crate::{error::Error, write::UploadSession};
 use angos_cache::Cache;
 use angos_mtls_client::{BasicAuth, ClientTls, MtlsClientBuilder};
 use angos_secret::Secret;
-
-use angos_storage::BoxedReader;
 use auth::token_index_cache_key;
 
 /// Classifies a non-success read status: a true 404 maps to `not_found` so
@@ -163,7 +164,7 @@ impl RegistryClientConfig {
 pub struct FetchedBlob {
     pub length: u64,
     pub content_range: Option<ResponseRange>,
-    pub reader: BoxedReader,
+    pub reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
 }
 
 #[derive(Debug)]

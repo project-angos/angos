@@ -186,7 +186,6 @@ dependencies = [
  "angos-mtls-client",
  "angos-oci",
  "angos-secret",
- "angos-storage",
  "base64 0.23.1",
  "bytes",
  "chrono",

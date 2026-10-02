@@ -43,13 +43,13 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 bytesize = "2.7.0"
 chrono = { version = "0.4.45", features = ["serde"] }
+flate2 = "1.1"
 futures-util = { version = "0.3.34", default-features = false }
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
 hyper = "1.11.0"
 http-body-util = "0.1.5"
-redis = { version = "1.5.0", features = ["tokio-comp", "connection-manager"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -59,8 +59,9 @@ tempfile = "3.27"
 thiserror = "2.0.20"
 tokio = "1.53.1"
 tokio-util = { version = "0.7.19", features = ["io-util"] }
+toml = "1.1.4"
 tracing = "0.1.44"
-tracing-opentelemetry = "0.33"
+tracing-subscriber = "0.3.23"
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring"] }
@@ -99,7 +100,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 bytesize = { workspace = true, features = ["serde"] }
 cel-interpreter = "0.10"
-flate2 = "1.1"
+flate2 = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
@@ -136,10 +137,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
 tokio-rustls = "0.26.4"
 tokio-util = { workspace = true, features = ["rt"] }
-toml = "1.1.4"
+toml = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.33"
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["serde"] }
 x509-parser = "0.18.1"
