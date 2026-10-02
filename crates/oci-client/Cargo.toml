@@ -24,6 +24,6 @@ url = { workspace = true }
 [dev-dependencies]
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-toml = "1.1.4"
+toml = "1.1.6"
 tracing-subscriber = "0.3.23"
 wiremock = { workspace = true }
