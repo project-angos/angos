@@ -313,16 +313,10 @@ async fn tag_targeting_missing_blob_is_removed() {
         let namespace = &Namespace::new("test-repo/dangling-tag").unwrap();
         let metadata_store = test_case.metadata_store();
 
+        // A tag write pins its reference key first, as every writer does.
         let ghost_digest = Digest::sha256_of_bytes(b"never-uploaded");
-        let key = namespace.tag_entry_path(
-            &Tag::new("dangling").unwrap(),
-            Utc::now(),
-            false,
-            &ghost_digest,
-        );
         metadata_store
-            .object_store()
-            .put(&key, Bytes::from_static(b"{}"))
+            .write_link(namespace, &tag("dangling"), &ghost_digest)
             .await
             .unwrap();
 
