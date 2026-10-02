@@ -9,10 +9,13 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
+use angos_mtls_client::ClientTls;
+
 use crate::{
     auth::Error,
     auth::oidc::{
-        Config, Jwk,
+        Config,
+        jwk::Jwk,
         validator::{
             Jwks, OpenIdConfiguration, fetch_jwks, fetch_oidc_configuration, issuer_bearer_token,
             issuer_key, validate_oidc_token, verify_jwt_with_header,
@@ -27,9 +30,7 @@ use crate::{
 
 pub fn build_test_provider_config(uri: &str) -> Config {
     Config {
-        server_ca_bundle: None,
-        client_certificate_bundle: None,
-        client_private_key: None,
+        tls: ClientTls::default(),
         bearer_token_file: None,
         issuer: uri.to_string(),
         jwks_uri: Some(format!("{uri}/.well-known/jwks")),
@@ -902,9 +903,7 @@ pub fn valid_claims(issuer: &str, audience: &str) -> HashMap<String, serde_json:
 /// token against a JWKS they hold rather than one they fetch.
 fn test_provider(issuer: &str, audience: Option<&str>) -> Config {
     Config {
-        server_ca_bundle: None,
-        client_certificate_bundle: None,
-        client_private_key: None,
+        tls: ClientTls::default(),
         bearer_token_file: None,
         issuer: issuer.to_string(),
         jwks_uri: None,

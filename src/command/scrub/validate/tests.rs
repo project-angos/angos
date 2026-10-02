@@ -586,10 +586,9 @@ async fn a_live_gc_marker_survives_the_walk() {
 #[tokio::test]
 async fn orphan_blob_is_reclaimed() {
     for_each_backend(async |test_case| {
-        let metadata_store = test_case.metadata_store();
         let blob_store = test_case.blob_store();
 
-        let orphan = put_blob_direct(metadata_store.object_store(), b"unreferenced-bytes").await;
+        let orphan = put_blob_direct(&blob_store, b"unreferenced-bytes").await;
         assert!(blob_store.size(&orphan).await.is_ok());
 
         scrub_apply(test_case).await;
@@ -610,7 +609,7 @@ async fn a_blob_whose_only_reference_dangles_is_reclaimed_in_one_run() {
         let namespace = Namespace::new("test-repo/dangling-ref").unwrap();
         let blob_store = test_case.blob_store();
         let metadata_store = test_case.metadata_store();
-        let blob = put_blob_direct(metadata_store.object_store(), b"deleted-manifest-body").await;
+        let blob = put_blob_direct(&blob_store, b"deleted-manifest-body").await;
         metadata_store
             .insert_reference(&namespace, &blob, &LinkKind::Digest(blob.clone()))
             .await

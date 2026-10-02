@@ -7,7 +7,7 @@
 
 use std::str::FromStr;
 
-use angos_oci::{Algorithm, Digest, Namespace, Tag, UploadSessionId};
+use angos_oci::{Digest, Namespace, Tag, UploadSessionId};
 
 use crate::{
     command::maintenance::action::LOST_AND_FOUND_PREFIX,
@@ -15,7 +15,8 @@ use crate::{
     registry::{
         keys::{
             ATIME_COMPACTED, BLOBS_ROOT, CAT_ROOT, DigestKeys, GC_ROOT, LAYERS_ROOT, NS_ROOT,
-            REF_ROOT, REPOS_ROOT, TagEntry, parse_atime_entry,
+            REF_ROOT, REPOS_ROOT, TagEntry, parse_atime_entry, parse_digest, parse_referrer_record,
+            parse_revision_record, parse_sharded,
         },
         metadata_store::LinkKind,
     },
@@ -267,11 +268,7 @@ fn categorize_ns(rest: &str) -> KeyCategory {
         return categorize_atime(namespace, rest);
     }
     if let Some(rest) = marker.strip_prefix("rev/") {
-        let segments: Vec<&str> = rest.split('/').collect();
-        let [algorithm, prefix, hash] = segments.as_slice() else {
-            return KeyCategory::Unknown;
-        };
-        let Some(digest) = parse_sharded(algorithm, prefix, hash) else {
+        let Some(digest) = parse_revision_record(rest) else {
             return KeyCategory::Unknown;
         };
         return KeyCategory::RevisionRecord {
@@ -280,17 +277,7 @@ fn categorize_ns(rest: &str) -> KeyCategory {
         };
     }
     if let Some(rest) = marker.strip_prefix("sub/") {
-        let segments: Vec<&str> = rest.split('/').collect();
-        let [algorithm, prefix, hash, entry] = segments.as_slice() else {
-            return KeyCategory::Unknown;
-        };
-        let Some(subject) = parse_sharded(algorithm, prefix, hash) else {
-            return KeyCategory::Unknown;
-        };
-        let Some((r_algorithm, r_hash)) = entry.split_once('.') else {
-            return KeyCategory::Unknown;
-        };
-        let Some(referrer) = parse_digest(r_algorithm, r_hash) else {
+        let Some((subject, referrer)) = parse_referrer_record(rest) else {
             return KeyCategory::Unknown;
         };
         return KeyCategory::ReferrerRecord {
@@ -424,20 +411,6 @@ fn categorize_upload(namespace: String, tail: &[&str]) -> KeyCategory {
     }
 }
 
-/// A digest from its sharded segments `{alg}/{prefix}/{hash}`; `None` when the
-/// shard does not open the hash or the key cannot belong to this angos version.
-fn parse_sharded(algorithm: &str, prefix: &str, hash: &str) -> Option<Digest> {
-    let digest = parse_digest(algorithm, hash)?;
-    (hash.as_bytes().get(..2) == Some(prefix.as_bytes())).then_some(digest)
-}
-
-/// A digest from separate path segments; `None` means the key cannot belong
-/// to this angos version.
-fn parse_digest(algorithm: &str, hash: &str) -> Option<Digest> {
-    let algorithm = Algorithm::from_str(algorithm).ok()?;
-    Digest::with_algorithm(algorithm, hash).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
@@ -476,6 +449,34 @@ mod tests {
             categorize(&digest_a().blob_path()),
             KeyCategory::BlobData { digest: digest_a() }
         );
+    }
+
+    /// Catalog reads these keys through the same parsers, so a shard that
+    /// does not open the hash is no record there either.
+    #[test]
+    fn record_paths_round_trip_and_need_a_matching_shard() {
+        assert_eq!(
+            categorize(&namespace().revision_record_path(&digest_a())),
+            KeyCategory::RevisionRecord {
+                namespace: "org/app".to_string(),
+                digest: digest_a(),
+            }
+        );
+        assert_eq!(
+            categorize(&namespace().referrer_record_path(&digest_a(), &digest_b())),
+            KeyCategory::ReferrerRecord {
+                namespace: "org/app".to_string(),
+                subject: digest_a(),
+                referrer: digest_b(),
+            }
+        );
+        for key in [
+            format!("v2/ns/org/app!rev/sha256/bb/{HASH_A}"),
+            format!("v2/ns/org/app!sub/sha256/bb/{HASH_A}/sha256.{HASH_B}"),
+            format!("v2/ns/org/app!sub/sha256/aa/{HASH_A}/sha256/{HASH_B}"),
+        ] {
+            assert_eq!(categorize(&key), KeyCategory::Unknown, "key {key:?}");
+        }
     }
 
     #[test]

@@ -298,19 +298,43 @@ impl DigestKeys for Digest {
     }
 }
 
-/// `<algo>.<hash>` inside a reference-key entry; `.` separates unambiguously
-/// because algorithm names never contain it.
-fn parse_ref_digest(s: &str) -> Option<Digest> {
-    let (algorithm, hash) = s.split_once('.')?;
+/// A digest from its separate `<algo>` and `<hash>` key segments.
+pub fn parse_digest(algorithm: &str, hash: &str) -> Option<Digest> {
     Digest::with_algorithm(Algorithm::from_str(algorithm).ok()?, hash).ok()
+}
+
+/// `<algo>.<hash>` inside a reference-key entry or a referrer record; `.`
+/// separates unambiguously because algorithm names never contain it.
+pub fn parse_ref_digest(s: &str) -> Option<Digest> {
+    let (algorithm, hash) = s.split_once('.')?;
+    parse_digest(algorithm, hash)
+}
+
+/// A digest from its sharded segments `<algo>/<pfx>/<hash>`; `None` when the
+/// shard does not open the hash.
+pub fn parse_sharded(algorithm: &str, prefix: &str, hash: &str) -> Option<Digest> {
+    parse_digest(algorithm, hash).filter(|digest| digest.hash_prefix() == prefix)
+}
+
+/// A revision record key below [`NamespaceKeys::revision_records_root`],
+/// `<algo>/<pfx>/<hash>`, which is also how a referrer record names its subject.
+pub fn parse_revision_record(key: &str) -> Option<Digest> {
+    let (algorithm, rest) = key.split_once('/')?;
+    let (prefix, hash) = rest.split_once('/')?;
+    parse_sharded(algorithm, prefix, hash)
+}
+
+/// A referrer record key below [`NamespaceKeys::referrer_records_root`],
+/// `<algo>/<pfx>/<hash>/<algo>.<hash>`: its subject, then its referrer.
+pub fn parse_referrer_record(key: &str) -> Option<(Digest, Digest)> {
+    let (subject, referrer) = key.rsplit_once('/')?;
+    Some((parse_revision_record(subject)?, parse_ref_digest(referrer)?))
 }
 
 /// The layer a listing key names, `v2/layers/<algorithm>/<prefix>/<hash>/...`.
 pub fn parse_layer_key(key: &str) -> Option<Digest> {
     let mut parts = key.strip_prefix(LAYERS_ROOT)?.strip_prefix('/')?.split('/');
-    let algorithm = Algorithm::from_str(parts.next()?).ok()?;
-    let _prefix = parts.next()?;
-    Digest::with_algorithm(algorithm, parts.next()?).ok()
+    parse_sharded(parts.next()?, parts.next()?, parts.next()?)
 }
 
 /// Every current-shape storage key addressed by a namespace.

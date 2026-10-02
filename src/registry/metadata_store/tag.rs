@@ -8,6 +8,7 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
+use futures_util::TryStreamExt;
 
 use angos_oci::{Digest, Namespace, Tag};
 use angos_storage::Error as StorageError;
@@ -15,7 +16,7 @@ use angos_storage::Error as StorageError;
 use crate::registry::{
     Error,
     keys::{NamespaceKeys, TagEntry},
-    metadata_store::{LIST_PAGE, LinkMetadata, MetadataStore},
+    metadata_store::{LinkMetadata, MetadataStore},
 };
 
 /// The timestamp a locally authored entry carries: this replica's clock,
@@ -137,7 +138,7 @@ impl MetadataStore {
 
     /// The winner of the tag's complete lowest-ordinal entry group, or `None`
     /// when the tag has no entries, a tombstone winner included, since a local
-    /// write floors its own timestamp above whatever is newest. Pages
+    /// write floors its own timestamp above whatever is newest. Reads
     /// until the ordinal changes, so a same-millisecond pair straddling a page
     /// boundary is never split.
     async fn resolve_tag_winner(
@@ -146,22 +147,15 @@ impl MetadataStore {
         tag: &Tag,
     ) -> Result<Option<TagEntry>, Error> {
         let dir = namespace.tag_entry_dir(tag);
+        let mut names = self.object_store().list_in_order(&dir);
         let mut group: Vec<TagEntry> = Vec::new();
-        let mut token = None;
-        'pages: loop {
-            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            for name in &page.items {
-                let Ok(entry) = name.parse::<TagEntry>() else {
-                    continue;
-                };
-                match group.first() {
-                    Some(first) if entry.ord() != first.ord() => break 'pages,
-                    _ => group.push(entry),
-                }
-            }
-            token = page.next_token;
-            if token.is_none() {
-                break;
+        while let Some(name) = names.try_next().await? {
+            let Ok(entry) = name.parse::<TagEntry>() else {
+                continue;
+            };
+            match group.first() {
+                Some(first) if entry.ord() != first.ord() => break,
+                _ => group.push(entry),
             }
         }
         // Highest digest first; a `set` beats a `del` of the same digest.

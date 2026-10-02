@@ -10,6 +10,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone as _, Utc};
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::{sync::Semaphore, time::sleep};
 use tokio_util::sync::CancellationToken;
@@ -21,13 +22,15 @@ use angos_storage::{
 };
 
 use crate::jobs::store::{
-    ClaimCheck, ClaimMode, ClaimedJob, CompleteOutcome, DeadLetterRecord, FailOutcome, JOBS_ROOT,
-    JobEnvelope, JobQueueConfig, JobRetryPolicy, JobState, JobStore, LockKey, MAX_REPORTED_PENDING,
-    Queue, QueueDepthRefresh, STORAGE_KEY_PREFIX_LEN, ensure_claim_support, job_claim_path,
-    job_lock_key_index_path, job_pending_path, make_storage_key, parse_lock_key_index,
-    parse_not_before, queue_depth_refresh_loop, serialize_lock_key_index, should_cancel_claim,
+    ClaimCheck, ClaimMode, ClaimedJob, CompleteOutcome, DeadLetterRecord, Error, FailOutcome,
+    JOBS_ROOT, JobEnvelope, JobQueueConfig, JobRetryPolicy, JobState, JobStore, LockKey,
+    MAX_REPORTED_PENDING, Queue, QueueDepthRefresh, STORAGE_KEY_PREFIX_LEN, ensure_claim_support,
+    job_claim_path, job_lock_key_index_path, job_pending_path, make_storage_key,
+    parse_lock_key_index, parse_not_before, queue_depth_refresh_loop, serialize_lock_key_index,
+    should_cancel_claim,
 };
 use crate::metrics_provider;
+use crate::registry::{Error as RegistryError, test_utils::metadata_store_over};
 
 struct Harness {
     store: Arc<JobStore>,
@@ -42,7 +45,11 @@ struct Harness {
 fn harness() -> Harness {
     metrics_provider::init_for_tests();
     let (raw, dir) = fs_store();
-    let store = Arc::new(JobStore::new(raw.clone(), "test-worker", ClaimMode::Atomic));
+    let store = Arc::new(JobStore::new(
+        &metadata_store_over(raw.clone()),
+        "test-worker",
+        ClaimMode::Atomic,
+    ));
     Harness {
         store,
         raw,
@@ -446,7 +453,11 @@ async fn orphan_index_transient_delete_failure_does_not_drop_enqueue() {
         index_path: index_path.clone(),
     };
     let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(inner.clone(), hook));
-    let store = Arc::new(JobStore::new(hooked, "test-worker", ClaimMode::Atomic));
+    let store = Arc::new(JobStore::new(
+        &metadata_store_over(hooked),
+        "test-worker",
+        ClaimMode::Atomic,
+    ));
 
     // Seed an orphan index (index present, pending file absent) through the
     // inner store so the fault hook does not intercept the fixture write.
@@ -509,7 +520,11 @@ async fn claim_rechecks_pending_under_lock_and_skips_a_vanished_job() {
             pending_reads: AtomicUsize::new(0),
         },
     ));
-    let store = Arc::new(JobStore::new(hooked, "test-worker", ClaimMode::Atomic));
+    let store = Arc::new(JobStore::new(
+        &metadata_store_over(hooked),
+        "test-worker",
+        ClaimMode::Atomic,
+    ));
 
     store
         .enqueue(dummy_envelope("cache.ns:sha256:vanish"))
@@ -542,7 +557,11 @@ async fn claim_is_skipped_when_the_dedup_index_cannot_be_retired() {
             index_path: index_path.clone(),
         },
     ));
-    let store = Arc::new(JobStore::new(hooked, "test-worker", ClaimMode::Atomic));
+    let store = Arc::new(JobStore::new(
+        &metadata_store_over(hooked),
+        "test-worker",
+        ClaimMode::Atomic,
+    ));
 
     store
         .enqueue(dummy_envelope(lock_key.as_str()))
@@ -1001,6 +1020,44 @@ async fn delete_pending_removes_record_and_index() {
 }
 
 // =========================================================================
+// Handler-facing helpers
+// =========================================================================
+
+/// Neither a foreign kind nor a payload that does not decode can change on
+/// retry, so both must dead-letter at once.
+#[test]
+fn a_foreign_kind_or_undecodable_payload_is_terminal() {
+    let envelope = JobEnvelope::new(Queue::Cache, "cache.fetch_blob", "lock", &json!({"a": 1}))
+        .expect("envelope");
+    assert!(
+        envelope
+            .payload::<serde_json::Value>(&["cache.fetch_blob"])
+            .is_ok()
+    );
+    assert!(matches!(
+        envelope.payload::<serde_json::Value>(&["scan.image"]),
+        Err(Error::Terminal(_))
+    ));
+    assert!(matches!(
+        envelope.payload::<u32>(&["cache.fetch_blob"]),
+        Err(Error::Terminal(_))
+    ));
+}
+
+/// An authorization denial dead-letters; any other registry error is retried.
+#[test]
+fn only_a_denied_registry_error_is_terminal() {
+    assert!(matches!(
+        Error::from(RegistryError::Denied("forbidden".to_string())),
+        Error::Terminal(_)
+    ));
+    assert!(matches!(
+        Error::from(RegistryError::BlobUnknown),
+        Error::Execution(_)
+    ));
+}
+
+// =========================================================================
 // Key helpers
 // =========================================================================
 
@@ -1453,7 +1510,9 @@ async fn ensure_claim_support_probe_succeeds_and_cleans_up() {
     metrics_provider::init_for_tests();
     let (raw, _dir) = fs_store();
     assert_eq!(
-        ensure_claim_support(&raw).await.expect("probe"),
+        ensure_claim_support(&metadata_store_over(raw.clone()))
+            .await
+            .expect("probe"),
         ClaimMode::Atomic,
         "the fs backend is honest and must probe as atomic",
     );
@@ -1493,7 +1552,7 @@ async fn a_dishonest_backend_probes_as_advisory() {
     let hooked: Arc<dyn ObjectStore> =
         Arc::new(HookedStore::new(inner.clone(), DishonestCreate { inner }));
     assert_eq!(
-        ensure_claim_support(&hooked)
+        ensure_claim_support(&metadata_store_over(hooked.clone()))
             .await
             .expect("a dishonest backend must probe cleanly"),
         ClaimMode::Advisory,
@@ -1579,12 +1638,20 @@ async fn advisory_claim_race_admits_exactly_one_winner() {
     ));
 
     let a = {
-        let store = JobStore::new(hooked_a, "worker-a", ClaimMode::Advisory);
+        let store = JobStore::new(
+            &metadata_store_over(hooked_a),
+            "worker-a",
+            ClaimMode::Advisory,
+        );
         let key = claim_key.clone();
         tokio::spawn(async move { store.put_claim_advisory(&key, "instance-a").await })
     };
     let b = {
-        let store = JobStore::new(hooked_b, "worker-b", ClaimMode::Advisory);
+        let store = JobStore::new(
+            &metadata_store_over(hooked_b),
+            "worker-b",
+            ClaimMode::Advisory,
+        );
         let key = claim_key.clone();
         tokio::spawn(async move { store.put_claim_advisory(&key, "instance-b").await })
     };
@@ -1608,7 +1675,11 @@ async fn advisory_claim_race_admits_exactly_one_winner() {
 async fn advisory_mode_claims_completes_and_reclaims() {
     metrics_provider::init_for_tests();
     let (raw, _dir) = fs_store();
-    let store = Arc::new(JobStore::new(raw, "advisory-worker", ClaimMode::Advisory));
+    let store = Arc::new(JobStore::new(
+        &metadata_store_over(raw),
+        "advisory-worker",
+        ClaimMode::Advisory,
+    ));
 
     store
         .enqueue(dummy_envelope("cache.ns:sha256:advisory"))
@@ -1668,7 +1739,11 @@ async fn complete_cleanup_failure_fails_over_to_retry() {
             remaining: AtomicUsize::new(1),
         },
     ));
-    let store = Arc::new(JobStore::new(hooked, "test-worker", ClaimMode::Atomic));
+    let store = Arc::new(JobStore::new(
+        &metadata_store_over(hooked),
+        "test-worker",
+        ClaimMode::Atomic,
+    ));
 
     store
         .enqueue(dummy_envelope("cache.ns:sha256:cleanup"))
@@ -1722,7 +1797,7 @@ async fn claim_ttl_knob_stamps_the_claim_lease() {
     metrics_provider::init_for_tests();
     let (raw, _dir) = fs_store();
     let store = Arc::new(JobStore::with_retry_policy(
-        raw.clone(),
+        &metadata_store_over(raw.clone()),
         "test-worker",
         ClaimMode::Atomic,
         JobRetryPolicy {

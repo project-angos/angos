@@ -1,10 +1,15 @@
 use std::{num::TryFromIntError, string::FromUtf8Error};
 
-use http::header::InvalidHeaderValue;
+use http::StatusCode;
 use sha2::digest::common::hazmat::DeserializeStateError;
 use tracing::warn;
 
-use angos_oci::{Error as OciError, http_range};
+use angos_oci::{
+    Error as OciError, http_range,
+    response::{
+        ErrorCode, INTERNAL_ERROR_CODE, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE,
+    },
+};
 use angos_storage::Error as StorageError;
 
 use crate::{configuration, jobs::store as job_store, policy};
@@ -79,26 +84,130 @@ pub enum Error {
     Cache(#[from] angos_cache::Error),
     #[error("I/O error during operations: {0}")]
     Io(#[from] std::io::Error),
-    #[error("HTTP error during operations: {0}")]
-    Http(#[from] http::Error),
     #[error("(de)serialization error during operations: {0}")]
     Serde(#[from] serde_json::Error),
-    #[error("invalid header value: {0}")]
-    InvalidHeader(#[from] InvalidHeaderValue),
+}
+
+impl Error {
+    /// How this outcome answers on the distribution API: its status, its
+    /// error code and the message worth sending. A 4xx code must come from the
+    /// spec's set, so each case picks the closest of those.
+    #[must_use]
+    pub fn oci_answer(&self) -> (StatusCode, &'static str, Option<String>) {
+        match self {
+            Error::BlobUnknown => (StatusCode::NOT_FOUND, ErrorCode::BlobUnknown.as_str(), None),
+            // `405` is what end-10 lists for a refused blob delete, so the
+            // reason travels in the message rather than in a status outside
+            // that set.
+            Error::BlobReferenced => (
+                StatusCode::METHOD_NOT_ALLOWED,
+                ErrorCode::Denied.as_str(),
+                Some(self.to_string()),
+            ),
+            Error::BlobUploadUnknown => (
+                StatusCode::NOT_FOUND,
+                ErrorCode::BlobUploadUnknown.as_str(),
+                None,
+            ),
+            Error::DigestInvalid => (
+                StatusCode::BAD_REQUEST,
+                ErrorCode::DigestInvalid.as_str(),
+                None,
+            ),
+            Error::ManifestBlobUnknown => (
+                StatusCode::NOT_FOUND,
+                ErrorCode::ManifestBlobUnknown.as_str(),
+                None,
+            ),
+            Error::ManifestBodyTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorCode::ManifestInvalid.as_str(),
+                Some(self.to_string()),
+            ),
+            Error::BlobBodyTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorCode::BlobUploadInvalid.as_str(),
+                Some(self.to_string()),
+            ),
+            Error::ManifestInvalid(msg) => (
+                StatusCode::BAD_REQUEST,
+                ErrorCode::ManifestInvalid.as_str(),
+                Some(msg.clone()),
+            ),
+            Error::ManifestUnknown => (
+                StatusCode::NOT_FOUND,
+                ErrorCode::ManifestUnknown.as_str(),
+                None,
+            ),
+            Error::NameInvalid => (
+                StatusCode::BAD_REQUEST,
+                ErrorCode::NameInvalid.as_str(),
+                None,
+            ),
+            Error::NameUnknown | Error::NotFound => {
+                (StatusCode::NOT_FOUND, ErrorCode::NameUnknown.as_str(), None)
+            }
+            Error::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::Unauthorized.as_str(),
+                Some(msg.clone()),
+            ),
+            Error::Denied(msg) => (
+                StatusCode::FORBIDDEN,
+                ErrorCode::Denied.as_str(),
+                Some(msg.clone()),
+            ),
+            Error::Unsupported => (
+                StatusCode::BAD_REQUEST,
+                ErrorCode::Unsupported.as_str(),
+                None,
+            ),
+            Error::RangeNotSatisfiable => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                ErrorCode::SizeInvalid.as_str(),
+                None,
+            ),
+            // A refused write (an immutable tag, a concurrent-writer CAS
+            // conflict) answers 409 under the spec code closest to it.
+            Error::Conflict(msg) => (
+                StatusCode::CONFLICT,
+                ErrorCode::Denied.as_str(),
+                Some(msg.clone()),
+            ),
+            // Transient by construction, since the collector's batch moves on:
+            // the client backs off and retries instead of reading a refusal.
+            Error::ReclamationInProgress(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                RECLAMATION_IN_PROGRESS_CODE,
+                Some(msg.clone()),
+            ),
+            Error::ReplicationSuperseded(msg) => (
+                StatusCode::CONFLICT,
+                REPLICATION_SUPERSEDED_CODE,
+                Some(msg.clone()),
+            ),
+            // Corrupt content is a 500 like any other internal failure; only
+            // the reclaim paths inside angos act on the distinction.
+            Error::Initialization(msg)
+            | Error::EventDelivery(msg)
+            | Error::Internal(msg)
+            | Error::Corrupt(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                INTERNAL_ERROR_CODE,
+                Some(msg.clone()),
+            ),
+            Error::Configuration(_) | Error::Cache(_) | Error::Io(_) | Error::Serde(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                INTERNAL_ERROR_CODE,
+                Some(self.to_string()),
+            ),
+        }
+    }
 }
 
 // A raw storage outcome carries no domain context: a call site that knows a
 // miss means a specific blob/upload/manifest 404 must intercept
 // `StorageError::NotFound` before `?` reaches this impl.
-impl From<angos_transport::RenderError> for Error {
-    fn from(error: angos_transport::RenderError) -> Self {
-        match error {
-            angos_transport::RenderError::Header(e) => Error::Http(e),
-            angos_transport::RenderError::Serialize(e) => Error::Serde(e),
-        }
-    }
-}
-
 impl From<StorageError> for Error {
     fn from(error: StorageError) -> Self {
         match error {

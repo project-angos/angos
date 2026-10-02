@@ -7,6 +7,9 @@ pub const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1
 pub const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 /// Media type of a Docker schema-2 image manifest.
 pub const DOCKER_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
+/// Media type of the OCI empty descriptor, the config of an artifact that has
+/// none.
+pub const OCI_EMPTY_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 /// Media type of a Docker schema-2 manifest list.
 pub const DOCKER_MANIFEST_LIST_MEDIA_TYPE: &str =
     "application/vnd.docker.distribution.manifest.list.v2+json";

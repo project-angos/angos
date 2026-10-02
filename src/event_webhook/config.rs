@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use url::Url;
 
+use angos_mtls_client::ClientTls;
 use angos_secret::Secret;
 
 use crate::{configuration::RegexPattern, event_webhook::event::EventKind};
@@ -28,6 +29,8 @@ pub struct EventWebhookConfig {
     pub events: Vec<EventKind>,
     #[serde(default)]
     pub repository_filter: Option<Vec<RegexPattern>>,
+    #[serde(flatten)]
+    pub tls: ClientTls,
 }
 
 /// Default retry budget for `required`-policy webhooks: a transient delivery
@@ -81,6 +84,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use crate::{
         configuration::RegexPattern,
         event_webhook::{
@@ -264,6 +269,31 @@ mod tests {
             err.to_string()
                 .contains("max_retries=999999 exceeds the supported maximum of 16"),
             "unexpected error message: {err}"
+        );
+    }
+
+    /// An endpoint behind a private CA, or one asking for a client certificate,
+    /// is reachable; half an identity is refused.
+    #[test]
+    fn tls_settings_parse_and_half_an_identity_is_refused() {
+        let base = r#"
+            url = "https://hooks.internal/webhook"
+            policy = "required"
+            events = ["manifest.push"]
+            server_ca_bundle = "/etc/angos/ca.pem"
+        "#;
+        let config: EventWebhookConfig = toml::from_str(&format!(
+            "{base}client_certificate_bundle = \"/c.pem\"\nclient_private_key = \"/k.pem\""
+        ))
+        .unwrap();
+        assert_eq!(
+            config.tls.server_ca_bundle.as_deref(),
+            Some(Path::new("/etc/angos/ca.pem"))
+        );
+        assert!(config.tls.identity.is_some());
+        assert!(
+            toml::from_str::<EventWebhookConfig>(&format!("{base}client_private_key = \"/k.pem\""))
+                .is_err()
         );
     }
 }

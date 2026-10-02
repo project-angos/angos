@@ -156,14 +156,9 @@ fn test_repository_config() {
     assert_eq!(repo.upstream.len(), 1);
     assert_eq!(repo.upstream[0].url, "https://registry.example.com");
     assert_eq!(repo.upstream[0].max_redirect, 3);
-    assert_eq!(repo.upstream[0].username.as_deref(), Some("mirror"));
-    assert_eq!(
-        repo.upstream[0]
-            .password
-            .as_ref()
-            .map(|p| p.expose().as_str()),
-        Some("secret")
-    );
+    let auth = repo.upstream[0].basic_auth.as_ref().unwrap();
+    assert_eq!(auth.username, "mirror");
+    assert_eq!(auth.password.expose(), "secret");
     let access_policy = repo.access_policy.as_ref().unwrap();
     assert_eq!(access_policy.default, Some(AccessMode::Allow));
     assert_eq!(access_policy.rules.len(), 1);
@@ -203,15 +198,9 @@ fn test_repository_downstream_config() {
     let downstream = &repo.downstream[0];
     assert_eq!(downstream.name, "instance-b");
     assert_eq!(downstream.client.url, "https://angos-eu.example.com");
-    assert_eq!(downstream.client.username.as_deref(), Some("replicator"));
-    assert_eq!(
-        downstream
-            .client
-            .password
-            .as_ref()
-            .map(|p| p.expose().as_str()),
-        Some("s3cret")
-    );
+    let auth = downstream.client.basic_auth.as_ref().unwrap();
+    assert_eq!(auth.username, "replicator");
+    assert_eq!(auth.password.expose(), "s3cret");
     assert_eq!(downstream.mode, ReplicationMode::EventOnly);
     assert_eq!(downstream.namespace_filter.len(), 1);
     assert_eq!(downstream.namespace_filter[0].as_source(), "^nginx/.*");

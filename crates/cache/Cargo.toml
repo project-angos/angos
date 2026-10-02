@@ -10,7 +10,7 @@ test-util = []
 
 [dependencies]
 angos-secret = { workspace = true }
-redis = { workspace = true }
+redis = { version = "1.5.0", features = ["tokio-comp", "connection-manager"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -20,4 +20,4 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-toml = "1.1.4"
+toml = { workspace = true }

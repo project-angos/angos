@@ -1,5 +1,6 @@
 //! Fixtures for [`RegistryClientConfig`]-based tests.
 
+use angos_mtls_client::ClientTls;
 use angos_oci_client::RegistryClientConfig;
 
 /// The modal test client config: `url` plus defaults everywhere (no TLS
@@ -11,9 +12,7 @@ pub fn test_client_config(url: impl Into<String>) -> RegistryClientConfig {
         max_redirect: 5,
         connect_timeout_secs: 30,
         read_timeout_secs: 300,
-        server_ca_bundle: None,
-        mtls: None,
-        username: None,
-        password: None,
+        tls: ClientTls::default(),
+        basic_auth: None,
     }
 }

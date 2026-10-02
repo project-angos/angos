@@ -12,8 +12,7 @@ use angos_oci::request::{
 };
 use angos_oci::response::{ManifestHeadResponse, ManifestResponse};
 use angos_oci::{Descriptor, Digest, Error as OciError, MediaRange, Namespace, Reference};
-pub use angos_oci_client::RegistryClientConfig;
-use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient};
+use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient, RegistryClientConfig};
 
 use crate::{
     configuration::RegexPattern,
@@ -450,13 +449,15 @@ mod tests {
         matchers::{method, path},
     };
 
+    use angos_mtls_client::ClientTls;
     use angos_oci::{Digest, Namespace, Reference, Tag};
+    use angos_oci_client::RegistryClientConfig;
 
     use crate::{
         registry::{
             Error,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            repository::{Config, RegistryClientConfig, Repository},
+            repository::{Config, Repository},
         },
         replication::{ReplicationDownstreamConfig, ReplicationMode},
         test_fixtures::{client::test_client_config, webhook::ca_bundle_pem},
@@ -653,7 +654,10 @@ mod tests {
         let cache = angos_cache::Config::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![RegistryClientConfig {
-                server_ca_bundle: Some(ca_bundle_path.clone()),
+                tls: ClientTls {
+                    server_ca_bundle: Some(ca_bundle_path.clone()),
+                    identity: None,
+                },
                 ..test_client_config("https://registry.example.test")
             }],
             ..Default::default()

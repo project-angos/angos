@@ -11,12 +11,15 @@ use futures_util::{
 };
 use tracing::{instrument, warn};
 
-use angos_oci::{Algorithm, Digest, Namespace, Tag, namespace_belongs_to};
+use angos_oci::{Digest, Namespace, Tag, namespace_belongs_to};
 use angos_storage::{Page, paginated};
 
 use crate::registry::{
     Error,
-    keys::{CAT_ROOT, NamespaceKeys, TagEntry},
+    keys::{
+        CAT_ROOT, NamespaceKeys, TagEntry, parse_ref_digest, parse_referrer_record,
+        parse_revision_record,
+    },
     metadata_store::{LIST_PAGE, LinkMetadata, MetadataStore},
     pagination,
 };
@@ -163,37 +166,30 @@ impl MetadataStore {
         &self,
         scope: Option<&str>,
     ) -> Result<Vec<Namespace>, Error> {
-        let mut namespaces = Vec::new();
-        let mut token = None;
         // Keys carry a trailing `!`, so the bare scope sorts below every key
         // in its range and skips everything before it.
         let mut start_after = scope.map(str::to_string);
-        loop {
-            let page = self
-                .object_store()
-                .list_after(CAT_ROOT, LIST_PAGE, token, start_after.take())
-                .await?;
-            for key in &page.items {
-                if let Some(scope) = scope
-                    && !key.starts_with(scope)
-                {
-                    // Ordered keys: past the prefix range, nothing else matches.
-                    return Ok(namespaces);
-                }
-                let Some(name) = key.strip_suffix('!') else {
-                    continue;
-                };
-                if scope.is_none_or(|scope| namespace_belongs_to(name, scope))
-                    && let Ok(namespace) = Namespace::new(name)
-                {
-                    namespaces.push(namespace);
-                }
+        paginated(|token| {
+            let start_after = start_after.take();
+            async move {
+                let page = self
+                    .object_store()
+                    .list_after(CAT_ROOT, LIST_PAGE, token, start_after)
+                    .await?;
+                Ok::<_, Error>((page.items, page.next_token))
             }
-            token = page.next_token;
-            if token.is_none() {
-                return Ok(namespaces);
-            }
-        }
+        })
+        // Ordered keys: past the prefix range, nothing else matches.
+        .try_take_while(|key| ready(Ok(scope.is_none_or(|scope| key.starts_with(scope)))))
+        .try_filter_map(|key| {
+            let namespace = key
+                .strip_suffix('!')
+                .filter(|name| scope.is_none_or(|scope| namespace_belongs_to(name, scope)))
+                .and_then(|name| Namespace::new(name).ok());
+            ready(Ok(namespace))
+        })
+        .try_collect()
+        .await
     }
 
     /// Streams the `v2/cat` index above `last` in lexical key order, which is
@@ -362,13 +358,7 @@ impl MetadataStore {
                 Ok::<_, Error>((page.items, page.next_token))
             }
         })
-        .try_filter_map(|key| {
-            let referrer = key.split_once('.').and_then(|(algorithm, hash)| {
-                let algorithm = algorithm.parse::<Algorithm>().ok()?;
-                Digest::with_algorithm(algorithm, hash).ok()
-            });
-            ready(Ok(referrer))
-        })
+        .try_filter_map(|key| ready(Ok(parse_ref_digest(&key))))
     }
 
     /// Every referrer record in `namespace`, keyed by subject: one walk of the
@@ -378,43 +368,12 @@ impl MetadataStore {
         namespace: &Namespace,
     ) -> Result<HashMap<Digest, Vec<Digest>>, Error> {
         let root = namespace.referrer_records_root();
-        let keys: Vec<String> = paginated(move |token| {
-            let root = root.clone();
-            async move {
-                let page = self.object_store().list(&root, LIST_PAGE, token).await?;
-                Ok::<_, Error>((page.items, page.next_token))
-            }
-        })
-        .try_collect()
-        .await?;
-
+        let mut keys = self.object_store().list_all(&root);
         let mut by_subject: HashMap<Digest, Vec<Digest>> = HashMap::new();
-        for key in keys {
-            // `<algo>/<pfx>/<hash>/<algo>.<hash>`, the subject then the referrer.
-            let mut parts = key.split('/');
-            let (Some(algorithm), Some(_), Some(hash), Some(file), None) = (
-                parts.next(),
-                parts.next(),
-                parts.next(),
-                parts.next(),
-                parts.next(),
-            ) else {
-                continue;
-            };
-            let Some(subject) = algorithm
-                .parse::<Algorithm>()
-                .ok()
-                .and_then(|algorithm| Digest::with_algorithm(algorithm, hash).ok())
-            else {
-                continue;
-            };
-            let Some(referrer) = file.split_once('.').and_then(|(algorithm, hash)| {
-                let algorithm = algorithm.parse::<Algorithm>().ok()?;
-                Digest::with_algorithm(algorithm, hash).ok()
-            }) else {
-                continue;
-            };
-            by_subject.entry(subject).or_default().push(referrer);
+        while let Some(key) = keys.try_next().await? {
+            if let Some((subject, referrer)) = parse_referrer_record(&key) {
+                by_subject.entry(subject).or_default().push(referrer);
+            }
         }
         Ok(by_subject)
     }
@@ -440,18 +399,7 @@ impl MetadataStore {
             let page = self.object_store().list(&root, LIST_PAGE, token).await?;
             Ok::<_, Error>((page.items, page.next_token))
         })
-        .try_filter_map(|key| {
-            // `<algo>/<pfx>/<hash>`
-            let mut parts = key.split('/');
-            let digest = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                (Some(algorithm), Some(_), Some(hash), None) => algorithm
-                    .parse::<Algorithm>()
-                    .ok()
-                    .and_then(|algorithm| Digest::with_algorithm(algorithm, hash).ok()),
-                _ => None,
-            };
-            ready(Ok(digest))
-        })
+        .try_filter_map(|key| ready(Ok(parse_revision_record(&key))))
     }
 }
 
@@ -972,7 +920,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let digest = put_blob_direct(m.object_store(), b"test blob content").await;
+            let digest = put_blob_direct(&test_case.blob_store(), b"test blob content").await;
 
             let tags = ["latest", "v1.0", "v2.0"];
             for tag in tags {
@@ -1052,7 +1000,7 @@ mod tests {
 
             let mut digests = Vec::new();
             for content in &manifest_contents {
-                let digest = put_blob_direct(m.object_store(), content).await;
+                let digest = put_blob_direct(&test_case.blob_store(), content).await;
                 digests.push(digest.clone());
 
                 let digest_link = LinkKind::Digest(digest.clone());

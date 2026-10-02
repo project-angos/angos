@@ -6,7 +6,8 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
-use angos_oci::{Digest, Manifest, Namespace, Tag};
+use angos_mtls_client::ClientTls;
+use angos_oci::{Digest, Namespace, Tag};
 
 use crate::{
     jobs::{
@@ -23,8 +24,8 @@ use crate::{
         },
     },
     scan::{
-        SARIF_MEDIA_TYPE, ScanAction, ScanConfig, ScanImagePayload, ScanJobHandler, ScanSummary,
-        build_envelope, is_scan_subject, scan_reports,
+        SARIF_MEDIA_TYPE, ScanAction, ScanConfig, ScanImagePayload, ScanSummary, build_envelope,
+        handler::ScanJobHandler, scan_reports,
     },
 };
 use angos_secret::Secret;
@@ -49,28 +50,6 @@ fn scan_jobs_coalesce_on_the_image_digest() {
     );
 }
 
-#[test]
-fn only_a_plain_image_manifest_is_a_scan_subject() {
-    let image = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
-    let report = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/sarif+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":2},"layers":[],"subject":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0}}"#;
-    let index = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
-    // A buildx provenance attestation: an image manifest with no subject,
-    // whose one layer is an in-toto statement.
-    let attestation = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":167},"layers":[{"mediaType":"application/vnd.in-toto+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":34184,"annotations":{"in-toto.io/predicate-type":"https://slsa.dev/provenance/v0.2"}}]}"#;
-    assert!(is_scan_subject(
-        &Manifest::from_slice(image.as_bytes()).unwrap()
-    ));
-    assert!(!is_scan_subject(
-        &Manifest::from_slice(report.as_bytes()).unwrap()
-    ));
-    assert!(!is_scan_subject(
-        &Manifest::from_slice(index.as_bytes()).unwrap()
-    ));
-    assert!(!is_scan_subject(
-        &Manifest::from_slice(attestation.as_bytes()).unwrap()
-    ));
-}
-
 /// The handler asks the scanner service for the report, pushes it as a SARIF
 /// referrer of the image through the registry, and a re-run finds the report
 /// already there rather than asking again.
@@ -79,7 +58,7 @@ async fn a_scan_job_attaches_one_report_and_reruns_as_a_no_op() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
     let (image, _config, _layer) =
-        seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+        seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
 
     let scanner = MockServer::start().await;
     Mock::given(method("POST"))
@@ -141,7 +120,7 @@ async fn a_scan_job_attaches_one_report_and_reruns_as_a_no_op() {
 async fn a_failing_scanner_fails_the_job() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (image, _, _) = seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let scanner = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(502).set_body_string("grype exited with 1"))
@@ -188,7 +167,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
     let stack = fs_test_stack();
     let namespace = Namespace::new("mirror/web").unwrap();
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "scan-test",
         ClaimMode::Atomic,
     ));
@@ -268,9 +247,10 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
 
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (_, config, layer) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (_, config, layer) =
+        seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "scan-test",
         ClaimMode::Atomic,
     ));
@@ -325,7 +305,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
     );
 
     let other = Namespace::new("other/web").unwrap();
-    let (_, config, layer) = seed_manifest(&stack.store, &stack.metadata_store, &other).await;
+    let (_, config, layer) = seed_manifest(&stack.blob_store, &stack.metadata_store, &other).await;
     let foreign = format!(
         r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[{}],"annotations":{{"v":"3"}}}}"#,
         descriptor("application/vnd.oci.image.config.v1+json", &config),
@@ -345,7 +325,7 @@ async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository()
 async fn a_forced_scan_job_scans_a_reported_image_again() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (image, _, _) = seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let scanner = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(SARIF))
@@ -449,7 +429,7 @@ fn handler_for(
     token: Option<Secret<String>>,
 ) -> ScanJobHandler {
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "scan-test",
         ClaimMode::Atomic,
     ));
@@ -467,6 +447,7 @@ fn handler_for(
             url: scanner.uri(),
             token,
             timeout_secs: 5,
+            tls: ClientTls::default(),
             policy: PolicyConfig {
                 default: None,
                 rules: Vec::new(),
@@ -492,7 +473,7 @@ fn payload(namespace: &Namespace, digest: &Digest) -> ScanImagePayload {
 async fn reported_before_skips_only_when_a_newer_report_exists() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (image, _, _) = seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let scanner = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(SARIF))

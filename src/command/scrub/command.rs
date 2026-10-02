@@ -17,7 +17,7 @@ use crate::{
         bootstrap,
         maintenance::{
             Error,
-            executor::{ActionSink, DryRunSink, Executor, run_job_store},
+            executor::{ActionSink, Executor, run_sink},
             walk::{self, WalkStats},
         },
         reconcile,
@@ -79,26 +79,18 @@ impl Command {
         } = bootstrap::maintenance_context(config).await?;
 
         let mut registry = None;
-        let sink: Arc<dyn ActionSink> = if options.dry_run {
-            info!("Dry-run mode: no changes will be made to the storage");
-            Arc::new(DryRunSink)
-        } else {
-            let job_store = run_job_store(&metadata_store, "scrub");
-            // Tag and manifest deletions take the registry's standard delete
-            // path (locking, blob reclaim, events, replication).
-            let scrub_registry = bootstrap::registry(
+        let sink: Arc<dyn ActionSink> = run_sink(options.dry_run, || {
+            let (executor, scrub_registry) = Executor::with_run_registry(
                 config,
-                blob_store.clone(),
-                metadata_store.clone(),
-                repositories.clone(),
-                job_store.clone(),
+                &blob_store,
+                &metadata_store,
+                &repositories,
+                "scrub",
             )?;
-            registry = Some(scrub_registry.clone());
-            Arc::new(
-                Executor::new(blob_store.clone(), metadata_store.clone(), job_store)
-                    .with_registry(scrub_registry),
-            )
-        };
+            registry = Some(scrub_registry);
+            Ok(executor)
+        })?
+        .into();
 
         let stats = Arc::new(WalkStats::default());
         let validator = Arc::new(Validator::new(
@@ -141,7 +133,7 @@ impl Command {
         .await?;
         orphan_jobs::sweep_orphan_jobs(
             &Arc::new(JobStore::new(
-                self.metadata_store.object_store().clone(),
+                &self.metadata_store,
                 "scrub-orphans",
                 ClaimMode::Atomic,
             )),
@@ -237,12 +229,7 @@ mod tests {
 
         // Seed content plus one defect through a throwaway command's stores.
         let seed = Command::new(&options(true, 2), &config).await.unwrap();
-        seed_manifest(
-            seed.metadata_store.object_store(),
-            &seed.metadata_store,
-            &namespace,
-        )
-        .await;
+        seed_manifest(&seed.blob_store, &seed.metadata_store, &namespace).await;
         let objects = seed.metadata_store.object_store();
         objects
             .put("stray/junk-object", Bytes::from_static(b"junk"))
@@ -326,12 +313,7 @@ mod tests {
             let namespace = Namespace::new("test-repo/app").unwrap();
 
             let seed = Command::new(&options(true, 1), &config).await.unwrap();
-            seed_manifest(
-                seed.metadata_store.object_store(),
-                &seed.metadata_store,
-                &namespace,
-            )
-            .await;
+            seed_manifest(&seed.blob_store, &seed.metadata_store, &namespace).await;
             seed.metadata_store
                 .object_store()
                 .put("stray/junk", Bytes::from_static(b"junk"))

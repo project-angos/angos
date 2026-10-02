@@ -24,15 +24,6 @@ use crate::{
     },
 };
 
-/// Maps a registry error to a job error, dead-lettering an upstream
-/// authorization denial instead of retrying an outcome that cannot change.
-fn job_error(error: RegistryError) -> Error {
-    match error {
-        RegistryError::Denied(msg) => Error::Terminal(msg),
-        other => Error::Execution(other.to_string()),
-    }
-}
-
 pub const CACHE_FETCH_BLOB_KIND: &str = "cache.fetch_blob";
 
 /// Internal-process name stamped on the events cache fills emit.
@@ -161,20 +152,8 @@ impl CacheFillJobHandler {
 #[async_trait]
 impl JobHandler for CacheFillJobHandler {
     async fn execute(&self, envelope: &JobEnvelope) -> Result<(), Error> {
-        if envelope.kind != CACHE_FETCH_BLOB_KIND {
-            return Err(Error::Execution(format!(
-                "unsupported job kind '{}'; expected '{CACHE_FETCH_BLOB_KIND}'",
-                envelope.kind,
-            )));
-        }
-        let payload: CacheFetchBlobPayload = serde_json::from_value(envelope.payload.clone())
-            .map_err(|e| Error::Execution(format!("failed to deserialize job payload: {e}")))?;
-
-        self.fill(&payload.namespace, &payload.digest)
-            .await
-            .map_err(job_error)?;
-
-        Ok(())
+        let payload: CacheFetchBlobPayload = envelope.payload(&[CACHE_FETCH_BLOB_KIND])?;
+        Ok(self.fill(&payload.namespace, &payload.digest).await?)
     }
 }
 

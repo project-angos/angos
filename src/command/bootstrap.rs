@@ -3,10 +3,7 @@ use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 use tracing::info;
 
 use angos_cache::Cache;
-use angos_s3_client::Backend as S3HttpBackend;
-use angos_storage::{
-    ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
-};
+use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
 use crate::{
     configuration::{Configuration, GlobalConfig, ResolvedStorageConfig},
@@ -69,8 +66,7 @@ pub fn build_object_store(config: &ResolvedStorageConfig) -> Result<Arc<dyn Obje
         }
         ResolvedStorageConfig::S3(config) => {
             info!("Using S3 storage backend");
-            let http = S3HttpBackend::new(&config.connection.to_client_config())?;
-            Arc::new(StorageS3Backend::builder(Arc::new(http)).build())
+            Arc::new(config.build()?)
         }
     };
 

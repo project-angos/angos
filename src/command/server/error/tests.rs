@@ -2,13 +2,9 @@ use std::io;
 
 use hyper::StatusCode;
 
-use angos_oci::response::ErrorCode;
-use angos_oci_client::REPLICATION_SUPERSEDED_CODE;
+use angos_oci::response::{ErrorCode, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE};
 
-use crate::{
-    command::server::{Error, error::RECLAMATION_IN_PROGRESS_CODE},
-    configuration, event_webhook, registry,
-};
+use crate::{command::server::Error, configuration, event_webhook, registry};
 
 /// Whether this error's `code` must come from the set the spec fixes for a 4XX.
 /// Exhaustive on purpose: a variant added later does not compile until it is
@@ -41,9 +37,7 @@ fn owes_a_spec_code(error: &registry::Error) -> bool {
         | registry::Error::Configuration(_)
         | registry::Error::Cache(_)
         | registry::Error::Io(_)
-        | registry::Error::Http(_)
-        | registry::Error::Serde(_)
-        | registry::Error::InvalidHeader(_) => false,
+        | registry::Error::Serde(_) => false,
     }
 }
 

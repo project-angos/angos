@@ -287,6 +287,17 @@ impl Manifest {
             .find_map(|layer| layer.annotations.get(IN_TOTO_PREDICATE_TYPE))
             .map(String::as_str)
     }
+
+    /// Whether this is a plain image manifest, not a referrer, an artifact, an
+    /// index, or a buildx attestation (which names no subject, but whose layers
+    /// carry an in-toto predicate type).
+    #[must_use]
+    pub fn is_plain_image(&self) -> bool {
+        self.subject.is_none()
+            && self.artifact_type.is_none()
+            && matches!(self.content, Content::Image { .. })
+            && self.in_toto_predicate_type().is_none()
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +785,36 @@ mod tests {
         .unwrap();
         let manifest = Manifest::from_pushed(&body, None).expect("a config-less image must parse");
         assert!(matches!(manifest.content, Content::Image { .. }));
+    }
+
+    #[test]
+    fn only_a_plain_image_manifest_is_one() {
+        let image = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
+        let report = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/sarif+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":2},"layers":[],"subject":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0}}"#;
+        let index = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+        // A buildx provenance attestation: an image manifest with no subject,
+        // whose one layer is an in-toto statement.
+        let attestation = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":167},"layers":[{"mediaType":"application/vnd.in-toto+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":34184,"annotations":{"in-toto.io/predicate-type":"https://slsa.dev/provenance/v0.2"}}]}"#;
+        assert!(
+            Manifest::from_slice(image.as_bytes())
+                .unwrap()
+                .is_plain_image()
+        );
+        assert!(
+            !Manifest::from_slice(report.as_bytes())
+                .unwrap()
+                .is_plain_image()
+        );
+        assert!(
+            !Manifest::from_slice(index.as_bytes())
+                .unwrap()
+                .is_plain_image()
+        );
+        assert!(
+            !Manifest::from_slice(attestation.as_bytes())
+                .unwrap()
+                .is_plain_image()
+        );
     }
 
     #[test]

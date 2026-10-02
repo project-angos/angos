@@ -14,6 +14,7 @@ use crate::{
     },
     metrics_provider,
 };
+use angos_mtls_client::ClientTls;
 use angos_secret::Secret;
 
 const TEST_DIGEST: &str = "sha256:abc1230000000000000000000000000000000000000000000000000000000000";
@@ -66,6 +67,7 @@ pub fn create_test_config(
         max_retries: Some(0),
         events,
         repository_filter,
+        tls: ClientTls::default(),
     }
 }
 
@@ -95,5 +97,6 @@ pub fn create_test_webhook_config(
         max_retries: Some(max_retries),
         events: vec![EventKind::ManifestPush],
         repository_filter: None,
+        tls: ClientTls::default(),
     }
 }

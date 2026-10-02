@@ -13,18 +13,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, empty};
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use tokio_util::io::{StreamReader, SyncIoBridge};
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use angos_extension_service::{
-    LayerEntries, LayerEntriesRequest, LayerFile, LayerFileDetails, LayerFileDetailsRequest,
-    LayerFileRequest, LayerListing,
+    EntryKind, LayerEntries, LayerEntriesRequest, LayerEntry, LayerFile, LayerFileDetails,
+    LayerFileDetailsRequest, LayerFileRequest, LayerListing,
 };
 use angos_oci::{Digest, Namespace};
 
 use crate::{
     jobs::Queue,
-    layer::{self, Entry, IndexLayerPayload, Kind, Listing, elf, pem},
-    metrics_provider::metrics_provider,
+    layer::{self, IndexLayerPayload, Listing, elf, pem},
     registry::{Error, Registry, angos_extension::layer_listing},
 };
 
@@ -57,7 +56,7 @@ impl Registry {
             self.dispatch_cache_fill(&namespace, &digest).await;
             return Ok(LayerEntries::Indexing);
         }
-        let Some(listing) = layer::read_listing(&self.metadata_store, &digest).await? else {
+        let Some(listing) = self.metadata_store.read_listing(&digest).await? else {
             match self.blob_store.size(&digest).await {
                 Ok(_) => {}
                 // A pull-through manifest pull links its layers before their
@@ -74,7 +73,8 @@ impl Registry {
                 digest,
                 force: false,
             };
-            self.job_queue
+            self.config
+                .job_queue
                 .enqueue(layer::build_envelope(&payload)?)
                 .await?;
             return Ok(LayerEntries::Indexing);
@@ -85,9 +85,9 @@ impl Registry {
             self.dispatch_index(&namespace, &digest).await;
         }
         // Every chunk: the web UI merges whole layers.
-        let entries: Vec<Entry> = stream::iter(0..listing.chunks.len())
-            .map(|chunk| layer::read_entries(&self.metadata_store, &digest, chunk))
-            .buffered(self.listing_read_concurrency.get())
+        let entries: Vec<LayerEntry> = stream::iter(0..listing.chunks.len())
+            .map(|chunk| self.metadata_store.read_entries(&digest, chunk))
+            .buffered(self.config.listing_read_concurrency.get())
             .try_concat()
             .await?;
         // Megabytes to serialize and compress: off the async threads.
@@ -111,7 +111,9 @@ impl Registry {
             range,
         } = request;
         self.readable_layer(&namespace, &digest).await?;
-        let listing = layer::read_listing(&self.metadata_store, &digest)
+        let listing = self
+            .metadata_store
+            .read_listing(&digest)
             .await?
             .ok_or(Error::NotFound)?;
         let entry = self
@@ -162,7 +164,9 @@ impl Registry {
             path,
         } = request;
         self.readable_layer(&namespace, &digest).await?;
-        let listing = layer::read_listing(&self.metadata_store, &digest)
+        let listing = self
+            .metadata_store
+            .read_listing(&digest)
             .await?
             .ok_or(Error::NotFound)?;
         let entry = self
@@ -210,16 +214,18 @@ impl Registry {
         digest: &Digest,
         listing: &Listing,
         path: &str,
-    ) -> Result<Option<Entry>, Error> {
+    ) -> Result<Option<LayerEntry>, Error> {
         let Some(entry) = self.layer_entry(digest, listing, path, |_| true).await? else {
             return Ok(None);
         };
         match (entry.kind, entry.link.as_deref()) {
-            (Kind::File, _) => Ok(Some(entry)),
-            (Kind::Hardlink, Some(target)) => {
+            (EntryKind::File, _) => Ok(Some(entry)),
+            (EntryKind::Hardlink, Some(target)) => {
                 let target = target.trim_start_matches("./").trim_matches('/');
-                self.layer_entry(digest, listing, target, |entry| entry.kind == Kind::File)
-                    .await
+                self.layer_entry(digest, listing, target, |entry| {
+                    entry.kind == EntryKind::File
+                })
+                .await
             }
             _ => Ok(None),
         }
@@ -232,12 +238,14 @@ impl Registry {
         digest: &Digest,
         listing: &Listing,
         path: &str,
-        wanted: impl Fn(&Entry) -> bool,
-    ) -> Result<Option<Entry>, Error> {
+        wanted: impl Fn(&LayerEntry) -> bool,
+    ) -> Result<Option<LayerEntry>, Error> {
         let Some(chunk) = listing.entry_chunk(path) else {
             return Ok(None);
         };
-        Ok(layer::read_entries(&self.metadata_store, digest, chunk)
+        Ok(self
+            .metadata_store
+            .read_entries(digest, chunk)
             .await?
             .into_iter()
             .rev()
@@ -262,7 +270,9 @@ impl Registry {
         }
         // Only the chunk of checkpoints holding the one nearest `offset` is read.
         let checkpoint = match listing.checkpoint_chunk(offset) {
-            Some(chunk) => layer::read_checkpoints(&self.metadata_store, digest, chunk)
+            Some(chunk) => self
+                .metadata_store
+                .read_checkpoints(digest, chunk)
                 .await?
                 .before(offset),
             None => None,
@@ -313,21 +323,12 @@ impl Registry {
             digest: digest.clone(),
             force: false,
         };
-        let outcome = match layer::build_envelope(&payload) {
-            Ok(envelope) => self
-                .job_queue
-                .enqueue(envelope)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(error) = outcome {
-            warn!("Failed to dispatch index job for {namespace}@{digest}: {error}");
-            metrics_provider()
-                .job_queue_enqueue_failures_total
-                .with_label_values(&[Queue::Index.as_str()])
-                .inc();
-        }
+        self.enqueue_best_effort(
+            Queue::Index,
+            layer::build_envelope(&payload),
+            &format!("index job for {namespace}@{digest}"),
+        )
+        .await;
     }
 }
 

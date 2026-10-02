@@ -16,7 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::future::try_join_all;
+use futures_util::{TryStreamExt, future::try_join_all};
 use tracing::instrument;
 
 use angos_oci::{Digest, Namespace};
@@ -25,7 +25,7 @@ use angos_storage::Error as StorageError;
 use crate::registry::{
     Error,
     keys::DigestKeys,
-    metadata_store::{LIST_PAGE, LinkKind, MetadataStore},
+    metadata_store::{LinkKind, MetadataStore},
 };
 
 /// Every namespace referencing one blob, with the links each references it
@@ -46,18 +46,9 @@ impl MetadataStore {
             links.insert(LinkKind::Blob(digest.clone()));
         }
         let dir = digest.blob_ref_namespace_dir(namespace);
-        let mut token = None;
-        loop {
-            let page = store.list(&dir, LIST_PAGE, token).await?;
-            links.extend(
-                page.items
-                    .iter()
-                    .filter_map(|entry| digest.parse_blob_ref_entry(entry)),
-            );
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
+        let mut entries = store.list_all(&dir);
+        while let Some(entry) = entries.try_next().await? {
+            links.extend(digest.parse_blob_ref_entry(&entry));
         }
         Ok(links)
     }
@@ -208,22 +199,15 @@ impl MetadataStore {
     pub async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
         let mut index = BlobIndex::default();
         let dir = digest.blob_ref_dir();
-        let mut token = None;
-        loop {
-            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            for key in &page.items {
-                let Some((raw, link)) = digest.parse_blob_ref(key) else {
-                    continue;
-                };
-                let Ok(namespace) = Namespace::new(&raw) else {
-                    continue;
-                };
-                index.entry(namespace).or_default().insert(link);
-            }
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
+        let mut keys = self.object_store().list_all(&dir);
+        while let Some(key) = keys.try_next().await? {
+            let Some((raw, link)) = digest.parse_blob_ref(&key) else {
+                continue;
+            };
+            let Ok(namespace) = Namespace::new(&raw) else {
+                continue;
+            };
+            index.entry(namespace).or_default().insert(link);
         }
 
         if index.is_empty() {
@@ -302,33 +286,26 @@ impl MetadataStore {
     /// the caller's, since the bytes live in the blob store.
     pub async fn blob_references_live(&self, digest: &Digest) -> Result<bool, Error> {
         let dir = digest.blob_ref_dir();
-        let mut token = None;
-        loop {
-            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            for key in &page.items {
-                let Some((raw, link)) = digest.parse_blob_ref(key) else {
-                    continue;
-                };
-                if matches!(link, LinkKind::Blob(_)) {
-                    return Ok(true);
-                }
-                match self.key_within_grace(&format!("{dir}/{key}")).await? {
-                    Some(true) => return Ok(true),
-                    Some(false) => {}
-                    None => continue,
-                }
-                let Ok(namespace) = Namespace::new(&raw) else {
-                    // A key angos cannot address is left to quarantine, and
-                    // pins until then.
-                    return Ok(true);
-                };
-                if self.reference_backed(&namespace, &link, digest).await? {
-                    return Ok(true);
-                }
+        let mut keys = self.object_store().list_all(&dir);
+        while let Some(key) = keys.try_next().await? {
+            let Some((raw, link)) = digest.parse_blob_ref(&key) else {
+                continue;
+            };
+            if matches!(link, LinkKind::Blob(_)) {
+                return Ok(true);
             }
-            token = page.next_token;
-            if token.is_none() {
-                break;
+            match self.key_within_grace(&format!("{dir}/{key}")).await? {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => continue,
+            }
+            let Ok(namespace) = Namespace::new(&raw) else {
+                // A key angos cannot address is left to quarantine, and
+                // pins until then.
+                return Ok(true);
+            };
+            if self.reference_backed(&namespace, &link, digest).await? {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -344,19 +321,13 @@ impl MetadataStore {
         digest: &Digest,
     ) -> Result<bool, Error> {
         let dir = digest.blob_ref_namespace_dir(namespace);
-        let mut token = None;
-        loop {
-            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            for entry in &page.items {
-                if self.key_within_grace(&format!("{dir}/{entry}")).await? == Some(true) {
-                    return Ok(true);
-                }
-            }
-            token = page.next_token;
-            if token.is_none() {
-                return Ok(false);
+        let mut entries = self.object_store().list_all(&dir);
+        while let Some(entry) = entries.try_next().await? {
+            if self.key_within_grace(&format!("{dir}/{entry}")).await? == Some(true) {
+                return Ok(true);
             }
         }
+        Ok(false)
     }
 
     /// Whether the key at `key` is younger than the grace period, or carries no
@@ -428,9 +399,9 @@ mod tests {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("parallel-mixed-ns").unwrap();
 
-            let digest_a = put_blob_direct(m.object_store(), b"content-a").await;
-            let digest_b = put_blob_direct(m.object_store(), b"content-b").await;
-            let digest_c = put_blob_direct(m.object_store(), b"content-c").await;
+            let digest_a = put_blob_direct(&test_case.blob_store(), b"content-a").await;
+            let digest_b = put_blob_direct(&test_case.blob_store(), b"content-b").await;
+            let digest_c = put_blob_direct(&test_case.blob_store(), b"content-c").await;
 
             create_link(
                 &m,
@@ -512,7 +483,7 @@ mod tests {
 
             let mut digests = Vec::new();
             for i in 0..4 {
-                let digest = put_blob_direct(m.object_store(), format!("content-{i}").as_bytes()).await;
+                let digest = put_blob_direct(&test_case.blob_store(), format!("content-{i}").as_bytes()).await;
                 digests.push(digest);
             }
 
@@ -567,11 +538,12 @@ mod tests {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("tracked-duplicate-layer-ns").unwrap();
 
-            let layer_digest = put_blob_direct(m.object_store(), b"layer listed twice").await;
+            let layer_digest =
+                put_blob_direct(&test_case.blob_store(), b"layer listed twice").await;
             let first_manifest_digest =
-                put_blob_direct(m.object_store(), b"manifest c content").await;
+                put_blob_direct(&test_case.blob_store(), b"manifest c content").await;
             let second_manifest_digest =
-                put_blob_direct(m.object_store(), b"manifest d content").await;
+                put_blob_direct(&test_case.blob_store(), b"manifest d content").await;
 
             m.pin_references(
                 namespace,
@@ -612,10 +584,12 @@ mod tests {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("shared-config-delete-ns").unwrap();
 
-            let config_digest = put_blob_direct(m.object_store(), b"shared config bytes").await;
-            let first_manifest = put_blob_direct(m.object_store(), b"first sharing manifest").await;
+            let config_digest =
+                put_blob_direct(&test_case.blob_store(), b"shared config bytes").await;
+            let first_manifest =
+                put_blob_direct(&test_case.blob_store(), b"first sharing manifest").await;
             let second_manifest =
-                put_blob_direct(m.object_store(), b"second sharing manifest").await;
+                put_blob_direct(&test_case.blob_store(), b"second sharing manifest").await;
 
             for manifest in [&first_manifest, &second_manifest] {
                 m.pin_references(
@@ -672,12 +646,13 @@ mod tests {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("mixed-tracked-untracked-ns").unwrap();
 
-            let tag_digest = put_blob_direct(m.object_store(), b"tag content").await;
-            let layer_digest = put_blob_direct(m.object_store(), b"layer content mixed").await;
+            let tag_digest = put_blob_direct(&test_case.blob_store(), b"tag content").await;
+            let layer_digest =
+                put_blob_direct(&test_case.blob_store(), b"layer content mixed").await;
             let digest_link_digest =
-                put_blob_direct(m.object_store(), b"digest link content").await;
+                put_blob_direct(&test_case.blob_store(), b"digest link content").await;
             let manifest_digest =
-                put_blob_direct(m.object_store(), b"manifest content mixed").await;
+                put_blob_direct(&test_case.blob_store(), b"manifest content mixed").await;
 
             seed_links(
                 &m,
@@ -756,7 +731,7 @@ mod tests {
             let m = test_case.metadata_store();
             let other_ns = &Namespace::new("other-ns").unwrap();
             let my_ns = &Namespace::new("my-ns").unwrap();
-            let digest = put_blob_direct(m.object_store(), b"shared content").await;
+            let digest = put_blob_direct(&test_case.blob_store(), b"shared content").await;
 
             let other_tag = LinkKind::Tag(Tag::new("stable").unwrap());
             create_link(&m, other_ns, &other_tag, &digest).await;

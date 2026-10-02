@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.12.2 - UNRELEASED
 
+### Added
+
+- Event webhooks and the scanner client take `server_ca_bundle`, `client_certificate_bundle` and `client_private_key`, to reach an endpoint behind a private CA or one requiring a client certificate.
+
+### Changed
+
+- An upstream, downstream or scanner service configured with only one of `username` and `password` fails the configuration load instead of running anonymously.
+- The job listings reject `n=0`, as the other `_angos` listings do.
+
 ### Security
 
 - A client can no longer spoof its IP with its own `X-Forwarded-For` line, or with `X-Real-IP` behind an unparsable `X-Forwarded-For` entry.
@@ -18,6 +27,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A storage error while reclaiming a blob no longer refuses pushes naming it for twice `gc_grace_secs`.
 - Scrub deletes the expired reclamation markers it leaves, so the first push after a large scrub no longer reads each one.
 - A manifest push refuses a reference whose bytes a concurrent scrub reclaimed, instead of committing an image with a missing blob.
+- The metadata and job stores apply the S3 timeouts, retries and circuit breaker they inherit from `[blob_store.s3]`, and `[metadata_store.s3]` accepts them too.
+- A denied scan or index job, and any job whose kind or payload the worker cannot read, dead-letters at once instead of using up its retries.
+- The web UI shows and copies a sha512 manifest as `repo@sha512:<hex>`, the reference it is pulled by, instead of `repo:sha512:<hex>`.
+- The web UI's vulnerability table reads a finding's severity as the report badge does, so the two no longer disagree.
+- The web UI pages the referrers of a pull-through manifest with more than 150 of them without skipping upstream ones.
 
 ## 1.12.1
 

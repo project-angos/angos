@@ -5,10 +5,10 @@ use hyper::{
     header::{ALLOW, CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE},
 };
 
-use angos_oci::response::ErrorCode;
+use angos_oci::response::{ErrorCode, RECLAMATION_IN_PROGRESS_CODE};
 use angos_transport::ResponseBody;
 
-use crate::command::server::error::{Error, RECLAMATION_IN_PROGRESS_CODE};
+use crate::command::server::error::Error;
 
 const BASIC_AUTH_CHALLENGE: &str = r#"Basic realm="Angos", charset="UTF-8""#;
 

@@ -19,7 +19,8 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use futures_util::TryStreamExt;
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use tokio::{
     select, spawn,
     task::JoinHandle,
@@ -35,6 +36,7 @@ use angos_storage::{Error as StorageError, ObjectStore, Page};
 use crate::{
     jobs::{JobState, Queue},
     metrics_provider::metrics_provider,
+    registry::{Error as RegistryError, metadata_store::MetadataStore},
 };
 
 pub const JOBS_ROOT: &str = "_jobs";
@@ -159,6 +161,17 @@ pub enum Error {
     Terminal(String),
 }
 
+/// A registry outcome as a job failure: an authorization denial cannot change,
+/// so it dead-letters on the spot; anything else is retried.
+impl From<RegistryError> for Error {
+    fn from(error: RegistryError) -> Self {
+        match error {
+            RegistryError::Denied(msg) => Error::Terminal(msg),
+            other => Error::Execution(other.to_string()),
+        }
+    }
+}
+
 impl From<StorageError> for Error {
     fn from(error: StorageError) -> Self {
         match error {
@@ -183,7 +196,8 @@ pub enum ClaimMode {
 /// second create fails is [`ClaimMode::Atomic`], one that accepts it degrades to
 /// [`ClaimMode::Advisory`], since claims are an efficiency mechanism and
 /// correctness rests on handler idempotency. Probe IO errors fail startup.
-pub async fn ensure_claim_support(store: &Arc<dyn ObjectStore>) -> Result<ClaimMode, Error> {
+pub async fn ensure_claim_support(metadata_store: &MetadataStore) -> Result<ClaimMode, Error> {
+    let store = metadata_store.object_store();
     let key = format!("{JOBS_ROOT}/claims/.probe-{}", Uuid::new_v4());
     let first = store
         .create_if_absent(&key, Bytes::from_static(b"probe"))
@@ -356,6 +370,20 @@ impl JobEnvelope {
             max_attempts: None,
             payload: serde_json::to_value(payload).map_err(|e| Error::Execution(e.to_string()))?,
         })
+    }
+
+    /// The payload, for a handler accepting `kinds`. Neither a foreign kind nor
+    /// a payload that does not decode can change on retry, so both are
+    /// terminal.
+    pub fn payload<T: DeserializeOwned>(&self, kinds: &[&str]) -> Result<T, Error> {
+        if !kinds.contains(&self.kind.as_str()) {
+            return Err(Error::Terminal(format!(
+                "unsupported job kind '{}'; expected one of {kinds:?}",
+                self.kind
+            )));
+        }
+        serde_json::from_value(self.payload.clone())
+            .map_err(|e| Error::Terminal(format!("failed to deserialize job payload: {e}")))
     }
 }
 
@@ -583,20 +611,26 @@ pub struct JobStore {
 }
 
 impl JobStore {
-    /// Construct a `JobStore` with the default retry policy. `worker_id` is a
+    /// Construct a `JobStore` over the metadata store's backend, which the
+    /// queue always shares, with the default retry policy. `worker_id` is a
     /// structured-log tag (empty for producer-only instances) and `claim_mode`
     /// comes from [`ensure_claim_support`].
     pub fn new(
-        store: Arc<dyn ObjectStore>,
+        metadata_store: &MetadataStore,
         worker_id: impl Into<String>,
         claim_mode: ClaimMode,
     ) -> Self {
-        Self::with_retry_policy(store, worker_id, claim_mode, JobRetryPolicy::default())
+        Self::with_retry_policy(
+            metadata_store,
+            worker_id,
+            claim_mode,
+            JobRetryPolicy::default(),
+        )
     }
 
     /// [`Self::new`] with an operator-configured retry policy.
     pub fn with_retry_policy(
-        store: Arc<dyn ObjectStore>,
+        metadata_store: &MetadataStore,
         worker_id: impl Into<String>,
         claim_mode: ClaimMode,
         retry: JobRetryPolicy,
@@ -608,7 +642,7 @@ impl JobStore {
             )
         };
         Self {
-            store,
+            store: metadata_store.object_store().clone(),
             worker_id: worker_id.into(),
             claim_mode,
             retry_backoff: backoff(),
@@ -713,55 +747,38 @@ impl JobStore {
     pub async fn count_pending(&self, queue: Queue, ready_horizon_secs: u64) -> Result<u64, Error> {
         let prefix = job_pending_dir(queue.as_str());
         let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
+        let mut names = self.store.list_in_order(&prefix);
         let mut count: u64 = 0;
-        let mut token: Option<String> = None;
-        loop {
-            let page = self.store.list(&prefix, 1000, token).await?;
-            for name in &page.items {
-                let Some(stem) = name.strip_suffix(".json") else {
-                    continue;
-                };
-                // Lex order equals `not_before` order, so the first key past the
-                // cutoff ends the count.
-                if let Some(p) = stem.get(..STORAGE_KEY_PREFIX_LEN)
-                    && p > cutoff_prefix.as_str()
-                {
-                    return Ok(count.min(MAX_REPORTED_PENDING));
-                }
-                count += 1;
-                if count >= MAX_REPORTED_PENDING {
-                    return Ok(MAX_REPORTED_PENDING);
-                }
+        while count < MAX_REPORTED_PENDING
+            && let Some(name) = names.try_next().await?
+        {
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            // Lex order equals `not_before` order, so the first key past the
+            // cutoff ends the count.
+            if let Some(p) = stem.get(..STORAGE_KEY_PREFIX_LEN)
+                && p > cutoff_prefix.as_str()
+            {
+                break;
             }
-            match page.next_token {
-                Some(t) => token = Some(t),
-                None => return Ok(count),
-            }
+            count += 1;
         }
+        Ok(count)
     }
 
     /// Count dead-lettered envelopes in `queue`, capped at
     /// `MAX_REPORTED_PENDING`.
     pub async fn count_failed(&self, queue: Queue) -> Result<u64, Error> {
         let prefix = job_failed_dir(queue.as_str());
+        let mut names = self.store.list_in_order(&prefix);
         let mut count: u64 = 0;
-        let mut token: Option<String> = None;
-        loop {
-            let page = self.store.list(&prefix, 1000, token).await?;
-            for name in &page.items {
-                if name.strip_suffix(".json").is_none() {
-                    continue;
-                }
-                count += 1;
-                if count >= MAX_REPORTED_PENDING {
-                    return Ok(MAX_REPORTED_PENDING);
-                }
-            }
-            match page.next_token {
-                Some(t) => token = Some(t),
-                None => return Ok(count),
-            }
+        while count < MAX_REPORTED_PENDING
+            && let Some(name) = names.try_next().await?
+        {
+            count += u64::from(name.strip_suffix(".json").is_some());
         }
+        Ok(count)
     }
 
     /// `true` when any pending job in `queue` carries `lock_key`, via the O(1)

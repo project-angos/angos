@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, time::Duration};
 
 use http::{Method, request::Builder};
 use reqwest::{Client, redirect::Policy};
@@ -25,7 +25,7 @@ use crate::{
         webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
     },
 };
-use angos_mtls_client::MtlsClientBuilder;
+use angos_mtls_client::{ClientTls, MtlsClientBuilder, MtlsIdentity};
 use angos_secret::Secret;
 
 #[test]
@@ -43,9 +43,7 @@ fn test_config_deserialize() {
     assert!(
         matches!(config.auth, Some(WebhookAuth::BasicAuth { username, password }) if username == "user" && password.expose() == "pass")
     );
-    assert!(config.client_certificate_bundle.is_none());
-    assert!(config.client_private_key.is_none());
-    assert!(config.server_ca_bundle.is_none());
+    assert_eq!(config.tls, ClientTls::default());
     assert!(config.forward_headers.is_empty());
 
     let valid_config = r#"
@@ -61,33 +59,22 @@ fn test_config_deserialize() {
     assert!(
         matches!(config.auth, Some(WebhookAuth::BearerToken(token)) if token.expose() == "hello-token")
     );
-    assert!(config.client_certificate_bundle.is_none());
-    assert!(config.client_private_key.is_none());
-    assert!(config.server_ca_bundle.is_none());
+    assert_eq!(config.tls, ClientTls::default());
     assert!(config.forward_headers.is_empty());
 }
 
 #[test]
-fn mtls_pair_must_be_complete_at_validation() {
-    let config: Config = toml::from_str(
-        r#"
-        url = "https://example.com"
-        timeout_ms = 1000
-        client_certificate_bundle = "/valid/path/to/cert.pem"
-    "#,
-    )
-    .unwrap();
-    assert!(config.validate().is_err());
-
-    let config: Config = toml::from_str(
-        r#"
-        url = "https://example.com"
-        timeout_ms = 1000
-        client_private_key = "/valid/path/to/key.pem"
-    "#,
-    )
-    .unwrap();
-    assert!(config.validate().is_err());
+fn mtls_pair_must_be_complete_at_parse() {
+    for half in [
+        r#"client_certificate_bundle = "/valid/path/to/cert.pem""#,
+        r#"client_private_key = "/valid/path/to/key.pem""#,
+    ] {
+        let toml = format!("url = \"https://example.com\"\ntimeout_ms = 1000\n{half}");
+        assert!(
+            toml::from_str::<Config>(&toml).is_err(),
+            "{half} alone must be refused"
+        );
+    }
 }
 
 #[test]
@@ -231,19 +218,12 @@ fn test_build_headers_optional_and_multi_valued_fields() {
     assert_eq!(orgs, ["org1", "org2"]);
 }
 
-fn build_test_config(
-    url: Url,
-    server_ca_bundle: Option<PathBuf>,
-    client_certificate_bundle: Option<PathBuf>,
-    client_private_key: Option<PathBuf>,
-) -> Config {
+fn build_test_config(url: Url, tls: ClientTls) -> Config {
     Config {
         url,
         timeout_ms: 1000,
         auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
-        client_certificate_bundle,
-        client_private_key,
-        server_ca_bundle,
+        tls,
         forward_headers: vec!["X-Custom-Header".to_string()],
     }
 }
@@ -252,13 +232,7 @@ fn build_test_client(config: &Config) -> Result<Client, String> {
     MtlsClientBuilder::new()
         .with_redirect_policy(Policy::none())
         .with_timeout(Duration::from_millis(config.timeout_ms))
-        .with_server_ca_bundle(config.server_ca_bundle.as_deref())
-        .with_client_certificate(
-            config
-                .client_certificate_bundle
-                .as_deref()
-                .zip(config.client_private_key.as_deref()),
-        )
+        .with_tls(&config.tls)
         .build()
 }
 
@@ -282,28 +256,17 @@ fn test_new_invalid_mtls() {
 
     let config = build_test_config(
         Url::parse("https://example.com").unwrap(),
-        Some(ca_file_path),
-        Some(cert_file_path),
-        Some(key_file_path),
+        ClientTls {
+            server_ca_bundle: Some(ca_file_path),
+            identity: Some(MtlsIdentity {
+                certificate: cert_file_path,
+                private_key: key_file_path,
+            }),
+        },
     );
     let webhook = build_test_webhook("test".to_string(), config);
 
     assert!(matches!(webhook, Err(Error::Initialization(_))));
-}
-
-#[test]
-fn test_new_rejects_incomplete_mtls_config() {
-    let config = build_test_config(
-        Url::parse("https://example.com").unwrap(),
-        None,
-        Some(PathBuf::from("certificate.pem")),
-        None,
-    );
-    let webhook = build_test_webhook("test".to_string(), config);
-
-    assert!(
-        matches!(webhook, Err(Error::Initialization(msg)) if msg.contains("client_private_key"))
-    );
 }
 
 #[test]
@@ -320,9 +283,13 @@ fn test_new_mtls() {
 
     let config = build_test_config(
         Url::parse("https://example.com").unwrap(),
-        Some(ca_file_path),
-        Some(cert_file_path),
-        Some(key_file_path),
+        ClientTls {
+            server_ca_bundle: Some(ca_file_path),
+            identity: Some(MtlsIdentity {
+                certificate: cert_file_path,
+                private_key: key_file_path,
+            }),
+        },
     );
     let webhook = build_test_webhook("test".to_string(), config);
 
@@ -331,7 +298,10 @@ fn test_new_mtls() {
 
 #[test]
 fn test_new_simple() {
-    let config = build_test_config(Url::parse("https://example.com").unwrap(), None, None, None);
+    let config = build_test_config(
+        Url::parse("https://example.com").unwrap(),
+        ClientTls::default(),
+    );
     let webhook = build_test_webhook("test".to_string(), config);
 
     assert!(webhook.is_ok());
@@ -346,7 +316,10 @@ async fn test_authorize_success() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    let mut config = build_test_config(
+        Url::parse(&mock_server.uri()).unwrap(),
+        ClientTls::default(),
+    );
     config.auth = None;
 
     let webhook = build_test_webhook("test".to_string(), config).unwrap();
@@ -368,7 +341,10 @@ async fn test_authorize_denied() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    let mut config = build_test_config(
+        Url::parse(&mock_server.uri()).unwrap(),
+        ClientTls::default(),
+    );
     config.auth = None;
 
     let webhook = build_test_webhook("test".to_string(), config).unwrap();
@@ -391,7 +367,10 @@ async fn test_authorize_with_bearer_token() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    let mut config = build_test_config(
+        Url::parse(&mock_server.uri()).unwrap(),
+        ClientTls::default(),
+    );
     config.auth = Some(WebhookAuth::BearerToken(Secret::new(
         "test-token".to_string(),
     )));
@@ -416,7 +395,10 @@ async fn test_authorize_with_basic_auth() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    let mut config = build_test_config(
+        Url::parse(&mock_server.uri()).unwrap(),
+        ClientTls::default(),
+    );
     config.auth = Some(WebhookAuth::BasicAuth {
         username: "testuser".to_string(),
         password: Secret::new("testpass".to_string()),
@@ -443,7 +425,10 @@ async fn test_authorize_sends_correct_headers() {
         .mount(&mock_server)
         .await;
 
-    let config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    let config = build_test_config(
+        Url::parse(&mock_server.uri()).unwrap(),
+        ClientTls::default(),
+    );
     let webhook = build_test_webhook("test".to_string(), config).unwrap();
 
     let action = Action::ApiVersion;
@@ -461,7 +446,10 @@ async fn test_authorize_sends_correct_headers() {
 
 #[tokio::test]
 async fn test_authorize_returns_err_on_unreachable_url() {
-    let mut config = build_test_config(Url::parse("http://127.0.0.1:1").unwrap(), None, None, None);
+    let mut config = build_test_config(
+        Url::parse("http://127.0.0.1:1").unwrap(),
+        ClientTls::default(),
+    );
     config.auth = None;
 
     let webhook = build_test_webhook("test".to_string(), config).unwrap();
@@ -481,7 +469,10 @@ async fn test_authorize_returns_err_on_unreachable_url() {
 }
 
 fn build_webhook_against(mock_server: &MockServer) -> WebhookAuthorizer {
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    let mut config = build_test_config(
+        Url::parse(&mock_server.uri()).unwrap(),
+        ClientTls::default(),
+    );
     config.auth = None;
     build_test_webhook("test".to_string(), config).unwrap()
 }

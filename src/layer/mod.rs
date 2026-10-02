@@ -12,32 +12,20 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     mem,
     path::Path,
-    sync::Arc,
 };
 
-use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha512};
-use tokio::runtime::Handle;
-use tokio_util::io::SyncIoBridge;
-use tracing::{debug, info};
 
+use angos_extension_service::{EntryKind, FileContent, LayerEntry, Secret, SecretKind};
+use angos_inflate::{Checkpoint, Inflater};
 use angos_oci::{Content, Digest, Manifest};
 
-use crate::{
-    jobs::{
-        Queue,
-        store::{Error, JobEnvelope, JobHandler},
-    },
-    registry::{
-        Error as RegistryError, blob_store::BlobStore, keys::DigestKeys,
-        metadata_store::MetadataStore,
-    },
+use crate::jobs::{
+    Queue,
+    store::{Error, JobEnvelope},
 };
-
-pub use angos_inflate::{Checkpoint, Inflater};
 
 pub mod elf;
 pub mod pem;
@@ -226,100 +214,14 @@ pub fn is_filesystem_layer(media_type: &str) -> bool {
 /// The digests of a plain image manifest's walkable layers; empty for an
 /// index, a referrer or an artifact.
 pub fn filesystem_layers(manifest: &Manifest) -> Vec<Digest> {
-    if manifest.subject.is_some() || manifest.artifact_type.is_some() {
-        return Vec::new();
-    }
     match &manifest.content {
-        Content::Image { layers, .. } => layers
+        Content::Image { layers, .. } if manifest.is_plain_image() => layers
             .iter()
             .filter(|layer| is_filesystem_layer(layer.media_type.as_ref()))
             .map(|layer| layer.digest.clone())
             .collect(),
-        Content::Index { .. } => Vec::new(),
+        _ => Vec::new(),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    File,
-    Dir,
-    Symlink,
-    Hardlink,
-    /// `.wh.<name>`: the lower layers' `<name>` is gone; `path` names it.
-    Whiteout,
-    /// `.wh..wh..opq`: the lower layers' content of `path` is gone.
-    Opaque,
-    Other,
-}
-
-/// One tar entry, with where its data starts in the uncompressed stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Entry {
-    pub path: String,
-    pub kind: Kind,
-    pub size: u64,
-    pub mode: u32,
-    pub uid: u64,
-    pub gid: u64,
-    pub mtime: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub link: Option<String>,
-    pub offset: u64,
-    /// Set on files only, and missing from listings indexed before it existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<FileContent>,
-    /// The Linux capabilities its `security.capability` attribute permits.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
-}
-
-/// A file's digests, hex-encoded, its media type, and the credentials its
-/// first bytes give away.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileContent {
-    pub sha256: String,
-    pub sha512: String,
-    pub mime_type: String,
-    /// In line order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secrets: Vec<Secret>,
-}
-
-/// A credential, and the line it is on from 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Secret {
-    pub kind: SecretKind,
-    pub line: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SecretKind {
-    /// A PEM, OpenSSH or PGP private key block.
-    PrivateKey,
-    /// An `aws_secret_access_key` line of an AWS credentials file.
-    AwsCredentials,
-    /// An `auth` entry of a Docker `config.json`.
-    RegistryAuth,
-    /// An `.npmrc` registry token or password.
-    NpmToken,
-    /// A URL carrying a user and a password, as `.git-credentials` keeps them.
-    GitCredentials,
-    /// A `.netrc` machine with its password.
-    Netrc,
-    /// A GitHub personal access, OAuth or app token.
-    GithubToken,
-    /// A GitLab personal access token.
-    GitlabToken,
-    /// A Slack bot or user token.
-    SlackToken,
-    /// A Stripe live secret or restricted key.
-    StripeKey,
-    /// An AWS access key ID, long-lived or temporary.
-    AwsAccessKey,
-    /// A kubeconfig's client key or bearer token.
-    Kubeconfig,
 }
 
 /// Digests a file's bytes as they stream past, keeping the first ones and
@@ -892,7 +794,7 @@ impl<R: Read> Read for Source<'_, R> {
 /// opaque marker of `a`; the rest keep their kind. Paths lose the `./` and
 /// trailing `/` tar spellings so the same file is named the same in every
 /// layer.
-fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, Kind)> {
+fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, EntryKind)> {
     let path = raw.trim_start_matches("./").trim_matches('/');
     if path.is_empty() || path == "." {
         return None;
@@ -906,21 +808,21 @@ fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, Kind)> {
         }
     };
     if name == ".wh..wh..opq" {
-        return Some((dir.to_string(), Kind::Opaque));
+        return Some((dir.to_string(), EntryKind::Opaque));
     }
     if let Some(target) = name.strip_prefix(".wh.") {
-        return Some((join(target), Kind::Whiteout));
+        return Some((join(target), EntryKind::Whiteout));
     }
     let kind = if tar_kind.is_dir() {
-        Kind::Dir
+        EntryKind::Dir
     } else if tar_kind.is_symlink() {
-        Kind::Symlink
+        EntryKind::Symlink
     } else if tar_kind.is_hard_link() {
-        Kind::Hardlink
+        EntryKind::Hardlink
     } else if tar_kind.is_file() || tar_kind == tar::EntryType::Continuous {
-        Kind::File
+        EntryKind::File
     } else {
-        Kind::Other
+        EntryKind::Other
     };
     Some((path.to_string(), kind))
 }
@@ -934,7 +836,7 @@ pub fn index_stream<R: Read>(
     input: R,
     limits: IndexLimits,
     mut store_chunk: impl FnMut(usize, Vec<Checkpoint>) -> io::Result<()>,
-) -> io::Result<(Listing, Vec<Entry>)> {
+) -> io::Result<(Listing, Vec<LayerEntry>)> {
     let mut reader = BufReader::new(input);
     let compressed = reader.fill_buf()?.starts_with(&GZIP_MAGIC);
     let mut starts = Vec::new();
@@ -981,12 +883,12 @@ pub fn index_stream<R: Read>(
                 continue;
             };
             let link = match kind {
-                Kind::Symlink | Kind::Hardlink => entry
+                EntryKind::Symlink | EntryKind::Hardlink => entry
                     .link_name()?
                     .map(|link| link.to_string_lossy().into_owned()),
                 _ => None,
             };
-            let mut item = Entry {
+            let mut item = LayerEntry {
                 path,
                 kind,
                 size: header.size()?,
@@ -999,7 +901,7 @@ pub fn index_stream<R: Read>(
                 content: None,
                 capabilities,
             };
-            if kind == Kind::File {
+            if kind == EntryKind::File {
                 item.content = Some(inspect(&item.path, &mut entry)?);
             }
             if entries.len() == limits.max_entries {
@@ -1022,7 +924,7 @@ pub fn index_stream<R: Read>(
         Source::Plain(_, count) => count,
     };
     // Stable, so a path the tar repeats keeps its last entry last.
-    entries.sort_by(|a: &Entry, b: &Entry| a.path.cmp(&b.path));
+    entries.sort_by(|a: &LayerEntry, b: &LayerEntry| a.path.cmp(&b.path));
     let chunks = entries
         .chunks(CHUNK_ENTRIES)
         .filter_map(|chunk| chunk.first().map(|entry| entry.path.clone()))
@@ -1069,158 +971,6 @@ pub fn extract_gzip<R: Read>(
     Ok(())
 }
 
-/// Reads a layer's stored listing; `None` when it was never indexed.
-pub async fn read_listing(
-    metadata_store: &MetadataStore,
-    digest: &Digest,
-) -> Result<Option<Listing>, RegistryError> {
-    match metadata_store
-        .object_store()
-        .get(&digest.layer_listing_path())
-        .await
-    {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(angos_storage::Error::NotFound) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Reads chunk `chunk` of a layer's stored entries.
-pub async fn read_entries(
-    metadata_store: &MetadataStore,
-    digest: &Digest,
-    chunk: usize,
-) -> Result<Vec<Entry>, RegistryError> {
-    let bytes = metadata_store
-        .object_store()
-        .get(&digest.layer_entries_chunk_path(chunk))
-        .await?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-/// Reads chunk `chunk` of a layer's stored checkpoints.
-pub async fn read_checkpoints(
-    metadata_store: &MetadataStore,
-    digest: &Digest,
-    chunk: usize,
-) -> Result<Checkpoints, RegistryError> {
-    match metadata_store
-        .object_store()
-        .get(&digest.layer_checkpoints_path(chunk))
-        .await
-    {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(angos_storage::Error::NotFound) => Ok(Checkpoints::default()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-pub struct IndexLayerJobHandler {
-    blob_store: Arc<BlobStore>,
-    metadata_store: Arc<MetadataStore>,
-    limits: IndexLimits,
-}
-
-fn job_error(error: &RegistryError) -> Error {
-    Error::Execution(error.to_string())
-}
-
-impl IndexLayerJobHandler {
-    pub fn new(
-        blob_store: Arc<BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-        limits: IndexLimits,
-    ) -> Self {
-        Self {
-            blob_store,
-            metadata_store,
-            limits,
-        }
-    }
-
-    /// Indexes the layer unless a current listing already exists, or again
-    /// when `force`; a layer whose bytes are gone has nothing to index and the
-    /// job is done.
-    pub async fn index(&self, digest: &Digest, force: bool) -> Result<(), Error> {
-        let store = self.metadata_store.object_store();
-        if !force
-            && read_listing(&self.metadata_store, digest)
-                .await
-                .map_err(|e| job_error(&e))?
-                .is_some_and(|listing| !listing.is_outdated())
-        {
-            return Ok(());
-        }
-        let (reader, _) = match self.blob_store.reader(digest, None).await {
-            Ok(reader) => reader,
-            Err(RegistryError::BlobUnknown) => {
-                debug!("Index of {digest} skipped: the layer is gone");
-                return Ok(());
-            }
-            Err(e) => return Err(job_error(&e)),
-        };
-        let limits = self.limits;
-        // Each chunk is stored as the walk passes it, so a layer's checkpoints
-        // never sit in memory whole.
-        let (runtime, chunks, layer) = (Handle::current(), store.clone(), digest.clone());
-        let store_chunk = move |chunk: usize, checkpoints: Vec<Checkpoint>| {
-            let body = serde_json::to_vec(&Checkpoints::from_inflater(checkpoints))?;
-            runtime
-                .block_on(chunks.put(&layer.layer_checkpoints_path(chunk), Bytes::from(body)))
-                .map_err(io::Error::other)
-        };
-        let (listing, entries) = tokio::task::spawn_blocking(move || {
-            index_stream(SyncIoBridge::new(reader), limits, store_chunk)
-        })
-        .await
-        .map_err(|e| Error::Execution(format!("index task failed: {e}")))?
-        .map_err(|e| match e.kind() {
-            // The same bytes pass the same limits on every attempt.
-            io::ErrorKind::FileTooLarge => {
-                Error::Terminal(format!("layer {digest} is too large to index: {e}"))
-            }
-            _ => Error::Execution(format!("indexing layer {digest} failed: {e}")),
-        })?;
-        for (chunk, entries) in entries.chunks(CHUNK_ENTRIES).enumerate() {
-            let body = serde_json::to_vec(entries).map_err(|e| Error::Execution(e.to_string()))?;
-            store
-                .put(&digest.layer_entries_chunk_path(chunk), Bytes::from(body))
-                .await
-                .map_err(|e| job_error(&e.into()))?;
-        }
-        let entries = entries.len();
-        // The listing lands last: its presence is what marks the layer indexed.
-        store
-            .put(
-                &digest.layer_listing_path(),
-                Bytes::from(
-                    serde_json::to_vec(&listing).map_err(|e| Error::Execution(e.to_string()))?,
-                ),
-            )
-            .await
-            .map_err(|e| job_error(&e.into()))?;
-        info!(
-            "Indexed layer {digest}: {entries} entries, {} checkpoint chunks",
-            listing.checkpoints.len()
-        );
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl JobHandler for IndexLayerJobHandler {
-    async fn execute(&self, envelope: &JobEnvelope) -> Result<(), Error> {
-        if envelope.kind != INDEX_LAYER_KIND {
-            return Err(Error::Execution(format!(
-                "unsupported job kind '{}'; expected '{INDEX_LAYER_KIND}'",
-                envelope.kind,
-            )));
-        }
-        let payload: IndexLayerPayload = serde_json::from_value(envelope.payload.clone())
-            .map_err(|e| Error::Execution(format!("failed to deserialize job payload: {e}")))?;
-        self.index(&payload.digest, payload.force).await
-    }
-}
-
+pub mod handler;
 #[cfg(test)]
 mod tests;

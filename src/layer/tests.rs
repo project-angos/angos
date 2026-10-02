@@ -13,7 +13,11 @@ use wiremock::{
 };
 
 use angos_extension_service::{
-    ElfDetails, LayerEntriesRequest, LayerFileDetailsRequest, LayerFileRequest,
+    ElfDetails, EntryKind, LayerEntriesRequest, LayerFileDetailsRequest, LayerFileRequest,
+    SecretKind::{
+        self, AwsAccessKey, AwsCredentials, GitCredentials, GithubToken, GitlabToken, Kubeconfig,
+        Netrc, NpmToken, PrivateKey, RegistryAuth, SlackToken, StripeKey,
+    },
 };
 use angos_oci::http_range::RequestRange;
 use angos_oci::{Digest, Namespace};
@@ -24,14 +28,9 @@ use crate::{
         store::{ClaimMode, JobStore},
     },
     layer::IndexAction,
-    layer::SecretKind::{
-        AwsAccessKey, AwsCredentials, GitCredentials, GithubToken, GitlabToken, Kubeconfig, Netrc,
-        NpmToken, PrivateKey, RegistryAuth, SlackToken, StripeKey,
-    },
     layer::{
-        Checkpoints, IndexLayerJobHandler, IndexLayerPayload, IndexLimits, Kind, Listing,
-        SecretKind, SecretScanner, classify, elf, extract_gzip, index_stream, mime_type, pem,
-        read_entries, read_listing,
+        Checkpoints, IndexLayerPayload, IndexLimits, Listing, SecretScanner, classify, elf,
+        extract_gzip, handler::IndexLayerJobHandler, index_stream, mime_type, pem,
     },
     policy::{ImagePolicy, PolicyConfig},
     registry::{
@@ -118,19 +117,19 @@ fn classify_names_whiteouts_and_normalises_paths() {
     let file = tar::EntryType::Regular;
     assert_eq!(
         classify("./usr/bin/", tar::EntryType::Directory),
-        Some(("usr/bin".to_string(), Kind::Dir))
+        Some(("usr/bin".to_string(), EntryKind::Dir))
     );
     assert_eq!(
         classify("etc/.wh.motd", file),
-        Some(("etc/motd".to_string(), Kind::Whiteout))
+        Some(("etc/motd".to_string(), EntryKind::Whiteout))
     );
     assert_eq!(
         classify(".wh.top", file),
-        Some(("top".to_string(), Kind::Whiteout))
+        Some(("top".to_string(), EntryKind::Whiteout))
     );
     assert_eq!(
         classify("var/cache/.wh..wh..opq", file),
-        Some(("var/cache".to_string(), Kind::Opaque))
+        Some(("var/cache".to_string(), EntryKind::Opaque))
     );
     assert_eq!(classify("./", tar::EntryType::Directory), None);
     assert_eq!(classify(".", tar::EntryType::Directory), None);
@@ -358,7 +357,7 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     assert!(listing.compressed);
     assert_eq!(listing.uncompressed_size, tar.len() as u64);
     assert_eq!(listing.chunks, ["etc/motd"]);
-    let kinds: Vec<(&str, Kind)> = entries
+    let kinds: Vec<(&str, EntryKind)> = entries
         .iter()
         .map(|entry| (entry.path.as_str(), entry.kind))
         .collect();
@@ -370,14 +369,14 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     assert_eq!(
         [&kinds[..2], &kinds[3..]].concat(),
         [
-            ("etc/motd", Kind::Whiteout),
-            ("filler.bin", Kind::File),
-            ("usr", Kind::Dir),
-            ("usr/bin", Kind::Dir),
-            ("usr/bin/hello", Kind::File),
-            ("usr/bin/hello-again", Kind::Hardlink),
-            ("usr/bin/hi", Kind::Symlink),
-            ("var/cache", Kind::Opaque),
+            ("etc/motd", EntryKind::Whiteout),
+            ("filler.bin", EntryKind::File),
+            ("usr", EntryKind::Dir),
+            ("usr/bin", EntryKind::Dir),
+            ("usr/bin/hello", EntryKind::File),
+            ("usr/bin/hello-again", EntryKind::Hardlink),
+            ("usr/bin/hi", EntryKind::Symlink),
+            ("var/cache", EntryKind::Opaque),
         ]
     );
     let hello = &entries[5];
@@ -402,7 +401,7 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     assert!(
         entries
             .iter()
-            .filter(|entry| entry.kind != Kind::File)
+            .filter(|entry| entry.kind != EntryKind::File)
             .all(|entry| entry.content.is_none()),
         "only files carry content"
     );
@@ -519,21 +518,23 @@ async fn the_job_indexes_a_stored_layer_once() {
         LIMITS,
     );
     handler.index(&digest, false).await.unwrap();
-    let listing = read_listing(&stack.metadata_store, &digest)
+    let listing = stack
+        .metadata_store
+        .read_listing(&digest)
         .await
         .unwrap()
         .expect("a listing");
     assert_eq!(listing.chunks.len(), 1);
-    let entries = read_entries(&stack.metadata_store, &digest, 0)
-        .await
-        .unwrap();
+    let entries = stack.metadata_store.read_entries(&digest, 0).await.unwrap();
     assert_eq!(entries.len(), 9);
     handler.index(&digest, false).await.unwrap();
 
     let gone = Digest::sha256_of_bytes(b"never stored");
     handler.index(&gone, false).await.unwrap();
     assert!(
-        read_listing(&stack.metadata_store, &gone)
+        stack
+            .metadata_store
+            .read_listing(&gone)
             .await
             .unwrap()
             .is_none()
@@ -555,7 +556,7 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
         .await
         .unwrap();
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -667,30 +668,30 @@ async fn an_older_listing_is_served_and_walked_again() {
         LIMITS,
     );
     handler.index(&digest, false).await.unwrap();
-    let mut listing = read_listing(&stack.metadata_store, &digest)
+    let mut listing = stack
+        .metadata_store
+        .read_listing(&digest)
         .await
         .unwrap()
         .expect("a listing");
     listing.version = 0;
-    let mut entries = read_entries(&stack.metadata_store, &digest, 0)
-        .await
-        .unwrap();
+    let mut entries = stack.metadata_store.read_entries(&digest, 0).await.unwrap();
     for entry in &mut entries {
         entry.content = None;
     }
-    let store = stack.metadata_store.object_store();
-    for (key, body) in [
-        (digest.layer_listing_path(), serde_json::to_vec(&listing)),
-        (
-            digest.layer_entries_chunk_path(0),
-            serde_json::to_vec(&entries),
-        ),
-    ] {
-        store.put(&key, body.unwrap().into()).await.unwrap();
-    }
+    stack
+        .metadata_store
+        .put_entries(&digest, 0, &entries)
+        .await
+        .unwrap();
+    stack
+        .metadata_store
+        .put_listing(&digest, &listing)
+        .await
+        .unwrap();
 
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -735,13 +736,11 @@ async fn an_older_listing_is_served_and_walked_again() {
     let payload: IndexLayerPayload = serde_json::from_value(claimed.envelope.payload).unwrap();
     // No need to force it: the outdated listing counts as none.
     handler.index(&digest, payload.force).await.unwrap();
-    let entries = read_entries(&stack.metadata_store, &digest, 0)
-        .await
-        .unwrap();
+    let entries = stack.metadata_store.read_entries(&digest, 0).await.unwrap();
     assert!(
         entries
             .iter()
-            .filter(|entry| entry.kind == Kind::File)
+            .filter(|entry| entry.kind == EntryKind::File)
             .all(|entry| entry.content.is_some())
     );
 }
@@ -775,13 +774,14 @@ async fn the_file_endpoint_serves_a_range() {
     // Without its chunk the read would still succeed, decoding from the start.
     assert!(
         stack
-            .store
+            .metadata_store
+            .object_store()
             .exists(&digest.layer_checkpoints_path(0))
             .await
             .unwrap()
     );
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -879,13 +879,15 @@ async fn a_file_is_found_across_entry_chunks() {
     .index(&digest, false)
     .await
     .unwrap();
-    let listing = read_listing(&stack.metadata_store, &digest)
+    let listing = stack
+        .metadata_store
+        .read_listing(&digest)
         .await
         .unwrap()
         .expect("a listing");
     assert_eq!(listing.chunks.len(), 3);
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -939,7 +941,7 @@ fn elf_binary(size: usize, dynamic_at: usize) -> Vec<u8> {
     put(32, &64u64.to_le_bytes());
     put(54, &56u16.to_le_bytes());
     put(56, &6u16.to_le_bytes());
-    // Kind, flags, offset and size; each loads at `BASE` past its offset.
+    // EntryKind, flags, offset and size; each loads at `BASE` past its offset.
     let segments = [
         (3u32, 4u32, 512, interpreter.len()),
         (4, 4, 600, note.len()),
@@ -1103,7 +1105,7 @@ async fn details_describe_binaries_and_certificates() {
     .await
     .unwrap();
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -1151,9 +1153,10 @@ async fn a_push_enqueues_an_index_job_per_tar_layer_of_an_indexing_repository() 
 
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let (_, config, layer) = seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+    let (_, config, layer) =
+        seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "index-test",
         ClaimMode::Atomic,
     ));
@@ -1216,7 +1219,7 @@ async fn the_entries_endpoint_fills_the_cache_of_a_pull_through_layer() {
         .mount(&upstream)
         .await;
     let job_store = Arc::new(JobStore::new(
-        stack.store.clone(),
+        &stack.metadata_store,
         "fill-test",
         ClaimMode::Atomic,
     ));

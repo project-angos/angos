@@ -7,16 +7,16 @@ use angos_oci::{
     request::{DeleteBlobRequest, GetBlobRequest, HeadBlobRequest},
 };
 use angos_oci_service::{Accepted, BlobDescriptor, BlobGet, BlobStream};
+use angos_storage::BoxedReader;
 
 use crate::{
     cache_fill::build_envelope,
     event_webhook::event::{Event, EventActor},
     jobs::Queue,
-    metrics_provider::metrics_provider,
     registry::{
         Error, Registry, Repository,
         blob_ownership::promote_and_grant,
-        blob_store::{BlobStore, BoxedReader, upload_session::HashStart},
+        blob_store::{BlobStore, upload_session::HashStart},
         metadata_store::{LinkKind, MetadataStore},
         record_pull_through, repository_name,
     },
@@ -242,7 +242,7 @@ impl Registry {
     ) -> Result<BlobGet<BoxedReader>, Error> {
         if request.range.is_none()
             && allow_redirect
-            && self.enable_blob_redirect
+            && self.config.enable_blob_redirect
             && self.blob_store.size(&request.digest).await.is_ok()
             && let Ok(Some(location)) = self.blob_store.presigned_url(&request.digest, None).await
         {
@@ -260,22 +260,12 @@ impl Registry {
     /// logged and counted but never bubbles up, so a scheduling glitch cannot
     /// degrade the client response.
     pub async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
-        // Build + enqueue as one fallible step so failures share the warn + metric path.
-        let outcome = match build_envelope(namespace, digest) {
-            Ok(envelope) => self
-                .job_queue
-                .enqueue(envelope)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(e) = outcome {
-            warn!("Failed to enqueue cache job for {digest}: {e}");
-            metrics_provider()
-                .job_queue_enqueue_failures_total
-                .with_label_values(&[Queue::Cache.as_str()])
-                .inc();
-        }
+        self.enqueue_best_effort(
+            Queue::Cache,
+            build_envelope(namespace, digest),
+            &format!("cache job for {digest}"),
+        )
+        .await;
     }
 
     async fn get_local_blob(
@@ -534,7 +524,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned blob content";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
             let repository = registry.get_repository_for_namespace(namespace).unwrap();
 
             let head_result = registry
@@ -587,7 +577,7 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test blob content";
 
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
             registry
                 .metadata_store()
                 .grant(namespace, &digest)
@@ -630,12 +620,11 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"referenced blob content";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
 
             // A live referring revision, whose per-referrer entry is what pins
             // the blob against the delete.
-            let manifest =
-                put_blob_direct(registry.metadata_store.object_store(), b"manifest").await;
+            let manifest = put_blob_direct(&registry.blob_store, b"manifest").await;
             seed_links(
                 &registry.metadata_store,
                 namespace,
@@ -683,7 +672,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"stale referenced blob";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
             let ownership = registry.metadata_store();
             ownership.grant(namespace, &digest).await.unwrap();
 
@@ -729,8 +718,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let parent =
-                put_blob_direct(registry.metadata_store.object_store(), b"index manifest").await;
+            let parent = put_blob_direct(&registry.blob_store, b"index manifest").await;
             // Every kind is backed only while a referring manifest's revision
             // resolves, so each case names `parent`.
             seed_links(
@@ -754,8 +742,7 @@ mod tests {
 
             for link in cases {
                 let content = format!("content for {link}").into_bytes();
-                let digest =
-                    put_blob_direct(registry.metadata_store.object_store(), &content).await;
+                let digest = put_blob_direct(&registry.blob_store, &content).await;
                 registry
                     .metadata_store()
                     .grant(namespace, &digest)
@@ -819,7 +806,7 @@ mod tests {
             let first = &Namespace::new("test-repo/first").unwrap();
             let second = &Namespace::new("test-repo/second").unwrap();
             let content = b"shared blob content";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
             let ownership = registry.metadata_store();
 
             ownership.grant(first, &digest).await.unwrap();
@@ -858,7 +845,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned delete content";
-            let digest = put_blob_direct(registry.metadata_store.object_store(), content).await;
+            let digest = put_blob_direct(&registry.blob_store, content).await;
 
             let result = registry
                 .handle_delete_blob(DeleteBlobRequest {

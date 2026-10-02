@@ -9,7 +9,7 @@ use futures_util::{
 };
 use tracing::{instrument, warn};
 
-use angos_docker_extension_service::{Catalog, CatalogRequest, NamespaceVisibility};
+use angos_docker_extension_service::{Catalog, CatalogRequest};
 use angos_oci::{
     Content, Descriptor, Digest, Manifest, MediaType, Namespace, client,
     request::{GetReferrersRequest, ListTagsRequest},
@@ -58,7 +58,7 @@ impl Registry {
     pub async fn handle_list_catalog(
         &self,
         request: CatalogRequest,
-        visibility: &dyn NamespaceVisibility,
+        visibility: &(dyn Fn(&Namespace) -> bool + Sync),
     ) -> Result<Catalog, Error> {
         let n = request.n.unwrap_or(DEFAULT_PAGE_SIZE);
         // The walk drops what the caller may not see before it probes a name,
@@ -66,12 +66,9 @@ impl Registry {
         // its cursor is the last one served.
         let page = self
             .metadata_store
-            .list_namespaces(
-                n,
-                request.last,
-                &|namespace| visibility.allows(namespace),
-                |namespace| holds_manifest_content(&self.metadata_store, namespace),
-            )
+            .list_namespaces(n, request.last, visibility, |namespace| {
+                holds_manifest_content(&self.metadata_store, namespace)
+            })
             .await?;
         let next = page
             .next_token
@@ -485,8 +482,7 @@ mod tests {
             let namespace = Namespace::new("test-repo").unwrap();
 
             let test_content = b"test content";
-            let test_digest =
-                put_blob_direct(registry.metadata_store.object_store(), test_content).await;
+            let test_digest = put_blob_direct(&registry.blob_store, test_content).await;
             let ops: Vec<(LinkKind, Digest)> = ["latest", "v1.0", "v2.0"]
                 .iter()
                 .map(|&tag| (LinkKind::Tag(Tag::new(tag).unwrap()), test_digest.clone()))
@@ -553,7 +549,7 @@ mod tests {
         // FS only: this pins the walk's filtering, not backend specifics.
         let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
-        let digest = put_blob_direct(registry.metadata_store.object_store(), b"visible").await;
+        let digest = put_blob_direct(&registry.blob_store, b"visible").await;
         for i in 0..10 {
             let namespace = Namespace::new(&format!("vis-{i:02}")).unwrap();
             seed_links(
@@ -619,7 +615,7 @@ mod tests {
         ];
 
         let blob_content = b"pagination-test-blob";
-        let digest = put_blob_direct(registry.metadata_store.object_store(), blob_content).await;
+        let digest = put_blob_direct(&registry.blob_store, blob_content).await;
 
         for ns_str in &namespaces {
             let ns = Namespace::new(ns_str).unwrap();
@@ -693,8 +689,7 @@ mod tests {
         let registry = test_case.registry();
         let namespace = Namespace::new("test-repo").unwrap();
 
-        let digest =
-            put_blob_direct(registry.metadata_store.object_store(), b"revision body").await;
+        let digest = put_blob_direct(&registry.blob_store, b"revision body").await;
         seed_links(
             &registry.metadata_store,
             &namespace,
@@ -815,7 +810,7 @@ mod tests {
     async fn split_case_with_blob(
         blob_artifact_type: Option<&str>,
     ) -> (FSRegistryTestCase, Digest) {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let digest = upload_blob(
             case.registry(),
             &referrer_namespace(),
@@ -860,7 +855,7 @@ mod tests {
     async fn returns_cached_descriptor_when_no_filter() {
         // The blob is deliberately unparseable, so only the cached descriptor
         // can answer.
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
         let manifest_digest = upload_blob(registry, &referrer_namespace(), b"not json").await;
         let desc = descriptor_with(Some("application/vnd.foo"), &manifest_digest);
@@ -880,7 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_cached_descriptor_when_filter_matches() {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
         let manifest_digest = upload_blob(registry, &referrer_namespace(), b"not json").await;
         let at = media_type("application/vnd.foo");
@@ -1027,7 +1022,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_none_when_blob_not_found() {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
 
         let result = registry
@@ -1043,7 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_none_when_blob_is_invalid_manifest_json() {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
         let manifest_digest = upload_blob(registry, &referrer_namespace(), b"not json").await;
 
@@ -1057,7 +1052,7 @@ mod tests {
     /// fallback tag keeps those entries.
     #[tokio::test]
     async fn list_referrers_merges_the_fallback_tag_index() {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
         let namespace = referrer_namespace();
         let subject = subject();
@@ -1109,7 +1104,7 @@ mod tests {
     /// cached, or an uncached subject would answer with nothing at all.
     #[tokio::test]
     async fn list_referrers_merges_the_upstream_listing() {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
         let namespace = Namespace::new("mirror/app").unwrap();
         let cached = Digest::sha256_of_bytes(b"cached referrer");
@@ -1154,7 +1149,7 @@ mod tests {
     /// down with it.
     #[tokio::test]
     async fn list_referrers_serves_the_cache_when_the_upstream_fails() {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
         let namespace = Namespace::new("mirror/app").unwrap();
         let cached = Digest::sha256_of_bytes(b"cached referrer");
@@ -1205,7 +1200,7 @@ mod tests {
     /// every referrer exactly once and no single response carries them all.
     #[tokio::test]
     async fn get_referrers_pages_through_the_fan_out() {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
 
         // One past the page size the registry serves: the endpoint takes no
@@ -1266,7 +1261,7 @@ mod tests {
     /// with a short page while matches remain: the walk carries on past them.
     #[tokio::test]
     async fn filtered_referrer_pages_fill_past_what_the_filter_drops() {
-        let case = FSRegistryTestCase::with_split_backends();
+        let case = FSRegistryTestCase::new();
         let registry = case.registry();
         let wanted = "application/vnd.wanted";
 
@@ -1326,7 +1321,7 @@ mod tests {
             let registry = test_case.registry();
             let m = registry.metadata_store.clone();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let base_digest = put_blob_direct(m.object_store(), b"base manifest content").await;
+            let base_digest = put_blob_direct(&test_case.blob_store(), b"base manifest content").await;
             let base_link = LinkKind::Digest(base_digest.clone());
 
             create_link(&m, namespace, &base_link, &base_digest).await;
@@ -1350,7 +1345,7 @@ mod tests {
                 }}"#
             );
 
-            let referrer_digest = put_blob_direct(m.object_store(), referrer_content.as_bytes()).await;
+            let referrer_digest = put_blob_direct(&test_case.blob_store(), referrer_content.as_bytes()).await;
             let link = LinkKind::Digest(referrer_digest.clone());
 
             create_link(&m, namespace, &link, &referrer_digest).await;
@@ -1413,7 +1408,7 @@ mod tests {
             let m = registry.metadata_store.clone();
             let namespace = &Namespace::new("test-referrers-filter").unwrap();
             let subject_digest =
-                put_blob_direct(m.object_store(), b"subject manifest for filter test").await;
+                put_blob_direct(&test_case.blob_store(), b"subject manifest for filter test").await;
             let subject_link = LinkKind::Digest(subject_digest.clone());
             create_link(&m, namespace, &subject_link, &subject_digest).await;
 
@@ -1438,7 +1433,7 @@ mod tests {
                     }}"#
                 );
 
-                let referrer_digest = put_blob_direct(m.object_store(), referrer_content.as_bytes()).await;
+                let referrer_digest = put_blob_direct(&test_case.blob_store(), referrer_content.as_bytes()).await;
                 let digest_link = LinkKind::Digest(referrer_digest.clone());
                 create_link(&m, namespace, &digest_link, &referrer_digest).await;
 
@@ -1470,7 +1465,7 @@ mod tests {
                     }}"#
                 );
 
-                let referrer_digest = put_blob_direct(m.object_store(), referrer_content.as_bytes()).await;
+                let referrer_digest = put_blob_direct(&test_case.blob_store(), referrer_content.as_bytes()).await;
                 let digest_link = LinkKind::Digest(referrer_digest.clone());
                 create_link(&m, namespace, &digest_link, &referrer_digest).await;
 
@@ -1517,7 +1512,7 @@ mod tests {
             let m = registry.metadata_store.clone();
             let namespace = &Namespace::new("test-referrers-order").unwrap();
             let subject_digest =
-                put_blob_direct(m.object_store(), b"subject manifest for order test").await;
+                put_blob_direct(&test_case.blob_store(), b"subject manifest for order test").await;
             let subject_link = LinkKind::Digest(subject_digest.clone());
             create_link(&m, namespace, &subject_link, &subject_digest).await;
 
@@ -1542,7 +1537,7 @@ mod tests {
                     }}"#
                 );
 
-                let referrer_digest = put_blob_direct(m.object_store(), referrer_content.as_bytes()).await;
+                let referrer_digest = put_blob_direct(&test_case.blob_store(), referrer_content.as_bytes()).await;
                 let digest_link = LinkKind::Digest(referrer_digest.clone());
                 create_link(&m, namespace, &digest_link, &referrer_digest).await;
 
@@ -1600,7 +1595,8 @@ mod tests {
             let m = registry.metadata_store.clone();
             let namespace = &Namespace::new("test-stored-descriptor").unwrap();
 
-            let base_digest = put_blob_direct(m.object_store(), b"base manifest content").await;
+            let base_digest =
+                put_blob_direct(&test_case.blob_store(), b"base manifest content").await;
             let base_link = LinkKind::Digest(base_digest.clone());
             create_link(&m, namespace, &base_link, &base_digest).await;
 

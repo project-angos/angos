@@ -22,6 +22,13 @@ pub const DOCKER_DISTRIBUTION_API_VERSION: HeaderName =
 pub const DOCKER_DISTRIBUTION_API_VERSION_V2: HeaderValue =
     HeaderValue::from_static("registry/2.0");
 
+/// The originating event timestamp (RFC 3339) of an angos replication write;
+/// the receiver refuses it with
+/// [`crate::response::REPLICATION_SUPERSEDED_CODE`] when its local tag is
+/// strictly newer.
+pub const X_ANGOS_SOURCE_TIMESTAMP: HeaderName =
+    HeaderName::from_static("x-angos-source-timestamp");
+
 /// The `rel` a paginated listing advertises its next page under, written into
 /// the `Link` header by the server and matched by the client that follows it.
 pub const LINK_REL_NEXT: &str = "rel=\"next\"";

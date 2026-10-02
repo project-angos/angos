@@ -302,7 +302,7 @@ multipart_uniform_parts = true
 
 ## Metadata Storage (`metadata_store`)
 
-Optional. Defaults to same backend as blob store.
+Optional. Defaults to the blob store's backend and settings.
 
 ### Unknown Keys
 
@@ -320,7 +320,9 @@ your convenience.
 
 ### S3 (`metadata_store.s3`)
 
-The same connection options as `blob_store.s3`, and no others.
+The same options as `blob_store.s3`. The timeouts, retries, circuit breaker and
+`children_scan_concurrency` apply to the metadata and job stores; the multipart
+and presign options have no effect there.
 
 > **Warning:** With `update_pull_time` enabled, every stamped manifest pull adds one storage write (the append-only access entry). At scale with many concurrent pulls this adds latency and API costs; disable access time tracking if it is not needed for retention policies.
 
@@ -460,8 +462,8 @@ rules = [
 | `forward_headers`           | [string] | `[]`     | Headers to forward from client         |
 
 `url` and `forward_headers` are validated when the configuration is loaded.
-If either `client_certificate_bundle` or `client_private_key` is set, both
-must be set.
+`client_certificate_bundle` and `client_private_key` are set together or not
+at all, here and on every outbound client below.
 
 ---
 
@@ -490,10 +492,13 @@ Array of upstream registries for pull-through cache.
 | `connect_timeout_secs` | u64  | `30`     | Timeout for establishing the connection (TCP + TLS handshake) |
 | `read_timeout_secs`  | u64    | `300`    | Per-read inactivity timeout during a transfer; not a whole-transfer cap, so a large blob is never limited by total time |
 | `server_ca_bundle`   | string | -        | CA bundle for server verification |
-| `client_certificate` | string | -        | Client certificate for mTLS       |
+| `client_certificate` | string | -        | Client certificate for mTLS (`client_certificate_bundle` also accepted) |
 | `client_private_key` | string | -        | Client key for mTLS               |
 | `username`           | string | -        | Basic auth username               |
 | `password`           | string | -        | Basic auth password               |
+
+The certificate and key, like `username` and `password`, are set together or
+not at all; half a pair fails the configuration load.
 
 ### Downstream (`repository."<namespace>".downstream`)
 
@@ -554,6 +559,9 @@ HTTP POST notifications for registry operations. See [Event Webhooks Reference](
 | `timeout_ms`        | u64      | `5000`   | HTTP request timeout in milliseconds             |
 | `max_retries`       | u32      | policy   | Maximum retry attempts after initial failure (max 16); defaults to `3` for `required`, `0` otherwise |
 | `repository_filter` | [string] | -        | Regex patterns to match repository names         |
+| `server_ca_bundle`  | string   | -        | CA bundle trusted for the endpoint, beside the system roots |
+| `client_certificate_bundle` | string | - | Client certificate for mTLS                      |
+| `client_private_key` | string  | -        | Client key for mTLS                              |
 
 `url`, `events`, `token`, and `repository_filter` are validated when the
 configuration is loaded. If `token` is set, it must not be empty.
@@ -576,6 +584,9 @@ The scanner service scanning repositories send their image pushes to, and the sc
 | `url`          | string   | required | Base URL of the scanner service; the job posts to its `/scan` |
 | `token`        | string   | -        | Bearer token the service expects, when it checks one         |
 | `timeout_secs` | u64      | `600`    | Bound on one scan request, pull and analysis included        |
+| `server_ca_bundle` | string | -      | CA bundle trusted for the scanner service, beside the system roots |
+| `client_certificate_bundle` | string | - | Client certificate for mTLS                             |
+| `client_private_key` | string | -    | Client key for mTLS                                          |
 | `default`      | string   | `skip`   | `scan` or `skip`: what an image no rule matches gets, as it lands and on every `angos reconcile scan` run |
 | `rules`        | [string] | `[]`     | CEL rules over the [retention variables](cel-expressions.md#retention-policy-variables) and `image.scanned_at`, the time of the image's newest report; an image a rule matches gets the opposite of `default`. `last_pulled_at` and `top_pulled` require `update_pull_time = true` |
 
@@ -594,7 +605,7 @@ Read by `angos scanner` alone, so a scanner host's configuration can hold this s
 | `token`                | string | -         | Bearer token a scan request must carry; unset accepts any    |
 | `max_concurrent_scans` | usize  | `2`       | Scanner processes run at once; further requests wait. Trivy locks its cache and runs one at a time whatever the value |
 | `registry.url`         | string | required  | Registry the scanner pulls images from                       |
-| `registry.username`    | string | -         | Identity the scanner pulls with                              |
+| `registry.username`    | string | -         | Identity the scanner pulls with; set with `registry.password` or not at all |
 | `registry.password`    | string | -         | Its password                                                 |
 
 ---

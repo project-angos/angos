@@ -10,7 +10,7 @@ use url::Url;
 use crate::{
     auth::Error,
     auth::{
-        oidc::{Config, Jwk},
+        oidc::{Config, jwk::Jwk},
         sha256_hex,
     },
     identity::OidcClaims,

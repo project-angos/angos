@@ -17,12 +17,10 @@ use crate::{
     event_webhook::event::{Event, EventActor},
     jobs::Queue,
     layer,
-    metrics_provider::metrics_provider,
     policy::ImagePolicy,
     registry::{
         Error, Registry, Repository,
         blob_store::BlobStore,
-        keys::NamespaceKeys,
         metadata_store::{LinkKind, LinkMetadata},
         record_pull_through, repository_name,
     },
@@ -260,8 +258,7 @@ async fn needs_upstream_pull(
 
 impl Registry {
     #[instrument(skip(actor))]
-    /// The typed manifest-HEAD the [`angos_oci_service::OciService`] trait
-    /// serves.
+    /// `HEAD /v2/<name>/manifests/<reference>`: the manifest's descriptor.
     pub async fn handle_head_manifest(
         &self,
         actor: Option<EventActor>,
@@ -391,7 +388,7 @@ impl Registry {
         link: &LinkKind,
         client: &EventActor,
     ) -> Result<(), Error> {
-        if !self.update_pull_time {
+        if !self.config.update_pull_time {
             return Ok(());
         }
         self.metadata_store
@@ -481,7 +478,7 @@ impl Registry {
             ..
         } = request;
         if allow_redirect
-            && self.enable_manifest_redirect
+            && self.config.enable_manifest_redirect
             && let Some(response) = self
                 .try_redirect_via_link(namespace, reference, client)
                 .await?
@@ -512,7 +509,7 @@ impl Registry {
             accepted_types,
         } = request;
         if allow_redirect
-            && self.enable_manifest_redirect
+            && self.config.enable_manifest_redirect
             && (matches!(reference, Reference::Digest(_)) || is_tag_immutable)
             && let Some(response) = self
                 .try_redirect_via_link(namespace, reference, client)
@@ -756,8 +753,7 @@ impl Registry {
             let applies = |policy: Option<&ImagePolicy>| {
                 policy.is_some_and(|policy| policy.applies_at_push(namespace, &written_tags))
             };
-            if scan::is_scan_subject(&manifest) && applies(repository.and_then(|r| r.scan.as_ref()))
-            {
+            if manifest.is_plain_image() && applies(repository.and_then(|r| r.scan.as_ref())) {
                 self.dispatch_scan(namespace, &computed_digest).await;
             }
             if applies(repository.and_then(|r| r.index.as_ref())) {
@@ -871,11 +867,16 @@ impl Registry {
         let events = Event::delete_manifest(namespace, &repository, reference, actor.as_ref());
         self.dispatch_events(&events).await?;
 
-        // Read while the manifest is still here: once gone, neither this job nor
-        // its retries can name the subject holding the referrer's descriptor.
-        let subject = self
-            .referrer_subject(resolved_repository, reference)
-            .await?;
+        // Read while the manifest is still here: once gone, neither the
+        // referrer record nor the delete job can name its subject. A faulted
+        // read aborts the delete before anything is written.
+        let subject = match reference {
+            Reference::Digest(digest) => read_manifest(&self.blob_store, digest)
+                .await?
+                .and_then(|manifest| manifest.subject)
+                .map(|subject| subject.digest),
+            Reference::Tag(_) => None,
+        };
 
         // A digest delete cascades to the pointing tags, and a replicated
         // delete is gated on last-writer-wins before anything is written.
@@ -884,6 +885,7 @@ impl Registry {
                 resolved_repository,
                 namespace,
                 reference,
+                subject.as_ref(),
                 source_ts,
                 client_initiated,
             )
@@ -910,25 +912,6 @@ impl Registry {
         }
 
         Ok(())
-    }
-
-    /// Subject of the referrer manifest at `reference`, for the delete job to
-    /// carry. Only a replicated delete has a fallback index to prune.
-    async fn referrer_subject(
-        &self,
-        repository: Option<&Repository>,
-        reference: &Reference,
-    ) -> Result<Option<Digest>, Error> {
-        let Reference::Digest(digest) = reference else {
-            return Ok(None);
-        };
-        if repository.is_none_or(|repository| repository.replication.is_empty()) {
-            return Ok(None);
-        }
-        Ok(read_manifest(&self.blob_store, digest)
-            .await?
-            .and_then(|manifest| manifest.subject)
-            .map(|subject| subject.digest))
     }
 
     /// Whether the reference counted as present before the delete, gating the
@@ -958,20 +941,11 @@ impl Registry {
     async fn delete_revision_keys(
         &self,
         namespace: &Namespace,
-        reference: &Reference,
+        digest: &Digest,
+        subject: Option<&Digest>,
         pointing_tags: &[Tag],
         source_ts: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
-        let Reference::Digest(digest) = reference else {
-            return Ok(());
-        };
-
-        // The subject is read before anything is written, so a faulted read
-        // aborts the delete whole rather than half-way through it.
-        let subject = read_manifest(&self.blob_store, digest)
-            .await?
-            .and_then(|manifest| manifest.subject);
-
         // Every tombstone first, then the referrer back-link, and the revision
         // record last: a tag must never resolve to a manifest that is already
         // gone. The config, layer and child links need no delete at all, since
@@ -979,21 +953,14 @@ impl Registry {
         // its own once this revision is gone. Reference keys are the
         // collector's to remove, because a writer-side delete could unpin a
         // blob a concurrent push is committing.
-        let store = self.metadata_store.object_store();
+        let store = &self.metadata_store;
         for tag in pointing_tags {
-            self.metadata_store
-                .put_tag_tombstone(namespace, tag, source_ts)
-                .await?;
+            store.put_tag_tombstone(namespace, tag, source_ts).await?;
         }
         if let Some(subject) = subject {
-            store
-                .delete(&namespace.referrer_record_path(&subject.digest, digest))
-                .await?;
+            store.delete_referrer(namespace, subject, digest).await?;
         }
-        store
-            .delete(&namespace.revision_record_path(digest))
-            .await?;
-        Ok(())
+        store.delete_revision(namespace, digest).await
     }
 
     /// Deletes the reference's links, reporting whether it counted as present
@@ -1006,6 +973,7 @@ impl Registry {
         resolved_repository: Option<&Repository>,
         namespace: &Namespace,
         reference: &Reference,
+        subject: Option<&Digest>,
         source_ts: Option<DateTime<Utc>>,
         client_initiated: bool,
     ) -> Result<bool, Error> {
@@ -1049,8 +1017,8 @@ impl Registry {
                     .put_tag_tombstone(namespace, tag, source_ts)
                     .await?;
             }
-            Reference::Digest(_) => {
-                self.delete_revision_keys(namespace, reference, &dropped_tags, source_ts)
+            Reference::Digest(digest) => {
+                self.delete_revision_keys(namespace, digest, subject, &dropped_tags, source_ts)
                     .await?;
             }
         }
@@ -1099,8 +1067,7 @@ impl Registry {
     /// needs the caller's consent (a client opts out with
     /// `X-Angos-No-Redirect`) and an authoritative target.
     #[instrument(skip(self, request))]
-    /// The typed manifest-GET the [`angos_oci_service::OciService`] trait
-    /// serves.
+    /// `GET /v2/<name>/manifests/<reference>`: the manifest or a redirect to it.
     pub async fn handle_get_manifest(
         &self,
         actor: Option<EventActor>,
@@ -1321,7 +1288,7 @@ impl Registry {
         };
 
         let request_body =
-            read_limited_manifest_body(body_stream, self.max_manifest_size_bytes).await?;
+            read_limited_manifest_body(body_stream, self.config.max_manifest_size_bytes).await?;
 
         // Hashed up front: the intent events fired before the store carry the
         // content digest, the LWW tie-break compares it on equal timestamps,
@@ -1341,9 +1308,7 @@ impl Registry {
                 .await?;
         }
 
-        let repository = resolved_repository
-            .map(|r| r.name.to_string())
-            .unwrap_or_default();
+        let repository = repository_name(resolved_repository);
 
         // Intent-first emission: a performed write can never go unnotified.
         let events = Event::put_manifest(
@@ -1359,7 +1324,7 @@ impl Registry {
         self.check_lww_not_superseded(&namespace, written_tags, source_ts, Some(&digest))
             .await?;
 
-        let reference_policy = if self.validate_manifest_references {
+        let reference_policy = if self.config.validate_manifest_references {
             ReferencePolicy::Strict
         } else {
             ReferencePolicy::Permissive
@@ -1405,21 +1370,12 @@ impl Registry {
             force: false,
             reported_before: None,
         };
-        let outcome = match scan::build_envelope(&payload) {
-            Ok(envelope) => self
-                .job_queue
-                .enqueue(envelope)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(error) = outcome {
-            warn!("Failed to dispatch scan job for {namespace}@{digest}: {error}");
-            metrics_provider()
-                .job_queue_enqueue_failures_total
-                .with_label_values(&[Queue::Scan.as_str()])
-                .inc();
-        }
+        self.enqueue_best_effort(
+            Queue::Scan,
+            scan::build_envelope(&payload),
+            &format!("scan job for {namespace}@{digest}"),
+        )
+        .await;
     }
 
     /// Replicates a push for the path tag plus each `?tag=` created tag, so a
@@ -1509,25 +1465,12 @@ impl Registry {
                     }
                 };
                 async move {
-                    // Build + enqueue as one fallible step so failures share the warn + metric path.
-                    let outcome = match build_envelope(&payload) {
-                        Ok(envelope) => self
-                            .job_queue
-                            .enqueue(envelope)
-                            .await
-                            .map_err(|e| e.to_string()),
-                        Err(e) => Err(e.to_string()),
-                    };
-                    if let Err(error) = outcome {
-                        warn!(
-                            "Failed to dispatch replication job for {}: {error}",
-                            downstream.name
-                        );
-                        metrics_provider()
-                            .job_queue_enqueue_failures_total
-                            .with_label_values(&[Queue::Replication.as_str()])
-                            .inc();
-                    }
+                    self.enqueue_best_effort(
+                        Queue::Replication,
+                        build_envelope(&payload),
+                        &format!("replication job for {}", downstream.name),
+                    )
+                    .await;
                 }
             });
         join_all(dispatches).await;
@@ -1559,8 +1502,8 @@ mod tests {
         Algorithm, MediaType, Namespace, Tag,
         header::{DOCKER_CONTENT_DIGEST, OCI_TAG},
         request::{DeleteBlobRequest, PutManifestRequest},
+        response::REPLICATION_SUPERSEDED_CODE,
     };
-    use angos_oci_client::REPLICATION_SUPERSEDED_CODE;
     use angos_storage::{
         Error as StorageError, ObjectStore,
         test_util::{HookedStore, StoreHook, StoreOp},
@@ -3899,7 +3842,7 @@ mod tests {
     /// store, where reads look, and not in the metadata store.
     #[tokio::test]
     async fn manifest_blob_lives_in_blob_store_with_split_backends() {
-        let test_case = FSRegistryTestCase::with_split_backends();
+        let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
         let namespace = Namespace::new("split-repo").unwrap();
 
@@ -5066,7 +5009,6 @@ mod tests {
         fn build_registry() -> (Arc<Registry>, Arc<JobStore>, TempDir) {
             let FsTestStack {
                 dir,
-                store,
                 metadata_store,
                 blob_store,
             } = fs_test_stack();
@@ -5076,7 +5018,7 @@ mod tests {
             );
 
             let job_store: Arc<JobStore> =
-                Arc::new(JobStore::new(store, "test", ClaimMode::Atomic));
+                Arc::new(JobStore::new(&metadata_store, "test", ClaimMode::Atomic));
 
             let config = RegistryConfig::new(job_store.clone());
             let registry = Registry::new(blob_store, metadata_store, resolver, config);
@@ -5695,7 +5637,6 @@ mod tests {
         fn build_registry_with(repository: Repository) -> (Arc<Registry>, Arc<JobStore>, TempDir) {
             let FsTestStack {
                 dir,
-                store,
                 metadata_store,
                 blob_store,
             } = fs_test_stack();
@@ -5703,7 +5644,7 @@ mod tests {
 
             // No drain spawned: the bare JobStore only persists envelopes; these tests assert enqueue only.
             let job_store: Arc<JobStore> =
-                Arc::new(JobStore::new(store, "test", ClaimMode::Atomic));
+                Arc::new(JobStore::new(&metadata_store, "test", ClaimMode::Atomic));
 
             let config = RegistryConfig::new(job_store.clone());
             let registry = Registry::new(blob_store, metadata_store, resolver, config);

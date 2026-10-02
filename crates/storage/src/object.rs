@@ -158,20 +158,27 @@ pub trait ObjectStore: Send + Sync {
         start_after: Option<String>,
     ) -> Result<ChildrenPage, Error>;
 
-    /// Flat-recursive enumeration of *every* key under `prefix`, streamed
-    /// lazily with no caller-managed continuation token. Keys arrive in no
-    /// guaranteed order.
-    ///
-    /// The default drains [`ObjectStore::list`] pages serially, which both
-    /// shipped backends override: S3 walks disjoint key ranges concurrently, so
-    /// a whole-store scan (scrub, migration) is bounded by its slowest range
-    /// rather than by one continuation-token chain, and FS walks its tree once
-    /// instead of re-walking it per page.
-    fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
+    /// Every key under `prefix` in ascending order, its [`ObjectStore::list`]
+    /// pages drained one at a time as the stream is polled: what a caller that
+    /// stops at a key, or reads newest first, walks.
+    fn list_in_order<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
         Box::pin(paginated(move |token| async move {
             let page = self.list(prefix, 1000, token).await?;
             Ok((page.items, page.next_token))
         }))
+    }
+
+    /// Flat-recursive enumeration of *every* key under `prefix`, streamed
+    /// lazily with no caller-managed continuation token. Keys arrive in no
+    /// guaranteed order.
+    ///
+    /// The default is [`ObjectStore::list_in_order`], which both shipped
+    /// backends override: S3 walks disjoint key ranges concurrently, so a
+    /// whole-store scan (scrub, migration) is bounded by its slowest range
+    /// rather than by one continuation-token chain, and FS walks its tree once
+    /// instead of re-walking it per page.
+    fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
+        self.list_in_order(prefix)
     }
 
     /// Complete one-level enumeration: every immediate child under `prefix`.

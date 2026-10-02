@@ -4,8 +4,8 @@ use regex::Regex;
 
 use crate::types::Error;
 use crate::types::constants::{
-    DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, OCI_INDEX_MEDIA_TYPE,
-    OCI_MANIFEST_MEDIA_TYPE,
+    DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, OCI_EMPTY_MEDIA_TYPE,
+    OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE,
 };
 
 // RFC 6838 media type: `type/subtype` where each name is a `restricted-name`
@@ -65,6 +65,13 @@ impl MediaType {
     #[must_use]
     pub fn oci_index() -> Self {
         Self(OCI_INDEX_MEDIA_TYPE.to_owned())
+    }
+
+    /// The OCI empty-descriptor media type, infallible like
+    /// [`Self::oci_manifest`].
+    #[must_use]
+    pub fn oci_empty() -> Self {
+        Self(OCI_EMPTY_MEDIA_TYPE.to_owned())
     }
 
     /// The Docker v2 schema-2 manifest media type, infallible like

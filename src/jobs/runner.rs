@@ -129,6 +129,7 @@ mod tests {
             store::{ClaimMode, ClaimedJob, Error, JobEnvelope, JobHandler, JobStore},
         },
         metrics_provider,
+        registry::test_utils::metadata_store_over,
     };
 
     struct OkHandler;
@@ -143,7 +144,11 @@ mod tests {
     fn make_store(dir: &TempDir) -> Arc<JobStore> {
         let object: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder(dir.path().to_str().expect("valid path")).build());
-        Arc::new(JobStore::new(object, "test-worker", ClaimMode::Atomic))
+        Arc::new(JobStore::new(
+            &metadata_store_over(object),
+            "test-worker",
+            ClaimMode::Atomic,
+        ))
     }
 
     #[tokio::test]

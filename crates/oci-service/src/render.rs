@@ -5,6 +5,7 @@
 
 use http::header::InvalidHeaderValue;
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
+use serde::Serialize;
 use tokio::io::AsyncRead;
 
 use angos_oci::server;
@@ -18,6 +19,18 @@ use crate::{
 use angos_transport::RenderError;
 
 type Rendered = Result<Response<ResponseBody>, RenderError>;
+
+/// `200 OK` JSON, with a `Link` to the next page when the listing has more.
+///
+/// # Errors
+/// Fails when the body cannot be serialized or a header value built.
+pub fn paginated_json(body: &impl Serialize, next: Option<&str>) -> Rendered {
+    Ok(build_response(
+        StatusCode::OK,
+        server::paginated_json_headers(next)?,
+        ResponseBody::fixed(serde_json::to_vec(body)?),
+    )?)
+}
 
 /// The non-standard branding header `GET /v2/` may carry.
 const X_POWERED_BY: HeaderName = HeaderName::from_static("x-powered-by");
@@ -260,11 +273,7 @@ impl Tags {
     /// # Errors
     /// Fails when the body cannot be serialized or a header value built.
     pub fn into_response(self) -> Rendered {
-        Ok(build_response(
-            StatusCode::OK,
-            server::paginated_json_headers(self.next.as_deref())?,
-            ResponseBody::fixed(serde_json::to_vec(&self.list)?),
-        )?)
+        paginated_json(&self.list, self.next.as_deref())
     }
 }
 

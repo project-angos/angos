@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::stream::{self, StreamExt};
+use futures_util::{StreamExt, TryStreamExt, future::ready};
 use serde::{Deserialize, Serialize};
 
 use angos_oci::Namespace;
@@ -16,7 +16,7 @@ use angos_oci::Namespace;
 use crate::registry::{
     Error,
     keys::{NamespaceKeys, atime_entry_name, parse_atime_entry},
-    metadata_store::{LIST_PAGE, LinkKind, MetadataStore},
+    metadata_store::{LinkKind, MetadataStore},
 };
 
 /// The stored body of one access entry: who pulled, from where, and when.
@@ -104,44 +104,39 @@ impl MetadataStore {
         } else {
             page_len
         };
-        let chunks = self.list_names(&compacted).await?;
+        let chunks: Vec<String> = self
+            .object_store()
+            .list_in_order(&compacted)
+            .try_collect()
+            .await?;
         // Live entries at or past the newest chunk's name are already packed:
         // leftovers of a scrub whose retires did not all land.
         let packed_through = chunks.first();
         let mut skip = offset;
-        let mut entries = Vec::new();
 
         // Live entries are skipped by name, so skipping costs no reads.
-        let mut token = None;
-        while entries.len() < wanted {
-            let page = self.object_store().list(&dir, LIST_PAGE, token).await?;
-            let names: Vec<String> = page
-                .items
-                .into_iter()
-                .filter(|name| packed_through.is_none_or(|through| name < through))
-                .collect();
-            let skipped = skip.min(names.len());
-            skip -= skipped;
-            let names = names.into_iter().skip(skipped).take(wanted - entries.len());
-            // `buffered` keeps the listing's newest-first order.
-            let read: Vec<AccessEntry> = stream::iter(names)
-                .map(|name| {
-                    let key = format!("{dir}/{name}");
-                    async move {
-                        let raw = self.object_store().get(&key).await.ok()?;
-                        serde_json::from_slice::<AccessEntry>(&raw).ok()
-                    }
-                })
-                .buffered(ENTRY_READ_CONCURRENCY)
-                .filter_map(|entry| async move { entry })
-                .collect()
-                .await;
-            entries.extend(read);
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
-        }
+        let mut entries: Vec<AccessEntry> = self
+            .object_store()
+            .list_in_order(&dir)
+            .try_filter(|name| {
+                let live = packed_through.is_none_or(|through| name < through);
+                let skipped = live && skip > 0;
+                skip -= usize::from(skipped);
+                ready(live && !skipped)
+            })
+            .map_ok(|name| {
+                let key = format!("{dir}/{name}");
+                async move {
+                    let raw = self.object_store().get(&key).await.ok();
+                    Ok(raw.and_then(|raw| serde_json::from_slice::<AccessEntry>(&raw).ok()))
+                }
+            })
+            // `try_buffered` keeps the listing's newest-first order.
+            .try_buffered(ENTRY_READ_CONCURRENCY)
+            .try_filter_map(|entry| ready(Ok(entry)))
+            .take(wanted)
+            .try_collect()
+            .await?;
 
         // The oldest entry a chunk held so far: a chunk no older is the stale
         // source of a scrub merge whose retire did not land.

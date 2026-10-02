@@ -5,7 +5,9 @@ edition = "2024"
 
 
 [dependencies]
+angos-secret = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

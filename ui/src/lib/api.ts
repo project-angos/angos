@@ -1,4 +1,5 @@
 import { authHeaders, signInOnUnauthorized } from './auth.svelte';
+import { isDigest } from './utils';
 
 export interface Platform {
 	os: string;
@@ -298,14 +299,14 @@ export async function fetchRevision(
 }
 
 // The registry keys pull records by the reference they were pulled through, so
-// the target is queried as it was addressed. A tag cannot contain a colon,
-// which is what tells the two apart; the endpoint takes exactly one of them.
+// the target is queried as it was addressed; the endpoint takes exactly one of
+// a digest and a tag.
 export async function fetchPullHistory(
 	namespace: string,
 	target: string,
 	offset = 0
 ): Promise<FetchResult<PullHistory>> {
-	const param = target.includes(':') ? 'digest' : 'tag';
+	const param = isDigest(target) ? 'digest' : 'tag';
 	return fetchJson<PullHistory>(
 		`/v2/${namespace}/_angos/pulls/list?${param}=${encodeURIComponent(target)}&offset=${offset}`
 	);

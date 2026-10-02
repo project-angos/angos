@@ -1,7 +1,9 @@
 use hyper::StatusCode;
 use serde_json::json;
 
-use angos_oci::response::{ErrorCode, ErrorInfo, ErrorResponse};
+use angos_oci::response::{
+    ErrorCode, ErrorInfo, ErrorResponse, INTERNAL_ERROR_CODE, PROVIDER_UNAVAILABLE_CODE,
+};
 use angos_transport::RenderError;
 
 mod conversions;
@@ -46,12 +48,6 @@ impl From<RenderError> for Error {
         }
     }
 }
-
-/// Codes the spec does not define, which angos serves on failures the OCI set
-/// has no word for. A 5xx code is unconstrained, so these never collide.
-pub const INTERNAL_ERROR_CODE: &str = "INTERNAL_ERROR";
-pub const PROVIDER_UNAVAILABLE_CODE: &str = "PROVIDER_UNAVAILABLE";
-pub const RECLAMATION_IN_PROGRESS_CODE: &str = "RECLAMATION_IN_PROGRESS";
 
 impl Error {
     pub fn status_code(&self) -> StatusCode {

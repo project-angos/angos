@@ -20,6 +20,7 @@ use std::time::Duration as StdDuration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -79,40 +80,34 @@ impl MetadataStore {
     /// Whether an unexpired collector run covers any of `digests`, reaping the
     /// expired markers it reads on the way: one read per marker.
     pub async fn gc_blocked(&self, digests: &[&Digest]) -> Result<bool, Error> {
-        let mut token = None;
-        loop {
-            let page = self.object_store().list(GC_ROOT, 100, token).await?;
-            for run in &page.items {
-                let key = gc_run_path(run);
-                let raw = match self.object_store().get(&key).await {
-                    Ok(raw) => raw,
-                    // Released between the listing and the read.
-                    Err(StorageError::NotFound) => continue,
-                    Err(e) => return Err(e.into()),
-                };
-                // An unreadable marker blocks: failing open here would let a
-                // corrupt marker green-light a delete race.
-                let Ok(run) = serde_json::from_slice::<GcRun>(&raw) else {
-                    return Ok(true);
-                };
-                if run.expires_at < Utc::now() {
-                    // A released marker lingers by design, so whoever reads it
-                    // expired reaps it.
-                    let _ = self.object_store().delete(&key).await;
-                    continue;
-                }
-                if digests
-                    .iter()
-                    .any(|digest| run.start <= **digest && **digest <= run.end)
-                {
-                    return Ok(true);
-                }
+        let mut runs = self.object_store().list_all(GC_ROOT);
+        while let Some(run) = runs.try_next().await? {
+            let key = gc_run_path(&run);
+            let raw = match self.object_store().get(&key).await {
+                Ok(raw) => raw,
+                // Released between the listing and the read.
+                Err(StorageError::NotFound) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            // An unreadable marker blocks: failing open here would let a
+            // corrupt marker green-light a delete race.
+            let Ok(run) = serde_json::from_slice::<GcRun>(&raw) else {
+                return Ok(true);
+            };
+            if run.expires_at < Utc::now() {
+                // A released marker lingers by design, so whoever reads it
+                // expired reaps it.
+                let _ = self.object_store().delete(&key).await;
+                continue;
             }
-            token = page.next_token;
-            if token.is_none() {
-                return Ok(false);
+            if digests
+                .iter()
+                .any(|digest| run.start <= **digest && **digest <= run.end)
+            {
+                return Ok(true);
             }
         }
+        Ok(false)
     }
 
     /// Collector side: run `body` under a marker covering `start..=end`,

@@ -27,13 +27,13 @@ use crate::{
             Error,
             action::Action,
             check::{self, NamespaceChecker},
-            executor::{ActionSink, DryRunSink, Executor, run_job_store},
+            executor::{ActionSink, Executor, run_job_store, run_sink},
             tags::Rankings,
             walk::for_each_key,
         },
     },
     configuration::Configuration,
-    layer::{IndexLayerPayload, filesystem_layers, read_listing},
+    layer::{IndexLayerPayload, filesystem_layers},
     registry::{
         blob_store::BlobStore,
         keys::{LAYERS_ROOT, parse_layer_key},
@@ -115,7 +115,7 @@ impl NamespaceChecker for IndexChecker {
                 if !first || !self.enqueue {
                     continue;
                 }
-                if !self.force && read_listing(&self.metadata_store, &layer).await?.is_some() {
+                if !self.force && self.metadata_store.read_listing(&layer).await?.is_some() {
                     continue;
                 }
                 sink.apply(Action::EnqueueIndex(IndexLayerPayload {
@@ -210,16 +210,13 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         enqueue: true,
         seen: Mutex::new(HashSet::new()),
     };
-    let sink: Box<dyn ActionSink> = if options.dry_run {
-        info!("Dry-run mode: no changes will be made to the storage");
-        Box::new(DryRunSink)
-    } else {
-        Box::new(Executor::new(
+    let sink = run_sink(options.dry_run, || {
+        Ok(Executor::new(
             blob_store,
             metadata_store.clone(),
             run_job_store(&metadata_store, "reconcile"),
         ))
-    };
+    })?;
     check_and_reclaim(checker, &metadata_store, sink.as_ref()).await?;
     info!("Index reconciliation complete; the server or a worker drains the enqueued jobs");
     Ok(())
@@ -268,7 +265,7 @@ mod tests {
         let stack = fs_test_stack();
         let namespace = Namespace::new("apps/web").unwrap();
         let (image, _, layer) =
-            seed_manifest(&stack.store, &stack.metadata_store, &namespace).await;
+            seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
         // The walk is over revision records, which the seed helper leaves to
         // the push path.
         seed_links(

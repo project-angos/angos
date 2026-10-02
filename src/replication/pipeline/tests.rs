@@ -17,10 +17,8 @@ use angos_oci::{
     Reference, Tag,
     constants::{DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE},
 };
-use angos_oci_client::{
-    REPLICATION_SUPERSEDED_CODE, RegistryClient, UploadSession, X_ANGOS_SOURCE_TIMESTAMP,
-};
-use angos_storage::ObjectStore;
+use angos_oci::{header::X_ANGOS_SOURCE_TIMESTAMP, response::REPLICATION_SUPERSEDED_CODE};
+use angos_oci_client::{RegistryClient, UploadSession};
 
 use crate::{
     metrics_provider,
@@ -49,19 +47,13 @@ fn instant(rfc3339: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-fn test_blob_store() -> (
-    Arc<BlobStore>,
-    Arc<MetadataStore>,
-    Arc<dyn ObjectStore>,
-    TempDir,
-) {
+fn test_blob_store() -> (Arc<BlobStore>, Arc<MetadataStore>, TempDir) {
     let FsTestStack {
         dir,
-        store,
         metadata_store,
         blob_store,
     } = fs_test_stack();
-    (blob_store, metadata_store, store, dir)
+    (blob_store, metadata_store, dir)
 }
 
 /// The modal test downstream: no remapping, four concurrent pushes.
@@ -111,10 +103,10 @@ async fn mount_manifest_put(
 async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let subject = put_blob_direct(&store, b"subject-bytes").await;
-    let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
+    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
 
     let manifest = json!({
         "schemaVersion": 2,
@@ -132,7 +124,7 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
         },
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config]).await;
 
@@ -190,10 +182,10 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
 async fn referrers_fallback_descriptor_carries_annotations_and_artifact_type() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let subject = put_blob_direct(&store, b"subject-bytes").await;
-    let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
+    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": OCI_MANIFEST_MEDIA_TYPE,
@@ -212,7 +204,7 @@ async fn referrers_fallback_descriptor_carries_annotations_and_artifact_type() {
         },
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config]).await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
@@ -262,9 +254,9 @@ async fn referrers_fallback_put_is_timestamp_less() {
     // come back superseded and silently drop the just-merged descriptor.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let subject = put_blob_direct(&store, b"subject-bytes").await;
+    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -276,7 +268,7 @@ async fn referrers_fallback_put_is_timestamp_less() {
         },
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // The primary PUT must carry the header; no `OCI-Subject` => fallback runs.
     Mock::given(method("PUT"))
@@ -305,9 +297,7 @@ async fn referrers_fallback_put_is_timestamp_less() {
         .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
         .respond_with(move |request: &Request| {
             assert!(
-                !request
-                    .headers
-                    .contains_key(X_ANGOS_SOURCE_TIMESTAMP.to_lowercase().as_str()),
+                !request.headers.contains_key(X_ANGOS_SOURCE_TIMESTAMP),
                 "the fallback-index PUT must be timestamp-less (set merge, not LWW)"
             );
             ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())
@@ -334,10 +324,10 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
     // built from an empty base and drop the subject's sibling referrers.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let subject = put_blob_direct(&store, b"subject-bytes").await;
-    let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
+    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -354,7 +344,7 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
         },
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config]).await;
 
@@ -394,9 +384,9 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
     // from empty and drop the subject's existing sibling referrers.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let subject = put_blob_direct(&store, b"subject-bytes").await;
+    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     // Config-less manifest, so no blob upload mocks are needed.
     let manifest = json!({
         "schemaVersion": 2,
@@ -409,7 +399,7 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
         },
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // No `OCI-Subject` response => OCI-1.0 => fallback runs.
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
@@ -455,9 +445,9 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
     // descriptor vanishes from the final PUT.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let subject = put_blob_direct(&store, b"subject-bytes").await;
+    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let referrer = |name: &str| {
         json!({
             "schemaVersion": 2,
@@ -473,8 +463,8 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
     };
     let bytes_a = serde_json::to_vec(&referrer("a")).unwrap();
     let bytes_b = serde_json::to_vec(&referrer("b")).unwrap();
-    let digest_a = put_blob_direct(&store, &bytes_a).await;
-    let digest_b = put_blob_direct(&store, &bytes_b).await;
+    let digest_a = put_blob_direct(&blob_store, &bytes_a).await;
+    let digest_b = put_blob_direct(&blob_store, &bytes_b).await;
 
     // No `OCI-Subject` response => OCI-1.0 => the fallback runs.
     for (tag, digest) in [("v1", &digest_a), ("v2", &digest_b)] {
@@ -548,9 +538,9 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
 async fn no_referrers_fallback_when_downstream_indexes_subject() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let subject = put_blob_direct(&store, b"subject-bytes").await;
+    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -562,7 +552,7 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
         },
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // PUT echoes back `OCI-Subject` => OCI-1.1 downstream => no fallback.
     Mock::given(method("PUT"))
@@ -593,7 +583,7 @@ async fn index_lands_after_all_children_when_fanned_out() {
     // dropped.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
     let mut child_digests = Vec::new();
     let mut manifests = Vec::new();
@@ -605,7 +595,7 @@ async fn index_lands_after_all_children_when_fanned_out() {
             "annotations": { "idx": i.to_string() },
         });
         let child_bytes = serde_json::to_vec(&child).unwrap();
-        let child_digest = put_blob_direct(&store, &child_bytes).await;
+        let child_digest = put_blob_direct(&blob_store, &child_bytes).await;
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
             .respond_with(ResponseTemplate::new(201))
@@ -626,7 +616,7 @@ async fn index_lands_after_all_children_when_fanned_out() {
         "manifests": manifests,
     });
     let index_bytes = serde_json::to_vec(&index).unwrap();
-    let index_digest = put_blob_direct(&store, &index_bytes).await;
+    let index_digest = put_blob_direct(&blob_store, &index_bytes).await;
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
         .respond_with(ResponseTemplate::new(201))
@@ -671,7 +661,7 @@ async fn index_lands_after_all_children_when_fanned_out() {
 async fn a_manifest_named_many_times_is_pushed_once() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
     let leaf = serde_json::to_vec(&json!({
         "schemaVersion": 2,
@@ -679,7 +669,7 @@ async fn a_manifest_named_many_times_is_pushed_once() {
         "layers": [],
     }))
     .unwrap();
-    let leaf_digest = put_blob_direct(&store, &leaf).await;
+    let leaf_digest = put_blob_direct(&blob_store, &leaf).await;
     // Two sibling indexes, each naming the leaf five times, then a root naming
     // each sibling five times.
     let index = |label: &str, digest: &Digest, size: usize| {
@@ -701,8 +691,8 @@ async fn a_manifest_named_many_times_is_pushed_once() {
         index("b", &leaf_digest, leaf.len()),
     );
     let (a_digest, b_digest) = (
-        put_blob_direct(&store, &a).await,
-        put_blob_direct(&store, &b).await,
+        put_blob_direct(&blob_store, &a).await,
+        put_blob_direct(&blob_store, &b).await,
     );
     let mut children = vec![
         json!({ "mediaType": "application/vnd.oci.image.index.v1+json", "digest": a_digest.to_string(), "size": a.len() });
@@ -718,7 +708,7 @@ async fn a_manifest_named_many_times_is_pushed_once() {
         "manifests": children,
     }))
     .unwrap();
-    let root_digest = put_blob_direct(&store, &root).await;
+    let root_digest = put_blob_direct(&blob_store, &root).await;
 
     for reference in [&leaf_digest, &a_digest, &b_digest] {
         Mock::given(method("PUT"))
@@ -764,10 +754,10 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
 
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let config = put_blob_direct(&store, br#"{"c":1}"#).await;
-    let layer = put_blob_direct(&store, b"layer-bytes").await;
+    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
+    let layer = put_blob_direct(&blob_store, b"layer-bytes").await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -783,7 +773,7 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
         }],
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // Record the sibling's ownership so a mount `from` exists.
     for blob in [&config, &layer] {
@@ -835,9 +825,9 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
 
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -849,7 +839,7 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
         "layers": [],
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     metadata_store
         .insert_reference(
@@ -910,14 +900,14 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
 
 /// Seeds a minimal blob-less image manifest locally, returning its digest
 /// and serialized body.
-async fn seed_blobless_manifest(store: &Arc<dyn ObjectStore>) -> (Digest, Vec<u8>) {
+async fn seed_blobless_manifest(blob_store: &BlobStore) -> (Digest, Vec<u8>) {
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "layers": [],
     });
     let bytes = serde_json::to_vec(&manifest).unwrap();
-    let digest = put_blob_direct(store, &bytes).await;
+    let digest = put_blob_direct(blob_store, &bytes).await;
     (digest, bytes)
 }
 
@@ -930,8 +920,8 @@ fn oci_error_body(code: &str) -> serde_json::Value {
 async fn push_manifest_stamps_source_timestamp_header() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -966,9 +956,9 @@ async fn repeated_layer_digest_uploads_the_blob_once() {
     // every mock is pinned to `.expect(1)`.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let layer = put_blob_direct(&store, b"twice-listed layer").await;
+    let layer = put_blob_direct(&blob_store, b"twice-listed layer").await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -978,7 +968,7 @@ async fn repeated_layer_digest_uploads_the_blob_once() {
         ],
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&layer]).await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
@@ -1000,8 +990,8 @@ async fn converged_skip_head_sends_standard_accept_headers() {
     // skip would never fire.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     let digest_str = manifest_digest.to_string();
     let body_len = manifest_bytes.len();
@@ -1050,11 +1040,11 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
     // zero blob HEADs, zero uploads, zero PUTs.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let config = put_blob_direct(&store, br#"{"c":1}"#).await;
-    let layer_a = put_blob_direct(&store, b"layer-a-bytes").await;
-    let layer_b = put_blob_direct(&store, b"layer-b-bytes").await;
+    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
+    let layer_a = put_blob_direct(&blob_store, b"layer-a-bytes").await;
+    let layer_b = put_blob_direct(&blob_store, b"layer-b-bytes").await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": OCI_MANIFEST_MEDIA_TYPE,
@@ -1077,7 +1067,7 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
         ],
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // The converged probe is the only request allowed to reach the downstream.
     Mock::given(method("HEAD"))
@@ -1131,7 +1121,7 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
     // downstream already holds is not re-PUT while the index still lands.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
     let child = json!({
         "schemaVersion": 2,
@@ -1139,7 +1129,7 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
         "layers": [],
     });
     let child_bytes = serde_json::to_vec(&child).unwrap();
-    let child_digest = put_blob_direct(&store, &child_bytes).await;
+    let child_digest = put_blob_direct(&blob_store, &child_bytes).await;
     let index = json!({
         "schemaVersion": 2,
         "mediaType": OCI_INDEX_MEDIA_TYPE,
@@ -1150,7 +1140,7 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
         }],
     });
     let index_bytes = serde_json::to_vec(&index).unwrap();
-    let index_digest = put_blob_direct(&store, &index_bytes).await;
+    let index_digest = put_blob_direct(&blob_store, &index_bytes).await;
 
     // The index probe misses (404), the child probe hits (converged).
     Mock::given(method("HEAD"))
@@ -1193,9 +1183,9 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
     // retries; treating it as absent would start a pointless full upload.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": OCI_MANIFEST_MEDIA_TYPE,
@@ -1207,7 +1197,7 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
         "layers": [],
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     Mock::given(method("HEAD"))
         .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
@@ -1246,9 +1236,9 @@ async fn failed_patch_cancels_the_upload_session() {
     // once and still propagate the original upload error.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": OCI_MANIFEST_MEDIA_TYPE,
@@ -1260,7 +1250,7 @@ async fn failed_patch_cancels_the_upload_session() {
         "layers": [],
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     Mock::given(method("HEAD"))
         .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
@@ -1315,9 +1305,9 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
     // stranding the referrer.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let subject = put_blob_direct(&store, b"subject-bytes").await;
+    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     // Config-less manifest, so no blob mocks are needed.
     let manifest = json!({
         "schemaVersion": 2,
@@ -1330,7 +1320,7 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
         },
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // The HEAD reports the converged state, but a subject-bearing manifest
     // bypasses the skip, so this mock carries no `.expect()`.
@@ -1375,8 +1365,8 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
     // The PUT must still run so receiver-side LWW can arbitrate the divergence.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     let other_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     Mock::given(method("HEAD"))
@@ -1406,8 +1396,8 @@ async fn push_manifest_puts_when_downstream_head_returns_404() {
     // 404 and the PUT must still run.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
@@ -1427,11 +1417,11 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
     // carry no `Content-Type` and the receiver rejects it 400.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
     let manifest = json!({ "schemaVersion": 2, "layers": [] });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // Seed the revision link with the type `store_manifest` records from
     // the original push's `Content-Type`.
@@ -1473,11 +1463,11 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
     // by digest must recover its Content-Type from its own revision link.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
     let child = json!({ "schemaVersion": 2, "layers": [] });
     let child_bytes = serde_json::to_vec(&child).unwrap();
-    let child_digest = put_blob_direct(&store, &child_bytes).await;
+    let child_digest = put_blob_direct(&blob_store, &child_bytes).await;
     let index = json!({
         "schemaVersion": 2,
         "mediaType": OCI_INDEX_MEDIA_TYPE,
@@ -1488,7 +1478,7 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
         }],
     });
     let index_bytes = serde_json::to_vec(&index).unwrap();
-    let index_digest = put_blob_direct(&store, &index_bytes).await;
+    let index_digest = put_blob_direct(&blob_store, &index_bytes).await;
 
     // Seed only the child's revision link with its stored media type.
     metadata_store
@@ -1536,8 +1526,8 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
 async fn push_manifest_treats_lww_superseded_409_as_success() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -1565,8 +1555,8 @@ async fn push_manifest_treats_lww_superseded_409_as_success() {
 async fn push_manifest_propagates_immutable_409_as_error() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     // A 409 with the immutable-tag `CONFLICT` code is not an LWW loss.
     Mock::given(method("PUT"))
@@ -1593,7 +1583,7 @@ async fn push_manifest_propagates_immutable_409_as_error() {
 #[tokio::test]
 async fn push_manifest_rejects_invalid_content_as_terminal() {
     metrics_provider::init_for_tests();
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
     // The rejection precedes every HTTP call, so the downstream is unroutable
     // on purpose: a dialled request surfaces as `Client`, failing the assert.
     let downstream = test_downstream(downstream_client("http://127.0.0.1:1"));
@@ -1601,7 +1591,7 @@ async fn push_manifest_rejects_invalid_content_as_terminal() {
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
 
     let unparseable = b"not json".to_vec();
-    let stored = put_blob_direct(&store, &unparseable).await;
+    let stored = put_blob_direct(&blob_store, &unparseable).await;
     let error = push_manifest(&ctx, &stored, Some("v1"), unparseable)
         .await
         .expect_err("an unparseable body must fail the push");
@@ -1629,7 +1619,7 @@ async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
         .mount(&mock_server)
         .await;
 
-    let (_, _metadata_store, _, _dir) = test_blob_store();
+    let (_, _metadata_store, _dir) = test_blob_store();
     delete_manifest(
         &downstream_client(&mock_server.uri()),
         &Namespace::new(NAMESPACE).unwrap(),
@@ -1656,7 +1646,7 @@ async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
         .mount(&mock_server)
         .await;
 
-    let (_, _metadata_store, _, _dir) = test_blob_store();
+    let (_, _metadata_store, _dir) = test_blob_store();
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &Namespace::new(NAMESPACE).unwrap(),
@@ -1688,7 +1678,7 @@ async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
         .mount(&mock_server)
         .await;
 
-    let (_, _metadata_store, _, _dir) = test_blob_store();
+    let (_, _metadata_store, _dir) = test_blob_store();
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &Namespace::new(NAMESPACE).unwrap(),
@@ -1715,7 +1705,7 @@ async fn delete_manifest_propagates_non_superseded_409_as_error() {
         .mount(&mock_server)
         .await;
 
-    let (_, _metadata_store, _, _dir) = test_blob_store();
+    let (_, _metadata_store, _dir) = test_blob_store();
     let result = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &Namespace::new(NAMESPACE).unwrap(),
@@ -1739,7 +1729,7 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
     // strand it on the downstream.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
     let absent = Digest::sha256_of_bytes(b"never-written-locally");
     let session = UploadSession {
@@ -1780,7 +1770,7 @@ fn referrer_manifest(subject: &Digest) -> (Vec<u8>, Digest) {
 async fn deleting_last_referrer_removes_the_fallback_tag() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (_, _metadata_store, _, _dir) = test_blob_store();
+    let (_, _metadata_store, _dir) = test_blob_store();
 
     let subject = Digest::sha256_of_bytes(b"the-subject");
     let (referrer_body, referrer) = referrer_manifest(&subject);
@@ -1847,7 +1837,7 @@ async fn deleting_last_referrer_removes_the_fallback_tag() {
 async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (_, _metadata_store, _, _dir) = test_blob_store();
+    let (_, _metadata_store, _dir) = test_blob_store();
 
     let subject = Digest::sha256_of_bytes(b"shared-subject");
     let (referrer_body, referrer) = referrer_manifest(&subject);
@@ -1938,7 +1928,7 @@ async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
 async fn a_retried_delete_prunes_the_fallback_index_from_the_carried_subject() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (_, _metadata_store, _, _dir) = test_blob_store();
+    let (_, _metadata_store, _dir) = test_blob_store();
 
     let subject = Digest::sha256_of_bytes(b"retried-subject");
     let (_, referrer) = referrer_manifest(&subject);
@@ -2001,10 +1991,10 @@ async fn a_retried_delete_prunes_the_fallback_index_from_the_carried_subject() {
 async fn a_failing_blob_lets_its_siblings_finish_their_upload() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
-    let failing = put_blob_direct(&store, b"fails").await;
-    let sibling = put_blob_direct(&store, b"transfers").await;
+    let failing = put_blob_direct(&blob_store, b"fails").await;
+    let sibling = put_blob_direct(&blob_store, b"transfers").await;
 
     // The probe fails outright, so this blob errors before it opens a session.
     Mock::given(method("HEAD"))
@@ -2069,10 +2059,10 @@ async fn a_failing_blob_lets_its_siblings_finish_their_upload() {
 async fn an_index_child_over_the_manifest_limit_is_refused_before_it_is_read() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
     let oversized = vec![b'x'; DEFAULT_MAX_MANIFEST_SIZE_BYTES + 1];
-    let child_digest = put_blob_direct(&store, &oversized).await;
+    let child_digest = put_blob_direct(&blob_store, &oversized).await;
 
     let index = json!({
         "schemaVersion": 2,
@@ -2084,7 +2074,7 @@ async fn an_index_child_over_the_manifest_limit_is_refused_before_it_is_read() {
         }],
     });
     let index_bytes = serde_json::to_vec(&index).unwrap();
-    let index_digest = put_blob_direct(&store, &index_bytes).await;
+    let index_digest = put_blob_direct(&blob_store, &index_bytes).await;
 
     let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
@@ -2106,7 +2096,7 @@ async fn an_index_child_over_the_manifest_limit_is_refused_before_it_is_read() {
 async fn an_index_chain_deeper_than_the_cap_is_refused() {
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, store, _dir) = test_blob_store();
+    let (blob_store, metadata_store, _dir) = test_blob_store();
 
     // Innermost is a plain manifest; wrap it in one index per level.
     let leaf = json!({
@@ -2115,7 +2105,7 @@ async fn an_index_chain_deeper_than_the_cap_is_refused() {
         "layers": [],
     });
     let leaf_bytes = serde_json::to_vec(&leaf).unwrap();
-    let mut digest = put_blob_direct(&store, &leaf_bytes).await;
+    let mut digest = put_blob_direct(&blob_store, &leaf_bytes).await;
     let mut bytes = leaf_bytes;
 
     for _ in 0..=MAX_INDEX_DEPTH {
@@ -2129,7 +2119,7 @@ async fn an_index_chain_deeper_than_the_cap_is_refused() {
             }],
         });
         bytes = serde_json::to_vec(&index).unwrap();
-        digest = put_blob_direct(&store, &bytes).await;
+        digest = put_blob_direct(&blob_store, &bytes).await;
     }
 
     let downstream = test_downstream(downstream_client(&mock_server.uri()));

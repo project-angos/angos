@@ -4,15 +4,15 @@ use http::header::{
     CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, VARY,
 };
 use http::{HeaderMap, HeaderValue, Response, StatusCode};
-use serde::Serialize;
 use tokio::io::AsyncRead;
 
 use angos_oci::server;
+use angos_oci_service::render::paginated_json;
 use angos_transport::{ResponseBody, build_response, json_headers, json_response};
 
 use crate::{
-    FailedJobsBody, JobsBody, LayerEntries, LayerFile, LayerFileDetails, NamespacesBody, NoContent,
-    PullsBody, RepositoriesBody, RevisionsBody, UploadsBody,
+    FailedJobsBody, JobsBody, LayerEntries, LayerFile, LayerFileDetails, NamespacesBody, PullsBody,
+    RepositoriesBody, RevisionsBody, UploadsBody,
 };
 
 use angos_transport::RenderError;
@@ -43,18 +43,6 @@ json_body!(
     LayerFileDetails,
 );
 
-/// `200 OK` JSON, with a `Link` to the next page when the listing has more.
-///
-/// # Errors
-/// Fails when the body cannot be serialized or a header value built.
-fn paginated_json(body: &impl Serialize, next: Option<&str>) -> Rendered {
-    Ok(build_response(
-        StatusCode::OK,
-        server::paginated_json_headers(next)?,
-        ResponseBody::fixed(serde_json::to_vec(body)?),
-    )?)
-}
-
 impl JobsBody {
     /// `200 OK` JSON, with a `Link` to the next page when the listing has more.
     ///
@@ -72,20 +60,6 @@ impl FailedJobsBody {
     /// Fails when the body cannot be serialized or a header value built.
     pub fn into_response(self) -> Rendered {
         paginated_json(&self, self.next.as_deref())
-    }
-}
-
-impl NoContent {
-    /// `204 No Content`, empty.
-    ///
-    /// # Errors
-    /// Fails only if the response cannot be assembled.
-    pub fn into_response(self) -> Rendered {
-        Ok(build_response(
-            StatusCode::NO_CONTENT,
-            HeaderMap::new(),
-            ResponseBody::empty(),
-        )?)
     }
 }
 

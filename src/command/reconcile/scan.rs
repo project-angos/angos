@@ -21,7 +21,7 @@ use crate::{
             Error,
             action::Action,
             check::{self, NamespaceChecker},
-            executor::{ActionSink, DryRunSink, Executor, run_job_store},
+            executor::{ActionSink, Executor, run_job_store, run_sink},
             tags::Rankings,
         },
         scrub::default_concurrency,
@@ -31,7 +31,7 @@ use crate::{
         blob_store::BlobStore, manifest::read_manifest, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
-    scan::{ScanImagePayload, is_scan_subject, scan_reports},
+    scan::{ScanImagePayload, scan_reports},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -92,7 +92,7 @@ impl NamespaceChecker for ScanChecker {
             let Some(manifest) = read_manifest(&self.blob_store, &digest).await? else {
                 continue;
             };
-            if !is_scan_subject(&manifest) {
+            if !manifest.is_plain_image() {
                 continue;
             }
             let payload = ScanImagePayload {
@@ -141,16 +141,13 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         resolver: repositories,
         force: options.force,
     };
-    let sink: Box<dyn ActionSink> = if options.dry_run {
-        info!("Dry-run mode: no changes will be made to the storage");
-        Box::new(DryRunSink)
-    } else {
-        Box::new(Executor::new(
+    let sink = run_sink(options.dry_run, || {
+        Ok(Executor::new(
             blob_store,
             metadata_store.clone(),
             run_job_store(&metadata_store, "reconcile"),
         ))
-    };
+    })?;
     check::check_namespaces(
         &metadata_store,
         &checker,
@@ -222,7 +219,8 @@ mod tests {
 
     /// An image with a revision record, which the walk is over.
     async fn seed_image(stack: &FsTestStack, namespace: &Namespace) -> Digest {
-        let (image, _, _) = seed_manifest(&stack.store, &stack.metadata_store, namespace).await;
+        let (image, _, _) =
+            seed_manifest(&stack.blob_store, &stack.metadata_store, namespace).await;
         seed_links(
             &stack.metadata_store,
             namespace,
@@ -370,7 +368,7 @@ mod tests {
         stack.metadata_store.index_namespace(&namespace).await;
         seed_report(&stack, &namespace, &image, Utc::now() - TimeDelta::days(2)).await;
         let job_store = Arc::new(JobStore::new(
-            stack.store.clone(),
+            &stack.metadata_store,
             "reconcile-test",
             ClaimMode::Atomic,
         ));

@@ -6,6 +6,8 @@ use std::{
 use tempfile::TempDir;
 
 use angos_docker_extension_service::CatalogRequest;
+use angos_mtls_client::BasicAuth;
+use angos_oci_client::RegistryClientConfig;
 use angos_secret::Secret;
 
 use crate::{
@@ -90,9 +92,11 @@ async fn test_build_repository_with_upstream() {
             default: Some(AccessMode::Allow),
             ..PolicyConfig::default()
         }),
-        upstream: vec![repository::RegistryClientConfig {
-            username: Some("testuser".to_string()),
-            password: Some(Secret::new("testpass".to_string())),
+        upstream: vec![RegistryClientConfig {
+            basic_auth: Some(BasicAuth {
+                username: "testuser".to_string(),
+                password: Secret::new("testpass".to_string()),
+            }),
             ..test_client_config("https://registry-1.docker.io")
         }],
         ..repository::Config::default()

@@ -1,6 +1,6 @@
 use std::{fmt, num::NonZeroUsize, sync::Arc};
 
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 pub mod admin;
 mod angos_extension;
@@ -8,7 +8,6 @@ pub mod blob;
 pub mod blob_ownership;
 pub mod blob_store;
 pub mod content_discovery;
-mod docker_extension;
 mod error;
 #[cfg(test)]
 mod event_emission_tests;
@@ -16,7 +15,6 @@ pub mod keys;
 pub mod layers;
 pub mod manifest;
 pub mod metadata_store;
-mod oci_service;
 pub mod pagination;
 pub mod repository;
 pub mod repository_resolver;
@@ -30,7 +28,10 @@ use angos_oci::{Namespace, Reference, Tag};
 use crate::{
     configuration::RegexPattern,
     event_webhook::{dispatcher::EventDispatcher, event::Event},
-    jobs::store::JobStore,
+    jobs::{
+        Queue,
+        store::{Error as JobError, JobEnvelope, JobStore},
+    },
     metrics_provider::metrics_provider,
     registry::{
         blob_store::BlobStore, metadata_store::MetadataStore,
@@ -93,23 +94,11 @@ impl RegistryConfig {
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
 pub struct Registry {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
-    enable_blob_redirect: bool,
-    enable_manifest_redirect: bool,
-    update_pull_time: bool,
-    job_queue: Arc<JobStore>,
-    global_immutable_tags: bool,
-    global_immutable_tags_exclusions: Vec<RegexPattern>,
-    max_manifest_size_bytes: usize,
-    max_blob_size_bytes: u64,
-    blob_stream_frame_size: usize,
-    validate_manifest_references: bool,
-    listing_read_concurrency: NonZeroUsize,
-    event_dispatcher: Option<Arc<EventDispatcher>>,
+    config: RegistryConfig,
 }
 
 impl fmt::Debug for Registry {
@@ -145,7 +134,7 @@ impl Registry {
     /// and its own exclusions replace the global ones when it declares any.
     pub fn is_tag_immutable(&self, repository: Option<&Repository>, tag: &Tag) -> bool {
         let immutable =
-            self.global_immutable_tags || repository.is_some_and(|repo| repo.immutable_tags);
+            self.config.global_immutable_tags || repository.is_some_and(|repo| repo.immutable_tags);
         if !immutable {
             return false;
         }
@@ -154,7 +143,7 @@ impl Registry {
             Some(repo) if !repo.immutable_tags_exclusions.is_empty() => {
                 &repo.immutable_tags_exclusions
             }
-            _ => &self.global_immutable_tags_exclusions,
+            _ => &self.config.global_immutable_tags_exclusions,
         };
 
         !exclusions
@@ -172,7 +161,7 @@ impl Registry {
     /// which the transport passes when rendering a [`BlobGet`](angos_oci_service::BlobGet).
     #[must_use]
     pub fn blob_stream_frame_size(&self) -> usize {
-        self.blob_stream_frame_size
+        self.config.blob_stream_frame_size
     }
 
     #[instrument(skip(blob_store, metadata_store, resolver, config))]
@@ -183,33 +172,22 @@ impl Registry {
         config: RegistryConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
-            update_pull_time: config.update_pull_time,
-            enable_blob_redirect: config.enable_blob_redirect,
-            enable_manifest_redirect: config.enable_manifest_redirect,
             blob_store,
             metadata_store,
             resolver,
-            job_queue: config.job_queue,
-            global_immutable_tags: config.global_immutable_tags,
-            global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
-            max_manifest_size_bytes: config.max_manifest_size_bytes,
-            max_blob_size_bytes: config.max_blob_size_bytes,
-            blob_stream_frame_size: config.blob_stream_frame_size,
-            validate_manifest_references: config.validate_manifest_references,
-            listing_read_concurrency: config.listing_read_concurrency,
-            event_dispatcher: config.event_dispatcher,
+            config,
         })
     }
 
     /// The configured webhook dispatcher, shared so externally built handlers
     /// emit through the same instance [`Registry::shutdown`] drains.
     pub fn event_dispatcher(&self) -> Option<Arc<EventDispatcher>> {
-        self.event_dispatcher.clone()
+        self.config.event_dispatcher.clone()
     }
 
     #[cfg(test)]
     pub fn has_event_dispatcher(&self) -> bool {
-        self.event_dispatcher.is_some()
+        self.config.event_dispatcher.is_some()
     }
 
     /// Delivers every event even when an earlier delivery fails, returning the
@@ -217,7 +195,7 @@ impl Registry {
     /// performed action can never go unnotified (at-least-once) at the cost of
     /// a false-positive notification when the action then fails.
     pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
-        let Some(dispatcher) = &self.event_dispatcher else {
+        let Some(dispatcher) = &self.config.event_dispatcher else {
             return Ok(());
         };
         let mut outcome = Ok(());
@@ -233,7 +211,7 @@ impl Registry {
 
     /// Drains in-flight async webhook deliveries to completion.
     pub async fn shutdown(&self) {
-        if let Some(dispatcher) = &self.event_dispatcher {
+        if let Some(dispatcher) = &self.config.event_dispatcher {
             dispatcher.shutdown().await;
         }
     }
@@ -262,6 +240,28 @@ impl Registry {
     /// instead, so a request never resolves the same namespace twice.
     pub fn repository_name_for(&self, namespace: &Namespace) -> String {
         repository_name(self.get_repository_for_namespace(namespace).ok())
+    }
+
+    /// Fire-and-forget enqueue of the follow-up work a write dispatches: a
+    /// failure to build or enqueue `envelope` is logged and counted on
+    /// `queue`, never the client's problem.
+    async fn enqueue_best_effort(
+        &self,
+        queue: Queue,
+        envelope: Result<JobEnvelope, JobError>,
+        what: &str,
+    ) {
+        let outcome = match envelope {
+            Ok(envelope) => self.config.job_queue.enqueue(envelope).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
+            warn!("Failed to enqueue {what}: {error}");
+            metrics_provider()
+                .job_queue_enqueue_failures_total
+                .with_label_values(&[queue.as_str()])
+                .inc();
+        }
     }
 }
 

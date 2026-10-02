@@ -21,13 +21,13 @@ use crate::{
         runner::execute_one,
         store::{self as job_store, ClaimMode, JobHandler, JobRetryPolicy, JobStore},
     },
-    layer::{IndexLayerJobHandler, IndexLimits},
+    layer::{IndexLimits, handler::IndexLayerJobHandler},
     registry::{
         Registry, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
     replication::ReplicationJobHandler,
-    scan::{ScanConfig, ScanJobHandler},
+    scan::{ScanConfig, handler::ScanJobHandler},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -258,14 +258,14 @@ impl WorkerContext {
         };
         let retry_policy = job_queue.retry_policy();
 
-        let claim_mode = job_store::ensure_claim_support(metadata_store.object_store()).await?;
+        let claim_mode = job_store::ensure_claim_support(&metadata_store).await?;
         let registry = bootstrap::registry(
             config,
             blob_store.clone(),
             metadata_store.clone(),
             repositories.clone(),
             Arc::new(JobStore::with_retry_policy(
-                metadata_store.object_store().clone(),
+                &metadata_store,
                 "worker",
                 claim_mode,
                 retry_policy,
@@ -288,7 +288,7 @@ impl WorkerContext {
     /// bound to `queue`.
     fn components_for(&self, queue: Queue) -> Result<Components, Error> {
         let consumer = Arc::new(JobStore::with_retry_policy(
-            self.metadata_store.object_store().clone(),
+            &self.metadata_store,
             Uuid::new_v4().to_string(),
             self.claim_mode,
             self.retry_policy,
@@ -427,7 +427,7 @@ mod tests {
             metadata_store.clone(),
             repositories.clone(),
             RegistryConfig::new(Arc::new(JobStore::new(
-                metadata_store.object_store().clone(),
+                &metadata_store,
                 "worker-test",
                 ClaimMode::Atomic,
             ))),

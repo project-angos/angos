@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Cursor, sync::Arc};
+use std::{collections::HashMap, io::Cursor, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -39,7 +39,7 @@ use crate::{
     registry::{
         Error, Registry, RegistryConfig, Repository,
         blob_store::{self, BlobStore, BlobStoreConfig},
-        keys::{DigestKeys, NamespaceKeys},
+        keys::NamespaceKeys,
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkKind, MetadataStore, Settings},
         repository_resolver::RepositoryResolver,
@@ -61,12 +61,12 @@ pub fn s3_test_connection(key_prefix: String) -> S3ConnectionConfig {
     }
 }
 
-/// One object store over a fresh temp directory, shared by a cache-less
-/// [`MetadataStore`] and a presign-less [`BlobStore`]. Keep the stack alive for
-/// the test's duration: dropping it deletes the directory.
+/// A cache-less [`MetadataStore`] and a presign-less [`BlobStore`] over
+/// separate roots of a fresh temp directory, so a read from the wrong store
+/// finds nothing. Keep the stack alive for the test's duration: dropping it
+/// deletes the directory.
 pub struct FsTestStack {
     pub dir: TempDir,
-    pub store: Arc<dyn ObjectStore>,
     pub metadata_store: Arc<MetadataStore>,
     pub blob_store: Arc<BlobStore>,
 }
@@ -74,12 +74,16 @@ pub struct FsTestStack {
 pub fn fs_test_stack() -> FsTestStack {
     metrics_provider::init_for_tests();
     let dir = TempDir::new().expect("temp dir for fs test stack");
-    let store: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
-    let metadata_store = Arc::new(MetadataStore::new(store.clone(), Settings::default()));
-    let blob_store = Arc::new(BlobStore::new(store.clone(), None));
+    let metadata_store = Arc::new(MetadataStore::new(
+        Arc::new(StorageFsBackend::builder(dir.path().join("meta")).build()),
+        Settings::default(),
+    ));
+    let blob_store = Arc::new(BlobStore::new(
+        Arc::new(StorageFsBackend::builder(dir.path().join("blob")).build()),
+        None,
+    ));
     FsTestStack {
         dir,
-        store,
         metadata_store,
         blob_store,
     }
@@ -125,11 +129,7 @@ pub fn metadata_store_over(object: Arc<dyn ObjectStore>) -> Arc<MetadataStore> {
 /// spawns the loops itself, which is the point: building a registry starts no
 /// background work.
 pub fn test_job_store(metadata_store: &MetadataStore) -> Arc<JobStore> {
-    Arc::new(JobStore::new(
-        metadata_store.object_store().clone(),
-        "test",
-        ClaimMode::Atomic,
-    ))
+    Arc::new(JobStore::new(metadata_store, "test", ClaimMode::Atomic))
 }
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
@@ -322,10 +322,10 @@ pub fn s3_metadata_store() -> Arc<MetadataStore> {
     metadata_store_over(Arc::new(StorageS3Backend::builder(http).build()))
 }
 
-pub async fn put_blob_direct(store: &Arc<dyn ObjectStore>, content: &[u8]) -> Digest {
+pub async fn put_blob_direct(blob_store: &BlobStore, content: &[u8]) -> Digest {
     let digest = Digest::sha256_of_bytes(content);
-    store
-        .put(&digest.blob_path(), Bytes::copy_from_slice(content))
+    blob_store
+        .put_blob(&digest, Bytes::copy_from_slice(content))
         .await
         .unwrap();
     digest
@@ -360,7 +360,9 @@ pub async fn get_blob(
     } else {
         return Err(Error::BlobUnknown);
     };
-    Ok(served.into_response(registry.blob_stream_frame_size())?)
+    Ok(served
+        .into_response(registry.blob_stream_frame_size())
+        .expect("a served blob renders"))
 }
 
 pub async fn create_test_blob(
@@ -421,18 +423,25 @@ pub struct FSRegistryTestCase {
 }
 
 impl FSRegistryTestCase {
+    /// Blob and metadata stores over separate roots, the split-backend topology
+    /// a deployment can configure, so a read from the wrong store finds
+    /// nothing.
     pub fn new() -> Self {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
-        let path = temp_dir.path().to_path_buf();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir for split backends");
+        let blob_path = temp_dir.path().join("blob");
+        let meta_path = temp_dir.path().join("meta");
 
         let config = BlobStoreConfig::FS(blob_store::FsBackendConfig {
-            root_dir: path.clone(),
+            root_dir: blob_path,
             sync_to_disk: false,
         });
         let blob_store = Arc::new(config.build_backend().expect("fs blob backend"));
 
-        let meta_storage: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
+        let meta_storage: Arc<dyn ObjectStore> = Arc::new(
+            StorageFsBackend::builder(&meta_path)
+                .sync_to_disk(false)
+                .build(),
+        );
         let metadata_store = metadata_store_over(meta_storage);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
@@ -464,43 +473,16 @@ impl FSRegistryTestCase {
         }
     }
 
-    /// Blob and metadata stores over separate roots, the split-backend topology
-    /// a deployment can configure. `blob_path(digest)` then addresses different
-    /// physical objects per store, so a manifest written through the metadata
-    /// store would be invisible to the blob-store read path.
-    pub fn with_split_backends() -> Self {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir for split backends");
-        let blob_path = temp_dir.path().join("blob");
-        let meta_path = temp_dir.path().join("meta");
-
-        let config = BlobStoreConfig::FS(blob_store::FsBackendConfig {
-            root_dir: blob_path,
-            sync_to_disk: false,
-        });
-        let blob_store = Arc::new(config.build_backend().expect("fs blob backend"));
-
-        let meta_storage: Arc<dyn ObjectStore> = Arc::new(
-            StorageFsBackend::builder(&meta_path)
-                .sync_to_disk(false)
-                .build(),
-        );
-        let metadata_store = metadata_store_over(meta_storage);
-        let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
-
-        Self {
-            blob_store,
-            metadata_store,
-            registry,
-            temp_dir,
-        }
-    }
-
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
 
-    pub fn temp_dir(&self) -> &TempDir {
-        &self.temp_dir
+    pub fn blob_root(&self) -> PathBuf {
+        self.temp_dir.path().join("blob")
+    }
+
+    pub fn metadata_root(&self) -> PathBuf {
+        self.temp_dir.path().join("meta")
     }
 }
 
@@ -525,19 +507,20 @@ impl RegistryTestCase for FSRegistryTestCase {
 
 pub struct S3RegistryTestCase {
     key_prefix: String,
-    s3_blob_store: Arc<BlobStore>,
-    s3_metadata_store: Arc<MetadataStore>,
-    s3_registry: Arc<Registry>,
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
+    registry: Arc<Registry>,
 }
 
 impl S3RegistryTestCase {
     pub fn new() -> Self {
+        // Separate prefixes, so a read from the wrong store finds nothing.
         let key_prefix = format!("test-{}", Uuid::new_v4());
-
-        let connection = s3_test_connection(key_prefix.clone());
+        let blob_connection = s3_test_connection(format!("{key_prefix}/blob"));
+        let meta_connection = s3_test_connection(format!("{key_prefix}/meta"));
 
         let s3_config = blob_store::S3BackendConfig {
-            connection: connection.clone(),
+            connection: blob_connection,
             transport: blob_store::TransportFields {
                 multipart_copy_threshold: ByteSize::mib(5),
                 multipart_copy_chunk_size: ByteSize::mib(5),
@@ -551,8 +534,9 @@ impl S3RegistryTestCase {
                 .expect("s3 blob backend"),
         );
 
-        let meta_http =
-            Arc::new(S3HttpBackend::new(&connection.to_client_config()).expect("s3 http client"));
+        let meta_http = Arc::new(
+            S3HttpBackend::new(&meta_connection.to_client_config()).expect("s3 http client"),
+        );
         let meta_object_store: Arc<dyn ObjectStore> =
             Arc::new(StorageS3Backend::builder(meta_http).build());
         let metadata_store = metadata_store_over(meta_object_store);
@@ -561,9 +545,9 @@ impl S3RegistryTestCase {
 
         Self {
             key_prefix,
-            s3_blob_store: blob_store,
-            s3_metadata_store: metadata_store,
-            s3_registry: registry,
+            blob_store,
+            metadata_store,
+            registry,
         }
     }
 }
@@ -575,24 +559,26 @@ impl RegistryTestCase for S3RegistryTestCase {
     }
 
     fn registry(&self) -> &Registry {
-        &self.s3_registry
+        &self.registry
     }
 
     fn blob_store(&self) -> Arc<BlobStore> {
-        self.s3_blob_store.clone()
+        self.blob_store.clone()
     }
 
     fn metadata_store(&self) -> Arc<MetadataStore> {
-        self.s3_metadata_store.clone()
+        self.metadata_store.clone()
     }
 
+    /// Both stores are rooted under the case's prefix, so only a bucket-level
+    /// store can delete it whole.
     async fn cleanup(&self) {
-        if let Err(e) = self
-            .s3_blob_store
-            .object_store()
-            .delete_prefix(&self.key_prefix)
-            .await
-        {
+        let http = Arc::new(
+            S3HttpBackend::new(&s3_test_connection(String::new()).to_client_config())
+                .expect("s3 http client"),
+        );
+        let bucket = StorageS3Backend::builder(http).build();
+        if let Err(e) = bucket.delete_prefix(&self.key_prefix).await {
             println!("Warning: Failed to clean up S3RegistryTestCase data: {e:?}");
         }
     }
@@ -684,15 +670,15 @@ pub fn angos_report(subject: &Digest, created: &str) -> (Vec<u8>, Descriptor) {
 /// Seed a config blob, a layer blob, a manifest referencing both, and a `v1`
 /// tag link under `namespace`, returning the (manifest, config, layer) digests.
 pub async fn seed_manifest(
-    store: &Arc<dyn ObjectStore>,
+    blob_store: &BlobStore,
     metadata_store: &MetadataStore,
     namespace: &Namespace,
 ) -> (Digest, Digest, Digest) {
     let config_bytes = br#"{"config":true}"#.to_vec();
     let layer_bytes = b"layer-bytes".to_vec();
 
-    let config_digest = put_blob_direct(store, &config_bytes).await;
-    let layer_digest = put_blob_direct(store, &layer_bytes).await;
+    let config_digest = put_blob_direct(blob_store, &config_bytes).await;
+    let layer_digest = put_blob_direct(blob_store, &layer_bytes).await;
 
     let manifest = json!({
         "schemaVersion": 2,
@@ -709,7 +695,7 @@ pub async fn seed_manifest(
         }],
     });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(store, &manifest_bytes).await;
+    let manifest_digest = put_blob_direct(blob_store, &manifest_bytes).await;
 
     seed_links(
         metadata_store,

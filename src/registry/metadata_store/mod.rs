@@ -22,6 +22,7 @@ pub mod access_time;
 mod blob_index;
 mod catalog;
 mod gc;
+mod listing;
 mod record;
 pub mod tag;
 
@@ -241,20 +242,6 @@ impl MetadataStore {
         &self.object
     }
 
-    /// Every key name under `dir`, in listing order.
-    pub async fn list_names(&self, dir: &str) -> Result<Vec<String>, Error> {
-        let mut names = Vec::new();
-        let mut token = None;
-        loop {
-            let page = self.object.list(dir, LIST_PAGE, token).await?;
-            names.extend(page.items);
-            token = page.next_token;
-            if token.is_none() {
-                return Ok(names);
-            }
-        }
-    }
-
     /// Write one link of any kind: the repair path's "make this link exist". The reference key lands first and is
     /// checked against collector runs before the record it pins, the same
     /// order a push keeps across its whole batch; a kind that lives as a
@@ -331,8 +318,8 @@ mod tests {
         for_each_backend(async |test_case| {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("test-update-links").unwrap();
-            let digest1 = put_blob_direct(m.object_store(), b"content1").await;
-            let digest2 = put_blob_direct(m.object_store(), b"content2").await;
+            let digest1 = put_blob_direct(&test_case.blob_store(), b"content1").await;
+            let digest2 = put_blob_direct(&test_case.blob_store(), b"content2").await;
 
             let tag = LinkKind::Tag(Tag::new("v1").unwrap());
             let revision = LinkKind::Digest(digest2.clone());
@@ -378,7 +365,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let m = test_case.metadata_store();
             let namespace = Namespace::new("media-type-test").unwrap();
-            let digest = put_blob_direct(m.object_store(), b"test content").await;
+            let digest = put_blob_direct(&test_case.blob_store(), b"test content").await;
             let recorded =
                 MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap();
 
