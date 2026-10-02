@@ -36,6 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Each page of the revision listing reads only the revisions it serves, instead of every record, referrer and index body in the namespace.
 - The web UI reads the repository names once per page load, instead of on every navigation and every hovered link.
 - Browsing a large layer's files decodes its stored listing off the request threads, so it no longer stalls other requests.
+- On the filesystem backend, a listing page reads only the directories it pages through, instead of walking and sorting everything under its prefix.
 
 ## 1.12.1
 

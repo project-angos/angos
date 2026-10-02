@@ -14,7 +14,6 @@
 //! keeps writing to the file it opened.
 
 use std::{
-    collections::VecDeque,
     fs::{File, FileType},
     io::{self, ErrorKind, Read, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -22,7 +21,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, TryStreamExt, stream::try_unfold};
+use futures_util::{Stream, StreamExt, TryStreamExt, stream::try_unfold};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::{
     fs,
@@ -365,46 +364,49 @@ async fn read_dir_sorted(path: &Path) -> Result<Vec<(String, FileType)>, Error> 
     Ok(entries)
 }
 
-/// Walk `root` once, streaming every regular-file key relative to `root`
-/// itself. Only the directory stack and one directory's entries are held, so a
-/// whole-store scan does not materialise the tree.
-fn walk_keys(root: PathBuf) -> impl Stream<Item = Result<String, Error>> + Send {
-    let stack = vec![root.clone()];
+/// Every regular-file key under `root` strictly above `after`, relative to
+/// `root` and in lexical order, as the S3 backend lists them. A directory
+/// sorts as its name plus `/`, where its keys fall (`a.txt` < `a/x` < `a0`),
+/// so one wholly at or below `after` is never read, and directories are read
+/// only as the stream is polled. Only the pending siblings along one path are
+/// held, so a whole-store scan does not materialise the tree.
+fn walk_sorted(
+    root: PathBuf,
+    after: Option<String>,
+) -> impl Stream<Item = Result<String, Error>> + Send {
+    // Each pending entry is a key, or a directory's prefix (`true`) ending in
+    // `/`, the root's being empty; the last one sorts first.
+    let pending = vec![(String::new(), true)];
     try_unfold(
-        (stack, VecDeque::new(), root),
-        |(mut stack, mut ready, root)| async move {
-            loop {
-                if let Some(key) = ready.pop_front() {
-                    return Ok(Some((key, (stack, ready, root))));
+        (pending, root, after),
+        |(mut pending, root, after)| async move {
+            while let Some((key, is_dir)) = pending.pop() {
+                if !is_dir {
+                    return Ok(Some((key, (pending, root, after))));
                 }
-                let Some(current) = stack.pop() else {
-                    return Ok(None);
-                };
-                // Reverse so `pop` takes sub-directories, and `push_front`
-                // takes files, in name order.
-                for (name, file_type) in read_dir_sorted(&current).await?.into_iter().rev() {
-                    let child = current.join(&name);
-                    if file_type.is_dir() {
-                        stack.push(child);
-                    } else if let Ok(rel) = child.strip_prefix(&root)
-                        && let Some(rel) = rel.to_str()
-                    {
-                        ready.push_front(rel.to_string());
-                    }
-                }
+                let mut children: Vec<(String, bool)> = read_dir_sorted(&root.join(&key))
+                    .await?
+                    .into_iter()
+                    .map(|(name, file_type)| {
+                        if file_type.is_dir() {
+                            (format!("{key}{name}/"), true)
+                        } else {
+                            (format!("{key}{name}"), false)
+                        }
+                    })
+                    // A directory the cursor lies in still holds keys above it.
+                    .filter(|(child, is_dir)| {
+                        after.as_deref().is_none_or(|after| {
+                            child.as_str() > after || (*is_dir && after.starts_with(child.as_str()))
+                        })
+                    })
+                    .collect();
+                children.sort();
+                pending.extend(children.into_iter().rev());
             }
+            Ok(None)
         },
     )
-}
-
-/// Every regular-file key under `dir`, relative to `dir` itself and sorted
-/// lexicographically. Matches the S3 backend, which returns prefix-relative
-/// names from `ListObjectsV2`. Depth-first name order is not lexicographic
-/// (`a.txt` sorts below `a/x`), so the walk's output is sorted here.
-async fn collect_flat_keys(dir: &Path) -> Result<Vec<String>, Error> {
-    let mut keys: Vec<String> = walk_keys(dir.to_path_buf()).try_collect().await?;
-    keys.sort();
-    Ok(keys)
 }
 
 #[async_trait]
@@ -505,28 +507,24 @@ impl ObjectStore for Backend {
         token: Option<String>,
         start_after: Option<String>,
     ) -> Result<Page<String>, Error> {
-        let all_keys = collect_flat_keys(&self.full_path(prefix)).await?;
+        let n = usize::from(n);
         // Listings sort, so a token and a start-after bound resume the same
-        // way: skip to the first key strictly above the cursor.
-        let cursor = token.or(start_after);
-        let start = cursor.as_deref().map_or(0, |t| {
-            all_keys
-                .iter()
-                .position(|k| k.as_str() > t)
-                .unwrap_or(all_keys.len())
-        });
-        let end = (start + n as usize).min(all_keys.len());
-        let items: Vec<String> = all_keys[start..end].to_vec();
-        let next_token = (end < all_keys.len())
-            .then(|| items.last().cloned())
-            .flatten();
+        // way, from the first key strictly above the cursor. The one key past
+        // the page only tells whether more remain.
+        let mut items: Vec<String> = walk_sorted(self.full_path(prefix), token.or(start_after))
+            .take(n + 1)
+            .try_collect()
+            .await?;
+        let more = items.len() > n;
+        items.truncate(n);
+        let next_token = more.then(|| items.last().cloned()).flatten();
         Ok(Page { items, next_token })
     }
 
-    fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
-        // The paged listing re-walks the subtree for every page, which a
-        // whole-store scan cannot afford.
-        Box::pin(walk_keys(self.full_path(prefix)))
+    /// One walk, where draining pages would read the directories on each
+    /// page's cursor path again.
+    fn list_in_order<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
+        Box::pin(walk_sorted(self.full_path(prefix), None))
     }
 
     async fn list_children(

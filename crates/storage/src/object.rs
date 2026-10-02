@@ -172,11 +172,10 @@ pub trait ObjectStore: Send + Sync {
     /// lazily with no caller-managed continuation token. Keys arrive in no
     /// guaranteed order.
     ///
-    /// The default is [`ObjectStore::list_in_order`], which both shipped
-    /// backends override: S3 walks disjoint key ranges concurrently, so a
-    /// whole-store scan (scrub, migration) is bounded by its slowest range
-    /// rather than by one continuation-token chain, and FS walks its tree once
-    /// instead of re-walking it per page.
+    /// The default is [`ObjectStore::list_in_order`], which FS overrides to
+    /// walk its tree once. S3 overrides this instead, walking disjoint key
+    /// ranges concurrently, so a whole-store scan (scrub, migration) is bounded
+    /// by its slowest range rather than by one continuation-token chain.
     fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
         self.list_in_order(prefix)
     }
