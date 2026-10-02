@@ -393,11 +393,10 @@ revisions. A revision held from two pages is listed on each.
 
 A revision that is itself another's referrer is listed as a leaf: the web UI shows it under its
 subject with no push or pull time, so neither `pushed_at` nor `last_pulled_at` is reported for it.
-`last_pulled_at` is reported for the rest only while `update_pull_time` records pulls. The listing
-reads one record per root revision, one descriptor per referrer, and a manifest body only for an
-index, with the fan-out set by `listing_read_concurrency`; its cost is set by the number of roots
-and referrers rather than by a round trip per manifest field. Pull times are read for the page's
-revisions alone.
+`last_pulled_at` is reported for the rest only while `update_pull_time` records pulls. Each
+request walks the namespace's revisions, tags and referrers, and reads only the manifest bodies the
+replica has not cached (see `revision_cache_entries`). Push times, referrer descriptors and pull
+times are read for the served revisions alone, with the fan-out set by `listing_read_concurrency`.
 
 **Response:**
 ```json

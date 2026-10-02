@@ -7,6 +7,7 @@ use crate::{
     configuration::{RegexPattern, TrustedProxy},
     jobs::store::JobQueueConfig,
     policy::{AccessMode, PolicyConfig, RetentionPolicyConfig},
+    registry::admin::DEFAULT_REVISION_CACHE_ENTRIES,
     registry::metadata_store::{DEFAULT_GC_GRACE_SECS, PullHistoryConfig},
     registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY},
 };
@@ -110,6 +111,10 @@ pub struct GlobalConfig {
     /// per request: revision records, referrer descriptors, job records.
     #[serde(default = "default_listing_read_concurrency")]
     pub listing_read_concurrency: NonZeroUsize,
+    /// Manifests whose index children each replica keeps in memory, so paging
+    /// the revision listing reads a namespace's manifest bodies once.
+    #[serde(default = "default_revision_cache_entries")]
+    pub revision_cache_entries: NonZeroUsize,
     /// Reclamation grace period in seconds: scrub leaves unreferenced blobs,
     /// dangling reference keys and stale index entries younger than this alone,
     /// so it cannot race an in-flight push or upload. Lower it only for offline
@@ -137,6 +142,10 @@ fn default_namespace_walk_concurrency() -> NonZeroUsize {
 
 fn default_listing_read_concurrency() -> NonZeroUsize {
     LISTING_READ_CONCURRENCY
+}
+
+fn default_revision_cache_entries() -> NonZeroUsize {
+    DEFAULT_REVISION_CACHE_ENTRIES
 }
 
 fn default_gc_grace_secs() -> u64 {
@@ -224,6 +233,7 @@ impl Default for GlobalConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             namespace_walk_concurrency: default_namespace_walk_concurrency(),
             listing_read_concurrency: default_listing_read_concurrency(),
+            revision_cache_entries: default_revision_cache_entries(),
             gc_grace_secs: default_gc_grace_secs(),
             pull_history: PullHistoryConfig::default(),
             trusted_proxies: Vec::new(),

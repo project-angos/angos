@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Event webhooks and the scanner client take `server_ca_bundle`, `client_certificate_bundle` and `client_private_key`, to reach an endpoint behind a private CA or one requiring a client certificate.
+- `revision_cache_entries` sets how many manifests each replica keeps the index children of for the revision listing.
 
 ### Changed
 
@@ -32,6 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The web UI shows and copies a sha512 manifest as `repo@sha512:<hex>`, the reference it is pulled by, instead of `repo:sha512:<hex>`.
 - The web UI's vulnerability table reads a finding's severity as the report badge does, so the two no longer disagree.
 - The web UI pages the referrers of a pull-through manifest with more than 150 of them without skipping upstream ones.
+- Each page of the revision listing reads only the revisions it serves, instead of every record, referrer and index body in the namespace.
 
 ## 1.12.1
 

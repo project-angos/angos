@@ -1,4 +1,9 @@
-use std::{fmt, num::NonZeroUsize, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+};
 
 use tracing::{instrument, warn};
 
@@ -23,7 +28,7 @@ pub mod s3_connection;
 pub mod test_utils;
 pub mod upload;
 
-use angos_oci::{Namespace, Reference, Tag};
+use angos_oci::{Digest, Namespace, Reference, Tag};
 
 use crate::{
     configuration::RegexPattern,
@@ -34,7 +39,7 @@ use crate::{
     },
     metrics_provider::metrics_provider,
     registry::{
-        blob_store::BlobStore, metadata_store::MetadataStore,
+        admin::ManifestAnalysis, blob_store::BlobStore, metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
 };
@@ -61,6 +66,8 @@ pub struct RegistryConfig {
     pub validate_manifest_references: bool,
     /// Concurrent reads an admin listing keeps in flight per request.
     pub listing_read_concurrency: NonZeroUsize,
+    /// Manifests whose analysis the revision listing keeps in memory.
+    pub revision_cache_entries: NonZeroUsize,
     /// The queue every cache-fill and replication job is enqueued to. Who
     /// drains it is the caller's business: the registry only enqueues, and
     /// starts nothing of its own.
@@ -88,6 +95,7 @@ impl RegistryConfig {
             // default via `[global]`.
             validate_manifest_references: true,
             listing_read_concurrency: pagination::LISTING_READ_CONCURRENCY,
+            revision_cache_entries: admin::DEFAULT_REVISION_CACHE_ENTRIES,
             job_queue,
             event_dispatcher: None,
         }
@@ -99,6 +107,8 @@ pub struct Registry {
     metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
     config: RegistryConfig,
+    /// The revision listing's manifest analyses, keyed by digest.
+    manifest_analyses: Mutex<HashMap<Digest, Arc<ManifestAnalysis>>>,
 }
 
 impl fmt::Debug for Registry {
@@ -176,6 +186,7 @@ impl Registry {
             metadata_store,
             resolver,
             config,
+            manifest_analyses: Mutex::new(HashMap::new()),
         })
     }
 
