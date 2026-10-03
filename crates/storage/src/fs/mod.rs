@@ -294,38 +294,48 @@ async fn copy_into_place(
     }
 }
 
-async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Error> {
-    // A concurrent `delete` can prune the parent directory between
-    // `ensure_parent` and temp-file creation (see `prune_empty_ancestors`).
-    // Once the temp file exists the directory is non-empty and safe from the
-    // sweep, so only creation races: retry the racy error kinds with the same
-    // bound as `ensure_parent`.
+/// Run `write`, which stages a temp file in `target`'s parent and puts it in
+/// place, on a blocking thread. A concurrent `delete` can prune the parent
+/// between `ensure_parent` and the temp file's creation (see
+/// `prune_empty_ancestors`); once the temp file exists the directory is
+/// non-empty and safe from the sweep, so only creation races, and the racy
+/// error kinds re-create the parent and retry, bounded as `ensure_parent` is.
+async fn write_beside<T, F>(target: &Path, op: &str, write: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: Fn(&Path) -> io::Result<T> + Clone + Send + 'static,
+{
     let mut attempt = 0;
     loop {
         ensure_parent(target).await?;
         let parent = target.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-        let final_path = target.to_owned();
-        let body = data.clone();
-        let result = spawn_blocking(move || -> io::Result<()> {
-            staged_file(&parent, sync, |file| file.write_all(&body))?
-                .persist(final_path)
-                .map_err(|e| e.error)?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("temp-write task panicked: {e}")))?;
+        let write = write.clone();
+        let result = spawn_blocking(move || write(&parent))
+            .await
+            .map_err(|e| Error::Backend(format!("{op} task panicked: {e}")))?;
         match result {
-            Ok(()) => return Ok(()),
+            Ok(value) => return Ok(value),
             Err(e) => {
                 let racy = matches!(e.kind(), ErrorKind::InvalidInput | ErrorKind::NotFound);
                 attempt += 1;
                 if !racy || attempt >= ENSURE_PARENT_RETRIES {
-                    return Err(backend_error("atomic_write", target, &e));
+                    return Err(backend_error(op, target, &e));
                 }
                 yield_now().await;
             }
         }
     }
+}
+
+async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Error> {
+    let final_path = target.to_owned();
+    write_beside(target, "atomic_write", move |parent| {
+        staged_file(parent, sync, |file| file.write_all(&data))?
+            .persist(&final_path)
+            .map_err(|e| e.error)?;
+        Ok(())
+    })
+    .await
 }
 
 /// Split directory entries into `(sub_prefixes, objects)` by file type.
@@ -434,22 +444,19 @@ impl ObjectStore for Backend {
 
     async fn create_if_absent(&self, key: &str, data: Bytes) -> Result<bool, Error> {
         let target = self.full_path(key);
-        ensure_parent(&target).await?;
-        let parent = target.parent().unwrap_or_else(|| Path::new(".")).to_owned();
+        let link = target.clone();
         let sync = self.sync_to_disk;
-        spawn_blocking(move || -> Result<bool, Error> {
-            // `link(2)` is the atomic create-if-absent that also holds on
-            // NFS: the temp file is fully written before the name appears.
-            let temp = staged_file(&parent, sync, |file| file.write_all(&data))
-                .map_err(|e| backend_error("create_if_absent", &target, &e))?;
-            match std::fs::hard_link(temp.path(), &target) {
+        // `link(2)` is the atomic create-if-absent that also holds on NFS: the
+        // temp file is fully written before the name appears.
+        write_beside(&target, "create_if_absent", move |parent| {
+            let temp = staged_file(parent, sync, |file| file.write_all(&data))?;
+            match std::fs::hard_link(temp.path(), &link) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
-                Err(e) => Err(backend_error("create_if_absent", &target, &e)),
+                Err(e) => Err(e),
             }
         })
         .await
-        .map_err(|e| Error::Backend(format!("create-if-absent task panicked: {e}")))?
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {

@@ -50,6 +50,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub no longer holds a record of every revision it validated for the whole run.
 - The web UI's pull history tab shows the error when the registry refuses it, instead of re-requesting in a loop.
 - S3 conditional writes and multipart creates and completes are no longer replayed after a 500, 502 or 504, which could read a write's own success as a conflict, drop a job enqueue, or open a second multipart upload.
+- On the filesystem backend, a create-if-absent that races the removal of its directory retries instead of failing as not found.
+- A streamed S3 part whose endpoint never answers fails at `operation_attempt_timeout` once its body is sent, instead of hanging.
+- A client that stalls or disconnects mid-part no longer counts as an S3 failure toward opening the circuit breaker.
 
 ## 1.12.1
 

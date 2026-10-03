@@ -11,6 +11,7 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     future::Future,
     io,
+    pin::pin,
     sync::Arc,
     time::Duration,
 };
@@ -20,7 +21,10 @@ use arc_swap::ArcSwapOption;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures_util::{Stream, StreamExt};
+use futures_util::{
+    Stream, StreamExt, TryStreamExt,
+    future::{Either, pending, select},
+};
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use reqwest::{
@@ -30,7 +34,10 @@ use reqwest::{
     },
 };
 use sha2::Sha256;
-use tokio::time::{sleep, timeout};
+use tokio::{
+    sync::watch,
+    time::{sleep, timeout},
+};
 use url::Url;
 
 use crate::BackendConfig;
@@ -188,6 +195,14 @@ impl Display for S3Error {
 }
 
 impl std::error::Error for S3Error {}
+
+/// A streamed request's failure, and whether its body had gone out in full by
+/// then: until it has, the pushing client paces the exchange, so a failure may
+/// be its slowness or departure rather than the backend's.
+pub struct StreamedFailure {
+    pub error: S3Error,
+    pub body_sent: bool,
+}
 
 /// Request body variants. `Bytes` payloads are replayable across retries
 /// (cheap to clone: refcount only). `Stream` is one-shot; it disables
@@ -373,9 +388,12 @@ impl S3Client {
 
     /// Send a request whose body is produced by a `Stream`. The body is one-shot
     /// (no retries) and signed as UNSIGNED-PAYLOAD so it never has to be
-    /// buffered. It carries no deadline of its own: the pushing client paces it,
-    /// so any S3-side timer would cap that client's speed and then count the
-    /// slow push as a backend failure against the circuit breaker.
+    /// buffered. The pushing client paces the body, so nothing is timed until
+    /// its last byte is out, as any timer would cap that client's speed; from
+    /// then on S3 owes an answer within `operation_attempt_timeout`.
+    ///
+    /// # Errors
+    /// The failure, telling whether the body had been sent in full.
     pub async fn send_streaming_body<S>(
         &self,
         method: Method,
@@ -384,28 +402,55 @@ impl S3Client {
         headers: HeaderMap,
         content_length: u64,
         stream: S,
-    ) -> Result<S3Response, S3Error>
+    ) -> Result<S3Response, StreamedFailure>
     where
         S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static,
     {
-        let response = self
-            .dispatch(
-                method,
-                key,
-                &query,
-                headers,
-                RequestBody::Stream {
-                    content_length,
-                    stream,
-                },
-                None,
-            )
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(S3Error::from_response(response).await);
-        }
-        collect_full_response(response).await
+        let (sent_tx, mut sent_rx) = watch::channel(content_length == 0);
+        let mut unsent = content_length;
+        let stream = stream.inspect_ok(move |chunk| {
+            unsent = unsent.saturating_sub(chunk.len() as u64);
+            if unsent == 0 {
+                sent_tx.send_replace(true);
+            }
+        });
+        let exchange = async {
+            let response = self
+                .dispatch(
+                    method,
+                    key,
+                    &query,
+                    headers,
+                    RequestBody::Stream {
+                        content_length,
+                        stream,
+                    },
+                    None,
+                )
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(S3Error::from_response(response).await);
+            }
+            collect_full_response(response).await
+        };
+        let answer_due = async {
+            // A body that stops short ends the exchange on its own.
+            let sent = sent_rx.wait_for(|sent| *sent).await.is_ok();
+            if sent {
+                sleep(self.operation_attempt_timeout).await;
+            } else {
+                pending::<()>().await;
+            }
+        };
+        let result = match select(pin!(exchange), pin!(answer_due)).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), _)) => Err(S3Error::timeout(self.operation_attempt_timeout)),
+        };
+        result.map_err(|error| StreamedFailure {
+            error,
+            body_sent: *sent_rx.borrow(),
+        })
     }
 
     /// Send a request and return the raw response for streaming download.
