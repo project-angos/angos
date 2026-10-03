@@ -40,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A blob mount without `from`, and replication's mount hint, read only the namespaces they use off the blob's reference index, instead of all of it.
 - A manifest delete by digest finds the tags pointing at it from its reference keys, instead of walking every tag in the namespace.
 - Each page of a subject's referrers reads its records from the page's cursor, instead of listing all of them again.
+- The web UI's filesystem tree applies a path filter once typing pauses and shows at most 1000 rows, so filtering a large image no longer freezes the tab.
 
 ## 1.12.1
 

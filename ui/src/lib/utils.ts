@@ -705,18 +705,43 @@ export function fsVisible(matcher: FsMatcher, node: FsNode): boolean {
 	return fsMatches(matcher, node) || [...node.children.values()].some((c) => fsVisible(matcher, c));
 }
 
-/** The rows the tree view shows, in order: a narrowed tree opens itself, as `FsRow` does. */
-export function fsRows(root: FsNode, expanded: Set<string>, matcher: FsMatcher): FsNode[] {
+/** One row of the tree view, with what its guide lines need. */
+export interface FsTreeRow {
+	node: FsNode;
+	depth: number;
+	/** Whether each ancestor column carries a continuing guide line. */
+	guides: boolean[];
+	/** Whether a sibling follows, so the row's own guide line continues. */
+	hasNext: boolean;
+	open: boolean;
+}
+
+/**
+ * The rows the tree view shows, in order: a narrowed tree opens itself. Each
+ * node's visibility is settled once, so narrowing costs one pass over the tree.
+ */
+export function fsRows(root: FsNode, expanded: Set<string>, matcher: FsMatcher): FsTreeRow[] {
 	const filtering = matcher.layers.size > 0 || matcher.text !== '';
-	const rows: FsNode[] = [];
-	const walk = (node: FsNode) => {
-		for (const child of sortedChildren(node)) {
-			if (filtering && !fsVisible(matcher, child)) continue;
-			rows.push(child);
-			if (child.kind === 'dir' && (matcher.text !== '' || expanded.has(child.path))) walk(child);
+	const visible = new Map<FsNode, boolean>();
+	const shown = (node: FsNode): boolean => {
+		let seen = visible.get(node);
+		if (seen === undefined) {
+			seen = fsMatches(matcher, node) || [...node.children.values()].some(shown);
+			visible.set(node, seen);
 		}
+		return seen;
 	};
-	walk(root);
+	const rows: FsTreeRow[] = [];
+	const walk = (dir: FsNode, depth: number, guides: boolean[]) => {
+		const kids = sortedChildren(dir).filter((child) => !filtering || shown(child));
+		kids.forEach((node, i) => {
+			const hasNext = i < kids.length - 1;
+			const open = node.kind === 'dir' && (matcher.text !== '' || expanded.has(node.path));
+			rows.push({ node, depth, guides, hasNext, open });
+			if (open) walk(node, depth + 1, [...guides, hasNext]);
+		});
+	};
+	walk(root, 0, []);
 	return rows;
 }
 

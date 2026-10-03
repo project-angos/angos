@@ -43,6 +43,10 @@
 
 	/** Rows a wasted-space list shows, the largest. */
 	const WASTE_ROWS = 100;
+	/** Rows the tree view shows: a filter can match most of an image. */
+	const TREE_ROWS = 1000;
+	/** How long typing pauses before the filter applies. */
+	const FILTER_DELAY_MS = 150;
 
 	// Replaced whole, never edited, so neither needs a deep proxy.
 	let listings = $state.raw<(LayerListing | null)[]>([]);
@@ -60,6 +64,8 @@
 	let pane = $state<HTMLElement>();
 	let grid = $state<HTMLElement>();
 	let search = $state('');
+	/** The filter text the views apply, `search` once typing pauses. */
+	let query = $state('');
 	let expanded = $state<Set<string>>(new Set());
 	/** The folder the icon view is in. */
 	let cwd = $state('');
@@ -100,6 +106,7 @@
 		cwd = '';
 		layerFilter = new Set();
 		search = '';
+		query = '';
 		clearTimeout(timer);
 		// The load reads the listings it may keep; they are not this effect's to track.
 		untrack(() => load(0));
@@ -111,7 +118,12 @@
 			? mergeLayers(listings as LayerListing[])
 			: null
 	);
-	const matcher = $derived<FsMatcher>({ layers: layerFilter, text: search.trim().toLowerCase() });
+	$effect(() => {
+		const text = search.trim().toLowerCase();
+		const pause = setTimeout(() => (query = text), FILTER_DELAY_MS);
+		return () => clearTimeout(pause);
+	});
+	const matcher = $derived<FsMatcher>({ layers: layerFilter, text: query });
 	const filtering = $derived(layerFilter.size > 0 || matcher.text !== '');
 	const deleted = $derived(tree ? tree.deletions.filter((d) => layerFilter.has(d.layer)) : []);
 	const total = $derived(listings.reduce((sum, listing) => sum + (listing?.entries.length ?? 0), 0));
@@ -158,10 +170,11 @@
 
 	const risky = $derived(tree ? fsRisks(tree.root) : []);
 
+	const rows = $derived(tree && view === 'tree' ? fsRows(tree.root, expanded, matcher) : []);
 	/** The nodes the current view lists, in order, which the keyboard walks. */
 	const items = $derived.by((): FsNode[] => {
 		if (!tree) return [];
-		if (view === 'tree') return fsRows(tree.root, expanded, matcher);
+		if (view === 'tree') return rows.slice(0, TREE_ROWS).map((row) => row.node);
 		if (view === 'icons') return tiles;
 		if (view === 'secrets') return secrets;
 		if (view === 'permissions') return risky.map((risk) => risk.node);
@@ -435,13 +448,9 @@
 							</tr>
 						</thead>
 						<tbody>
-							{#each sortedChildren(tree.root) as node, i (node.path)}
+							{#each rows.slice(0, TREE_ROWS) as row (row.node.path)}
 								<FsRow
-									{node}
-									depth={0}
-									guides={[]}
-									hasNext={i < tree.root.children.size - 1}
-									{expanded}
+									{...row}
 									{matcher}
 									selected={inTree(target) ? (target?.path ?? null) : null}
 									cursor={rover?.path ?? null}
@@ -453,6 +462,11 @@
 									{layerlabel}
 								/>
 							{/each}
+							{#if rows.length > TREE_ROWS}
+								<tr>
+									<td class="muted" colspan="5">And {rows.length - TREE_ROWS} more entries; filter to narrow them</td>
+								</tr>
+							{/if}
 							{#each deleted as gone}
 								<tr>
 									<td class="fs-name fs-deleted" colspan="4">{gone.path}</td>
