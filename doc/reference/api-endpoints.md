@@ -146,7 +146,7 @@ GET  /v2/{namespace}/manifests/{reference}
 Check existence or download a manifest. `{reference}` can be a tag or digest. As for blobs, the
 answer is sandboxed, since its `Content-Type` is whatever media type the manifest was pushed with.
 
-When manifest redirects are enabled (`global.enable_manifest_redirect`, default `true`) and the blob store supports presigned URLs, `GET` may answer with a `307` redirect. As for blobs, an `X-Angos-No-Redirect` header with any non-empty value other than `0` or `false` forces an inline body instead.
+When manifest redirects are enabled (`global.enable_manifest_redirect`, default `true`) and the blob store supports presigned URLs, a `GET` by digest may answer with a `307` redirect; a `GET` by tag is served inline. As for blobs, an `X-Angos-No-Redirect` header with any non-empty value other than `0` or `false` forces an inline body instead.
 
 ```
 PUT /v2/{namespace}/manifests/{reference}

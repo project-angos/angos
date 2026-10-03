@@ -70,7 +70,6 @@ async fn delete_prunes_empty_ancestors_up_to_root() {
 async fn promote_upload_publishes_only_verified_bytes() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(backend(&dir));
-    store.create_upload("up/data").await.unwrap();
     store
         .write_upload("up/data", frame("verified"), Some(8))
         .await
@@ -449,7 +448,6 @@ async fn an_upload_round_trips_with_durability_enabled() {
     let store = Backend::builder(dir.path()).sync_to_disk(true).build();
     let body = Bytes::from_static(b"durable bytes");
 
-    store.create_upload("up/synced").await.unwrap();
     let written = store
         .write_upload("up/synced", frame(body.clone()), Some(body.len() as u64))
         .await

@@ -18,6 +18,7 @@
 use std::{
     io::{self, Read},
     mem,
+    sync::Arc,
 };
 
 /// The LZ77 window a block may reference, and so what a checkpoint carries.
@@ -145,18 +146,6 @@ impl Huffman {
             counts,
             symbols,
         })
-    }
-
-    /// The fixed literal/length code of RFC 1951 3.2.6.
-    fn fixed_literals() -> io::Result<Self> {
-        let mut lengths = [8u8; 288];
-        lengths[144..256].fill(9);
-        lengths[256..280].fill(7);
-        Self::new(&lengths)
-    }
-
-    fn fixed_distances() -> io::Result<Self> {
-        Self::new(&[5u8; 30])
     }
 }
 
@@ -430,6 +419,19 @@ struct Block {
     distances: Huffman,
 }
 
+impl Block {
+    /// The fixed codes of RFC 1951 3.2.6.
+    fn fixed() -> io::Result<Self> {
+        let mut literals = [8u8; 288];
+        literals[144..256].fill(9);
+        literals[256..280].fill(7);
+        Ok(Self {
+            literals: Huffman::new(&literals)?,
+            distances: Huffman::new(&[5u8; 30])?,
+        })
+    }
+}
+
 /// Inflates a gzip stream (one member or several) read from `input`, as a
 /// [`Read`] of the uncompressed bytes.
 pub struct Inflater<R: Read> {
@@ -442,7 +444,10 @@ pub struct Inflater<R: Read> {
     final_block: bool,
     /// Bits of the first input byte to drop when resuming at a checkpoint.
     resume_bit: Option<u8>,
-    block: Option<Block>,
+    /// The codes the current block decodes with.
+    block: Option<Arc<Block>>,
+    /// Built once: a stream can hold a fixed-code block every few bits.
+    fixed: Arc<Block>,
     checkpoint_every: u64,
     last_checkpoint: u64,
     checkpoints: Vec<Checkpoint>,
@@ -455,8 +460,8 @@ impl<R: Read> Inflater<R> {
     ///
     /// # Errors
     ///
-    /// Only when the 64 KiB ring cannot be allocated, which never happens in
-    /// practice; the stream itself is read lazily.
+    /// Never in practice: allocating the 64 KiB ring and building the fixed
+    /// codes are all that can fail, and the stream itself is read lazily.
     pub fn new(input: R, checkpoint_every: u64) -> io::Result<Self> {
         // Built on the heap: a 64 KiB array would land on the stack first.
         let ring = vec![0u8; RING]
@@ -472,6 +477,7 @@ impl<R: Read> Inflater<R> {
             final_block: false,
             resume_bit: None,
             block: None,
+            fixed: Arc::new(Block::fixed()?),
             checkpoint_every,
             last_checkpoint: 0,
             checkpoints: Vec::new(),
@@ -607,10 +613,7 @@ impl<R: Read> Inflater<R> {
                 };
             }
             1 => {
-                self.block = Some(Block {
-                    literals: Huffman::fixed_literals()?,
-                    distances: Huffman::fixed_distances()?,
-                });
+                self.block = Some(Arc::clone(&self.fixed));
                 self.state = State::Huffman;
             }
             2 => {
@@ -669,10 +672,10 @@ impl<R: Read> Inflater<R> {
         if lengths[256] == 0 {
             return Err(invalid("block has no end-of-block code"));
         }
-        self.block = Some(Block {
+        self.block = Some(Arc::new(Block {
             literals: Huffman::new(&lengths[..hlit])?,
             distances: Huffman::new(&lengths[hlit..])?,
-        });
+        }));
         Ok(())
     }
 
@@ -878,11 +881,9 @@ impl<R: Read> Inflater<R> {
                 State::Huffman => {
                     let block = self
                         .block
-                        .take()
+                        .clone()
                         .ok_or_else(|| invalid("no code table for this block"))?;
-                    let result = self.run_block(&block);
-                    self.block = Some(block);
-                    result?;
+                    self.run_block(&block)?;
                 }
                 State::BlockEnd => {
                     self.state = if self.final_block {
@@ -979,6 +980,20 @@ mod tests {
             let (out, _) = inflate_all(&gzip(&data, level), u64::MAX);
             assert_eq!(out, data, "level {level}");
         }
+    }
+
+    /// A short member deflates as one fixed-code block, so a stream of them
+    /// decodes block after block with the codes it built once.
+    #[test]
+    fn inflates_a_stream_of_fixed_code_blocks() {
+        let members: Vec<Vec<u8>> = (0..1000)
+            .map(|i| format!("member {i}").into_bytes())
+            .collect();
+        // The block type is in bits 1 and 2 of the first byte past the header.
+        assert_eq!((gzip(&members[0], 6)[10] >> 1) & 0b11, 1);
+        let stream: Vec<u8> = members.iter().flat_map(|member| gzip(member, 6)).collect();
+        let (out, _) = inflate_all(&stream, u64::MAX);
+        assert_eq!(out, members.concat());
     }
 
     #[test]

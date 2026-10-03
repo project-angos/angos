@@ -41,6 +41,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A manifest delete by digest finds the tags pointing at it from its reference keys, instead of walking every tag in the namespace.
 - Each page of a subject's referrers reads its records from the page's cursor, instead of listing all of them again.
 - The web UI's filesystem tree applies a path filter once typing pauses and shows at most 1000 rows, so filtering a large image no longer freezes the tab.
+- A manifest GET by tag resolves the tag once; only a GET by digest tries the presigned redirect, as the docs now say.
+- A HEAD on a pull-through tag the upstream moved checks the upstream once, instead of twice plus a read of the stale copy.
+- A manifest push checks the ownership of the blobs it references concurrently rather than one at a time.
+- A blob upload no longer cleans up its session twice or reads it twice per chunk, and on S3 skips a multipart listing at its start and a HEAD per chunk.
+- An upload refused for a size mismatch aborts its S3 multipart instead of leaving the parts to the multipart sweep.
+- Layer indexing builds the fixed Huffman codes once per layer rather than for every block that uses them.
+- Scrub no longer holds a record of every revision it validated for the whole run.
 
 ## 1.12.1
 

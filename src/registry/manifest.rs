@@ -1,8 +1,11 @@
-use std::{iter::once, slice};
+use std::{iter::once, pin::pin, slice};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::future::{join_all, try_join_all};
+use futures_util::{
+    future::{join_all, try_join_all},
+    stream::{self, StreamExt, TryStreamExt},
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, error, instrument, warn};
 
@@ -28,6 +31,9 @@ use crate::{
     scan,
 };
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Referenced digests a push checks the ownership of at once.
+const REFERENCE_CHECK_CONCURRENCY: usize = 16;
 
 /// How a manifest push treats newly-referenced digests the target namespace
 /// does not already own, enforced by
@@ -297,7 +303,7 @@ impl Registry {
     }
 
     /// HEAD on a pull-through namespace: the cached manifest while it is
-    /// current, else the upstream's, fetched and stored by the GET path.
+    /// current, else the upstream's, fetched and stored.
     async fn head_cached_manifest(
         &self,
         upstream: &Repository,
@@ -320,30 +326,31 @@ impl Registry {
             .await
         })
         .await?;
-        // Only the hit is counted here: the fall-through below goes through
-        // `get_cached_manifest`, which counts the outcome it acts on.
-        if let ServeLocal::Hit(meta) = serveable {
-            record_pull_through(&upstream.name, "manifest", "hit");
+        record_pull_through(&upstream.name, "manifest", serveable.outcome());
+        // A local copy counts as pulled, stale or not, as the GET's read of it
+        // does.
+        if !matches!(serveable, ServeLocal::Miss) {
             self.record_manifest_pull(
                 &request.namespace,
                 &LinkKind::from_reference(&request.reference),
                 client,
             )
             .await?;
+        }
+        if let ServeLocal::Hit(meta) = serveable {
             return Ok(meta);
         }
 
+        // The freshness check above decided: fetch, with no second local read
+        // or upstream check.
         let body = self
-            .get_cached_manifest(
+            .fetch_upstream_manifest(
                 upstream,
                 &GetManifestRequest {
                     namespace: request.namespace.clone(),
                     reference: request.reference.clone(),
                     accepted_types: request.accepted_types.clone(),
                 },
-                is_tag_immutable,
-                false,
-                client,
             )
             .await?;
 
@@ -353,7 +360,7 @@ impl Registry {
             bytes,
         } = body
         else {
-            // A HEAD resolves without redirecting, so the read is always content.
+            // A fetch from the upstream is always content.
             return Err(Error::ManifestUnknown);
         };
 
@@ -479,8 +486,9 @@ impl Registry {
         } = request;
         if allow_redirect
             && self.config.enable_manifest_redirect
+            && let Reference::Digest(digest) = reference
             && let Some(response) = self
-                .try_redirect_via_link(namespace, reference, client)
+                .try_redirect_via_link(namespace, digest, client)
                 .await?
         {
             return Ok(response);
@@ -491,9 +499,9 @@ impl Registry {
     }
 
     /// GET on a pull-through namespace: the cached manifest while it is
-    /// current, else the upstream's, stored on the way out. A digest or an
-    /// immutable tag cannot move upstream, so only those redirect from the
-    /// link alone; a mutable tag is checked against the upstream first.
+    /// current, else the upstream's, stored on the way out. A digest cannot
+    /// move upstream, so it redirects from its record alone; a mutable tag is
+    /// checked against the upstream first.
     #[instrument(skip(upstream))]
     async fn get_cached_manifest(
         &self,
@@ -510,9 +518,9 @@ impl Registry {
         } = request;
         if allow_redirect
             && self.config.enable_manifest_redirect
-            && (matches!(reference, Reference::Digest(_)) || is_tag_immutable)
+            && let Reference::Digest(digest) = reference
             && let Some(response) = self
-                .try_redirect_via_link(namespace, reference, client)
+                .try_redirect_via_link(namespace, digest, client)
                 .await?
         {
             return Ok(response);
@@ -535,7 +543,21 @@ impl Registry {
         if let ServeLocal::Hit(manifest) = serveable {
             return Ok(manifest);
         }
+        self.fetch_upstream_manifest(upstream, request).await
+    }
 
+    /// The upstream's manifest for `request`, stored in the cache on the way
+    /// out.
+    async fn fetch_upstream_manifest(
+        &self,
+        upstream: &Repository,
+        request: &GetManifestRequest,
+    ) -> Result<ManifestGet, Error> {
+        let GetManifestRequest {
+            namespace,
+            reference,
+            accepted_types,
+        } = request;
         let fetched = upstream
             .get_manifest(accepted_types, namespace, reference)
             .await?;
@@ -1025,18 +1047,20 @@ impl Registry {
         Ok(existed_before)
     }
 
-    /// Short-circuits a manifest GET into a presigned redirect from the link
-    /// metadata alone, without reading the manifest blob. `Ok(None)` when the
-    /// link records no `media_type` or the blob store produces no URL, so the
-    /// caller falls through to the body-loading path; an unrecordable pull is
-    /// an error, since by then the redirect is the served response.
+    /// Short-circuits a GET by digest into a presigned redirect from the
+    /// revision record alone, without reading the manifest blob. Only a digest
+    /// can: a tag resolves from entry names, which record no media type.
+    /// `Ok(None)` when the record holds no `media_type` or the blob store
+    /// produces no URL, so the caller falls through to the body-loading path;
+    /// an unrecordable pull is an error, since by then the redirect is the
+    /// served response.
     async fn try_redirect_via_link(
         &self,
         namespace: &Namespace,
-        reference: &Reference,
+        digest: &Digest,
         client: &EventActor,
     ) -> Result<Option<ManifestGet>, Error> {
-        let blob_link = LinkKind::from_reference(reference);
+        let blob_link = LinkKind::Digest(digest.clone());
         // Read without stamping: this probe abandons the redirect on a backend
         // that presigns nothing, and an abandoned probe is not a pull.
         let Ok(link) = self.metadata_store.read_link(namespace, &blob_link).await else {
@@ -1212,15 +1236,26 @@ impl Registry {
         referenced: Vec<Digest>,
         policy: ReferencePolicy,
     ) -> Result<Vec<Digest>, Error> {
-        let mut allowed = Vec::with_capacity(referenced.len());
-        for digest in referenced {
-            let unstored = policy == ReferencePolicy::Trusted
-                && match self.blob_store.size(&digest).await {
-                    Ok(_) => false,
-                    Err(Error::BlobUnknown) => true,
-                    Err(error) => return Err(error),
-                };
-            if unstored || self.metadata_store.can_read(namespace, &digest).await? {
+        // Checked concurrently but answered in order, so a Strict refusal
+        // names the first digest the namespace does not own.
+        let mut checked = pin!(
+            stream::iter(referenced)
+                .map(async |digest| {
+                    let unstored = policy == ReferencePolicy::Trusted
+                        && match self.blob_store.size(&digest).await {
+                            Ok(_) => false,
+                            Err(Error::BlobUnknown) => true,
+                            Err(error) => return Err(error),
+                        };
+                    let owned =
+                        unstored || self.metadata_store.can_read(namespace, &digest).await?;
+                    Ok((digest, owned))
+                })
+                .buffered(REFERENCE_CHECK_CONCURRENCY)
+        );
+        let mut allowed = Vec::new();
+        while let Some((digest, owned)) = checked.try_next().await? {
+            if owned {
                 allowed.push(digest);
             } else if policy == ReferencePolicy::Strict {
                 warn!(
@@ -2507,6 +2542,93 @@ mod tests {
             1,
             "a refresh is not counted as a miss"
         );
+    }
+
+    /// A HEAD on a mutable tag the upstream re-pointed asks the upstream once
+    /// whether it moved, then fetches it once.
+    #[tokio::test]
+    async fn a_head_on_a_moved_tag_checks_the_upstream_once() {
+        const REPOSITORY: &str = "pull-through-head";
+        let case = FSRegistryTestCase::new();
+        let namespace = Namespace::new(REPOSITORY).unwrap();
+        let (content, _) = create_raw_test_manifest();
+        let accepted = [MediaRange::from(MediaType::docker_manifest())];
+        let manifest_path = format!("/v2/{REPOSITORY}/manifests/latest");
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(manifest_path.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(content.clone())
+                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(manifest_path.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        DOCKER_CONTENT_DIGEST,
+                        Digest::sha256_of_bytes(b"moved upstream")
+                            .to_string()
+                            .as_str(),
+                    )
+                    .insert_header(CONTENT_LENGTH, "0")
+                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
+            )
+            .mount(&upstream)
+            .await;
+
+        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let repository = Repository::new(
+            REPOSITORY,
+            &RepositoryConfig {
+                upstream: vec![test_client_config(upstream.uri())],
+                ..Default::default()
+            },
+            &cache_backend,
+            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
+        let registry = case.registry();
+        let tag = Reference::Tag(Tag::new("latest").unwrap());
+        // Cached as an immutable tag, which the upstream is never asked about.
+        registry
+            .get_manifest_direct(
+                Some(&repository),
+                &accepted,
+                &namespace,
+                tag.clone(),
+                true,
+                &EventActor::default(),
+            )
+            .await
+            .unwrap();
+        let seeded = upstream.received_requests().await.unwrap().len();
+
+        registry
+            .head_cached_manifest(
+                &repository,
+                &HeadManifestRequest {
+                    namespace,
+                    reference: tag,
+                    accepted_types: accepted.to_vec(),
+                },
+                false,
+                &EventActor::default(),
+            )
+            .await
+            .unwrap();
+
+        let requests = upstream.received_requests().await.unwrap();
+        let methods: Vec<&str> = requests[seeded..]
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect();
+        assert_eq!(methods, ["HEAD", "GET"]);
     }
 
     /// The recomputed digest follows the algorithm the reference asked for, so a

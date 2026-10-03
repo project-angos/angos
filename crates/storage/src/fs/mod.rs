@@ -600,13 +600,6 @@ impl ObjectStore for Backend {
         verified_move(self, source, destination).await
     }
 
-    async fn create_upload(&self, key: &str) -> Result<(), Error> {
-        // Create/truncate the staging file at `key` so a re-`create` at a reused
-        // key starts from an empty file and `write_upload` can re-open it in
-        // append mode.
-        self.put(key, Bytes::new()).await
-    }
-
     async fn write_upload(
         &self,
         key: &str,

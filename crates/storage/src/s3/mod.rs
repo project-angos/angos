@@ -13,14 +13,10 @@
 //! parts, the staged sub-part remainder) from S3 itself, so nothing has to be
 //! persisted by the caller between calls.
 //!
-//! - `create_upload` clears any leaked prior upload at `key` (`abort_upload`
-//!   semantics) and returns. It is lazy: no `CreateMultipartUpload` round-trip
-//!   happens until the first flush actually needs one. Small uploads
-//!   (≤ `part_size`) never open a multipart upload at all.
 //! - `write_upload` recovers the upload id (searching `ListMultipartUploads`
 //!   for `key`) and the committed parts (`ListParts`) to compute the next part
-//!   number and the committed byte offset, HEADs the staged remainder at that
-//!   offset, combines it with the incoming stream, and emits `UploadPart`s of
+//!   number and the committed byte offset, reads the staged remainder at that
+//!   offset ahead of the incoming stream, and emits `UploadPart`s of
 //!   up to `part_size` bytes (uniform mode) or one `UploadPart` of all
 //!   available bytes once they meet `part_size` (non-uniform mode). The new
 //!   remainder is restaged at the new offset and the superseded staged object
@@ -447,12 +443,6 @@ impl ObjectStore for Backend {
         Ok(self.client.copy_object(source, destination).await?)
     }
 
-    async fn create_upload(&self, key: &str) -> Result<(), Error> {
-        // Clear any leaked prior in-progress upload at this key so a re-`create`
-        // at a reused key starts clean. Lazy otherwise: no multipart opened.
-        self.abort_upload(key).await
-    }
-
     async fn write_upload(
         &self,
         key: &str,
@@ -479,11 +469,10 @@ impl ObjectStore for Backend {
                 .ok_or_else(|| Error::Backend("upload size overflow".to_string()));
         }
 
-        // The current remainder (if any) sits at `staged/<committed_size>`. HEAD
-        // it for its size, then stream it ahead of the incoming body.
+        // The current remainder (if any) sits at `staged/<committed_size>`,
+        // streamed ahead of the incoming body; its GET reports its length.
         let read_key = staged_key(key, committed_size);
-        let expected = self.staged_size(key, committed_size).await?;
-        let (staged, staged_len) = staged_stream(&self.client, &read_key, expected).await?;
+        let (staged, staged_len) = staged_stream(&self.client, &read_key).await?;
         let mut reader = StreamReader::new(staged.chain(body));
 
         // Emit whole multipart parts; the remainder is the trailing sub-part
@@ -702,14 +691,7 @@ fn staged_key(key: &str, offset: u64) -> String {
 /// already buffers a whole part, and reading this in would double that. The
 /// length comes from the `GET` itself, and is zero when the staged object is
 /// gone, as it is for a session whose previous call left no remainder.
-async fn staged_stream(
-    client: &S3Backend,
-    staging: &str,
-    expected: u64,
-) -> Result<(ByteStream, u64), Error> {
-    if expected == 0 {
-        return Ok((Box::pin(stream::empty()), 0));
-    }
+async fn staged_stream(client: &S3Backend, staging: &str) -> Result<(ByteStream, u64), Error> {
     match client.get_object(staging, None).await {
         Ok(staged) => Ok((
             Box::pin(ReaderStream::new(staged.body)),

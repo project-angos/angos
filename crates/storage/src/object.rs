@@ -56,7 +56,7 @@ pub fn dir_prefix(prefix: &str) -> Cow<'_, str> {
 /// S3 (multipart protocol) implement, hiding the S3 multipart wire details
 /// (parts, upload IDs, staged remainders) from consumers. Every upload is
 /// addressed solely by its `key`; there is no caller-held session value. The
-/// caller drives an upload by calling [`ObjectStore::create_upload`] once,
+/// caller drives an upload at a fresh key by calling
 /// [`ObjectStore::write_upload`] per chunk, and finally
 /// [`ObjectStore::complete_upload`] or [`ObjectStore::abort_upload`]. After
 /// `complete_upload`, the assembled object is visible via the read methods at
@@ -218,12 +218,6 @@ pub trait ObjectStore: Send + Sync {
     async fn move_object(&self, source: &str, destination: &str) -> Result<(), Error> {
         verified_move(self, source, destination).await
     }
-
-    /// Begin/clear a fresh upload at `key`. Idempotent: discards any leaked
-    /// prior in-progress upload at `key` (so re-`create`ing at a reused key
-    /// starts clean). Lazy: no backend round-trip is required until the first
-    /// write.
-    async fn create_upload(&self, key: &str) -> Result<(), Error>;
 
     /// Append `body` to the upload at `key`, returning the new total uploaded
     /// size. `Some(len)` declares an exact byte count and is validated;

@@ -57,7 +57,7 @@ pub struct MultipartUploadPage {
     pub next_upload_id_marker: Option<String>,
 }
 
-// The upload methods (`create_upload`, `write_upload`, `complete_upload`,
-// `abort_upload`, `list_multipart_uploads`) live on the
+// The upload methods (`write_upload`, `complete_upload`, `abort_upload`,
+// `list_multipart_uploads`) live on the
 // [`ObjectStore`](crate::ObjectStore) trait. This module owns only the value
 // types those methods exchange.

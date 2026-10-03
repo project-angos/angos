@@ -226,7 +226,6 @@ async fn upload_uniform_round_trip() {
         vec![0x42; 4 * 1024 * 1024],
         vec![0x43; 6 * 1024 * 1024],
     ];
-    store.create_upload(&key).await.unwrap();
     let mut total = 0u64;
     for chunk in &chunks {
         let len = chunk.len() as u64;
@@ -257,7 +256,6 @@ async fn upload_unknown_length_streams_to_eof() {
     // 13 MiB: two full 5 MiB parts plus a 3 MiB remainder.
     let data: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let total = store
         .write_upload(&key, frame(data.clone()), None)
         .await
@@ -284,7 +282,6 @@ async fn upload_unknown_length_emits_part_size_parts() {
     // 20 MiB = exactly two 10 MiB parts, no remainder.
     let data: Vec<u8> = (0..20 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let total = store
         .write_upload(&key, frame(data.clone()), None)
         .await
@@ -309,7 +306,6 @@ async fn upload_unknown_length_non_multiple_part_size() {
     // 24 MiB = exactly two 12 MiB parts.
     let data: Vec<u8> = (0..24 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let total = store
         .write_upload(&key, frame(data.clone()), None)
         .await
@@ -339,7 +335,6 @@ async fn upload_unknown_length_uniform_uses_equal_parts() {
     // itself.
     let data: Vec<u8> = (0..23 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let total = store
         .write_upload(&key, frame(data.clone()), None)
         .await
@@ -376,7 +371,6 @@ async fn upload_uniform_mixed_known_then_chunked_stays_uniform() {
     let first: Vec<u8> = (0..PART).map(|i| (i % 251) as u8).collect();
     let second: Vec<u8> = (0..23 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let first_len = first.len() as u64;
     store
         .write_upload(&key, frame(first.clone()), Some(first_len))
@@ -411,7 +405,6 @@ async fn upload_nonuniform_known_then_chunked_round_trips() {
     let first: Vec<u8> = (0..7 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let second: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let first_len = first.len() as u64;
     store
         .write_upload(&key, frame(first.clone()), Some(first_len))
@@ -438,7 +431,6 @@ async fn upload_unknown_length_empty_body_coalesce_path() {
     let store = backend_with(false, PART);
     let key = format!("up/chunked-empty-coalesce/{}/data", Uuid::new_v4());
 
-    store.create_upload(&key).await.unwrap();
     let total = store
         .write_upload(&key, frame(Vec::new()), None)
         .await
@@ -461,7 +453,6 @@ async fn upload_unknown_length_empty_body_direct_path() {
     let store = backend_with(false, 5 * 1024 * 1024);
     let key = format!("up/chunked-empty-direct/{}/data", Uuid::new_v4());
 
-    store.create_upload(&key).await.unwrap();
     let total = store
         .write_upload(&key, frame(Vec::new()), None)
         .await
@@ -488,7 +479,6 @@ async fn upload_unknown_length_large_body_emits_part_size_parts() {
     // part too, leaving nothing staged).
     let data: Vec<u8> = (0..35 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let total = store
         .write_upload(&key, frame(data.clone()), None)
         .await
@@ -516,7 +506,6 @@ async fn upload_unknown_length_small_chunked_body_round_trips() {
     // 1 MiB: well below the 5 MiB floor, so nothing can flush as a part.
     let data: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let total = store
         .write_upload(&key, frame(data.clone()), None)
         .await
@@ -550,7 +539,6 @@ async fn upload_unknown_length_nonuniform_resumes_across_writes() {
     let first: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect(); // 1 part + 3 MiB tail
     let second: Vec<u8> = (0..10 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     store
         .write_upload(&key, frame(first.clone()), None)
         .await
@@ -576,7 +564,6 @@ async fn upload_unknown_length_resumes_across_writes() {
     let first: Vec<u8> = vec![0x41; 7 * 1024 * 1024]; // 1 part + 2 MiB staged
     let second: Vec<u8> = vec![0x42; 6 * 1024 * 1024]; // combined 8 MiB staged -> 1 part + 3 MiB
 
-    store.create_upload(&key).await.unwrap();
     store
         .write_upload(&key, frame(first.clone()), None)
         .await
@@ -606,7 +593,6 @@ async fn upload_nonuniform_flushes_at_configured_part_size_not_min() {
     // ~6 MiB: above the 5 MiB S3 floor but below the 8 MiB configured
     // threshold. Nothing may flush; it all stays staged.
     let first: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
-    store.create_upload(&key).await.unwrap();
     let first_len = first.len() as u64;
     let total = store
         .write_upload(&key, frame(first.clone()), Some(first_len))
@@ -671,7 +657,6 @@ async fn upload_nonuniform_default_still_flushes_at_5_mib() {
     let key = format!("up/nonuniform-default/{}/data", Uuid::new_v4());
     let data: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    store.create_upload(&key).await.unwrap();
     let len = data.len() as u64;
     store
         .write_upload(&key, frame(data.clone()), Some(len))
@@ -713,7 +698,6 @@ async fn upload_nonuniform_default_still_flushes_at_5_mib() {
 async fn upload_small_upload_takes_singleshot_path() {
     let store = backend_with(false, 5 * 1024 * 1024);
     let key = format!("up/small/{}/data", Uuid::new_v4());
-    store.create_upload(&key).await.unwrap();
     store
         .write_upload(&key, frame(b"hello".to_vec()), Some(5))
         .await
@@ -732,7 +716,6 @@ async fn upload_small_upload_takes_singleshot_path() {
 async fn upload_resumes_from_recovered_state() {
     let store = backend_with(true, 5 * 1024 * 1024);
     let key = format!("up/resume/{}/data", Uuid::new_v4());
-    store.create_upload(&key).await.unwrap();
     let head = vec![0x55; 6 * 1024 * 1024];
     store
         .write_upload(&key, frame(head.clone()), Some(head.len() as u64))

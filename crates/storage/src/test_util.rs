@@ -60,9 +60,6 @@ pub enum StoreOp<'a> {
         source: &'a str,
         destination: &'a str,
     },
-    CreateUpload {
-        key: &'a str,
-    },
     WriteUpload {
         key: &'a str,
     },
@@ -196,11 +193,6 @@ macro_rules! delegate_object_store {
                     })
                     .await?;
                 self.inner.copy(source, destination).await
-            }
-
-            async fn create_upload(&self, key: &str) -> Result<(), Error> {
-                self.hook.before(StoreOp::CreateUpload { key }).await?;
-                self.inner.create_upload(key).await
             }
 
             async fn write_upload(
