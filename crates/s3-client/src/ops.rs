@@ -1225,6 +1225,33 @@ mod tests {
         .await;
     }
 
+    /// A 500, 502 or 504 can come from a proxy after the write landed, so a
+    /// conditional PUT answered with one is not replayed into a false 412.
+    #[tokio::test]
+    async fn conditional_put_not_retried_on_a_status_that_proves_nothing() {
+        for status in [500, 502, 504] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/test-bucket/object"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+
+            let backend = mock_backend(&server);
+            backend
+                .put_object_if_not_exists("object", Bytes::from_static(b"body"))
+                .await
+                .unwrap_err();
+
+            assert_attempts(
+                &server,
+                1,
+                &format!("a conditional PUT answered {status} must make exactly one attempt"),
+            )
+            .await;
+        }
+    }
+
     #[tokio::test]
     async fn complete_multipart_upload_not_retried_on_transport_error() {
         let server = MockServer::start().await;

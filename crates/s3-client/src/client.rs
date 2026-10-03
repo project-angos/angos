@@ -210,12 +210,12 @@ pub struct SendOpts {
     /// converted into an [`S3Error`] if an embedded error is found.
     pub check_embedded_error: bool,
     /// Whether the request mutates state in a way that is unsafe to replay
-    /// blindly (conditional writes/deletes, `CompleteMultipartUpload`). When
-    /// set, the retry path does NOT retry on a status-less (transport) error:
-    /// the request may already have landed on the server, so a blind replay
-    /// could observe a false `PreconditionFailed`. Explicit retryable HTTP
-    /// statuses (5xx / throttle) are still retried, because such a response
-    /// proves the server did not apply the request.
+    /// blindly (conditional writes, multipart create and complete). When set,
+    /// it is retried only on an error proving the server did not apply it: a
+    /// throttle or a conditional conflict. A transport error, or a 500, 502 or
+    /// 504 a proxy can answer after the write landed, is returned instead, so
+    /// a replay never observes a false `PreconditionFailed` or opens a second
+    /// multipart upload.
     pub non_idempotent: bool,
 }
 
@@ -502,15 +502,15 @@ impl S3Client {
             loop {
                 match request().await {
                     Ok(value) => return Ok(value),
-                    // A non-idempotent request is not retried on a status-less
-                    // (transport) error: the outcome is ambiguous because the
-                    // request may already have landed. An explicit retryable
-                    // HTTP status is still retried: the server then proved it
-                    // did not apply the request.
+                    // A non-idempotent request may already have landed unless
+                    // the error proves it did not.
                     Err(error)
-                        if is_retryable_error(&error)
-                            && !(non_idempotent && error.status.is_none())
-                            && attempt < attempts =>
+                        if attempt < attempts
+                            && if non_idempotent {
+                                is_unapplied_error(&error)
+                            } else {
+                                is_retryable_error(&error)
+                            } =>
                     {
                         sleep(self.retry_backoff.delay(attempt - 1)).await;
                         attempt += 1;
@@ -875,33 +875,43 @@ fn hmac_sha256(key: &[u8], value: &[u8]) -> Result<[u8; 32], S3Error> {
     Ok(mac.finalize().into_bytes().into())
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
+/// Whether `error` proves the server did not apply the request, the only
+/// errors a non-idempotent request is replayed on: a throttle refuses before
+/// acting, and S3 answers a conditional conflict instead of applying the
+/// request, defining the remedy as retrying. A 500, 502 or 504 proves nothing,
+/// since a proxy can send one after the write landed.
+fn is_unapplied_error(error: &S3Error) -> bool {
     matches!(
-        status,
-        StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::INTERNAL_SERVER_ERROR
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT
+        error.status,
+        Some(StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE)
+    ) || matches!(
+        error.code.as_deref(),
+        Some(
+            "ConditionalRequestConflict"
+                | "SlowDown"
+                | "Throttling"
+                | "ThrottlingException"
+                | "TooManyRequestsException"
+        )
     )
 }
 
+/// Whether `error` is worth replaying a request that is safe to repeat: one
+/// proving nothing landed, a server or gateway failure, a transport error
+/// with no status, or a timeout.
 fn is_retryable_error(error: &S3Error) -> bool {
-    error.status.is_none_or(is_retryable_status)
+    is_unapplied_error(error)
+        || error.status.is_none_or(|status| {
+            matches!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::GATEWAY_TIMEOUT
+            )
+        })
         || matches!(
             error.code.as_deref(),
-            Some(
-                // S3 answers this while another conditional request is in
-                // flight, and defines the remedy as retrying.
-                "ConditionalRequestConflict"
-                    | "InternalError"
-                    | "RequestTimeout"
-                    | "RequestTimeoutException"
-                    | "SlowDown"
-                    | "Throttling"
-                    | "ThrottlingException"
-                    | "TooManyRequestsException"
-            )
+            Some("InternalError" | "RequestTimeout" | "RequestTimeoutException")
         )
 }
 

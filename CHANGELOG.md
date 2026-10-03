@@ -49,6 +49,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Layer indexing builds the fixed Huffman codes once per layer rather than for every block that uses them.
 - Scrub no longer holds a record of every revision it validated for the whole run.
 - The web UI's pull history tab shows the error when the registry refuses it, instead of re-requesting in a loop.
+- S3 conditional writes and multipart creates and completes are no longer replayed after a 500, 502 or 504, which could read a write's own success as a conflict, drop a job enqueue, or open a second multipart upload.
 
 ## 1.12.1
 
