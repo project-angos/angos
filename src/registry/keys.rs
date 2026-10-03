@@ -310,6 +310,12 @@ pub fn parse_ref_digest(s: &str) -> Option<Digest> {
     parse_digest(algorithm, hash)
 }
 
+/// The `<algo>.<hash>` name [`parse_ref_digest`] reads back, which sorts as
+/// the digest does.
+pub fn ref_digest_name(digest: &Digest) -> String {
+    format!("{}.{}", digest.algorithm(), digest.hash())
+}
+
 /// A digest from its sharded segments `<algo>/<pfx>/<hash>`; `None` when the
 /// shard does not open the hash.
 pub fn parse_sharded(algorithm: &str, prefix: &str, hash: &str) -> Option<Digest> {
@@ -523,10 +529,9 @@ impl NamespaceKeys for Namespace {
 
     fn referrer_record_path(&self, subject: &Digest, referrer: &Digest) -> String {
         format!(
-            "{}/{}.{}",
+            "{}/{}",
             self.referrer_record_dir(subject),
-            referrer.algorithm(),
-            referrer.hash()
+            ref_digest_name(referrer)
         )
     }
 

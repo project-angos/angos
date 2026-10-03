@@ -39,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - On the filesystem backend, a listing page reads only the directories it pages through, instead of walking and sorting everything under its prefix.
 - A blob mount without `from`, and replication's mount hint, read only the namespaces they use off the blob's reference index, instead of all of it.
 - A manifest delete by digest finds the tags pointing at it from its reference keys, instead of walking every tag in the namespace.
+- Each page of a subject's referrers reads its records from the page's cursor, instead of listing all of them again.
 
 ## 1.12.1
 

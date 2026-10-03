@@ -122,7 +122,7 @@ pub async fn scan_reports(
     digest: &Digest,
 ) -> Result<Vec<ScanReport>, RegistryError> {
     let mut reports: Vec<ScanReport> = metadata_store
-        .stream_referrer_digests(namespace, digest)
+        .stream_referrer_digests(namespace, digest, None)
         .map_ok(|referrer| async move {
             let link = LinkKind::Referrer {
                 subject: digest.clone(),

@@ -18,7 +18,7 @@ use crate::registry::{
     Error,
     keys::{
         CAT_ROOT, DigestKeys, NamespaceKeys, TagEntry, parse_ref_digest, parse_referrer_record,
-        parse_revision_record,
+        parse_revision_record, ref_digest_name,
     },
     metadata_store::{LIST_PAGE, LinkKind, LinkMetadata, MetadataStore},
     pagination,
@@ -363,21 +363,25 @@ impl MetadataStore {
             .await
     }
 
-    /// Streams `digest`'s candidate referrer manifest digests, unresolved and
-    /// unordered. Callers resolve each candidate to a descriptor at registry
-    /// altitude, where the blob store holding manifest bodies is in reach.
+    /// Streams `digest`'s candidate referrer manifest digests above `after`,
+    /// unresolved and in digest order, a listing page at a time, so a caller
+    /// resuming at a cursor reads from there. Callers resolve each candidate
+    /// to a descriptor at registry altitude, where the blob store holding
+    /// manifest bodies is in reach.
     pub fn stream_referrer_digests(
         &self,
         namespace: &Namespace,
         digest: &Digest,
+        after: Option<&Digest>,
     ) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
         let record_dir = namespace.referrer_record_dir(digest);
+        let start_after = after.map(ref_digest_name);
         paginated(move |token| {
-            let record_dir = record_dir.clone();
+            let (record_dir, start_after) = (record_dir.clone(), start_after.clone());
             async move {
                 let page = self
                     .object_store()
-                    .list(&record_dir, LIST_PAGE, token)
+                    .list_after(&record_dir, LIST_PAGE, token, start_after)
                     .await?;
                 Ok::<_, Error>((page.items, page.next_token))
             }
