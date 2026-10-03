@@ -551,7 +551,16 @@ impl Backend {
                     body,
                 )
                 .await
-                .map_err(|e| classify_error(&e))
+                .map_err(|failure| {
+                    // Until the last byte is out the pushing client paces the
+                    // part, so a failure then, its departure or S3's
+                    // `RequestTimeout` at its pace, says nothing of the
+                    // backend's health and stays off the breaker.
+                    match classify_error(&failure.error) {
+                        Error::Io(message) if !failure.body_sent => Error::Rejected(message),
+                        error => error,
+                    }
+                })
                 .and_then(|response| part_etag(&response.headers, part_number))
         })
         .await
@@ -860,6 +869,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Instant,
     };
 
     use bytesize::ByteSize;
@@ -1223,6 +1233,33 @@ mod tests {
             "a non-idempotent conditional PUT must still retry on a retryable HTTP status",
         )
         .await;
+    }
+
+    /// A 500, 502 or 504 can come from a proxy after the write landed, so a
+    /// conditional PUT answered with one is not replayed into a false 412.
+    #[tokio::test]
+    async fn conditional_put_not_retried_on_a_status_that_proves_nothing() {
+        for status in [500, 502, 504] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/test-bucket/object"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+
+            let backend = mock_backend(&server);
+            backend
+                .put_object_if_not_exists("object", Bytes::from_static(b"body"))
+                .await
+                .unwrap_err();
+
+            assert_attempts(
+                &server,
+                1,
+                &format!("a conditional PUT answered {status} must make exactly one attempt"),
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
@@ -1642,5 +1679,57 @@ mod tests {
             .expect("a body still flowing must not be cut off by an S3-side deadline");
 
         assert_eq!(etag, r#""slow-part""#);
+    }
+
+    /// Once the last byte is out S3 owes an answer, so a part the endpoint
+    /// takes and never answers fails at the attempt timeout instead of hanging,
+    /// and counts against the breaker.
+    #[tokio::test]
+    async fn a_sent_part_left_unanswered_times_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", r#""late""#)
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let started = Instant::now();
+        let body = stream::iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"0123"))]);
+        let error = fast_retry_backend(&server)
+            .upload_part_streaming("late/part", "upload-id", 1, 4, body)
+            .await
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(matches!(error, Error::Io(_)), "got: {error:?}");
+    }
+
+    /// A pushing client that leaves mid-part fails the part, but its pace or
+    /// departure says nothing of the backend, so no run of them opens the
+    /// breaker.
+    #[tokio::test]
+    async fn a_part_its_client_cuts_short_stays_off_the_breaker() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", r#""cut""#))
+            .mount(&server)
+            .await;
+        let backend = mock_backend(&server);
+
+        for _ in 0..10 {
+            let body = stream::iter([
+                Ok(Bytes::from_static(b"01")),
+                Err(io::Error::other("the pushing client went away")),
+            ]);
+            let error = backend
+                .upload_part_streaming("cut/part", "upload-id", 1, 4, body)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Rejected(_)), "got: {error:?}");
+        }
+        assert!(backend.circuit_breaker.check().is_ok());
     }
 }

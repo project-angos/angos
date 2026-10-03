@@ -231,7 +231,6 @@ impl Probes {
             ORPHAN_PENDING_JOB_KEY.to_string(),
             ORPHAN_FAILED_JOB_KEY.to_string(),
             "_lost_and_found/".to_string(),
-            ".tx-".to_string(),
             // A reclaiming run leaves its marker to linger past the delete.
             "v2/gc/".to_string(),
         ]

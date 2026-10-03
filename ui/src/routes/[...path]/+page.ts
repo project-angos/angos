@@ -36,7 +36,14 @@ export const load: PageLoad = async ({ params }): Promise<BrowseParams> => {
 	}
 
 	const path = [...segments.slice(0, -1), tail].filter(Boolean).join('/');
-	const names = (await fetchRepositoryNames()).data ?? [];
+	let names = (await fetchRepositoryNames()).data ?? [];
+	let repository = resolveRepository(names, path);
+	// A path the kept names place above every repository rereads them: its
+	// repository may have gained content since they were read.
+	if (repository === null) {
+		names = (await fetchRepositoryNames(true)).data ?? [];
+		repository = resolveRepository(names, path);
+	}
 
-	return { path, repository: resolveRepository(names, path), reference, repositoryNames: names };
+	return { path, repository, reference, repositoryNames: names };
 };

@@ -3,6 +3,8 @@
 //! layer indexed.
 
 use bytes::Bytes;
+use serde::de::DeserializeOwned;
+use tokio::task::spawn_blocking;
 
 use angos_extension_service::LayerEntry;
 use angos_oci::Digest;
@@ -33,7 +35,7 @@ impl MetadataStore {
             .object_store()
             .get(&digest.layer_entries_chunk_path(chunk))
             .await?;
-        Ok(serde_json::from_slice(&bytes)?)
+        decode(bytes).await
     }
 
     /// Chunk `chunk` of a layer's checkpoints, empty when none was stored.
@@ -47,7 +49,7 @@ impl MetadataStore {
             .get(&digest.layer_checkpoints_path(chunk))
             .await
         {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => decode(bytes).await,
             Err(StorageError::NotFound) => Ok(Checkpoints::default()),
             Err(e) => Err(e.into()),
         }
@@ -96,4 +98,16 @@ impl MetadataStore {
             .await?;
         Ok(())
     }
+}
+
+/// Decodes a stored chunk off the async threads: each runs to a megabyte of
+/// JSON, and the entries endpoint decodes every chunk of a layer.
+async fn decode<T>(bytes: Vec<u8>) -> Result<T, Error>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    spawn_blocking(move || serde_json::from_slice(&bytes))
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))?
+        .map_err(Error::from)
 }

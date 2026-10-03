@@ -58,8 +58,10 @@
 	}
 
 	// In its own tab it is the reason the tab was opened, so it loads at once.
+	// Untracked: the load reads `history` and `loading`, and a failure resetting
+	// them would re-run the effect and request again, forever.
 	$effect(() => {
-		if (open) load();
+		if (open) untrack(load);
 	});
 
 	// The retention is only known once the registry has answered, so the label

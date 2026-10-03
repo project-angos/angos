@@ -130,7 +130,7 @@ sequenceDiagram
     HTTP-->>Client: 200 OK + manifest
 ```
 
-With S3 storage, blob and manifest GET requests redirect to pre-signed URLs by default, avoiding proxying data through the registry.
+With S3 storage, blob GETs and manifest GETs by digest redirect to pre-signed URLs by default, avoiding proxying data through the registry; a manifest GET by tag is served inline.
 This can be disabled per object kind with `enable_blob_redirect = false` and/or `enable_manifest_redirect = false` in `[global]`, in which case the registry proxies the corresponding responses.
 
 **When redirects are enabled** (both flags default to `true`):

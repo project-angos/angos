@@ -11,6 +11,7 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     future::Future,
     io,
+    pin::pin,
     sync::Arc,
     time::Duration,
 };
@@ -20,7 +21,10 @@ use arc_swap::ArcSwapOption;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures_util::{Stream, StreamExt};
+use futures_util::{
+    Stream, StreamExt, TryStreamExt,
+    future::{Either, pending, select},
+};
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use reqwest::{
@@ -30,7 +34,10 @@ use reqwest::{
     },
 };
 use sha2::Sha256;
-use tokio::time::{sleep, timeout};
+use tokio::{
+    sync::watch,
+    time::{sleep, timeout},
+};
 use url::Url;
 
 use crate::BackendConfig;
@@ -189,6 +196,14 @@ impl Display for S3Error {
 
 impl std::error::Error for S3Error {}
 
+/// A streamed request's failure, and whether its body had gone out in full by
+/// then: until it has, the pushing client paces the exchange, so a failure may
+/// be its slowness or departure rather than the backend's.
+pub struct StreamedFailure {
+    pub error: S3Error,
+    pub body_sent: bool,
+}
+
 /// Request body variants. `Bytes` payloads are replayable across retries
 /// (cheap to clone: refcount only). `Stream` is one-shot; it disables
 /// payload signing (UNSIGNED-PAYLOAD) so the body never needs buffering.
@@ -210,12 +225,12 @@ pub struct SendOpts {
     /// converted into an [`S3Error`] if an embedded error is found.
     pub check_embedded_error: bool,
     /// Whether the request mutates state in a way that is unsafe to replay
-    /// blindly (conditional writes/deletes, `CompleteMultipartUpload`). When
-    /// set, the retry path does NOT retry on a status-less (transport) error:
-    /// the request may already have landed on the server, so a blind replay
-    /// could observe a false `PreconditionFailed`. Explicit retryable HTTP
-    /// statuses (5xx / throttle) are still retried, because such a response
-    /// proves the server did not apply the request.
+    /// blindly (conditional writes, multipart create and complete). When set,
+    /// it is retried only on an error proving the server did not apply it: a
+    /// throttle or a conditional conflict. A transport error, or a 500, 502 or
+    /// 504 a proxy can answer after the write landed, is returned instead, so
+    /// a replay never observes a false `PreconditionFailed` or opens a second
+    /// multipart upload.
     pub non_idempotent: bool,
 }
 
@@ -373,9 +388,12 @@ impl S3Client {
 
     /// Send a request whose body is produced by a `Stream`. The body is one-shot
     /// (no retries) and signed as UNSIGNED-PAYLOAD so it never has to be
-    /// buffered. It carries no deadline of its own: the pushing client paces it,
-    /// so any S3-side timer would cap that client's speed and then count the
-    /// slow push as a backend failure against the circuit breaker.
+    /// buffered. The pushing client paces the body, so nothing is timed until
+    /// its last byte is out, as any timer would cap that client's speed; from
+    /// then on S3 owes an answer within `operation_attempt_timeout`.
+    ///
+    /// # Errors
+    /// The failure, telling whether the body had been sent in full.
     pub async fn send_streaming_body<S>(
         &self,
         method: Method,
@@ -384,28 +402,55 @@ impl S3Client {
         headers: HeaderMap,
         content_length: u64,
         stream: S,
-    ) -> Result<S3Response, S3Error>
+    ) -> Result<S3Response, StreamedFailure>
     where
         S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static,
     {
-        let response = self
-            .dispatch(
-                method,
-                key,
-                &query,
-                headers,
-                RequestBody::Stream {
-                    content_length,
-                    stream,
-                },
-                None,
-            )
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(S3Error::from_response(response).await);
-        }
-        collect_full_response(response).await
+        let (sent_tx, mut sent_rx) = watch::channel(content_length == 0);
+        let mut unsent = content_length;
+        let stream = stream.inspect_ok(move |chunk| {
+            unsent = unsent.saturating_sub(chunk.len() as u64);
+            if unsent == 0 {
+                sent_tx.send_replace(true);
+            }
+        });
+        let exchange = async {
+            let response = self
+                .dispatch(
+                    method,
+                    key,
+                    &query,
+                    headers,
+                    RequestBody::Stream {
+                        content_length,
+                        stream,
+                    },
+                    None,
+                )
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(S3Error::from_response(response).await);
+            }
+            collect_full_response(response).await
+        };
+        let answer_due = async {
+            // A body that stops short ends the exchange on its own.
+            let sent = sent_rx.wait_for(|sent| *sent).await.is_ok();
+            if sent {
+                sleep(self.operation_attempt_timeout).await;
+            } else {
+                pending::<()>().await;
+            }
+        };
+        let result = match select(pin!(exchange), pin!(answer_due)).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), _)) => Err(S3Error::timeout(self.operation_attempt_timeout)),
+        };
+        result.map_err(|error| StreamedFailure {
+            error,
+            body_sent: *sent_rx.borrow(),
+        })
     }
 
     /// Send a request and return the raw response for streaming download.
@@ -502,15 +547,15 @@ impl S3Client {
             loop {
                 match request().await {
                     Ok(value) => return Ok(value),
-                    // A non-idempotent request is not retried on a status-less
-                    // (transport) error: the outcome is ambiguous because the
-                    // request may already have landed. An explicit retryable
-                    // HTTP status is still retried: the server then proved it
-                    // did not apply the request.
+                    // A non-idempotent request may already have landed unless
+                    // the error proves it did not.
                     Err(error)
-                        if is_retryable_error(&error)
-                            && !(non_idempotent && error.status.is_none())
-                            && attempt < attempts =>
+                        if attempt < attempts
+                            && if non_idempotent {
+                                is_unapplied_error(&error)
+                            } else {
+                                is_retryable_error(&error)
+                            } =>
                     {
                         sleep(self.retry_backoff.delay(attempt - 1)).await;
                         attempt += 1;
@@ -875,33 +920,43 @@ fn hmac_sha256(key: &[u8], value: &[u8]) -> Result<[u8; 32], S3Error> {
     Ok(mac.finalize().into_bytes().into())
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
+/// Whether `error` proves the server did not apply the request, the only
+/// errors a non-idempotent request is replayed on: a throttle refuses before
+/// acting, and S3 answers a conditional conflict instead of applying the
+/// request, defining the remedy as retrying. A 500, 502 or 504 proves nothing,
+/// since a proxy can send one after the write landed.
+fn is_unapplied_error(error: &S3Error) -> bool {
     matches!(
-        status,
-        StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::INTERNAL_SERVER_ERROR
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT
+        error.status,
+        Some(StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE)
+    ) || matches!(
+        error.code.as_deref(),
+        Some(
+            "ConditionalRequestConflict"
+                | "SlowDown"
+                | "Throttling"
+                | "ThrottlingException"
+                | "TooManyRequestsException"
+        )
     )
 }
 
+/// Whether `error` is worth replaying a request that is safe to repeat: one
+/// proving nothing landed, a server or gateway failure, a transport error
+/// with no status, or a timeout.
 fn is_retryable_error(error: &S3Error) -> bool {
-    error.status.is_none_or(is_retryable_status)
+    is_unapplied_error(error)
+        || error.status.is_none_or(|status| {
+            matches!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::GATEWAY_TIMEOUT
+            )
+        })
         || matches!(
             error.code.as_deref(),
-            Some(
-                // S3 answers this while another conditional request is in
-                // flight, and defines the remedy as retrying.
-                "ConditionalRequestConflict"
-                    | "InternalError"
-                    | "RequestTimeout"
-                    | "RequestTimeoutException"
-                    | "SlowDown"
-                    | "Throttling"
-                    | "ThrottlingException"
-                    | "TooManyRequestsException"
-            )
+            Some("InternalError" | "RequestTimeout" | "RequestTimeoutException")
         )
 }
 

@@ -5,8 +5,9 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     future::Future,
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroUsize},
     ops::Range,
+    sync::{Arc, PoisonError},
 };
 
 use chrono::{DateTime, Utc};
@@ -22,8 +23,8 @@ use angos_extension_service::{
     UploadEntry, UploadsBody,
 };
 use angos_oci::{
-    Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, MediaType, Namespace, Platform,
-    Tag, UploadSessionId, namespace_belongs_to, request::GetReferrersRequest,
+    Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace, Platform, Tag,
+    UploadSessionId, namespace_belongs_to, request::GetReferrersRequest,
 };
 use angos_oci_service::NoContent;
 
@@ -34,13 +35,16 @@ use crate::{
         Error, Registry,
         content_discovery::{DEFAULT_PAGE_SIZE, REFERRER_RESOLVE_CONCURRENCY},
         manifest::read_manifest,
-        metadata_store::{LinkKind, LinkMetadata},
+        metadata_store::LinkKind,
     },
 };
 
 /// Bounds the per-namespace stat fan-out so a repository with many namespaces
 /// does not open one request per namespace at once.
 const NAMESPACE_STAT_CONCURRENCY: usize = 32;
+
+/// Manifests whose analysis the revision listing keeps in memory per replica.
+pub const DEFAULT_REVISION_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(100_000).unwrap();
 
 struct RepositoryConfig {
     pull_through_cache: bool,
@@ -51,6 +55,7 @@ struct RepositoryConfig {
 
 /// A child descriptor that points back at a `subject` via the Docker reference
 /// digest annotation.
+#[derive(Clone)]
 struct DockerReferrerCandidate {
     subject: Digest,
     child_digest: Digest,
@@ -69,23 +74,16 @@ fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCand
     })
 }
 
-/// Whether a revision of this media type is an index, the one kind of
-/// manifest with children to analyze.
-fn is_index(media_type: &MediaType) -> bool {
-    *media_type == MediaType::oci_index() || *media_type == MediaType::docker_manifest_list()
-}
-
-/// What the revisions listing gathers in bulk, each in one walk or one
-/// bounded fan-out, before it assembles an entry per revision.
+/// What the revisions listing gathers over the whole namespace, in three
+/// walks and one cached analysis per revision, to place every revision
+/// before it reads anything for the entries it serves.
 struct ListingInputs {
+    revisions: Vec<Digest>,
     digest_to_tags: HashMap<Digest, Vec<Tag>>,
-    /// Records of the revisions that are not another's referrer.
-    records: HashMap<Digest, LinkMetadata>,
-    /// The revisions recorded as another's referrer, listed as leaves.
-    leaves: HashSet<Digest>,
-    subject_referrers: HashMap<Digest, SubjectReferrers>,
-    child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
-    docker_referrers: HashMap<Digest, Vec<ReferrerInfo>>,
+    /// Every referrer record, keyed by subject.
+    referrers_by_subject: HashMap<Digest, Vec<Digest>>,
+    /// The analysis of each revision whose body read.
+    analyses: HashMap<Digest, Arc<ManifestAnalysis>>,
 }
 
 /// One subject's referrers as the listing serves them: the descriptors of
@@ -95,7 +93,9 @@ struct SubjectReferrers {
     next: Option<String>,
 }
 
-struct ManifestAnalysis {
+/// The children an index body lists, none for any other manifest. A digest
+/// fixes its body, so an analysis never goes stale.
+pub struct ManifestAnalysis {
     /// Index children that are not referrers, each paired with its platform.
     parent_links: Vec<(Digest, Option<Platform>)>,
     referrer_candidates: Vec<DockerReferrerCandidate>,
@@ -198,64 +198,75 @@ fn page_range(total: usize, page: PageRequest) -> (Range<usize>, Option<u32>) {
     (start..end, next)
 }
 
-/// Which of `entries` a revision listing serves, in order, with the top-level
-/// count and the next page's offset. A top-level entry is one no other holds,
-/// as the web UI nests them: each selected one is followed by what it holds,
-/// its platform manifests and referrers, so a page renders whole.
+/// Which of `inputs.revisions` a listing serves, in order, with the top-level
+/// count and the next page's offset. A top-level revision is one no other
+/// holds, as the web UI nests them: each selected one is followed by what it
+/// holds, its platform manifests and referrers, so a page renders whole.
 fn select_revisions(
-    entries: &[ManifestEntry],
+    inputs: &ListingInputs,
     selection: &RevisionSelection,
 ) -> (Vec<usize>, usize, Option<u32>) {
-    let position: HashMap<&str, usize> = entries
+    let revisions = &inputs.revisions;
+    let position: HashMap<&Digest, usize> = revisions
         .iter()
         .enumerate()
-        .map(|(index, entry)| (entry.digest.as_str(), index))
+        .map(|(index, digest)| (digest, index))
         .collect();
-    // A self-reference holds nothing, or the entry would list nowhere.
-    let mut holds: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
-    for (index, entry) in entries.iter().enumerate() {
-        for parent in &entry.parents {
-            if let Some(&holder) = position.get(parent.digest.as_str())
-                && holder != index
-            {
-                holds[holder].push(index);
-            }
+    let mut holds: Vec<Vec<usize>> = vec![Vec::new(); revisions.len()];
+    // A self-reference holds nothing, or the revision would list nowhere.
+    let mut add_hold = |holder: &Digest, held: &Digest| {
+        if let (Some(&holder), Some(&held)) = (position.get(holder), position.get(held))
+            && holder != held
+        {
+            holds[holder].push(held);
         }
-        for referrer in &entry.referrers {
-            if let Some(&held) = position.get(referrer.digest.as_str())
-                && held != index
-            {
-                holds[index].push(held);
-            }
+    };
+    for digest in revisions {
+        let Some(analysis) = inputs.analyses.get(digest) else {
+            continue;
+        };
+        for (child, _) in &analysis.parent_links {
+            add_hold(digest, child);
+        }
+        for candidate in &analysis.referrer_candidates {
+            add_hold(&candidate.subject, &candidate.child_digest);
+        }
+    }
+    // A subject holds the referrers its first page serves; any past it list
+    // on their own.
+    for (subject, referrers) in &inputs.referrers_by_subject {
+        let mut first_page: Vec<&Digest> = referrers.iter().collect();
+        first_page.sort();
+        for referrer in first_page.into_iter().take(usize::from(DEFAULT_PAGE_SIZE)) {
+            add_hold(subject, referrer);
         }
     }
 
     let (tops, total, next) = match selection {
         RevisionSelection::Digest(digest) => {
-            let tops: Vec<usize> = position
-                .get(digest.to_string().as_str())
-                .copied()
-                .into_iter()
-                .collect();
+            let tops: Vec<usize> = position.get(digest).copied().into_iter().collect();
             let total = tops.len();
             (tops, total, None)
         }
         &RevisionSelection::Page { sort, order, page } => {
             let held: HashSet<usize> = holds.iter().flatten().copied().collect();
-            let mut tops: Vec<usize> = (0..entries.len())
+            let mut tops: Vec<usize> = (0..revisions.len())
                 .filter(|index| !held.contains(index))
                 .collect();
+            let first_tag = |index: usize| {
+                inputs
+                    .digest_to_tags
+                    .get(&revisions[index])
+                    .and_then(|tags| tags.first())
+            };
             // A tag sort keeps the untagged last in either order, in revision
             // order.
-            tops.sort_by(|&a, &b| {
-                let (a, b) = (&entries[a], &entries[b]);
-                match sort {
-                    RevisionSort::Digest => directed(a.digest.cmp(&b.digest), order),
-                    RevisionSort::Tag => match (a.tags.first(), b.tags.first()) {
-                        (Some(a), Some(b)) => directed(a.cmp(b), order),
-                        (a, b) => a.is_none().cmp(&b.is_none()),
-                    },
-                }
+            tops.sort_by(|&a, &b| match sort {
+                RevisionSort::Digest => directed(revisions[a].cmp(&revisions[b]), order),
+                RevisionSort::Tag => match (first_tag(a), first_tag(b)) {
+                    (Some(a), Some(b)) => directed(a.cmp(b), order),
+                    (a, b) => a.is_none().cmp(&b.is_none()),
+                },
             });
             let total = tops.len();
             let (range, next) = page_range(total, page);
@@ -419,70 +430,26 @@ impl Registry {
         namespace: &Namespace,
         selection: RevisionSelection,
     ) -> Result<RevisionsBody, Error> {
-        // Materialized once: every step below needs the full revision set. The
-        // three walks are independent, so they go out together.
-        let (all_revisions, digest_to_tags, referrers_by_subject) = try_join!(
+        // Placing each revision takes the whole namespace: three walks, which
+        // go out together, and each revision's analysis, cached once read.
+        // Every other read is for the served entries alone.
+        let (revisions, digest_to_tags, referrers_by_subject) = try_join!(
             self.metadata_store
                 .stream_revisions(namespace)
                 .try_collect::<Vec<Digest>>(),
             self.build_digest_to_tags_map(namespace),
             self.metadata_store.collect_referrers(namespace),
         )?;
-        let tag_names: HashSet<Tag> = digest_to_tags.values().flatten().cloned().collect();
-        // A subject is any revision holding referrer records, or carrying the
-        // pre-API fallback tag that holds them instead.
-        let subjects: Vec<Digest> = all_revisions
-            .iter()
-            .filter(|digest| {
-                referrers_by_subject.contains_key(*digest)
-                    || tag_names.contains(&digest.referrers_fallback_tag())
-            })
-            .cloned()
-            .collect();
-        let subject_referrers = self
-            .resolve_subject_referrers(namespace, subjects, &referrers_by_subject, &tag_names)
-            .await;
-
-        // A revision recorded as another's referrer lists as a leaf under it,
-        // where no push or pull time is shown, and the descriptor just read for
-        // its subject names its media type: its record goes unread.
-        let leaves: HashSet<Digest> = referrers_by_subject.values().flatten().cloned().collect();
-        let roots: Vec<Digest> = all_revisions
-            .iter()
-            .filter(|digest| !leaves.contains(*digest))
-            .cloned()
-            .collect();
-        let records = self.read_revision_records(namespace, &roots).await;
-        let mut media_types: HashMap<Digest, MediaType> = records
-            .iter()
-            .filter_map(|(digest, record)| Some((digest.clone(), record.media_type.clone()?)))
-            .collect();
-        for descriptor in subject_referrers
-            .values()
-            .flat_map(|listed| &listed.descriptors)
-        {
-            media_types
-                .entry(descriptor.digest.clone())
-                .or_insert_with(|| descriptor.media_type.clone());
-        }
-
-        let (child_to_parents, docker_referrers) = self
-            .build_parent_and_referrer_maps(&all_revisions, &media_types)
-            .await;
-        let (manifests, total, next) = self
-            .build_manifest_entries(
-                namespace,
-                all_revisions,
-                ListingInputs {
-                    digest_to_tags,
-                    records,
-                    leaves,
-                    subject_referrers,
-                    child_to_parents,
-                    docker_referrers,
-                },
-                &selection,
-            )
+        let analyses = self.analyze_revisions(&revisions).await;
+        let inputs = ListingInputs {
+            revisions,
+            digest_to_tags,
+            referrers_by_subject,
+            analyses,
+        };
+        let (served, total, next) = select_revisions(&inputs, &selection);
+        let manifests = self
+            .build_manifest_entries(namespace, &served, inputs)
             .await;
 
         Ok(RevisionsBody {
@@ -725,84 +692,131 @@ impl Registry {
         }
     }
 
-    /// Each revision's record, keyed by digest: its push time, and the media
-    /// type that decides whether its body is worth reading. A record that will
-    /// not read is absent, and its revision lists without a push time.
-    async fn read_revision_records(
+    /// Each revision's push time from its record, keyed by digest. A record
+    /// that will not read is absent, and its revision lists without one.
+    async fn read_push_times(
         &self,
         namespace: &Namespace,
-        all_revisions: &[Digest],
-    ) -> HashMap<Digest, LinkMetadata> {
-        stream::iter(all_revisions.iter().cloned())
+        revisions: &[Digest],
+    ) -> HashMap<Digest, DateTime<Utc>> {
+        stream::iter(revisions.iter().cloned())
             .map(|digest| async move {
                 let record = self
                     .metadata_store
                     .read_link(namespace, &LinkKind::Digest(digest.clone()))
                     .await
                     .ok()?;
-                Some((digest, record))
+                Some((digest, record.created_at?))
             })
             .buffer_unordered(self.config.listing_read_concurrency.get())
-            .filter_map(|record| async move { record })
+            .filter_map(|pushed| async move { pushed })
             .collect()
             .await
     }
 
-    async fn build_parent_and_referrer_maps(
+    /// Each revision's analysis, keyed by digest, read from its body only
+    /// when this replica has not cached it yet. A body that will not read is
+    /// left out and uncached, so the next listing retries it.
+    async fn analyze_revisions(
         &self,
-        all_revisions: &[Digest],
-        media_types: &HashMap<Digest, MediaType>,
-    ) -> (
-        HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
-        HashMap<Digest, Vec<ReferrerInfo>>,
-    ) {
-        // Only an index has children to analyze, and the media type is known
-        // for nearly every revision without its body, so every other body goes
-        // unread. A revision whose type is unknown is read to be sure.
-        let indexes: Vec<Digest> = all_revisions
-            .iter()
-            .filter(|digest| media_types.get(*digest).is_none_or(is_index))
-            .cloned()
-            .collect();
+        revisions: &[Digest],
+    ) -> HashMap<Digest, Arc<ManifestAnalysis>> {
+        let mut analyses = HashMap::with_capacity(revisions.len());
+        let mut unread = Vec::new();
+        {
+            let cache = self
+                .manifest_analyses
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for digest in revisions {
+                match cache.get(digest) {
+                    Some(cached) => {
+                        analyses.insert(digest.clone(), cached.clone());
+                    }
+                    None => unread.push(digest.clone()),
+                }
+            }
+        }
 
-        // `buffered` keeps the revision order so the merged map values stay
-        // deterministic.
-        let analyses: Vec<_> = stream::iter(indexes)
+        let read: Vec<(Digest, Arc<ManifestAnalysis>)> = stream::iter(unread)
             .map(|digest| async move {
-                // A body that will not read drops its row rather than failing
-                // the whole listing.
                 let manifest = read_manifest(&self.blob_store, &digest)
                     .await
                     .ok()
                     .flatten()?;
-                let analysis = analyze_manifest(&manifest);
-                let mut referrers = Vec::with_capacity(analysis.referrer_candidates.len());
-                for referrer in analysis.referrer_candidates {
-                    let info = self
-                        .enrich_referrer_with_predicate(referrer.info, &referrer.child_digest)
-                        .await;
-                    referrers.push((referrer.subject, info));
+                Some((digest, Arc::new(analyze_manifest(&manifest))))
+            })
+            .buffer_unordered(self.config.listing_read_concurrency.get())
+            .filter_map(|analysis| async move { analysis })
+            .collect()
+            .await;
+
+        {
+            let capacity = self.config.revision_cache_entries.get();
+            let mut cache = self
+                .manifest_analyses
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // Emptied whole when full, which only costs a namespace larger
+            // than the cache its saving.
+            if cache.len() + read.len() > capacity {
+                cache.clear();
+            }
+            cache.extend(read.iter().take(capacity).cloned());
+        }
+        analyses.extend(read);
+        analyses
+    }
+
+    /// The parents of each `served` revision, and the Docker-style referrers
+    /// of each `served` subject with their in-toto predicates read.
+    async fn build_parent_and_referrer_maps(
+        &self,
+        revisions: &[Digest],
+        analyses: &HashMap<Digest, Arc<ManifestAnalysis>>,
+        served: &HashSet<&Digest>,
+    ) -> (
+        HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+        HashMap<Digest, Vec<ReferrerInfo>>,
+    ) {
+        // Walked in revision order so each entry's parents are deterministic.
+        let mut child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>> = HashMap::new();
+        let mut candidates = Vec::new();
+        for digest in revisions {
+            let Some(manifest) = analyses.get(digest) else {
+                continue;
+            };
+            for (child, platform) in &manifest.parent_links {
+                if served.contains(child) {
+                    child_to_parents
+                        .entry(child.clone())
+                        .or_default()
+                        .push((digest.clone(), platform.clone()));
                 }
-                Some((digest, analysis.parent_links, referrers))
+            }
+            candidates.extend(
+                manifest
+                    .referrer_candidates
+                    .iter()
+                    .filter(|candidate| served.contains(&candidate.subject))
+                    .cloned(),
+            );
+        }
+
+        let enriched: Vec<(Digest, ReferrerInfo)> = stream::iter(candidates)
+            .map(|candidate| async move {
+                let info = self
+                    .enrich_referrer_with_predicate(candidate.info, &candidate.child_digest)
+                    .await;
+                (candidate.subject, info)
             })
             .buffered(self.config.listing_read_concurrency.get())
             .collect()
             .await;
-
-        let mut child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>> = HashMap::new();
         let mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>> = HashMap::new();
-        for (digest, parent_links, referrers) in analyses.into_iter().flatten() {
-            for (child_digest, platform) in parent_links {
-                child_to_parents
-                    .entry(child_digest)
-                    .or_default()
-                    .push((digest.clone(), platform));
-            }
-            for (subject, info) in referrers {
-                docker_referrers.entry(subject).or_default().push(info);
-            }
+        for (subject, info) in enriched {
+            docker_referrers.entry(subject).or_default().push(info);
         }
-
         (child_to_parents, docker_referrers)
     }
 
@@ -822,26 +836,55 @@ impl Registry {
         info
     }
 
-    /// The entries `selection` serves, with the top-level count and the next
-    /// page's offset. Pull times, the one per-entry read, are read for those
-    /// entries alone.
+    /// The entries at `served` in `inputs.revisions`, with the reads they alone
+    /// need: referrer descriptors, in-toto predicates, push and pull times.
     async fn build_manifest_entries(
         &self,
         namespace: &Namespace,
-        all_revisions: Vec<Digest>,
+        served: &[usize],
         inputs: ListingInputs,
-        selection: &RevisionSelection,
-    ) -> (Vec<ManifestEntry>, usize, Option<u32>) {
+    ) -> Vec<ManifestEntry> {
         let ListingInputs {
+            revisions,
             digest_to_tags,
-            records,
-            leaves,
-            mut subject_referrers,
-            child_to_parents,
-            mut docker_referrers,
+            referrers_by_subject,
+            analyses,
         } = inputs;
+        let served: Vec<Digest> = served
+            .iter()
+            .map(|&index| revisions[index].clone())
+            .collect();
+        let is_served: HashSet<&Digest> = served.iter().collect();
 
-        let (digests, entries): (Vec<Digest>, Vec<ManifestEntry>) = all_revisions
+        let tag_names: HashSet<Tag> = digest_to_tags.values().flatten().cloned().collect();
+        // A subject is any revision holding referrer records, or carrying the
+        // pre-API fallback tag that holds them instead.
+        let subjects: Vec<Digest> = served
+            .iter()
+            .filter(|digest| {
+                referrers_by_subject.contains_key(*digest)
+                    || tag_names.contains(&digest.referrers_fallback_tag())
+            })
+            .cloned()
+            .collect();
+        let mut subject_referrers = self
+            .resolve_subject_referrers(namespace, subjects, &referrers_by_subject, &tag_names)
+            .await;
+
+        // A revision recorded as another's referrer lists as a leaf under it,
+        // where no push or pull time is shown: its record goes unread.
+        let leaves: HashSet<&Digest> = referrers_by_subject.values().flatten().collect();
+        let roots: Vec<Digest> = served
+            .iter()
+            .filter(|digest| !leaves.contains(*digest))
+            .cloned()
+            .collect();
+        let pushed_at = self.read_push_times(namespace, &roots).await;
+        let (child_to_parents, mut docker_referrers) = self
+            .build_parent_and_referrer_maps(&revisions, &analyses, &is_served)
+            .await;
+
+        let served: Vec<(Digest, ManifestEntry)> = served
             .into_iter()
             .map(|digest| {
                 let tags = digest_to_tags.get(&digest).cloned().unwrap_or_default();
@@ -868,25 +911,17 @@ impl Registry {
                     parents,
                     referrers,
                     referrers_next,
-                    pushed_at: records.get(&digest).and_then(|record| record.created_at),
+                    pushed_at: pushed_at.get(&digest).copied(),
                     last_pulled_at: None,
                 };
                 (digest, entry)
             })
-            .unzip();
-
-        let (served, total, next) = select_revisions(&entries, selection);
-        let mut slots: Vec<_> = digests.into_iter().zip(entries).map(Some).collect();
-        let served: Vec<(Digest, ManifestEntry)> = served
-            .into_iter()
-            .filter_map(|index| slots[index].take())
             .collect();
 
         // Pull times exist only while pulls are recorded: with recording off
         // every read below would list an empty directory.
         if !self.config.update_pull_time {
-            let entries = served.into_iter().map(|(_, entry)| entry).collect();
-            return (entries, total, next);
+            return served.into_iter().map(|(_, entry)| entry).collect();
         }
         let tags = served
             .iter()
@@ -894,7 +929,7 @@ impl Registry {
             .collect();
         let tag_pulls = &self.newest_tag_pulls(namespace, tags).await;
         let leaves = &leaves;
-        let entries = stream::iter(served)
+        stream::iter(served)
             .map(|(digest, mut entry)| async move {
                 // A revision's last pull lives in its access entries; a leaf
                 // shows no pull time.
@@ -929,8 +964,7 @@ impl Registry {
             })
             .buffered(self.config.listing_read_concurrency.get())
             .collect()
-            .await;
-        (entries, total, next)
+            .await
     }
 
     /// Each subject's referrers as the listing serves them. Recorded referrers
@@ -1111,7 +1145,7 @@ mod tests {
         collections::HashMap,
         num::NonZeroU16,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
@@ -1128,8 +1162,8 @@ mod tests {
 
     use angos_cache::Config as CacheConfig;
     use angos_extension_service::{
-        ListNamespacesRequest, ManifestEntry, NamespacesBody, PageRequest, ParentRef, ReferrerInfo,
-        RevisionSelection, RevisionSort, SortOrder,
+        ListNamespacesRequest, NamespacesBody, PageRequest, RevisionSelection, RevisionSort,
+        SortOrder,
     };
     use angos_oci::{
         DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, OCI_INDEX_MEDIA_TYPE,
@@ -1144,9 +1178,10 @@ mod tests {
         registry::{
             Error as RegistryError, Registry, RegistryConfig,
             admin::{
-                ListPullsRequest, analyze_manifest, extract_docker_referrer, parent_refs_for,
-                select_revisions,
+                ListPullsRequest, ListingInputs, ManifestAnalysis, analyze_manifest,
+                extract_docker_referrer, parent_refs_for, select_revisions,
             },
+            blob_store::BlobStore,
             content_discovery::DEFAULT_PAGE_SIZE,
             keys::NamespaceKeys,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -1639,37 +1674,6 @@ mod tests {
         .await;
     }
 
-    fn listed(
-        digest: &Digest,
-        tags: &[&str],
-        parents: &[&Digest],
-        referrers: &[&Digest],
-    ) -> ManifestEntry {
-        ManifestEntry {
-            digest: digest.to_string(),
-            tags: tags.iter().map(|tag| Tag::new(tag).unwrap()).collect(),
-            parents: parents
-                .iter()
-                .map(|parent| ParentRef {
-                    digest: parent.to_string(),
-                    tags: Vec::new(),
-                    platform: None,
-                })
-                .collect(),
-            referrers: referrers
-                .iter()
-                .map(|referrer| ReferrerInfo {
-                    digest: referrer.to_string(),
-                    artifact_type: None,
-                    annotations: HashMap::new(),
-                })
-                .collect(),
-            referrers_next: None,
-            pushed_at: None,
-            last_pulled_at: None,
-        }
-    }
-
     /// Pages count top-level revisions, and each carries the platform manifest
     /// it holds and that manifest's referrer, however the rows are ordered.
     #[test]
@@ -1681,13 +1685,25 @@ mod tests {
             digest("4"),
             digest("5"),
         );
-        let entries = [
-            listed(&index, &["b"], &[], &[]),
-            listed(&child, &[], &[&index], &[&attestation]),
-            listed(&attestation, &[], &[], &[]),
-            listed(&top, &["a"], &[], &[]),
-            listed(&untagged, &[], &[], &[]),
-        ];
+        let tagged = |digest: &Digest, tag: &str| (digest.clone(), vec![Tag::new(tag).unwrap()]);
+        let inputs = ListingInputs {
+            revisions: vec![
+                index.clone(),
+                child.clone(),
+                attestation.clone(),
+                top.clone(),
+                untagged,
+            ],
+            digest_to_tags: HashMap::from([tagged(&index, "b"), tagged(&top, "a")]),
+            referrers_by_subject: HashMap::from([(child.clone(), vec![attestation])]),
+            analyses: HashMap::from([(
+                index,
+                Arc::new(ManifestAnalysis {
+                    parent_links: vec![(child.clone(), None)],
+                    referrer_candidates: Vec::new(),
+                }),
+            )]),
+        };
         let page = |offset, n| RevisionSelection::Page {
             sort: RevisionSort::Tag,
             order: SortOrder::Asc,
@@ -1698,14 +1714,111 @@ mod tests {
         };
 
         assert_eq!(
-            select_revisions(&entries, &page(0, 2)),
+            select_revisions(&inputs, &page(0, 2)),
             (vec![3, 0, 1, 2], 3, Some(2))
         );
-        assert_eq!(select_revisions(&entries, &page(2, 2)), (vec![4], 3, None));
+        assert_eq!(select_revisions(&inputs, &page(2, 2)), (vec![4], 3, None));
         assert_eq!(
-            select_revisions(&entries, &RevisionSelection::Digest(child)),
+            select_revisions(&inputs, &RevisionSelection::Digest(child)),
             (vec![1, 2], 1, None),
             "a held revision is served on its own, with what it holds"
+        );
+    }
+
+    /// Records every key a store is asked to read.
+    struct ReadLog(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl StoreHook for ReadLog {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            if let StoreOp::Get { key } | StoreOp::GetStream { key } = op {
+                self.0.lock().unwrap().push(key.to_string());
+            }
+            Ok(())
+        }
+    }
+
+    /// The first page analyzes every body; a later one reads only the record
+    /// of what it serves, leaving the other pages' records and referrers be.
+    #[tokio::test]
+    async fn a_later_revision_page_reads_only_what_it_serves() {
+        let FsTestStack {
+            dir: _dir,
+            metadata_store,
+            blob_store,
+        } = fs_test_stack();
+        let namespace = Namespace::new("test-repo/paged").unwrap();
+        let mut tops = Vec::new();
+        for tag in ["a", "b", "c"] {
+            let index = json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_INDEX_MEDIA_TYPE,
+                "manifests": [{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": Digest::sha256_of_bytes(tag.as_bytes()).to_string(),
+                    "size": 1
+                }]
+            });
+            let top = put_blob_body(&blob_store, &serde_json::to_vec(&index).unwrap()).await;
+            seed_tagged_revision(&metadata_store, &namespace, &top, &[tag]).await;
+            tops.push(top);
+        }
+        metadata_store
+            .put_referrer(&namespace, &tops[2], &digest("5e"), None)
+            .await
+            .unwrap();
+
+        let blob_reads = Arc::new(Mutex::new(Vec::new()));
+        let metadata_reads = Arc::new(Mutex::new(Vec::new()));
+        let registry = create_test_registry(
+            Arc::new(BlobStore::new(
+                Arc::new(HookedStore::new(
+                    blob_store.object_store().clone(),
+                    ReadLog(blob_reads.clone()),
+                )),
+                None,
+            )),
+            metadata_store_over(Arc::new(HookedStore::new(
+                metadata_store.object_store().clone(),
+                ReadLog(metadata_reads.clone()),
+            ))),
+        );
+        let page = |offset| RevisionSelection::Page {
+            sort: RevisionSort::Tag,
+            order: SortOrder::Asc,
+            page: PageRequest {
+                offset,
+                n: NonZeroU16::new(1),
+            },
+        };
+
+        registry
+            .handle_list_revisions(&namespace, page(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            blob_reads.lock().unwrap().len(),
+            3,
+            "every body is analyzed"
+        );
+        blob_reads.lock().unwrap().clear();
+        metadata_reads.lock().unwrap().clear();
+        let body = registry
+            .handle_list_revisions(&namespace, page(1))
+            .await
+            .unwrap();
+
+        let served: Vec<&str> = body.manifests.iter().map(|m| m.digest.as_str()).collect();
+        assert_eq!(served, [tops[1].to_string()]);
+        assert_eq!(
+            *blob_reads.lock().unwrap(),
+            Vec::<String>::new(),
+            "the analyses are cached"
+        );
+        assert_eq!(
+            *metadata_reads.lock().unwrap(),
+            [namespace.revision_record_path(&tops[1])],
+            "only the served revision's record is read"
         );
     }
 

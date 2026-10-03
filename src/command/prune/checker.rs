@@ -507,7 +507,7 @@ impl RetentionChecker {
                 // Its referrers lose their subject and are judged in this run.
                 let referrers: Vec<Digest> = self
                     .metadata_store
-                    .stream_referrer_digests(namespace, digest)
+                    .stream_referrer_digests(namespace, digest, None)
                     .try_collect()
                     .await?;
                 unpinned.extend(referrers);

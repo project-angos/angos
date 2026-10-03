@@ -14,15 +14,12 @@ use crate::{
     registry::{
         Error, Registry,
         blob_ownership::{GrantOutcome, grant_existing, promote_and_grant},
-        blob_store::{
-            hashing::{Hasher, HashingReader},
-            upload_session::HashStart,
-        },
+        blob_store::hashing::{Hasher, HashingReader},
     },
 };
 
-/// Caps the namespaces CEL-evaluated for a from-less mount, bounding an
-/// attacker-influenceable fan-out. Candidates beyond the cap fall back to a
+/// Caps the namespaces a from-less mount reads off the blob index and
+/// CEL-evaluates, bounding an attacker-influenceable fan-out. Candidates beyond the cap fall back to a
 /// normal upload session, so no access is over-granted.
 const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
 
@@ -157,14 +154,9 @@ impl Registry {
             });
         }
 
-        let mut candidates = self
-            .metadata_store()
-            .referencing_namespaces(&mount.digest)
-            .await?;
-        // Sort before truncating so the kept candidates are deterministic.
-        candidates.sort();
-        candidates.truncate(MAX_FROM_LESS_MOUNT_CANDIDATES);
-        Ok(candidates)
+        self.metadata_store()
+            .referencing_namespaces(&mount.digest, MAX_FROM_LESS_MOUNT_CANDIDATES)
+            .await
     }
 
     /// Opens a fresh resumable upload session; `digest_algorithm` fixes what
@@ -229,9 +221,8 @@ impl Registry {
             ));
         };
 
-        let session_id = UploadSessionId::generate();
-        self.blob_store
-            .create_upload(&request.namespace, &session_id, Some(digest.algorithm()))
+        let session = self
+            .open_upload_session(&request.namespace, Some(digest.algorithm()))
             .await?;
 
         Ok(StartUpload::Completed(Box::new(
@@ -239,7 +230,7 @@ impl Registry {
                 actor,
                 CompleteUploadRequest {
                     namespace: request.namespace.clone(),
-                    session_id: session_id.clone(),
+                    session_id: session.session_id,
                     digest: digest.clone(),
                     content_range: None,
                     content_length: Some(content_length),
@@ -391,16 +382,17 @@ impl Registry {
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
-        let summary = self
+        let session = self
             .blob_store
-            .upload_summary(&request.namespace, &request.session_id)
+            .read_session(&request.namespace, &request.session_id)
             .await?;
+        let committed = session.committed_offset;
 
         // Refused before a byte is committed: a chunk must resume where the
         // session stands, and a declared length must match the window it
         // announced.
         if let Some(range) = request.content_range
-            && (!range.starts_at(summary.size)
+            && (!range.starts_at(committed)
                 || request
                     .content_length
                     .is_some_and(|length| !range.covers(length)))
@@ -411,12 +403,12 @@ impl Registry {
         self.reject_oversized_known_length(
             &request.namespace,
             &request.session_id,
-            summary.size,
+            committed,
             request.content_length,
         )
         .await?;
 
-        let bounded = self.bound_blob_stream(summary.size, request.content_length, stream);
+        let bounded = self.bound_blob_stream(committed, request.content_length, stream);
         // PATCH only needs the running size, the digest being finalized at the
         // PUT. Concurrent PATCHes on one session are unserialized: the PUT's
         // size check rejects an interleaving, and it promotes only the bytes it
@@ -426,6 +418,7 @@ impl Registry {
             .append_upload(
                 &request.namespace,
                 &request.session_id,
+                session,
                 Box::new(bounded),
                 request.content_length,
             )
@@ -438,7 +431,7 @@ impl Registry {
             &request.session_id,
             request.content_range,
             request.content_length,
-            size.saturating_sub(summary.size),
+            size.saturating_sub(committed),
         )
         .await?;
 
@@ -483,12 +476,14 @@ impl Registry {
 
         // An unknown session reads as empty only so the blob-exists path below
         // can answer a retry whose 201 was lost; anything else it reaches 404s.
-        let (committed, session_known) =
-            match self.blob_store.upload_summary(namespace, session_id).await {
-                Ok(summary) => (summary.size, true),
-                Err(Error::BlobUploadUnknown) => (0, false),
-                Err(e) => return Err(e),
-            };
+        let session = match self.blob_store.read_session(namespace, session_id).await {
+            Ok(session) => Some(session),
+            Err(Error::BlobUploadUnknown) => None,
+            Err(e) => return Err(e),
+        };
+        let committed = session
+            .as_ref()
+            .map_or(0, |session| session.committed_offset);
         let has_prior_writes = committed > 0;
 
         // A final-chunk PUT carrying a Content-Range must resume from the
@@ -518,26 +513,18 @@ impl Registry {
                 .await;
         }
 
-        if !session_known {
+        let Some(session) = session else {
             return Err(Error::BlobUploadUnknown);
-        }
-
-        // A monolithic PUT knows its algorithm up front, so it hashes only the
-        // target; a chunked finalize must resume the both-algorithm checkpoint
-        // its PATCHes left.
-        let start = if has_prior_writes {
-            HashStart::Resume
-        } else {
-            HashStart::Fresh(digest.algorithm())
         };
+
         let (upload_digest, new_total) = self
             .blob_store
             .write_upload(
                 namespace,
                 session_id,
+                session,
                 Box::new(stream),
                 content_length,
-                start,
                 digest.algorithm(),
             )
             .await?;
@@ -562,6 +549,7 @@ impl Registry {
             return Err(Error::DigestInvalid);
         }
 
+        // A promotion leaves no session behind, so there is nothing to clean.
         promote_and_grant(
             &self.blob_store,
             self.metadata_store.as_ref(),
@@ -572,8 +560,10 @@ impl Registry {
         )
         .await?;
 
-        self.finish_completed_upload(namespace, session_id, digest)
-            .await
+        Ok(BlobWritten {
+            namespace: namespace.clone(),
+            digest: digest.clone(),
+        })
     }
 
     #[instrument]
@@ -629,7 +619,7 @@ mod tests {
 
     use crate::registry::{
         Error, Registry, RegistryConfig,
-        blob_store::{BlobStore, upload_session::HashStart},
+        blob_store::BlobStore,
         keys::NamespaceKeys,
         metadata_store::LinkKind,
         repository_resolver::RepositoryResolver,
@@ -2316,7 +2306,7 @@ mod tests {
             let session_id = UploadSessionId::generate();
             let content = b"hello world upload";
 
-            registry
+            let session = registry
                 .blob_store
                 .create_upload(namespace, &session_id, None)
                 .await
@@ -2329,9 +2319,9 @@ mod tests {
                 .write_upload(
                     namespace,
                     &session_id,
+                    session,
                     stream,
                     Some(content.len() as u64),
-                    HashStart::Fresh(Algorithm::Sha256),
                     Algorithm::Sha256,
                 )
                 .await
@@ -2359,7 +2349,7 @@ mod tests {
             let session_id = UploadSessionId::generate();
             let content = b"size check content";
 
-            registry
+            let session = registry
                 .blob_store
                 .create_upload(namespace, &session_id, None)
                 .await
@@ -2379,9 +2369,9 @@ mod tests {
                 .write_upload(
                     namespace,
                     &session_id,
+                    session,
                     stream,
                     Some(content.len() as u64),
-                    HashStart::Fresh(Algorithm::Sha256),
                     Algorithm::Sha256,
                 )
                 .await

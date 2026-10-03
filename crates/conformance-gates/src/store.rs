@@ -126,7 +126,6 @@ impl GateStore {
     pub async fn seed_orphan_multipart(&self, key: &str) -> GateResult<()> {
         let body = Bytes::from(vec![0u8; MULTIPART_SEED_BYTES]);
         let len = body.len() as u64;
-        self.store.create_upload(key).await?;
         self.store
             .write_upload(key, Box::pin(stream::once(async { Ok(body) })), Some(len))
             .await?;

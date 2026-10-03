@@ -115,7 +115,7 @@ listener.
 | `blob_stream_frame_size`    | string   | `"128KiB"` | Read buffer each frame of a streamed blob response is filled from; larger frames cost fewer allocations and body writes per blob served, at one buffer per in-flight response |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
 | `enable_blob_redirect`      | bool     | `true`   | Allow HTTP 307 redirects for blob downloads. |
-| `enable_manifest_redirect`  | bool     | `true`   | Allow HTTP 307 redirects for manifest downloads. Manifest bodies served via `response-content-type` to preserve the media type across redirects. |
+| `enable_manifest_redirect`  | bool     | `true`   | Allow HTTP 307 redirects for manifest downloads by digest; a download by tag is served inline. Manifest bodies served via `response-content-type` to preserve the media type across redirects. |
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
 | `immutable_tags_exclusions` | [string] | `[]`     | Regex patterns for mutable tags             |
 | `allow_missing_manifest_references` | bool | `true` | When `true` (default), accept a manifest push whose referenced blobs or child manifests are not yet present/owned in the namespace; the missing references stay unreadable until their content is pushed. Set to `false` to reject such pushes with `MANIFEST_BLOB_UNKNOWN`. See note below. |
@@ -124,6 +124,7 @@ listener.
 | `shutdown_drain_secs`       | u64      | `30`     | Seconds to keep draining in-flight work on shutdown before forcing exit: the server stops accepting, lets the requests in flight finish, then drains the queued webhook deliveries. |
 | `namespace_walk_concurrency`| usize > 0| `128`    | Concurrent directory scans a catalog / upload-namespace walk keeps in flight, hiding per-request backend latency on S3. Zero is refused. |
 | `listing_read_concurrency`  | usize > 0| `16`     | Concurrent reads an admin listing behind the web UI keeps in flight per request: revision records, referrer descriptors, job records. Raise it on a high-latency store to shorten the manifest view's load; zero is refused. |
+| `revision_cache_entries`    | usize > 0| `100000` | Manifests whose index children each replica keeps in memory, about 200 bytes each and more for an index, so paging the revision listing reads each manifest body once. A namespace with more revisions than this reads them all on every page; zero is refused. |
 | `gc_grace_secs`             | u64      | `300`    | Reclamation grace period, used by the serving process and scrub alike: young keys read as live, the push path re-checks the collector after this long, and gc run markers derive their TTL from it. Lower it only in a maintenance config for offline runs against a store with no live traffic; the serving processes must keep a value that exceeds clock skew plus the longest write stall. |
 | `trusted_proxies`           | [string] | `[]`     | Proxy IPs or CIDR networks (e.g. `"10.0.0.1"`, `"10.0.0.0/8"`) whose `X-Forwarded-For`/`X-Real-IP` headers are honored as the client IP. From any other peer those headers are ignored and the socket address is used. The set must name proxies only: a range that also covers clients lets them spoof the forwarded header. |
 

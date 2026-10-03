@@ -245,8 +245,23 @@ export async function fetchRepositories(
 	);
 }
 
-/** Every repository's name, page after page: a browse path resolves against all of them. */
-export async function fetchRepositoryNames(): Promise<FetchResult<string[]>> {
+/** The repository names this page load read. They change only with the
+ * configuration or the session, and signing in or out reloads the page. */
+let repositoryNames: Promise<FetchResult<string[]>> | null = null;
+
+/** Every repository's name, which a browse path resolves against: read once
+ * per page load, or again when `fresh`. A failed read is not kept. */
+export function fetchRepositoryNames(fresh = false): Promise<FetchResult<string[]>> {
+	if (fresh || repositoryNames === null) {
+		repositoryNames = readRepositoryNames().then((result) => {
+			if (!result.data) repositoryNames = null;
+			return result;
+		});
+	}
+	return repositoryNames;
+}
+
+async function readRepositoryNames(): Promise<FetchResult<string[]>> {
 	const names: string[] = [];
 	let offset: number | undefined = 0;
 	while (offset !== undefined) {

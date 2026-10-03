@@ -70,7 +70,6 @@ async fn delete_prunes_empty_ancestors_up_to_root() {
 async fn promote_upload_publishes_only_verified_bytes() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(backend(&dir));
-    store.create_upload("up/data").await.unwrap();
     store
         .write_upload("up/data", frame("verified"), Some(8))
         .await
@@ -251,6 +250,48 @@ async fn list_returns_prefix_relative_keys() {
     assert_eq!(page.items, vec!["a".to_string(), "sub/b".to_string()]);
 }
 
+/// The listing skips the directories a cursor lies past, so paging from any
+/// cursor, a key or not, must still yield every key above it in lexical order,
+/// across names that sort against their own directory (`a!` < `a/x` < `a0`).
+#[tokio::test]
+async fn list_after_pages_in_lexical_order_from_any_cursor() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    let mut keys = [
+        "a!", "a.txt", "a/x", "a/y!", "a/y/z", "a0", "b/c!", "b/c/d", "e",
+    ]
+    .map(String::from);
+    for key in &keys {
+        store
+            .put(&format!("p/{key}"), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    keys.sort();
+
+    let others = ["", "a", "a/", "a/y", "b", "z"].map(String::from);
+    for cursor in keys.iter().chain(&others) {
+        for n in 1..=3 {
+            let mut listed = Vec::new();
+            let mut page = store
+                .list_after("p", n, None, Some(cursor.clone()))
+                .await
+                .unwrap();
+            loop {
+                listed.extend(page.items);
+                let Some(token) = page.next_token else { break };
+                page = store.list_after("p", n, Some(token), None).await.unwrap();
+            }
+            let above: Vec<&String> = keys.iter().filter(|key| *key > cursor).collect();
+            assert_eq!(
+                listed.iter().collect::<Vec<_>>(),
+                above,
+                "after {cursor:?} in pages of {n}"
+            );
+        }
+    }
+}
+
 /// The FS `list_all_children` override reads the directory once and must
 /// still return every child, separated by kind.
 #[tokio::test]
@@ -407,7 +448,6 @@ async fn an_upload_round_trips_with_durability_enabled() {
     let store = Backend::builder(dir.path()).sync_to_disk(true).build();
     let body = Bytes::from_static(b"durable bytes");
 
-    store.create_upload("up/synced").await.unwrap();
     let written = store
         .write_upload("up/synced", frame(body.clone()), Some(body.len() as u64))
         .await

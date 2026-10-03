@@ -118,29 +118,24 @@ pub async fn healthy(ctx: &GateContext) -> GateResult<()> {
         || "prune sweep proof missing from dry-run log".to_string(),
     )?;
 
-    // A real scrub on a healthy store may touch only leftover `.tx-` keys of
-    // the removed transaction engine (reclaimed as garbage); everything else
-    // must be byte-identical.
+    // A real scrub on a healthy store must leave it byte-identical.
     let real = ctx.scrub_logged("scrub-real.log").await?;
     println!("{real}");
     ensure(real.is_all_zero(), || {
         "real scrub acted on a healthy store".to_string()
     })?;
     let after_real = ctx.snapshot_to("snap-after-real").await?;
-    let illegal: Vec<String> = snapshot_diff(&after_dry, &after_real)
-        .into_iter()
-        .filter(|key| !key.starts_with(".tx-"))
-        .collect();
-    ensure(illegal.is_empty(), || {
+    let modified = snapshot_diff(&after_dry, &after_real);
+    ensure(modified.is_empty(), || {
         format!(
-            "a healthy-store scrub modified non-engine keys:\n{}",
-            report_keys(&illegal)
+            "a healthy-store scrub modified keys:\n{}",
+            report_keys(&modified)
         )
     })?;
 
     ctx.registry.audit_digests(AUDIT_FLOOR).await?;
     println!(
-        "GATE healthy: PASS (walked {}, dry-run byte-pure, real run byte-identical outside .tx-)",
+        "GATE healthy: PASS (walked {}, dry-run byte-pure, real run byte-identical)",
         real.walked
     );
     Ok(())

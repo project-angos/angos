@@ -17,12 +17,15 @@ use angos_storage::{Page, paginated};
 use crate::registry::{
     Error,
     keys::{
-        CAT_ROOT, NamespaceKeys, TagEntry, parse_ref_digest, parse_referrer_record,
-        parse_revision_record,
+        CAT_ROOT, DigestKeys, NamespaceKeys, TagEntry, parse_ref_digest, parse_referrer_record,
+        parse_revision_record, ref_digest_name,
     },
-    metadata_store::{LIST_PAGE, LinkMetadata, MetadataStore},
+    metadata_store::{LIST_PAGE, LinkKind, LinkMetadata, MetadataStore},
     pagination,
 };
+
+/// Candidate tags a digest delete resolves at once.
+const TAG_RESOLVE_CONCURRENCY: usize = 16;
 
 /// Folds a sorted stream of (group, entry-file) pairs into each group's
 /// resolved tag: `Some(digest)` live, `None` tombstoned, and no tag at all for
@@ -323,37 +326,62 @@ impl MetadataStore {
         .try_flatten()
     }
 
-    /// The tags in `namespace` currently pointing at `digest`, with their
-    /// winning entries, resolved from the tag entries alone; bodies are never
-    /// read. The walk gates the digest-delete LWW guard, so it must not omit a
-    /// tag re-pointed on another replica.
+    /// The tags in `namespace` currently pointing at `digest`, in tag order,
+    /// with their winning entries resolved from the tag entries alone. Every
+    /// tag write pins its reference key on the digest first, and only scrub
+    /// removes one once stale, so the namespace's tag keys for `digest` hold
+    /// every candidate, a tag re-pointed on another replica included: the
+    /// result gates the digest-delete LWW guard.
     #[instrument(skip(self))]
     pub async fn find_tags_pointing_at(
         &self,
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<Vec<(Tag, LinkMetadata)>, Error> {
-        self.stream_live_tags(namespace, None)
-            .try_filter(|(_, metadata)| ready(metadata.target == *digest))
+        let candidates: Vec<Tag> = self
+            .object_store()
+            .list_in_order(&digest.blob_ref_namespace_dir(namespace))
+            .try_filter_map(|entry| {
+                ready(Ok(match digest.parse_blob_ref_entry(&entry) {
+                    Some(LinkKind::Tag(tag)) => Some(tag),
+                    _ => None,
+                }))
+            })
+            .try_collect()
+            .await?;
+        stream::iter(candidates)
+            .map(|tag| async move {
+                match self.resolve_tag(namespace, &tag).await {
+                    Ok(metadata) if metadata.target == *digest => Ok(Some((tag, metadata))),
+                    Ok(_) | Err(Error::NotFound) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .buffered(TAG_RESOLVE_CONCURRENCY)
+            .try_filter_map(|pointing| ready(Ok(pointing)))
             .try_collect()
             .await
     }
 
-    /// Streams `digest`'s candidate referrer manifest digests, unresolved and
-    /// unordered. Callers resolve each candidate to a descriptor at registry
-    /// altitude, where the blob store holding manifest bodies is in reach.
+    /// Streams `digest`'s candidate referrer manifest digests above `after`,
+    /// unresolved and in digest order, a listing page at a time, so a caller
+    /// resuming at a cursor reads from there. Callers resolve each candidate
+    /// to a descriptor at registry altitude, where the blob store holding
+    /// manifest bodies is in reach.
     pub fn stream_referrer_digests(
         &self,
         namespace: &Namespace,
         digest: &Digest,
+        after: Option<&Digest>,
     ) -> impl Stream<Item = Result<Digest, Error>> + Send + '_ {
         let record_dir = namespace.referrer_record_dir(digest);
+        let start_after = after.map(ref_digest_name);
         paginated(move |token| {
-            let record_dir = record_dir.clone();
+            let (record_dir, start_after) = (record_dir.clone(), start_after.clone());
             async move {
                 let page = self
                     .object_store()
-                    .list(&record_dir, LIST_PAGE, token)
+                    .list_after(&record_dir, LIST_PAGE, token, start_after)
                     .await?;
                 Ok::<_, Error>((page.items, page.next_token))
             }
@@ -830,6 +858,55 @@ mod tests {
             1,
             "taking two tags must not drain the namespace's entries"
         );
+    }
+
+    /// The tags pointing at a digest come off its reference keys, each
+    /// confirmed by a point read, so the namespace's tag entries are never
+    /// listed; a tag moved off the digest or deleted is not among them.
+    #[tokio::test]
+    async fn tags_pointing_at_a_digest_skip_the_namespace_tag_walk() {
+        for_each_backend(async |test_case| {
+            let seeding = test_case.metadata_store();
+            let namespace = &Namespace::new("pointing-ns").unwrap();
+            let target = Digest::sha256_of_bytes(b"pointed at");
+            let other = Digest::sha256_of_bytes(b"pointed elsewhere");
+            for (name, digest) in [
+                ("kept", &target),
+                ("moved", &target),
+                ("deleted", &target),
+                ("other", &other),
+                ("moved", &other),
+            ] {
+                let tag = LinkKind::Tag(Tag::new(name).unwrap());
+                create_link(&seeding, namespace, &tag, digest).await;
+            }
+            seeding
+                .put_tag_tombstone(namespace, &Tag::new("deleted").unwrap(), None)
+                .await
+                .unwrap();
+
+            let count = Arc::new(AtomicUsize::new(0));
+            let store = metadata_store_over(Arc::new(HookedStore::new(
+                seeding.object_store().clone(),
+                CountTagListings {
+                    root: namespace.tag_entries_root(),
+                    count: count.clone(),
+                },
+            )));
+            let pointing = store
+                .find_tags_pointing_at(namespace, &target)
+                .await
+                .unwrap();
+
+            let names: Vec<&str> = pointing.iter().map(|(tag, _)| tag.as_ref()).collect();
+            assert_eq!(names, ["kept"]);
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                0,
+                "the namespace's tag entries must not be listed"
+            );
+        })
+        .await;
     }
 
     /// A listed tag carries what a point read of it resolves: the walk reads

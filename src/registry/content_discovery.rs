@@ -1,11 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
     pin::pin,
 };
 
 use futures_util::{
-    future::BoxFuture,
-    stream::{self, StreamExt, TryStreamExt},
+    future::{BoxFuture, ready},
+    stream::{self, Stream, StreamExt, TryStreamExt},
 };
 use tracing::{instrument, warn};
 
@@ -42,6 +43,44 @@ pub fn holds_manifest_content(
 /// Whether `referrer` passes a listing's `artifactType` filter.
 fn matches_filter(referrer: &Descriptor, artifact_type: Option<&MediaType>) -> bool {
     artifact_type.is_none_or(|filter| referrer.artifact_type.as_ref() == Some(filter))
+}
+
+/// The local and described referrer candidates in one digest order, a digest
+/// both hold taken as local: a local candidate (`None`) resolves from its
+/// record, a described one arrives resolved.
+fn merge_candidates<'a>(
+    local: impl Stream<Item = Result<Digest, Error>> + Send + 'a,
+    described: BTreeMap<Digest, Descriptor>,
+) -> impl Stream<Item = Result<(Digest, Option<Descriptor>), Error>> + Send + 'a {
+    stream::try_unfold(
+        (
+            Box::pin(local),
+            None::<Digest>,
+            described.into_iter().peekable(),
+        ),
+        |(mut local, mut head, mut described)| async move {
+            if head.is_none() {
+                head = local.try_next().await?;
+            }
+            let order = match (&head, described.peek()) {
+                (Some(own), Some((other, _))) => other.cmp(own),
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => return Ok(None),
+            };
+            let next = match order {
+                Ordering::Less => described
+                    .next()
+                    .map(|(other, descriptor)| (other, Some(descriptor))),
+                Ordering::Equal => {
+                    described.next();
+                    head.take().map(|own| (own, None))
+                }
+                Ordering::Greater => head.take().map(|own| (own, None)),
+            };
+            Ok(next.map(|candidate| (candidate, (local, head, described))))
+        },
+    )
 }
 
 /// Fan-out for resolving referrer candidates, each an independent manifest read.
@@ -153,9 +192,10 @@ impl Registry {
     /// remain: candidates resolve until it is filled, so a filter dropping a
     /// long stretch costs reads rather than a short page.
     ///
-    /// Merging needs both listings whole, so every page re-enumerates the
-    /// upstream in full: walking a subject costs one upstream enumeration per
-    /// page, set by its total fan-out rather than by the page size.
+    /// The local records are read from the cursor and only as far as the page
+    /// takes. An upstream's listing has no cursor to resume at, so every page
+    /// re-enumerates it in full: walking a pull-through subject costs one
+    /// upstream enumeration per page.
     #[instrument(skip(upstream))]
     pub async fn list_referrers(
         &self,
@@ -164,6 +204,11 @@ impl Registry {
     ) -> Result<Page<Descriptor>, Error> {
         let (namespace, digest) = (&request.namespace, &request.digest);
         let artifact_type = request.artifact_type.as_ref();
+        let last = request.last.as_deref();
+        // A digest sorts as its string form, so `last` cuts every source alike.
+        let above =
+            move |candidate: &Digest| last.is_none_or(|last| candidate.to_string().as_str() > last);
+
         // Referrers no local index knows, both arriving already resolved: an
         // upstream's, and any a pre-API client left under the fallback tag.
         let mut described = self
@@ -174,80 +219,71 @@ impl Registry {
                 described.entry(referrer.digest.clone()).or_insert(referrer);
             }
         }
-
-        let local: HashSet<Digest> = self
-            .metadata_store
-            .stream_referrer_digests(namespace, digest)
-            .try_collect()
-            .await?;
-        let mut candidates: Vec<Digest> = local
-            .iter()
-            .chain(described.keys().filter(|digest| !local.contains(*digest)))
-            .cloned()
+        let described: BTreeMap<Digest, Descriptor> = described
+            .into_iter()
+            .filter(|(candidate, _)| above(candidate))
             .collect();
-        candidates.sort();
 
-        // The candidates past the cursor, in the order their digests sort.
-        let start = request.last.as_deref().map_or(0, |last| {
-            candidates
-                .iter()
-                .position(|candidate| candidate.to_string().as_str() > last)
-                .unwrap_or(candidates.len())
-        });
-        let remaining = &candidates[start..];
+        // The records resume past a cursor naming a digest; any other cursor
+        // lists them from the start, the filter cutting what it covers.
+        let after = last.and_then(|last| last.parse::<Digest>().ok());
+        let local = self
+            .metadata_store
+            .stream_referrer_digests(namespace, digest, after.as_ref())
+            .try_filter(move |candidate| ready(above(candidate)));
+        let mut candidates = pin!(merge_candidates(local, described).peekable());
 
-        // A candidate the local index does not hold is already resolved, its
-        // descriptor having come with it.
-        let (local, described) = (&local, &described);
         let page_size = usize::from(DEFAULT_PAGE_SIZE);
         let mut referrers: Vec<Descriptor> = Vec::new();
-        let mut consumed = 0usize;
-        let mut last_consumed: Option<&Digest> = None;
+        let mut last_consumed: Option<Digest> = None;
         // A local candidate's artifact type is only known once its descriptor
         // is resolved, so the page fills as they resolve rather than being cut
         // over the candidates first, which would answer short while matches
         // remain. Resolution is batched a page at a time to bound the reads an
         // unmatched stretch costs.
-        for chunk in remaining.chunks(page_size) {
-            let resolved: Vec<Option<Descriptor>> = stream::iter(chunk.to_vec())
-                .map(async |manifest_digest| {
-                    if local.contains(&manifest_digest) {
-                        return self
-                            .resolve_referrer_descriptor(
+        let more = loop {
+            let chunk: Vec<(Digest, Option<Descriptor>)> =
+                candidates.as_mut().take(page_size).try_collect().await?;
+            if chunk.is_empty() {
+                break false;
+            }
+            let resolved: Vec<(Digest, Option<Descriptor>)> = stream::iter(chunk)
+                .map(async |(candidate, described)| {
+                    let descriptor = match described {
+                        Some(descriptor) => Some(descriptor),
+                        None => {
+                            self.resolve_referrer_descriptor(
                                 namespace,
                                 digest,
-                                manifest_digest,
+                                candidate.clone(),
                                 artifact_type,
                             )
-                            .await;
-                    }
-                    described.get(&manifest_digest).cloned()
+                            .await
+                        }
+                    };
+                    (candidate, descriptor)
                 })
                 .buffered(REFERRER_RESOLVE_CONCURRENCY)
                 .collect()
                 .await;
-
-            for (candidate, descriptor) in chunk.iter().zip(resolved) {
+            let mut resolved = resolved.into_iter();
+            for (candidate, descriptor) in resolved.by_ref() {
+                last_consumed = Some(candidate);
+                referrers.extend(descriptor);
                 if referrers.len() == page_size {
                     break;
                 }
-                consumed += 1;
-                last_consumed = Some(candidate);
-                if let Some(descriptor) = descriptor {
-                    referrers.push(descriptor);
-                }
             }
             if referrers.len() == page_size {
-                break;
+                break resolved.next().is_some() || candidates.as_mut().peek().await.is_some();
             }
-        }
+        };
 
         // The cursor names the last candidate consumed rather than the last
         // served, so a stretch the filter dropped is not walked a second time.
-        let next_token = match last_consumed {
-            Some(candidate) if consumed < remaining.len() => Some(candidate.to_string()),
-            _ => None,
-        };
+        let next_token = last_consumed
+            .filter(|_| more)
+            .map(|candidate| candidate.to_string());
 
         Ok(Page {
             items: referrers,
@@ -368,8 +404,15 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
+    use futures_util::future::try_join_all;
     use http::{Response, header::LINK};
     use serde_json::json;
     use url::form_urlencoded;
@@ -384,17 +427,23 @@ mod tests {
         client::next_page_target,
         request::{GetReferrersRequest, ListTagsRequest},
     };
+    use angos_storage::{
+        Error as StorageError,
+        test_util::{HookedStore, StoreHook, StoreOp},
+    };
     use angos_transport::ResponseBody;
 
     use crate::{
         registry::{
             Error,
             content_discovery::{DEFAULT_PAGE_SIZE, Repository},
+            keys::NamespaceKeys,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::{LinkKind, MetadataStore},
+            metadata_store::{LIST_PAGE, LinkKind, MetadataStore},
             repository::Config,
             test_utils::{
-                FSRegistryTestCase, create_link, create_test_blob, for_each_backend, media_type,
+                FSRegistryTestCase, RegistryTestCase, create_link, create_test_blob,
+                create_test_registry, for_each_backend, media_type, metadata_store_over,
                 put_blob_direct, referrers_request, response_json, seed_links, upload_blob,
             },
         },
@@ -1254,6 +1303,84 @@ mod tests {
         assert_eq!(
             served, expected,
             "paging must visit every referrer exactly once, in digest order"
+        );
+    }
+
+    /// Counts the listings of one subject's referrer records.
+    struct CountRecordListings {
+        dir: String,
+        count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl StoreHook for CountRecordListings {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            if let StoreOp::List { prefix } = op
+                && prefix == self.dir
+            {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    /// A page reads the records from its cursor: with more records than one
+    /// listing returns, the last page costs a single listing, where reading
+    /// from the start would take two.
+    #[tokio::test]
+    async fn a_referrers_page_lists_the_records_from_its_cursor() {
+        let case = FSRegistryTestCase::new();
+        let seeding = case.metadata_store();
+        let namespace = referrer_namespace();
+        let mut referrers: Vec<Digest> = (0..=usize::from(LIST_PAGE))
+            .map(|index| Digest::sha256_of_bytes(index.to_le_bytes()))
+            .collect();
+        {
+            let (seeding, namespace, subject) = (&seeding, &namespace, &subject());
+            try_join_all(referrers.iter().map(|referrer| async move {
+                let descriptor = descriptor_with(None, referrer);
+                seeding
+                    .put_referrer(namespace, subject, referrer, Some(&descriptor))
+                    .await
+            }))
+            .await
+            .unwrap();
+        }
+        referrers.sort();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let registry = create_test_registry(
+            case.blob_store(),
+            metadata_store_over(Arc::new(HookedStore::new(
+                seeding.object_store().clone(),
+                CountRecordListings {
+                    dir: namespace.referrer_record_dir(&subject()),
+                    count: count.clone(),
+                },
+            ))),
+        );
+        let page_size = usize::from(DEFAULT_PAGE_SIZE);
+        let page = registry
+            .list_referrers(
+                None,
+                &GetReferrersRequest {
+                    namespace,
+                    digest: subject(),
+                    artifact_type: None,
+                    last: Some(referrers[referrers.len() - page_size - 1].to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let served: Vec<&Digest> = page.items.iter().map(|referrer| &referrer.digest).collect();
+        let expected: Vec<&Digest> = referrers[referrers.len() - page_size..].iter().collect();
+        assert_eq!(served, expected);
+        assert_eq!(page.next_token, None);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a page must not list the records before its cursor"
         );
     }
 

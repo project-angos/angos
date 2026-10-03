@@ -14,7 +14,7 @@ register(
 				: next(specifier, context);`
 		)
 );
-const { mergeLayers, fsDuplicates, fsRisks, formatMode, imageReference, parseSarif } = await import(
+const { mergeLayers, fsDuplicates, fsRisks, fsRows, formatMode, imageReference, parseSarif } = await import(
 	'../src/lib/utils.ts'
 );
 
@@ -69,6 +69,28 @@ test('a later layer wastes the bytes it overwrites or removes, largest first', (
 
 test('a folder listed again keeps what lower layers put in it', () => {
 	assert.ok(tree.root.children.get('app')?.children.has('a'));
+});
+
+test('the tree rows open what was expanded, and a filter keeps a match with the folders above it', () => {
+	const row = ({ node, depth, guides, hasNext, open }) => [node.path, depth, guides.join(), hasNext, open];
+	const none = { layers: new Set(), text: '' };
+	assert.deepEqual(fsRows(tree.root, new Set(['app']), none).map(row), [
+		['app', 0, '', true, true],
+		['app/a', 1, 'true', true, false],
+		['app/b', 1, 'true', false, false],
+		['cache', 0, '', true, false],
+		['etc', 0, '', true, false],
+		['copy1', 0, '', true, false],
+		['copy2', 0, '', true, false],
+		['copy3', 0, '', true, false],
+		['empty', 0, '', true, false],
+		['lib', 0, '', false, false]
+	]);
+	// The match's folder opens and stays, its sibling goes, and so does every unrelated top-level entry.
+	assert.deepEqual(fsRows(tree.root, new Set(), { layers: new Set(), text: 'app/b' }).map(row), [
+		['app', 0, '', false, true],
+		['app/b', 1, 'false', false, false]
+	]);
 });
 
 test('identical files group by digest, the most bytes spent on copies first', () => {

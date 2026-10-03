@@ -313,6 +313,8 @@ async fn tag_targeting_missing_blob_is_removed() {
         let namespace = &Namespace::new("test-repo/dangling-tag").unwrap();
         let metadata_store = test_case.metadata_store();
 
+        // A bare entry, with no reference key: scrub must heal the tag without
+        // the index a digest delete finds tags through.
         let ghost_digest = Digest::sha256_of_bytes(b"never-uploaded");
         let key = namespace.tag_entry_path(
             &Tag::new("dangling").unwrap(),

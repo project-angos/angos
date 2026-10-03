@@ -28,6 +28,10 @@ use crate::registry::{
     metadata_store::{LinkKind, MetadataStore},
 };
 
+/// The reference keys a bounded namespace lookup lists per page: a namespace
+/// holds one per link referencing the blob, usually a handful.
+const REF_PAGE: u16 = 128;
+
 /// Every namespace referencing one blob, with the links each references it
 /// through.
 pub type BlobIndex = HashMap<Namespace, HashSet<LinkKind>>;
@@ -167,13 +171,47 @@ impl MetadataStore {
         Ok(false)
     }
 
-    /// Every local namespace referencing `digest`, per the blob index; empty
-    /// when none do, a missing index entry included.
-    pub async fn referencing_namespaces(&self, digest: &Digest) -> Result<Vec<Namespace>, Error> {
-        match self.read_blob_index(digest).await {
-            Ok(index) => Ok(index.into_keys().collect()),
-            Err(Error::NotFound) => Ok(Vec::new()),
-            Err(error) => Err(error),
+    /// The first `limit` local namespaces referencing `digest`, in name order;
+    /// empty when none do. Keys list in namespace order, since the `!` ending
+    /// a namespace sorts below every character one holds, so each page
+    /// resumes past the last namespace it reached: one referencing the blob
+    /// through thousands of manifests costs a page, not a read through.
+    pub async fn referencing_namespaces(
+        &self,
+        digest: &Digest,
+        limit: usize,
+    ) -> Result<Vec<Namespace>, Error> {
+        let dir = digest.blob_ref_dir();
+        let mut namespaces: Vec<Namespace> = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .object_store()
+                .list_after(&dir, REF_PAGE, None, after.take())
+                .await?;
+            for key in &page.items {
+                let Some((raw, _)) = digest.parse_blob_ref(key) else {
+                    continue;
+                };
+                let Ok(namespace) = Namespace::new(&raw) else {
+                    continue;
+                };
+                if namespaces.last() != Some(&namespace) {
+                    namespaces.push(namespace);
+                }
+                if namespaces.len() == limit {
+                    return Ok(namespaces);
+                }
+            }
+            let (Some(_), Some(last)) = (page.next_token, page.items.last()) else {
+                return Ok(namespaces);
+            };
+            // `"` follows `!` and sorts below every namespace character, so
+            // listing after `<namespace>"` resumes at the next namespace.
+            after = Some(match last.split_once('!') {
+                Some((namespace, _)) => format!("{namespace}\""),
+                None => last.clone(),
+            });
         }
     }
 
@@ -184,12 +222,12 @@ impl MetadataStore {
         digest: &Digest,
         exclude: &str,
     ) -> Result<Option<Namespace>, Error> {
+        // The namespaces are distinct, so `exclude` is at most one of two.
         Ok(self
-            .referencing_namespaces(digest)
+            .referencing_namespaces(digest, 2)
             .await?
             .into_iter()
-            .filter(|namespace| namespace.as_ref() != exclude)
-            .min())
+            .find(|namespace| namespace.as_ref() != exclude))
     }
 
     /// Every namespace referencing `digest` with the links it references
@@ -356,19 +394,97 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        str::FromStr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use futures_util::future::try_join_all;
 
     use angos_oci::{Digest, Namespace, Tag};
+    use angos_storage::{
+        Error as StorageError,
+        test_util::{HookedStore, StoreHook, StoreOp},
+    };
 
     use crate::registry::{
         Error,
         keys::DigestKeys,
         metadata_store::LinkKind,
         test_utils::{
-            create_link, drop_links, for_each_backend, put_blob_direct, s3_metadata_store,
-            seed_links,
+            create_link, drop_links, for_each_backend, metadata_store_over, put_blob_direct,
+            s3_metadata_store, seed_links,
         },
     };
+
+    /// Counts the listings a store is asked for.
+    struct ListCount(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl StoreHook for ListCount {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            if matches!(op, StoreOp::List { .. }) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    /// A namespace referencing the blob through more keys than a page holds is
+    /// listed past, not read through, and the namespaces after it still come
+    /// back in name order.
+    #[tokio::test]
+    async fn referencing_namespaces_list_past_a_namespace_with_many_references() {
+        for_each_backend(async |test_case| {
+            let lists = Arc::new(AtomicUsize::new(0));
+            let m = metadata_store_over(Arc::new(HookedStore::new(
+                test_case.metadata_store().object_store().clone(),
+                ListCount(lists.clone()),
+            )));
+            let digest = Digest::sha256_of_bytes(b"a popular base layer");
+            let heavy = Namespace::new("ref-heavy").unwrap();
+            try_join_all((0..300).map(|i| {
+                let manifest = Digest::sha256_of_bytes(format!("manifest {i}").as_bytes());
+                let (m, heavy, digest) = (&m, &heavy, &digest);
+                async move {
+                    m.insert_reference(heavy, digest, &LinkKind::ReferencedBy(manifest))
+                        .await
+                }
+            }))
+            .await
+            .unwrap();
+            let names = ["ref-heavy", "ref-heavy-b", "ref-heavy/b", "ref-light"];
+            for name in &names[1..] {
+                m.grant(&Namespace::new(name).unwrap(), &digest)
+                    .await
+                    .unwrap();
+            }
+            let listed = |namespaces: Vec<Namespace>| -> Vec<String> {
+                namespaces.iter().map(ToString::to_string).collect()
+            };
+
+            lists.store(0, Ordering::SeqCst);
+            let all = m.referencing_namespaces(&digest, 10).await.unwrap();
+            assert_eq!(listed(all), names);
+            assert_eq!(
+                lists.load(Ordering::SeqCst),
+                2,
+                "the heavy namespace costs one page"
+            );
+            let first = m.referencing_namespaces(&digest, 2).await.unwrap();
+            assert_eq!(listed(first), names[..2]);
+            assert_eq!(
+                m.smallest_referencing_namespace(&digest, "ref-heavy")
+                    .await
+                    .unwrap(),
+                Some(Namespace::new("ref-heavy-b").unwrap())
+            );
+        })
+        .await;
+    }
 
     /// A link write lands as one key under `v2/ref/`.
     #[tokio::test]

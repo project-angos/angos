@@ -9,7 +9,7 @@ use angos_storage::test_util::frame;
 
 use crate::registry::{
     Error,
-    blob_store::{upload_session::HashStart, *},
+    blob_store::*,
     keys::{DigestKeys, NamespaceKeys},
     test_utils::{FSRegistryTestCase, RegistryTestCase, for_each_backend},
 };
@@ -28,9 +28,9 @@ async fn seed_blob_with(store: &BlobStore, content: &[u8], algorithm: Algorithm)
         .write_upload(
             &namespace,
             &session_id,
+            store.read_session(&namespace, &session_id).await.unwrap(),
             Box::new(Cursor::new(content.to_vec())),
             Some(len),
-            HashStart::Fresh(algorithm),
             algorithm,
         )
         .await
@@ -64,9 +64,9 @@ async fn stream_uploads() {
                 .write_upload(
                     namespace,
                     id,
+                    store.read_session(namespace, id).await.unwrap(),
                     Box::new(Cursor::new(content)),
                     Some(len),
-                    HashStart::Fresh(Algorithm::Sha256),
                     Algorithm::Sha256,
                 )
                 .await
@@ -237,9 +237,9 @@ async fn upload_operations() {
             .write_upload(
                 namespace,
                 &session_id,
+                store.read_session(namespace, &session_id).await.unwrap(),
                 Box::new(Cursor::new(test_content.to_vec())),
                 Some(test_content.len() as u64),
-                HashStart::Fresh(Algorithm::Sha256),
                 Algorithm::Sha256,
             )
             .await
@@ -315,9 +315,9 @@ async fn complete_upload_fails_on_rerun() {
             .write_upload(
                 &namespace,
                 &session_id,
+                store.read_session(&namespace, &session_id).await.unwrap(),
                 Box::new(Cursor::new(content.to_vec())),
                 Some(content.len() as u64),
-                HashStart::Fresh(Algorithm::Sha256),
                 Algorithm::Sha256,
             )
             .await
@@ -366,6 +366,7 @@ async fn session_state_is_one_json_record() {
             .append_upload(
                 namespace,
                 session_id,
+                store.read_session(namespace, session_id).await.unwrap(),
                 Box::new(Cursor::new(chunk.as_bytes().to_vec())),
                 Some(chunk.len() as u64),
             )
@@ -459,9 +460,9 @@ async fn complete_upload_rejects_size_divergence() {
             .write_upload(
                 &namespace,
                 &session_id,
+                store.read_session(&namespace, &session_id).await.unwrap(),
                 Box::new(Cursor::new(content.to_vec())),
                 Some(content.len() as u64),
-                HashStart::Fresh(Algorithm::Sha256),
                 Algorithm::Sha256,
             )
             .await
@@ -510,6 +511,7 @@ async fn append_fails_closed_on_size_divergence() {
             .append_upload(
                 namespace,
                 session_id,
+                store.read_session(namespace, session_id).await.unwrap(),
                 Box::new(Cursor::new(b"hashed prefix".to_vec())),
                 Some(13),
             )
@@ -528,6 +530,7 @@ async fn append_fails_closed_on_size_divergence() {
             .append_upload(
                 namespace,
                 session_id,
+                store.read_session(namespace, session_id).await.unwrap(),
                 Box::new(Cursor::new(b"more".to_vec())),
                 Some(4),
             )

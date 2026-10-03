@@ -2,6 +2,8 @@
 //! themselves belong to the metadata store; what lives here needs the blob
 //! store's bytes in the same breath.
 
+use tracing::warn;
+
 use angos_oci::{Digest, Namespace, UploadSessionId};
 
 use crate::registry::{Error, blob_store::BlobStore, metadata_store::MetadataStore};
@@ -9,7 +11,8 @@ use crate::registry::{Error, blob_store::BlobStore, metadata_store::MetadataStor
 /// Promote the upload session's staged bytes to the canonical blob path and
 /// grant `namespace` its reference. No lock is needed: fresh bytes and a fresh
 /// `own` key sit inside the collector's grace period, and both steps are
-/// idempotent.
+/// idempotent. A success leaves no session behind: its bytes are promoted, or
+/// discarded when the blob is already stored.
 pub async fn promote_and_grant(
     blob_store: &BlobStore,
     metadata_store: &MetadataStore,
@@ -23,7 +26,12 @@ pub async fn promote_and_grant(
             // The bytes may be old, so the guarded grant catches a mid-flight
             // reclaim; only vanished bytes fall back to a fresh promotion.
             match grant_existing(blob_store, metadata_store, namespace, digest).await? {
-                GrantOutcome::Granted => return Ok(()),
+                GrantOutcome::Granted => {
+                    if let Err(error) = blob_store.delete_upload(namespace, session_key).await {
+                        warn!("Failed to delete a surplus upload session: {error}");
+                    }
+                    return Ok(());
+                }
                 GrantOutcome::BytesAbsent => {}
                 GrantOutcome::ReclaimBlocked => {
                     return Err(Error::ReclamationInProgress(

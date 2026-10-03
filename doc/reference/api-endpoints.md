@@ -146,7 +146,7 @@ GET  /v2/{namespace}/manifests/{reference}
 Check existence or download a manifest. `{reference}` can be a tag or digest. As for blobs, the
 answer is sandboxed, since its `Content-Type` is whatever media type the manifest was pushed with.
 
-When manifest redirects are enabled (`global.enable_manifest_redirect`, default `true`) and the blob store supports presigned URLs, `GET` may answer with a `307` redirect. As for blobs, an `X-Angos-No-Redirect` header with any non-empty value other than `0` or `false` forces an inline body instead.
+When manifest redirects are enabled (`global.enable_manifest_redirect`, default `true`) and the blob store supports presigned URLs, a `GET` by digest may answer with a `307` redirect; a `GET` by tag is served inline. As for blobs, an `X-Angos-No-Redirect` header with any non-empty value other than `0` or `false` forces an inline body instead.
 
 ```
 PUT /v2/{namespace}/manifests/{reference}
@@ -393,11 +393,10 @@ revisions. A revision held from two pages is listed on each.
 
 A revision that is itself another's referrer is listed as a leaf: the web UI shows it under its
 subject with no push or pull time, so neither `pushed_at` nor `last_pulled_at` is reported for it.
-`last_pulled_at` is reported for the rest only while `update_pull_time` records pulls. The listing
-reads one record per root revision, one descriptor per referrer, and a manifest body only for an
-index, with the fan-out set by `listing_read_concurrency`; its cost is set by the number of roots
-and referrers rather than by a round trip per manifest field. Pull times are read for the page's
-revisions alone.
+`last_pulled_at` is reported for the rest only while `update_pull_time` records pulls. Each
+request walks the namespace's revisions, tags and referrers, and reads only the manifest bodies the
+replica has not cached (see `revision_cache_entries`). Push times, referrer descriptors and pull
+times are read for the served revisions alone, with the fan-out set by `listing_read_concurrency`.
 
 **Response:**
 ```json

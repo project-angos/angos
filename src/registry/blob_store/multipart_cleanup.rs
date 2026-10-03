@@ -253,9 +253,6 @@ mod tests {
         async fn copy(&self, _source: &str, _destination: &str) -> Result<u64, StorageError> {
             unimplemented!("not reached by orphan listing")
         }
-        async fn create_upload(&self, _key: &str) -> Result<(), StorageError> {
-            unimplemented!("not reached by orphan listing")
-        }
         async fn write_upload(
             &self,
             _key: &str,

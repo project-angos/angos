@@ -364,6 +364,14 @@ impl Validator {
             }
             Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 warn!("scrub: tag '{namespace}:{tag}' targets missing blob '{target}'; removing");
+                // Deleted by name: the digest delete below finds tags through
+                // their reference keys, which a damaged tag may lack.
+                self.emit(Action::DeleteTag {
+                    namespace: namespace.clone(),
+                    tag: tag.clone(),
+                    target: Some(target.clone()),
+                })
+                .await?;
                 self.emit(Action::DeleteOrphanManifest {
                     namespace: namespace.clone(),
                     digest: target,
@@ -374,7 +382,9 @@ impl Validator {
         }
     }
 
-    /// A revision record, anchored once per (namespace, digest).
+    /// A revision record, the anchor of the derivable state: one manifest
+    /// read drives child-link repair, back-links, and grant reconciliation.
+    /// Each revision has the one record, so the walk reaches it once.
     pub async fn validate_revision_record(
         &self,
         namespace_raw: &str,
@@ -384,24 +394,8 @@ impl Validator {
         let Ok(namespace) = Namespace::new(namespace_raw) else {
             return Ok(());
         };
-        self.validate_revision_content(&namespace, revision)
-            .await
-            .map(|_| ())
-    }
-
-    /// The anchor of the derivable state, shared by both revision shapes: one
-    /// manifest read drives child-link repair, back-links, and grant
-    /// reconciliation, returning whether the manifest blob is present. Runs
-    /// once per (namespace, revision); a repeat visit only re-probes health.
-    async fn validate_revision_content(
-        &self,
-        namespace: &Namespace,
-        revision: &Digest,
-    ) -> Result<bool, Error> {
+        let namespace = &namespace;
         self.ensure_catalog(namespace).await?;
-        if !self.claim(format!("revision:{namespace}:{revision}")) {
-            return Ok(self.blob_store.size(revision).await.is_ok());
-        }
 
         // A revision younger than the grace period may belong to a push whose
         // later waves are still in flight, so repairs derived from it would
@@ -410,7 +404,7 @@ impl Validator {
             .younger_than_grace(&namespace.revision_record_path(revision))
             .await?
         {
-            return Ok(false);
+            return Ok(());
         }
         let content = match self.blob_store.read(revision).await {
             Ok(content) => content,
@@ -423,7 +417,7 @@ impl Validator {
                     digest: revision.clone(),
                 })
                 .await?;
-                return Ok(false);
+                return Ok(());
             }
             Err(e) => return Err(e.into()),
         };
@@ -478,7 +472,7 @@ impl Validator {
                 );
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Whether the revision's record exists, the shape that makes a digest

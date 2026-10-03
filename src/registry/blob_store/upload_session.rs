@@ -37,7 +37,7 @@ const PEEK_FRAME_SIZE: usize = 8 * 1024;
 
 /// How an append seeds its hasher.
 #[derive(Debug)]
-pub enum HashStart {
+enum HashStart {
     /// Rebuild every supported algorithm from the checkpoint, for a chunked
     /// upload whose target algorithm was unknown during PATCH.
     Resume,
@@ -160,21 +160,18 @@ impl BlobStore {
         .await
     }
 
-    /// Opens an upload session. `algorithm` is the one the client said it
-    /// would close with, letting the session checkpoint that hash alone;
-    /// without it every supported algorithm must be kept, since the digest is
-    /// only known at the closing `PUT`.
+    /// Opens an upload session at a fresh id, returning the record it wrote.
+    /// `algorithm` is the one the client said it would close with, letting
+    /// the session checkpoint that hash alone; without it every supported
+    /// algorithm must be kept, since the digest is only known at the closing
+    /// `PUT`.
     #[instrument(skip(self))]
     pub async fn create_upload(
         &self,
         namespace: &Namespace,
         session_id: &UploadSessionId,
         algorithm: Option<Algorithm>,
-    ) -> Result<(), Error> {
-        let upload_path = namespace.upload_path(session_id);
-        // Also clears any leaked prior multipart and staged remainder.
-        self.object.create_upload(&upload_path).await?;
-
+    ) -> Result<SessionFile, Error> {
         let hasher = match algorithm {
             Some(algorithm) => Hasher::for_algorithm(algorithm),
             None => Hasher::new(),
@@ -184,42 +181,52 @@ impl BlobStore {
             committed_offset: 0,
             hash_state: BASE64_STANDARD.encode(hasher.state().to_bytes()?),
         };
-        self.write_session(namespace, session_id, &record).await
+        self.write_session(namespace, session_id, &record).await?;
+        Ok(record)
     }
 
-    /// Append the final chunk and return its digest under `algorithm` plus the
-    /// total size. Resuming the checkpoint lets an upload whose algorithm was
-    /// unknown during PATCH close under any supported one; a fresh start hashes
-    /// a monolithic body under its one known algorithm.
-    #[instrument(skip(self, stream))]
+    /// Append the final chunk to the session `record` holds and return its
+    /// digest under `algorithm` plus the total size. A session holding bytes
+    /// resumes its checkpoint, which lets an upload whose algorithm was unknown
+    /// during PATCH close under any supported one; an empty one hashes the
+    /// body under `algorithm` alone.
+    #[instrument(skip(self, record, stream))]
     pub async fn write_upload(
         &self,
         namespace: &Namespace,
         session_id: &UploadSessionId,
+        record: SessionFile,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
-        start: HashStart,
         algorithm: Algorithm,
     ) -> Result<(Digest, u64), Error> {
+        let start = if record.committed_offset > 0 {
+            HashStart::Resume
+        } else {
+            HashStart::Fresh(algorithm)
+        };
         let (hasher, size) = self
-            .append(namespace, session_id, stream, content_length, start)
+            .append(namespace, session_id, record, stream, content_length, start)
             .await?;
         Ok((hasher.digest(algorithm)?, size))
     }
 
-    /// Append a chunk without finalizing, returning the live hasher and the
-    /// new total. PATCH discards the hasher; the PUT finalizes the digest.
-    #[instrument(skip(self, stream))]
+    /// Append a chunk to the session `record` holds without finalizing,
+    /// returning the live hasher and the new total. PATCH discards the hasher;
+    /// the PUT finalizes the digest.
+    #[instrument(skip(self, record, stream))]
     pub async fn append_upload(
         &self,
         namespace: &Namespace,
         session_id: &UploadSessionId,
+        record: SessionFile,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
     ) -> Result<(Hasher, u64), Error> {
         self.append(
             namespace,
             session_id,
+            record,
             stream,
             content_length,
             HashStart::Resume,
@@ -228,16 +235,17 @@ impl BlobStore {
     }
 
     /// Append `stream` to the session, persisting the updated hash state and
-    /// size, and return the live hasher plus the new total.
+    /// size, and return the live hasher plus the new total. `record` is the
+    /// session as its caller just read it, so a chunk costs one session read.
     async fn append(
         &self,
         namespace: &Namespace,
         session_id: &UploadSessionId,
+        mut record: SessionFile,
         mut stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
         start: HashStart,
     ) -> Result<(Hasher, u64), Error> {
-        let mut record = self.read_session(namespace, session_id).await?;
         let hasher = match start {
             HashStart::Resume => HashState::from_bytes(&record.hash_context()?)?.into_hasher()?,
             HashStart::Fresh(algorithm) => Hasher::for_algorithm(algorithm),
@@ -293,8 +301,7 @@ impl BlobStore {
             warn!(
                 "Upload session staged {backend_total} bytes but hashed {hashed_total}, failing closed"
             );
-            let container = namespace.upload_container_path(session_id);
-            let _ = self.object.delete_prefix(&container).await;
+            let _ = self.delete_upload(namespace, session_id).await;
             return Err(Error::DigestInvalid);
         }
 
@@ -353,8 +360,7 @@ impl BlobStore {
         let staged_size = self.object.head(&upload_key).await?.size;
         if staged_size != hashed_size {
             warn!("Staged {staged_size} bytes but hashed {hashed_size}, refusing to promote");
-            let container = namespace.upload_container_path(session_id);
-            let _ = self.object.delete_prefix(&container).await;
+            let _ = self.delete_upload(namespace, session_id).await;
             return Err(Error::DigestInvalid);
         }
 

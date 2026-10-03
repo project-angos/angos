@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Event webhooks and the scanner client take `server_ca_bundle`, `client_certificate_bundle` and `client_private_key`, to reach an endpoint behind a private CA or one requiring a client certificate.
+- `revision_cache_entries` sets how many manifests each replica keeps the index children of for the revision listing.
 
 ### Changed
 
@@ -32,6 +33,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The web UI shows and copies a sha512 manifest as `repo@sha512:<hex>`, the reference it is pulled by, instead of `repo:sha512:<hex>`.
 - The web UI's vulnerability table reads a finding's severity as the report badge does, so the two no longer disagree.
 - The web UI pages the referrers of a pull-through manifest with more than 150 of them without skipping upstream ones.
+- Each page of the revision listing reads only the revisions it serves, instead of every record, referrer and index body in the namespace.
+- The web UI reads the repository names once per page load, instead of on every navigation and every hovered link.
+- Browsing a large layer's files decodes its stored listing off the request threads, so it no longer stalls other requests.
+- On the filesystem backend, a listing page reads only the directories it pages through, instead of walking and sorting everything under its prefix.
+- A blob mount without `from`, and replication's mount hint, read only the namespaces they use off the blob's reference index, instead of all of it.
+- A manifest delete by digest finds the tags pointing at it from its reference keys, instead of walking every tag in the namespace.
+- Each page of a subject's referrers reads its records from the page's cursor, instead of listing all of them again.
+- The web UI's filesystem tree applies a path filter once typing pauses and shows at most 1000 rows, so filtering a large image no longer freezes the tab.
+- A manifest GET by tag resolves the tag once; only a GET by digest tries the presigned redirect, as the docs now say.
+- A HEAD on a pull-through tag the upstream moved checks the upstream once, instead of twice plus a read of the stale copy.
+- A manifest push checks the ownership of the blobs it references concurrently rather than one at a time.
+- A blob upload no longer cleans up its session twice or reads it twice per chunk, and on S3 skips a multipart listing at its start and a HEAD per chunk.
+- An upload refused for a size mismatch aborts its S3 multipart instead of leaving the parts to the multipart sweep.
+- Layer indexing builds the fixed Huffman codes once per layer rather than for every block that uses them.
+- Scrub no longer holds a record of every revision it validated for the whole run.
+- The web UI's pull history tab shows the error when the registry refuses it, instead of re-requesting in a loop.
+- S3 conditional writes and multipart creates and completes are no longer replayed after a 500, 502 or 504, which could read a write's own success as a conflict, drop a job enqueue, or open a second multipart upload.
+- On the filesystem backend, a create-if-absent that races the removal of its directory retries instead of failing as not found.
+- A streamed S3 part whose endpoint never answers fails at `operation_attempt_timeout` once its body is sent, instead of hanging.
+- A client that stalls or disconnects mid-part no longer counts as an S3 failure toward opening the circuit breaker.
 
 ## 1.12.1
 

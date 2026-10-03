@@ -237,6 +237,7 @@ pub async fn build_registry(
         global_immutable_tags: config.global.immutable_tags,
         global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
         listing_read_concurrency: config.global.listing_read_concurrency,
+        revision_cache_entries: config.global.revision_cache_entries,
         event_dispatcher,
         ..RegistryConfig::new(job_store)
     };

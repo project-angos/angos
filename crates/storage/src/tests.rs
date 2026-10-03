@@ -412,7 +412,6 @@ macro_rules! object_store_conformance {
                 // second write addressed at the same key picks up where the
                 // first left off.
                 let (store, _guard) = $fixture;
-                store.create_upload("up/blob").await.unwrap();
                 assert_eq!(
                     store
                         .write_upload("up/blob", frame("hello "), Some(6))
@@ -434,7 +433,6 @@ macro_rules! object_store_conformance {
             #[tokio::test]
             async fn upload_complete_with_no_writes_creates_empty_object() {
                 let (store, _guard) = $fixture;
-                store.create_upload("up/empty").await.unwrap();
                 store.complete_upload("up/empty").await.unwrap();
                 assert_eq!(store.get("up/empty").await.unwrap(), b"");
             }
@@ -445,7 +443,6 @@ macro_rules! object_store_conformance {
                 // is a no-op and must not overwrite the assembled object with
                 // an empty one.
                 let (store, _guard) = $fixture;
-                store.create_upload("up/rerun").await.unwrap();
                 store
                     .write_upload("up/rerun", frame("payload"), Some(7))
                     .await
@@ -462,7 +459,6 @@ macro_rules! object_store_conformance {
                 // `Some(len)` declares an exact count, so a longer body is an
                 // error on every backend rather than a silent truncation.
                 let (store, _guard) = $fixture;
-                store.create_upload("up/long").await.unwrap();
                 let error = store
                     .write_upload("up/long", frame("hello world"), Some(5))
                     .await
@@ -477,7 +473,6 @@ macro_rules! object_store_conformance {
             #[tokio::test]
             async fn upload_abort_leaves_no_object() {
                 let (store, _guard) = $fixture;
-                store.create_upload("up/abort").await.unwrap();
                 store
                     .write_upload("up/abort", frame("partial"), Some(7))
                     .await
@@ -492,7 +487,6 @@ macro_rules! object_store_conformance {
                 // declared length); successive chunked writes append, with the
                 // running total growing by each frame's actual size.
                 let (store, _guard) = $fixture;
-                store.create_upload("up/chunked").await.unwrap();
                 assert_eq!(
                     store
                         .write_upload("up/chunked", frame("hello "), None)
@@ -517,7 +511,6 @@ macro_rules! object_store_conformance {
                 // size already committed by the prior write and the object
                 // still round-trips.
                 let (store, _guard) = $fixture;
-                store.create_upload("up/chunked-empty").await.unwrap();
                 store
                     .write_upload("up/chunked-empty", frame("data"), None)
                     .await

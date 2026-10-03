@@ -16,7 +16,7 @@ use crate::{
     registry::{
         Error, Registry, Repository,
         blob_ownership::promote_and_grant,
-        blob_store::{BlobStore, upload_session::HashStart},
+        blob_store::BlobStore,
         metadata_store::{LinkKind, MetadataStore},
         record_pull_through, repository_name,
     },
@@ -58,11 +58,6 @@ pub async fn cache_blob(
 ) -> Result<(), Error> {
     debug!("Fetching blob: {digest}");
     let session_id = UploadSessionId::generate();
-    // The fill knows what it is fetching, so the session hashes that alone.
-    blob_store
-        .create_upload(namespace, &session_id, Some(digest.algorithm()))
-        .await?;
-
     let result = fill_cache_session(
         blob_store,
         metadata_store,
@@ -74,10 +69,12 @@ pub async fn cache_blob(
     )
     .await;
 
-    // Reclaim the session whatever the outcome: a fill that fails partway
-    // otherwise strands a layer-sized staging directory until scrub runs, and
-    // repeated failures would fill the disk.
-    if let Err(error) = blob_store.delete_upload(namespace, &session_id).await {
+    // A fill that fails partway otherwise strands a layer-sized staging
+    // directory until scrub runs, and repeated failures would fill the disk;
+    // a promotion leaves nothing to reclaim.
+    if result.is_err()
+        && let Err(error) = blob_store.delete_upload(namespace, &session_id).await
+    {
         warn!("Failed to delete cache-fill upload state: {error}");
     }
     result?;
@@ -86,8 +83,8 @@ pub async fn cache_blob(
     Ok(())
 }
 
-/// Stream the upstream bytes into the staged session and promote them. The
-/// caller owns the session's lifetime and reclaims it on every outcome.
+/// Open a session at `session_key`, stream the upstream bytes into it and
+/// promote them. The caller reclaims the session when this fails.
 async fn fill_cache_session(
     blob_store: &BlobStore,
     metadata_store: &MetadataStore,
@@ -98,13 +95,16 @@ async fn fill_cache_session(
     session_key: &UploadSessionId,
 ) -> Result<(), Error> {
     // A single-shot copy of a known blob: hash only the target algorithm.
+    let session = blob_store
+        .create_upload(namespace, session_key, Some(digest.algorithm()))
+        .await?;
     let (computed_digest, hashed_size) = blob_store
         .write_upload(
             namespace,
             session_key,
+            session,
             stream,
             Some(content_length),
-            HashStart::Fresh(digest.algorithm()),
             digest.algorithm(),
         )
         .await?;
