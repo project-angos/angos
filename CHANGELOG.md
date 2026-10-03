@@ -48,6 +48,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - An upload refused for a size mismatch aborts its S3 multipart instead of leaving the parts to the multipart sweep.
 - Layer indexing builds the fixed Huffman codes once per layer rather than for every block that uses them.
 - Scrub no longer holds a record of every revision it validated for the whole run.
+- The web UI's pull history tab shows the error when the registry refuses it, instead of re-requesting in a loop.
 
 ## 1.12.1
 
