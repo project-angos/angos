@@ -364,6 +364,14 @@ impl Validator {
             }
             Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 warn!("scrub: tag '{namespace}:{tag}' targets missing blob '{target}'; removing");
+                // Deleted by name: the digest delete below finds tags through
+                // their reference keys, which a damaged tag may lack.
+                self.emit(Action::DeleteTag {
+                    namespace: namespace.clone(),
+                    tag: tag.clone(),
+                    target: Some(target.clone()),
+                })
+                .await?;
                 self.emit(Action::DeleteOrphanManifest {
                     namespace: namespace.clone(),
                     digest: target,
