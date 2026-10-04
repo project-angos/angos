@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - A retention tag delete no longer removes a push of the same tag that lands while it runs, locally or on a `prune` downstream.
+- Two first pushes of an immutable tag with different content, on one replica or several, can no longer both succeed and move it.
 
 ## 1.12.2
 
