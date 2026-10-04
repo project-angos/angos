@@ -339,7 +339,7 @@ fn categorize_atime(namespace: &str, rest: &str) -> KeyCategory {
 }
 
 /// `pending/{queue}/{stem}.json`, `failed/{queue}/{stem}.json`,
-/// `index/{queue}/{encoded}.json`, or `claims/{encoded}.json`.
+/// `index/{queue}/{hash}.json`, or `claims/{hash}.json`.
 fn categorize_job(rest: &str) -> KeyCategory {
     // Claim keys are worker leases the walk never touches; a lapsed one is
     // taken over by the next claimant.
