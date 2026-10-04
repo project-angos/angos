@@ -21,6 +21,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use sha2::{Digest as _, Sha256};
 use tokio::{
     select, spawn,
     task::JoinHandle,
@@ -60,20 +61,18 @@ pub fn job_failed_path(queue: &str, id: &str) -> String {
 /// Path to the `lock_key` to `storage_key` dedup index file, read for an O(1)
 /// lookup instead of scanning every pending body.
 pub fn job_lock_key_index_path(queue: &str, lock_key: &LockKey) -> String {
-    format!("{JOBS_ROOT}/index/{queue}/{}.json", lock_key.encode())
+    format!("{JOBS_ROOT}/index/{queue}/{}.json", lock_key.file_name())
 }
 
 /// Path of the claim key serialising execution of one `lock_key` across
 /// workers: created with `create_if_absent`, leased, refreshed by the holder,
 /// and deleted on release; a lapsed lease is taken over by deletion.
 fn job_claim_path(lock_key: &LockKey) -> String {
-    format!("{JOBS_ROOT}/claims/{}.json", lock_key.encode())
+    format!("{JOBS_ROOT}/claims/{}.json", lock_key.file_name())
 }
 
 /// A job's per-key serialization token: at most one worker executes a given
-/// lock key at a time. Valid keys are non-empty and free of `%`, which
-/// [`Self::encode`] reserves as its escape character; allowing it would let two
-/// distinct keys encode to one index path and falsely dedup.
+/// lock key at a time. Valid keys are non-empty.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct LockKey(String);
@@ -81,33 +80,19 @@ pub struct LockKey(String);
 impl LockKey {
     /// # Errors
     ///
-    /// Returns [`Error::InvalidLockKey`] when `key` is empty or contains `%`.
+    /// Returns [`Error::InvalidLockKey`] when `key` is empty.
     pub fn new(key: impl Into<String>) -> Result<Self, Error> {
         let key = key.into();
         if key.is_empty() {
             return Err(Error::InvalidLockKey("lock key is empty".to_string()));
         }
-        if key.contains('%') {
-            return Err(Error::InvalidLockKey(format!(
-                "lock key '{key}' contains a reserved '%'"
-            )));
-        }
         Ok(Self(key))
     }
 
-    /// Percent-encode characters unsafe in a filename or an S3 key component so
-    /// a key lands on the same path on every backend. Injective, since `%`
-    /// cannot appear in a [`LockKey`].
-    fn encode(&self) -> String {
-        self.0
-            .chars()
-            .map(|c| match c {
-                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => {
-                    format!("%{:02X}", c as u32)
-                }
-                c => c.to_string(),
-            })
-            .collect()
+    /// The name of the key's index and claim files: its hex SHA-256, so a key
+    /// built from the longest namespace and tag still fits one file name.
+    fn file_name(&self) -> String {
+        hex::encode(Sha256::digest(self.0.as_bytes()))
     }
 
     #[must_use]

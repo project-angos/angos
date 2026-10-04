@@ -15,8 +15,8 @@ use crate::{
     registry::{
         keys::{
             ATIME_COMPACTED, BLOBS_ROOT, CAT_ROOT, DigestKeys, GC_ROOT, LAYERS_ROOT, NS_ROOT,
-            REF_ROOT, REPOS_ROOT, TagEntry, parse_atime_entry, parse_digest, parse_referrer_record,
-            parse_revision_record, parse_sharded,
+            REF_ROOT, REPOS_ROOT, TAG_CLAIM, TagEntry, parse_atime_entry, parse_digest,
+            parse_referrer_record, parse_revision_record, parse_sharded,
         },
         metadata_store::LinkKind,
     },
@@ -39,7 +39,8 @@ pub enum KeyCategory {
         link: LinkKind,
     },
     /// `v2/ns/{ns}!tag/{tag}!/{ord}.{kind}.{alg}.{hash}` (metadata store): one
-    /// write-once tag event, both names already checked against their grammars.
+    /// write-once tag event, both names already checked against their grammars,
+    /// or the `claim` an immutable tag's first push took.
     TagEntry { namespace: String, tag: String },
     /// `v2/ns/{ns}!hist/{tag}!/{ord}.{kind}.{alg}.{hash}` (metadata store):
     /// one demoted tag-history entry, write-once and never validated.
@@ -252,7 +253,8 @@ fn categorize_ns(rest: &str) -> KeyCategory {
         let Some((tag, entry)) = entries.split_once("!/") else {
             return KeyCategory::Unknown;
         };
-        if Tag::new(tag).is_err() || entry.parse::<TagEntry>().is_err() {
+        let claim = kind == "tag" && entry == TAG_CLAIM;
+        if Tag::new(tag).is_err() || (!claim && entry.parse::<TagEntry>().is_err()) {
             return KeyCategory::Unknown;
         }
         return if kind == "tag" {
@@ -337,7 +339,7 @@ fn categorize_atime(namespace: &str, rest: &str) -> KeyCategory {
 }
 
 /// `pending/{queue}/{stem}.json`, `failed/{queue}/{stem}.json`,
-/// `index/{queue}/{encoded}.json`, or `claims/{encoded}.json`.
+/// `index/{queue}/{hash}.json`, or `claims/{hash}.json`.
 fn categorize_job(rest: &str) -> KeyCategory {
     // Claim keys are worker leases the walk never touches; a lapsed one is
     // taken over by the next claimant.
@@ -538,6 +540,14 @@ mod tests {
         let key = ns.tag_entry_path(&tag, epoch(), false, &digest_a());
         assert_eq!(
             categorize(&key),
+            KeyCategory::TagEntry {
+                namespace: "org/app".to_string(),
+                tag: "v1.0".to_string(),
+            }
+        );
+        // An immutable tag's claim belongs to its tag, not to the quarantine.
+        assert_eq!(
+            categorize(&ns.tag_claim_path(&tag)),
             KeyCategory::TagEntry {
                 namespace: "org/app".to_string(),
                 tag: "v1.0".to_string(),

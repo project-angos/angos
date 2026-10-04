@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -430,32 +430,45 @@ impl Executor {
         tag: Tag,
         target: Option<Digest>,
     ) -> Result<(), Error> {
-        if let Some(target) = target {
-            // Uncached, like the digest-delete guard: a re-push landed on
-            // another replica within the link-cache TTL must be visible here,
-            // which is the whole point of re-reading.
-            let current = self
-                .metadata_store
-                .read_link(&namespace, &LinkKind::Tag(tag.clone()))
-                .await?;
-            if current.target != target {
-                info!(
-                    "skipping tag deletion: '{namespace}:{tag}' now points at '{}', not the judged '{target}'",
-                    current.target
-                );
-                return Ok(());
+        let source_ts = match target {
+            None => None,
+            Some(target) => {
+                let current = self
+                    .metadata_store
+                    .read_link(&namespace, &LinkKind::Tag(tag.clone()))
+                    .await?;
+                if current.target != target {
+                    info!(
+                        "skipping tag deletion: '{namespace}:{tag}' now points at '{}', not the judged '{target}'",
+                        current.target
+                    );
+                    return Ok(());
+                }
+                // Dated just after the judged entry, the delete loses to any
+                // push authored since, whether it lands before the write or
+                // after.
+                current
+                    .created_at
+                    .map(|created_at| created_at + TimeDelta::milliseconds(1))
             }
-        }
+        };
 
-        self.retention_registry()?
+        match self
+            .retention_registry()?
             .remove_manifest(
                 Some(EventActor::internal(RETENTION_ACTOR)),
-                None,
+                source_ts,
                 &namespace,
-                &Reference::Tag(tag),
+                &Reference::Tag(tag.clone()),
             )
-            .await?;
-        Ok(())
+            .await
+        {
+            Err(RegistryError::ReplicationSuperseded(reason)) => {
+                info!("skipping tag deletion: '{namespace}:{tag}' was pushed since ({reason})");
+                Ok(())
+            }
+            result => result.map_err(Error::from),
+        }
     }
 
     /// Applies [`MetadataStore::demote_tag_entry`], which owns the `!hist/`
@@ -828,6 +841,7 @@ mod tests {
     use std::{
         fs::File,
         str::FromStr,
+        sync::atomic::{AtomicBool, Ordering},
         time::{Duration, SystemTime},
     };
 
@@ -836,7 +850,10 @@ mod tests {
     use tempfile::TempDir;
 
     use angos_oci::{Digest, UploadSessionId};
-    use angos_storage::fs::Backend as StorageFsBackend;
+    use angos_storage::{
+        fs::Backend as StorageFsBackend,
+        test_util::{HookedStore, StoreHook, StoreOp},
+    };
 
     use crate::{
         cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
@@ -1184,6 +1201,81 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// A push of `tag` to `digest`, stamped `at`, landed through `store` just
+    /// before the first tombstone write under the tag: the push racing a
+    /// retention delete.
+    struct PushBeforeTombstone {
+        store: Arc<MetadataStore>,
+        namespace: Namespace,
+        tag: Tag,
+        digest: Digest,
+        at: DateTime<Utc>,
+        fired: AtomicBool,
+    }
+
+    #[async_trait]
+    impl StoreHook for PushBeforeTombstone {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            let StoreOp::Put { key, .. } = op else {
+                return Ok(());
+            };
+            let tombstone =
+                key.starts_with(&self.namespace.tag_entry_dir(&self.tag)) && key.contains(".del.");
+            if tombstone && !self.fired.swap(true, Ordering::SeqCst) {
+                self.store
+                    .put_tag_entry(&self.namespace, &self.tag, &self.digest, Some(self.at))
+                    .await
+                    .map_err(|e| StorageError::Backend(e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// A push landing after the delete checked the tag, but before its
+    /// tombstone, still wins: the tombstone is dated just after the judged
+    /// entry, so it never outranks a later push whatever the write order.
+    #[tokio::test]
+    async fn a_push_racing_a_retention_delete_survives_it() {
+        let case = FSRegistryTestCase::new();
+        let blob_store = case.blob_store();
+        let metadata_store = case.metadata_store();
+        let namespace = Namespace::new("test-repo/ci").unwrap();
+        let tag = Tag::new("latest").unwrap();
+        let judged = put_blob_direct(&blob_store, b"what retention judged").await;
+        let pushed = put_blob_direct(&blob_store, b"what CI pushed meanwhile").await;
+        let judged_at = Utc::now() - TimeDelta::seconds(60);
+        metadata_store
+            .put_tag_entry(&namespace, &tag, &judged, Some(judged_at))
+            .await
+            .unwrap();
+
+        let hooked = metadata_store_over(Arc::new(HookedStore::new(
+            metadata_store.object_store().clone(),
+            PushBeforeTombstone {
+                store: metadata_store.clone(),
+                namespace: namespace.clone(),
+                tag: tag.clone(),
+                digest: pushed.clone(),
+                at: judged_at + TimeDelta::seconds(5),
+                fired: AtomicBool::new(false),
+            },
+        )));
+        Executor::new_for_test(blob_store, hooked)
+            .apply(Action::DeleteTag {
+                namespace: namespace.clone(),
+                tag: tag.clone(),
+                target: Some(judged),
+            })
+            .await
+            .unwrap();
+
+        let current = metadata_store
+            .read_link(&namespace, &LinkKind::Tag(tag))
+            .await
+            .unwrap();
+        assert_eq!(current.target, pushed);
     }
 
     /// CI that re-pushes a tag between the retention snapshot and the delete

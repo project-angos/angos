@@ -1031,3 +1031,19 @@ objects to `_lost_and_found/`.
 
 Run `angos reconcile index` after upgrading to walk the layers of indexing
 repositories again in the background, rather than on their first open.
+
+---
+
+## 1.12.x → 1.12.3
+
+### Job Index and Claim Files Are Renamed
+
+A job's `_jobs/index/` and `_jobs/claims/` files are named by the SHA-256 of
+its lock key, where the key itself used to be the file name. A key built from
+a long namespace or tag no longer exceeds the filesystem's file name limit.
+
+#### Migration
+
+None. While replicas of both versions run, a job may be queued or run twice.
+`angos scrub` removes an old index file once its job is gone; an old claim file
+left by a stopped worker stays behind, unused.

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.12.3 - UNRELEASED
+
+### Fixed
+
+- A retention tag delete no longer removes a push of the same tag that lands while it runs, locally or on a `prune` downstream.
+- Two first pushes of an immutable tag with different content, on one replica or several, can no longer both succeed and move it.
+- A job whose lock key is longer than a file name, built from a long namespace or tag, is no longer dropped on the filesystem backend.
+
 ## 1.12.2
 
 ### Added
