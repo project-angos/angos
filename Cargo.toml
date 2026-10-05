@@ -43,28 +43,28 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 bytesize = "2.7.0"
 chrono = { version = "0.4.45", features = ["serde"] }
-flate2 = "1.1"
+flate2 = "1.1.10"
 futures-util = { version = "0.3.34", default-features = false }
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
-hyper = "1.11.0"
+hyper = "1.11.1"
 http-body-util = "0.1.5"
 regex = "1.13.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 tempfile = "3.27"
-thiserror = "2.0.20"
-tokio = "1.53.1"
+thiserror = "2.0.21"
+tokio = "1.53.2"
 tokio-util = { version = "0.7.19", features = ["io-util"] }
-toml = "1.1.4"
+toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 url = "2.5.8"
-uuid = { version = "1.24.0", features = ["v4"] }
-rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring"] }
+uuid = { version = "1.27.0", features = ["v4"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 wiremock = "0.6.5"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
@@ -94,7 +94,7 @@ angos-secret = { workspace = true }
 angos-storage = { workspace = true }
 arc-swap = { workspace = true }
 argh = { workspace = true }
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -109,37 +109,37 @@ http-body-util = { workspace = true }
 humantime = "2.4.0"
 http = { workspace = true }
 hyper = { workspace = true, features = ["full"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
-jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 mime_guess = "2.0.5"
 notify = "8.2"
-opentelemetry = "0.32.0"
-opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "metrics"] }
-opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
+opentelemetry = "0.33.0"
+opentelemetry_sdk = { version = "0.33.0", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.33.0", features = ["grpc-tonic"] }
 # Stays on 0.5 in lockstep with argon2: this dep exists to enable the
 # `getrandom` feature on the password-hash instance argon2 re-exports, which
 # requires both to resolve to the same crate version.
-password-hash = { version = "0.5", features = ["getrandom"] }
+password-hash = { version = "0.6.1", features = ["getrandom"] }
 prometheus = "0.14"
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rpassword = "7.5.4"
 rust-embed = "8.12.0"
-rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 serde = { workspace = true }
 serde_html_form = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-tar = "0.4.44"
+tar = "0.4.46"
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
-tokio-rustls = "0.26.4"
+tokio-rustls = "0.26.6"
 tokio-util = { workspace = true, features = ["rt"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["serde"] }
@@ -152,7 +152,7 @@ angos-oci = { workspace = true, features = ["test-util"] }
 angos-s3-client = { workspace = true, features = ["test-util"] }
 angos-storage = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
-opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
+opentelemetry_sdk = { version = "0.33.0", features = ["testing"] }
 p256 = { version = "0.14.0", features = ["ecdsa", "pem"] }
 rcgen = { workspace = true }
 wiremock = { workspace = true }
