@@ -164,6 +164,10 @@ The push refers to repository [registry.local/myapp]
 unknown: Tag 'v1.0.0' is immutable and cannot be overwritten
 ```
 
+### Concurrent pushes and deletion
+
+Two first pushes of an immutable tag with different content cannot both land, on one replica or several: the first to claim the tag wins, and the other gets the `409` above. On S3 this takes a provider that enforces conditional writes (`If-None-Match: *`). Deleting an immutable tag releases it, so it can then be pushed with new content. A push that fails after claiming the tag keeps it reserved for its content until the tag is deleted.
+
 ---
 
 ## Verification

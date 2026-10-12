@@ -91,24 +91,56 @@ impl MetadataStore {
         Ok(!same_target)
     }
 
+    /// Claim immutable `tag` for `target` with one create-if-absent, so that
+    /// of first pushes racing on any replica exactly one holds it; `false`
+    /// when another digest does. Deleting the tag releases the claim.
+    pub async fn claim_tag(
+        &self,
+        namespace: &Namespace,
+        tag: &Tag,
+        target: &Digest,
+    ) -> Result<bool, Error> {
+        let key = namespace.tag_claim_path(tag);
+        let claim = Bytes::from(target.to_string());
+        if self
+            .object_store()
+            .create_if_absent(&key, claim.clone())
+            .await?
+        {
+            return Ok(true);
+        }
+        match self.object_store().get(&key).await {
+            Ok(held) => Ok(held == claim),
+            // Released meanwhile by a delete: refused, and the client retries.
+            Err(StorageError::NotFound) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// End `tag` with one tombstone entry naming the digest it held, which
-    /// tag history requires. A tag with no live entry has nothing to end, and
-    /// reads as untouched.
+    /// tag history requires, and release its immutability claim. A tag with
+    /// no live entry has nothing to end, but its claim still goes, so deleting
+    /// it frees a claim a failed push left behind.
     pub async fn put_tag_tombstone(
         &self,
         namespace: &Namespace,
         tag: &Tag,
         authored_at: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
-        let current = match self.resolve_tag(namespace, tag).await {
-            Ok(current) => current,
-            Err(Error::NotFound) => return Ok(()),
+        match self.resolve_tag(namespace, tag).await {
+            Ok(current) => {
+                let created_at =
+                    authored_at.unwrap_or_else(|| local_entry_ts(Utc::now(), current.created_at));
+                self.write_tag_entry(namespace, tag, &current.target, true, created_at)
+                    .await?;
+            }
+            Err(Error::NotFound) => {}
             Err(e) => return Err(e),
-        };
-        let created_at =
-            authored_at.unwrap_or_else(|| local_entry_ts(Utc::now(), current.created_at));
-        self.write_tag_entry(namespace, tag, &current.target, true, created_at)
-            .await
+        }
+        self.object_store()
+            .delete(&namespace.tag_claim_path(tag))
+            .await?;
+        Ok(())
     }
 
     /// Resolve `tag` to link-shaped metadata: the complete newest entry group

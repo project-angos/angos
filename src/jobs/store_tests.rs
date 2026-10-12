@@ -1149,25 +1149,43 @@ fn test_job_paths() {
         job_failed_path("cache", "01HABCDE"),
         "_jobs/failed/cache/01HABCDE.json"
     );
-    assert_eq!(
-        job_lock_key_index_path("cache", &lock_key("cache.ns:sha256:abc")),
-        "_jobs/index/cache/cache.ns%3Asha256%3Aabc.json"
-    );
+    // Index files take a fixed-length name per key, whatever the key's length.
+    let short = job_lock_key_index_path("cache", &lock_key("cache.ns:sha256:abc"));
+    let long = job_lock_key_index_path("cache", &lock_key(&"cache.ns/".repeat(100)));
+    assert_eq!(short.len(), long.len());
+    assert_ne!(short, long);
+    assert!(short.starts_with("_jobs/index/cache/"));
 }
 
-/// `%` is the escape character of the index-path encoding, so a key carrying
-/// one could encode onto another key's path and falsely dedup. The type makes
-/// that key unrepresentable rather than leaving the encoding non-injective.
 #[test]
-fn a_lock_key_containing_the_escape_character_is_rejected() {
-    assert!(matches!(
-        LockKey::new("a%3Ab"),
-        Err(crate::jobs::store::Error::InvalidLockKey(_))
-    ));
+fn an_empty_lock_key_is_rejected() {
     assert!(matches!(
         LockKey::new(""),
         Err(crate::jobs::store::Error::InvalidLockKey(_))
     ));
+}
+
+/// A lock key built from a long namespace and tag runs past any file name
+/// limit, so its index and claim files are named by a hash of it: on FS the
+/// job still enqueues, claims and completes.
+#[tokio::test]
+async fn a_lock_key_longer_than_a_file_name_runs_on_fs() {
+    let h = harness();
+    let key = format!("cache.{}:sha256:{}", "segment/".repeat(40), "f".repeat(64));
+    h.store
+        .enqueue(dummy_envelope(&key))
+        .await
+        .expect("a long lock key must enqueue");
+
+    let claimed = h
+        .store
+        .claim_one(Queue::Cache)
+        .await
+        .expect("claim_one")
+        .claimed
+        .expect("the job must be claimable");
+    assert_eq!(claimed.envelope.lock_key, lock_key(&key));
+    h.store.complete(claimed).await.expect("complete");
 }
 
 /// A pinned budget of zero used to be indistinguishable from "not set", so the

@@ -61,6 +61,8 @@ struct PushedKeys<'a> {
     subject: Option<&'a Digest>,
     descriptor: Option<&'a Descriptor>,
     tags: &'a [Tag],
+    /// The immutable ones among `tags`, claimed before their entry is written.
+    claimed: &'a [Tag],
     media_type: Option<MediaType>,
     authored_at: Option<DateTime<Utc>>,
 }
@@ -131,6 +133,13 @@ pub async fn read_manifest(
         Err(Error::BlobUnknown) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// The refusal of a push that would move immutable `tag`.
+fn immutable_overwrite(tag: &Tag) -> Error {
+    Error::Conflict(format!(
+        "Tag '{tag}' is immutable and cannot be overwritten"
+    ))
 }
 
 /// The digest a pushed manifest lands under. A digest reference fixes the
@@ -714,6 +723,16 @@ impl Registry {
             .chain(created_tags)
             .cloned()
             .collect();
+        // A pull-through fill caches what the upstream says, which no claim
+        // may refuse.
+        let claimed_tags: Vec<Tag> = written_tags
+            .iter()
+            .filter(|tag| {
+                reference_policy != ReferencePolicy::Trusted
+                    && self.is_tag_immutable(repository, tag)
+            })
+            .cloned()
+            .collect();
 
         // The digests this manifest references, deduped because a manifest may
         // name one digest as both its config and a layer, and filtered by the
@@ -756,6 +775,7 @@ impl Registry {
                     subject: subject.as_ref(),
                     descriptor: descriptor.as_ref(),
                     tags: &written_tags,
+                    claimed: &claimed_tags,
                     media_type: effective_media_type.clone(),
                     authored_at: created_at,
                 },
@@ -835,6 +855,11 @@ impl Registry {
 
         let mut tag_moved = false;
         for tag in keys.tags {
+            // The early check reads; this claim decides between first pushes
+            // racing on any replica.
+            if keys.claimed.contains(tag) && !store.claim_tag(namespace, tag, digest).await? {
+                return Err(immutable_overwrite(tag));
+            }
             tag_moved |= store
                 .put_tag_entry(namespace, tag, digest, keys.authored_at)
                 .await?;
@@ -1163,10 +1188,7 @@ impl Registry {
         if held == *incoming_digest {
             return Ok(());
         }
-
-        Err(Error::Conflict(format!(
-            "Tag '{tag}' is immutable and cannot be overwritten"
-        )))
+        Err(immutable_overwrite(tag))
     }
 
     /// Last-writer-wins gate for a replication-originated write: refuses when
@@ -6184,6 +6206,106 @@ mod tests {
             matches!(result, Err(Error::Conflict(_))),
             "a `?tag=` moving an immutable tag must be refused, got: {result:?}"
         );
+    }
+
+    /// Of first pushes racing on an immutable tag, the claim admits one. With
+    /// another digest's claim taken but its entry not yet written, as when a
+    /// concurrent first push is mid-flight, a push of other content is refused
+    /// while the claimed content still lands.
+    #[tokio::test]
+    async fn racing_first_pushes_of_an_immutable_tag_admit_only_the_claimant() {
+        let test_case = FSRegistryTestCase::with_immutable_tags();
+        let registry = test_case.registry();
+        let namespace = Namespace::new("test-repo/app").unwrap();
+        let tag = Tag::new("v1.0.0").unwrap();
+        let claimed = registry
+            .metadata_store
+            .claim_tag(&namespace, &tag, &Digest::sha256_of_bytes(RELEASE))
+            .await
+            .unwrap();
+        assert!(claimed);
+
+        let push = async |body: &'static [u8]| {
+            registry
+                .handle_put_manifest(
+                    None,
+                    PutManifestRequest {
+                        namespace: namespace.clone(),
+                        reference: Reference::Tag(tag.clone()),
+                        content_type: Some(MediaType::oci_manifest()),
+                        tags: Vec::new(),
+                        source_ts: None,
+                    },
+                    Cursor::new(body.to_vec()),
+                )
+                .await
+        };
+
+        let result = push(REBUILD).await;
+        assert!(
+            matches!(result, Err(Error::Conflict(_))),
+            "a push losing the claim must be refused, got: {result:?}"
+        );
+        push(RELEASE)
+            .await
+            .expect("the claimant's own push must land");
+    }
+
+    /// Deleting an immutable tag releases it, so it can be pushed anew with
+    /// other content; deleting a tag that never landed frees the claim a
+    /// failed push left behind.
+    #[tokio::test]
+    async fn deleting_an_immutable_tag_releases_it() {
+        let test_case = FSRegistryTestCase::with_immutable_tags();
+        let registry = test_case.registry();
+        let namespace = Namespace::new("test-repo/app").unwrap();
+        let tag = Tag::new("v1.0.0").unwrap();
+
+        let push = async |tag: &Tag, body: &'static [u8]| {
+            registry
+                .handle_put_manifest(
+                    None,
+                    PutManifestRequest {
+                        namespace: namespace.clone(),
+                        reference: Reference::Tag(tag.clone()),
+                        content_type: Some(MediaType::oci_manifest()),
+                        tags: Vec::new(),
+                        source_ts: None,
+                    },
+                    Cursor::new(body.to_vec()),
+                )
+                .await
+        };
+        let delete = async |tag: &Tag| {
+            registry
+                .handle_delete_manifest(
+                    None,
+                    DeleteManifestRequest {
+                        namespace: namespace.clone(),
+                        reference: Reference::Tag(tag.clone()),
+                        source_ts: None,
+                    },
+                )
+                .await
+                .expect("deleting the tag must succeed");
+        };
+
+        push(&tag, RELEASE).await.unwrap();
+        delete(&tag).await;
+        push(&tag, REBUILD)
+            .await
+            .expect("a deleted immutable tag must take new content");
+
+        let stale = Tag::new("v2.0.0").unwrap();
+        registry
+            .metadata_store
+            .claim_tag(&namespace, &stale, &Digest::sha256_of_bytes(RELEASE))
+            .await
+            .unwrap();
+        delete(&stale).await;
+        push(&stale, REBUILD)
+            .await
+            .expect("deleting must free a claim no entry backs");
     }
 
     /// An excluded tag stays writable while the rest of the repository is frozen.

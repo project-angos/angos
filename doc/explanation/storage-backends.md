@@ -168,7 +168,7 @@ operation_attempt_timeout_secs = 300
 - Higher latency than local disk
 - Network dependency
 - Potential egress costs
-- The job queue probes conditional writes (`If-None-Match: *`) at startup; a provider that does not enforce them degrades to advisory claims, where a claim race may run an idempotent job more than once
+- The job queue probes conditional writes (`If-None-Match: *`) at startup; a provider that does not enforce them degrades to advisory claims, where a claim race may run an idempotent job more than once, and two racing first pushes of an immutable tag may both land
 
 ### Compatible Services
 

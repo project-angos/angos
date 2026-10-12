@@ -343,6 +343,9 @@ pub fn parse_layer_key(key: &str) -> Option<Digest> {
     parse_sharded(parts.next()?, parts.next()?, parts.next()?)
 }
 
+/// The file name of an immutable tag's claim in its entry directory.
+pub const TAG_CLAIM: &str = "claim";
+
 /// Every current-shape storage key addressed by a namespace.
 pub trait NamespaceKeys {
     /// Directory holding every tag-entry directory of the namespace,
@@ -354,6 +357,11 @@ pub trait NamespaceKeys {
     /// listing, which is what lets the tag list serve lexical order straight
     /// off it.
     fn tag_entry_dir(&self, tag: &Tag) -> String;
+
+    /// The claim an immutable tag's first push takes, holding the digest it
+    /// was pushed with. It sits among the tag's entries, whose readers all skip
+    /// a name that does not parse as one.
+    fn tag_claim_path(&self, tag: &Tag) -> String;
 
     /// One tag event: `<ord>.<kind>.<algo>.<hash>`, where `<ord>` inverts the
     /// author's unix-millisecond timestamp so entries list newest first, and
@@ -439,6 +447,10 @@ impl NamespaceKeys for Namespace {
 
     fn tag_entry_dir(&self, tag: &Tag) -> String {
         format!("{}/{tag}!", self.tag_entries_root())
+    }
+
+    fn tag_claim_path(&self, tag: &Tag) -> String {
+        format!("{}/{TAG_CLAIM}", self.tag_entry_dir(tag))
     }
 
     fn tag_entry_path(
