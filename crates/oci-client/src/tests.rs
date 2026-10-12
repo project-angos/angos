@@ -1082,6 +1082,52 @@ async fn a_persistent_unauthorized_after_a_refresh_is_terminal() {
     );
 }
 
+/// A token service that is down or throttling refused nothing, so it reads as
+/// no answer, as the registry's own 5xx does; one that turns the credential
+/// away is still `Unauthorized`.
+#[tokio::test]
+async fn a_failing_token_service_is_an_outage_not_a_refusal() {
+    for (status, outage) in [(503, true), (429, true), (401, false)] {
+        let mock_server = MockServer::start().await;
+        let registry_url = mock_server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/test/manifests/latest"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{registry_url}/token",service="registry""#).as_str(),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let error = client_for(&mock_server)
+            .get_manifest(GetManifestRequest {
+                namespace: Namespace::new("test").unwrap(),
+                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                accepted_types: Vec::new(),
+            })
+            .await
+            .expect_err("a failed token exchange must fail the fetch");
+
+        if outage {
+            assert!(
+                matches!(error, Error::Internal(_)),
+                "a token service answering {status} is an outage, got: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, Error::Unauthorized(_)),
+                "a token service answering {status} is a refusal, got: {error:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_forbidden_access() {
     let mock_server = MockServer::start().await;

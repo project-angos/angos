@@ -34,6 +34,9 @@ sequenceDiagram
             Upstream-->>Registry: Updated content
             Registry->>Cache: Update cache
             Registry-->>Client: Serve updated content
+        else Upstream unavailable
+            Cache-->>Registry: Return cached content
+            Registry-->>Client: Serve from cache (stale)
         end
     else Cache miss
         Registry->>Upstream: GET content
@@ -70,6 +73,28 @@ When content is cached:
 - Registry checks upstream for updates
 - If same digest, serves from cache
 - If different, refreshes cache
+- If no upstream can answer, serves from cache
+
+### Upstream Unavailable
+
+An upstream is unavailable when it cannot be reached, answers a server error (`5xx`) or
+`429 Too Many Requests` (the registry or its token service), or sends a response Angos cannot
+read. With several upstreams, a request is unavailable unless one of them serves it or every one
+of them answers.
+
+- **Cached content keeps being served.** A mutable tag no upstream can check is served as
+  cached. A tag the upstream reports as moved but then fails to serve, such as a throttled `GET`
+  behind an unthrottled `HEAD`, is served from the copy it would have replaced. Digests,
+  immutable tags and blobs are served from the cache without asking the upstream, so an outage
+  does not reach them.
+- **Uncached content answers `503 UPSTREAM_UNAVAILABLE`**, not `404`, so clients retry instead
+  of reporting a missing image.
+- **An upstream that answers is believed.** A `404`, `401` or `403` is an answer: a mutable tag
+  the upstream reports as gone, or no longer lets Angos read, is not served from the cache.
+  Docker Hub answers `401` for a repository that does not exist.
+
+Each pull served this way logs a warning and counts as `outcome="stale"` in
+[`angos_pull_through_total`](../reference/metrics.md#angos_pull_through_total).
 
 ---
 
@@ -185,6 +210,7 @@ Pull-through cache reduces upstream requests:
 2. **Subsequent pulls**: Served from cache (no limit impact)
 3. **Immutable tags**: Never re-check upstream
 4. **Mutable tags**: Only lightweight HEAD requests
+5. **Throttled upstream**: Cached content keeps being served (see [Upstream Unavailable](#upstream-unavailable))
 
 ### Optimization Tips
 
@@ -378,8 +404,23 @@ max_redirect = 5
 ### Content Not Updating
 
 - Check if tag is marked immutable
-- Verify upstream connectivity
+- Verify upstream connectivity: a tag no upstream can check is served as cached, counted as
+  `angos_pull_through_total{outcome="stale"}`
 - Check exclusion patterns
+
+### `503 UPSTREAM_UNAVAILABLE`
+
+No upstream answered for content Angos has not cached. The warning log names each upstream's
+failure.
+
+- Verify upstream connectivity and the token service it redirects to
+- Check for upstream rate limiting (`429`)
+- Add fallback upstreams
+
+### Cached Tag Answers `404`
+
+The upstream answered that the tag is gone, or refused Angos access (`401`/`403`). Verify the
+upstream credentials have not expired, or mark the tag immutable to serve it without asking.
 
 ### Rate Limit Errors
 

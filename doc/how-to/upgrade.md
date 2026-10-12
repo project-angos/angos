@@ -1047,3 +1047,15 @@ a long namespace or tag no longer exceeds the filesystem's file name limit.
 None. While replicas of both versions run, a job may be queued or run twice.
 `angos scrub` removes an old index file once its job is gone; an old claim file
 left by a stopped worker stays behind, unused.
+
+### An Upstream Outage Is a `503`, Not a `404`
+
+A pull-through repository serves a cached mutable tag while no upstream is
+available to check it, where it answered `404 MANIFEST_UNKNOWN`. Content it
+has not cached answers `503 UPSTREAM_UNAVAILABLE` instead of `404`. An
+upstream is unavailable when it cannot be reached, or it or its token service
+answers a `5xx` or `429`; a `404`, `401` or `403` still answers `404`. See
+[Upstream Unavailable](../explanation/pull-through-caching.md#upstream-unavailable).
+
+**Who is affected:** scripts and alerts that read a pull-through `404` as an
+upstream outage, or treat a `5xx` from Angos as its own failure.

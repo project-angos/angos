@@ -2,7 +2,9 @@ use std::io;
 
 use hyper::StatusCode;
 
-use angos_oci::response::{ErrorCode, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE};
+use angos_oci::response::{
+    ErrorCode, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE, UPSTREAM_UNAVAILABLE_CODE,
+};
 
 use crate::{command::server::Error, configuration, event_webhook, registry};
 
@@ -30,6 +32,7 @@ fn owes_a_spec_code(error: &registry::Error) -> bool {
         | registry::Error::Conflict(_) => true,
         registry::Error::ReplicationSuperseded(_)
         | registry::Error::ReclamationInProgress(_)
+        | registry::Error::UpstreamUnavailable(_)
         | registry::Error::Initialization(_)
         | registry::Error::EventDelivery(_)
         | registry::Error::Internal(_)
@@ -211,6 +214,13 @@ fn registry_answers() -> Vec<Answer> {
             registry::Error::ReclamationInProgress("reclaiming".into()),
             503,
             RECLAMATION_IN_PROGRESS_CODE,
+            None,
+        ),
+        // An unreachable upstream is a retry, not a missing image.
+        answer(
+            registry::Error::UpstreamUnavailable("down".into()),
+            503,
+            UPSTREAM_UNAVAILABLE_CODE,
             None,
         ),
         // A typed variant routes to a generic 500 with its detail left in the log.

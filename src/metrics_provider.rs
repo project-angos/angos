@@ -207,7 +207,7 @@ impl MetricsProvider {
 
         let pull_through_total = register_int_counter_vec_with_registry!(
             "angos_pull_through_total",
-            "Total pull-through cache lookups, by repository, content kind (manifest, blob) and outcome (hit, miss, refresh)",
+            "Total pull-through cache lookups, by repository, content kind (manifest, blob) and outcome (hit, miss, refresh, stale)",
             &["repository", "kind", "outcome"],
             registry
         )

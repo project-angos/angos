@@ -8,6 +8,7 @@ use angos_oci::{
     Error as OciError, http_range,
     response::{
         ErrorCode, INTERNAL_ERROR_CODE, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE,
+        UPSTREAM_UNAVAILABLE_CODE,
     },
 };
 use angos_storage::Error as StorageError;
@@ -60,6 +61,12 @@ pub enum Error {
     /// client retries after the collector's batch moves on.
     #[error("reclamation in progress: {0}")]
     ReclamationInProgress(String),
+    /// No pull-through upstream gave an answer: each was unreachable, failed,
+    /// or answered unusably, and none said the content is absent. Distinct
+    /// from a miss so an outage does not read as deleted content, and so a
+    /// cached copy can be served in its place.
+    #[error("upstream unavailable: {0}")]
+    UpstreamUnavailable(String),
     /// A replication write lost last-writer-wins: the local tag is strictly
     /// newer than the incoming `source_ts`. Carries a distinct OCI code so the
     /// sender treats it as convergence rather than a conflict to retry.
@@ -93,6 +100,7 @@ impl Error {
     /// error code and the message worth sending. A 4xx code must come from the
     /// spec's set, so each case picks the closest of those.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn oci_answer(&self) -> (StatusCode, &'static str, Option<String>) {
         match self {
             Error::BlobUnknown => (StatusCode::NOT_FOUND, ErrorCode::BlobUnknown.as_str(), None),
@@ -179,6 +187,13 @@ impl Error {
             Error::ReclamationInProgress(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 RECLAMATION_IN_PROGRESS_CODE,
+                Some(msg.clone()),
+            ),
+            // Transient too: the client retries once the upstream is back,
+            // instead of reading the outage as a missing image.
+            Error::UpstreamUnavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                UPSTREAM_UNAVAILABLE_CODE,
                 Some(msg.clone()),
             ),
             Error::ReplicationSuperseded(msg) => (
