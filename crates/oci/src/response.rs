@@ -102,6 +102,7 @@ impl Display for ErrorCode {
 pub const INTERNAL_ERROR_CODE: &str = "INTERNAL_ERROR";
 pub const PROVIDER_UNAVAILABLE_CODE: &str = "PROVIDER_UNAVAILABLE";
 pub const RECLAMATION_IN_PROGRESS_CODE: &str = "RECLAMATION_IN_PROGRESS";
+pub const UPSTREAM_UNAVAILABLE_CODE: &str = "UPSTREAM_UNAVAILABLE";
 pub const REPLICATION_SUPERSEDED_CODE: &str = "REPLICATION_SUPERSEDED";
 
 /// Body of any 4xx/5xx answer: the codes the spec defines, each with what the

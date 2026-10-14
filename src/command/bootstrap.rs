@@ -227,6 +227,7 @@ mod tests {
             ("manifest", "hit"),
             ("manifest", "miss"),
             ("manifest", "refresh"),
+            ("manifest", "stale"),
             ("blob", "hit"),
             ("blob", "miss"),
         ] {

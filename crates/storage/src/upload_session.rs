@@ -27,7 +27,6 @@ use tokio::sync::mpsc;
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
 
 /// Wrap a [`mpsc::Receiver`] of [`Bytes`] as a [`ByteStream`].
-#[must_use]
 pub fn channel_stream(rx: mpsc::Receiver<Bytes>) -> ByteStream {
     Box::pin(stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|chunk| (Ok(chunk), rx))

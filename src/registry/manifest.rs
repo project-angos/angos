@@ -208,18 +208,11 @@ enum ServeLocal<T> {
     Hit(T),
     /// Nothing local to serve.
     Miss,
-    /// A mutable tag the upstream has since re-pointed.
-    Refresh,
-}
-
-impl<T> ServeLocal<T> {
-    fn outcome(&self) -> &'static str {
-        match self {
-            ServeLocal::Hit(_) => "hit",
-            ServeLocal::Miss => "miss",
-            ServeLocal::Refresh => "refresh",
-        }
-    }
+    /// A mutable tag the upstream has since re-pointed. The copy is kept for
+    /// a refetch that finds the upstream unavailable.
+    Refresh(T),
+    /// A mutable tag no upstream could be asked about, served as stored.
+    Stale(T),
 }
 
 /// Only a genuine miss is a 404; collapsing a backend fault into one makes a
@@ -238,7 +231,8 @@ fn hosted_manifest_error(namespace: &Namespace, reference: &Reference, error: Er
 }
 
 /// The serve-local gate shared by the cached manifest HEAD and GET: `local`
-/// is served unless it is absent or `needs_upstream` finds it stale.
+/// is served unless it is absent or `needs_upstream` finds it stale. An
+/// upstream too unavailable to say serves it as it stands.
 async fn serveable_cached<T>(
     local: Result<T, Error>,
     needs_upstream: impl AsyncFnOnce(&T) -> Result<bool, Error>,
@@ -246,10 +240,40 @@ async fn serveable_cached<T>(
     let Ok(value) = local else {
         return Ok(ServeLocal::Miss);
     };
-    if needs_upstream(&value).await? {
-        return Ok(ServeLocal::Refresh);
+    match needs_upstream(&value).await {
+        Ok(false) => Ok(ServeLocal::Hit(value)),
+        Ok(true) => Ok(ServeLocal::Refresh(value)),
+        Err(error @ Error::UpstreamUnavailable(_)) => {
+            warn!("Serving the cached manifest unchecked: {error}");
+            Ok(ServeLocal::Stale(value))
+        }
+        Err(error) => Err(error),
     }
-    Ok(ServeLocal::Hit(value))
+}
+
+/// Answers a cached pull from `serveable`, calling `fetch` when the copy is
+/// missing or re-pointed, and records the one outcome the pull ends on. A
+/// refetch the upstream is unavailable for serves the copy it would have
+/// replaced: an outdated image beats none.
+async fn serve_cached<T>(
+    upstream: &Repository,
+    serveable: ServeLocal<T>,
+    fetch: impl AsyncFnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let (outcome, served) = match serveable {
+        ServeLocal::Hit(value) => ("hit", Ok(value)),
+        ServeLocal::Stale(value) => ("stale", Ok(value)),
+        ServeLocal::Miss => ("miss", fetch().await),
+        ServeLocal::Refresh(value) => match fetch().await {
+            Err(error @ Error::UpstreamUnavailable(_)) => {
+                warn!("Serving the cached manifest the upstream re-pointed: {error}");
+                ("stale", Ok(value))
+            }
+            fetched => ("refresh", fetched),
+        },
+    };
+    record_pull_through(&upstream.name, "manifest", outcome);
+    served
 }
 
 /// Whether a cached mutable tag must be refetched because the upstream has
@@ -312,7 +336,8 @@ impl Registry {
     }
 
     /// HEAD on a pull-through namespace: the cached manifest while it is
-    /// current, else the upstream's, fetched and stored.
+    /// current or no upstream is available, else the upstream's, fetched and
+    /// stored.
     async fn head_cached_manifest(
         &self,
         upstream: &Repository,
@@ -335,7 +360,6 @@ impl Registry {
             .await
         })
         .await?;
-        record_pull_through(&upstream.name, "manifest", serveable.outcome());
         // A local copy counts as pulled, stale or not, as the GET's read of it
         // does.
         if !matches!(serveable, ServeLocal::Miss) {
@@ -346,38 +370,38 @@ impl Registry {
             )
             .await?;
         }
-        if let ServeLocal::Hit(meta) = serveable {
-            return Ok(meta);
-        }
 
         // The freshness check above decided: fetch, with no second local read
         // or upstream check.
-        let body = self
-            .fetch_upstream_manifest(
-                upstream,
-                &GetManifestRequest {
-                    namespace: request.namespace.clone(),
-                    reference: request.reference.clone(),
-                    accepted_types: request.accepted_types.clone(),
-                },
-            )
-            .await?;
+        serve_cached(upstream, serveable, async || {
+            let body = self
+                .fetch_upstream_manifest(
+                    upstream,
+                    &GetManifestRequest {
+                        namespace: request.namespace.clone(),
+                        reference: request.reference.clone(),
+                        accepted_types: request.accepted_types.clone(),
+                    },
+                )
+                .await?;
 
-        let ManifestGet::Content {
-            digest,
-            media_type,
-            bytes,
-        } = body
-        else {
-            // A fetch from the upstream is always content.
-            return Err(Error::ManifestUnknown);
-        };
+            let ManifestGet::Content {
+                digest,
+                media_type,
+                bytes,
+            } = body
+            else {
+                // A fetch from the upstream is always content.
+                return Err(Error::ManifestUnknown);
+            };
 
-        Ok(ManifestDescriptor {
-            digest,
-            media_type,
-            length: bytes.len() as u64,
+            Ok(ManifestDescriptor {
+                digest,
+                media_type,
+                length: bytes.len() as u64,
+            })
         })
+        .await
     }
 
     /// Read a manifest/tag link for a client pull, recording its access time
@@ -510,7 +534,8 @@ impl Registry {
     /// GET on a pull-through namespace: the cached manifest while it is
     /// current, else the upstream's, stored on the way out. A digest cannot
     /// move upstream, so it redirects from its record alone; a mutable tag is
-    /// checked against the upstream first.
+    /// checked against the upstream first, and served as cached when no
+    /// upstream is available to check or refetch it.
     #[instrument(skip(upstream))]
     async fn get_cached_manifest(
         &self,
@@ -548,11 +573,10 @@ impl Registry {
             .await
         })
         .await?;
-        record_pull_through(&upstream.name, "manifest", serveable.outcome());
-        if let ServeLocal::Hit(manifest) = serveable {
-            return Ok(manifest);
-        }
-        self.fetch_upstream_manifest(upstream, request).await
+        serve_cached(upstream, serveable, async || {
+            self.fetch_upstream_manifest(upstream, request).await
+        })
+        .await
     }
 
     /// The upstream's manifest for `request`, stored in the cache on the way
@@ -1552,7 +1576,7 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{any, method, path},
     };
 
     use angos_oci::{
@@ -2651,6 +2675,206 @@ mod tests {
             .map(|request| request.method.as_str())
             .collect();
         assert_eq!(methods, ["HEAD", "GET"]);
+    }
+
+    fn latest() -> Reference {
+        Reference::Tag(Tag::new("latest").unwrap())
+    }
+
+    /// A pull-through repository `name` holding `content` as `latest`, cached
+    /// by an immutable-tag pull that never asks the upstream about the tag. The
+    /// upstream is then reset, for each test to mount the outage it needs.
+    async fn cache_latest(
+        registry: &Registry,
+        name: &str,
+        content: &[u8],
+    ) -> (MockServer, Repository) {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{name}/manifests/latest")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(content.to_vec())
+                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
+            )
+            .mount(&upstream)
+            .await;
+        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let repository = Repository::new(
+            name,
+            &RepositoryConfig {
+                upstream: vec![test_client_config(upstream.uri())],
+                ..Default::default()
+            },
+            &cache_backend,
+            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
+        registry
+            .get_manifest_direct(
+                Some(&repository),
+                &[MediaRange::from(MediaType::docker_manifest())],
+                &Namespace::new(name).unwrap(),
+                latest(),
+                true,
+                &EventActor::default(),
+            )
+            .await
+            .expect("the upstream must fill the cache");
+        upstream.reset().await;
+        (upstream, repository)
+    }
+
+    /// A cached mutable tag outlives its upstream: with no upstream to confirm
+    /// it, HEAD and GET serve the stored copy, each counted `stale`.
+    #[tokio::test]
+    async fn a_cached_tag_is_served_while_the_upstream_is_down() {
+        const REPOSITORY: &str = "pull-through-outage";
+        let case = FSRegistryTestCase::new();
+        let registry = case.registry();
+        let namespace = Namespace::new(REPOSITORY).unwrap();
+        let accepted = [MediaRange::from(MediaType::docker_manifest())];
+        let (content, _) = create_raw_test_manifest();
+        let (upstream, repository) = cache_latest(registry, REPOSITORY, &content).await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+
+        let manifest = registry
+            .get_manifest_direct(
+                Some(&repository),
+                &accepted,
+                &namespace,
+                latest(),
+                false,
+                &EventActor::default(),
+            )
+            .await
+            .expect("a cached tag must be served while the upstream is down");
+        assert_eq!(expect_content(manifest).bytes, content);
+
+        let head = registry
+            .head_cached_manifest(
+                &repository,
+                &HeadManifestRequest {
+                    namespace,
+                    reference: latest(),
+                    accepted_types: accepted.to_vec(),
+                },
+                false,
+                &EventActor::default(),
+            )
+            .await
+            .expect("a cached tag must be described while the upstream is down");
+        assert_eq!(head.digest, Digest::sha256_of_bytes(&content));
+        assert_eq!(pull_through_count(REPOSITORY, "stale"), 2);
+    }
+
+    /// A tag the upstream re-pointed but cannot then serve, as a throttled GET
+    /// behind an unthrottled HEAD, is answered with the copy it would have
+    /// replaced, and counted `stale` rather than `refresh`.
+    #[tokio::test]
+    async fn a_moved_tag_the_upstream_cannot_serve_is_answered_from_the_cache() {
+        const REPOSITORY: &str = "pull-through-throttled";
+        let case = FSRegistryTestCase::new();
+        let registry = case.registry();
+        let (content, _) = create_raw_test_manifest();
+        let (upstream, repository) = cache_latest(registry, REPOSITORY, &content).await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        DOCKER_CONTENT_DIGEST,
+                        Digest::sha256_of_bytes(b"moved upstream")
+                            .to_string()
+                            .as_str(),
+                    )
+                    .insert_header(CONTENT_LENGTH, "0")
+                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&upstream)
+            .await;
+
+        let manifest = registry
+            .get_manifest_direct(
+                Some(&repository),
+                &[MediaRange::from(MediaType::docker_manifest())],
+                &Namespace::new(REPOSITORY).unwrap(),
+                latest(),
+                false,
+                &EventActor::default(),
+            )
+            .await
+            .expect("a refetch the upstream cannot serve must fall back to the cache");
+        assert_eq!(expect_content(manifest).bytes, content);
+        assert_eq!(pull_through_count(REPOSITORY, "stale"), 1);
+        assert_eq!(pull_through_count(REPOSITORY, "refresh"), 0);
+    }
+
+    /// An upstream that answers the tag is gone is believed, cached copy or
+    /// not; only one that cannot answer leaves the copy served.
+    #[tokio::test]
+    async fn a_tag_the_upstream_says_is_gone_is_not_served() {
+        let case = FSRegistryTestCase::new();
+        let registry = case.registry();
+        let (content, _) = create_raw_test_manifest();
+        let (upstream, repository) = cache_latest(registry, "pull-through-deleted", &content).await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+
+        let result = registry
+            .get_manifest_direct(
+                Some(&repository),
+                &[MediaRange::from(MediaType::docker_manifest())],
+                &Namespace::new("pull-through-deleted").unwrap(),
+                latest(),
+                false,
+                &EventActor::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::ManifestUnknown)),
+            "a tag the upstream deleted must read as unknown, got: {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    /// With nothing cached there is nothing to fall back to: an upstream
+    /// outage answers as one, not as a manifest that does not exist.
+    #[tokio::test]
+    async fn an_uncached_tag_reports_the_upstream_outage() {
+        let case = FSRegistryTestCase::new();
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&upstream)
+            .await;
+        let repository = pull_through_repository(&upstream).await;
+
+        let result = case
+            .registry()
+            .get_manifest_direct(
+                Some(&repository),
+                &[MediaRange::from(MediaType::docker_manifest())],
+                &Namespace::new("test-repo").unwrap(),
+                latest(),
+                false,
+                &EventActor::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::UpstreamUnavailable(_))),
+            "an outage with nothing cached must not read as a 404, got: {:?}",
+            result.map(|_| ())
+        );
     }
 
     /// The recomputed digest follows the algorithm the reference asked for, so a

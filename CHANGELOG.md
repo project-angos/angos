@@ -6,11 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.12.3 - UNRELEASED
 
+### Added
+
+- `angos_pull_through_total` counts a manifest served from the cache because the upstream was unavailable as `outcome="stale"`.
+
+### Changed
+
+- A pull-through pull of uncached content that no upstream is available to serve answers `503 UPSTREAM_UNAVAILABLE` instead of `404`.
+- An upstream token service answering a `5xx` or `429` counts as unavailable, instead of as a refused credential.
+
 ### Fixed
 
 - A retention tag delete no longer removes a push of the same tag that lands while it runs, locally or on a `prune` downstream.
 - Two first pushes of an immutable tag with different content, on one replica or several, can no longer both succeed and move it.
 - A job whose lock key is longer than a file name, built from a long namespace or tag, is no longer dropped on the filesystem backend.
+- A pull-through repository serves a cached mutable tag while its upstream is unreachable, failing or rate-limited, instead of answering `404`, including a tag the upstream re-pointed but then failed to serve.
 
 ## 1.12.2
 

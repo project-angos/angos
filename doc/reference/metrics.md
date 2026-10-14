@@ -271,8 +271,12 @@ and records nothing, so the counter covers pull-through traffic alone. See
 - `outcome`: `hit` when the stored copy answered the pull; `miss` when nothing
   was stored, so the content came from the upstream; `refresh` when a mutable
   tag was stored but the upstream has since re-pointed it, so the manifest was
-  refetched. Only a manifest refreshes: a blob is content-addressed, so a
-  stored one is never re-checked.
+  refetched; `stale` when a mutable tag was stored and no upstream was
+  available to check it, or the upstream re-pointed it and then failed to
+  serve the new manifest, so the stored copy answered the pull. Only a manifest
+  refreshes or goes stale: a blob is content-addressed, so a stored one is
+  never re-checked. See [Upstream
+  Unavailable](../explanation/pull-through-caching.md#upstream-unavailable).
 
 Each pull records exactly one outcome, `HEAD` and `GET` alike. A `hit` on a
 mutable tag still costs the upstream a `HEAD` to confirm the digest; an
@@ -293,6 +297,9 @@ sum by (repository) (rate(angos_pull_through_total{outcome=~"miss|refresh"}[5m])
 
 # Manifest refreshes: mutable tags moving upstream
 sum by (repository) (rate(angos_pull_through_total{kind="manifest", outcome="refresh"}[5m]))
+
+# Pulls served from the cache because the upstream was unavailable
+sum by (repository) (rate(angos_pull_through_total{outcome="stale"}[5m]))
 ```
 
 A blob `miss` also enqueues a cache-fill job, so it is followed by an

@@ -2,7 +2,7 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::{
-    Response,
+    Response, StatusCode,
     header::{AUTHORIZATION, WWW_AUTHENTICATE},
 };
 use serde::Deserialize;
@@ -209,10 +209,17 @@ impl RegistryClient {
             .await
             .map_err(|e| Error::Internal(format!("Token request failed: {e}")))?;
 
-        if !resp.status().is_success() {
+        // A token service that is down or throttling has refused nothing, so
+        // it must not read as a credential the registry turned away.
+        let status = resp.status();
+        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(Error::Internal(format!(
+                "Token acquisition failed: {status}"
+            )));
+        }
+        if !status.is_success() {
             return Err(Error::Unauthorized(format!(
-                "Token acquisition failed: {}",
-                resp.status()
+                "Token acquisition failed: {status}"
             )));
         }
 

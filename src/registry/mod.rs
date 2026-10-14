@@ -283,6 +283,7 @@ pub fn prime_pull_through(repository: &str) {
         ("manifest", "hit"),
         ("manifest", "miss"),
         ("manifest", "refresh"),
+        ("manifest", "stale"),
         ("blob", "hit"),
         ("blob", "miss"),
     ] {

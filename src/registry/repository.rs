@@ -260,7 +260,10 @@ pub struct Repository {
 
 impl Repository {
     /// Runs `op` against each upstream in turn, the namespace mapped to that
-    /// upstream's form, and answers with the first success or `fallback`.
+    /// upstream's form, and answers with the first success. With none, the
+    /// answer is `fallback` when every upstream answered, and
+    /// [`Error::UpstreamUnavailable`] when one could not: the content may be
+    /// there, so a miss would be a guess.
     async fn try_upstreams<'a, F, T>(
         &'a self,
         namespace: &'a Namespace,
@@ -270,20 +273,32 @@ impl Repository {
     where
         F: Fn(&'a RegistryClient, Namespace) -> BoxFuture<'a, Result<T, ClientError>>,
     {
+        let mut unavailable = false;
         for upstream in &self.upstreams {
-            let result = match upstream.remote(namespace) {
-                Ok(remote) => op(&upstream.client, remote).await.map_err(Error::from),
-                Err(error) => Err(error.into()),
+            let error = match upstream.remote(namespace) {
+                Ok(remote) => match op(&upstream.client, remote).await {
+                    Ok(result) => return Ok(result),
+                    // A miss or a refusal is an answer; `Internal` is the
+                    // client's word for none: a transport failure, an
+                    // unexpected status such as a 5xx or 429, or a response
+                    // it could not read.
+                    Err(error) => {
+                        unavailable |= matches!(error, ClientError::Internal(_));
+                        Error::from(error)
+                    }
+                },
+                Err(error) => error.into(),
             };
-            match result {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    warn!(
-                        "Upstream operation failed for namespace '{namespace}' against {}: {e}",
-                        upstream.client.url
-                    );
-                }
-            }
+            warn!(
+                "Upstream operation failed for namespace '{namespace}' against {}: {error}",
+                upstream.client.url
+            );
+        }
+        if unavailable {
+            return Err(Error::UpstreamUnavailable(format!(
+                "no upstream of '{}' answered for '{namespace}'",
+                self.name
+            )));
         }
         Err(fallback)
     }
@@ -332,7 +347,8 @@ impl Repository {
     /// Checks whether the upstream still has the same digest for the given tag.
     /// An upstream that omits `Docker-Content-Digest` reads as a mismatch, so
     /// the caller refetches the body rather than serving a copy it cannot show
-    /// to be current.
+    /// to be current. No upstream answering is [`Error::UpstreamUnavailable`],
+    /// not a mismatch.
     pub async fn is_upstream_digest_match(
         &self,
         accepted_types: &[MediaRange],
@@ -743,6 +759,39 @@ mod tests {
         assert!(
             !matched,
             "an unknown upstream digest cannot confirm the cached copy is current"
+        );
+    }
+
+    /// A miss is believed only when every upstream answered it: one that could
+    /// not answer may hold the content, so the outcome is an outage, blob and
+    /// manifest alike.
+    #[tokio::test]
+    async fn an_upstream_that_cannot_answer_is_unavailable_not_a_miss() {
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
+        let namespace = Namespace::new("local/repo").unwrap();
+
+        let (repo, _first, _second) =
+            fallback_repository("HEAD", MANIFEST_PATH, ResponseTemplate::new(503)).await;
+        let error = repo
+            .head_manifest(&[], &namespace, &reference)
+            .await
+            .expect_err("no upstream served the manifest");
+        assert!(
+            matches!(error, Error::UpstreamUnavailable(_)),
+            "a 404 beside a 503 is no miss, got: {error:?}"
+        );
+
+        let digest = Digest::try_from(TEST_DIGEST).unwrap();
+        let (repo, _first, _second) =
+            fallback_repository("GET", BLOB_PATH, ResponseTemplate::new(429)).await;
+        let error = repo
+            .get_blob(&[], &namespace, &digest, None)
+            .await
+            .err()
+            .expect("no upstream served the blob");
+        assert!(
+            matches!(error, Error::UpstreamUnavailable(_)),
+            "a throttled upstream is no miss, got: {error:?}"
         );
     }
 
