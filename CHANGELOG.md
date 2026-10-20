@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `job_idle_backoff_min_ms` and `job_idle_backoff_max_ms` under `[global]` (default `1000` and `15000`) bound the idle wait of in-process job loops.
+
+### Changed
+
+- An idle in-process job loop backs off between `LIST`s of its queue instead of polling every second, and a local enqueue wakes it at once. A job another replica enqueued waits for the next poll.
+
 ## 1.12.3
 
 ### Added

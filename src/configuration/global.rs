@@ -1,5 +1,6 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, time::Duration};
 
+use angos_backoff::Backoff;
 use bytesize::ByteSize;
 use serde::Deserialize;
 
@@ -30,6 +31,9 @@ pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::new(2).
 /// Worker concurrency for the index queue: opening an image asks for all its
 /// layers at once, each job inflating one on a core.
 pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Floor on `job_idle_backoff_min_ms`: every idle poll is a `LIST` per loop,
+/// so a shorter wait storms the object store.
+pub const MIN_JOB_IDLE_BACKOFF_MS: u64 = 100;
 /// Entries a layer listing may hold, about half a GiB of listing in memory.
 const DEFAULT_MAX_INDEX_ENTRIES: NonZeroUsize = NonZeroUsize::new(500_000).unwrap();
 
@@ -48,6 +52,14 @@ pub struct GlobalConfig {
     pub max_concurrent_scan_jobs: NonZeroUsize,
     #[serde(default = "default_max_concurrent_index_jobs")]
     pub max_concurrent_index_jobs: NonZeroUsize,
+    /// First wait, in milliseconds, of an in-process job loop that finds its
+    /// queue empty. Each further empty poll doubles it up to
+    /// `job_idle_backoff_max_ms`, and jitter stretches each by up to as much again.
+    #[serde(default = "default_job_idle_backoff_min_ms")]
+    pub job_idle_backoff_min_ms: u64,
+    /// Cap, in milliseconds and before jitter, of that idle wait.
+    #[serde(default = "default_job_idle_backoff_max_ms")]
+    pub job_idle_backoff_max_ms: u64,
     /// Uncompressed bytes an index job reads of one layer, which bounds how
     /// long it runs; a larger layer is not indexed.
     #[serde(default = "default_max_index_size")]
@@ -136,6 +148,14 @@ fn default_shutdown_drain_secs() -> u64 {
     30
 }
 
+fn default_job_idle_backoff_min_ms() -> u64 {
+    1_000
+}
+
+fn default_job_idle_backoff_max_ms() -> u64 {
+    15_000
+}
+
 fn default_namespace_walk_concurrency() -> NonZeroUsize {
     NAMESPACE_WALK_CONCURRENCY
 }
@@ -212,6 +232,8 @@ impl Default for GlobalConfig {
             max_concurrent_replication_jobs: default_max_concurrent_replication_jobs(),
             max_concurrent_scan_jobs: default_max_concurrent_scan_jobs(),
             max_concurrent_index_jobs: default_max_concurrent_index_jobs(),
+            job_idle_backoff_min_ms: default_job_idle_backoff_min_ms(),
+            job_idle_backoff_max_ms: default_job_idle_backoff_max_ms(),
             max_index_size: default_max_index_size(),
             max_index_entries: default_max_index_entries(),
             max_manifest_size: default_max_manifest_size(),
@@ -252,6 +274,16 @@ impl GlobalConfig {
 
     pub fn blob_stream_frame_size_bytes(&self) -> usize {
         usize::try_from(self.blob_stream_frame_size.as_u64()).unwrap_or(usize::MAX)
+    }
+
+    /// How long an idle in-process job loop waits between polls of its queue.
+    #[must_use]
+    pub fn job_idle_backoff(&self) -> Backoff {
+        Backoff::exponential(
+            Duration::from_millis(self.job_idle_backoff_min_ms),
+            Duration::from_millis(self.job_idle_backoff_max_ms),
+        )
+        .with_jitter()
     }
 
     pub fn index_limits(&self) -> IndexLimits {

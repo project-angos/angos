@@ -4,12 +4,13 @@ use tokio::time::timeout;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{info, warn};
 
+use angos_backoff::Backoff;
 use angos_cache::Cache;
 
 use crate::{
     cache_fill::CacheFillJobHandler,
     command::{bootstrap, server::error::Error},
-    configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig},
+    configuration::{Configuration, GlobalConfig, RegistryStorageConfig, ResolvedStorageConfig},
     event_webhook::dispatcher::EventDispatcher,
     jobs::{
         Queue,
@@ -49,6 +50,7 @@ impl InProcessLoops {
         handler: &Arc<dyn JobHandler>,
         queue: Queue,
         count: NonZeroUsize,
+        idle: Backoff,
     ) {
         for _ in 0..count.get() {
             self.tracker.spawn(claim_loop(
@@ -56,6 +58,7 @@ impl InProcessLoops {
                 handler.clone(),
                 queue,
                 self.shutdown.clone(),
+                idle,
             ));
         }
     }
@@ -86,23 +89,35 @@ impl InProcessLoops {
     }
 }
 
-/// Spawn `cache_loops` and `replication_loops` claim loops draining
-/// `job_store`. Replication drains only when a downstream is configured: an
-/// always-empty queue would just storm the object store with `LIST`s.
-/// How many in-process loops each queue gets.
-struct LoopCounts {
+/// How many in-process loops each queue gets, and how long an idle one waits
+/// between polls.
+struct LoopSettings {
     cache: NonZeroUsize,
     replication: NonZeroUsize,
     index: NonZeroUsize,
+    idle: Backoff,
 }
 
+impl LoopSettings {
+    fn from_global(global: &GlobalConfig) -> Self {
+        Self {
+            cache: global.max_concurrent_cache_jobs,
+            replication: global.max_concurrent_replication_jobs,
+            index: global.max_concurrent_index_jobs,
+            idle: global.job_idle_backoff(),
+        }
+    }
+}
+
+/// Spawn the claim loops draining `job_store`. Replication drains only when a
+/// downstream is configured: an always-empty queue would only cost `LIST`s.
 fn spawn_in_process_loops(
     job_store: &Arc<JobStore>,
     resolver: &Arc<RepositoryResolver>,
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     event_dispatcher: Option<Arc<EventDispatcher>>,
-    counts: &LoopCounts,
+    settings: &LoopSettings,
     index_limits: IndexLimits,
 ) -> InProcessLoops {
     let loops = InProcessLoops::none();
@@ -113,7 +128,13 @@ fn spawn_in_process_loops(
         metadata_store.clone(),
         index_limits,
     ));
-    loops.spawn(job_store, &index_handler, Queue::Index, counts.index);
+    loops.spawn(
+        job_store,
+        &index_handler,
+        Queue::Index,
+        settings.index,
+        settings.idle,
+    );
 
     let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheFillJobHandler::new(
         resolver.clone(),
@@ -121,7 +142,13 @@ fn spawn_in_process_loops(
         metadata_store.clone(),
         event_dispatcher,
     ));
-    loops.spawn(job_store, &cache_handler, Queue::Cache, counts.cache);
+    loops.spawn(
+        job_store,
+        &cache_handler,
+        Queue::Cache,
+        settings.cache,
+        settings.idle,
+    );
 
     let any_downstream = resolver
         .keys()
@@ -139,7 +166,8 @@ fn spawn_in_process_loops(
             job_store,
             &replication_handler,
             Queue::Replication,
-            counts.replication,
+            settings.replication,
+            settings.idle,
         );
     }
 
@@ -216,11 +244,7 @@ pub async fn build_registry(
                 &blob_backend,
                 &metadata_store,
                 event_dispatcher.clone(),
-                &LoopCounts {
-                    cache: config.global.max_concurrent_cache_jobs,
-                    replication: config.global.max_concurrent_replication_jobs,
-                    index: config.global.max_concurrent_index_jobs,
-                },
+                &LoopSettings::from_global(&config.global),
                 config.global.index_limits(),
             );
             (job_store, None, loops)
@@ -264,6 +288,7 @@ pub async fn build_registry(
             &handler,
             Queue::Scan,
             config.global.max_concurrent_scan_jobs,
+            config.global.job_idle_backoff(),
         );
     }
 
@@ -289,12 +314,9 @@ mod tests {
     use angos_oci::{Namespace, Tag};
     use angos_oci_client::RegistryClient;
 
-    use super::{InProcessLoops, LoopCounts, spawn_in_process_loops};
+    use super::{InProcessLoops, LoopSettings, spawn_in_process_loops};
     use crate::{
-        configuration::global::{
-            DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
-            DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS, GlobalConfig,
-        },
+        configuration::GlobalConfig,
         jobs::{
             Queue,
             store::{ClaimMode, JobEnvelope, JobStore},
@@ -346,11 +368,7 @@ mod tests {
             &blob_store,
             &metadata_store,
             None,
-            &LoopCounts {
-                cache: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
-                replication: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
-                index: DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
-            },
+            &LoopSettings::from_global(&GlobalConfig::default()),
             GlobalConfig::default().index_limits(),
         );
         let registry = Registry::new(
@@ -504,8 +522,8 @@ mod tests {
             .await
             .unwrap();
 
-        // A spawned loop idles at 10 ms under cfg(test), so one would have
-        // claimed the job many times over within 500 ms.
+        // The enqueue wakes any loop idling on the queue, so one would have
+        // claimed the job well within 500 ms.
         sleep(Duration::from_millis(500)).await;
 
         assert_eq!(

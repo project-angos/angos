@@ -403,3 +403,64 @@ fn policy_rules_reading_pull_times_require_update_pull_time() {
         "{msg}"
     );
 }
+
+#[test]
+fn global_job_idle_backoff_defaults_from_one_to_fifteen_seconds() {
+    let config = Configuration::load_from_str(&config_toml("")).expect("config");
+    let idle = config.global.job_idle_backoff();
+    assert_eq!(idle.step(0), std::time::Duration::from_secs(1));
+    assert_eq!(idle.step(u32::MAX), std::time::Duration::from_secs(15));
+}
+
+#[test]
+fn global_job_idle_backoff_reads_its_bounds() {
+    let config = config_toml(
+        r"
+    job_idle_backoff_min_ms = 500
+    job_idle_backoff_max_ms = 60000
+    ",
+    );
+
+    let idle = Configuration::load_from_str(&config)
+        .expect("config")
+        .global
+        .job_idle_backoff();
+    assert_eq!(idle.step(0), std::time::Duration::from_millis(500));
+    assert_eq!(idle.step(u32::MAX), std::time::Duration::from_mins(1));
+}
+
+/// Every idle poll is a `LIST` per loop, so a near-zero wait storms the store.
+#[test]
+fn global_job_idle_backoff_min_ms_has_a_floor() {
+    let config = config_toml(
+        r"
+    job_idle_backoff_min_ms = 10
+    ",
+    );
+
+    match Configuration::load_from_str(&config) {
+        Err(Error::InvalidFormat(msg)) => {
+            assert!(msg.contains("global.job_idle_backoff_min_ms must be at least 100"));
+        }
+        other => panic!("Expected InvalidFormat error, got {other:?}"),
+    }
+}
+
+#[test]
+fn global_job_idle_backoff_max_ms_must_not_be_below_min() {
+    let config = config_toml(
+        r"
+    job_idle_backoff_min_ms = 5000
+    job_idle_backoff_max_ms = 1000
+    ",
+    );
+
+    match Configuration::load_from_str(&config) {
+        Err(Error::InvalidFormat(msg)) => {
+            assert!(msg.contains(
+                "global.job_idle_backoff_max_ms must be at least global.job_idle_backoff_min_ms"
+            ));
+        }
+        other => panic!("Expected InvalidFormat error, got {other:?}"),
+    }
+}
