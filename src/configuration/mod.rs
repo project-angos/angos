@@ -23,6 +23,7 @@ pub use base64_string::Base64String;
 pub use error::Error;
 
 pub use global::GlobalConfig;
+use global::MIN_JOB_IDLE_BACKOFF_MS;
 pub use observability::ObservabilityConfig;
 pub use regex_pattern::RegexPattern;
 pub use registry_storage::{RegistryStorageConfig, ResolvedStorageConfig};
@@ -304,6 +305,19 @@ fn validate_global(
     if global.max_index_size.as_u64() == 0 {
         return Err(Error::InvalidFormat(
             "global.max_index_size must be greater than zero".to_string(),
+        ));
+    }
+
+    if global.job_idle_backoff_min_ms < MIN_JOB_IDLE_BACKOFF_MS {
+        return Err(Error::InvalidFormat(format!(
+            "global.job_idle_backoff_min_ms must be at least {MIN_JOB_IDLE_BACKOFF_MS}"
+        )));
+    }
+
+    if global.job_idle_backoff_max_ms < global.job_idle_backoff_min_ms {
+        return Err(Error::InvalidFormat(
+            "global.job_idle_backoff_max_ms must be at least global.job_idle_backoff_min_ms"
+                .to_string(),
         ));
     }
 

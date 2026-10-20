@@ -24,8 +24,9 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use tokio::{
     select, spawn,
+    sync::Notify,
     task::JoinHandle,
-    time::{Interval, MissedTickBehavior, interval, sleep},
+    time::{Interval, MissedTickBehavior, interval, sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -559,6 +560,8 @@ pub enum CompleteOutcome {
 pub struct ClaimOutcome {
     pub claimed: Option<ClaimedJob>,
     pub next_ready: Option<DateTime<Utc>>,
+    /// The scan saw another ready job after the claimed one.
+    pub more_ready: bool,
 }
 
 impl ClaimOutcome {
@@ -593,6 +596,31 @@ pub struct JobStore {
     /// Claim-lease seconds, clamped at construction so chrono arithmetic on it
     /// cannot overflow.
     claim_ttl_secs: i64,
+    /// Wakes this process's idle claim loops; another process's enqueue is
+    /// only seen by their next poll.
+    wakers: QueueWakers,
+}
+
+/// One wake signal per queue. `notify_one` keeps a permit when no loop is
+/// waiting, so an enqueue racing a loop between its poll and its wait is not
+/// lost.
+#[derive(Default)]
+struct QueueWakers {
+    cache: Notify,
+    replication: Notify,
+    scan: Notify,
+    index: Notify,
+}
+
+impl QueueWakers {
+    fn get(&self, queue: Queue) -> &Notify {
+        match queue {
+            Queue::Cache => &self.cache,
+            Queue::Replication => &self.replication,
+            Queue::Scan => &self.scan,
+            Queue::Index => &self.index,
+        }
+    }
 }
 
 impl JobStore {
@@ -637,6 +665,7 @@ impl JobStore {
             claim_ttl_secs: i64::try_from(retry.claim_ttl_secs)
                 .unwrap_or(i64::MAX)
                 .clamp(1, 86_400),
+            wakers: QueueWakers::default(),
         }
     }
 
@@ -1046,6 +1075,7 @@ impl JobStore {
             objects
                 .create_if_absent(&pending_path, pending_body)
                 .await?;
+            self.wake_one(envelope.queue);
             "miss"
         } else {
             "hit"
@@ -1055,6 +1085,16 @@ impl JobStore {
             .with_label_values(&[envelope.queue.as_str(), outcome])
             .inc();
         Ok(())
+    }
+
+    /// Wait until this process queues work on `queue`, or `limit` elapses.
+    pub async fn wait_for_work(&self, queue: Queue, limit: Duration) {
+        let _ = timeout(limit, self.wakers.get(queue).notified()).await;
+    }
+
+    /// Wake one of this process's loops idling on `queue`.
+    pub fn wake_one(&self, queue: Queue) {
+        self.wakers.get(queue).notify_one();
     }
 
     /// Claim the next available job from `queue`, sleeping a capped exponential
@@ -1100,7 +1140,8 @@ impl JobStore {
     async fn try_claim_one(&self, queue: Queue) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
         let mut next_ready: Option<DateTime<Utc>> = None;
-        for storage_key in self.list_pending(queue, MAX_SCAN).await? {
+        let pending = self.list_pending(queue, MAX_SCAN).await?;
+        for (position, storage_key) in pending.iter().cloned().enumerate() {
             // The filename prefix is the readiness signal, so a backed-off entry
             // never costs a body GET.
             if let Some(not_before) = parse_not_before(&storage_key)
@@ -1153,6 +1194,10 @@ impl JobStore {
                     worker_id = self.worker_id.as_str(),
                     "Claimed job"
                 );
+                // Keys sort by readiness, so the next one tells.
+                let more_ready = pending
+                    .get(position + 1)
+                    .is_some_and(|next| parse_not_before(next).is_none_or(|t| t <= now));
                 return Ok(ClaimOutcome {
                     claimed: Some(ClaimedJob {
                         envelope,
@@ -1160,12 +1205,14 @@ impl JobStore {
                         claim,
                     }),
                     next_ready: None,
+                    more_ready,
                 });
             }
         }
         Ok(ClaimOutcome {
             claimed: None,
             next_ready,
+            more_ready: false,
         })
     }
 
@@ -1361,6 +1408,7 @@ impl JobStore {
             .create_if_absent(&pending_path, pending_body)
             .await?;
         self.store.delete(&failed_path).await?;
+        self.wake_one(queue);
         Ok(())
     }
 

@@ -108,6 +108,8 @@ listener.
 | `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes are handled in parallel by each `angos worker`, the server's in-process drain, and the `angos reconcile replication` end-of-run drain. |
 | `max_concurrent_scan_jobs` | usize | `2` | Worker concurrency for the scan queue |
 | `max_concurrent_index_jobs` | usize | `4` | Worker concurrency for the layer index queue; a job inflates one layer on one core |
+| `job_idle_backoff_min_ms` | u64 | `1000` | First wait before an idle in-process job loop polls (`LIST`s) its queue again, doubling per empty poll; minimum `100` |
+| `job_idle_backoff_max_ms` | u64 | `15000` | Cap on that wait, before up to as much again of jitter. A local enqueue wakes the loops at once, except from a request in flight across a reload; another replica's waits for the next poll |
 | `max_index_size`            | string   | `"50GiB"` | Uncompressed bytes an index job reads of one layer, which bounds how long it runs; a larger layer is not indexed |
 | `max_index_entries`         | usize    | `500000` | Entries one layer listing may hold, about 1 KiB of memory each while indexing; a layer with more is not indexed |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
