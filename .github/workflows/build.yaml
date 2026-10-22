@@ -121,7 +121,7 @@ jobs:
 
       - name: Build the container
         run: |
-          docker build -t ${CONFORMANCE_IMAGE_NAME} -f Dockerfile --build-arg RELEASE_MODE=release .
+          docker build --pull -t ${CONFORMANCE_IMAGE_NAME} -f Dockerfile --build-arg RELEASE_MODE=release .
           docker save ${CONFORMANCE_IMAGE_NAME} -o conformance-image.tar
 
       - name: Upload test artifacts
@@ -759,6 +759,9 @@ jobs:
         with:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Always build on the current base image, so the image ships its
+          # latest CA bundle rather than a stale cached one.
+          pull: true
           build-args: RELEASE_MODE=release
           outputs: type=image,"name=${{ env.GHCR_REPO }}",push-by-digest=true,name-canonical=true,push=true
 
