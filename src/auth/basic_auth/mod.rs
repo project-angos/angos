@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
+use argon2::{Argon2, PasswordVerifier};
 use async_trait::async_trait;
 use http::request::Parts;
 use serde::{Deserialize, de};
@@ -22,7 +22,7 @@ use crate::{
 
 /// An Argon2 password hash string, validated at deserialize time.
 #[derive(Clone)]
-pub struct PasswordHash(PasswordHashString);
+pub struct PasswordHash(argon2::PasswordHash);
 
 impl fmt::Debug for PasswordHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -31,15 +31,15 @@ impl fmt::Debug for PasswordHash {
 }
 
 impl PasswordHash {
-    pub fn as_password_hash(&self) -> argon2::password_hash::PasswordHash<'_> {
-        self.0.password_hash()
+    pub fn as_password_hash(&self) -> &argon2::PasswordHash {
+        &self.0
     }
 }
 
 impl<'de> Deserialize<'de> for PasswordHash {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let source = String::deserialize(deserializer)?;
-        PasswordHashString::new(&source)
+        argon2::PasswordHash::new(&source)
             .map(Self)
             .map_err(|e| de::Error::custom(format!("invalid Argon2 password hash: {e}")))
     }
@@ -109,7 +109,7 @@ impl BasicAuthValidator {
         // parameters would leave a gap the guard exists to close.
         let timing_guard = match identities.values().next() {
             Some(config) => config.password.clone(),
-            None => PasswordHashString::new(TIMING_GUARD_HASH)
+            None => argon2::PasswordHash::new(TIMING_GUARD_HASH)
                 .map(PasswordHash)
                 .map_err(|e| Error::Initialization(format!("invalid timing-guard hash: {e}")))?,
         };
@@ -125,13 +125,13 @@ impl BasicAuthValidator {
             // Burn the same Argon2 work as a real verification so response
             // timing cannot reveal whether the username exists.
             let _ = Argon2::default()
-                .verify_password(password.as_bytes(), &self.timing_guard.as_password_hash());
+                .verify_password(password.as_bytes(), self.timing_guard.as_password_hash());
             debug!("Username not found in credentials");
             return None;
         };
 
         match Argon2::default()
-            .verify_password(password.as_bytes(), &identity_password.as_password_hash())
+            .verify_password(password.as_bytes(), identity_password.as_password_hash())
         {
             Ok(()) => Some(identity_id.clone()),
             Err(error) => {

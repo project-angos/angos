@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { LayerEntryKind } from '$lib/api';
+	import type { LayerEntryKind } from '#lib/api.js';
 
 	let { kind, open = false }: { kind: LayerEntryKind; open?: boolean } = $props();
 </script>

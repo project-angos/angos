@@ -1,7 +1,4 @@
-use argon2::{
-    Algorithm, Argon2, Params, PasswordHasher, Version,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use http_body_util::BodyExt;
 use hyper::{
@@ -476,9 +473,8 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
 #[tokio::test]
 async fn bad_basic_auth_returns_http_401() {
     metrics_provider::init_for_tests();
-    let salt = SaltString::generate(OsRng);
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
-    let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
+    let password_hash = argon.hash_password(b"testpass").unwrap().to_string();
     let config = load_config(&format!(
         r#"
         [global.access_policy]

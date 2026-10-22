@@ -1,6 +1,6 @@
 <script lang="ts">
-	import type { Descriptor, LayerEntry, LayerListing } from '$lib/api';
-	import { fetchLayerEntries } from '$lib/api';
+	import type { Descriptor, LayerEntry, LayerListing } from '#lib/api.js';
+	import { fetchLayerEntries } from '#lib/api.js';
 	import { goto } from '$app/navigation';
 	import { tick, untrack } from 'svelte';
 	import {
@@ -23,7 +23,7 @@
 		type FsMatcher,
 		type FsNode,
 		type FsTree
-	} from '$lib/utils';
+	} from '#lib/utils.js';
 	import Card from './Card.svelte';
 	import FilePreview from './FilePreview.svelte';
 	import FsIcon from './FsIcon.svelte';
@@ -290,7 +290,7 @@
 	/** Puts a file in the URL, `layer` naming a version the image no longer shows. */
 	function show(path: string, layer: number | null) {
 		const encoded = path.split('/').map(encodeURIComponent).join('/');
-		goto(`#filesystem/${encoded}${layer === null ? '' : `@L${layer + 1}`}`, { noScroll: true, keepFocus: true });
+		goto(`#filesystem/${encoded}${layer === null ? '' : `@L${layer + 1}`}`, { reset: false });
 	}
 
 	function open(node: FsNode) {
@@ -299,7 +299,7 @@
 	}
 
 	function close() {
-		goto('#filesystem', { noScroll: true, keepFocus: true });
+		goto('#filesystem', { reset: false });
 	}
 
 	/** What a click or Enter does: a folder opens in place, or in the tree from a list, anything else in the preview. */

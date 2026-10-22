@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { initTheme, setTheme, getThemePreference, type ThemePreference } from '$lib/theme.svelte';
+	import { initTheme, setTheme, getThemePreference, type ThemePreference } from '#lib/theme.svelte.js';
 
 	let current: ThemePreference = $state('system');
 

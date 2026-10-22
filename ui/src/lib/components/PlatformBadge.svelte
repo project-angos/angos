@@ -1,6 +1,6 @@
 <script lang="ts">
-	import type { Platform } from '$lib/api';
-	import { formatPlatform } from '$lib/utils';
+	import type { Platform } from '#lib/api.js';
+	import { formatPlatform } from '#lib/utils.js';
 
 	interface Props {
 		platform?: Platform;

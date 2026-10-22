@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.12.4
+
+### Changed
+
+- An Argon2 password hash whose salt is shorter than 8 bytes, which the Argon2 specification forbids, fails the configuration load.
+
+### Security
+
+- Re-release to get rid of eMudhra intermediate CA compromise
+
 ## 1.12.3
 
 ### Added

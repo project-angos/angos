@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { SortOrder } from '$lib/api';
+	import type { SortOrder } from '#lib/api.js';
 
 	interface Props {
 		label: string;

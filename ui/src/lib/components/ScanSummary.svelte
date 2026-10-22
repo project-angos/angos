@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { parseScanSummary, SEVERITIES } from '$lib/utils';
+	import { parseScanSummary, SEVERITIES } from '#lib/utils.js';
 
 	interface Props {
 		annotations?: Record<string, string>;

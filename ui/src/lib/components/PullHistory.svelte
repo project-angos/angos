@@ -1,8 +1,8 @@
 <script lang="ts">
 	// Aliased: the component's own generated type owns the `PullHistory` name here.
 	import { untrack } from 'svelte';
-	import { fetchPullHistory, type PullHistory as PullHistoryBody } from '$lib/api';
-	import { formatRetention, formatTimeAgo } from '$lib/utils';
+	import { fetchPullHistory, type PullHistory as PullHistoryBody } from '#lib/api.js';
+	import { formatRetention, formatTimeAgo } from '#lib/utils.js';
 	import Card from './Card.svelte';
 	import AnnotationToggle from './AnnotationToggle.svelte';
 	import LoadingState from './LoadingState.svelte';

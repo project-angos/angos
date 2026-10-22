@@ -1,19 +1,19 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { base } from '$app/paths';
-	import { getRegistryName } from '$lib/config.svelte';
-	import { PAGE, fetchRevision, fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, type FetchResult, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo, type RevisionSort, type SortOrder } from '$lib/api';
-	import { buildTree, buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, imageReference, isDigest, isInteractiveTarget, pathUrl, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '$lib/utils';
-	import LoadingState from '$lib/components/LoadingState.svelte';
-	import ErrorState from '$lib/components/ErrorState.svelte';
-	import Breadcrumb from '$lib/components/Breadcrumb.svelte';
-	import ManifestView from '$lib/components/ManifestView.svelte';
-	import RepositoryTree from '$lib/components/RepositoryTree.svelte';
-	import Card from '$lib/components/Card.svelte';
-	import CopyButton from '$lib/components/CopyButton.svelte';
-	import DeleteButton from '$lib/components/DeleteButton.svelte';
-	import SortHeader from '$lib/components/SortHeader.svelte';
+	import { resolve } from '$app/paths';
+	import { getRegistryName } from '#lib/config.svelte.js';
+	import { PAGE, fetchRevision, fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, type FetchResult, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo, type RevisionSort, type SortOrder } from '#lib/api.js';
+	import { buildTree, buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, imageReference, isDigest, isInteractiveTarget, pathUrl, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '#lib/utils.js';
+	import LoadingState from '#lib/components/LoadingState.svelte';
+	import ErrorState from '#lib/components/ErrorState.svelte';
+	import Breadcrumb from '#lib/components/Breadcrumb.svelte';
+	import ManifestView from '#lib/components/ManifestView.svelte';
+	import RepositoryTree from '#lib/components/RepositoryTree.svelte';
+	import Card from '#lib/components/Card.svelte';
+	import CopyButton from '#lib/components/CopyButton.svelte';
+	import DeleteButton from '#lib/components/DeleteButton.svelte';
+	import SortHeader from '#lib/components/SortHeader.svelte';
 	import type { BrowseParams } from './+page';
 
 	let { data }: { data: BrowseParams } = $props();
@@ -528,7 +528,7 @@
 </svelte:head>
 
 <Breadcrumb items={[
-	{ label: 'Repositories', href: `${base}/` },
+	{ label: 'Repositories', href: resolve('/') },
 	...(data.repository === null
 		? [{ label: data.path, href: pathUrl(data.path) }]
 		: [

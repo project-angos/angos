@@ -1,9 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-use argon2::{
-    Algorithm, Argon2, Params, PasswordHasher, Version,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
 use base64::Engine;
 use hyper::{
     Request, StatusCode, Uri,
@@ -167,10 +164,9 @@ async fn test_authenticate_request_no_credentials() {
 
 #[tokio::test]
 async fn test_authenticate_request_with_basic_auth() {
-    let salt = SaltString::generate(OsRng);
     let argon_config = Params::default();
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_config);
-    let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
+    let password_hash = argon.hash_password(b"testpass").unwrap().to_string();
 
     let config = load_config(&format!(
         r#"

@@ -1,9 +1,6 @@
 use std::{collections::HashMap, time::Instant};
 
-use argon2::{
-    Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version};
 use serde::Deserialize;
 
 use crate::{
@@ -28,10 +25,9 @@ fn tiny_argon_params() -> Params {
 }
 
 fn hash_password_for_test(password: &str) -> String {
-    let salt = SaltString::generate(OsRng);
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, tiny_argon_params());
     argon
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .expect("test password hash must succeed")
         .to_string()
 }
@@ -71,7 +67,7 @@ fn test_build_users() {
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, tiny_argon_params());
     assert!(
         argon
-            .verify_password("password1".as_bytes(), &pass1.as_password_hash())
+            .verify_password("password1".as_bytes(), pass1.as_password_hash())
             .is_ok()
     );
 
@@ -79,7 +75,7 @@ fn test_build_users() {
     assert_eq!(id2, "id_2");
     assert!(
         argon
-            .verify_password("password2".as_bytes(), &pass2.as_password_hash())
+            .verify_password("password2".as_bytes(), pass2.as_password_hash())
             .is_ok()
     );
 }
@@ -127,15 +123,15 @@ fn the_timing_guard_borrows_a_configured_hash() {
     let config = build_test_config();
     let auth = BasicAuthValidator::new(&config.identity).unwrap();
 
-    let configured: Vec<&str> = config
+    let configured: Vec<&argon2::PasswordHash> = config
         .identity
         .values()
-        .map(|identity| identity.password.0.as_str())
+        .map(|identity| &identity.password.0)
         .collect();
     assert!(
-        configured.contains(&auth.timing_guard.0.as_str()),
+        configured.contains(&&auth.timing_guard.0),
         "the guard must be one of the configured hashes, got: {}",
-        auth.timing_guard.0.as_str()
+        auth.timing_guard.0
     );
 }
 
@@ -145,7 +141,7 @@ fn the_timing_guard_borrows_a_configured_hash() {
 fn the_timing_guard_falls_back_to_the_constant_without_identities() {
     let auth = BasicAuthValidator::new(&HashMap::new()).unwrap();
 
-    assert_eq!(auth.timing_guard.0.as_str(), TIMING_GUARD_HASH);
+    assert_eq!(auth.timing_guard.0.to_string(), TIMING_GUARD_HASH);
 }
 
 /// Every rejection answers at the same moment whatever made it fail, so

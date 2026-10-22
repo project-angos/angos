@@ -11,7 +11,7 @@ register(
 		encodeURIComponent(
 			`const stubs = {
 				'./auth.svelte': 'export const authHeaders = () => ({}); export const signInOnUnauthorized = async () => {};',
-				'$app/paths': 'export const base = ""'
+				'$app/paths': 'export const resolve = (path) => "/" + path;'
 			};
 			export const resolve = (specifier, context, next) => {
 				if (specifier in stubs) {

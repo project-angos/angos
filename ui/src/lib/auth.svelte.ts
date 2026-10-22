@@ -214,7 +214,7 @@ export async function completeSignIn(): Promise<string | null> {
 	if (!stored) return null;
 	const pending: Pending = JSON.parse(stored);
 
-	const restore = () => goto(pending.origin, { replaceState: true });
+	const restore = () => goto(pending.origin, { replace: true });
 
 	if (failure) {
 		await restore();

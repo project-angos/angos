@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { signIn, signOut, signedInAs, signInAvailable } from '$lib/auth.svelte';
+	import { signIn, signOut, signedInAs, signInAvailable } from '#lib/auth.svelte.js';
 
 	// Both track module state, so the control follows a sign-in that finishes
 	// after it mounted and a configuration that loads after it.

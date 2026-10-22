@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { formatMode, formatSize, fsMatches, type FsMatcher, type FsNode } from '$lib/utils';
+	import { formatMode, formatSize, fsMatches, type FsMatcher, type FsNode } from '#lib/utils.js';
 	import FsIcon from './FsIcon.svelte';
 
 	interface Props {

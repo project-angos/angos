@@ -11,7 +11,6 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/src");
     println!("cargo:rerun-if-changed=ui/package.json");
     println!("cargo:rerun-if-changed=ui/package-lock.json");
-    println!("cargo:rerun-if-changed=ui/svelte.config.js");
     println!("cargo:rerun-if-changed=ui/vite.config.js");
 
     let node_modules = ui_dir.join("node_modules");

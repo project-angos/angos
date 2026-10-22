@@ -1,8 +1,8 @@
 <script lang="ts">
-	import type { LayerEntry, LayerFileDetails } from '$lib/api';
-	import { authedFetch, fetchLayerFileDetails, layerFileUrl } from '$lib/api';
-	import { highlight } from '$lib/highlight';
-	import { SECRET_LABELS, formatMode, formatSize, secretKinds, type FsNode } from '$lib/utils';
+	import type { LayerEntry, LayerFileDetails } from '#lib/api.js';
+	import { authedFetch, fetchLayerFileDetails, layerFileUrl } from '#lib/api.js';
+	import { highlight } from '#lib/highlight.js';
+	import { SECRET_LABELS, formatMode, formatSize, secretKinds, type FsNode } from '#lib/utils.js';
 	import CopyButton from './CopyButton.svelte';
 	import ErrorState from './ErrorState.svelte';
 	import LoadingState from './LoadingState.svelte';

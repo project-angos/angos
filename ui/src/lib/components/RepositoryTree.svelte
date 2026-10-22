@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import type { RevisionSort, SortOrder, UploadEntry } from '$lib/api';
+	import type { RevisionSort, SortOrder, UploadEntry } from '#lib/api.js';
 	import {
 		formatSize,
 		formatTimeAgo,
@@ -9,7 +9,7 @@
 		selectedUploadsConfirmKey,
 		uploadConfirmKey,
 		type TreeRowNode
-	} from '$lib/utils';
+	} from '#lib/utils.js';
 	import Card from './Card.svelte';
 	import DeleteButton from './DeleteButton.svelte';
 	import SortHeader from './SortHeader.svelte';
