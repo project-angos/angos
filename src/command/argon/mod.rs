@@ -1,10 +1,7 @@
 mod error;
 
 use argh::FromArgs;
-use argon2::{
-    Algorithm, Argon2, Params, PasswordHasher, Version,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
 use zeroize::Zeroizing;
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -23,13 +20,11 @@ pub fn run() -> Result<(), error::Error> {
 }
 
 fn generate_password(password: &str) -> Result<String, error::Error> {
-    let salt = SaltString::generate(OsRng);
-
     // OWASP Argon2id minimum (19 MiB, 2 iterations, 1 thread)
     let params = Params::new(19_456, 2, 1, None).map_err(|e| error::Error::Hashing(e.into()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let hash = argon
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(error::Error::Hashing)?;
 
     Ok(hash.to_string())

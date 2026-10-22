@@ -10,7 +10,7 @@ test-util = []
 
 [dependencies]
 angos-secret = { workspace = true }
-redis = { version = "1.5.0", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.7.1", features = ["tokio-comp", "connection-manager"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -340,10 +340,7 @@ fn reject_provider_name_collision(auth_config: &AuthConfig) -> Result<(), Error>
 mod tests {
     use std::fs;
 
-    use argon2::{
-        Algorithm, Argon2, Params, PasswordHasher, Version,
-        password_hash::{SaltString, rand_core::OsRng},
-    };
+    use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
     use serde_json::{Value, json};
     use tempfile::tempdir;
     use wiremock::MockServer;
@@ -728,10 +725,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_request_with_basic_auth() {
-        let salt = SaltString::generate(OsRng);
         let config = Params::default();
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
-        let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
+        let password_hash = argon.hash_password(b"testpass").unwrap().to_string();
 
         let config = load_config(&format!(
             r#"
@@ -757,10 +753,9 @@ mod tests {
     #[tokio::test]
     async fn test_authenticate_request_with_invalid_basic_auth() {
         metrics_provider::init_for_tests();
-        let salt = SaltString::generate(OsRng);
         let config = Params::default();
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
-        let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
+        let password_hash = argon.hash_password(b"testpass").unwrap().to_string();
 
         let config = load_config(&format!(
             r#"
@@ -970,9 +965,8 @@ mod tests {
     /// Built through `load_config` because `basic_auth::PasswordHash` is not
     /// publicly constructible: its only path is deserialisation.
     fn admin_basic_auth_validator() -> BasicAuthValidator {
-        let salt = SaltString::generate(OsRng);
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
-        let password_hash = argon.hash_password(b"secret", &salt).unwrap().to_string();
+        let password_hash = argon.hash_password(b"secret").unwrap().to_string();
         let config = load_config(&format!(
             r#"
             [auth.identity.admin]
@@ -1205,9 +1199,8 @@ mod tests {
         // Generate a valid Argon2 hash, then embed it in a config string so that
         // `basic_auth::PasswordHash` is constructed through the normal deserialisation path
         // (its inner type is not publicly constructible).
-        let salt = SaltString::generate(OsRng);
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
-        let password_hash = argon.hash_password(b"secret", &salt).unwrap().to_string();
+        let password_hash = argon.hash_password(b"secret").unwrap().to_string();
 
         let config = load_config(&format!(
             r#"
