@@ -10,7 +10,7 @@ register(
 	'data:text/javascript,' +
 		encodeURIComponent(
 			`export const resolve = (specifier, context, next) => specifier === '$app/paths'
-				? { url: 'data:text/javascript,export const base = ""', shortCircuit: true }
+				? { url: 'data:text/javascript,export const resolve = (path) => "/" + path;', shortCircuit: true }
 				: next(specifier, context);`
 		)
 );

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { formatTimeAgo, digestConfirmKey, getTagConfirm, tagConfirmKey, type TreeRowNode } from '$lib/utils';
+	import { formatTimeAgo, digestConfirmKey, getTagConfirm, tagConfirmKey, type TreeRowNode } from '#lib/utils.js';
 	import TagList from './TagList.svelte';
 	import PlatformBadge from './PlatformBadge.svelte';
 	import AttestationBadge from './AttestationBadge.svelte';

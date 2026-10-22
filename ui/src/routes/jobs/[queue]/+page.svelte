@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import { base } from '$app/paths';
-	import { getRegistryName } from '$lib/config.svelte';
+	import { resolve } from '$app/paths';
+	import { getRegistryName } from '#lib/config.svelte.js';
 	import {
 		PAGE,
 		fetchJobs,
@@ -12,13 +12,13 @@
 		type JobEntry,
 		type FailedJobEntry,
 		type JobState
-	} from '$lib/api';
-	import { formatTimeAgo } from '$lib/utils';
-	import Breadcrumb from '$lib/components/Breadcrumb.svelte';
-	import Card from '$lib/components/Card.svelte';
-	import LoadingState from '$lib/components/LoadingState.svelte';
-	import ErrorState from '$lib/components/ErrorState.svelte';
-	import DeleteButton from '$lib/components/DeleteButton.svelte';
+	} from '#lib/api.js';
+	import { formatTimeAgo } from '#lib/utils.js';
+	import Breadcrumb from '#lib/components/Breadcrumb.svelte';
+	import Card from '#lib/components/Card.svelte';
+	import LoadingState from '#lib/components/LoadingState.svelte';
+	import ErrorState from '#lib/components/ErrorState.svelte';
+	import DeleteButton from '#lib/components/DeleteButton.svelte';
 	import type { JobsParams } from './+page';
 
 	let { data }: { data: JobsParams } = $props();
@@ -127,7 +127,7 @@
 	<title>{getRegistryName()} &gt; Jobs &gt; {queue}</title>
 </svelte:head>
 
-<Breadcrumb items={[{ label: 'Jobs', href: `${base}/jobs` }, { label: queue }]} />
+<Breadcrumb items={[{ label: 'Jobs', href: resolve('/jobs') }, { label: queue }]} />
 
 <h1>Jobs</h1>
 <p class="lede">Queued and failed background work, by queue.</p>
@@ -135,7 +135,7 @@
 <div class="toolbar">
 	<nav class="view-toggle" aria-label="Job queue">
 		{#each JOB_QUEUES as name (name)}
-			<a href="{base}/jobs/{name}" aria-current={queue === name ? 'page' : undefined}>{name}</a>
+			<a href={resolve('/jobs/[queue]', { queue: name })} aria-current={queue === name ? 'page' : undefined}>{name}</a>
 		{/each}
 	</nav>
 	<button class="secondary" onclick={refresh} disabled={loading}>

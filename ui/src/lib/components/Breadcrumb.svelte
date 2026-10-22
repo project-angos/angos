@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { trail, type TrailItem } from '$lib/trail.svelte';
+	import { trail, type TrailItem } from '#lib/trail.svelte.js';
 
 	interface Props {
 		items: TrailItem[];

@@ -1,7 +1,7 @@
 import { redirect } from '@sveltejs/kit';
-import { base } from '$app/paths';
-import { fetchRepositoryNames } from '$lib/api';
-import { resolveRepository } from '$lib/utils';
+import { resolve } from '$app/paths';
+import { fetchRepositoryNames } from '#lib/api.js';
+import { resolveRepository } from '#lib/utils.js';
 import type { PageLoad } from './$types';
 
 export interface BrowseParams {
@@ -19,7 +19,7 @@ export const load: PageLoad = async ({ params }): Promise<BrowseParams> => {
 	// Empty segments come from a trailing or doubled slash and name nothing.
 	const segments = params.path.split('/').filter(Boolean);
 	if (segments.length === 0) {
-		redirect(307, `${base}/`);
+		redirect(307, resolve('/'));
 	}
 
 	const last = segments[segments.length - 1];

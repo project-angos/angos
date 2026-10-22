@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { fetchManifest, type Manifest } from '$lib/api';
-	import { formatTimeAgo, manifestUrl } from '$lib/utils';
+	import { fetchManifest, type Manifest } from '#lib/api.js';
+	import { formatTimeAgo, manifestUrl } from '#lib/utils.js';
 	import DigestLink from './DigestLink.svelte';
 	import ScanReport from './ScanReport.svelte';
 	import LoadingState from './LoadingState.svelte';

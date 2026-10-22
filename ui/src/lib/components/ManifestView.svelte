@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import type { ParentRef, Manifest, ReferrerInfo } from '$lib/api';
+	import type { ParentRef, Manifest, ReferrerInfo } from '#lib/api.js';
 	import {
 		formatPlatform,
 		formatSize,
@@ -15,7 +15,7 @@
 		isOrasArtifact,
 		getFileName,
 		isFilesystemLayer
-	} from '$lib/utils';
+	} from '#lib/utils.js';
 	import Card from './Card.svelte';
 	import DeleteButton from './DeleteButton.svelte';
 	import TagList from './TagList.svelte';

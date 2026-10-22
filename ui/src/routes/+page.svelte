@@ -1,15 +1,15 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { base } from '$app/paths';
-	import { getRegistryName } from '$lib/config.svelte';
-	import { PAGE, fetchRepositories, type RepositoryInfo, type SortOrder } from '$lib/api';
-	import { isInteractiveTarget, pathUrl } from '$lib/utils';
-	import Card from '$lib/components/Card.svelte';
-	import LoadingState from '$lib/components/LoadingState.svelte';
-	import ErrorState from '$lib/components/ErrorState.svelte';
-	import Breadcrumb from '$lib/components/Breadcrumb.svelte';
-	import SortHeader from '$lib/components/SortHeader.svelte';
+	import { resolve } from '$app/paths';
+	import { getRegistryName } from '#lib/config.svelte.js';
+	import { PAGE, fetchRepositories, type RepositoryInfo, type SortOrder } from '#lib/api.js';
+	import { isInteractiveTarget, pathUrl } from '#lib/utils.js';
+	import Card from '#lib/components/Card.svelte';
+	import LoadingState from '#lib/components/LoadingState.svelte';
+	import ErrorState from '#lib/components/ErrorState.svelte';
+	import Breadcrumb from '#lib/components/Breadcrumb.svelte';
+	import SortHeader from '#lib/components/SortHeader.svelte';
 
 	let repositories: RepositoryInfo[] = $state([]);
 	let loading = $state(true);
@@ -80,7 +80,7 @@
 	<title>{getRegistryName()} &gt; Repositories</title>
 </svelte:head>
 
-<Breadcrumb items={[{ label: 'Repositories', href: `${base}/` }]} />
+<Breadcrumb items={[{ label: 'Repositories', href: resolve('/') }]} />
 
 <h1>Repositories</h1>
 <p class="lede">Every repository this registry serves.</p>

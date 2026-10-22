@@ -1,14 +1,14 @@
 <script lang="ts">
 	import '../app.css';
-	import { base } from '$app/paths';
+	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
-	import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
-	import SignIn from '$lib/components/SignIn.svelte';
-	import ErrorState from '$lib/components/ErrorState.svelte';
-	import { loadConfig, getRegistryName } from '$lib/config.svelte';
-	import { completeSignIn } from '$lib/auth.svelte';
-	import { trail } from '$lib/trail.svelte';
+	import ThemeSwitcher from '#lib/components/ThemeSwitcher.svelte';
+	import SignIn from '#lib/components/SignIn.svelte';
+	import ErrorState from '#lib/components/ErrorState.svelte';
+	import { loadConfig, getRegistryName } from '#lib/config.svelte.js';
+	import { completeSignIn } from '#lib/auth.svelte.js';
+	import { trail } from '#lib/trail.svelte.js';
 
 	let { children } = $props();
 	let registryName = $state('Angos');
@@ -20,12 +20,11 @@
 		signInError = await completeSignIn();
 	});
 
-	const pathname = $derived(page.url.pathname.slice(base.length));
-	const here = (path: string) => (pathname === path ? 'page' : undefined);
+	const here = (href: string) => (page.url.pathname === href ? 'page' : undefined);
 </script>
 
 <header>
-	<a class="brand" href="{base}/">
+	<a class="brand" href={resolve('/')}>
 		<svg viewBox="0 0 100 100" aria-hidden="true">
 			<rect x="10" y="18" width="50" height="10" rx="3" fill="currentColor" />
 			<rect x="10" y="36" width="60" height="10" rx="3" fill="currentColor" opacity="0.7" />
@@ -45,8 +44,8 @@
 		{/each}
 	</nav>
 	<nav class="pages">
-		<a href="{base}/" aria-current={here('/')}>Repositories</a>
-		<a href="{base}/jobs" aria-current={pathname.startsWith('/jobs') ? 'page' : undefined}>Jobs</a>
+		<a href={resolve('/')} aria-current={here(resolve('/'))}>Repositories</a>
+		<a href={resolve('/jobs')} aria-current={page.url.pathname.startsWith(resolve('/jobs')) ? 'page' : undefined}>Jobs</a>
 	</nav>
 	<div class="theme">
 		<SignIn />

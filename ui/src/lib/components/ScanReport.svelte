@@ -1,7 +1,7 @@
 <script lang="ts">
-	import type { Manifest } from '$lib/api';
-	import { fetchBlobJson } from '$lib/api';
-	import { parseSarif, SEVERITIES, type ParsedReport, type Severity } from '$lib/utils';
+	import type { Manifest } from '#lib/api.js';
+	import { fetchBlobJson } from '#lib/api.js';
+	import { parseSarif, SEVERITIES, type ParsedReport, type Severity } from '#lib/utils.js';
 	import Card from './Card.svelte';
 	import LoadingState from './LoadingState.svelte';
 	import ErrorState from './ErrorState.svelte';

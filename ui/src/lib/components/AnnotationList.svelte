@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getAnnotationLabel, isUrl } from '$lib/utils';
+	import { getAnnotationLabel, isUrl } from '#lib/utils.js';
 
 	interface Props {
 		annotations: Record<string, string>;

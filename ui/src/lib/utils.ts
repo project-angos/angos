@@ -1,4 +1,4 @@
-import { base } from '$app/paths';
+import { resolve } from '$app/paths';
 import type { ManifestEntry, Platform, Manifest, Descriptor, ReferrerInfo, LayerEntry, LayerEntryKind, LayerListing, Secret, SecretKind } from './api';
 
 export type AttestationType = 'slsa' | 'sbom' | 'signature' | 'vuln' | 'artifact';
@@ -171,7 +171,7 @@ export function getAttestationType(referrer: ReferrerInfo): AttestationType {
  * slashes, so only the configured names can tell them apart.
  */
 export function pathUrl(path: string): string {
-	return `${base}/${path}`;
+	return resolve(path);
 }
 
 /** A tag cannot contain a colon and a digest always does (`algorithm:hex`). */
@@ -185,7 +185,7 @@ export function imageReference(path: string, reference: string): string {
 }
 
 export function manifestUrl(path: string, reference: string): string {
-	return `${base}/${imageReference(path, reference)}`;
+	return resolve(imageReference(path, reference));
 }
 
 /** The page rendering the vulnerability report stored at `digest`. */
