@@ -280,7 +280,7 @@ mod tests {
     const AUTH: &str = r#"
         [identity.ci]
         username = "ci-bot"
-        password = "$argon2id$v=19$m=19456,t=2,p=1$test"
+        password = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ"
 
         [oidc.github-actions]
         issuer = "https://token.actions.githubusercontent.com"
@@ -459,7 +459,7 @@ mod tests {
         for (from, to) in [
             (PROVIDER, "other"),
             ("[identity.ci]", "[identity.other]"),
-            ("p=1$test", "p=1$rotated"),
+            ("p=1$dGVzdHNhbHQ", "p=1$cm90YXRlZHNhbHQ"),
             ("ci-bot", "ci-robot"),
             ("token.actions.githubusercontent.com", "other.example.com"),
         ] {

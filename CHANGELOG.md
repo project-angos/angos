@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.12.4
 
+### Changed
+
+- An Argon2 password hash whose salt is shorter than 8 bytes, which the Argon2 specification forbids, fails the configuration load.
+
 ### Security
 
 - Re-release to get rid of eMudhra intermediate CA compromise

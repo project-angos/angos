@@ -383,7 +383,7 @@ mod tests {
             r#"
             [auth.identity.user1]
             username = "user1"
-            password = "$argon2id$v=19$m=19456,t=2,p=1$test"
+            password = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ"
         "#,
         );
 
@@ -434,7 +434,7 @@ mod tests {
             r#"
             [auth.identity.testuser]
             username = "testuser"
-            password = "$argon2id$v=19$m=19456,t=2,p=1$test"
+            password = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ"
         "#,
         );
 
@@ -453,7 +453,7 @@ mod tests {
             r#"
             [auth.identity.ci]
             username = "github-actions"
-            password = "$argon2id$v=19$m=19456,t=2,p=1$test"
+            password = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ"
 
             [auth.oidc.github-actions]
             issuer = "https://token.actions.githubusercontent.com"
