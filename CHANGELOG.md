@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.12.5 - UNRELEASED
+
+### Changed
+
+- Outbound HTTPS trusts only the system CA bundle (`SSL_CERT_FILE`, else `/etc/ssl/certs/ca-certificates.crt`) and a section's `server_ca_bundle`, no longer going through the platform verifier.
+
 ## 1.12.4
 
 ### Changed
