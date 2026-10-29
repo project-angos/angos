@@ -11,6 +11,7 @@ test-util = []
 
 [dependencies]
 angos-backoff = { workspace = true }
+angos-mtls-client = { workspace = true }
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }

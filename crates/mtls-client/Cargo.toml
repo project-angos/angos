@@ -7,7 +7,10 @@ edition = "2024"
 [dependencies]
 angos-secret = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = "0.8.5"
 serde = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

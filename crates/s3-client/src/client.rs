@@ -237,8 +237,10 @@ pub struct SendOpts {
 /// One reqwest client, with `read_timeout` only where a stalled transfer must
 /// be cut short.
 fn http_client(read_timeout: Option<Duration>) -> Result<Client, S3Error> {
+    let roots = angos_mtls_client::trusted_roots(None).map_err(S3Error::configuration)?;
     let mut builder = Client::builder()
         .use_rustls_tls()
+        .tls_certs_only(roots)
         .pool_idle_timeout(Duration::from_secs(90));
     if let Some(read_timeout) = read_timeout {
         builder = builder.read_timeout(read_timeout);

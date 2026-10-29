@@ -5,7 +5,10 @@ use std::{
 };
 
 use reqwest::{Certificate, Client, ClientBuilder, Identity, redirect::Policy};
+use rustls::RootCertStore;
+use rustls_native_certs::CertificateResult;
 use serde::Deserialize;
+use tracing::warn;
 
 use angos_secret::Secret;
 
@@ -142,7 +145,7 @@ impl MtlsClientBuilder {
     }
 
     /// Trusts `tls`'s PEM CA bundle for server verification, beside the
-    /// platform roots, and presents its client identity.
+    /// system roots, and presents its client identity.
     #[must_use]
     pub fn with_tls(mut self, tls: &ClientTls) -> Self {
         self.tls = tls.clone();
@@ -156,12 +159,9 @@ impl MtlsClientBuilder {
     /// Returns an error when a configured certificate or key file cannot be read
     /// or parsed, or when the HTTP client cannot be built.
     pub fn build(self) -> Result<Client, String> {
-        let mut builder = self.builder;
-        if let Some(path) = &self.tls.server_ca_bundle {
-            for certificate in load_certificate_bundle(path)? {
-                builder = builder.add_root_certificate(certificate);
-            }
-        }
+        let mut builder = self
+            .builder
+            .tls_certs_only(trusted_roots(self.tls.server_ca_bundle.as_deref())?);
         if let Some(identity) = &self.tls.identity {
             builder = builder.identity(load_identity(identity)?);
         }
@@ -169,6 +169,57 @@ impl MtlsClientBuilder {
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {e}"))
     }
+}
+
+/// The roots every outbound client trusts: the system CA bundle
+/// (`SSL_CERT_FILE`/`SSL_CERT_DIR`, else the platform's standard location) plus
+/// `server_ca_bundle`. Given to [`ClientBuilder::tls_certs_only`], they are the
+/// only roots reqwest consults.
+///
+/// # Errors
+///
+/// Returns an error when `server_ca_bundle` cannot be read or parsed, or when
+/// no root is left to trust at all.
+pub fn trusted_roots(server_ca_bundle: Option<&Path>) -> Result<Vec<Certificate>, String> {
+    let configured = server_ca_bundle
+        .map(load_certificate_bundle)
+        .transpose()?
+        .unwrap_or_default();
+    collect_roots(rustls_native_certs::load_native_certs(), configured)
+}
+
+/// The parsable system roots followed by `configured`: one bad system entry is
+/// skipped rather than failing every client.
+fn collect_roots(
+    system: CertificateResult,
+    configured: Vec<Certificate>,
+) -> Result<Vec<Certificate>, String> {
+    for error in &system.errors {
+        warn!("Failed to load system CA certificates: {error}");
+    }
+    let found = system.certs.len();
+    let mut parsed = RootCertStore::empty();
+    let mut roots: Vec<Certificate> = system
+        .certs
+        .into_iter()
+        .filter(|der| parsed.add(der.clone()).is_ok())
+        .filter_map(|der| Certificate::from_der(&der).ok())
+        .collect();
+    if roots.len() < found {
+        warn!(
+            "Ignored {} unparsable system CA certificates",
+            found - roots.len()
+        );
+    }
+    roots.extend(configured);
+    if roots.is_empty() {
+        return Err(
+            "No CA certificate to trust: none loaded from the system bundle \
+             (see SSL_CERT_FILE) and no server_ca_bundle configured"
+                .to_string(),
+        );
+    }
+    Ok(roots)
 }
 
 fn load_certificate_bundle(path: &Path) -> Result<Vec<Certificate>, String> {
@@ -199,11 +250,14 @@ mod tests {
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
     };
+    use reqwest::Certificate;
+    use rustls::pki_types::CertificateDer;
+    use rustls_native_certs::CertificateResult;
 
     use angos_secret::Secret;
 
     use super::{
-        BasicAuth, ClientTls, ClientTlsFields, MtlsClientBuilder, MtlsIdentity,
+        BasicAuth, ClientTls, ClientTlsFields, MtlsClientBuilder, MtlsIdentity, collect_roots,
         load_certificate_bundle, load_identity,
     };
 
@@ -301,6 +355,55 @@ mod tests {
             })
             .build();
         assert!(client.is_ok());
+    }
+
+    fn self_signed_ca_der(common_name: &str) -> CertificateDer<'static> {
+        let key = KeyPair::generate().expect("ca key");
+        let mut params = CertificateParams::new(vec![]).expect("ca params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params
+            .self_signed(&key)
+            .expect("ca self-sign")
+            .der()
+            .clone()
+    }
+
+    /// One system certificate rustls cannot parse is skipped rather than
+    /// costing every client its TLS, and a configured bundle is trusted beside
+    /// the system roots.
+    #[test]
+    fn roots_skip_an_unparsable_system_certificate_and_add_configured_ones() {
+        let mut system = CertificateResult::default();
+        system.certs = vec![
+            self_signed_ca_der("System CA"),
+            CertificateDer::from(vec![0u8; 16]),
+        ];
+        let configured = Certificate::from_pem_bundle(ca_bundle_pem().as_bytes()).unwrap();
+
+        let roots = collect_roots(system, configured).expect("roots must be collected");
+
+        assert_eq!(
+            roots.len(),
+            3,
+            "the parsable system root and both configured certificates"
+        );
+    }
+
+    /// A configured bundle is enough where the system has none; with neither,
+    /// no TLS connection could ever verify, so the client is not built.
+    #[test]
+    fn roots_need_a_system_or_a_configured_certificate() {
+        let configured = Certificate::from_pem_bundle(ca_bundle_pem().as_bytes()).unwrap();
+        assert_eq!(
+            collect_roots(CertificateResult::default(), configured)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(collect_roots(CertificateResult::default(), Vec::new()).is_err());
     }
 
     #[test]

@@ -72,6 +72,15 @@ TLS certificate files are also automatically reloaded when they change.
 
 ---
 
+## Outbound TLS Trust
+
+Every outbound HTTPS connection (registries, S3, OIDC, webhooks, scanner) trusts the system CA
+bundle: `SSL_CERT_FILE` or `SSL_CERT_DIR` when set, otherwise `/etc/ssl/certs/ca-certificates.crt`
+in the image, the same file a mounted scanner uses. Replace that file or set `SSL_CERT_FILE` to
+change what is trusted; a section's `server_ca_bundle` adds CAs for that client alone.
+
+---
+
 ## Server (`server`)
 
 | Option                            | Type         | Default  | Description                                        |
