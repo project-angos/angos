@@ -270,7 +270,7 @@ impl RegistryClient {
 
     /// Cached-token-then-single-refresh-retry orchestration for replayable-body
     /// requests, also returning the auth header which produced the final
-    /// response: a streamed `PATCH` to a server-assigned upload-session URL
+    /// response: a streamed upload `PUT` to a server-assigned session URL
     /// reuses it, as that URL never issues its own challenge and a consumed
     /// stream cannot be replayed to refresh a token. `send_once` may run twice
     /// (cached header, then one refreshed token on `401`), so it must clone any

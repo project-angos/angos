@@ -17,7 +17,7 @@ use angos_oci::request::{
     HeadManifestRequest, ListTagsRequest, MountBlobRequest, PutManifestRequest, StartUploadRequest,
 };
 use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome, REPLICATION_SUPERSEDED_CODE};
-use angos_oci::{Digest, MediaType, Namespace, Reference, Tag};
+use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, Tag};
 
 use angos_mtls_client::{BasicAuth, ClientTls, MtlsIdentity};
 
@@ -1327,19 +1327,11 @@ async fn test_blob_upload_sequence() {
         .mount(&mock_server)
         .await;
 
-    Mock::given(method("PATCH"))
-        .and(path(session_path))
-        .and(body_bytes(content.to_vec()))
-        .respond_with(
-            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=b")),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
     Mock::given(method("PUT"))
         .and(path(session_path))
+        .and(query_param("state", "a"))
         .and(query_param("digest", digest))
+        .and(body_bytes(content.to_vec()))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&mock_server)
@@ -1360,22 +1352,14 @@ async fn test_blob_upload_sequence() {
         format!("{}{session_path}?state=a", mock_server.uri())
     );
 
-    let next_url = client
-        .patch_upload(
+    client
+        .put_upload(
             &session.url,
             session.auth.as_deref(),
+            &Digest::try_from(digest).unwrap(),
             content.len() as u64,
             Cursor::new(content.to_vec()),
         )
-        .await
-        .unwrap();
-    assert_eq!(
-        next_url,
-        format!("{}{session_path}?state=b", mock_server.uri())
-    );
-
-    client
-        .complete_upload(&next_url, &Digest::try_from(digest).unwrap())
         .await
         .unwrap();
 }
@@ -1410,14 +1394,14 @@ async fn start_upload_refuses_a_cross_origin_location() {
 }
 
 #[tokio::test]
-async fn test_patch_upload_401_is_unauthorized_without_retry() {
+async fn test_put_upload_401_is_unauthorized_without_retry() {
     // A single-use streamed body cannot be replayed, so a 401 must not trigger
-    // the refresh-and-retry path (`.expect(1)` proves a single PATCH).
+    // the refresh-and-retry path (`.expect(1)` proves a single PUT).
     let mock_server = MockServer::start().await;
     let content = b"replicated blob content";
     let session_path = "/v2/test/blobs/uploads/session-1";
 
-    Mock::given(method("PATCH"))
+    Mock::given(method("PUT"))
         .and(path(session_path))
         .respond_with(ResponseTemplate::new(401))
         .expect(1)
@@ -1427,10 +1411,12 @@ async fn test_patch_upload_401_is_unauthorized_without_retry() {
     let client = client_for(&mock_server);
     let session_url = format!("{}{session_path}", mock_server.uri());
 
+    let digest = Digest::from_bytes(Algorithm::Sha256, content);
     let result = client
-        .patch_upload(
+        .put_upload(
             &session_url,
             None,
+            &digest,
             content.len() as u64,
             Cursor::new(content.to_vec()),
         )
@@ -1438,18 +1424,18 @@ async fn test_patch_upload_401_is_unauthorized_without_retry() {
 
     assert!(
         matches!(result, Err(Error::Unauthorized(_))),
-        "a 401 on a streamed PATCH must be Error::Unauthorized (no replay), got {result:?}"
+        "a 401 on a streamed PUT must be Error::Unauthorized (no replay), got {result:?}"
     );
-    // Dropping the server verifies `.expect(1)`: exactly one PATCH, no retry.
+    // Dropping the server verifies `.expect(1)`: exactly one PUT, no retry.
     drop(mock_server);
 }
 
 #[tokio::test]
-async fn test_blob_upload_reuses_session_open_bearer_token_on_patch() {
-    // Regression: the streamed PATCH targets a server-assigned session URL that
+async fn test_blob_upload_reuses_session_open_bearer_token_on_put() {
+    // Regression: the streamed PUT targets a server-assigned session URL that
     // never issues its own auth challenge, so it must reuse the bearer token the
-    // start-upload POST resolved. The PATCH mock requires that token, so an
-    // unauthenticated PATCH (the pre-fix behaviour) would not match and fail.
+    // start-upload POST resolved. The PUT mock requires that token, so an
+    // unauthenticated PUT (the pre-fix behaviour) would not match and fail.
     let mock_server = MockServer::start().await;
     let auth_server = MockServer::start().await;
     let content = b"replicated blob content";
@@ -1486,12 +1472,10 @@ async fn test_blob_upload_reuses_session_open_bearer_token_on_patch() {
         )
         .mount(&auth_server)
         .await;
-    Mock::given(method("PATCH"))
+    Mock::given(method("PUT"))
         .and(path(session_path))
         .and(header("Authorization", "Bearer push-token"))
-        .respond_with(
-            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=b")),
-        )
+        .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -1506,24 +1490,21 @@ async fn test_blob_upload_reuses_session_open_bearer_token_on_patch() {
         .await
         .unwrap();
     assert_eq!(session.auth.as_deref(), Some("Bearer push-token"));
-    let next_url = client
-        .patch_upload(
+    client
+        .put_upload(
             &session.url,
             session.auth.as_deref(),
+            &Digest::from_bytes(Algorithm::Sha256, content),
             content.len() as u64,
             Cursor::new(content.to_vec()),
         )
         .await
         .unwrap();
-    assert_eq!(
-        next_url,
-        format!("{}{session_path}?state=b", mock_server.uri())
-    );
 }
 
 #[tokio::test]
-async fn test_blob_upload_reuses_basic_credentials_on_patch() {
-    // Basic credentials are never cached, so the streamed PATCH must carry the
+async fn test_blob_upload_reuses_basic_credentials_on_put() {
+    // Basic credentials are never cached, so the streamed PUT must carry the
     // header resolved when the session was opened.
     let mock_server = MockServer::start().await;
     let content = b"replicated blob content";
@@ -1548,12 +1529,10 @@ async fn test_blob_upload_reuses_basic_credentials_on_patch() {
         .expect(1)
         .mount(&mock_server)
         .await;
-    Mock::given(method("PATCH"))
+    Mock::given(method("PUT"))
         .and(path(session_path))
         .and(header("Authorization", "Basic dXNlcjpwYXNz"))
-        .respond_with(
-            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=b")),
-        )
+        .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -1578,19 +1557,16 @@ async fn test_blob_upload_reuses_basic_credentials_on_patch() {
         .await
         .unwrap();
     assert_eq!(session.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
-    let next_url = client
-        .patch_upload(
+    client
+        .put_upload(
             &session.url,
             session.auth.as_deref(),
+            &Digest::from_bytes(Algorithm::Sha256, content),
             content.len() as u64,
             Cursor::new(content.to_vec()),
         )
         .await
         .unwrap();
-    assert_eq!(
-        next_url,
-        format!("{}{session_path}?state=b", mock_server.uri())
-    );
 }
 
 #[tokio::test]

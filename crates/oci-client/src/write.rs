@@ -30,7 +30,7 @@ use crate::{Error, RegistryClient, denied_if_forbidden, parse_header, without_qu
 /// An open downstream blob-upload session: the server-assigned continuation
 /// URL plus the auth header that opened it.
 ///
-/// The streamed `PATCH` reuses [`Self::auth`] because the session URL never
+/// The streamed upload `PUT` reuses [`Self::auth`] because the session URL never
 /// issues its own auth challenge and a single-use body cannot be replayed to
 /// refresh a token on a `401`. Not `Debug`: `auth` carries a bearer/basic
 /// credential.
@@ -75,7 +75,7 @@ fn write_failure(op: &str, status: StatusCode) -> Error {
 impl RegistryClient {
     /// Sends a replayable body under the auth retry, also returning the
     /// resolved auth header so an upload-session opener can reuse it for the
-    /// single-use streamed `PATCH`.
+    /// single-use streamed upload `PUT`.
     async fn send_body_with_auth(
         &self,
         method: &Method,
@@ -206,7 +206,7 @@ impl RegistryClient {
 
     /// Starts a resumable blob upload session, returning the server-assigned
     /// continuation URL from the `Location` header and the auth header that
-    /// opened it (reused for the streamed `PATCH`).
+    /// opened it (reused for the streamed upload `PUT`).
     ///
     /// # Errors
     ///
@@ -283,59 +283,32 @@ impl RegistryClient {
         }))
     }
 
-    /// Streams a chunk to an upload session and returns the next continuation
-    /// URL from the `Location` response header.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the request fails, access is rejected, or the
-    /// response lacks a success status or `Location` header.
-    #[instrument(skip(self, stream))]
-    pub async fn patch_upload<S>(
-        &self,
-        session_url: &str,
-        auth_header: Option<&str>,
-        content_length: u64,
-        stream: S,
-    ) -> Result<String, Error>
-    where
-        S: AsyncRead + Unpin + Send + Sync + 'static,
-    {
-        let response = self
-            .send_stream(
-                &Method::PATCH,
-                session_url,
-                auth_header,
-                content_length,
-                stream,
-            )
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(write_failure("patch_upload", response.status()));
-        }
-
-        Self::parse_location(&response)
-    }
-
-    /// Finalizes an upload session by committing the named `digest` (appended
-    /// as the `?digest=` query parameter).
+    /// Streams the whole blob into an upload session with the final `PUT`
+    /// (`?digest=` appended), uploading and committing it in one request.
     ///
     /// # Errors
     ///
     /// Returns an error when the request fails, access is rejected, or the
     /// response is not a success status.
-    #[instrument(skip(self))]
-    pub async fn complete_upload(&self, session_url: &str, digest: &Digest) -> Result<(), Error> {
+    #[instrument(skip(self, stream))]
+    pub async fn put_upload<S>(
+        &self,
+        session_url: &str,
+        auth_header: Option<&str>,
+        digest: &Digest,
+        content_length: u64,
+        stream: S,
+    ) -> Result<(), Error>
+    where
+        S: AsyncRead + Unpin + Send + Sync + 'static,
+    {
         let location = append_query(session_url, &format!("digest={digest}"));
-
         let response = self
-            .send_body_with_auth(&Method::PUT, &location, None, Vec::new(), None)
-            .await?
-            .0;
+            .send_stream(&Method::PUT, &location, auth_header, content_length, stream)
+            .await?;
 
         if !response.status().is_success() {
-            return Err(write_failure("complete_upload", response.status()));
+            return Err(write_failure("put_upload", response.status()));
         }
 
         Ok(())

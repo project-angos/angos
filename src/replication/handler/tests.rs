@@ -460,7 +460,7 @@ async fn execute_skips_blob_present_on_downstream() {
 
     // Both blobs already present (200 on HEAD) -> NO upload sequence at all.
     mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
-    // No POST/PATCH mounted: if the pipeline tried to upload, the request
+    // No upload POST/PUT mounted: if the pipeline tried to upload, the request
     // would 404 and the push would error.
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))

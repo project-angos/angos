@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Outbound HTTPS trusts only the system CA bundle (`SSL_CERT_FILE`, else `/etc/ssl/certs/ca-certificates.crt`) and a section's `server_ca_bundle`, no longer going through the platform verifier.
+- Replication uploads each blob in its committing `PUT` instead of a `PATCH` followed by a `PUT`, and probes the downstream and the local mount source concurrently.
 
 ### Fixed
 
