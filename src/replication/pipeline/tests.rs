@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, Mutex},
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -652,6 +652,65 @@ async fn index_lands_after_all_children_when_fanned_out() {
             "every child manifest must be pushed"
         );
     }
+    drop(mock_server);
+}
+
+#[tokio::test]
+async fn root_index_children_push_concurrently() {
+    metrics_provider::init_for_tests();
+    let mock_server = MockServer::start().await;
+    let (blob_store, metadata_store, _dir) = test_blob_store();
+
+    let mut manifests = Vec::new();
+    for i in 0..4 {
+        let child = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [],
+            "annotations": { "idx": i.to_string() },
+        }))
+        .unwrap();
+        let child_digest = put_blob_direct(&blob_store, &child).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
+            .respond_with(ResponseTemplate::new(201).set_delay(StdDuration::from_millis(500)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        manifests.push(json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": child_digest.to_string(),
+            "size": child.len(),
+        }));
+    }
+    let index = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": manifests,
+    }))
+    .unwrap();
+    let index_digest = put_blob_direct(&blob_store, &index).await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let namespace = Namespace::new(NAMESPACE).unwrap();
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
+    let started = Instant::now();
+    push_manifest(&ctx, &index_digest, Some("v1"), index)
+        .await
+        .unwrap();
+
+    // One at a time, the four 500 ms child PUTs take at least two seconds.
+    assert!(
+        started.elapsed() < StdDuration::from_millis(1500),
+        "the root index's children must push concurrently, took {:?}",
+        started.elapsed()
+    );
     drop(mock_server);
 }
 

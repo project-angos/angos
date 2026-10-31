@@ -27,7 +27,7 @@ username = "replicator"
 password = "..."
 mode = "event+reconcile"              # "event+reconcile" | "event-only" | "reconcile-only"
 namespace_filter = ["^nginx/.*"]      # optional regex list; empty matches all namespaces
-max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (positive integer, default 4)
+max_concurrent_pushes = 4             # optional; per-manifest blob and child-manifest fan-out (positive integer, default 4)
 ```
 
 ### Downstream Options
@@ -38,7 +38,7 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (pos
 | `url` | string | required | Downstream registry URL. A bare host mirrors the namespace verbatim; a path (`http://host:8000/team`) becomes the namespace prefix the content lands under, replacing the source repository prefix (`<repo>/x` → `team/x`). Angos serves the OCI API at `/v2/` root, so the path is mapped into the namespace, not the HTTP path. See [Fan out into sibling repositories](#fan-out-into-sibling-repositories). |
 | `mode` | string | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"` |
 | `namespace_filter` | [string] | `[]` (all) | Regex patterns; a namespace replicates to this downstream only if it matches one |
-| `max_concurrent_pushes` | usize | `4` | Concurrent blob pushes per manifest for this downstream (positive integer, >= 1) |
+| `max_concurrent_pushes` | usize | `4` | Concurrent blob pushes per manifest, and concurrent child-manifest pushes per top-level index, for this downstream (positive integer, >= 1) |
 | `prune` | bool | `false` | When `true`, reconciliation also **deletes** tags present on this downstream but absent locally (authoritative one-way mirror). **Leave `false` for active-active peers**; see [Reconcile on Demand](#reconcile-on-demand). |
 | `username` / `password` | string | - | Basic auth for the downstream |
 | `max_redirect` | u8 | `5` | Maximum redirects to follow |
