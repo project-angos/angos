@@ -16,7 +16,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::{TryStreamExt, future::try_join_all};
+use futures_util::{
+    TryStreamExt,
+    future::{try_join, try_join_all},
+};
 use tracing::instrument;
 
 use angos_oci::{Digest, Namespace};
@@ -38,19 +41,35 @@ pub type BlobIndex = HashMap<Namespace, HashSet<LinkKind>>;
 
 impl MetadataStore {
     /// `namespace`'s reference entries for `digest`: the `!own` leaf plus the
-    /// `!r/` subtree.
+    /// `!r/` subtree, read concurrently.
     async fn namespace_ref_entries(
         &self,
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<HashSet<LinkKind>, Error> {
-        let store = self.object_store();
-        let mut links = HashSet::new();
-        if store.exists(&digest.blob_ref_own_path(namespace)).await? {
+        let own = async {
+            Ok::<_, Error>(
+                self.object_store()
+                    .exists(&digest.blob_ref_own_path(namespace))
+                    .await?,
+            )
+        };
+        let (owned, mut links) = try_join(own, self.listed_ref_entries(namespace, digest)).await?;
+        if owned {
             links.insert(LinkKind::Blob(digest.clone()));
         }
+        Ok(links)
+    }
+
+    /// `namespace`'s `!r/` reference entries for `digest`.
+    async fn listed_ref_entries(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+    ) -> Result<HashSet<LinkKind>, Error> {
+        let mut links = HashSet::new();
         let dir = digest.blob_ref_namespace_dir(namespace);
-        let mut entries = store.list_all(&dir);
+        let mut entries = self.object_store().list_all(&dir);
         while let Some(entry) = entries.try_next().await? {
             links.extend(digest.parse_blob_ref_entry(&entry));
         }
@@ -158,12 +177,7 @@ impl MetadataStore {
         {
             return Ok(true);
         }
-        let entries = self.namespace_ref_entries(namespace, digest).await?;
-        // A grant that landed between the head and the listing.
-        if entries.contains(&LinkKind::Blob(digest.clone())) {
-            return Ok(true);
-        }
-        for entry in &entries {
+        for entry in &self.listed_ref_entries(namespace, digest).await? {
             if self.reference_backed(namespace, entry, digest).await? {
                 return Ok(true);
             }
@@ -834,6 +848,51 @@ mod tests {
             assert!(
                 digest_links.contains(&LinkKind::Digest(digest_link_digest.clone())),
                 "Blob index for digest_link_digest should contain the Digest link"
+            );
+        })
+        .await;
+    }
+
+    /// Counts the heads a store is asked for.
+    struct HeadCount(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl StoreHook for HeadCount {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            if matches!(op, StoreOp::Head { .. }) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    /// A read authorization check heads the `own` key once, whether it hits or
+    /// falls through to the listing.
+    #[tokio::test]
+    async fn can_read_heads_the_own_key_once() {
+        for_each_backend(async |test_case| {
+            let heads = Arc::new(AtomicUsize::new(0));
+            let m = metadata_store_over(Arc::new(HookedStore::new(
+                test_case.metadata_store().object_store().clone(),
+                HeadCount(heads.clone()),
+            )));
+            let digest = Digest::sha256_of_bytes(b"a blob only one namespace owns");
+            let (owner, other) = (
+                Namespace::new("can-read-owner").unwrap(),
+                Namespace::new("can-read-other").unwrap(),
+            );
+            m.grant(&owner, &digest).await.unwrap();
+
+            heads.store(0, Ordering::SeqCst);
+            assert!(m.can_read(&owner, &digest).await.unwrap());
+            assert_eq!(heads.load(Ordering::SeqCst), 1, "a hit costs one head");
+
+            heads.store(0, Ordering::SeqCst);
+            assert!(!m.can_read(&other, &digest).await.unwrap());
+            assert_eq!(
+                heads.load(Ordering::SeqCst),
+                1,
+                "a miss must not head the own key again before listing"
             );
         })
         .await;

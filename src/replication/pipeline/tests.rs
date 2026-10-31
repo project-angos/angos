@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, Mutex},
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -655,6 +655,65 @@ async fn index_lands_after_all_children_when_fanned_out() {
     drop(mock_server);
 }
 
+#[tokio::test]
+async fn root_index_children_push_concurrently() {
+    metrics_provider::init_for_tests();
+    let mock_server = MockServer::start().await;
+    let (blob_store, metadata_store, _dir) = test_blob_store();
+
+    let mut manifests = Vec::new();
+    for i in 0..4 {
+        let child = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [],
+            "annotations": { "idx": i.to_string() },
+        }))
+        .unwrap();
+        let child_digest = put_blob_direct(&blob_store, &child).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
+            .respond_with(ResponseTemplate::new(201).set_delay(StdDuration::from_millis(500)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        manifests.push(json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": child_digest.to_string(),
+            "size": child.len(),
+        }));
+    }
+    let index = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": manifests,
+    }))
+    .unwrap();
+    let index_digest = put_blob_direct(&blob_store, &index).await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let namespace = Namespace::new(NAMESPACE).unwrap();
+    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
+    let started = Instant::now();
+    push_manifest(&ctx, &index_digest, Some("v1"), index)
+        .await
+        .unwrap();
+
+    // One at a time, the four 500 ms child PUTs take at least two seconds.
+    assert!(
+        started.elapsed() < StdDuration::from_millis(1500),
+        "the root index's children must push concurrently, took {:?}",
+        started.elapsed()
+    );
+    drop(mock_server);
+}
+
 /// A manifest named by several indexes, or several times by one, is pushed
 /// once per job: repeats would otherwise multiply at every nesting level.
 #[tokio::test]
@@ -795,7 +854,7 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
             .mount(&mock_server)
             .await;
     }
-    // No PATCH/PUT upload mock is mounted, so a fall-back transfer would 404
+    // No upload PUT mock is mounted, so a fall-back transfer would 404
     // and fail the push, proving the bytes were never streamed.
     Mock::given(method("POST"))
         .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
@@ -869,15 +928,6 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
             }
         })
         .expect(2)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
-        )
-        .expect(1)
         .mount(&mock_server)
         .await;
     Mock::given(method("PUT"))
@@ -1232,7 +1282,7 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
 
 #[tokio::test]
 async fn failed_patch_cancels_the_upload_session() {
-    // A PATCH failure must best-effort DELETE the open session exactly
+    // An upload failure must best-effort DELETE the open session exactly
     // once and still propagate the original upload error.
     metrics_provider::init_for_tests();
     let mock_server = MockServer::start().await;
@@ -1267,7 +1317,7 @@ async fn failed_patch_cancels_the_upload_session() {
         .expect(1)
         .mount(&mock_server)
         .await;
-    Mock::given(method("PATCH"))
+    Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
         .respond_with(ResponseTemplate::new(500))
         .expect(1)
@@ -1293,7 +1343,7 @@ async fn failed_patch_cancels_the_upload_session() {
 
     assert!(
         result.is_err(),
-        "the original PATCH failure must propagate past the session cancel, got: {result:?}"
+        "the original upload failure must propagate past the session cancel, got: {result:?}"
     );
     drop(mock_server);
 }
@@ -2015,19 +2065,10 @@ async fn a_failing_blob_lets_its_siblings_finish_their_upload() {
         )
         .mount(&mock_server)
         .await;
-    // Slow enough that the sibling is still mid-PATCH when the other blob fails.
-    Mock::given(method("PATCH"))
-        .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1"))
-                .set_delay(StdDuration::from_millis(300)),
-        )
-        .mount(&mock_server)
-        .await;
+    // Slow enough that the sibling is still mid-upload when the other blob fails.
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
-        .respond_with(ResponseTemplate::new(201))
+        .respond_with(ResponseTemplate::new(201).set_delay(StdDuration::from_millis(300)))
         .expect(1)
         .mount(&mock_server)
         .await;

@@ -1251,15 +1251,6 @@ mod tests {
             .expect(2)
             .mount(mock_server)
             .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
-            .respond_with(
-                ResponseTemplate::new(202)
-                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1")),
-            )
-            .expect(2)
-            .mount(mock_server)
-            .await;
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
             .respond_with(ResponseTemplate::new(201))

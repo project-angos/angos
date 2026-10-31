@@ -38,7 +38,7 @@ pub async fn mount_jwks(server: &MockServer, jwks: Value) {
 
 /// A downstream registry accepting a full upload of `blobs` under
 /// `namespace`: each blob HEAD-misses exactly once (404), then the
-/// POST/PATCH/PUT session accepts one upload per blob. The counts are
+/// POST/PUT session accepts one upload per blob. The counts are
 /// asserted when the `MockServer` drops.
 pub async fn mount_blob_upload_accepted(server: &MockServer, namespace: &str, blobs: &[&Digest]) {
     for blob in blobs {
@@ -52,15 +52,6 @@ pub async fn mount_blob_upload_accepted(server: &MockServer, namespace: &str, bl
     let uploads = blobs.len() as u64;
     Mock::given(method("POST"))
         .and(path(format!("/v2/{namespace}/blobs/uploads/")))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("Location", format!("/v2/{namespace}/blobs/uploads/s1")),
-        )
-        .expect(uploads)
-        .mount(server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path(format!("/v2/{namespace}/blobs/uploads/s1")))
         .respond_with(
             ResponseTemplate::new(202)
                 .insert_header("Location", format!("/v2/{namespace}/blobs/uploads/s1")),

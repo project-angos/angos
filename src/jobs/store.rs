@@ -7,9 +7,10 @@
 //! crash window re-runs work instead of losing it.
 
 use std::{
+    collections::HashSet,
     fmt,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU32, Ordering},
     },
     time::Duration,
@@ -456,6 +457,10 @@ pub trait JobHandler: Send + Sync {
 /// claim serialization, which is the actual correctness primitive.
 const MAX_SCAN: u16 = 1000;
 
+/// Width of the queue head a claim starts from at a random offset, sized above
+/// the claim loops of several replicas so they rarely pick the same job.
+const CLAIM_SPREAD: usize = 64;
+
 /// Cap on the pending/failed gauges. The gauge feeds autoscaling, which needs
 /// only ordinal granularity at high depth, and the cap bounds S3 `LIST` cost per
 /// refresh tick; read the cap value as "at least this many".
@@ -480,13 +485,34 @@ struct ClaimRecord {
     expires_at: DateTime<Utc>,
 }
 
+/// Pending storage keys a process's claim loops are working on.
+type InFlight = Arc<Mutex<HashSet<String>>>;
+
+/// A pending key reserved in [`JobStore::in_flight`] until dropped, so sibling
+/// claim loops skip it without touching the store.
+struct Reservation {
+    in_flight: InFlight,
+    storage_key: String,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.storage_key);
+    }
+}
+
 /// A held claim: the key, the instance token proving ownership, the token the
-/// refresh task raises when the claim is lost, and the refresh task itself.
+/// refresh task raises when the claim is lost, the refresh task itself, and the
+/// local reservation of the job's pending key.
 pub struct JobClaim {
     key: String,
     instance: String,
     lost: CancellationToken,
     refresher: Option<JoinHandle<()>>,
+    _reservation: Reservation,
 }
 
 impl JobClaim {
@@ -530,6 +556,10 @@ impl ClaimedJob {
             instance: String::new(),
             lost,
             refresher: None,
+            _reservation: Reservation {
+                in_flight: InFlight::default(),
+                storage_key: storage_key.clone(),
+            },
         };
         Self {
             envelope,
@@ -593,6 +623,9 @@ pub struct JobStore {
     /// Claim-lease seconds, clamped at construction so chrono arithmetic on it
     /// cannot overflow.
     claim_ttl_secs: i64,
+    /// Without it every local loop walks the same queue head, paying a body
+    /// read and a failed claim per job a sibling already holds.
+    in_flight: InFlight,
 }
 
 impl JobStore {
@@ -637,6 +670,7 @@ impl JobStore {
             claim_ttl_secs: i64::try_from(retry.claim_ttl_secs)
                 .unwrap_or(i64::MAX)
                 .clamp(1, 86_400),
+            in_flight: InFlight::default(),
         }
     }
 
@@ -854,7 +888,11 @@ impl JobStore {
     /// one is deleted and re-created. The takeover is deliberately unfenced, so
     /// racing claimants may both execute until each loser's refresher notices,
     /// costing a duplicate run of an idempotent handler and never a lost job.
-    async fn try_claim(&self, lock_key: &LockKey) -> Result<Option<JobClaim>, Error> {
+    async fn try_claim(
+        &self,
+        lock_key: &LockKey,
+        reservation: Reservation,
+    ) -> Result<Option<JobClaim>, Error> {
         let key = job_claim_path(lock_key);
         let instance = Uuid::new_v4().to_string();
         let mut stamped_until = self.acquire_claim(&key, &instance).await?;
@@ -882,7 +920,21 @@ impl JobStore {
             instance,
             lost,
             refresher: Some(refresher),
+            _reservation: reservation,
         }))
+    }
+
+    /// Reserve `storage_key` for the calling loop, `None` when a sibling loop of
+    /// this process already holds it.
+    fn reserve(&self, storage_key: &str) -> Option<Reservation> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(storage_key.to_string())
+            .then(|| Reservation {
+                in_flight: self.in_flight.clone(),
+                storage_key: storage_key.to_string(),
+            })
     }
 
     /// Acquire the claim record per the probed [`ClaimMode`]. Advisory
@@ -1094,21 +1146,28 @@ impl JobStore {
         }
     }
 
-    /// Walk pending keys in ascending `not_before` order and claim the first
-    /// ready one, stopping at the first key scheduled in the future and
-    /// reporting that instant as `next_ready`.
+    /// Walk the ready pending keys and claim the first one that is free, the
+    /// oldest [`CLAIM_SPREAD`] from a random offset so concurrent claimants do
+    /// not all race for the queue head. The first key scheduled in the future
+    /// ends the walk and is reported as `next_ready`.
     async fn try_claim_one(&self, queue: Queue) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
-        let mut next_ready: Option<DateTime<Utc>> = None;
-        for storage_key in self.list_pending(queue, MAX_SCAN).await? {
-            // The filename prefix is the readiness signal, so a backed-off entry
-            // never costs a body GET.
-            if let Some(not_before) = parse_not_before(&storage_key)
-                && not_before > now
-            {
-                next_ready = Some(not_before);
-                break;
-            }
+        let mut keys = self.list_pending(queue, MAX_SCAN).await?;
+        // The filename prefix is the readiness signal, so a backed-off entry
+        // never costs a body GET.
+        let ready = keys
+            .iter()
+            .position(|key| parse_not_before(key).is_some_and(|not_before| not_before > now))
+            .unwrap_or(keys.len());
+        let next_ready = keys.get(ready).and_then(|key| parse_not_before(key));
+        keys.truncate(ready);
+        let spread = ready.min(CLAIM_SPREAD);
+        let offset = usize::try_from(jitter_below(spread as u64)).unwrap_or(0);
+        keys[..spread].rotate_left(offset);
+        for storage_key in keys {
+            let Some(reservation) = self.reserve(&storage_key) else {
+                continue;
+            };
             let envelope = match self.read_pending(queue, &storage_key).await {
                 Ok(e) => e,
                 Err(Error::NotFound) => continue,
@@ -1118,7 +1177,7 @@ impl JobStore {
                 }
                 Err(e) => return Err(e),
             };
-            if let Some(claim) = self.try_claim(&envelope.lock_key).await? {
+            if let Some(claim) = self.try_claim(&envelope.lock_key, reservation).await? {
                 // Re-read under the claim: another worker may have completed this
                 // job between the first read and the claim, and re-running the
                 // stale envelope could dead-letter a finished job.

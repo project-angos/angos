@@ -6,11 +6,17 @@
 //! HEAD-probed before transfer, child manifests land before the parent index,
 //! and a re-run of a converged manifest costs one no-op HEAD.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use chrono::{DateTime, Utc};
-use futures_util::stream::{self, StreamExt};
-use tokio::io::AsyncReadExt;
+use futures_util::{
+    future::join,
+    stream::{self, StreamExt},
+};
+use tokio::{io::AsyncReadExt, sync::OnceCell};
 use tracing::{debug, info, instrument, warn};
 
 use angos_oci::manifest_accept_types;
@@ -36,6 +42,9 @@ use crate::{
 /// manifest body while the children below it push, so an unbounded chain of
 /// indexes each naming the next is memory an authenticated pusher controls.
 const MAX_INDEX_DEPTH: usize = 8;
+
+/// Child manifests a job has reached, each completed once its push succeeds.
+type Pushed = Mutex<HashMap<Digest, Arc<OnceCell<()>>>>;
 
 mod referrers_fallback;
 
@@ -98,8 +107,8 @@ pub async fn push_manifest(
     tag: Option<&str>,
     body: Vec<u8>,
 ) -> Result<PushOutcome, Error> {
-    // One set for the whole job: a manifest several indexes name is pushed once.
-    push_reached(ctx, &mut HashSet::new(), digest, tag, body).await
+    // One map for the whole job: a manifest several indexes name is pushed once.
+    push_reached(ctx, &Pushed::default(), digest, tag, body).await
 }
 
 /// [`push_manifest`] for a manifest the job reached, recording in `pushed`
@@ -107,7 +116,7 @@ pub async fn push_manifest(
 #[instrument(name = "push_manifest", skip(ctx, pushed, body))]
 async fn push_reached(
     ctx: &PushContext<'_>,
-    pushed: &mut HashSet<Digest>,
+    pushed: &Pushed,
     digest: &Digest,
     tag: Option<&str>,
     body: Vec<u8>,
@@ -229,12 +238,13 @@ async fn push_reached(
     Ok(PushOutcome::Pushed)
 }
 
-/// Push every child manifest of an index the job has not pushed yet, one at a
-/// time and depth first, so each lands before any index naming it. The caller
-/// awaits this before the parent PUT.
+/// Push every child manifest of an index, so each lands before the index the
+/// caller PUTs once this returns. The root index's children push
+/// concurrently; deeper levels go one at a time, since each level holds its
+/// body while its children push and per-level fan-out would compound.
 async fn push_child_manifests(
     ctx: &PushContext<'_>,
-    pushed: &mut HashSet<Digest>,
+    pushed: &Pushed,
     manifest: &Manifest,
     digest: &Digest,
 ) -> Result<(), Error> {
@@ -252,29 +262,67 @@ async fn push_child_manifests(
         index_depth: ctx.index_depth + 1,
         ..*ctx
     };
+    let concurrency = if ctx.index_depth == 0 {
+        ctx.downstream.max_concurrent_pushes.max(1)
+    } else {
+        1
+    };
 
-    for child in manifests.iter().map(|child| &child.digest) {
-        if !pushed.insert(child.clone()) {
-            continue;
-        }
-        // A manifest PUT only checks that a child's bytes exist, never that
-        // they parse, so a child may name a layer of any size; the size comes
-        // with the stream and is the cheap question, asked first.
-        let (mut reader, size) = ctx.blob_store.reader(child, None).await.map_err(|e| {
-            Error::Internal(format!("failed to open local manifest blob '{child}': {e}"))
-        })?;
-        if size > DEFAULT_MAX_MANIFEST_SIZE_BYTES as u64 {
-            return Err(Error::InvalidManifest(format!(
-                "index child '{child}' is {size} bytes, over the \
-                 {DEFAULT_MAX_MANIFEST_SIZE_BYTES}-byte manifest limit"
-            )));
-        }
-        let mut child_body = Vec::new();
-        reader.read_to_end(&mut child_body).await.map_err(|e| {
-            Error::Internal(format!("failed to read local manifest blob '{child}': {e}"))
-        })?;
-        Box::pin(push_reached(child_ctx, pushed, child, None, child_body)).await?;
+    let mut seen = HashSet::new();
+    let children: Vec<Digest> = manifests
+        .iter()
+        .map(|child| &child.digest)
+        .filter(|child| seen.insert(*child))
+        .cloned()
+        .collect();
+    let results = stream::iter(children)
+        .map(|child| async move { push_child_once(child_ctx, pushed, &child).await })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+    // Drained fully before failing, so siblings are not stranded mid-push.
+    results.into_iter().collect()
+}
+
+/// Push `child` unless the job already did. A child several indexes name is
+/// pushed by the first to reach it while the others wait on that push, so
+/// none PUTs before its child lands; a failed push leaves the next to retry.
+async fn push_child_once(
+    ctx: &PushContext<'_>,
+    pushed: &Pushed,
+    child: &Digest,
+) -> Result<(), Error> {
+    let cell = pushed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(child.clone())
+        .or_default()
+        .clone();
+    cell.get_or_try_init(|| push_child(ctx, pushed, child))
+        .await?;
+    Ok(())
+}
+
+/// Read one index child's body from the local store and push it.
+async fn push_child(ctx: &PushContext<'_>, pushed: &Pushed, child: &Digest) -> Result<(), Error> {
+    // A manifest PUT only checks that a child's bytes exist, never that
+    // they parse, so a child may name a layer of any size; the size comes
+    // with the stream and is the cheap question, asked first.
+    let (mut reader, size) = ctx.blob_store.reader(child, None).await.map_err(|e| {
+        Error::Internal(format!("failed to open local manifest blob '{child}': {e}"))
+    })?;
+    if size > DEFAULT_MAX_MANIFEST_SIZE_BYTES as u64 {
+        return Err(Error::InvalidManifest(format!(
+            "index child '{child}' is {size} bytes, over the \
+             {DEFAULT_MAX_MANIFEST_SIZE_BYTES}-byte manifest limit"
+        )));
     }
+    let mut child_body = Vec::new();
+    reader.read_to_end(&mut child_body).await.map_err(|e| {
+        Error::Internal(format!("failed to read local manifest blob '{child}': {e}"))
+    })?;
+    Box::pin(push_reached(ctx, pushed, child, None, child_body)).await?;
     Ok(())
 }
 
@@ -329,26 +377,25 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
     // Existence-only probe: any 2xx means present, so a converged blob never
     // dead-letters on a downstream that omits `Docker-Content-Digest`. A
     // transient failure fails the push so the job retries rather than starting
-    // a pointless full upload.
-    if ctx
-        .downstream
-        .registry_client
-        .blob_exists(HeadBlobRequest {
+    // a pointless full upload. The local mount lookup runs alongside it to save
+    // a round trip on the upload path.
+    let (exists, mount_from) = join(
+        ctx.downstream.registry_client.blob_exists(HeadBlobRequest {
             namespace: ctx.downstream_namespace.clone(),
             digest: digest.clone(),
             accepted_types: Vec::new(),
-        })
-        .await?
-    {
+        }),
+        mount_candidate(ctx.metadata_store, ctx.namespace, digest, ctx.downstream),
+    )
+    .await;
+    if exists? {
         debug!(namespace = %ctx.namespace, %digest, "Blob already present on downstream; skipping");
         return Ok(());
     }
 
     // The mount is a pure optimization: a miss opens a session and a policy
     // rejection falls through to a plain upload, so it can never fail the push.
-    if let Some(from) =
-        mount_candidate(ctx.metadata_store, ctx.namespace, digest, ctx.downstream).await
-    {
+    if let Some(from) = mount_from {
         match ctx
             .downstream
             .registry_client
@@ -386,48 +433,36 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
     upload_into_session(ctx, digest, &session).await
 }
 
-/// Streams a local blob's bytes into an already-open upload session and
-/// finalizes it.
+/// Streams a local blob's bytes into an already-open upload session with the
+/// committing `PUT`.
 async fn upload_into_session(
     ctx: &PushContext<'_>,
     digest: &Digest,
     session: &UploadSession,
 ) -> Result<(), Error> {
+    let client = &ctx.downstream.registry_client;
     let (reader, content_length) = match ctx.blob_store.reader(digest, None).await {
         Ok(reader) => reader,
         Err(e) => {
             // The session is already open; cancel it so a dying push does not
             // strand it on the downstream.
-            cancel_upload_session(&ctx.downstream.registry_client, &session.url).await;
+            cancel_upload_session(client, &session.url).await;
             return Err(Error::Internal(format!(
                 "failed to open local blob '{digest}': {e}"
             )));
         }
     };
-    let patched_url = match ctx
-        .downstream
-        .registry_client
-        .patch_upload(
+    if let Err(e) = client
+        .put_upload(
             &session.url,
             session.auth.as_deref(),
+            digest,
             content_length,
             reader,
         )
         .await
     {
-        Ok(url) => url,
-        Err(e) => {
-            cancel_upload_session(&ctx.downstream.registry_client, &session.url).await;
-            return Err(Error::Client(e));
-        }
-    };
-    if let Err(e) = ctx
-        .downstream
-        .registry_client
-        .complete_upload(&patched_url, digest)
-        .await
-    {
-        cancel_upload_session(&ctx.downstream.registry_client, &patched_url).await;
+        cancel_upload_session(client, &session.url).await;
         return Err(Error::Client(e));
     }
 

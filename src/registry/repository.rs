@@ -25,8 +25,8 @@ use crate::{
     scan::ScanAction,
 };
 
-/// Fallback per-manifest blob-push concurrency when a downstream omits
-/// `max_concurrent_pushes`.
+/// Fallback per-manifest blob-push and top-level child-manifest concurrency
+/// when a downstream omits `max_concurrent_pushes`.
 const DEFAULT_MAX_CONCURRENT_PUSHES: usize = 4;
 
 /// Split a registry URL (upstream or downstream) into the registry base (talked

@@ -520,7 +520,7 @@ Array of downstream registries to which this repository's mutations are replicat
 | `url`                   | string   | required           | Downstream registry URL. A bare host (`http://host:8000`) mirrors the namespace verbatim; a path (`http://host:8000/team`) becomes the namespace prefix the content lands under, replacing the source repository prefix (`<repo>/x` → `team/x`). The repository root `<repo>` itself maps to `<repo>` for a bare host and to `<path>` for a path URL. Angos serves the OCI API at the root, so the path is mapped into the namespace, not the HTTP path. |
 | `mode`                  | string   | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"`              |
 | `namespace_filter`      | [string] | `[]` (all)         | Regex patterns; a namespace replicates here only if it matches one       |
-| `max_concurrent_pushes` | usize    | `4`                | Concurrent blob pushes per manifest for this downstream (positive integer, >= 1) |
+| `max_concurrent_pushes` | usize    | `4`                | Concurrent blob pushes per manifest, and concurrent child-manifest pushes per top-level index, for this downstream (positive integer, >= 1) |
 | `prune`                 | bool     | `false`            | When `true`, reconciliation also deletes downstream-only tags (authoritative one-way mirror; unsafe for active-active peers) |
 | `max_redirect`          | u8       | `5`                | Maximum redirects to follow                                              |
 | `connect_timeout_secs`  | u64      | `30`               | Timeout for establishing the connection (TCP + TLS handshake)            |
