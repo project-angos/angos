@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Job workers in one process no longer contend for the same pending jobs, so queue draining scales with `max_concurrent_*_jobs`.
+- Job workers start each claim at a random point of the queue head, so several worker replicas rarely race for the same job.
 
 ## 1.12.4
 

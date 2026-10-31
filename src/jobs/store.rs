@@ -457,6 +457,10 @@ pub trait JobHandler: Send + Sync {
 /// claim serialization, which is the actual correctness primitive.
 const MAX_SCAN: u16 = 1000;
 
+/// Width of the queue head a claim starts from at a random offset, sized above
+/// the claim loops of several replicas so they rarely pick the same job.
+const CLAIM_SPREAD: usize = 64;
+
 /// Cap on the pending/failed gauges. The gauge feeds autoscaling, which needs
 /// only ordinal granularity at high depth, and the cap bounds S3 `LIST` cost per
 /// refresh tick; read the cap value as "at least this many".
@@ -1142,21 +1146,25 @@ impl JobStore {
         }
     }
 
-    /// Walk pending keys in ascending `not_before` order and claim the first
-    /// ready one, stopping at the first key scheduled in the future and
-    /// reporting that instant as `next_ready`.
+    /// Walk the ready pending keys and claim the first one that is free, the
+    /// oldest [`CLAIM_SPREAD`] from a random offset so concurrent claimants do
+    /// not all race for the queue head. The first key scheduled in the future
+    /// ends the walk and is reported as `next_ready`.
     async fn try_claim_one(&self, queue: Queue) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
-        let mut next_ready: Option<DateTime<Utc>> = None;
-        for storage_key in self.list_pending(queue, MAX_SCAN).await? {
-            // The filename prefix is the readiness signal, so a backed-off entry
-            // never costs a body GET.
-            if let Some(not_before) = parse_not_before(&storage_key)
-                && not_before > now
-            {
-                next_ready = Some(not_before);
-                break;
-            }
+        let mut keys = self.list_pending(queue, MAX_SCAN).await?;
+        // The filename prefix is the readiness signal, so a backed-off entry
+        // never costs a body GET.
+        let ready = keys
+            .iter()
+            .position(|key| parse_not_before(key).is_some_and(|not_before| not_before > now))
+            .unwrap_or(keys.len());
+        let next_ready = keys.get(ready).and_then(|key| parse_not_before(key));
+        keys.truncate(ready);
+        let spread = ready.min(CLAIM_SPREAD);
+        let offset = usize::try_from(jitter_below(spread as u64)).unwrap_or(0);
+        keys[..spread].rotate_left(offset);
+        for storage_key in keys {
             let Some(reservation) = self.reserve(&storage_key) else {
                 continue;
             };

@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -22,12 +22,12 @@ use angos_storage::{
 };
 
 use crate::jobs::store::{
-    ClaimCheck, ClaimMode, ClaimedJob, CompleteOutcome, DeadLetterRecord, Error, FailOutcome,
-    JOBS_ROOT, JobEnvelope, JobQueueConfig, JobRetryPolicy, JobState, JobStore, LockKey,
-    MAX_REPORTED_PENDING, Queue, QueueDepthRefresh, STORAGE_KEY_PREFIX_LEN, ensure_claim_support,
-    job_claim_path, job_lock_key_index_path, job_pending_path, make_storage_key,
-    parse_lock_key_index, parse_not_before, queue_depth_refresh_loop, serialize_lock_key_index,
-    should_cancel_claim,
+    CLAIM_SPREAD, ClaimCheck, ClaimMode, ClaimedJob, CompleteOutcome, DeadLetterRecord, Error,
+    FailOutcome, JOBS_ROOT, JobEnvelope, JobQueueConfig, JobRetryPolicy, JobState, JobStore,
+    LockKey, MAX_REPORTED_PENDING, Queue, QueueDepthRefresh, STORAGE_KEY_PREFIX_LEN,
+    ensure_claim_support, job_claim_path, job_lock_key_index_path, job_pending_path,
+    make_storage_key, parse_lock_key_index, parse_not_before, queue_depth_refresh_loop,
+    serialize_lock_key_index, should_cancel_claim,
 };
 use crate::metrics_provider;
 use crate::registry::{Error as RegistryError, test_utils::metadata_store_over};
@@ -810,22 +810,19 @@ async fn a_held_claim_blocks_a_second_claimant() {
     );
 }
 
-/// Counts the store reads and writes touching one job's pending file or claim.
-struct CountJobOps {
-    needles: [String; 2],
-    ops: Arc<AtomicUsize>,
+/// Records the keys of every store read and write.
+struct RecordKeys {
+    keys: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
-impl StoreHook for CountJobOps {
+impl StoreHook for RecordKeys {
     async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
-        if let StoreOp::Get { key } | StoreOp::Put { key, .. } = op
-            && self
-                .needles
-                .iter()
-                .any(|needle| key.contains(needle.as_str()))
-        {
-            self.ops.fetch_add(1, Ordering::SeqCst);
+        if let StoreOp::Get { key } | StoreOp::Put { key, .. } = op {
+            self.keys
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(key.to_string());
         }
         Ok(())
     }
@@ -835,37 +832,58 @@ impl StoreHook for CountJobOps {
 async fn a_sibling_loop_skips_a_locally_held_job_without_store_io() {
     metrics_provider::init_for_tests();
     let (inner, _dir) = fs_store();
-    let held = dummy_envelope("cache.ns:sha256:held");
-    let ops = Arc::new(AtomicUsize::new(0));
-    let hook = CountJobOps {
-        needles: [held.id.clone(), job_claim_path(&held.lock_key)],
-        ops: ops.clone(),
-    };
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let hook = RecordKeys { keys: keys.clone() };
     let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(inner, hook));
     let store = JobStore::new(
         &metadata_store_over(hooked),
         "test-worker",
         ClaimMode::Atomic,
     );
-    store.enqueue(held).await.expect("enqueue held");
-    store
-        .enqueue(dummy_envelope("cache.ns:sha256:next"))
-        .await
-        .expect("enqueue next");
+    for job in ["cache.ns:sha256:a", "cache.ns:sha256:b"] {
+        store.enqueue(dummy_envelope(job)).await.expect("enqueue");
+    }
 
     let first = store.claim_one(Queue::Cache).await.expect("claim").claimed;
-    let _first = first.expect("the head job is claimed");
-    let ops_after_first = ops.load(Ordering::SeqCst);
+    let first = first.expect("a job is claimed");
+    let seen = keys.lock().unwrap_or_else(PoisonError::into_inner).len();
 
     let second = store.claim_one(Queue::Cache).await.expect("claim").claimed;
-    assert_eq!(
-        second.expect("the next job is claimed").envelope.lock_key,
-        lock_key("cache.ns:sha256:next")
-    );
-    assert_eq!(
-        ops.load(Ordering::SeqCst),
-        ops_after_first,
+    let second = second.expect("the other job is claimed");
+    assert_ne!(second.envelope.lock_key, first.envelope.lock_key);
+    let held = [
+        first.envelope.id.clone(),
+        job_claim_path(&first.envelope.lock_key),
+    ];
+    let touched = keys.lock().unwrap_or_else(PoisonError::into_inner)[seen..]
+        .iter()
+        .any(|key| held.iter().any(|needle| key.contains(needle.as_str())));
+    assert!(
+        !touched,
         "the second claim must not touch the job a sibling loop holds"
+    );
+}
+
+#[tokio::test]
+async fn claims_do_not_all_start_at_the_queue_head() {
+    let h = harness();
+    for i in 0..CLAIM_SPREAD {
+        h.store
+            .enqueue(dummy_envelope(&format!("cache.ns:sha256:spread-{i}")))
+            .await
+            .expect("enqueue");
+    }
+    let head: Vec<String> = h.store.list_pending(Queue::Cache, 10).await.expect("list");
+
+    let mut claimed = Vec::new();
+    for _ in 0..head.len() {
+        let job = h.store.claim_one(Queue::Cache).await.expect("claim");
+        claimed.push(job.claimed.expect("a ready job is claimed"));
+    }
+    let order: Vec<&str> = claimed.iter().map(|job| job.storage_key.as_str()).collect();
+    assert_ne!(
+        order, head,
+        "claims must spread over the queue head instead of taking it in order"
     );
 }
 
