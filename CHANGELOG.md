@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Outbound HTTPS trusts only the system CA bundle (`SSL_CERT_FILE`, else `/etc/ssl/certs/ca-certificates.crt`) and a section's `server_ca_bundle`, no longer going through the platform verifier.
 
+### Fixed
+
+- Job workers in one process no longer contend for the same pending jobs, so queue draining scales with `max_concurrent_*_jobs`.
+
 ## 1.12.4
 
 ### Changed

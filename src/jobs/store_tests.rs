@@ -810,6 +810,65 @@ async fn a_held_claim_blocks_a_second_claimant() {
     );
 }
 
+/// Counts the store reads and writes touching one job's pending file or claim.
+struct CountJobOps {
+    needles: [String; 2],
+    ops: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StoreHook for CountJobOps {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        if let StoreOp::Get { key } | StoreOp::Put { key, .. } = op
+            && self
+                .needles
+                .iter()
+                .any(|needle| key.contains(needle.as_str()))
+        {
+            self.ops.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_sibling_loop_skips_a_locally_held_job_without_store_io() {
+    metrics_provider::init_for_tests();
+    let (inner, _dir) = fs_store();
+    let held = dummy_envelope("cache.ns:sha256:held");
+    let ops = Arc::new(AtomicUsize::new(0));
+    let hook = CountJobOps {
+        needles: [held.id.clone(), job_claim_path(&held.lock_key)],
+        ops: ops.clone(),
+    };
+    let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(inner, hook));
+    let store = JobStore::new(
+        &metadata_store_over(hooked),
+        "test-worker",
+        ClaimMode::Atomic,
+    );
+    store.enqueue(held).await.expect("enqueue held");
+    store
+        .enqueue(dummy_envelope("cache.ns:sha256:next"))
+        .await
+        .expect("enqueue next");
+
+    let first = store.claim_one(Queue::Cache).await.expect("claim").claimed;
+    let _first = first.expect("the head job is claimed");
+    let ops_after_first = ops.load(Ordering::SeqCst);
+
+    let second = store.claim_one(Queue::Cache).await.expect("claim").claimed;
+    assert_eq!(
+        second.expect("the next job is claimed").envelope.lock_key,
+        lock_key("cache.ns:sha256:next")
+    );
+    assert_eq!(
+        ops.load(Ordering::SeqCst),
+        ops_after_first,
+        "the second claim must not touch the job a sibling loop holds"
+    );
+}
+
 // =========================================================================
 // Keyset pagination + administrative mutations
 // =========================================================================
