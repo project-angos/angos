@@ -9,7 +9,10 @@
 use std::{collections::HashSet, sync::Arc};
 
 use chrono::{DateTime, Utc};
-use futures_util::stream::{self, StreamExt};
+use futures_util::{
+    future::join,
+    stream::{self, StreamExt},
+};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
 
@@ -329,26 +332,25 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
     // Existence-only probe: any 2xx means present, so a converged blob never
     // dead-letters on a downstream that omits `Docker-Content-Digest`. A
     // transient failure fails the push so the job retries rather than starting
-    // a pointless full upload.
-    if ctx
-        .downstream
-        .registry_client
-        .blob_exists(HeadBlobRequest {
+    // a pointless full upload. The local mount lookup runs alongside it to save
+    // a round trip on the upload path.
+    let (exists, mount_from) = join(
+        ctx.downstream.registry_client.blob_exists(HeadBlobRequest {
             namespace: ctx.downstream_namespace.clone(),
             digest: digest.clone(),
             accepted_types: Vec::new(),
-        })
-        .await?
-    {
+        }),
+        mount_candidate(ctx.metadata_store, ctx.namespace, digest, ctx.downstream),
+    )
+    .await;
+    if exists? {
         debug!(namespace = %ctx.namespace, %digest, "Blob already present on downstream; skipping");
         return Ok(());
     }
 
     // The mount is a pure optimization: a miss opens a session and a policy
     // rejection falls through to a plain upload, so it can never fail the push.
-    if let Some(from) =
-        mount_candidate(ctx.metadata_store, ctx.namespace, digest, ctx.downstream).await
-    {
+    if let Some(from) = mount_from {
         match ctx
             .downstream
             .registry_client
@@ -386,48 +388,36 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
     upload_into_session(ctx, digest, &session).await
 }
 
-/// Streams a local blob's bytes into an already-open upload session and
-/// finalizes it.
+/// Streams a local blob's bytes into an already-open upload session with the
+/// committing `PUT`.
 async fn upload_into_session(
     ctx: &PushContext<'_>,
     digest: &Digest,
     session: &UploadSession,
 ) -> Result<(), Error> {
+    let client = &ctx.downstream.registry_client;
     let (reader, content_length) = match ctx.blob_store.reader(digest, None).await {
         Ok(reader) => reader,
         Err(e) => {
             // The session is already open; cancel it so a dying push does not
             // strand it on the downstream.
-            cancel_upload_session(&ctx.downstream.registry_client, &session.url).await;
+            cancel_upload_session(client, &session.url).await;
             return Err(Error::Internal(format!(
                 "failed to open local blob '{digest}': {e}"
             )));
         }
     };
-    let patched_url = match ctx
-        .downstream
-        .registry_client
-        .patch_upload(
+    if let Err(e) = client
+        .put_upload(
             &session.url,
             session.auth.as_deref(),
+            digest,
             content_length,
             reader,
         )
         .await
     {
-        Ok(url) => url,
-        Err(e) => {
-            cancel_upload_session(&ctx.downstream.registry_client, &session.url).await;
-            return Err(Error::Client(e));
-        }
-    };
-    if let Err(e) = ctx
-        .downstream
-        .registry_client
-        .complete_upload(&patched_url, digest)
-        .await
-    {
-        cancel_upload_session(&ctx.downstream.registry_client, &patched_url).await;
+        cancel_upload_session(client, &session.url).await;
         return Err(Error::Client(e));
     }
 
