@@ -4,7 +4,9 @@ use angos_docker_extension_service::{Endpoint as DockerEndpoint, parse as parse_
 use angos_extension_service::{Endpoint as AngosEndpoint, parse as parse_angos};
 use angos_oci::Namespace;
 use angos_oci::path::API_PREFIX;
-use angos_oci_service::{Endpoint as OciEndpoint, parse as parse_oci};
+use angos_oci_service::{
+    Endpoint as OciEndpoint, ManifestEndpoint, UploadEndpoint, parse as parse_oci,
+};
 
 use crate::identity::Action;
 use crate::jobs::{JobState, Queue};
@@ -119,8 +121,10 @@ impl Route {
             Route::Oci(
                 OciEndpoint::GetBlob { namespace, .. }
                 | OciEndpoint::HeadBlob { namespace, .. }
-                | OciEndpoint::GetManifest { namespace, .. }
-                | OciEndpoint::HeadManifest { namespace, .. }
+                | OciEndpoint::Manifest(
+                    ManifestEndpoint::Get { namespace, .. }
+                    | ManifestEndpoint::Head { namespace, .. },
+                )
                 | OciEndpoint::ListTags { namespace, .. }
                 | OciEndpoint::GetReferrers { namespace, .. },
             ) => Some(namespace),
@@ -153,27 +157,27 @@ impl From<OciEndpoint> for Action {
     fn from(endpoint: OciEndpoint) -> Self {
         match endpoint {
             OciEndpoint::CheckVersion => Action::ApiVersion,
-            OciEndpoint::GetManifest {
+            OciEndpoint::Manifest(ManifestEndpoint::Get {
                 namespace,
                 reference,
-            } => Action::GetManifest {
-                namespace,
-                reference,
-            },
-            OciEndpoint::HeadManifest {
-                namespace,
-                reference,
-            } => Action::HeadManifest {
+            }) => Action::GetManifest {
                 namespace,
                 reference,
             },
-            OciEndpoint::PutManifest { namespace, target } => {
+            OciEndpoint::Manifest(ManifestEndpoint::Head {
+                namespace,
+                reference,
+            }) => Action::HeadManifest {
+                namespace,
+                reference,
+            },
+            OciEndpoint::Manifest(ManifestEndpoint::Put { namespace, target }) => {
                 Action::PutManifest { namespace, target }
             }
-            OciEndpoint::DeleteManifest {
+            OciEndpoint::Manifest(ManifestEndpoint::Delete {
                 namespace,
                 reference,
-            } => Action::DeleteManifest {
+            }) => Action::DeleteManifest {
                 namespace,
                 reference,
             },
@@ -182,51 +186,51 @@ impl From<OciEndpoint> for Action {
             OciEndpoint::DeleteBlob { namespace, digest } => {
                 Action::DeleteBlob { namespace, digest }
             }
-            OciEndpoint::StartUpload {
+            OciEndpoint::Upload(UploadEndpoint::Start {
                 namespace,
                 digest,
                 digest_algorithm,
-            } => Action::StartUpload {
+            }) => Action::StartUpload {
                 namespace,
                 digest,
                 digest_algorithm,
             },
-            OciEndpoint::MountBlob {
+            OciEndpoint::Upload(UploadEndpoint::Mount {
                 namespace,
                 digest,
                 from,
-            } => Action::MountBlob {
+            }) => Action::MountBlob {
                 namespace,
                 digest,
                 from,
             },
-            OciEndpoint::GetUpload {
+            OciEndpoint::Upload(UploadEndpoint::Get {
                 namespace,
                 session_id,
-            } => Action::GetUpload {
-                namespace,
-                session_id,
-            },
-            OciEndpoint::PatchUpload {
-                namespace,
-                session_id,
-            } => Action::PatchUpload {
+            }) => Action::GetUpload {
                 namespace,
                 session_id,
             },
-            OciEndpoint::PutUpload {
+            OciEndpoint::Upload(UploadEndpoint::Patch {
+                namespace,
+                session_id,
+            }) => Action::PatchUpload {
+                namespace,
+                session_id,
+            },
+            OciEndpoint::Upload(UploadEndpoint::Put {
                 namespace,
                 session_id,
                 digest,
-            } => Action::PutUpload {
+            }) => Action::PutUpload {
                 namespace,
                 session_id,
                 digest,
             },
-            OciEndpoint::DeleteUpload {
+            OciEndpoint::Upload(UploadEndpoint::Delete {
                 namespace,
                 session_id,
-            } => Action::DeleteUpload {
+            }) => Action::DeleteUpload {
                 namespace,
                 session_id,
             },

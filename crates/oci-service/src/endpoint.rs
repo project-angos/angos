@@ -26,26 +26,7 @@ use angos_oci::request::ManifestPutTarget;
 pub enum Endpoint {
     /// `GET`/`HEAD /v2/`, end-1.
     CheckVersion,
-    /// `GET /v2/<name>/manifests/<reference>`, end-3.
-    GetManifest {
-        namespace: Namespace,
-        reference: Reference,
-    },
-    /// `HEAD /v2/<name>/manifests/<reference>`, end-3.
-    HeadManifest {
-        namespace: Namespace,
-        reference: Reference,
-    },
-    /// `PUT /v2/<name>/manifests/<reference>`, end-7.
-    PutManifest {
-        namespace: Namespace,
-        target: ManifestPutTarget,
-    },
-    /// `DELETE /v2/<name>/manifests/<reference>`, end-9.
-    DeleteManifest {
-        namespace: Namespace,
-        reference: Reference,
-    },
+    Manifest(ManifestEndpoint),
     /// `GET /v2/<name>/blobs/<digest>`, end-2.
     GetBlob {
         namespace: Namespace,
@@ -61,39 +42,7 @@ pub enum Endpoint {
         namespace: Namespace,
         digest: Digest,
     },
-    /// `POST /v2/<name>/blobs/uploads/`, end-4a/4b.
-    StartUpload {
-        namespace: Namespace,
-        digest: Option<Digest>,
-        digest_algorithm: Option<Algorithm>,
-    },
-    /// `POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<name>`, end-11.
-    MountBlob {
-        namespace: Namespace,
-        digest: Digest,
-        from: Option<Namespace>,
-    },
-    /// `GET /v2/<name>/blobs/uploads/<session>`, end-13.
-    GetUpload {
-        namespace: Namespace,
-        session_id: UploadSessionId,
-    },
-    /// `PATCH /v2/<name>/blobs/uploads/<session>`, end-5.
-    PatchUpload {
-        namespace: Namespace,
-        session_id: UploadSessionId,
-    },
-    /// `PUT /v2/<name>/blobs/uploads/<session>?digest=<digest>`, end-6.
-    PutUpload {
-        namespace: Namespace,
-        session_id: UploadSessionId,
-        digest: Digest,
-    },
-    /// `DELETE /v2/<name>/blobs/uploads/<session>`.
-    DeleteUpload {
-        namespace: Namespace,
-        session_id: UploadSessionId,
-    },
+    Upload(UploadEndpoint),
     /// `GET /v2/<name>/tags/list`, end-8.
     ListTags {
         namespace: Namespace,
@@ -109,27 +58,110 @@ pub enum Endpoint {
     },
 }
 
+/// An operation on `/v2/<name>/manifests/<reference>`.
+#[derive(Clone, Debug)]
+pub enum ManifestEndpoint {
+    /// `GET /v2/<name>/manifests/<reference>`, end-3.
+    Get {
+        namespace: Namespace,
+        reference: Reference,
+    },
+    /// `HEAD /v2/<name>/manifests/<reference>`, end-3.
+    Head {
+        namespace: Namespace,
+        reference: Reference,
+    },
+    /// `PUT /v2/<name>/manifests/<reference>`, end-7.
+    Put {
+        namespace: Namespace,
+        target: ManifestPutTarget,
+    },
+    /// `DELETE /v2/<name>/manifests/<reference>`, end-9.
+    Delete {
+        namespace: Namespace,
+        reference: Reference,
+    },
+}
+
+/// An operation on `/v2/<name>/blobs/uploads/`.
+#[derive(Clone, Debug)]
+pub enum UploadEndpoint {
+    /// `POST /v2/<name>/blobs/uploads/`, end-4a/4b.
+    Start {
+        namespace: Namespace,
+        digest: Option<Digest>,
+        digest_algorithm: Option<Algorithm>,
+    },
+    /// `POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<name>`, end-11.
+    Mount {
+        namespace: Namespace,
+        digest: Digest,
+        from: Option<Namespace>,
+    },
+    /// `GET /v2/<name>/blobs/uploads/<session>`, end-13.
+    Get {
+        namespace: Namespace,
+        session_id: UploadSessionId,
+    },
+    /// `PATCH /v2/<name>/blobs/uploads/<session>`, end-5.
+    Patch {
+        namespace: Namespace,
+        session_id: UploadSessionId,
+    },
+    /// `PUT /v2/<name>/blobs/uploads/<session>?digest=<digest>`, end-6.
+    Put {
+        namespace: Namespace,
+        session_id: UploadSessionId,
+        digest: Digest,
+    },
+    /// `DELETE /v2/<name>/blobs/uploads/<session>`.
+    Delete {
+        namespace: Namespace,
+        session_id: UploadSessionId,
+    },
+}
+
 impl Endpoint {
     /// A stable, per-endpoint name for logs and metrics.
     #[must_use]
     pub fn endpoint_name(&self) -> &'static str {
         match self {
             Endpoint::CheckVersion => "check-version",
-            Endpoint::GetManifest { .. } => "get-manifest",
-            Endpoint::HeadManifest { .. } => "head-manifest",
-            Endpoint::PutManifest { .. } => "put-manifest",
-            Endpoint::DeleteManifest { .. } => "delete-manifest",
+            Endpoint::Manifest(endpoint) => endpoint.endpoint_name(),
             Endpoint::GetBlob { .. } => "get-blob",
             Endpoint::HeadBlob { .. } => "head-blob",
             Endpoint::DeleteBlob { .. } => "delete-blob",
-            Endpoint::StartUpload { .. } => "start-upload",
-            Endpoint::MountBlob { .. } => "mount-blob",
-            Endpoint::GetUpload { .. } => "get-upload",
-            Endpoint::PatchUpload { .. } => "patch-upload",
-            Endpoint::PutUpload { .. } => "put-upload",
-            Endpoint::DeleteUpload { .. } => "delete-upload",
+            Endpoint::Upload(endpoint) => endpoint.endpoint_name(),
             Endpoint::ListTags { .. } => "list-tags",
             Endpoint::GetReferrers { .. } => "get-referrers",
+        }
+    }
+}
+
+impl ManifestEndpoint {
+    /// A stable, per-endpoint name for logs and metrics.
+    #[must_use]
+    pub fn endpoint_name(&self) -> &'static str {
+        match self {
+            ManifestEndpoint::Get { .. } => "get-manifest",
+            ManifestEndpoint::Head { .. } => "head-manifest",
+            ManifestEndpoint::Put { .. } => "put-manifest",
+            ManifestEndpoint::Delete { .. } => "delete-manifest",
+        }
+    }
+}
+
+impl UploadEndpoint {
+    /// A stable, per-endpoint name for logs and metrics.
+    #[must_use]
+    pub fn endpoint_name(&self) -> &'static str {
+        match self {
+            UploadEndpoint::Start { .. } => "start-upload",
+            UploadEndpoint::Mount { .. } => "mount-blob",
+            UploadEndpoint::Get { .. } => "get-upload",
+            UploadEndpoint::Patch { .. } => "patch-upload",
+            UploadEndpoint::Put { .. } => "put-upload",
+            UploadEndpoint::Delete { .. } => "delete-upload",
         }
     }
 }
@@ -222,17 +254,17 @@ fn try_upload(method: &Method, path: &str, params: Option<&str>) -> Option<Endpo
         // syntactically invalid ones, so a malformed query is a 400.
         let query: MountQuery = parse_query(params)?;
         if let Some(digest) = query.mount {
-            return Some(Endpoint::MountBlob {
+            return Some(Endpoint::Upload(UploadEndpoint::Mount {
                 namespace,
                 digest,
                 from: query.from,
-            });
+            }));
         }
-        return Some(Endpoint::StartUpload {
+        return Some(Endpoint::Upload(UploadEndpoint::Start {
             namespace,
             digest: query.digest,
             digest_algorithm: query.digest_algorithm,
-        });
+        }));
     }
 
     let (namespace_str, session_id) = path.rsplit_once(UPLOADS)?;
@@ -240,23 +272,23 @@ fn try_upload(method: &Method, path: &str, params: Option<&str>) -> Option<Endpo
     let session_id = UploadSessionId::from_str(session_id).ok()?;
 
     match *method {
-        Method::GET => Some(Endpoint::GetUpload {
+        Method::GET => Some(Endpoint::Upload(UploadEndpoint::Get {
             namespace,
             session_id,
-        }),
-        Method::PATCH => Some(Endpoint::PatchUpload {
+        })),
+        Method::PATCH => Some(Endpoint::Upload(UploadEndpoint::Patch {
             namespace,
             session_id,
-        }),
-        Method::PUT => Some(Endpoint::PutUpload {
+        })),
+        Method::PUT => Some(Endpoint::Upload(UploadEndpoint::Put {
             namespace,
             session_id,
             digest: parse_query::<DigestQuery>(params)?.digest?,
-        }),
-        Method::DELETE => Some(Endpoint::DeleteUpload {
+        })),
+        Method::DELETE => Some(Endpoint::Upload(UploadEndpoint::Delete {
             namespace,
             session_id,
-        }),
+        })),
         _ => None,
     }
 }
@@ -278,14 +310,14 @@ fn try_manifests(method: &Method, path: &str, params: Option<&str>) -> Option<En
     let namespace = Namespace::new(namespace_str).ok()?;
     let reference = Reference::from_str(reference).ok()?;
     match *method {
-        Method::GET => Some(Endpoint::GetManifest {
+        Method::GET => Some(Endpoint::Manifest(ManifestEndpoint::Get {
             namespace,
             reference,
-        }),
-        Method::HEAD => Some(Endpoint::HeadManifest {
+        })),
+        Method::HEAD => Some(Endpoint::Manifest(ManifestEndpoint::Head {
             namespace,
             reference,
-        }),
+        })),
         Method::PUT => {
             // `?tag=` applies only to a by-digest push; a by-tag push ignores
             // it. Strict parse: a single invalid tag rejects the PUT.
@@ -296,12 +328,15 @@ fn try_manifests(method: &Method, path: &str, params: Option<&str>) -> Option<En
                     tags: parse_query::<TagQuery>(params)?.tag.into_iter().collect(),
                 },
             };
-            Some(Endpoint::PutManifest { namespace, target })
+            Some(Endpoint::Manifest(ManifestEndpoint::Put {
+                namespace,
+                target,
+            }))
         }
-        Method::DELETE => Some(Endpoint::DeleteManifest {
+        Method::DELETE => Some(Endpoint::Manifest(ManifestEndpoint::Delete {
             namespace,
             reference,
-        }),
+        })),
         _ => None,
     }
 }
@@ -378,7 +413,7 @@ mod tests {
 
     #[test]
     fn manifest_put_by_tag_takes_no_extra_tags() {
-        let Some(Endpoint::PutManifest { target, .. }) =
+        let Some(Endpoint::Manifest(ManifestEndpoint::Put { target, .. })) =
             parse(&Method::PUT, "/v2/app/manifests/latest", Some("tag=v1"))
         else {
             panic!("expected a by-tag put");
@@ -391,7 +426,7 @@ mod tests {
     fn start_upload_and_mount() {
         assert!(matches!(
             parse(&Method::POST, "/v2/app/blobs/uploads/", None),
-            Some(Endpoint::StartUpload { .. })
+            Some(Endpoint::Upload(UploadEndpoint::Start { .. }))
         ));
         let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert!(matches!(
@@ -400,7 +435,10 @@ mod tests {
                 "/v2/app/blobs/uploads/",
                 Some(&format!("mount={d}&from=other"))
             ),
-            Some(Endpoint::MountBlob { from: Some(_), .. })
+            Some(Endpoint::Upload(UploadEndpoint::Mount {
+                from: Some(_),
+                ..
+            }))
         ));
     }
 
@@ -422,12 +460,12 @@ mod tests {
         // POST with the spec's trailing slash opens a session under the namespace.
         assert!(matches!(
             parse(&Method::POST, "/v2/myrepo/app/blobs/uploads/", None),
-            Some(Endpoint::StartUpload { namespace, digest: None, .. }) if namespace == ns("myrepo/app")
+            Some(Endpoint::Upload(UploadEndpoint::Start { namespace, digest: None, .. })) if namespace == ns("myrepo/app")
         ));
         // Nested namespace parses correctly.
         assert!(matches!(
             parse(&Method::POST, "/v2/org/team/blobs/uploads/", None),
-            Some(Endpoint::StartUpload { namespace, .. }) if namespace == ns("org/team")
+            Some(Endpoint::Upload(UploadEndpoint::Start { namespace, .. })) if namespace == ns("org/team")
         ));
         // A GET on the start path is not the endpoint.
         assert!(parse(&Method::GET, "/v2/myrepo/app/blobs/uploads/", None).is_none());
@@ -460,7 +498,7 @@ mod tests {
         // A by-tag manifest read parses the tag reference.
         assert!(matches!(
             parse(&Method::GET, "/v2/myrepo/app/manifests/latest", None),
-            Some(Endpoint::GetManifest { namespace, reference })
+            Some(Endpoint::Manifest(ManifestEndpoint::Get { namespace, reference }))
                 if namespace == ns("myrepo/app") && reference.to_string() == "latest"
         ));
     }
@@ -502,9 +540,9 @@ mod tests {
     #[test]
     fn start_upload_with_digest() {
         let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::StartUpload {
+        let Some(Endpoint::Upload(UploadEndpoint::Start {
             namespace, digest, ..
-        }) = parse(
+        })) = parse(
             &Method::POST,
             "/v2/myrepo/app/blobs/uploads/",
             Some(&format!("digest={d}")),
@@ -520,7 +558,7 @@ mod tests {
     #[test]
     fn mount_blob_without_from() {
         let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::MountBlob { digest, from, .. }) = parse(
+        let Some(Endpoint::Upload(UploadEndpoint::Mount { digest, from, .. })) = parse(
             &Method::POST,
             "/v2/myrepo/target/blobs/uploads/",
             Some(&format!("mount={d}")),
@@ -603,10 +641,10 @@ mod tests {
     fn get_upload() {
         let session_id = UploadSessionId::generate();
         let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        let Some(Endpoint::GetUpload {
+        let Some(Endpoint::Upload(UploadEndpoint::Get {
             namespace,
             session_id: parsed,
-        }) = parse(&Method::GET, &path, None)
+        })) = parse(&Method::GET, &path, None)
         else {
             panic!("Expected GetUpload route");
         };
@@ -618,10 +656,10 @@ mod tests {
     fn patch_upload() {
         let session_id = UploadSessionId::generate();
         let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        let Some(Endpoint::PatchUpload {
+        let Some(Endpoint::Upload(UploadEndpoint::Patch {
             namespace,
             session_id: parsed,
-        }) = parse(&Method::PATCH, &path, None)
+        })) = parse(&Method::PATCH, &path, None)
         else {
             panic!("Expected PatchUpload route");
         };
@@ -634,11 +672,11 @@ mod tests {
         let session_id = UploadSessionId::generate();
         let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
         let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        let Some(Endpoint::PutUpload {
+        let Some(Endpoint::Upload(UploadEndpoint::Put {
             namespace,
             session_id: parsed,
             digest,
-        }) = parse(&Method::PUT, &path, Some(&format!("digest={d}")))
+        })) = parse(&Method::PUT, &path, Some(&format!("digest={d}")))
         else {
             panic!("Expected PutUpload route");
         };
@@ -658,10 +696,10 @@ mod tests {
     fn delete_upload() {
         let session_id = UploadSessionId::generate();
         let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        let Some(Endpoint::DeleteUpload {
+        let Some(Endpoint::Upload(UploadEndpoint::Delete {
             namespace,
             session_id: parsed,
-        }) = parse(&Method::DELETE, &path, None)
+        })) = parse(&Method::DELETE, &path, None)
         else {
             panic!("Expected DeleteUpload route");
         };
@@ -671,10 +709,10 @@ mod tests {
 
     #[test]
     fn head_manifest() {
-        let Some(Endpoint::HeadManifest {
+        let Some(Endpoint::Manifest(ManifestEndpoint::Head {
             namespace,
             reference,
-        }) = parse(&Method::HEAD, "/v2/myrepo/app/manifests/v1.0.0", None)
+        })) = parse(&Method::HEAD, "/v2/myrepo/app/manifests/v1.0.0", None)
         else {
             panic!("Expected HeadManifest route");
         };
@@ -685,10 +723,10 @@ mod tests {
     #[test]
     fn put_manifest_by_digest_dedups_repeated_tag_params() {
         let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::PutManifest {
+        let Some(Endpoint::Manifest(ManifestEndpoint::Put {
             target: ManifestPutTarget::Digest { tags, .. },
             ..
-        }) = parse(
+        })) = parse(
             &Method::PUT,
             &format!("/v2/foo/manifests/{d}"),
             Some("tag=a&tag=a&tag=b"),
@@ -724,7 +762,7 @@ mod tests {
         assert!(
             matches!(
                 parse(&Method::GET, "/v2/foo/manifests/latest", Some("tag=a")),
-                Some(Endpoint::GetManifest { .. })
+                Some(Endpoint::Manifest(ManifestEndpoint::Get { .. }))
             ),
             "GET by tag must not carry tag params"
         );
@@ -733,10 +771,10 @@ mod tests {
     #[test]
     fn delete_manifest() {
         let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::DeleteManifest {
+        let Some(Endpoint::Manifest(ManifestEndpoint::Delete {
             namespace,
             reference,
-        }) = parse(
+        })) = parse(
             &Method::DELETE,
             &format!("/v2/myrepo/app/manifests/{d}"),
             None,
@@ -788,16 +826,16 @@ mod tests {
             "/v2/myrepo/app/blobs/uploads/",
             Some("digest-algorithm=sha512"),
         ) {
-            Some(Endpoint::StartUpload {
+            Some(Endpoint::Upload(UploadEndpoint::Start {
                 digest_algorithm, ..
-            }) => assert_eq!(digest_algorithm, Some(Algorithm::Sha512)),
+            })) => assert_eq!(digest_algorithm, Some(Algorithm::Sha512)),
             other => panic!("a hinted upload must start a session, got {other:?}"),
         }
 
         match parse(&Method::POST, "/v2/myrepo/app/blobs/uploads/", None) {
-            Some(Endpoint::StartUpload {
+            Some(Endpoint::Upload(UploadEndpoint::Start {
                 digest_algorithm, ..
-            }) => assert!(digest_algorithm.is_none()),
+            })) => assert!(digest_algorithm.is_none()),
             other => panic!("an unhinted upload must start a session, got {other:?}"),
         }
 

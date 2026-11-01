@@ -11,7 +11,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use angos_cache::{Cache, Config as CacheConfig};
 use angos_oci::{Digest, Namespace, Reference, Tag};
-use angos_oci_service::Endpoint as OciEndpoint;
+use angos_oci_service::{Endpoint as OciEndpoint, ManifestEndpoint};
 
 use crate::command::bootstrap;
 use crate::command::server::router::Route;
@@ -282,10 +282,10 @@ async fn proxy_namespace_resolves_to_the_mirroring_repository() {
     let uri: Uri = "/v2/library/nginx/manifests/latest?ns=docker.io"
         .parse()
         .unwrap();
-    let mut route = Route::Oci(OciEndpoint::GetManifest {
+    let mut route = Route::Oci(OciEndpoint::Manifest(ManifestEndpoint::Get {
         namespace: Namespace::new("library/nginx").unwrap(),
         reference: Reference::Tag(Tag::new("latest").unwrap()),
-    });
+    }));
 
     let served = context
         .apply_proxy_namespace(Some(&mut route), &uri)
@@ -392,10 +392,10 @@ async fn proxy_namespace_leaves_a_write_alone() {
     let uri: Uri = "/v2/library/nginx/manifests/latest?ns=docker.io"
         .parse()
         .unwrap();
-    let mut route = Route::Oci(OciEndpoint::DeleteManifest {
+    let mut route = Route::Oci(OciEndpoint::Manifest(ManifestEndpoint::Delete {
         namespace: Namespace::new("library/nginx").unwrap(),
         reference: Reference::Tag(Tag::new("latest").unwrap()),
-    });
+    }));
 
     assert!(
         context
@@ -404,7 +404,8 @@ async fn proxy_namespace_leaves_a_write_alone() {
             .is_none(),
         "a write must not be scoped by ns, so nothing is echoed"
     );
-    let Route::Oci(OciEndpoint::DeleteManifest { namespace, .. }) = &route else {
+    let Route::Oci(OciEndpoint::Manifest(ManifestEndpoint::Delete { namespace, .. })) = &route
+    else {
         panic!("the action must be untouched");
     };
     assert_eq!(namespace.as_ref(), "library/nginx");

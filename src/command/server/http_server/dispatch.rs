@@ -20,7 +20,9 @@ use angos_oci::request::{
     PutManifestRequest, StartUploadRequest, StartUploadTarget,
 };
 use angos_oci::response::ErrorCode;
-use angos_oci_service::{Endpoint as OciEndpoint, is_invalid_referrers_request};
+use angos_oci_service::{
+    Endpoint as OciEndpoint, ManifestEndpoint, UploadEndpoint, is_invalid_referrers_request,
+};
 use angos_transport::{ResponseBody, json_response};
 
 use crate::command::server::error::Error;
@@ -113,12 +115,7 @@ async fn dispatch_oci(
 
     match endpoint {
         OciEndpoint::CheckVersion => Ok(registry::api_version().into_response()?),
-        endpoint @ (OciEndpoint::StartUpload { .. }
-        | OciEndpoint::MountBlob { .. }
-        | OciEndpoint::GetUpload { .. }
-        | OciEndpoint::PatchUpload { .. }
-        | OciEndpoint::PutUpload { .. }
-        | OciEndpoint::DeleteUpload { .. }) => {
+        OciEndpoint::Upload(endpoint) => {
             dispatch_upload(context, endpoint, parts, incoming, identity).await
         }
         OciEndpoint::GetBlob { namespace, digest } => Ok(registry
@@ -146,10 +143,7 @@ async fn dispatch_oci(
             .handle_delete_blob(DeleteBlobRequest { namespace, digest })
             .await?
             .into_response()?),
-        endpoint @ (OciEndpoint::GetManifest { .. }
-        | OciEndpoint::HeadManifest { .. }
-        | OciEndpoint::PutManifest { .. }
-        | OciEndpoint::DeleteManifest { .. }) => {
+        OciEndpoint::Manifest(endpoint) => {
             dispatch_manifest(context, endpoint, parts, incoming, identity).await
         }
         OciEndpoint::GetReferrers {
@@ -176,7 +170,7 @@ async fn dispatch_oci(
 /// The manifest endpoints, routed here by [`dispatch_oci`].
 async fn dispatch_manifest(
     context: &ServerContext,
-    endpoint: OciEndpoint,
+    endpoint: ManifestEndpoint,
     parts: &Parts,
     incoming: Incoming,
     identity: &ClientIdentity,
@@ -186,7 +180,7 @@ async fn dispatch_manifest(
     let actor = EventActor::from(identity.clone());
 
     match endpoint {
-        OciEndpoint::GetManifest {
+        ManifestEndpoint::Get {
             namespace,
             reference,
         } => Ok(registry
@@ -201,7 +195,7 @@ async fn dispatch_manifest(
             )
             .await?
             .into_response()?),
-        OciEndpoint::HeadManifest {
+        ManifestEndpoint::Head {
             namespace,
             reference,
         } => Ok(registry
@@ -215,7 +209,7 @@ async fn dispatch_manifest(
             )
             .await?
             .into_response()?),
-        OciEndpoint::PutManifest { namespace, target } => {
+        ManifestEndpoint::Put { namespace, target } => {
             let (reference, tags) = target.into_parts();
             let content_type = headers.content_type()?.ok_or(Error::BadRequest(
                 "No Content-Type header provided".to_string(),
@@ -236,7 +230,7 @@ async fn dispatch_manifest(
                 .await?
                 .into_response()?)
         }
-        OciEndpoint::DeleteManifest {
+        ManifestEndpoint::Delete {
             namespace,
             reference,
         } => Ok(registry
@@ -250,14 +244,13 @@ async fn dispatch_manifest(
             )
             .await?
             .into_response()?),
-        _ => unreachable!("dispatch_oci routes only manifest endpoints here"),
     }
 }
 
 /// The blob-upload session endpoints, routed here by [`dispatch_oci`].
 async fn dispatch_upload(
     context: &ServerContext,
-    endpoint: OciEndpoint,
+    endpoint: UploadEndpoint,
     parts: &Parts,
     incoming: Incoming,
     identity: &ClientIdentity,
@@ -267,7 +260,7 @@ async fn dispatch_upload(
     let actor = EventActor::from(identity.clone());
 
     match endpoint {
-        OciEndpoint::StartUpload {
+        UploadEndpoint::Start {
             namespace,
             digest,
             digest_algorithm,
@@ -291,7 +284,7 @@ async fn dispatch_upload(
                 .await?
                 .into_response()?)
         }
-        OciEndpoint::MountBlob {
+        UploadEndpoint::Mount {
             namespace,
             digest,
             from,
@@ -308,7 +301,7 @@ async fn dispatch_upload(
                 .await?
                 .into_response()?)
         }
-        OciEndpoint::GetUpload {
+        UploadEndpoint::Get {
             namespace,
             session_id,
         } => Ok(registry
@@ -318,7 +311,7 @@ async fn dispatch_upload(
             })
             .await?
             .into_status_response()?),
-        OciEndpoint::PatchUpload {
+        UploadEndpoint::Patch {
             namespace,
             session_id,
         } => Ok(registry
@@ -333,7 +326,7 @@ async fn dispatch_upload(
             )
             .await?
             .into_open_response()?),
-        OciEndpoint::PutUpload {
+        UploadEndpoint::Put {
             namespace,
             session_id,
             digest,
@@ -351,7 +344,7 @@ async fn dispatch_upload(
             )
             .await?
             .into_response()?),
-        OciEndpoint::DeleteUpload {
+        UploadEndpoint::Delete {
             namespace,
             session_id,
         } => Ok(registry
@@ -361,7 +354,6 @@ async fn dispatch_upload(
             })
             .await?
             .into_response()?),
-        _ => unreachable!("dispatch_oci routes only upload endpoints here"),
     }
 }
 

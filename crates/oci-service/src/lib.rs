@@ -27,7 +27,9 @@ use angos_oci::types::http_range::ResponseRange;
 use angos_oci::{Digest, Manifest, MediaType, Namespace, Reference, Tag, UploadSessionId};
 
 pub mod endpoint;
-pub use endpoint::{Endpoint, is_invalid_referrers_request, parse};
+pub use endpoint::{
+    Endpoint, ManifestEndpoint, UploadEndpoint, is_invalid_referrers_request, parse,
+};
 
 #[cfg(feature = "hyper")]
 pub mod render;
