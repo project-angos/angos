@@ -264,7 +264,8 @@ mod tests {
             repository_with_replication("apps", Vec::new()),
             true,
         );
-        assert!(enqueued(&checker, &namespace).await.is_empty());
+        let jobs = enqueued(&checker, &namespace).await;
+        assert!(jobs.is_empty(), "{jobs:?}");
     }
 
     /// A reported image is enqueued when the rules find its newest report
@@ -327,7 +328,8 @@ mod tests {
             ),
             false,
         );
-        assert!(enqueued(&checker, &namespace).await.is_empty());
+        let jobs = enqueued(&checker, &namespace).await;
+        assert!(jobs.is_empty(), "{jobs:?}");
 
         let checker = build_checker(
             &stack,

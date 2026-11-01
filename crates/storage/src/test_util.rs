@@ -22,7 +22,6 @@ use crate::{
 };
 
 /// Single-frame [`ByteStream`] over `body`.
-#[must_use]
 pub fn frame(body: &[u8]) -> ByteStream {
     let bytes = Bytes::copy_from_slice(body);
     Box::pin(stream::once(async move { Ok(bytes) }))

@@ -330,7 +330,11 @@ fn capabilities_come_from_the_security_xattr() {
     )
     .unwrap();
     assert_eq!(entries[0].capabilities, ["cap_net_raw", "cap_bpf"]);
-    assert!(entries[1].capabilities.is_empty());
+    assert!(
+        entries[1].capabilities.is_empty(),
+        "{:?}",
+        entries[1].capabilities
+    );
 }
 
 /// The listing carries every entry, sorted by path, with its kind and offset,
@@ -428,7 +432,7 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     })
     .unwrap();
     assert!(!plain.compressed);
-    assert!(plain.checkpoints.is_empty());
+    assert!(plain.checkpoints.is_empty(), "{:?}", plain.checkpoints);
     assert_eq!(plain_entries, entries);
 }
 

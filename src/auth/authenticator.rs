@@ -1074,6 +1074,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(identity.auth_method, AuthMethod::Mtls);
-        assert!(!identity.certificate.organizations.is_empty());
+        assert!(
+            !identity.certificate.organizations.is_empty(),
+            "the certificate carries no organization"
+        );
     }
 }

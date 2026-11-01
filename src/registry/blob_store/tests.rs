@@ -415,7 +415,8 @@ async fn the_empty_blob_reads_as_present() {
         let digest = seed_blob(&store, b"").await;
 
         assert_eq!(store.size(&digest).await.unwrap(), 0);
-        assert!(store.read(&digest).await.unwrap().is_empty());
+        let content = store.read(&digest).await.unwrap();
+        assert!(content.is_empty(), "{content:?}");
     })
     .await;
 }

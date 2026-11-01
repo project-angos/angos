@@ -185,7 +185,7 @@ async fn test_handle_metrics_contains_metric_data() {
     };
 
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
-    assert!(!body_str.is_empty());
+    assert!(!body_str.is_empty(), "the response body is empty");
 }
 
 #[test]

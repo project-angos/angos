@@ -53,7 +53,11 @@ mod tests {
         assert_eq!(config.client.url, "https://angos-eu.example.com");
         assert_eq!(config.client.max_redirect, 5);
         assert_eq!(config.mode, ReplicationMode::EventReconcile);
-        assert!(config.namespace_filter.is_empty());
+        assert!(
+            config.namespace_filter.is_empty(),
+            "{:?}",
+            config.namespace_filter
+        );
         assert_eq!(config.max_concurrent_pushes, None);
         assert!(!config.prune, "prune defaults to false");
     }

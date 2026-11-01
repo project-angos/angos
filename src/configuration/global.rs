@@ -299,7 +299,11 @@ mod tests {
         assert_eq!(config.blob_stream_frame_size, ByteSize::kib(128));
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
-        assert!(config.immutable_tags_exclusions.is_empty());
+        assert!(
+            config.immutable_tags_exclusions.is_empty(),
+            "{:?}",
+            config.immutable_tags_exclusions
+        );
         assert!(
             config.allow_missing_manifest_references,
             "manifest-reference validation is permissive by default"

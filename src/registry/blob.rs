@@ -1421,7 +1421,8 @@ mod tests {
 
             // An empty blob has no satisfiable window, so the range is ignored.
             assert_eq!(response.status(), StatusCode::OK);
-            assert!(response_body(response).await.is_empty());
+            let body = response_body(response).await;
+            assert!(body.is_empty(), "{body:?}");
         })
         .await;
     }

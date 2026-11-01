@@ -120,8 +120,16 @@ pub mod tests {
         });
 
         assert!(matches!(result.unwrap(), AuthResult::NoCredentials));
-        assert!(identity.certificate.common_names.is_empty());
-        assert!(identity.certificate.organizations.is_empty());
+        assert!(
+            identity.certificate.common_names.is_empty(),
+            "{:?}",
+            identity.certificate.common_names
+        );
+        assert!(
+            identity.certificate.organizations.is_empty(),
+            "{:?}",
+            identity.certificate.organizations
+        );
 
         let logs = capture.contents();
         assert!(
@@ -142,8 +150,16 @@ pub mod tests {
 
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), AuthResult::NoCredentials));
-        assert!(identity.certificate.common_names.is_empty());
-        assert!(identity.certificate.organizations.is_empty());
+        assert!(
+            identity.certificate.common_names.is_empty(),
+            "{:?}",
+            identity.certificate.common_names
+        );
+        assert!(
+            identity.certificate.organizations.is_empty(),
+            "{:?}",
+            identity.certificate.organizations
+        );
     }
 
     #[tokio::test]
@@ -178,7 +194,15 @@ pub mod tests {
 
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), AuthResult::Authenticated));
-        assert!(identity.certificate.common_names.is_empty());
-        assert!(identity.certificate.organizations.is_empty());
+        assert!(
+            identity.certificate.common_names.is_empty(),
+            "{:?}",
+            identity.certificate.common_names
+        );
+        assert!(
+            identity.certificate.organizations.is_empty(),
+            "{:?}",
+            identity.certificate.organizations
+        );
     }
 }

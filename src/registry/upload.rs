@@ -1063,7 +1063,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(candidates.is_empty());
+            assert!(candidates.is_empty(), "{candidates:?}");
 
             // Lexicographic order guards the sort-before-truncate determinism.
             let candidates = registry
@@ -1086,7 +1086,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(candidates.is_empty());
+            assert!(candidates.is_empty(), "{candidates:?}");
         })
         .await;
     }
@@ -1632,7 +1632,8 @@ mod tests {
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::CREATED);
-            assert!(registry.blob_store.read(&digest).await.unwrap().is_empty());
+            let content = registry.blob_store.read(&digest).await.unwrap();
+            assert!(content.is_empty(), "{content:?}");
         })
         .await;
     }

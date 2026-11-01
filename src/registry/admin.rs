@@ -2487,7 +2487,8 @@ mod tests {
                 .unwrap();
             let body = response_json(response).await;
 
-            assert!(body["entries"].as_array().unwrap().is_empty());
+            let entries = body["entries"].as_array().unwrap();
+            assert!(entries.is_empty(), "{entries:?}");
         })
         .await;
     }

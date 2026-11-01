@@ -250,7 +250,11 @@ mod tests {
         assert_eq!(config.issuer, "https://auth.example.com");
         assert!(config.jwks_uri.is_none());
         assert!(config.bearer_token_file.is_none());
-        assert!(config.required_claims.is_empty());
+        assert!(
+            config.required_claims.is_empty(),
+            "{:?}",
+            config.required_claims
+        );
         assert_eq!(config.jwks_refresh_interval, 3600);
         assert!(config.required_audience.is_none());
         assert_eq!(config.clock_skew_tolerance, 60);

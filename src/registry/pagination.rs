@@ -143,7 +143,7 @@ mod tests {
             items: result,
             next_token: token,
         } = slice_page(&items, 0, 0);
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "{result:?}");
         // No items emitted, but more remain after start_idx. The contract here
         // is that an empty page implies no last-element token.
         assert!(token.is_none());
@@ -156,7 +156,7 @@ mod tests {
             items: result,
             next_token: token,
         } = slice_page(&items, 5, 10);
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "{result:?}");
         assert!(token.is_none());
     }
 

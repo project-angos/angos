@@ -425,7 +425,8 @@ mod tests {
 
     #[test]
     fn no_accept_header_offers_nothing() {
-        assert!(ranges(&HeaderMap::new()).is_empty());
+        let offered = ranges(&HeaderMap::new());
+        assert!(offered.is_empty(), "{offered:?}");
     }
 
     #[test]

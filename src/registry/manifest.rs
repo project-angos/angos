@@ -3789,7 +3789,8 @@ mod tests {
         .unwrap();
 
         let manifest = Manifest::from_slice(&body).expect("subject-only manifest must parse");
-        assert!(referenced_digests(&manifest).is_empty());
+        let digests = referenced_digests(&manifest);
+        assert!(digests.is_empty(), "{digests:?}");
     }
 
     #[test]

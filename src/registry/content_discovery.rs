@@ -498,7 +498,8 @@ mod tests {
                 .unwrap();
 
             assert!(next_cursor(&response).is_none());
-            assert!(catalog(response).await.is_empty());
+            let namespaces = catalog(response).await;
+            assert!(namespaces.is_empty(), "{namespaces:?}");
         })
         .await;
     }
@@ -1434,7 +1435,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(!filtered_referrers.items.is_empty());
+            assert!(!filtered_referrers.items.is_empty(), "no referrer matched the filter");
 
             let non_matching_referrers = registry
                 .list_referrers(
@@ -1447,7 +1448,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(non_matching_referrers.items.is_empty());
+            assert!(non_matching_referrers.items.is_empty(), "{:?}", non_matching_referrers.items);
         })
         .await;
     }
