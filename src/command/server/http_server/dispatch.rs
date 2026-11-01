@@ -109,7 +109,8 @@ async fn dispatch_oci(
     let headers = RequestHeaders::new(&parts.headers);
     let registry = &context.registry;
     // The authenticated caller, borrowed by whichever arm runs.
-    let actor = EventActor::from(identity.clone());
+    let actor = Some(EventActor::from(identity.clone()));
+    let body = Box::new(incoming_into_async_read(incoming));
 
     match endpoint {
         OciEndpoint::CheckVersion => Ok(registry::api_version().into_response()?),
@@ -121,21 +122,17 @@ async fn dispatch_oci(
             // A body with no `?digest=` has nothing to verify it against, so
             // the request opens a session and the body is not read.
             let content_length = headers.content_length()?;
-            Ok(registry
-                .handle_start_upload(
-                    Some(actor),
-                    StartUploadRequest {
-                        namespace,
-                        digest_algorithm,
-                        target: digest.map(|digest| StartUploadTarget {
-                            digest,
-                            content_length,
-                        }),
-                    },
-                    Box::new(incoming_into_async_read(incoming)),
-                )
-                .await?
-                .into_response()?)
+            let target = digest.map(|digest| StartUploadTarget {
+                digest,
+                content_length,
+            });
+            let request = StartUploadRequest {
+                namespace,
+                digest_algorithm,
+                target,
+            };
+            let response = registry.handle_start_upload(actor, request, body).await?;
+            Ok(response.into_response()?)
         }
         OciEndpoint::MountBlob {
             namespace,
@@ -148,172 +145,172 @@ async fn dispatch_oci(
             let source = context
                 .authorize_mount_source(&mount, identity, parts)
                 .await?;
-
-            Ok(registry
-                .handle_mount_blob(Some(actor), MountBlobRequest { namespace, mount }, source)
-                .await?
-                .into_response()?)
+            let request = MountBlobRequest { namespace, mount };
+            let response = registry.handle_mount_blob(actor, request, source).await?;
+            Ok(response.into_response()?)
         }
         OciEndpoint::GetUpload {
             namespace,
             session_id,
-        } => Ok(registry
-            .handle_upload_status(GetUploadRequest {
+        } => {
+            let request = GetUploadRequest {
                 namespace,
                 session_id,
-            })
-            .await?
-            .into_status_response()?),
+            };
+            Ok(registry
+                .handle_upload_status(request)
+                .await?
+                .into_status_response()?)
+        }
         OciEndpoint::PatchUpload {
             namespace,
             session_id,
-        } => Ok(registry
-            .handle_patch_upload(
-                PatchUploadRequest {
-                    namespace,
-                    session_id,
-                    content_range: headers.chunk_range(CONTENT_RANGE)?,
-                    content_length: headers.content_length()?,
-                },
-                Box::new(incoming_into_async_read(incoming)),
-            )
-            .await?
-            .into_open_response()?),
+        } => {
+            let request = PatchUploadRequest {
+                namespace,
+                session_id,
+                content_range: headers.chunk_range(CONTENT_RANGE)?,
+                content_length: headers.content_length()?,
+            };
+            let response = registry.handle_patch_upload(request, body).await?;
+            Ok(response.into_open_response()?)
+        }
         OciEndpoint::PutUpload {
             namespace,
             session_id,
             digest,
-        } => Ok(registry
-            .handle_complete_upload(
-                Some(actor),
-                CompleteUploadRequest {
-                    namespace,
-                    session_id,
-                    digest,
-                    content_range: headers.chunk_range(CONTENT_RANGE)?,
-                    content_length: headers.content_length()?,
-                },
-                Box::new(incoming_into_async_read(incoming)),
-            )
-            .await?
-            .into_response()?),
+        } => {
+            let request = CompleteUploadRequest {
+                namespace,
+                session_id,
+                digest,
+                content_range: headers.chunk_range(CONTENT_RANGE)?,
+                content_length: headers.content_length()?,
+            };
+            let response = registry
+                .handle_complete_upload(actor, request, body)
+                .await?;
+            Ok(response.into_response()?)
+        }
         OciEndpoint::DeleteUpload {
             namespace,
             session_id,
-        } => Ok(registry
-            .handle_cancel_upload(DeleteUploadRequest {
+        } => {
+            let request = DeleteUploadRequest {
                 namespace,
                 session_id,
-            })
-            .await?
-            .into_response()?),
-        OciEndpoint::GetBlob { namespace, digest } => Ok(registry
-            .handle_get_blob(
-                Some(actor),
-                GetBlobRequest {
-                    namespace,
-                    digest,
-                    accepted_types: headers.accepted_content_types(),
-                    range: headers.blob_range()?,
-                },
-                !headers.redirect_suppressed(),
-            )
-            .await?
-            .into_response(registry.blob_stream_frame_size())?),
-        OciEndpoint::HeadBlob { namespace, digest } => Ok(registry
-            .handle_head_blob(HeadBlobRequest {
+            };
+            Ok(registry
+                .handle_cancel_upload(request)
+                .await?
+                .into_response()?)
+        }
+        OciEndpoint::GetBlob { namespace, digest } => {
+            let request = GetBlobRequest {
                 namespace,
                 digest,
                 accepted_types: headers.accepted_content_types(),
-            })
-            .await?
-            .into_response()?),
-        OciEndpoint::DeleteBlob { namespace, digest } => Ok(registry
-            .handle_delete_blob(DeleteBlobRequest { namespace, digest })
-            .await?
-            .into_response()?),
+                range: headers.blob_range()?,
+            };
+            let redirect = !headers.redirect_suppressed();
+            let response = registry.handle_get_blob(actor, request, redirect).await?;
+            Ok(response.into_response(registry.blob_stream_frame_size())?)
+        }
+        OciEndpoint::HeadBlob { namespace, digest } => {
+            let accepted_types = headers.accepted_content_types();
+            let request = HeadBlobRequest {
+                namespace,
+                digest,
+                accepted_types,
+            };
+            Ok(registry.handle_head_blob(request).await?.into_response()?)
+        }
+        OciEndpoint::DeleteBlob { namespace, digest } => {
+            let request = DeleteBlobRequest { namespace, digest };
+            Ok(registry
+                .handle_delete_blob(request)
+                .await?
+                .into_response()?)
+        }
         OciEndpoint::GetManifest {
             namespace,
             reference,
-        } => Ok(registry
-            .handle_get_manifest(
-                Some(actor),
-                GetManifestRequest {
-                    namespace,
-                    reference,
-                    accepted_types: headers.accepted_content_types(),
-                },
-                !headers.redirect_suppressed(),
-            )
-            .await?
-            .into_response()?),
+        } => {
+            let request = GetManifestRequest {
+                namespace,
+                reference,
+                accepted_types: headers.accepted_content_types(),
+            };
+            let redirect = !headers.redirect_suppressed();
+            let response = registry
+                .handle_get_manifest(actor, request, redirect)
+                .await?;
+            Ok(response.into_response()?)
+        }
         OciEndpoint::HeadManifest {
             namespace,
             reference,
-        } => Ok(registry
-            .handle_head_manifest(
-                Some(actor),
-                HeadManifestRequest {
-                    namespace,
-                    reference,
-                    accepted_types: headers.accepted_content_types(),
-                },
-            )
-            .await?
-            .into_response()?),
+        } => {
+            let request = HeadManifestRequest {
+                namespace,
+                reference,
+                accepted_types: headers.accepted_content_types(),
+            };
+            Ok(registry
+                .handle_head_manifest(actor, request)
+                .await?
+                .into_response()?)
+        }
         OciEndpoint::PutManifest { namespace, target } => {
             let (reference, tags) = target.into_parts();
             let content_type = headers.content_type()?.ok_or(Error::BadRequest(
                 "No Content-Type header provided".to_string(),
             ))?;
-
-            Ok(registry
-                .handle_put_manifest(
-                    Some(actor),
-                    PutManifestRequest {
-                        namespace,
-                        reference,
-                        content_type: Some(content_type),
-                        tags,
-                        source_ts: headers.source_timestamp(),
-                    },
-                    Box::new(incoming_into_async_read(incoming)),
-                )
-                .await?
-                .into_response()?)
+            let request = PutManifestRequest {
+                namespace,
+                reference,
+                content_type: Some(content_type),
+                tags,
+                source_ts: headers.source_timestamp(),
+            };
+            let response = registry.handle_put_manifest(actor, request, body).await?;
+            Ok(response.into_response()?)
         }
         OciEndpoint::DeleteManifest {
             namespace,
             reference,
-        } => Ok(registry
-            .handle_delete_manifest(
-                Some(actor),
-                DeleteManifestRequest {
-                    source_ts: headers.source_timestamp(),
-                    namespace,
-                    reference,
-                },
-            )
-            .await?
-            .into_response()?),
+        } => {
+            let request = DeleteManifestRequest {
+                source_ts: headers.source_timestamp(),
+                namespace,
+                reference,
+            };
+            Ok(registry
+                .handle_delete_manifest(actor, request)
+                .await?
+                .into_response()?)
+        }
         OciEndpoint::GetReferrers {
             namespace,
             digest,
             artifact_type,
             last,
-        } => Ok(registry
-            .handle_get_referrers(GetReferrersRequest {
+        } => {
+            let request = GetReferrersRequest {
                 namespace,
                 digest,
                 artifact_type,
                 last,
-            })
-            .await?
-            .into_response()?),
-        OciEndpoint::ListTags { namespace, n, last } => Ok(registry
-            .handle_list_tags(ListTagsRequest { namespace, n, last })
-            .await?
-            .into_response()?),
+            };
+            Ok(registry
+                .handle_get_referrers(request)
+                .await?
+                .into_response()?)
+        }
+        OciEndpoint::ListTags { namespace, n, last } => {
+            let request = ListTagsRequest { namespace, n, last };
+            Ok(registry.handle_list_tags(request).await?.into_response()?)
+        }
     }
 }
 
