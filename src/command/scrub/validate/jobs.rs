@@ -7,7 +7,7 @@ use tracing::warn;
 use angos_storage::Error as StorageError;
 
 use crate::command::maintenance::Error;
-use crate::command::maintenance::action::{Action, WalkedStore};
+use crate::command::maintenance::action::{Action, JobAction, WalkedStore};
 use crate::command::scrub::validate::Validator;
 use crate::jobs::store::{DeadLetterRecord, JobEnvelope, LockKeyIndex, job_pending_path};
 use crate::jobs::{JobState, Queue};
@@ -56,11 +56,11 @@ impl Validator {
         if self.younger_than_grace(key).await? {
             return Ok(());
         }
-        self.emit(Action::DeleteOrphanJobIndex {
+        self.emit(Action::Job(JobAction::DeleteOrphanJobIndex {
             queue,
             key: key.to_string(),
             storage_key: index.storage_key,
-        })
+        }))
         .await
     }
 

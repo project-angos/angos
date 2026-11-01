@@ -15,7 +15,7 @@ use angos_oci::{Digest, Namespace, Reference, Tag, manifest_accept_types};
 use angos_oci_client::Error as ClientError;
 
 use crate::command::maintenance::Error;
-use crate::command::maintenance::action::Action;
+use crate::command::maintenance::action::{Action, JobAction};
 use crate::command::maintenance::check::NamespaceChecker;
 use crate::command::maintenance::executor::ActionSink;
 use crate::registry::Error as RegistryError;
@@ -111,11 +111,11 @@ impl ReplicationChecker {
                 continue;
             }
             if let Err(e) = sink
-                .apply(Action::EnqueueReplicationDelete {
+                .apply(Action::Job(JobAction::EnqueueReplicationDelete {
                     downstream: downstream.name.clone(),
                     namespace: namespace.clone(),
                     tag: tag.clone(),
-                })
+                }))
                 .await
             {
                 // Continue so one flaky write does not skip the rest.
@@ -209,12 +209,12 @@ async fn reconcile_push_step(
             }
             Probe::Push { tag, digest } => {
                 if let Err(e) = sink
-                    .apply(Action::EnqueueReplicationPush {
+                    .apply(Action::Job(JobAction::EnqueueReplicationPush {
                         downstream: downstream.name.clone(),
                         namespace: namespace.clone(),
                         tag: tag.clone(),
                         digest,
-                    })
+                    }))
                     .await
                 {
                     // Never abort the namespace; the next run re-enqueues
@@ -294,7 +294,7 @@ mod tests {
     use angos_storage::{Error as StorageError, ObjectStore};
 
     use crate::command::maintenance::Error;
-    use crate::command::maintenance::action::Action;
+    use crate::command::maintenance::action::{Action, JobAction};
     use crate::command::maintenance::check::NamespaceChecker;
     use crate::command::maintenance::executor::{ActionSink, Executor};
     use crate::command::reconcile::replication::checker::ReplicationChecker;
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(sink.lock().unwrap().len(), 1);
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::EnqueueReplicationPush { downstream, tag, digest, .. }
+            Action::Job(JobAction::EnqueueReplicationPush { downstream, tag, digest, .. })
                 if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
         ));
     }
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(sink.lock().unwrap().len(), 1);
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::EnqueueReplicationPush { downstream, namespace, tag, digest }
+            Action::Job(JobAction::EnqueueReplicationPush { downstream, namespace, tag, digest })
                 if downstream == DOWNSTREAM
                     && namespace == "nginx/app"
                     && tag == "v1"
@@ -670,7 +670,7 @@ mod tests {
         let attempted: Vec<&str> = attempted
             .iter()
             .filter_map(|a| match a {
-                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_ref()),
+                Action::Job(JobAction::EnqueueReplicationPush { tag, .. }) => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -715,7 +715,7 @@ mod tests {
         let deleted: Vec<&str> = deleted
             .iter()
             .filter_map(|a| match a {
-                Action::EnqueueReplicationDelete { tag, .. } => Some(tag.as_ref()),
+                Action::Job(JobAction::EnqueueReplicationDelete { tag, .. }) => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -868,7 +868,7 @@ mod tests {
         let mut tags: Vec<&str> = sink
             .iter()
             .filter_map(|action| match action {
-                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_ref()),
+                Action::Job(JobAction::EnqueueReplicationPush { tag, .. }) => Some(tag.as_ref()),
                 _ => None,
             })
             .collect();
@@ -934,7 +934,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::EnqueueReplicationDelete { downstream, namespace, tag }
+            Action::Job(JobAction::EnqueueReplicationDelete { downstream, namespace, tag })
                 if downstream == DOWNSTREAM && namespace == NAMESPACE && tag == "stray"
         ));
     }
@@ -998,7 +998,7 @@ mod tests {
         );
         assert!(matches!(
             &actions[0],
-            Action::EnqueueReplicationDelete { tag, .. } if tag == "stray"
+            Action::Job(JobAction::EnqueueReplicationDelete { tag, .. }) if tag == "stray"
         ));
     }
 
@@ -1199,7 +1199,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::EnqueueReplicationPush { downstream, tag, digest, .. }
+            Action::Job(JobAction::EnqueueReplicationPush { downstream, tag, digest, .. })
                 if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
         ));
     }
@@ -1294,7 +1294,7 @@ mod tests {
         assert_eq!(captured.len(), 1, "out-of-sync tag must emit one action");
         assert!(matches!(
             &captured[0],
-            Action::EnqueueReplicationPush { downstream, namespace, tag, digest }
+            Action::Job(JobAction::EnqueueReplicationPush { downstream, namespace, tag, digest })
                 if downstream == DOWNSTREAM
                     && namespace == NAMESPACE
                     && tag == "v1"

@@ -112,6 +112,34 @@ pub enum Action {
     AbortMultipartUpload {
         upload: OrphanMultipartUpload,
     },
+    Job(JobAction),
+    /// Delete a layer's listing and checkpoints: no image an index policy
+    /// applies to uses the layer, so its listing lives on demand only.
+    ReclaimListing(Digest),
+    /// Move a key matching no known angos layout to its store's lost-and-found
+    /// prefix, preserving its bytes for inspection.
+    QuarantineKey {
+        store: WalkedStore,
+        key: String,
+    },
+    /// Discard a key matching no known angos layout, emitted instead of
+    /// [`Action::QuarantineKey`] under `scrub --delete-unknown`.
+    DeleteUnknownKey {
+        store: WalkedStore,
+        key: String,
+    },
+    /// Delete an expected-shape object whose content does not parse, so it can
+    /// never be read successfully again.
+    DeleteCorruptObject {
+        store: WalkedStore,
+        key: String,
+    },
+    /// Write one target's access chunks, then retire the keys they supersede.
+    CompactAtime(AtimeCompaction),
+}
+
+/// A maintenance action that enqueues or deletes a job.
+pub enum JobAction {
     /// Enqueue a replication push for a tag diverging from or absent on a
     /// downstream, rather than pushing inline, so it gets the event path's
     /// durable retry, backoff, and coalescing.
@@ -127,9 +155,6 @@ pub enum Action {
     /// Enqueue the filesystem indexing of a layer; a forced one walks it
     /// again even when a listing exists.
     EnqueueIndex(IndexLayerPayload),
-    /// Delete a layer's listing and checkpoints: no image an index policy
-    /// applies to uses the layer, so its listing lives on demand only.
-    ReclaimListing(Digest),
     /// Enqueue a replication delete for a downstream-only tag, only on a
     /// `prune = true` downstream: absence-driven deletion would destroy an
     /// active-active peer's not-yet-replicated newer tag.
@@ -154,26 +179,6 @@ pub enum Action {
         key: String,
         storage_key: String,
     },
-    /// Move a key matching no known angos layout to its store's lost-and-found
-    /// prefix, preserving its bytes for inspection.
-    QuarantineKey {
-        store: WalkedStore,
-        key: String,
-    },
-    /// Discard a key matching no known angos layout, emitted instead of
-    /// [`Action::QuarantineKey`] under `scrub --delete-unknown`.
-    DeleteUnknownKey {
-        store: WalkedStore,
-        key: String,
-    },
-    /// Delete an expected-shape object whose content does not parse, so it can
-    /// never be read successfully again.
-    DeleteCorruptObject {
-        store: WalkedStore,
-        key: String,
-    },
-    /// Write one target's access chunks, then retire the keys they supersede.
-    CompactAtime(AtimeCompaction),
 }
 
 impl fmt::Display for Action {
@@ -255,12 +260,7 @@ impl fmt::Display for Action {
                 upload.key, upload.upload_id
             ),
             Action::ReclaimListing(digest) => write!(f, "reclaim listing of layer '{digest}'"),
-            Action::EnqueueReplicationPush { .. }
-            | Action::EnqueueReplicationDelete { .. }
-            | Action::EnqueueIndex(_)
-            | Action::EnqueueScan(_)
-            | Action::DeleteOrphanJob { .. }
-            | Action::DeleteOrphanJobIndex { .. } => self.fmt_job_action(f),
+            Action::Job(job) => job.fmt(f),
             Action::QuarantineKey { store, key } => {
                 write!(f, "quarantine unrecognized {store} key '{key}'")
             }
@@ -280,11 +280,10 @@ impl fmt::Display for Action {
     }
 }
 
-impl Action {
-    /// Formats the actions that enqueue or delete jobs; `fmt` dispatches only those here.
-    fn fmt_job_action(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl fmt::Display for JobAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Action::EnqueueReplicationPush {
+            JobAction::EnqueueReplicationPush {
                 downstream,
                 namespace,
                 tag,
@@ -293,7 +292,7 @@ impl Action {
                 f,
                 "enqueue replication push of '{namespace}:{tag}' ({digest}) to downstream '{downstream}'"
             ),
-            Action::EnqueueReplicationDelete {
+            JobAction::EnqueueReplicationDelete {
                 downstream,
                 namespace,
                 tag,
@@ -301,7 +300,7 @@ impl Action {
                 f,
                 "enqueue replication delete of '{namespace}:{tag}' on downstream '{downstream}'"
             ),
-            Action::EnqueueIndex(index) => {
+            JobAction::EnqueueIndex(index) => {
                 let forced = if index.force { " (forced)" } else { "" };
                 write!(
                     f,
@@ -309,7 +308,7 @@ impl Action {
                     index.namespace, index.digest
                 )
             }
-            Action::EnqueueScan(scan) => {
+            JobAction::EnqueueScan(scan) => {
                 let forced = if scan.force { " (forced)" } else { "" };
                 write!(
                     f,
@@ -317,7 +316,7 @@ impl Action {
                     scan.namespace, scan.digest
                 )
             }
-            Action::DeleteOrphanJob {
+            JobAction::DeleteOrphanJob {
                 queue,
                 state,
                 storage_key,
@@ -332,7 +331,7 @@ impl Action {
                     "delete the {partition} {queue} job '{storage_key}' because {reason}"
                 )
             }
-            Action::DeleteOrphanJobIndex {
+            JobAction::DeleteOrphanJobIndex {
                 queue,
                 key,
                 storage_key,
@@ -340,7 +339,6 @@ impl Action {
                 f,
                 "delete orphan {queue} job index '{key}' (pending job '{storage_key}' does not exist)"
             ),
-            _ => unreachable!("fmt dispatches only job actions here"),
         }
     }
 }

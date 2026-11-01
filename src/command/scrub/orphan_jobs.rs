@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::cache_fill::CacheFetchBlobPayload;
 use crate::command::maintenance::Error;
-use crate::command::maintenance::action::Action;
+use crate::command::maintenance::action::{Action, JobAction};
 use crate::command::maintenance::executor::ActionSink;
 use crate::jobs::store::{Error as JobStoreError, JobStore};
 use crate::jobs::{JobState, Queue};
@@ -86,7 +86,7 @@ fn classify(
 }
 
 /// Scans every pending and dead-lettered job on one queue and emits
-/// [`Action::DeleteOrphanJob`] for each whose payload no longer resolves to
+/// [`JobAction::DeleteOrphanJob`] for each whose payload no longer resolves to
 /// configured state.
 pub struct OrphanJobChecker {
     job_store: Arc<JobStore>,
@@ -191,12 +191,12 @@ impl OrphanJobChecker {
                     continue;
                 };
                 orphans += 1;
-                sink.apply(Action::DeleteOrphanJob {
+                sink.apply(Action::Job(JobAction::DeleteOrphanJob {
                     queue,
                     state,
                     storage_key,
                     reason,
-                })
+                }))
                 .await?;
             }
 
@@ -250,7 +250,7 @@ mod tests {
     use angos_oci_client::RegistryClient;
 
     use crate::cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload};
-    use crate::command::maintenance::action::Action;
+    use crate::command::maintenance::action::{Action, JobAction};
     use crate::command::maintenance::executor::{ActionSink, DryRunSink, Executor};
     use crate::command::scrub::orphan_jobs::{OrphanJobChecker, classify};
     use crate::jobs::store::{ClaimMode, FailOutcome, JobEnvelope, JobStore};
@@ -442,7 +442,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, storage_key, reason }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, storage_key, reason })
                 if *queue == Queue::Replication
                     && *state == JobState::Pending
                     && *storage_key == keys[0]
@@ -499,7 +499,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, reason, .. }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
                 if *queue == Queue::Replication
                     && *state == JobState::Pending
                     && reason.contains(GHOST_NAMESPACE)
@@ -531,7 +531,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { state, reason, .. }
+            Action::Job(JobAction::DeleteOrphanJob { state, reason, .. })
                 if *state == JobState::Failed && reason.contains(REMOVED_DOWNSTREAM)
         ));
     }
@@ -675,7 +675,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, storage_key, reason }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, storage_key, reason })
                 if *queue == Queue::Cache
                     && *state == JobState::Pending
                     && *storage_key == keys[0]
@@ -732,7 +732,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, reason, .. }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
                 if *queue == Queue::Cache
                     && *state == JobState::Pending
                     && reason == "namespace 'local' is not configured for pull-through"
@@ -763,7 +763,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, reason, .. }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
                 if *queue == Queue::Cache
                     && *state == JobState::Failed
                     && reason.contains(GHOST_NAMESPACE)

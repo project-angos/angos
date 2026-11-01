@@ -10,7 +10,7 @@ use angos_storage::{Error as StorageError, ObjectStore};
 
 use crate::command::bootstrap;
 use crate::command::maintenance::action::{
-    Action, AtimeCompaction, LOST_AND_FOUND_PREFIX, WalkedStore,
+    Action, AtimeCompaction, JobAction, LOST_AND_FOUND_PREFIX, WalkedStore,
 };
 use crate::command::maintenance::error::Error;
 use crate::configuration::Configuration;
@@ -776,39 +776,39 @@ impl ActionSink for Executor {
                 .abort_orphan_multipart_upload(&upload)
                 .await
                 .map_err(Error::from),
-            Action::EnqueueReplicationPush {
+            Action::Job(JobAction::EnqueueReplicationPush {
                 downstream,
                 namespace,
                 tag,
                 digest,
-            } => {
+            }) => {
                 self.enqueue_replication_push(downstream, namespace, tag, digest)
                     .await
             }
-            Action::EnqueueScan(scan) => self.enqueue_scan(scan).await,
-            Action::EnqueueIndex(index) => self.enqueue_index(index).await,
+            Action::Job(JobAction::EnqueueScan(scan)) => self.enqueue_scan(scan).await,
+            Action::Job(JobAction::EnqueueIndex(index)) => self.enqueue_index(index).await,
             Action::ReclaimListing(digest) => {
                 Ok(self.metadata_store.delete_listing(&digest).await?)
             }
-            Action::EnqueueReplicationDelete {
+            Action::Job(JobAction::EnqueueReplicationDelete {
                 downstream,
                 namespace,
                 tag,
-            } => {
+            }) => {
                 self.enqueue_replication_delete(downstream, namespace, tag)
                     .await
             }
-            Action::DeleteOrphanJob {
+            Action::Job(JobAction::DeleteOrphanJob {
                 queue,
                 state,
                 storage_key,
                 ..
-            } => self.delete_orphan_job(queue, state, storage_key).await,
-            Action::DeleteOrphanJobIndex {
+            }) => self.delete_orphan_job(queue, state, storage_key).await,
+            Action::Job(JobAction::DeleteOrphanJobIndex {
                 queue,
                 key,
                 storage_key,
-            } => self.delete_orphan_job_index(queue, key, storage_key).await,
+            }) => self.delete_orphan_job_index(queue, key, storage_key).await,
             Action::QuarantineKey { store, key } => self.quarantine_key(store, key).await,
             Action::DeleteCorruptObject { store, key }
             | Action::DeleteUnknownKey { store, key } => self.delete_walked_key(store, key).await,
@@ -1748,11 +1748,11 @@ mod tests {
             let executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             executor
-                .apply(Action::EnqueueReplicationDelete {
+                .apply(Action::Job(JobAction::EnqueueReplicationDelete {
                     downstream: "mirror".to_string(),
                     namespace: Namespace::new("ns/app").unwrap(),
                     tag: Tag::new("stray").unwrap(),
-                })
+                }))
                 .await
                 .unwrap();
 
@@ -1792,11 +1792,11 @@ mod tests {
 
             for _ in 0..2 {
                 executor
-                    .apply(Action::EnqueueReplicationDelete {
+                    .apply(Action::Job(JobAction::EnqueueReplicationDelete {
                         downstream: "mirror".to_string(),
                         namespace: Namespace::new("ns/app").unwrap(),
                         tag: Tag::new("stray").unwrap(),
-                    })
+                    }))
                     .await
                     .unwrap();
             }
@@ -1846,12 +1846,12 @@ mod tests {
     }
 
     fn delete_orphan_action(queue: Queue, state: JobState, storage_key: String) -> Action {
-        Action::DeleteOrphanJob {
+        Action::Job(JobAction::DeleteOrphanJob {
             queue,
             state,
             storage_key,
             reason: "configuration no longer resolves this job".to_string(),
-        }
+        })
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use angos_oci::Namespace;
 
 use crate::command::bootstrap::{self, MaintenanceContext};
 use crate::command::maintenance::Error;
-use crate::command::maintenance::action::Action;
+use crate::command::maintenance::action::{Action, JobAction};
 use crate::command::maintenance::check::{self, NamespaceChecker};
 use crate::command::maintenance::executor::{ActionSink, Executor, run_job_store, run_sink};
 use crate::command::maintenance::tags::Rankings;
@@ -91,7 +91,8 @@ impl NamespaceChecker for ScanChecker {
                 reported_before: None,
             };
             if self.force {
-                sink.apply(Action::EnqueueScan(payload)).await?;
+                sink.apply(Action::Job(JobAction::EnqueueScan(payload)))
+                    .await?;
                 continue;
             }
             // Taken before the reports are read, so a report attached from
@@ -107,10 +108,10 @@ impl NamespaceChecker for ScanChecker {
                 .applies(policy, &self.metadata_store, namespace, &digest, scanned_at)
                 .await?
             {
-                sink.apply(Action::EnqueueScan(ScanImagePayload {
+                sink.apply(Action::Job(JobAction::EnqueueScan(ScanImagePayload {
                     reported_before: newest.map(|_| now),
                     ..payload
-                }))
+                })))
                 .await?;
             }
         }
@@ -157,7 +158,7 @@ mod tests {
     use angos_oci::{Digest, Namespace};
 
     use super::ScanChecker;
-    use crate::command::maintenance::action::Action;
+    use crate::command::maintenance::action::{Action, JobAction};
     use crate::command::maintenance::check::{self, NamespaceChecker};
     use crate::command::maintenance::executor::Executor;
     use crate::jobs::Queue;
@@ -228,7 +229,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter_map(|action| match action {
-                Action::EnqueueScan(scan) => Some(scan),
+                Action::Job(JobAction::EnqueueScan(scan)) => Some(scan),
                 _ => None,
             })
             .collect()

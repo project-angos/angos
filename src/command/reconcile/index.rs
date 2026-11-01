@@ -20,7 +20,7 @@ use angos_oci::{Digest, Namespace};
 
 use crate::command::bootstrap::{self, MaintenanceContext};
 use crate::command::maintenance::Error;
-use crate::command::maintenance::action::Action;
+use crate::command::maintenance::action::{Action, JobAction};
 use crate::command::maintenance::check::{self, NamespaceChecker};
 use crate::command::maintenance::executor::{ActionSink, Executor, run_job_store, run_sink};
 use crate::command::maintenance::tags::Rankings;
@@ -102,11 +102,11 @@ impl NamespaceChecker for IndexChecker {
                 if !self.force && self.metadata_store.read_listing(&layer).await?.is_some() {
                     continue;
                 }
-                sink.apply(Action::EnqueueIndex(IndexLayerPayload {
+                sink.apply(Action::Job(JobAction::EnqueueIndex(IndexLayerPayload {
                     namespace: namespace.clone(),
                     digest: layer,
                     force: self.force,
-                }))
+                })))
                 .await?;
             }
         }
@@ -216,7 +216,7 @@ mod tests {
     use angos_oci::{Digest, Namespace};
 
     use super::{IndexChecker, reclaim_listings};
-    use crate::command::maintenance::action::Action;
+    use crate::command::maintenance::action::{Action, JobAction};
     use crate::command::maintenance::check::NamespaceChecker;
     use crate::layer::IndexAction;
     use crate::policy::{ImagePolicy, PolicyConfig};
@@ -232,7 +232,9 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|action| match action {
-                Action::EnqueueIndex(index) => Some((index.digest.to_string(), index.force)),
+                Action::Job(JobAction::EnqueueIndex(index)) => {
+                    Some((index.digest.to_string(), index.force))
+                }
                 _ => None,
             })
             .collect()
