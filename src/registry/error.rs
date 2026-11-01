@@ -108,122 +108,105 @@ impl Error {
     /// error code and the message worth sending. A 4xx code must come from the
     /// spec's set, so each case picks the closest of those.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn oci_answer(&self) -> (StatusCode, &'static str, Option<String>) {
-        match self {
-            Error::BlobUnknown => (StatusCode::NOT_FOUND, ErrorCode::BlobUnknown.as_str(), None),
+        let (status, code) = match self {
+            Error::BlobUnknown => (StatusCode::NOT_FOUND, ErrorCode::BlobUnknown.as_str()),
             // `405` is what end-10 lists for a refused blob delete, so the
             // reason travels in the message rather than in a status outside
             // that set.
-            Error::BlobReferenced => (
-                StatusCode::METHOD_NOT_ALLOWED,
-                ErrorCode::Denied.as_str(),
-                Some(self.to_string()),
-            ),
-            Error::BlobUploadUnknown => (
-                StatusCode::NOT_FOUND,
-                ErrorCode::BlobUploadUnknown.as_str(),
-                None,
-            ),
-            Error::DigestInvalid => (
-                StatusCode::BAD_REQUEST,
-                ErrorCode::DigestInvalid.as_str(),
-                None,
-            ),
+            Error::BlobReferenced => (StatusCode::METHOD_NOT_ALLOWED, ErrorCode::Denied.as_str()),
+            Error::BlobUploadUnknown => {
+                (StatusCode::NOT_FOUND, ErrorCode::BlobUploadUnknown.as_str())
+            }
+            Error::DigestInvalid => (StatusCode::BAD_REQUEST, ErrorCode::DigestInvalid.as_str()),
             Error::ManifestBlobUnknown => (
                 StatusCode::NOT_FOUND,
                 ErrorCode::ManifestBlobUnknown.as_str(),
-                None,
             ),
             Error::ManifestBodyTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorCode::ManifestInvalid.as_str(),
-                Some(self.to_string()),
             ),
             Error::BlobBodyTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorCode::BlobUploadInvalid.as_str(),
-                Some(self.to_string()),
             ),
-            Error::ManifestInvalid(msg) => (
-                StatusCode::BAD_REQUEST,
-                ErrorCode::ManifestInvalid.as_str(),
-                Some(msg.clone()),
-            ),
-            Error::ManifestUnknown => (
-                StatusCode::NOT_FOUND,
-                ErrorCode::ManifestUnknown.as_str(),
-                None,
-            ),
-            Error::NameInvalid => (
-                StatusCode::BAD_REQUEST,
-                ErrorCode::NameInvalid.as_str(),
-                None,
-            ),
-            Error::NameUnknown | Error::NotFound => {
-                (StatusCode::NOT_FOUND, ErrorCode::NameUnknown.as_str(), None)
+            Error::ManifestInvalid(_) => {
+                (StatusCode::BAD_REQUEST, ErrorCode::ManifestInvalid.as_str())
             }
-            Error::Unauthorized(msg) => (
-                StatusCode::UNAUTHORIZED,
-                ErrorCode::Unauthorized.as_str(),
-                Some(msg.clone()),
-            ),
-            Error::Denied(msg) => (
-                StatusCode::FORBIDDEN,
-                ErrorCode::Denied.as_str(),
-                Some(msg.clone()),
-            ),
-            Error::Unsupported => (
-                StatusCode::BAD_REQUEST,
-                ErrorCode::Unsupported.as_str(),
-                None,
-            ),
+            Error::ManifestUnknown => (StatusCode::NOT_FOUND, ErrorCode::ManifestUnknown.as_str()),
+            Error::NameInvalid => (StatusCode::BAD_REQUEST, ErrorCode::NameInvalid.as_str()),
+            Error::NameUnknown | Error::NotFound => {
+                (StatusCode::NOT_FOUND, ErrorCode::NameUnknown.as_str())
+            }
+            Error::Unauthorized(_) => (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized.as_str()),
+            Error::Denied(_) => (StatusCode::FORBIDDEN, ErrorCode::Denied.as_str()),
+            Error::Unsupported => (StatusCode::BAD_REQUEST, ErrorCode::Unsupported.as_str()),
             Error::RangeNotSatisfiable => (
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 ErrorCode::SizeInvalid.as_str(),
-                None,
             ),
             // A refused write (an immutable tag, a concurrent-writer CAS
             // conflict) answers 409 under the spec code closest to it.
-            Error::Conflict(msg) => (
-                StatusCode::CONFLICT,
-                ErrorCode::Denied.as_str(),
-                Some(msg.clone()),
-            ),
+            Error::Conflict(_) => (StatusCode::CONFLICT, ErrorCode::Denied.as_str()),
             // Transient by construction, since the collector's batch moves on:
             // the client backs off and retries instead of reading a refusal.
-            Error::ReclamationInProgress(msg) => (
+            Error::ReclamationInProgress(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 RECLAMATION_IN_PROGRESS_CODE,
-                Some(msg.clone()),
             ),
             // Transient too: the client retries once the upstream is back,
             // instead of reading the outage as a missing image.
-            Error::UpstreamUnavailable(msg) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                UPSTREAM_UNAVAILABLE_CODE,
-                Some(msg.clone()),
-            ),
-            Error::ReplicationSuperseded(msg) => (
-                StatusCode::CONFLICT,
-                REPLICATION_SUPERSEDED_CODE,
-                Some(msg.clone()),
-            ),
+            Error::UpstreamUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, UPSTREAM_UNAVAILABLE_CODE)
+            }
+            Error::ReplicationSuperseded(_) => (StatusCode::CONFLICT, REPLICATION_SUPERSEDED_CODE),
             // Corrupt content is a 500 like any other internal failure; only
             // the reclaim paths inside angos act on the distinction.
-            Error::Initialization(msg)
+            Error::Initialization(_)
+            | Error::EventDelivery(_)
+            | Error::Internal(_)
+            | Error::Corrupt(_)
+            | Error::Configuration(_)
+            | Error::Cache(_)
+            | Error::Io(_)
+            | Error::Serde(_) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_CODE),
+        };
+        (status, code, self.oci_message())
+    }
+
+    /// The message sent with [`Self::oci_answer`]; `None` where the spec code
+    /// says it all.
+    fn oci_message(&self) -> Option<String> {
+        match self {
+            Error::ManifestInvalid(msg)
+            | Error::Unauthorized(msg)
+            | Error::Denied(msg)
+            | Error::Conflict(msg)
+            | Error::ReclamationInProgress(msg)
+            | Error::UpstreamUnavailable(msg)
+            | Error::ReplicationSuperseded(msg)
+            | Error::Initialization(msg)
             | Error::EventDelivery(msg)
             | Error::Internal(msg)
-            | Error::Corrupt(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                INTERNAL_ERROR_CODE,
-                Some(msg.clone()),
-            ),
-            Error::Configuration(_) | Error::Cache(_) | Error::Io(_) | Error::Serde(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                INTERNAL_ERROR_CODE,
-                Some(self.to_string()),
-            ),
+            | Error::Corrupt(msg) => Some(msg.clone()),
+            Error::BlobReferenced
+            | Error::ManifestBodyTooLarge { .. }
+            | Error::BlobBodyTooLarge { .. }
+            | Error::Configuration(_)
+            | Error::Cache(_)
+            | Error::Io(_)
+            | Error::Serde(_) => Some(self.to_string()),
+            Error::BlobUnknown
+            | Error::BlobUploadUnknown
+            | Error::DigestInvalid
+            | Error::ManifestBlobUnknown
+            | Error::ManifestUnknown
+            | Error::NameInvalid
+            | Error::NameUnknown
+            | Error::NotFound
+            | Error::Unsupported
+            | Error::RangeNotSatisfiable => None,
         }
     }
 }
