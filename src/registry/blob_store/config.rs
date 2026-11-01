@@ -2,7 +2,9 @@
 //! write under `[blob_store.fs]` or `[blob_store.s3]`, and the wiring of the
 //! storage handles it selects.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytesize::ByteSize;
 use serde::Deserialize;
@@ -10,17 +12,13 @@ use serde::Deserialize;
 use angos_s3_client::{
     Backend as S3HttpBackend, BackendConfig as S3TransportConfig, Error as S3ClientError,
 };
-use angos_storage::{
-    ObjectStore, PresignedStore,
-    fs::Backend as StorageFsBackend,
-    s3::{Backend as StorageS3Backend, DEFAULT_RANGE_CONCURRENCY},
-};
+use angos_storage::fs::Backend as StorageFsBackend;
+use angos_storage::s3::{Backend as StorageS3Backend, DEFAULT_RANGE_CONCURRENCY};
+use angos_storage::{ObjectStore, PresignedStore};
 
-use crate::registry::{
-    Error,
-    blob_store::{BlobStore, DEFAULT_PRESIGN_TTL_SECS},
-    s3_connection::S3ConnectionConfig,
-};
+use crate::registry::Error;
+use crate::registry::blob_store::{BlobStore, DEFAULT_PRESIGN_TTL_SECS};
+use crate::registry::s3_connection::S3ConnectionConfig;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct FsBackendConfig {

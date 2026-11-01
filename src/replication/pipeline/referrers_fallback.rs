@@ -4,13 +4,12 @@
 //! GET/modify/PUT under one per-subject lock so concurrent jobs cannot drop
 //! each other's update.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock, Mutex as StdMutex, PoisonError},
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, PoisonError};
+use std::time::Duration;
 
-use tokio::{sync::Mutex as AsyncMutex, time::timeout};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::timeout;
 use tracing::warn;
 
 use angos_oci::manifest_accept_types;
@@ -18,7 +17,8 @@ use angos_oci::request::{DeleteManifestRequest, GetManifestRequest, PutManifestR
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, Reference};
 use angos_oci_client::{Error as ClientError, RegistryClient};
 
-use crate::{registry::Error as RegistryError, replication::Error};
+use crate::registry::Error as RegistryError;
+use crate::replication::Error;
 
 /// Upper bound on each downstream HTTP call inside the referrers-merge
 /// critical section, so a hung downstream cannot hold the per-subject merge

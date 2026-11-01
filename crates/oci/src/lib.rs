@@ -12,4 +12,9 @@ pub mod response;
 pub mod server;
 pub mod types;
 
-pub use types::*;
+pub use types::{
+    Algorithm, Content, DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Error, IN_TOTO_PREDICATE_TYPE,
+    Manifest, MediaRange, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE,
+    OCI_MANIFEST_SCHEMA_VERSION, Platform, Reference, Tag, UploadSessionId, constants, http_range,
+    manifest_accept_types, namespace_belongs_to,
+};

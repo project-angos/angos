@@ -1,31 +1,27 @@
 //! The endpoints the registry does not serve: token exchange, the embedded web
 //! UI, and the operational probes. Everything OCI answers from `registry`.
 
-use std::{borrow::Cow, fmt::Display};
+use std::borrow::Cow;
+use std::fmt::Display;
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::{
-    HeaderMap, Response, StatusCode,
-    header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS},
+use hyper::header::{
+    CACHE_CONTROL, CONTENT_TYPE, HeaderValue, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
+use hyper::{HeaderMap, Response, StatusCode};
+use prometheus::TEXT_FORMAT;
 use rust_embed::Embed;
 use serde::Serialize;
 use tracing::warn;
 
 use angos_transport::{ResponseBody, build_response, json_headers, json_response};
 
-use crate::{
-    auth::TokenIssuer, command::server::error::Error, identity::ClientIdentity,
-    metrics_provider::metrics_provider, registry::Registry,
-};
-
-/// The response field names are the ones OCI clients read.
-#[derive(Serialize)]
-pub struct TokenBody {
-    token: String,
-    expires_in: u64,
-}
+use crate::auth::TokenIssuer;
+use crate::command::server::error::Error;
+use crate::identity::ClientIdentity;
+use crate::metrics_provider::metrics_provider;
+use crate::registry::Registry;
 
 #[derive(Clone, Serialize)]
 pub struct UiConfigBody {
@@ -70,8 +66,7 @@ pub fn handle_get_token(
         ));
     }
 
-    let (token, expires_in) = token_issuer.issue(identity)?;
-    let body = TokenBody { token, expires_in };
+    let body = token_issuer.issue(identity)?;
     // The body is a bearer credential, so no shared cache may store it and hand
     // it to the next client asking for one.
     let mut headers = json_headers();
@@ -82,10 +77,6 @@ pub fn handle_get_token(
         headers,
         ResponseBody::fixed(serde_json::to_vec(&body)?),
     )?)
-}
-
-pub fn handle_ui_config(ui_config: &UiConfigBody) -> Result<Response<ResponseBody>, Error> {
-    json_response(StatusCode::OK, ui_config)
 }
 
 pub fn handle_ui_asset(path: &str) -> Result<Response<ResponseBody>, Error> {
@@ -171,9 +162,9 @@ fn not_ready_body(error: &impl Display) -> StatusBody {
 }
 
 pub fn handle_metrics() -> Result<Response<ResponseBody>, Error> {
-    let (content_type, metrics) = metrics_provider().gather()?;
+    let metrics = metrics_provider().gather()?;
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::try_from(content_type)?);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(TEXT_FORMAT));
 
     Ok(build_response(
         StatusCode::OK,

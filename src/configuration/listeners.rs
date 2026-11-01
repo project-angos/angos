@@ -1,8 +1,6 @@
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    num::NonZeroU64,
-    path::PathBuf,
-};
+use std::net::{IpAddr, Ipv4Addr};
+use std::num::NonZeroU64;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 

@@ -5,7 +5,5 @@
 mod handler;
 
 #[cfg(test)]
-pub use crate::cache_fill::handler::CACHE_FETCH_BLOB_KIND;
-pub use crate::cache_fill::handler::{
-    CACHE_ACTOR, CacheFetchBlobPayload, CacheFillJobHandler, build_envelope,
-};
+pub use handler::CACHE_FETCH_BLOB_KIND;
+pub use handler::{CACHE_ACTOR, CacheFetchBlobPayload, CacheFillJobHandler, build_envelope};

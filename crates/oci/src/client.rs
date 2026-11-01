@@ -118,7 +118,7 @@ fn has_rel_next(entry: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::*;
+    use super::*;
     use crate::server::next_page_link;
     use crate::types::{MediaType, Tag};
 

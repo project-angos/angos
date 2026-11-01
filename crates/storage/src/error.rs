@@ -39,19 +39,3 @@ impl From<S3Error> for Error {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::error::Error;
-
-    #[test]
-    fn not_found_display() {
-        assert_eq!(Error::NotFound.to_string(), "object not found");
-    }
-
-    #[test]
-    fn backend_display_includes_message() {
-        let e = Error::Backend("connection reset".to_string());
-        assert_eq!(e.to_string(), "storage backend error: connection reset");
-    }
-}

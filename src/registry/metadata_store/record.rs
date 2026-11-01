@@ -1,7 +1,7 @@
 //! Immutable revision and referrer records.
 //!
 //! A stored manifest is one never-mutated record at
-//! [`NamespaceKeys::revision_record_path`] whose existence makes the digest
+//! [`NamespaceExt::revision_record_path`] whose existence makes the digest
 //! resolvable; a referrer is one record per (subject, referrer) whose body is
 //! the referring manifest's descriptor.
 
@@ -12,11 +12,9 @@ use serde::{Deserialize, Serialize};
 use angos_oci::{Descriptor, Digest, MediaType, Namespace};
 use angos_storage::Error as StorageError;
 
-use crate::registry::{
-    Error,
-    keys::NamespaceKeys,
-    metadata_store::{LinkMetadata, MetadataStore, stored_media_type},
-};
+use crate::registry::Error;
+use crate::registry::keys::NamespaceExt;
+use crate::registry::metadata_store::{LinkMetadata, MetadataStore, stored_media_type};
 
 /// The stored body of a revision record: written once and never mutated, so
 /// a re-push of a stored digest keeps the record it already has.

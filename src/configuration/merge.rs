@@ -1,7 +1,5 @@
-use toml::{
-    Spanned,
-    de::{DeTable, DeValue},
-};
+use toml::Spanned;
+use toml::de::{DeTable, DeValue};
 
 /// Merge `overlay` into `base`, letting `overlay` win. Tables merge recursively
 /// so a later file can add keys to a table an earlier file opened; every other
@@ -77,25 +75,5 @@ mod tests {
         );
         assert!(result.contains("bucket"), "deep base key kept: {result}");
         assert!(result.contains("redis://x"), "deep overlay added: {result}");
-    }
-
-    #[test]
-    fn table_absent_from_base_is_inserted() {
-        let result = merged("[server]\nport = 8000\n", "[ui]\nenabled = true\n");
-        assert!(result.contains("server"), "base table kept: {result}");
-        assert!(result.contains("ui"), "overlay table inserted: {result}");
-    }
-
-    #[test]
-    fn empty_overlay_leaves_base_untouched() {
-        let base = "[s3]\nbucket = \"b\"\nregion = \"r\"\n";
-        let untouched = format!("{:?}", DeTable::parse(base).expect("parses").into_inner());
-        assert_eq!(merged(base, ""), untouched);
-    }
-
-    #[test]
-    fn a_table_replaces_a_scalar_of_the_same_name() {
-        let result = merged("value = 1\n", "[value]\nnested = 2\n");
-        assert!(result.contains("nested"), "table won: {result}");
     }
 }

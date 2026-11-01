@@ -1,8 +1,10 @@
 //! The S3 XML bodies angos reads and writes, as serde shapes.
 
 use chrono::{DateTime, Utc};
-use quick_xml::{de::from_reader, escape::escape};
-use serde::{Deserialize, de::DeserializeOwned};
+use quick_xml::de::from_reader;
+use quick_xml::escape::escape;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::ops::UploadedPart;
 

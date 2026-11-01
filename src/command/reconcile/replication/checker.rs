@@ -2,28 +2,26 @@
 //! pushes inline, so reconcile-discovered divergences get the same
 //! retry/backoff/coalescing as the event path.
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, warn};
 
-use angos_oci::{
-    Digest, Namespace, Reference, Tag, manifest_accept_types,
-    request::{HeadManifestRequest, ListTagsRequest},
-    response::ManifestHeadResponse,
-};
+use angos_oci::request::{HeadManifestRequest, ListTagsRequest};
+use angos_oci::response::ManifestHeadResponse;
+use angos_oci::{Digest, Namespace, Reference, Tag, manifest_accept_types};
 use angos_oci_client::Error as ClientError;
 
-use crate::{
-    command::maintenance::{Error, action::Action, check::NamespaceChecker, executor::ActionSink},
-    registry::{
-        Error as RegistryError,
-        metadata_store::{LinkKind, MetadataStore},
-        repository_resolver::RepositoryResolver,
-    },
-    replication::{ReplicationDownstream, record_reconcile_outcome},
-};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::Action;
+use crate::command::maintenance::check::NamespaceChecker;
+use crate::command::maintenance::executor::ActionSink;
+use crate::registry::Error as RegistryError;
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::replication::{ReplicationDownstream, record_reconcile_outcome};
 
 /// Enqueues a replication push for each diverging or downstream-missing tag, and
 /// for a `prune = true` downstream (one-way mirror) a replication delete for each
@@ -40,11 +38,6 @@ impl ReplicationChecker {
             metadata_store,
             resolver,
         }
-    }
-
-    fn downstream_included(downstream: &ReplicationDownstream, namespace: &Namespace) -> bool {
-        downstream.mode.participates_in_reconcile()
-            && downstream.matches_namespace(namespace.as_ref())
     }
 
     /// Re-checks a prune candidate against live state, since the local tag
@@ -163,7 +156,7 @@ async fn reconcile_push_step(
     };
     let remote = &remote;
 
-    let probes = stream::iter(local_tags.to_vec())
+    let probes: Vec<Probe> = stream::iter(local_tags.to_vec())
         .map(|(tag, local)| async move {
             let reference = Reference::Tag(tag.clone());
             // Only a 404 means absence; any other HEAD failure skips the tag
@@ -201,7 +194,7 @@ async fn reconcile_push_step(
             }
         })
         .buffer_unordered(downstream.max_concurrent_pushes.max(1))
-        .collect::<Vec<_>>()
+        .collect()
         .await;
 
     // Actions apply serially in probe order; skips are counted so a
@@ -257,7 +250,9 @@ impl NamespaceChecker for ReplicationChecker {
         let downstreams: Vec<&ReplicationDownstream> = repository
             .replication
             .iter()
-            .filter(|d| Self::downstream_included(d, namespace))
+            .filter(|d| {
+                d.mode.participates_in_reconcile() && d.matches_namespace(namespace.as_ref())
+            })
             .collect();
         if downstreams.is_empty() {
             return Ok(());
@@ -283,49 +278,38 @@ impl NamespaceChecker for ReplicationChecker {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
     use serde_json::json;
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
-    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use angos_oci::{Digest, Namespace, Tag, header::DOCKER_CONTENT_DIGEST};
+    use angos_oci::header::DOCKER_CONTENT_DIGEST;
+    use angos_oci::{Digest, Namespace, Tag};
     use angos_oci_client::RegistryClient;
-    use angos_storage::{
-        Error as StorageError, ObjectStore,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::{Error as StorageError, ObjectStore};
 
-    use crate::{
-        command::{
-            maintenance::{
-                Error,
-                action::Action,
-                check::NamespaceChecker,
-                executor::{ActionSink, Executor},
-            },
-            reconcile::replication::checker::ReplicationChecker,
-        },
-        jobs::{
-            Queue,
-            runner::execute_one,
-            store::{ClaimMode, JobStore},
-        },
-        registry::{
-            Repository,
-            keys::NamespaceKeys,
-            metadata_store::LinkKind,
-            repository_resolver::RepositoryResolver,
-            test_utils::{
-                FsTestStack, downstream_client, fs_test_stack, metadata_store_over,
-                put_blob_direct, repository_with_replication, seed_links, seed_manifest,
-            },
-        },
-        replication::{ReplicationDownstream, ReplicationJobHandler, ReplicationMode},
+    use crate::command::maintenance::Error;
+    use crate::command::maintenance::action::Action;
+    use crate::command::maintenance::check::NamespaceChecker;
+    use crate::command::maintenance::executor::{ActionSink, Executor};
+    use crate::command::reconcile::replication::checker::ReplicationChecker;
+    use crate::jobs::Queue;
+    use crate::jobs::runner::execute_one;
+    use crate::jobs::store::{ClaimMode, JobStore};
+    use crate::registry::Repository;
+    use crate::registry::keys::NamespaceExt;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::registry::test_utils::{
+        FsTestStack, downstream_client, fs_test_stack, metadata_store_over, put_blob_direct,
+        repository_with_replication, seed_links, seed_manifest,
     };
+    use crate::replication::{ReplicationDownstream, ReplicationJobHandler, ReplicationMode};
 
     const NAMESPACE: &str = "nginx";
     const REPO: &str = "nginx";
@@ -404,7 +388,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert_eq!(sink.lock().unwrap().len(), 1);
@@ -452,7 +436,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&content, &sink).await.unwrap();
 
         assert_eq!(sink.lock().unwrap().len(), 1);
@@ -603,7 +587,7 @@ mod tests {
             .with_label_values(&["skipped"])
             .get();
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert!(
@@ -625,7 +609,7 @@ mod tests {
 
     /// An `ActionSink` that fails the first `fail_first` applies.
     struct FlakySink {
-        attempted: std::sync::Mutex<Vec<Action>>,
+        attempted: Mutex<Vec<Action>>,
         fail_first: usize,
     }
 
@@ -677,7 +661,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink = FlakySink {
-            attempted: std::sync::Mutex::new(Vec::new()),
+            attempted: Mutex::new(Vec::new()),
             fail_first: 1,
         };
         checker.check(&namespace(), &sink).await.unwrap();
@@ -722,7 +706,7 @@ mod tests {
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let sink = FlakySink {
-            attempted: std::sync::Mutex::new(Vec::new()),
+            attempted: Mutex::new(Vec::new()),
             fail_first: 1,
         };
         checker.check(&namespace(), &sink).await.unwrap();
@@ -778,7 +762,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert!(
@@ -827,7 +811,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert_eq!(
@@ -877,7 +861,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         let sink = sink.into_inner().unwrap();
@@ -940,7 +924,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert_eq!(
@@ -1001,7 +985,7 @@ mod tests {
         );
 
         // The empty list stands in for a walk that ran before `fresh` existed.
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker
             .reconcile_downstream(downstream, &namespace(), &[], &sink)
             .await;
@@ -1064,7 +1048,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert!(
@@ -1125,7 +1109,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert!(
@@ -1163,7 +1147,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert!(
@@ -1205,7 +1189,7 @@ mod tests {
         ));
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &sink).await.unwrap();
 
         assert_eq!(
@@ -1304,7 +1288,7 @@ mod tests {
 
         let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
-        let captured: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let captured: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker.check(&namespace(), &captured).await.unwrap();
         let captured = captured.into_inner().unwrap();
         assert_eq!(captured.len(), 1, "out-of-sync tag must emit one action");

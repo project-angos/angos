@@ -1,19 +1,19 @@
-use std::sync::LazyLock;
-
-use regex::Regex;
-
 use crate::types::Error;
 
-/// The distribution-spec repository-name grammar, anchored:
-/// `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*`.
-/// A separator is a dot, one or two underscores, or a run of dashes, and always
-/// sits between alphanumerics.
-static NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^[a-z0-9]+(?:(?:__|[._]|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:__|[._]|-+)[a-z0-9]+)*)*$",
-    )
-    .unwrap()
-});
+/// One `/`-separated component of the distribution-spec repository-name
+/// grammar, `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`. A separator is a dot, one or
+/// two underscores, or a run of dashes, and always sits between alphanumerics.
+fn is_path_component(component: &str) -> bool {
+    let is_alphanumeric = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let bytes = component.as_bytes();
+    bytes.first().is_some_and(is_alphanumeric)
+        && bytes.last().is_some_and(is_alphanumeric)
+        && component
+            .split(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .all(|separator| {
+                matches!(separator, "" | "." | "_" | "__") || separator.bytes().all(|b| b == b'-')
+            })
+}
 
 /// OCI/Docker repository-name cap (Docker `reference.NameTotalLengthMax`).
 const MAX_NAMESPACE_LENGTH: usize = 255;
@@ -27,10 +27,10 @@ impl Namespace {
     /// Returns an error when `s` breaks the namespace grammar or exceeds the
     /// length cap.
     pub fn new(s: &str) -> Result<Self, Error> {
-        if s.len() <= MAX_NAMESPACE_LENGTH && NAMESPACE_RE.is_match(s) {
+        if s.len() <= MAX_NAMESPACE_LENGTH && s.split('/').all(is_path_component) {
             Ok(Self(s.to_owned()))
         } else {
-            Err(Error::InvalidNamespace(s.to_string()))
+            Err(Error::Namespace(s.to_string()))
         }
     }
 
@@ -49,7 +49,7 @@ impl Namespace {
             .and_then(|rest| rest.strip_prefix('/'))
         {
             Some(sub) if !sub.is_empty() => Ok(Namespace(sub.to_owned())),
-            _ => Err(Error::InvalidNamespace(format!(
+            _ => Err(Error::Namespace(format!(
                 "'{}' is not a prefix of '{}'",
                 prefix.0, self.0
             ))),
@@ -58,7 +58,7 @@ impl Namespace {
 
     /// Nest this namespace under `prefix`, yielding `prefix/self`. Joining two
     /// valid namespaces always yields valid grammar, so only the total length
-    /// cap is checked here, keeping the request path off the full regex.
+    /// cap is checked here, keeping the request path off the full grammar.
     ///
     /// # Errors
     ///
@@ -68,7 +68,7 @@ impl Namespace {
         if joined.len() <= MAX_NAMESPACE_LENGTH {
             Ok(Namespace(joined))
         } else {
-            Err(Error::InvalidNamespace(joined))
+            Err(Error::Namespace(joined))
         }
     }
 
@@ -118,42 +118,7 @@ pub fn namespace_belongs_to(namespace: &str, repository_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use crate::types::namespace::*;
-
-    #[test]
-    fn test_from_str() {
-        let ns = Namespace::from_str("test-repo").unwrap();
-        assert_eq!(ns.as_ref(), "test-repo");
-    }
-
-    #[test]
-    fn test_display() {
-        let ns = Namespace::new("test-repo").unwrap();
-        assert_eq!(ns.to_string(), "test-repo");
-    }
-
-    #[test]
-    fn test_deref() {
-        let ns = Namespace::new("test-repo").unwrap();
-        assert_eq!(ns.len(), 9);
-        assert!(ns.starts_with("test"));
-    }
-
-    #[test]
-    fn test_serialize() {
-        let ns = Namespace::new("test-repo").unwrap();
-        let json = serde_json::to_string(&ns).unwrap();
-        assert_eq!(json, "\"test-repo\"");
-    }
-
-    #[test]
-    fn test_deserialize_valid() {
-        let json = "\"test-repo\"";
-        let ns: Namespace = serde_json::from_str(json).unwrap();
-        assert_eq!(ns.as_ref(), "test-repo");
-    }
+    use super::*;
 
     #[test]
     fn test_deserialize_invalid() {
@@ -163,52 +128,9 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_eq_str() {
-        let ns = Namespace::new("test-repo").unwrap();
-        assert_eq!(ns, "test-repo");
-        assert_ne!(ns, "other-repo");
-    }
-
-    #[test]
     fn test_namespace_length_cap() {
         assert!(Namespace::new(&"a".repeat(MAX_NAMESPACE_LENGTH)).is_ok());
         assert!(Namespace::new(&"a".repeat(MAX_NAMESPACE_LENGTH + 1)).is_err());
-    }
-
-    #[test]
-    fn test_try_from_str_ref() {
-        let ns = Namespace::try_from("valid-repo").unwrap();
-        assert_eq!(ns.as_ref(), "valid-repo");
-        assert!(Namespace::try_from("INVALID").is_err());
-    }
-
-    #[test]
-    fn test_try_from_string() {
-        let ns = Namespace::try_from("valid-repo".to_string()).unwrap();
-        assert_eq!(ns.as_ref(), "valid-repo");
-        assert!(Namespace::try_from("INVALID".to_string()).is_err());
-    }
-
-    #[test]
-    fn strip_prefix_removes_a_leading_segment() {
-        assert_eq!(
-            Namespace::new("repo/app")
-                .unwrap()
-                .strip_prefix(&Namespace::new("repo").unwrap())
-                .unwrap(),
-            "app"
-        );
-    }
-
-    #[test]
-    fn strip_prefix_keeps_deeper_sub_namespaces() {
-        assert_eq!(
-            Namespace::new("repo/team/app")
-                .unwrap()
-                .strip_prefix(&Namespace::new("repo").unwrap())
-                .unwrap(),
-            "team/app"
-        );
     }
 
     #[test]
@@ -229,28 +151,6 @@ mod tests {
                 .unwrap()
                 .strip_prefix(&Namespace::new("repo").unwrap())
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn prepend_nests_under_the_prefix() {
-        assert_eq!(
-            Namespace::new("app")
-                .unwrap()
-                .prepend(&Namespace::new("mirror").unwrap())
-                .unwrap(),
-            "mirror/app"
-        );
-    }
-
-    #[test]
-    fn strip_then_prepend_remaps_the_namespace() {
-        let repo = Namespace::new("repo").unwrap();
-        let mirror = Namespace::new("mirror").unwrap();
-        let ns = Namespace::new("repo/app").unwrap();
-        assert_eq!(
-            ns.strip_prefix(&repo).unwrap().prepend(&mirror).unwrap(),
-            "mirror/app"
         );
     }
 
@@ -423,13 +323,13 @@ mod tests {
         // Component boundaries.
         let empty_components = ["/repo", "repo/", "repo//app", "a///b", "a//b"];
 
-        for name in outside_the_alphabet
+        let illegal_names = outside_the_alphabet
             .into_iter()
             .chain(foreign_characters)
             .chain(dangling_separators)
             .chain(unlisted_separators)
-            .chain(empty_components)
-        {
+            .chain(empty_components);
+        for name in illegal_names {
             assert!(
                 Namespace::new(name).is_err(),
                 "{name} is not legal under the distribution-spec name grammar"

@@ -1,6 +1,7 @@
 mod checker;
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use argh::FromArgs;
 use futures_util::future::join_all;
@@ -8,24 +9,17 @@ use tracing::{info, warn};
 
 pub use checker::ReplicationChecker;
 
-use crate::{
-    command::{
-        bootstrap,
-        maintenance::{
-            Error, check,
-            executor::{Executor, run_job_store, run_sink},
-        },
-    },
-    configuration::Configuration,
-    jobs::Queue,
-    jobs::runner::run_once,
-    jobs::store::{JobHandler, JobStore},
-    registry::{
-        blob_store::BlobStore, metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-    replication::ReplicationJobHandler,
-};
+use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::maintenance::executor::{Executor, run_job_store, run_sink};
+use crate::command::maintenance::{Error, check};
+use crate::configuration::Configuration;
+use crate::jobs::Queue;
+use crate::jobs::runner::run_once;
+use crate::jobs::store::{JobHandler, JobStore};
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::MetadataStore;
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::replication::ReplicationJobHandler;
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -100,7 +94,7 @@ impl ReplicationDrain {
 /// Reconciles every replicated namespace against all its configured
 /// downstreams, then drains the enqueued jobs in-process.
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
-    let bootstrap::MaintenanceContext {
+    let MaintenanceContext {
         blob_store: blob_backend,
         metadata_store,
         repositories,

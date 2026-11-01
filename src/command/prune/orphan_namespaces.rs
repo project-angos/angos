@@ -10,15 +10,13 @@ use tracing::{error, warn};
 
 use angos_oci::Namespace;
 
-use crate::{
-    command::maintenance::{Error, action::Action, executor::ActionSink},
-    registry::{
-        blob_store::BlobStore,
-        content_discovery::holds_manifest_content,
-        metadata_store::{LIST_PAGE, MetadataStore},
-        repository_resolver::RepositoryResolver,
-    },
-};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::Action;
+use crate::command::maintenance::executor::ActionSink;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::content_discovery::holds_manifest_content;
+use crate::registry::metadata_store::{LIST_PAGE, MetadataStore};
+use crate::registry::repository_resolver::RepositoryResolver;
 
 /// Clear the manifest content and in-flight uploads of every namespace that
 /// no longer resolves to a configured repository. Deletes go through the
@@ -32,7 +30,7 @@ pub async fn sweep_orphan_namespaces(
 ) -> Result<(), Error> {
     // With no repositories configured every namespace looks like an orphan;
     // refuse to delete the entire registry.
-    if resolver.len() == 0 {
+    if resolver.is_empty() {
         warn!("prune: no repositories configured; skipping orphan-namespace clearing");
         return Ok(());
     }
@@ -114,16 +112,14 @@ async fn clear_uploads(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use angos_oci::UploadSessionId;
 
-    use crate::command::prune::orphan_namespaces::*;
-    use crate::{
-        command::maintenance::executor::Executor,
-        registry::{
-            repository_resolver::RepositoryResolver,
-            test_utils::{create_test_repositories, for_each_backend, seed_manifest},
-        },
-    };
+    use super::*;
+    use crate::command::maintenance::executor::Executor;
+    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::registry::test_utils::{create_test_repositories, for_each_backend, seed_manifest};
 
     fn resolver() -> Arc<RepositoryResolver> {
         Arc::new(
@@ -188,8 +184,7 @@ mod tests {
             seed_manifest(&blob_store, &metadata_store, &ghost).await;
 
             let empty = Arc::new(
-                RepositoryResolver::new(Arc::new(std::collections::HashMap::new()))
-                    .expect("empty resolver"),
+                RepositoryResolver::new(Arc::new(HashMap::new())).expect("empty resolver"),
             );
             let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
             sweep_orphan_namespaces(&blob_store, &metadata_store, &empty, &executor)

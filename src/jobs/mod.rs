@@ -7,10 +7,8 @@
 pub mod runner;
 pub mod store;
 
-use std::{
-    fmt::{self, Display, Formatter},
-    str::FromStr,
-};
+use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 

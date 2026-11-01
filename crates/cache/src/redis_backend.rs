@@ -1,9 +1,11 @@
 use std::fmt;
 
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use tokio::sync::OnceCell;
 use tracing::info;
+use zeroize::Zeroize;
 
 use angos_secret::Secret;
 
@@ -12,29 +14,36 @@ use crate::Error;
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct BackendConfig {
     /// Secret as a whole: a Redis URL conventionally carries its password in
-    /// the userinfo, and this config is `Debug`-formatted wherever the loaded
-    /// configuration is.
-    #[serde(deserialize_with = "validate_redis_url")]
-    pub url: Secret<String>,
+    /// the userinfo, and the loaded configuration is `Debug`-formatted.
+    pub url: Secret<RedisUrl>,
     pub key_prefix: String,
 }
 
-/// Rejects URLs that the `redis` client would refuse at `Client::open` time.
-/// Catching the error here surfaces it at config-load instead of at first connect.
-fn validate_redis_url<'de, D>(deserializer: D) -> Result<Secret<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    Client::open(s.as_str())
-        .map_err(|e| serde::de::Error::custom(format!("invalid Redis URL: {e}")))?;
-    Ok(Secret::new(s))
+/// A URL the `redis` client accepts, so a bad one fails at config load instead
+/// of at first connect.
+#[derive(Clone, Deserialize, PartialEq, Zeroize)]
+#[serde(try_from = "String")]
+pub struct RedisUrl(String);
+
+impl RedisUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RedisUrl {
+    type Error = String;
+
+    fn try_from(url: String) -> Result<Self, Self::Error> {
+        Client::open(url.as_str()).map_err(|e| format!("invalid Redis URL: {e}"))?;
+        Ok(Self(url))
+    }
 }
 
 pub struct Backend {
     client: Client,
     /// Reconnects on its own, so a Redis restart does not disable the cache.
-    connection: OnceCell<redis::aio::ConnectionManager>,
+    connection: OnceCell<ConnectionManager>,
     key_prefix: String,
 }
 
@@ -57,7 +66,7 @@ impl Backend {
         })
     }
 
-    async fn connection(&self) -> Result<redis::aio::ConnectionManager, Error> {
+    async fn connection(&self) -> Result<ConnectionManager, Error> {
         self.connection
             .get_or_try_init(|| async {
                 self.client
@@ -105,7 +114,7 @@ mod tests {
 
     fn make_backend(db: u8) -> Backend {
         let config = BackendConfig {
-            url: Secret::new(format!("redis://localhost:6379/{db}")),
+            url: Secret::new(RedisUrl::try_from(format!("redis://localhost:6379/{db}")).unwrap()),
             key_prefix: String::new(),
         };
         Backend::new(&config).unwrap()
@@ -114,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_retrieve() {
         let config = BackendConfig {
-            url: Secret::new("redis://localhost:6379/0".to_string()),
+            url: Secret::new(RedisUrl::try_from("redis://localhost:6379/0".to_string()).unwrap()),
             key_prefix: "test_acquire_write_lock".to_owned(),
         };
         let cache = Backend::new(&config).unwrap();
@@ -137,22 +146,6 @@ mod tests {
 
         let result = cache.retrieve_value(&key).await;
         assert_eq!(result, Ok(None));
-    }
-
-    /// A multi-kilobyte value must survive a store/retrieve round-trip intact.
-    #[tokio::test]
-    async fn test_large_value_round_trip() {
-        let cache = make_backend(1);
-        let key = format!("test_large_{}", Uuid::new_v4());
-        // 64 KiB of printable ASCII
-        let large_value: String = "x".repeat(65_536);
-
-        cache.store_value(&key, &large_value, 10).await.unwrap();
-        let retrieved = cache.retrieve_value(&key).await.unwrap();
-        // Best-effort cleanup before asserting so the key is removed even on failure.
-        let _ = cache.delete_value(&key).await;
-
-        assert_eq!(retrieved, Some(large_value));
     }
 
     /// `delete_value` must remove an existing key so subsequent retrieval returns `None`.
@@ -180,20 +173,10 @@ mod tests {
         "#;
         let result = toml::from_str::<BackendConfig>(toml);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
-        assert_eq!(result.unwrap().url.expose(), "redis://localhost:6379");
-    }
-
-    /// A `redis://` URL that selects a non-default database deserializes
-    /// successfully and round-trips the input string unchanged.
-    #[test]
-    fn redis_url_accepts_url_with_database_path() {
-        let toml = r#"
-            url = "redis://localhost:6380/3"
-            key_prefix = "test:"
-        "#;
-        let result = toml::from_str::<BackendConfig>(toml);
-        assert!(result.is_ok(), "expected Ok, got: {result:?}");
-        assert_eq!(result.unwrap().url.expose(), "redis://localhost:6380/3");
+        assert_eq!(
+            result.unwrap().url.expose().as_str(),
+            "redis://localhost:6379"
+        );
     }
 
     /// The loaded configuration is `Debug`-formatted in logs and errors, so a

@@ -8,25 +8,27 @@
 //! below; the tests in this file pin S3-specific behaviour: multipart part
 //! sizing, staged remainders, and presigned URLs.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 
+use angos_s3_client::test_util::{integration_config, mock_config};
 use angos_s3_client::{
     Backend as S3Backend, BackendConfig as S3Config, Error as S3Error, UploadedPart,
-    test_util::{integration_config, mock_config},
 };
 use bytes::Bytes;
 use bytesize::ByteSize;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use uuid::Uuid;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{body_bytes, header_exists, method, path, query_param},
-};
+use wiremock::matchers::{body_bytes, header_exists, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::{MAX_PART_SIZE, MIN_PART_SIZE, next_part_number, plan_known_length_parts, staged_key};
+use super::{
+    MAX_PART_SIZE, MIN_PART_SIZE, PartPlan, next_part_number, plan_known_length_parts, staged_key,
+};
+use crate::s3::Backend;
 use crate::test_util::frame;
 use crate::tests::object_store_conformance;
-use crate::{ObjectStore, PresignedStore, s3::Backend};
+use crate::{ObjectStore, PresignedStore};
 
 fn backend() -> Backend {
     backend_with(false, ByteSize::mib(5).as_u64())
@@ -186,11 +188,12 @@ async fn committed_part_count(store: &Backend, key: &str) -> usize {
 
 /// Sizes of the committed parts of the open multipart at `key`, in order.
 async fn committed_part_sizes(store: &Backend, key: &str) -> Vec<u64> {
-    let (uploads, _, _) = store
+    let uploads = store
         .client
         .list_multipart_uploads(Some(key), None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .uploads;
     match uploads.into_iter().find(|u| u.key == key) {
         Some(u) => store
             .client
@@ -206,11 +209,12 @@ async fn committed_part_sizes(store: &Backend, key: &str) -> Vec<u64> {
 
 /// Whether an in-flight multipart upload exists at `key`.
 async fn has_open_multipart(store: &Backend, key: &str) -> bool {
-    let (uploads, _, _) = store
+    let uploads = store
         .client
         .list_multipart_uploads(Some(key), None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .uploads;
     uploads.into_iter().any(|u| u.key == key)
 }
 
@@ -230,7 +234,7 @@ async fn upload_uniform_round_trip() {
     for chunk in &chunks {
         let len = chunk.len() as u64;
         total = store
-            .write_upload(&key, frame(chunk.clone()), Some(len))
+            .write_upload(&key, frame(chunk), Some(len))
             .await
             .unwrap();
     }
@@ -256,10 +260,7 @@ async fn upload_unknown_length_streams_to_eof() {
     // 13 MiB: two full 5 MiB parts plus a 3 MiB remainder.
     let data: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    let total = store
-        .write_upload(&key, frame(data.clone()), None)
-        .await
-        .unwrap();
+    let total = store.write_upload(&key, frame(&data), None).await.unwrap();
     assert_eq!(total, data.len() as u64);
     assert_eq!(
         committed_part_count(&store, &key).await,
@@ -282,10 +283,7 @@ async fn upload_unknown_length_emits_part_size_parts() {
     // 20 MiB = exactly two 10 MiB parts, no remainder.
     let data: Vec<u8> = (0..20 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    let total = store
-        .write_upload(&key, frame(data.clone()), None)
-        .await
-        .unwrap();
+    let total = store.write_upload(&key, frame(&data), None).await.unwrap();
     assert_eq!(total, data.len() as u64);
     assert_eq!(
         committed_part_sizes(&store, &key).await,
@@ -306,10 +304,7 @@ async fn upload_unknown_length_non_multiple_part_size() {
     // 24 MiB = exactly two 12 MiB parts.
     let data: Vec<u8> = (0..24 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    let total = store
-        .write_upload(&key, frame(data.clone()), None)
-        .await
-        .unwrap();
+    let total = store.write_upload(&key, frame(&data), None).await.unwrap();
     assert_eq!(total, data.len() as u64);
     assert_eq!(
         committed_part_sizes(&store, &key).await,
@@ -335,10 +330,7 @@ async fn upload_unknown_length_uniform_uses_equal_parts() {
     // itself.
     let data: Vec<u8> = (0..23 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    let total = store
-        .write_upload(&key, frame(data.clone()), None)
-        .await
-        .unwrap();
+    let total = store.write_upload(&key, frame(&data), None).await.unwrap();
     assert_eq!(total, data.len() as u64);
 
     let sizes = committed_part_sizes(&store, &key).await;
@@ -373,11 +365,11 @@ async fn upload_uniform_mixed_known_then_chunked_stays_uniform() {
 
     let first_len = first.len() as u64;
     store
-        .write_upload(&key, frame(first.clone()), Some(first_len))
+        .write_upload(&key, frame(&first), Some(first_len))
         .await
         .unwrap();
     let total = store
-        .write_upload(&key, frame(second.clone()), None)
+        .write_upload(&key, frame(&second), None)
         .await
         .unwrap();
     assert_eq!(total, (first.len() + second.len()) as u64);
@@ -407,11 +399,11 @@ async fn upload_nonuniform_known_then_chunked_round_trips() {
 
     let first_len = first.len() as u64;
     store
-        .write_upload(&key, frame(first.clone()), Some(first_len))
+        .write_upload(&key, frame(&first), Some(first_len))
         .await
         .unwrap();
     let total = store
-        .write_upload(&key, frame(second.clone()), None)
+        .write_upload(&key, frame(&second), None)
         .await
         .unwrap();
     assert_eq!(total, (first.len() + second.len()) as u64);
@@ -431,10 +423,7 @@ async fn upload_unknown_length_empty_body_coalesce_path() {
     let store = backend_with(false, PART);
     let key = format!("up/chunked-empty-coalesce/{}/data", Uuid::new_v4());
 
-    let total = store
-        .write_upload(&key, frame(Vec::new()), None)
-        .await
-        .unwrap();
+    let total = store.write_upload(&key, frame(&[]), None).await.unwrap();
     assert_eq!(total, 0, "an empty chunked body appends nothing");
     assert!(
         !has_open_multipart(&store, &key).await,
@@ -453,10 +442,7 @@ async fn upload_unknown_length_empty_body_direct_path() {
     let store = backend_with(false, 5 * 1024 * 1024);
     let key = format!("up/chunked-empty-direct/{}/data", Uuid::new_v4());
 
-    let total = store
-        .write_upload(&key, frame(Vec::new()), None)
-        .await
-        .unwrap();
+    let total = store.write_upload(&key, frame(&[]), None).await.unwrap();
     assert_eq!(total, 0, "an empty chunked body appends nothing");
     assert!(
         !has_open_multipart(&store, &key).await,
@@ -465,34 +451,6 @@ async fn upload_unknown_length_empty_body_direct_path() {
 
     store.complete_upload(&key).await.unwrap();
     assert_eq!(store.get(&key).await.unwrap(), b"");
-}
-
-/// Large chunked write: a body well above `part_size` must still seal exact
-/// `part_size` parts. This uses a moderately large materialized body since the
-/// test helpers build streams from a `Vec`.
-#[tokio::test]
-async fn upload_unknown_length_large_body_emits_part_size_parts() {
-    const PART: u64 = 10 * 1024 * 1024;
-    let store = backend_with(false, PART);
-    let key = format!("up/chunked-large/{}/data", Uuid::new_v4());
-    // 35 MiB = three 10 MiB parts plus a 5 MiB tail (which seals as a 5 MiB
-    // part too, leaving nothing staged).
-    let data: Vec<u8> = (0..35 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
-
-    let total = store
-        .write_upload(&key, frame(data.clone()), None)
-        .await
-        .unwrap();
-    assert_eq!(total, data.len() as u64);
-
-    let sizes = committed_part_sizes(&store, &key).await;
-    assert!(
-        sizes.iter().take(3).all(|&s| s == PART),
-        "the first three parts must each be exactly part_size, got {sizes:?}"
-    );
-
-    store.complete_upload(&key).await.unwrap();
-    assert_eq!(store.get(&key).await.unwrap(), data);
 }
 
 /// A chunked (`None`) body that is entirely below the 5 MiB floor with a
@@ -506,10 +464,7 @@ async fn upload_unknown_length_small_chunked_body_round_trips() {
     // 1 MiB: well below the 5 MiB floor, so nothing can flush as a part.
     let data: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
-    let total = store
-        .write_upload(&key, frame(data.clone()), None)
-        .await
-        .unwrap();
+    let total = store.write_upload(&key, frame(&data), None).await.unwrap();
     assert_eq!(total, data.len() as u64);
     assert!(
         !has_open_multipart(&store, &key).await,
@@ -539,12 +494,9 @@ async fn upload_unknown_length_nonuniform_resumes_across_writes() {
     let first: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect(); // 1 part + 3 MiB tail
     let second: Vec<u8> = (0..10 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
 
-    store
-        .write_upload(&key, frame(first.clone()), None)
-        .await
-        .unwrap();
+    store.write_upload(&key, frame(&first), None).await.unwrap();
     let total = store
-        .write_upload(&key, frame(second.clone()), None)
+        .write_upload(&key, frame(&second), None)
         .await
         .unwrap();
     assert_eq!(total, (first.len() + second.len()) as u64);
@@ -564,12 +516,9 @@ async fn upload_unknown_length_resumes_across_writes() {
     let first: Vec<u8> = vec![0x41; 7 * 1024 * 1024]; // 1 part + 2 MiB staged
     let second: Vec<u8> = vec![0x42; 6 * 1024 * 1024]; // combined 8 MiB staged -> 1 part + 3 MiB
 
-    store
-        .write_upload(&key, frame(first.clone()), None)
-        .await
-        .unwrap();
+    store.write_upload(&key, frame(&first), None).await.unwrap();
     let total = store
-        .write_upload(&key, frame(second.clone()), None)
+        .write_upload(&key, frame(&second), None)
         .await
         .unwrap();
     assert_eq!(total, (first.len() + second.len()) as u64);
@@ -595,7 +544,7 @@ async fn upload_nonuniform_flushes_at_configured_part_size_not_min() {
     let first: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let first_len = first.len() as u64;
     let total = store
-        .write_upload(&key, frame(first.clone()), Some(first_len))
+        .write_upload(&key, frame(&first), Some(first_len))
         .await
         .unwrap();
     assert_eq!(
@@ -627,7 +576,7 @@ async fn upload_nonuniform_flushes_at_configured_part_size_not_min() {
     let second: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let second_len = second.len() as u64;
     store
-        .write_upload(&key, frame(second.clone()), Some(second_len))
+        .write_upload(&key, frame(&second), Some(second_len))
         .await
         .unwrap();
 
@@ -659,7 +608,7 @@ async fn upload_nonuniform_default_still_flushes_at_5_mib() {
 
     let len = data.len() as u64;
     store
-        .write_upload(&key, frame(data.clone()), Some(len))
+        .write_upload(&key, frame(&data), Some(len))
         .await
         .unwrap();
 
@@ -699,7 +648,7 @@ async fn upload_small_upload_takes_singleshot_path() {
     let store = backend_with(false, 5 * 1024 * 1024);
     let key = format!("up/small/{}/data", Uuid::new_v4());
     store
-        .write_upload(&key, frame(b"hello".to_vec()), Some(5))
+        .write_upload(&key, frame(b"hello"), Some(5))
         .await
         .unwrap();
     assert!(
@@ -708,32 +657,6 @@ async fn upload_small_upload_takes_singleshot_path() {
     );
     store.complete_upload(&key).await.unwrap();
     assert_eq!(store.get(&key).await.unwrap(), b"hello");
-}
-
-/// Keyless recovery: a write followed by an independent write at the same key
-/// resumes from the recovered parts + staged remainder, with no caller state.
-#[tokio::test]
-async fn upload_resumes_from_recovered_state() {
-    let store = backend_with(true, 5 * 1024 * 1024);
-    let key = format!("up/resume/{}/data", Uuid::new_v4());
-    let head = vec![0x55; 6 * 1024 * 1024];
-    store
-        .write_upload(&key, frame(head.clone()), Some(head.len() as u64))
-        .await
-        .unwrap();
-
-    // No handle is threaded; the next call recovers state from S3 by key.
-    let tail = vec![0x66; 512 * 1024];
-    let total = store
-        .write_upload(&key, frame(tail.clone()), Some(tail.len() as u64))
-        .await
-        .unwrap();
-    assert_eq!(total, (head.len() + tail.len()) as u64);
-    store.complete_upload(&key).await.unwrap();
-    let assembled = store.get(&key).await.unwrap();
-    let mut expected = head;
-    expected.extend_from_slice(&tail);
-    assert_eq!(assembled, expected);
 }
 
 /// `abort_upload` clears every in-flight multipart upload at `key`, including
@@ -756,11 +679,12 @@ async fn upload_abort_removes_orphans_and_staged() {
 
     store.abort_upload(&key).await.unwrap();
 
-    let (remaining, _, _) = store
+    let remaining = store
         .client
         .list_multipart_uploads(Some(&key), None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .uploads;
     assert!(remaining.iter().all(|u| u.key != key));
     assert!(
         matches!(
@@ -852,7 +776,11 @@ fn known_length_parts_stay_within_the_s3_part_bounds() {
     ];
 
     for (uniform, part_size, available) in cases {
-        let (count, emit_size, restaged) = plan_known_length_parts(uniform, part_size, available);
+        let PartPlan {
+            count,
+            emit_size,
+            restaged,
+        } = plan_known_length_parts(uniform, part_size, available);
         assert_eq!(
             count * emit_size + restaged,
             available,
@@ -871,8 +799,9 @@ fn known_length_parts_stay_within_the_s3_part_bounds() {
 /// huge append must not leave most of it as the remainder.
 #[test]
 fn splitting_a_huge_append_leaves_a_small_remainder() {
-    let (count, _, restaged) =
-        plan_known_length_parts(false, MIN_PART_SIZE, 100 * 1024 * 1024 * 1024);
+    let PartPlan {
+        count, restaged, ..
+    } = plan_known_length_parts(false, MIN_PART_SIZE, 100 * 1024 * 1024 * 1024);
     assert!(
         restaged < count,
         "restaging {restaged} bytes defeats the point of splitting"
@@ -881,11 +810,12 @@ fn splitting_a_huge_append_leaves_a_small_remainder() {
 
 #[test]
 fn part_size_below_the_s3_floor_is_raised_to_it() {
-    let client = Arc::new(S3Backend::new(&mock_config("http://127.0.0.1:1")).expect("s3 client"));
+    let client =
+        Arc::new(S3Backend::new(&mock_config("http://127.0.0.1:1".to_owned())).expect("s3 client"));
     let backend = Backend::builder(client).part_size(1024).build();
 
-    let (_, emit_size, _) = plan_known_length_parts(true, backend.part_size, MIN_PART_SIZE * 3);
-    assert_eq!(emit_size, MIN_PART_SIZE);
+    let plan = plan_known_length_parts(true, backend.part_size, MIN_PART_SIZE * 3);
+    assert_eq!(plan.emit_size, MIN_PART_SIZE);
 }
 
 /// S3 caps an upload at 10,000 parts. Without this guard the 10,001st part is

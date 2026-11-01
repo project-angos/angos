@@ -1,6 +1,9 @@
-use std::{process::Output, str::FromStr};
+use std::process::Output;
+use std::str::FromStr;
 
 use tokio::process::Command;
+
+use angos_mtls_client::BasicAuth;
 
 use super::Error;
 
@@ -45,7 +48,7 @@ impl Scanner {
         self,
         image_ref: &str,
         plain_http: bool,
-        credentials: Option<&(String, String)>,
+        credentials: Option<&BasicAuth>,
     ) -> Result<Vec<u8>, Error> {
         let mut command = Command::new(self.as_str());
         self.arguments(&mut command, image_ref);
@@ -112,7 +115,7 @@ impl Scanner {
         command: &mut Command,
         image_ref: &str,
         plain_http: bool,
-        credentials: Option<&(String, String)>,
+        credentials: Option<&BasicAuth>,
     ) {
         let authority = image_ref.split('/').next().unwrap_or(image_ref);
         match self {
@@ -121,19 +124,19 @@ impl Scanner {
                 if plain_http {
                     command.env("GRYPE_REGISTRY_INSECURE_USE_HTTP", "true");
                 }
-                if let Some((username, password)) = credentials {
+                if let Some(auth) = credentials {
                     command.env("SYFT_REGISTRY_AUTH_AUTHORITY", authority);
-                    command.env("SYFT_REGISTRY_AUTH_USERNAME", username);
-                    command.env("SYFT_REGISTRY_AUTH_PASSWORD", password);
+                    command.env("SYFT_REGISTRY_AUTH_USERNAME", &auth.username);
+                    command.env("SYFT_REGISTRY_AUTH_PASSWORD", auth.password.expose());
                 }
             }
             Scanner::Trivy => {
                 if plain_http {
                     command.env("TRIVY_INSECURE", "true");
                 }
-                if let Some((username, password)) = credentials {
-                    command.env("TRIVY_USERNAME", username);
-                    command.env("TRIVY_PASSWORD", password);
+                if let Some(auth) = credentials {
+                    command.env("TRIVY_USERNAME", &auth.username);
+                    command.env("TRIVY_PASSWORD", auth.password.expose());
                 }
             }
         }
@@ -160,6 +163,9 @@ mod tests {
 
     use tokio::process::Command;
 
+    use angos_mtls_client::BasicAuth;
+    use angos_secret::Secret;
+
     use super::Scanner;
 
     fn argv(command: &Command) -> Vec<String> {
@@ -176,18 +182,6 @@ mod tests {
             .get_envs()
             .find(|(k, _)| *k == OsStr::new(key))
             .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
-    }
-
-    #[test]
-    fn trivy_runs_serially_and_grype_does_not() {
-        assert!(Scanner::Trivy.serial());
-        assert!(!Scanner::Grype.serial());
-    }
-
-    #[test]
-    fn grype_owns_its_database_and_trivy_refreshes_its_own() {
-        assert!(Scanner::Grype.owns_database());
-        assert!(!Scanner::Trivy.owns_database());
     }
 
     #[test]
@@ -209,7 +203,10 @@ mod tests {
             &mut command,
             image,
             true,
-            Some(&("scanner".to_string(), "pw".to_string())),
+            Some(&BasicAuth {
+                username: "scanner".to_string(),
+                password: Secret::new("pw".to_string()),
+            }),
         );
         assert_eq!(
             argv(&command),

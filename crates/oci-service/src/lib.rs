@@ -50,7 +50,7 @@ pub struct Accepted;
 #[derive(Debug)]
 pub struct NoContent;
 
-// ---- Manifests ------------------------------------------------------------
+// Manifests
 
 /// A manifest GET: the bytes inline, or a redirect to where they live. The
 /// digest and media type ride both arms, since the spec's `Docker-Content-Digest`
@@ -102,7 +102,7 @@ pub struct ManifestWritten {
     pub changed: bool,
 }
 
-// ---- Blobs ----------------------------------------------------------------
+// Blobs
 
 /// A blob body being streamed out. `range` is `None` for a whole blob and the
 /// response is `200`; `Some` makes it `206` and the reader carries exactly that
@@ -128,7 +128,7 @@ pub struct BlobDescriptor {
     pub media_type: Option<MediaType>,
 }
 
-// ---- Uploads --------------------------------------------------------------
+// Uploads
 
 /// An open upload session: the id to continue it under, the namespace it lives
 /// in, and the count of bytes received so far. A fresh session has received
@@ -156,7 +156,7 @@ pub enum StartUpload {
     Completed(Box<BlobWritten>),
 }
 
-// ---- Discovery ------------------------------------------------------------
+// Discovery
 
 /// A page of a tag listing and the cursor to resume after, `None` once the
 /// listing is exhausted.

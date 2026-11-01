@@ -1,6 +1,6 @@
 //! Tag state as ordered write-once entries.
 //!
-//! A tag is the set of entries under its [`NamespaceKeys::tag_entry_dir`], each
+//! A tag is the set of entries under its [`NamespaceExt::tag_entry_dir`], each
 //! named `<ord>.<kind>.<algo>.<hash>` with an inverted-timestamp `<ord>` so a
 //! listing yields newest first. Writers only append, so last-writer-wins is a
 //! property of the key names and concurrent writers never contend; a tag with
@@ -13,11 +13,9 @@ use futures_util::TryStreamExt;
 use angos_oci::{Digest, Namespace, Tag};
 use angos_storage::Error as StorageError;
 
-use crate::registry::{
-    Error,
-    keys::{NamespaceKeys, TagEntry},
-    metadata_store::{LinkMetadata, MetadataStore},
-};
+use crate::registry::Error;
+use crate::registry::keys::{NamespaceExt, TagEntry, TagEntryKind};
+use crate::registry::metadata_store::{LinkMetadata, MetadataStore};
 
 /// The timestamp a locally authored entry carries: this replica's clock,
 /// truncated to the millisecond its key encodes and floored one millisecond
@@ -49,10 +47,10 @@ impl MetadataStore {
         namespace: &Namespace,
         tag: &Tag,
         target: &Digest,
-        deletion: bool,
+        kind: TagEntryKind,
         created_at: DateTime<Utc>,
     ) -> Result<(), Error> {
-        let key = namespace.tag_entry_path(tag, created_at, deletion, target);
+        let key = namespace.tag_entry_path(tag, created_at, kind, target);
         self.object_store()
             .put(&key, Bytes::new())
             .await
@@ -83,7 +81,7 @@ impl MetadataStore {
             .or(authored_at)
             .unwrap_or_else(|| local_entry_ts(Utc::now(), newest));
 
-        self.write_tag_entry(namespace, tag, target, false, created_at)
+        self.write_tag_entry(namespace, tag, target, TagEntryKind::Set, created_at)
             .await?;
         if !same_target {
             self.index_namespace(namespace).await;
@@ -131,8 +129,14 @@ impl MetadataStore {
             Ok(current) => {
                 let created_at =
                     authored_at.unwrap_or_else(|| local_entry_ts(Utc::now(), current.created_at));
-                self.write_tag_entry(namespace, tag, &current.target, true, created_at)
-                    .await?;
+                self.write_tag_entry(
+                    namespace,
+                    tag,
+                    &current.target,
+                    TagEntryKind::Deletion,
+                    created_at,
+                )
+                .await?;
             }
             Err(Error::NotFound) => {}
             Err(e) => return Err(e),
@@ -230,20 +234,22 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::max;
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use chrono::{DateTime, TimeDelta, Utc};
+    use chrono::{DateTime, SubsecRound, TimeDelta, Utc};
     use tempfile::TempDir;
 
     use angos_oci::{Digest, Namespace, Tag};
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_storage::ObjectStore;
+    use angos_storage::fs::Backend as StorageFsBackend;
 
     use super::*;
-    use crate::registry::{
-        keys::NamespaceKeys,
-        metadata_store::LinkKind,
-        test_utils::{FSRegistryTestCase, RegistryTestCase, drop_links, metadata_store_over},
+    use crate::registry::keys::NamespaceExt;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::test_utils::{
+        FSRegistryTestCase, RegistryTestCase, drop_links, metadata_store_over,
     };
 
     /// The entry key carries only the millisecond, so a stamp landing later
@@ -283,10 +289,6 @@ mod tests {
         );
     }
 
-    fn entry_ms(ts: DateTime<Utc>) -> DateTime<Utc> {
-        DateTime::from_timestamp_millis(ts.timestamp_millis()).unwrap()
-    }
-
     /// Two processes pushing the same tag write disjoint entry keys, so neither
     /// write is lost and both resolve the same winner (equal timestamps
     /// tie-break on the higher digest).
@@ -306,7 +308,7 @@ mod tests {
         let namespace = Namespace::new("two-writers").unwrap();
         let tag = Tag::new("latest").unwrap();
         let link = LinkKind::Tag(tag.clone());
-        let ts = entry_ms(Utc::now());
+        let ts = Utc::now().trunc_subsecs(3);
         let digest_a = Digest::sha256_of_bytes(b"writer-a");
         let digest_b = Digest::sha256_of_bytes(b"writer-b");
 
@@ -328,7 +330,7 @@ mod tests {
             .unwrap();
         assert_eq!(entries.items.len(), 2, "neither concurrent write is lost");
 
-        let winner = std::cmp::max(digest_a.clone(), digest_b.clone());
+        let winner = max(digest_a.clone(), digest_b.clone());
         for store in [&a, &b] {
             let resolved = store.read_link(&namespace, &link).await.unwrap();
             assert_eq!(
@@ -393,9 +395,9 @@ mod tests {
         let namespace = Namespace::new("old-shape-entry").unwrap();
         let tag = Tag::new("v1").unwrap();
         let target = Digest::sha256_of_bytes(b"old-shape-manifest");
-        let ts = entry_ms(Utc::now());
+        let ts = Utc::now().trunc_subsecs(3);
 
-        let key = namespace.tag_entry_path(&tag, ts, false, &target);
+        let key = namespace.tag_entry_path(&tag, ts, TagEntryKind::Set, &target);
         store
             .object_store()
             .put(
@@ -439,7 +441,7 @@ mod tests {
                 &namespace,
                 &tag.clone(),
                 &peer.clone(),
-                Some(entry_ms(Utc::now()) + TimeDelta::seconds(60)),
+                Some(Utc::now().trunc_subsecs(3) + TimeDelta::seconds(60)),
             )
             .await
             .unwrap();
@@ -496,7 +498,7 @@ mod tests {
 
         // Seeded out of lexical order, each tag pushed twice so a superseded entry
         // sits beside its winner in the listing.
-        let base = entry_ms(Utc::now());
+        let base = Utc::now().trunc_subsecs(3);
         for name in ["v2", "v10", "v1", "v1.1"] {
             let tag = Tag::new(name).unwrap();
             for revision in 0..2i64 {

@@ -6,7 +6,8 @@ use angos_oci::Namespace;
 use angos_oci::path::API_PREFIX;
 use angos_oci_service::{Endpoint as OciEndpoint, parse as parse_oci};
 
-use crate::{identity::Action, jobs};
+use crate::identity::Action;
+use crate::jobs::{JobState, Queue};
 
 /// The token service's endpoint. Shared with the dispatcher, which answers a
 /// method this route does not serve rather than letting it fall through to the
@@ -293,17 +294,17 @@ impl From<&Route> for Action {
                     path: path.clone(),
                 },
                 AngosEndpoint::ListJobs { queue, n, after } => Action::ListJobs {
-                    queue: jobs::Queue::from(*queue),
+                    queue: Queue::from(*queue),
                     n: *n,
                     after: after.clone(),
                 },
                 AngosEndpoint::ListFailedJobs { queue, n, after } => Action::ListFailedJobs {
-                    queue: jobs::Queue::from(*queue),
+                    queue: Queue::from(*queue),
                     n: *n,
                     after: after.clone(),
                 },
                 AngosEndpoint::RetryJob { queue, storage_key } => Action::RetryJob {
-                    queue: jobs::Queue::from(*queue),
+                    queue: Queue::from(*queue),
                     storage_key: storage_key.clone(),
                 },
                 AngosEndpoint::DeleteJob {
@@ -311,8 +312,8 @@ impl From<&Route> for Action {
                     state,
                     storage_key,
                 } => Action::DeleteJob {
-                    queue: jobs::Queue::from(*queue),
-                    state: jobs::JobState::from(*state),
+                    queue: Queue::from(*queue),
+                    state: JobState::from(*state),
                     storage_key: storage_key.clone(),
                 },
             },

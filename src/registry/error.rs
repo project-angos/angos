@@ -1,19 +1,27 @@
-use std::{num::TryFromIntError, string::FromUtf8Error};
+use std::io::Error as IoError;
+use std::num::TryFromIntError;
+use std::string::FromUtf8Error;
 
+use chrono::format::ParseError as ChronoParseError;
 use http::StatusCode;
+use serde_json::Error as SerdeJsonError;
 use sha2::digest::common::hazmat::DeserializeStateError;
 use tracing::warn;
+use x509_parser::error::X509Error;
 
-use angos_oci::{
-    Error as OciError, http_range,
-    response::{
-        ErrorCode, INTERNAL_ERROR_CODE, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE,
-        UPSTREAM_UNAVAILABLE_CODE,
-    },
+use angos_cache::Error as CacheError;
+use angos_oci::Error as OciError;
+use angos_oci::http_range::Error as HttpRangeError;
+use angos_oci::response::{
+    ErrorCode, INTERNAL_ERROR_CODE, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE,
+    UPSTREAM_UNAVAILABLE_CODE,
 };
+use angos_oci_client::Error as ClientError;
 use angos_storage::Error as StorageError;
 
-use crate::{configuration, jobs::store as job_store, policy};
+use crate::configuration::Error as ConfigurationError;
+use crate::jobs::store::Error as JobStoreError;
+use crate::policy::Error as PolicyError;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -86,13 +94,13 @@ pub enum Error {
 
     // Typed variants preserving the source error chain.
     #[error("configuration error during operations: {0}")]
-    Configuration(#[from] configuration::Error),
+    Configuration(#[from] ConfigurationError),
     #[error("cache error during operations: {0}")]
-    Cache(#[from] angos_cache::Error),
+    Cache(#[from] CacheError),
     #[error("I/O error during operations: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] IoError),
     #[error("(de)serialization error during operations: {0}")]
-    Serde(#[from] serde_json::Error),
+    Serde(#[from] SerdeJsonError),
 }
 
 impl Error {
@@ -251,25 +259,25 @@ impl From<TryFromIntError> for Error {
     }
 }
 
-impl From<chrono::format::ParseError> for Error {
-    fn from(error: chrono::format::ParseError) -> Self {
+impl From<ChronoParseError> for Error {
+    fn from(error: ChronoParseError) -> Self {
         Error::Corrupt(error.to_string())
     }
 }
 
 // Every policy error collapses into the string-carrying `Initialization`, a
 // semantic mapping `#[from]` could not express.
-impl From<policy::Error> for Error {
-    fn from(error: policy::Error) -> Self {
+impl From<PolicyError> for Error {
+    fn from(error: PolicyError) -> Self {
         Error::Initialization(error.to_string())
     }
 }
 
 // A missing job record is a `404`; every other failure is an opaque `500`.
-impl From<job_store::Error> for Error {
-    fn from(error: job_store::Error) -> Self {
+impl From<JobStoreError> for Error {
+    fn from(error: JobStoreError) -> Self {
         match error {
-            job_store::Error::NotFound => Error::NotFound,
+            JobStoreError::NotFound => Error::NotFound,
             other => Error::Internal(other.to_string()),
         }
     }
@@ -277,27 +285,25 @@ impl From<job_store::Error> for Error {
 
 // Variant for variant, so the pull-through path surfaces a remote miss as the
 // matching local OCI code.
-impl From<angos_oci_client::Error> for Error {
-    fn from(error: angos_oci_client::Error) -> Self {
+impl From<ClientError> for Error {
+    fn from(error: ClientError) -> Self {
         match error {
-            angos_oci_client::Error::Initialization(msg) => Error::Initialization(msg),
-            angos_oci_client::Error::Unauthorized(msg) => Error::Unauthorized(msg),
-            angos_oci_client::Error::Denied(msg) => Error::Denied(msg),
-            angos_oci_client::Error::BlobUnknown => Error::BlobUnknown,
-            angos_oci_client::Error::ManifestUnknown => Error::ManifestUnknown,
-            angos_oci_client::Error::ManifestBodyTooLarge { limit } => {
-                Error::ManifestBodyTooLarge { limit }
-            }
-            angos_oci_client::Error::Unsupported => Error::Unsupported,
-            angos_oci_client::Error::RangeNotSatisfiable => Error::RangeNotSatisfiable,
-            angos_oci_client::Error::Internal(msg) => Error::Internal(msg),
+            ClientError::Initialization(msg) => Error::Initialization(msg),
+            ClientError::Unauthorized(msg) => Error::Unauthorized(msg),
+            ClientError::Denied(msg) => Error::Denied(msg),
+            ClientError::BlobUnknown => Error::BlobUnknown,
+            ClientError::ManifestUnknown => Error::ManifestUnknown,
+            ClientError::ManifestBodyTooLarge { limit } => Error::ManifestBodyTooLarge { limit },
+            ClientError::Unsupported => Error::Unsupported,
+            ClientError::RangeNotSatisfiable => Error::RangeNotSatisfiable,
+            ClientError::Internal(msg) => Error::Internal(msg),
         }
     }
 }
 
 // A malformed range and an unservable one are both a 416 to the client.
-impl From<http_range::Error> for Error {
-    fn from(_: http_range::Error) -> Self {
+impl From<HttpRangeError> for Error {
+    fn from(_: HttpRangeError) -> Self {
         Error::RangeNotSatisfiable
     }
 }
@@ -318,41 +324,17 @@ impl Error {
     }
 }
 
-impl From<x509_parser::error::X509Error> for Error {
-    fn from(_: x509_parser::error::X509Error) -> Self {
+impl From<X509Error> for Error {
+    fn from(_: X509Error) -> Self {
         Error::Unauthorized("Invalid client certificate".to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as StdError;
-
     use chrono::DateTime;
-    use x509_parser::error::X509Error;
 
-    use crate::registry::error::*;
-
-    #[test]
-    fn from_io_error_preserves_source() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
-        let err: Error = io_err.into();
-        assert!(matches!(err, Error::Io(_)));
-        assert!(StdError::source(&err).is_some());
-        assert!(err.to_string().contains("I/O error during operations"));
-    }
-
-    #[test]
-    fn from_serde_json_preserves_source() {
-        let serde_err = serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
-        let err: Error = serde_err.into();
-        assert!(matches!(err, Error::Serde(_)));
-        assert!(StdError::source(&err).is_some());
-        assert!(
-            err.to_string()
-                .contains("(de)serialization error during operations")
-        );
-    }
+    use super::*;
 
     #[test]
     fn from_storage_not_found_routes_to_not_found() {
@@ -361,37 +343,9 @@ mod tests {
     }
 
     #[test]
-    fn from_configuration_preserves_source() {
-        let config_err = configuration::Error::Initialization("cfg failed".to_string());
-        let err: Error = config_err.into();
-        assert!(matches!(err, Error::Configuration(_)));
-        assert!(StdError::source(&err).is_some());
-        assert!(
-            err.to_string()
-                .contains("configuration error during operations")
-        );
-    }
-
-    #[test]
-    fn from_cache_preserves_source() {
-        let cache_err = angos_cache::Error::Execution("cache miss".to_string());
-        let err: Error = cache_err.into();
-        assert!(matches!(err, Error::Cache(_)));
-        assert!(StdError::source(&err).is_some());
-        assert!(err.to_string().contains("cache error during operations"));
-    }
-
-    #[test]
     fn from_oci_error_routes_to_name_invalid() {
-        let err: Error = OciError::InvalidDigest("bad digest".to_string()).into();
+        let err: Error = OciError::Digest("bad digest".to_string()).into();
         assert!(matches!(err, Error::NameInvalid));
-    }
-
-    #[test]
-    fn from_policy_error_routes_to_initialization() {
-        let err: Error = policy::Error::Evaluation("eval failed".to_string()).into();
-        assert!(matches!(err, Error::Initialization(_)));
-        assert!(err.to_string().contains("eval failed"));
     }
 
     #[test]

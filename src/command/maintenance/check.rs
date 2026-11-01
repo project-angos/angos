@@ -10,13 +10,10 @@ use tracing::warn;
 
 use angos_oci::Namespace;
 
-use crate::{
-    command::maintenance::{error::Error, executor::ActionSink},
-    registry::{
-        content_discovery::holds_manifest_content,
-        metadata_store::{LIST_PAGE, MetadataStore},
-    },
-};
+use crate::command::maintenance::error::Error;
+use crate::command::maintenance::executor::ActionSink;
+use crate::registry::content_discovery::holds_manifest_content;
+use crate::registry::metadata_store::{LIST_PAGE, MetadataStore};
 
 /// A checker that operates on a single namespace at a time.
 ///

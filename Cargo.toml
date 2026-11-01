@@ -149,7 +149,6 @@ angos-oci = { workspace = true, features = ["test-util"] }
 angos-s3-client = { workspace = true, features = ["test-util"] }
 angos-storage = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
-opentelemetry_sdk = { version = "0.33.1", features = ["testing"] }
 p256 = { version = "0.14.0", features = ["ecdsa", "pem"] }
 rcgen = { workspace = true }
 wiremock = { workspace = true }

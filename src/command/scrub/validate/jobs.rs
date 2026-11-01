@@ -6,29 +6,16 @@ use tracing::warn;
 
 use angos_storage::Error as StorageError;
 
-use crate::{
-    command::{
-        maintenance::{
-            Error,
-            action::{Action, WalkedStore},
-        },
-        scrub::validate::Validator,
-    },
-    jobs::{
-        JobState, Queue,
-        store::{DeadLetterRecord, JobEnvelope, LockKeyIndex, job_pending_path},
-    },
-    registry::Error as RegistryError,
-};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::{Action, WalkedStore};
+use crate::command::scrub::validate::Validator;
+use crate::jobs::store::{DeadLetterRecord, JobEnvelope, LockKeyIndex, job_pending_path};
+use crate::jobs::{JobState, Queue};
+use crate::registry::Error as RegistryError;
 
 impl Validator {
     /// Validate one pending or dead-lettered job record.
-    pub async fn validate_job_record(
-        &self,
-        key: &str,
-        _queue: Queue,
-        state: JobState,
-    ) -> Result<(), Error> {
+    pub async fn validate_job_record(&self, key: &str, state: JobState) -> Result<(), Error> {
         let Some(raw) = self.read_metadata_object(key).await? else {
             return Ok(());
         };

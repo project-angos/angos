@@ -7,7 +7,8 @@ use std::io::{self, Write};
 use std::pin::Pin;
 
 use bytes::Bytes;
-use flate2::{Compression, write::GzEncoder};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use tokio::io::{AsyncRead, AsyncReadExt, empty};
 use tokio::sync::mpsc;
@@ -21,11 +22,10 @@ use angos_extension_service::{
 };
 use angos_oci::{Digest, Namespace};
 
-use crate::{
-    jobs::Queue,
-    layer::{self, IndexLayerPayload, Listing, elf, pem},
-    registry::{Error, Registry, angos_extension::layer_listing},
-};
+use crate::jobs::Queue;
+use crate::layer::{self, IndexLayerPayload, Listing, elf, pem};
+use crate::registry::angos_extension::layer_listing;
+use crate::registry::{Error, Registry};
 
 /// The boxed reader a layer file streams through. The gzip decode path is
 /// `!Unpin`, so this is a pinned box rather than the storage `BoxedReader`.
@@ -45,7 +45,7 @@ impl Registry {
             gzip,
         } = request;
         let upstream = self
-            .get_repository_for_namespace(&namespace)
+            .repository_for_namespace(&namespace)
             .ok()
             .filter(|repository| repository.is_pull_through());
         if !self.metadata_store.can_read(&namespace, &digest).await? {
@@ -317,7 +317,7 @@ impl Registry {
     /// Fire-and-forget enqueue of a layer's index job, after a push into an
     /// image an index policy applies to or to walk an outdated listing again;
     /// a failure is logged and counted, never the client's problem.
-    pub(crate) async fn dispatch_index(&self, namespace: &Namespace, digest: &Digest) {
+    pub async fn dispatch_index(&self, namespace: &Namespace, digest: &Digest) {
         let payload = IndexLayerPayload {
             namespace: namespace.clone(),
             digest: digest.clone(),

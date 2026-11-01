@@ -1,7 +1,10 @@
 //! Builders for the request `Parts` handed to auth middlewares under test.
 
-use base64::{Engine, prelude::BASE64_STANDARD};
-use http::{Request, header::AUTHORIZATION, request::Parts};
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
+use http::Request;
+use http::header::AUTHORIZATION;
+use http::request::Parts;
 
 /// Parts of a bare GET request with no headers.
 ///

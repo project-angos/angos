@@ -1,20 +1,22 @@
-use std::{
-    convert::Infallible, fmt::Debug, future::Future, net::SocketAddr, pin::Pin, sync::Arc,
-    time::Instant,
-};
+use std::convert::Infallible;
+use std::fmt::Debug;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use hyper::{
-    Method, Request, Response, body::Incoming, header::HeaderValue, server::conn::http1,
-    service::service_fn,
-};
+use hyper::body::Incoming;
+use hyper::header::HeaderValue;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use opentelemetry::trace::TraceContextExt;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    pin,
-    time::sleep,
-};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::pin;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, debug, error, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -22,18 +24,15 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use angos_oci::header::OCI_NAMESPACE;
 use angos_transport::ResponseBody;
 
-use crate::{
-    auth::PeerCertificate,
-    command::server::{
-        ServerContext,
-        error::Error as ServerError,
-        http_server::{dispatch::dispatch_request, error_to_response},
-        listeners::RequestTimeouts,
-        router,
-    },
-    identity::RequestScheme,
-    metrics_provider::{InFlightGuard, metrics_provider},
-};
+use crate::auth::PeerCertificate;
+use crate::command::server::error::Error as ServerError;
+use crate::command::server::http_server::dispatch::dispatch_request;
+use crate::command::server::http_server::error_to_response;
+use crate::command::server::listeners::RequestTimeouts;
+use crate::command::server::router::Route;
+use crate::command::server::{ServerContext, router};
+use crate::identity::RequestScheme;
+use crate::metrics_provider::{InFlightGuard, metrics_provider};
 
 /// Boxed, type-erased dispatch future. The erasure is load-bearing, not an
 /// optimization: with the concrete future type inlined, `tokio::spawn` fails
@@ -135,16 +134,14 @@ async fn handle_request(
     // lets such a client use angos without prefixing the paths it requests.
     let proxy_namespace = context.apply_proxy_namespace(route.as_mut(), request.uri());
     // Labels both HTTP metrics below.
-    let route_label = route
-        .as_ref()
-        .map_or("unknown", router::Route::metric_label);
+    let route_label = route.as_ref().map_or("unknown", Route::metric_label);
 
     let trace_id = current_trace_id(&Span::current());
     // Captured before the request moves into the dispatch future, since the realm
     // may be derived from the request's own host. A denial on the token endpoint
     // itself is not challenged: the client would be sent to fetch a token from
     // the endpoint that just refused it.
-    let challenge_origin = (!matches!(route, Some(router::Route::Token)))
+    let challenge_origin = (!matches!(route, Some(Route::Token)))
         .then(|| context.challenge_origin(&request))
         .flatten();
 
@@ -161,10 +158,10 @@ async fn handle_request(
     let (mut response, served_namespace) = match dispatched {
         Ok(served) => served,
         Err(error) => {
-            let challenge =
-                challenge_origin.and_then(|(scheme, host)| context.bearer_challenge(scheme, &host));
+            let challenge = challenge_origin
+                .and_then(|(scheme, host)| context.token_issuer()?.challenge(scheme, &host));
             (
-                error_to_response(&error, trace_id.as_ref(), challenge),
+                error_to_response(&error, trace_id.as_deref(), challenge),
                 None,
             )
         }
@@ -197,7 +194,11 @@ async fn handle_request(
     };
 
     if status.is_server_error() {
-        error!(error = %error_for_log(&response), "{log}");
+        let error = response
+            .extensions()
+            .get::<String>()
+            .map_or("unknown", String::as_str);
+        error!(error = %error, "{log}");
     } else {
         info!("{log}");
     }
@@ -224,13 +225,6 @@ pub fn method_label(method: &Method) -> &str {
     } else {
         "other"
     }
-}
-
-fn error_for_log(response: &Response<ResponseBody>) -> &str {
-    response
-        .extensions()
-        .get::<String>()
-        .map_or("unknown", String::as_str)
 }
 
 /// Extracts the `OpenTelemetry` trace ID from the given tracing span.

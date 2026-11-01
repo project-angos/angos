@@ -1,34 +1,39 @@
-use std::{collections::HashSet, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use argh::FromArgs;
 use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
-use tokio::{
-    select,
-    time::{sleep, timeout},
-};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio::select;
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::{
-    cache_fill::CacheFillJobHandler,
-    command::bootstrap::{self, Error},
-    configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
-    jobs::{
-        Queue,
-        runner::execute_one,
-        store::{self as job_store, ClaimMode, JobHandler, JobRetryPolicy, JobStore},
-    },
-    layer::{IndexLimits, handler::IndexLayerJobHandler},
-    registry::{
-        Registry, blob_store::BlobStore, metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-    replication::ReplicationJobHandler,
-    scan::{ScanConfig, handler::ScanJobHandler},
+use crate::cache_fill::CacheFillJobHandler;
+use crate::command::bootstrap;
+use crate::command::bootstrap::{Error, MaintenanceContext};
+use crate::configuration::Configuration;
+use crate::configuration::listeners::ServerTlsConfig;
+use crate::configuration::watcher::ConfigNotifier;
+use crate::jobs::Queue;
+use crate::jobs::runner::execute_one;
+use crate::jobs::store::{
+    ClaimMode, Error as JobStoreError, JobHandler, JobRetryPolicy, JobStore, ensure_claim_support,
 };
+use crate::layer::IndexLimits;
+use crate::layer::handler::IndexLayerJobHandler;
+use crate::registry::Registry;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::MetadataStore;
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::replication::ReplicationJobHandler;
+use crate::scan::ScanConfig;
+use crate::scan::handler::ScanJobHandler;
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -37,8 +42,8 @@ use crate::{
     description = "Process durable background jobs"
 )]
 pub struct Options {
-    /// queue to drain; repeatable. Defaults to both "cache" and "replication",
-    /// each on its own worker pool.
+    /// queue to drain; repeatable. Defaults to every queue the configuration
+    /// can drain, each on its own worker pool.
     #[argh(option)]
     pub queue: Vec<String>,
     /// idle poll interval when the queue is empty
@@ -93,9 +98,9 @@ fn resolve_queues(requested: &[String], scan_configured: bool) -> Result<Vec<Que
     for name in requested {
         let queue: Queue = name
             .parse()
-            .map_err(|e| Error::JobQueue(job_store::Error::Initialization(e)))?;
+            .map_err(|e| Error::JobQueue(JobStoreError::Initialization(e)))?;
         if queue == Queue::Scan && !scan_configured {
-            return Err(Error::JobQueue(job_store::Error::Initialization(
+            return Err(Error::JobQueue(JobStoreError::Initialization(
                 "[global.scan] is required to drain the scan queue".to_string(),
             )));
         }
@@ -243,22 +248,20 @@ struct WorkerContext {
 
 impl WorkerContext {
     async fn build(config: &Configuration) -> Result<Self, Error> {
-        let bootstrap::MaintenanceContext {
+        let MaintenanceContext {
             blob_store,
             metadata_store,
             repositories,
         } = bootstrap::maintenance_context(config).await?;
 
         let Some(job_queue) = config.global.job_queue.as_ref() else {
-            return Err(bootstrap::Error::JobQueue(
-                job_store::Error::Initialization(
-                    "[global.job_queue] is required for the worker subcommand".to_string(),
-                ),
-            ));
+            return Err(Error::JobQueue(JobStoreError::Initialization(
+                "[global.job_queue] is required for the worker subcommand".to_string(),
+            )));
         };
         let retry_policy = job_queue.retry_policy();
 
-        let claim_mode = job_store::ensure_claim_support(&metadata_store).await?;
+        let claim_mode = ensure_claim_support(&metadata_store).await?;
         let registry = bootstrap::registry(
             config,
             blob_store.clone(),
@@ -289,7 +292,7 @@ impl WorkerContext {
     fn components_for(&self, queue: Queue) -> Result<Components, Error> {
         let consumer = Arc::new(JobStore::with_retry_policy(
             &self.metadata_store,
-            Uuid::new_v4().to_string(),
+            &Uuid::new_v4().to_string(),
             self.claim_mode,
             self.retry_policy,
         ));
@@ -307,7 +310,7 @@ impl WorkerContext {
             )),
             Queue::Scan => {
                 let scan = self.scan.as_ref().ok_or_else(|| {
-                    Error::JobQueue(job_store::Error::Initialization(
+                    Error::JobQueue(JobStoreError::Initialization(
                         "[global.scan] is required to drain the scan queue".to_string(),
                     ))
                 })?;
@@ -338,29 +341,25 @@ impl WorkerContext {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_storage::ObjectStore;
+    use angos_storage::fs::Backend as StorageFsBackend;
 
     use super::{WorkerContext, resolve_queues};
-    use crate::{
-        cache_fill::CACHE_FETCH_BLOB_KIND,
-        configuration::global::GlobalConfig,
-        jobs::{
-            Queue,
-            store::{ClaimMode, JobEnvelope, JobRetryPolicy, JobStore},
-        },
-        metrics_provider,
-        registry::{
-            Registry, RegistryConfig,
-            blob_store::BlobStore,
-            metadata_store::{MetadataStore, Settings},
-            repository_resolver::RepositoryResolver,
-        },
-        replication::REPLICATION_PUSH_MANIFEST_KIND,
-    };
+    use crate::cache_fill::CACHE_FETCH_BLOB_KIND;
+    use crate::configuration::global::GlobalConfig;
+    use crate::jobs::Queue;
+    use crate::jobs::store::{ClaimMode, JobEnvelope, JobRetryPolicy, JobStore};
+    use crate::metrics_provider;
+    use crate::registry::blob_store::BlobStore;
+    use crate::registry::metadata_store::{MetadataStore, Settings};
+    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::registry::{Registry, RegistryConfig};
+    use crate::replication::REPLICATION_PUSH_MANIFEST_KIND;
 
     #[test]
     fn resolve_queues_defaults_to_cache_replication_and_index() {
@@ -413,11 +412,9 @@ mod tests {
     /// Builds a `WorkerContext` literal, bypassing `build` and its
     /// `[global.job_queue]` requirement; the `TempDir` keeps the store alive.
     fn worker_context() -> (WorkerContext, TempDir) {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let dir = TempDir::new().unwrap();
-        let root = dir.path().to_str().unwrap();
-
-        let storage: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
+        let storage: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
         let metadata_store = Arc::new(MetadataStore::new(storage.clone(), Settings::default()));
         let blob_store = Arc::new(BlobStore::new(storage.clone(), None));
         let repositories = Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());

@@ -1,21 +1,23 @@
-use std::{fs, net::SocketAddr, path::Path, sync::Arc};
+use std::fs;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use rustls::{
-    RootCertStore, ServerConfig,
-    server::{WebPkiClientVerifier, danger::ClientCertVerifier},
-};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::ClientCertVerifier;
+use rustls::{RootCertStore, ServerConfig};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 use tracing::debug;
 
-use crate::command::server::{
-    ServerContext,
-    error::Error,
-    listeners::{Connector, HandshakeResult, Listener},
-};
+use crate::command::server::ServerContext;
+use crate::command::server::error::Error;
+use crate::command::server::listeners::{Connector, HandshakeResult, Listener};
 use crate::configuration::listeners::{ClientAuth, ServerTlsConfig, TlsListenerConfig};
 use crate::identity::RequestScheme;
 
@@ -124,7 +126,7 @@ impl TlsConnector {
 
 #[async_trait]
 impl Connector for TlsConnector {
-    type Stream = tokio_rustls::server::TlsStream<TcpStream>;
+    type Stream = TlsStream<TcpStream>;
 
     async fn handshake(
         &self,

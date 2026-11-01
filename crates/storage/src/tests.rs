@@ -414,14 +414,14 @@ macro_rules! object_store_conformance {
                 let (store, _guard) = $fixture;
                 assert_eq!(
                     store
-                        .write_upload("up/blob", frame("hello "), Some(6))
+                        .write_upload("up/blob", frame(b"hello "), Some(6))
                         .await
                         .unwrap(),
                     6
                 );
                 assert_eq!(
                     store
-                        .write_upload("up/blob", frame("world"), Some(5))
+                        .write_upload("up/blob", frame(b"world"), Some(5))
                         .await
                         .unwrap(),
                     11
@@ -444,7 +444,7 @@ macro_rules! object_store_conformance {
                 // an empty one.
                 let (store, _guard) = $fixture;
                 store
-                    .write_upload("up/rerun", frame("payload"), Some(7))
+                    .write_upload("up/rerun", frame(b"payload"), Some(7))
                     .await
                     .unwrap();
                 store.complete_upload("up/rerun").await.unwrap();
@@ -460,7 +460,7 @@ macro_rules! object_store_conformance {
                 // error on every backend rather than a silent truncation.
                 let (store, _guard) = $fixture;
                 let error = store
-                    .write_upload("up/long", frame("hello world"), Some(5))
+                    .write_upload("up/long", frame(b"hello world"), Some(5))
                     .await
                     .expect_err("a body longer than declared must be rejected");
                 let message = error.to_string();
@@ -474,7 +474,7 @@ macro_rules! object_store_conformance {
             async fn upload_abort_leaves_no_object() {
                 let (store, _guard) = $fixture;
                 store
-                    .write_upload("up/abort", frame("partial"), Some(7))
+                    .write_upload("up/abort", frame(b"partial"), Some(7))
                     .await
                     .unwrap();
                 store.abort_upload("up/abort").await.unwrap();
@@ -489,14 +489,14 @@ macro_rules! object_store_conformance {
                 let (store, _guard) = $fixture;
                 assert_eq!(
                     store
-                        .write_upload("up/chunked", frame("hello "), None)
+                        .write_upload("up/chunked", frame(b"hello "), None)
                         .await
                         .unwrap(),
                     6
                 );
                 assert_eq!(
                     store
-                        .write_upload("up/chunked", frame("world"), None)
+                        .write_upload("up/chunked", frame(b"world"), None)
                         .await
                         .unwrap(),
                     11
@@ -512,12 +512,12 @@ macro_rules! object_store_conformance {
                 // still round-trips.
                 let (store, _guard) = $fixture;
                 store
-                    .write_upload("up/chunked-empty", frame("data"), None)
+                    .write_upload("up/chunked-empty", frame(b"data"), None)
                     .await
                     .unwrap();
                 assert_eq!(
                     store
-                        .write_upload("up/chunked-empty", frame(""), None)
+                        .write_upload("up/chunked-empty", frame(b""), None)
                         .await
                         .unwrap(),
                     4

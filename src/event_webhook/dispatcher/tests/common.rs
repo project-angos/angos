@@ -5,24 +5,20 @@ use url::Url;
 
 use angos_oci::{Digest, Namespace, Reference};
 
-use crate::{
-    configuration::RegexPattern,
-    event_webhook::{
-        config::{DeliveryPolicy, EventWebhookConfig},
-        dispatcher::{EventDispatcher, WebhookEndpoint},
-        event::{Event, EventKind},
-    },
-    metrics_provider,
-};
+use crate::configuration::RegexPattern;
+use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
+use crate::event_webhook::dispatcher::{EventDispatcher, WebhookEndpoint};
+use crate::event_webhook::event::{Event, EventKind};
+use crate::metrics_provider;
 use angos_mtls_client::ClientTls;
 use angos_secret::Secret;
 
 const TEST_DIGEST: &str = "sha256:abc1230000000000000000000000000000000000000000000000000000000000";
 
 pub fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventDispatcher {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     // Every webhook enabled for every repository: most tests exercise delivery alone.
-    let global = webhooks.keys().cloned().collect();
+    let global: Vec<String> = webhooks.keys().cloned().collect();
     EventDispatcher::new(webhooks, global, HashMap::new())
         .expect("dispatcher should build in tests")
 }

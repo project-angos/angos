@@ -1,9 +1,10 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use hyper::{
-    Method, Request, Response, StatusCode, body::Incoming, header::CONTENT_RANGE,
-    http::request::Parts,
-};
+use hyper::body::Incoming;
+use hyper::header::CONTENT_RANGE;
+use hyper::http::request::Parts;
+use hyper::{Method, Request, Response, StatusCode};
 use tracing::instrument;
 
 use angos_docker_extension_service::{CatalogRequest, Endpoint as DockerEndpoint};
@@ -20,20 +21,16 @@ use angos_oci::request::{
 };
 use angos_oci::response::ErrorCode;
 use angos_oci_service::{Endpoint as OciEndpoint, is_invalid_referrers_request};
-use angos_transport::ResponseBody;
+use angos_transport::{ResponseBody, json_response};
 
-use crate::{
-    command::server::{
-        ServerContext,
-        error::Error,
-        handlers,
-        request::{RequestHeaders, incoming_into_async_read},
-        router::{self, Route},
-    },
-    event_webhook::event::EventActor,
-    identity::{Action, ClientIdentity},
-    registry,
-};
+use crate::command::server::error::Error;
+use crate::command::server::request::{RequestHeaders, incoming_into_async_read};
+use crate::command::server::router::Route;
+use crate::command::server::{ServerContext, handlers, router};
+use crate::event_webhook::event::EventActor;
+use crate::identity::{Action, ClientIdentity};
+use crate::registry;
+use crate::registry::Error as RegistryError;
 
 #[instrument(skip(context, req, route))]
 pub async fn dispatch_request(
@@ -81,7 +78,7 @@ async fn dispatch_route<'a>(
 
     match route {
         Route::UiAsset { path } if context.enable_ui => handlers::handle_ui_asset(&path),
-        Route::UiConfig if context.enable_ui => handlers::handle_ui_config(&context.ui_config),
+        Route::UiConfig if context.enable_ui => json_response(StatusCode::OK, &context.ui_config),
         Route::UiAsset { .. } | Route::UiConfig => handle_unknown_route(parts),
         Route::Token => {
             let Some(token_issuer) = context.token_issuer() else {
@@ -408,7 +405,7 @@ pub fn handle_unknown_route(parts: &Parts) -> Result<Response<ResponseBody>, Err
     // The referrers endpoint is the exception: the spec requires `400` from a
     // read whose digest or filter is malformed, not the miss below.
     if is_invalid_referrers_request(&parts.method, parts.uri.path()) {
-        return Err(registry::Error::DigestInvalid.into());
+        return Err(RegistryError::DigestInvalid.into());
     }
 
     // A path angos serves, reached with a method it does not: 405 says so, and

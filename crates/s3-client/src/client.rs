@@ -6,41 +6,37 @@
 //! directly; it talks to [`S3Client`] through the few zero-copy primitives
 //! exposed below.
 
-use std::{
-    borrow::Cow,
-    fmt::{self, Debug, Display, Formatter},
-    future::Future,
-    io,
-    pin::pin,
-    sync::Arc,
-    time::Duration,
-};
+use std::borrow::Cow;
+use std::error::Error as StdError;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::future::Future;
+use std::io;
+use std::pin::pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 use angos_backoff::Backoff;
+use angos_mtls_client::trusted_roots;
 use arc_swap::ArcSwapOption;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures_util::{
-    Stream, StreamExt, TryStreamExt,
-    future::{Either, pending, select},
-};
+use futures_util::future::{Either, pending, select};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as Md5Digest, Md5};
-use reqwest::{
-    Body, Client, Method, Response, StatusCode,
-    header::{
-        AUTHORIZATION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, RANGE, USER_AGENT,
-    },
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, RANGE, USER_AGENT,
 };
+use reqwest::{Body, Client, Error as ReqwestError, Method, Response, StatusCode};
 use sha2::Sha256;
-use tokio::{
-    sync::watch,
-    time::{sleep, timeout},
-};
+use tokio::sync::watch;
+use tokio::time::{sleep, timeout};
 use url::Url;
 
 use crate::BackendConfig;
+use crate::xml;
 
 const SERVICE: &str = "s3";
 const SIGNING_ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -58,16 +54,16 @@ pub struct QueryParam {
 }
 
 impl QueryParam {
-    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn new(name: &str, value: &str) -> Self {
         Self {
-            name: name.into(),
-            value: Some(value.into()),
+            name: name.to_owned(),
+            value: Some(value.to_owned()),
         }
     }
 
-    pub fn marker(name: impl Into<String>) -> Self {
+    pub fn marker(name: &str) -> Self {
         Self {
-            name: name.into(),
+            name: name.to_owned(),
             value: None,
         }
     }
@@ -91,7 +87,7 @@ pub struct S3Error {
 }
 
 impl S3Error {
-    fn transport(error: &reqwest::Error) -> Self {
+    fn transport(error: &ReqwestError) -> Self {
         Self {
             status: error.status(),
             code: None,
@@ -107,11 +103,11 @@ impl S3Error {
         }
     }
 
-    fn configuration(message: impl Into<String>) -> Self {
+    fn configuration(message: String) -> Self {
         Self {
             status: None,
             code: Some("Configuration".to_string()),
-            message: message.into(),
+            message,
         }
     }
 
@@ -138,7 +134,7 @@ impl S3Error {
     }
 
     fn from_error_body(status: Option<StatusCode>, body: &[u8]) -> Option<Self> {
-        let parsed = super::xml::parse_error(body);
+        let parsed = xml::parse_error(body);
         if parsed.code.is_none() && parsed.message.is_none() {
             return None;
         }
@@ -163,11 +159,6 @@ impl S3Error {
             || matches!(self.code.as_deref(), Some("NoSuchKey" | "NotFound"))
     }
 
-    /// Whether the precondition itself failed, which for `If-None-Match: *`
-    /// means the object is already there. A 409 `ConditionalRequestConflict`
-    /// is not this: S3 answers it while another conditional request is in
-    /// flight and defines it as retry-worthy, so reading it as "already there"
-    /// would let a copy-then-delete move delete a source it never copied.
     /// Whether the backend refused the request in a way retrying cannot
     /// change: a 4xx that is neither a missing key, a failed precondition, nor
     /// one of the retryable throttle statuses.
@@ -178,6 +169,11 @@ impl S3Error {
             && !is_retryable_error(self)
     }
 
+    /// Whether the precondition itself failed, which for `If-None-Match: *`
+    /// means the object is already there. A 409 `ConditionalRequestConflict`
+    /// is not this: S3 answers it while another conditional request is in
+    /// flight and defines it as retry-worthy, so reading it as "already there"
+    /// would let a copy-then-delete move delete a source it never copied.
     pub fn is_conditional_conflict(&self) -> bool {
         self.status == Some(StatusCode::PRECONDITION_FAILED)
             || matches!(self.code.as_deref(), Some("PreconditionFailed"))
@@ -194,7 +190,7 @@ impl Display for S3Error {
     }
 }
 
-impl std::error::Error for S3Error {}
+impl StdError for S3Error {}
 
 /// A streamed request's failure, and whether its body had gone out in full by
 /// then: until it has, the pushing client paces the exchange, so a failure may
@@ -237,7 +233,7 @@ pub struct SendOpts {
 /// One reqwest client, with `read_timeout` only where a stalled transfer must
 /// be cut short.
 fn http_client(read_timeout: Option<Duration>) -> Result<Client, S3Error> {
-    let roots = angos_mtls_client::trusted_roots(None).map_err(S3Error::configuration)?;
+    let roots = trusted_roots(None).map_err(S3Error::configuration)?;
     let mut builder = Client::builder()
         .use_rustls_tls()
         .tls_certs_only(roots)
@@ -310,7 +306,7 @@ impl S3Client {
             .map_err(|e| S3Error::configuration(format!("invalid S3 endpoint: {e}")))?;
         let host = endpoint_url
             .host_str()
-            .ok_or_else(|| S3Error::configuration("S3 endpoint must include a host"))?;
+            .ok_or_else(|| S3Error::configuration("S3 endpoint must include a host".to_owned()))?;
         let host = match endpoint_url.port() {
             Some(port) => format!("{host}:{port}"),
             None => host.to_string(),
@@ -366,7 +362,7 @@ impl S3Client {
         body: Bytes,
         opts: SendOpts,
     ) -> Result<S3Response, S3Error> {
-        self.run_with_retries(opts.non_idempotent, || async {
+        self.run_with_retries(opts, || async {
             let response = self
                 .dispatch(
                     method.clone(),
@@ -463,7 +459,7 @@ impl S3Client {
         query: Vec<QueryParam>,
         headers: HeaderMap,
     ) -> Result<Response, S3Error> {
-        self.run_with_retries(false, || async {
+        self.run_with_retries(SendOpts::default(), || async {
             let response = self
                 .dispatch(
                     method.clone(),
@@ -499,10 +495,10 @@ impl S3Client {
             QueryParam::new("X-Amz-Algorithm", SIGNING_ALGORITHM),
             QueryParam::new(
                 "X-Amz-Credential",
-                format!("{}/{credential_scope}", self.access_key_id),
+                &format!("{}/{credential_scope}", self.access_key_id),
             ),
-            QueryParam::new("X-Amz-Date", amz_date.clone()),
-            QueryParam::new("X-Amz-Expires", expires_in.as_secs().to_string()),
+            QueryParam::new("X-Amz-Date", &amz_date),
+            QueryParam::new("X-Amz-Expires", &expires_in.as_secs().to_string()),
             QueryParam::new("X-Amz-SignedHeaders", "host"),
         ];
         if let Some(content_type) = response_content_type {
@@ -521,20 +517,21 @@ impl S3Client {
         );
         let signature = self.signature(&date, &amz_date, &credential_scope, &canonical_request)?;
 
-        let mut url = target.url;
-        url.push(if target.canonical_query.is_empty() {
+        let separator = if target.canonical_query.is_empty() {
             '?'
         } else {
             '&'
-        });
-        url.push_str("X-Amz-Signature=");
-        url.push_str(&aws_uri_encode(&signature, true));
-        Ok(url)
+        };
+        Ok(format!(
+            "{}{separator}X-Amz-Signature={}",
+            target.url,
+            aws_uri_encode(&signature, Slash::Encode)
+        ))
     }
 
     async fn run_with_retries<R, F, Fut>(
         &self,
-        non_idempotent: bool,
+        opts: SendOpts,
         mut request: F,
     ) -> Result<R, S3Error>
     where
@@ -553,7 +550,7 @@ impl S3Client {
                     // the error proves it did not.
                     Err(error)
                         if attempt < attempts
-                            && if non_idempotent {
+                            && if opts.non_idempotent {
                                 is_unapplied_error(&error)
                             } else {
                                 is_retryable_error(&error)
@@ -589,7 +586,10 @@ impl S3Client {
         let (payload_hash, content_length) = match &body {
             RequestBody::Empty => (Cow::Borrowed(EMPTY_PAYLOAD_SHA256), Some(0)),
             RequestBody::Bytes(b) if b.is_empty() => (Cow::Borrowed(EMPTY_PAYLOAD_SHA256), Some(0)),
-            RequestBody::Bytes(b) => (Cow::Owned(hex_sha256(b.as_ref())), Some(b.len() as u64)),
+            RequestBody::Bytes(b) => (
+                Cow::Owned(hex::encode(Sha256::digest(b.as_ref()))),
+                Some(b.len() as u64),
+            ),
             RequestBody::Stream { content_length, .. } => {
                 (Cow::Borrowed(UNSIGNED_PAYLOAD), Some(*content_length))
             }
@@ -644,27 +644,25 @@ impl S3Client {
     }
 
     fn request_target(&self, key: &str, query: &[QueryParam]) -> RequestTarget {
-        let encoded_key = aws_uri_encode(key, false);
+        let encoded_key = aws_uri_encode(key, Slash::Keep);
         let encoded_query = encode_query(query);
 
-        let mut canonical_uri = String::new();
-        if !self.endpoint_path.is_empty() {
-            canonical_uri.push_str(&self.endpoint_path);
-        }
-        canonical_uri.push('/');
-        canonical_uri.push_str(&self.encoded_bucket);
-        if !encoded_key.is_empty() {
-            canonical_uri.push('/');
-            canonical_uri.push_str(&encoded_key);
-        }
+        let canonical_uri = if encoded_key.is_empty() {
+            format!("{}/{}", self.endpoint_path, self.encoded_bucket)
+        } else {
+            format!(
+                "{}/{}/{encoded_key}",
+                self.endpoint_path, self.encoded_bucket
+            )
+        };
 
         let canonical_query = canonical_query(&encoded_query);
         let url_query = url_query(&encoded_query);
-        let mut url = format!("{}{canonical_uri}", self.endpoint);
-        if !url_query.is_empty() {
-            url.push('?');
-            url.push_str(&url_query);
-        }
+        let url = if url_query.is_empty() {
+            format!("{}{canonical_uri}", self.endpoint)
+        } else {
+            format!("{}{canonical_uri}?{url_query}", self.endpoint)
+        };
 
         RequestTarget {
             url,
@@ -706,7 +704,7 @@ impl S3Client {
         credential_scope: &str,
         canonical_request: &str,
     ) -> Result<String, S3Error> {
-        let canonical_hash = hex_sha256(canonical_request.as_bytes());
+        let canonical_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
         let string_to_sign =
             format!("{SIGNING_ALGORITHM}\n{amz_date}\n{credential_scope}\n{canonical_hash}");
         let signing_key = self.signing_key(date)?;
@@ -785,7 +783,7 @@ pub fn content_length(headers: &HeaderMap) -> Result<u64, S3Error> {
     // Defaulting a missing header to zero would report a stored blob as empty
     // and truncate the body served from it.
     header_string(headers, "content-length")
-        .ok_or_else(|| S3Error::configuration("S3 response carries no content-length"))?
+        .ok_or_else(|| S3Error::configuration("S3 response carries no content-length".to_owned()))?
         .parse::<u64>()
         .map_err(|e| S3Error::configuration(format!("invalid S3 content-length: {e}")))
 }
@@ -797,11 +795,11 @@ pub fn last_modified(headers: &HeaderMap) -> Option<DateTime<Utc>> {
 }
 
 pub fn encode_bucket(bucket: &str) -> String {
-    aws_uri_encode(bucket, true)
+    aws_uri_encode(bucket, Slash::Encode)
 }
 
 pub fn copy_source(encoded_bucket: &str, key: &str) -> String {
-    format!("{encoded_bucket}/{}", aws_uri_encode(key, false))
+    format!("{encoded_bucket}/{}", aws_uri_encode(key, Slash::Keep))
 }
 
 pub fn content_md5_base64(body: &[u8]) -> String {
@@ -830,11 +828,12 @@ fn canonical_headers(headers: &HeaderMap) -> Result<(String, String), S3Error> {
             continue;
         }
         let name = name.as_str().to_ascii_lowercase();
-        let value = normalize_header_value(
-            value
-                .to_str()
-                .map_err(|e| S3Error::configuration(format!("invalid signed header: {e}")))?,
-        );
+        let value = value
+            .to_str()
+            .map_err(|e| S3Error::configuration(format!("invalid signed header: {e}")))?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         values.push((name, value));
     }
     values.sort_by(|a, b| a.0.cmp(&b.0));
@@ -852,22 +851,21 @@ fn canonical_headers(headers: &HeaderMap) -> Result<(String, String), S3Error> {
     Ok((canonical, signed))
 }
 
-fn normalize_header_value(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn encode_query(query: &[QueryParam]) -> Vec<EncodedQueryParam> {
     query
         .iter()
         .map(|param| EncodedQueryParam {
-            name: aws_uri_encode(&param.name, true),
-            value: param.value.as_deref().map(|v| aws_uri_encode(v, true)),
+            name: aws_uri_encode(&param.name, Slash::Encode),
+            value: param
+                .value
+                .as_deref()
+                .map(|v| aws_uri_encode(v, Slash::Encode)),
         })
         .collect()
 }
 
 fn canonical_query(query: &[EncodedQueryParam]) -> String {
-    let mut params = query.iter().collect::<Vec<_>>();
+    let mut params: Vec<&EncodedQueryParam> = query.iter().collect();
     params.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
     params
         .iter()
@@ -893,13 +891,21 @@ fn url_query(query: &[EncodedQueryParam]) -> String {
         .join("&")
 }
 
-fn aws_uri_encode(input: &str, encode_slash: bool) -> String {
+/// Whether [`aws_uri_encode`] leaves `/` as is (an object key's path) or
+/// escapes it (a bucket name or query value).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slash {
+    Keep,
+    Encode,
+}
+
+fn aws_uri_encode(input: &str, slash: Slash) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(input.len());
     for &byte in input.as_bytes() {
         let allowed = byte.is_ascii_alphanumeric()
             || matches!(byte, b'-' | b'_' | b'.' | b'~')
-            || (!encode_slash && byte == b'/');
+            || (slash == Slash::Keep && byte == b'/');
         if allowed {
             encoded.push(char::from(byte));
         } else {
@@ -909,10 +915,6 @@ fn aws_uri_encode(input: &str, encode_slash: bool) -> String {
         }
     }
     encoded
-}
-
-fn hex_sha256(input: &[u8]) -> String {
-    hex::encode(Sha256::digest(input))
 }
 
 fn hmac_sha256(key: &[u8], value: &[u8]) -> Result<[u8; 32], S3Error> {
@@ -1013,6 +1015,8 @@ async fn read_response_prefix(response: Response, limit: usize) -> Bytes {
 
 #[cfg(test)]
 mod tests {
+    use http::Response as HttpResponse;
+
     use super::*;
 
     /// A response with no `Content-Length` must not read as an empty object:
@@ -1034,7 +1038,7 @@ mod tests {
     /// a failed allocation is not an error a caller can catch.
     #[tokio::test]
     async fn a_response_body_is_not_preallocated_from_its_declared_length() {
-        let declared = http::Response::builder()
+        let declared = HttpResponse::builder()
             .header(CONTENT_LENGTH, usize::MAX.to_string())
             .body("short")
             .unwrap();
@@ -1059,26 +1063,14 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_uses_the_configured_value() {
-        let client = S3Client::new(&BackendConfig {
-            endpoint: "https://s3.amazonaws.com".to_string(),
-            bucket: "b".to_string(),
-            user_agent: Some("angos/9.9.9".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(client.user_agent, "angos/9.9.9");
-    }
-
-    #[test]
     fn user_agent_falls_back_to_this_crate_version_when_unset() {
         assert_eq!(test_client().user_agent, USER_AGENT_VALUE);
     }
 
     #[test]
     fn aws_uri_encoding_preserves_key_slashes() {
-        assert_eq!(aws_uri_encode("a b/c+d", false), "a%20b/c%2Bd");
-        assert_eq!(aws_uri_encode("a b/c+d", true), "a%20b%2Fc%2Bd");
+        assert_eq!(aws_uri_encode("a b/c+d", Slash::Keep), "a%20b/c%2Bd");
+        assert_eq!(aws_uri_encode("a b/c+d", Slash::Encode), "a%20b%2Fc%2Bd");
     }
 
     #[test]

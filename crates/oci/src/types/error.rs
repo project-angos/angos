@@ -1,24 +1,19 @@
-// All variants are named `Invalid*` by design: each names the exact resource
-// class that failed validation (digest, namespace, reference, manifest JSON,
-// media type, upload session id). The shared prefix is intentional domain
-// vocabulary, not an accidental smell.
-#[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid digest: {0}")]
-    InvalidDigest(String),
+    Digest(String),
     #[error("invalid namespace: {0}")]
-    InvalidNamespace(String),
+    Namespace(String),
     #[error("invalid reference: {0}")]
-    InvalidReference(String),
+    Reference(String),
     #[error("invalid manifest JSON: {0}")]
-    InvalidManifestJson(#[from] serde_json::Error),
+    ManifestJson(#[from] serde_json::Error),
     #[error("invalid manifest: {0}")]
-    InvalidManifest(String),
+    Manifest(String),
     #[error("invalid media range: {0}")]
-    InvalidMediaRange(String),
+    MediaRange(String),
     #[error("invalid media type: {0}")]
-    InvalidMediaType(String),
+    MediaType(String),
     #[error("invalid upload session id: {0}")]
-    InvalidUploadSessionId(String),
+    UploadSessionId(String),
 }

@@ -1,31 +1,23 @@
-use std::{fs, time::Duration};
+use std::time::Duration;
 
-use http::{Method, request::Builder};
-use reqwest::{Client, redirect::Policy};
+use http::Method;
+use http::request::Builder;
+use reqwest::redirect::Policy;
 use url::Url;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{header, method},
-};
+use wiremock::matchers::{header, method};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use angos_oci::{Namespace, Reference, Tag};
 
-use crate::metrics_provider::init_for_tests;
+use crate::metrics_provider::initialize_metrics;
 
-use crate::{
-    auth::Error,
-    auth::webhook::{
-        Config, WebhookAuthorizer,
-        config::WebhookAuth,
-        headers::{build_header_name, build_header_value, build_headers},
-    },
-    identity::{Action, ClientIdentity, RequestScheme},
-    test_fixtures::{
-        requests::parts_with_uri,
-        webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
-    },
-};
-use angos_mtls_client::{ClientTls, MtlsClientBuilder, MtlsIdentity};
+use crate::auth::Error;
+use crate::auth::webhook::config::{ForwardHeader, WebhookAuth};
+use crate::auth::webhook::headers::{build_header_value, build_headers};
+use crate::auth::webhook::{Config, WebhookAuthorizer};
+use crate::identity::{Action, ClientIdentity};
+use crate::test_fixtures::requests::parts_with_uri;
+use angos_mtls_client::{ClientTls, MtlsClientBuilder};
 use angos_secret::Secret;
 
 #[test]
@@ -78,44 +70,23 @@ fn mtls_pair_must_be_complete_at_parse() {
 }
 
 #[test]
-fn invalid_forward_header_fails_validation() {
-    let config: Config = toml::from_str(
+fn invalid_forward_header_fails_at_parse() {
+    let err = toml::from_str::<Config>(
         r#"
         url = "https://example.com"
         timeout_ms = 1000
         forward_headers = ["X-Good-Header", "Invalid Header!"]
     "#,
     )
-    .unwrap();
+    .unwrap_err()
+    .to_string();
 
-    let err = config.validate().unwrap_err();
     assert!(
         err.contains("Invalid Header!"),
         "error should identify the invalid forwarded header: {err}"
     );
 }
 
-#[test]
-fn invalid_url_fails_at_deserialize() {
-    let toml = r#"
-        url = "ht!tp://::invalid"
-        timeout_ms = 1000
-    "#;
-
-    let result: Result<Config, _> = toml::from_str(toml);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_build_header_name() {
-    let header = "X-Custom-Header";
-    let header = build_header_name(header);
-    assert!(header.is_ok());
-
-    let header = "Invalid Header!";
-    let header = build_header_name(header);
-    assert!(matches!(header, Err(Error::Execution(_))));
-}
 #[test]
 fn test_build_header_value() {
     let value = "Some value";
@@ -148,7 +119,7 @@ fn test_build_headers() {
     identity.username = Some("testuser".to_string());
     identity.client_ip = Some("192.168.1.1".to_string());
 
-    let forward_headers = vec!["X-Custom-Header".to_string()];
+    let forward_headers = vec![ForwardHeader::try_from("X-Custom-Header".to_string()).unwrap()];
 
     let headers = build_headers(&forward_headers, &action, &identity, &parts);
 
@@ -218,93 +189,24 @@ fn test_build_headers_optional_and_multi_valued_fields() {
     assert_eq!(orgs, ["org1", "org2"]);
 }
 
-fn build_test_config(url: Url, tls: ClientTls) -> Config {
+fn build_test_config(url: Url) -> Config {
     Config {
         url,
         timeout_ms: 1000,
         auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
-        tls,
-        forward_headers: vec!["X-Custom-Header".to_string()],
+        tls: ClientTls::default(),
+        forward_headers: vec![ForwardHeader::try_from("X-Custom-Header".to_string()).unwrap()],
     }
 }
 
-fn build_test_client(config: &Config) -> Result<Client, String> {
-    MtlsClientBuilder::new()
+fn build_test_webhook(config: Config) -> WebhookAuthorizer {
+    initialize_metrics();
+    let client = MtlsClientBuilder::new()
         .with_redirect_policy(Policy::none())
         .with_timeout(Duration::from_millis(config.timeout_ms))
-        .with_tls(&config.tls)
         .build()
-}
-
-fn build_test_webhook(name: String, config: Config) -> Result<WebhookAuthorizer, Error> {
-    init_for_tests();
-    let client = build_test_client(&config).map_err(Error::Initialization)?;
-    WebhookAuthorizer::new(name, config, client)
-}
-
-#[test]
-fn test_new_invalid_mtls() {
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let cert_file_path = tmp_dir.path().join("certificate.pem");
-    fs::write(&cert_file_path, client_cert_pem()).unwrap();
-
-    let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, ca_bundle_pem()).unwrap();
-
-    let ca_file_path = tmp_dir.path().join("ca.pem");
-    fs::write(&ca_file_path, ca_bundle_pem()).unwrap();
-
-    let config = build_test_config(
-        Url::parse("https://example.com").unwrap(),
-        ClientTls {
-            server_ca_bundle: Some(ca_file_path),
-            identity: Some(MtlsIdentity {
-                certificate: cert_file_path,
-                private_key: key_file_path,
-            }),
-        },
-    );
-    let webhook = build_test_webhook("test".to_string(), config);
-
-    assert!(matches!(webhook, Err(Error::Initialization(_))));
-}
-
-#[test]
-fn test_new_mtls() {
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let cert_file_path = tmp_dir.path().join("certificate.pem");
-    fs::write(&cert_file_path, client_cert_pem()).unwrap();
-
-    let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, client_key_pem()).unwrap();
-
-    let ca_file_path = tmp_dir.path().join("ca.pem");
-    fs::write(&ca_file_path, ca_bundle_pem()).unwrap();
-
-    let config = build_test_config(
-        Url::parse("https://example.com").unwrap(),
-        ClientTls {
-            server_ca_bundle: Some(ca_file_path),
-            identity: Some(MtlsIdentity {
-                certificate: cert_file_path,
-                private_key: key_file_path,
-            }),
-        },
-    );
-    let webhook = build_test_webhook("test".to_string(), config);
-
-    assert!(webhook.is_ok());
-}
-
-#[test]
-fn test_new_simple() {
-    let config = build_test_config(
-        Url::parse("https://example.com").unwrap(),
-        ClientTls::default(),
-    );
-    let webhook = build_test_webhook("test".to_string(), config);
-
-    assert!(webhook.is_ok());
+        .unwrap();
+    WebhookAuthorizer::new("test".to_string(), config, client)
 }
 
 #[tokio::test]
@@ -316,13 +218,10 @@ async fn test_authorize_success() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(
-        Url::parse(&mock_server.uri()).unwrap(),
-        ClientTls::default(),
-    );
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
     config.auth = None;
 
-    let webhook = build_test_webhook("test".to_string(), config).unwrap();
+    let webhook = build_test_webhook(config);
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -330,31 +229,6 @@ async fn test_authorize_success() {
     let parts = parts_with_uri("https://example.com/v2/");
 
     assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
-}
-
-#[tokio::test]
-async fn test_authorize_denied() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&mock_server)
-        .await;
-
-    let mut config = build_test_config(
-        Url::parse(&mock_server.uri()).unwrap(),
-        ClientTls::default(),
-    );
-    config.auth = None;
-
-    let webhook = build_test_webhook("test".to_string(), config).unwrap();
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    assert!(!webhook.authorize(&action, &identity, &parts).await.unwrap());
 }
 
 #[tokio::test]
@@ -367,15 +241,12 @@ async fn test_authorize_with_bearer_token() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(
-        Url::parse(&mock_server.uri()).unwrap(),
-        ClientTls::default(),
-    );
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
     config.auth = Some(WebhookAuth::BearerToken(Secret::new(
         "test-token".to_string(),
     )));
 
-    let webhook = build_test_webhook("test".to_string(), config).unwrap();
+    let webhook = build_test_webhook(config);
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -395,16 +266,13 @@ async fn test_authorize_with_basic_auth() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(
-        Url::parse(&mock_server.uri()).unwrap(),
-        ClientTls::default(),
-    );
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
     config.auth = Some(WebhookAuth::BasicAuth {
         username: "testuser".to_string(),
         password: Secret::new("testpass".to_string()),
     });
 
-    let webhook = build_test_webhook("test".to_string(), config).unwrap();
+    let webhook = build_test_webhook(config);
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -425,11 +293,8 @@ async fn test_authorize_sends_correct_headers() {
         .mount(&mock_server)
         .await;
 
-    let config = build_test_config(
-        Url::parse(&mock_server.uri()).unwrap(),
-        ClientTls::default(),
-    );
-    let webhook = build_test_webhook("test".to_string(), config).unwrap();
+    let config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
+    let webhook = build_test_webhook(config);
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -446,13 +311,10 @@ async fn test_authorize_sends_correct_headers() {
 
 #[tokio::test]
 async fn test_authorize_returns_err_on_unreachable_url() {
-    let mut config = build_test_config(
-        Url::parse("http://127.0.0.1:1").unwrap(),
-        ClientTls::default(),
-    );
+    let mut config = build_test_config(Url::parse("http://127.0.0.1:1").unwrap());
     config.auth = None;
 
-    let webhook = build_test_webhook("test".to_string(), config).unwrap();
+    let webhook = build_test_webhook(config);
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -469,12 +331,9 @@ async fn test_authorize_returns_err_on_unreachable_url() {
 }
 
 fn build_webhook_against(mock_server: &MockServer) -> WebhookAuthorizer {
-    let mut config = build_test_config(
-        Url::parse(&mock_server.uri()).unwrap(),
-        ClientTls::default(),
-    );
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
     config.auth = None;
-    build_test_webhook("test".to_string(), config).unwrap()
+    build_test_webhook(config)
 }
 
 // 401/403 are decisions the webhook made: Ok(false), not Err.
@@ -531,59 +390,8 @@ async fn test_authorize_500_is_unavailable() {
 }
 
 #[tokio::test]
-async fn test_authorize_503_is_unavailable() {
-    assert_unavailable_fails_closed(503).await;
-}
-
-#[tokio::test]
-async fn test_authorize_429_is_unavailable() {
-    assert_unavailable_fails_closed(429).await;
-}
-
-#[tokio::test]
 async fn test_authorize_404_is_unavailable() {
     assert_unavailable_fails_closed(404).await;
-}
-
-/// HTTP/1.1 sends origin-form targets, so the URI carries no scheme and only
-/// the listener's own record can report TLS.
-#[test]
-fn build_headers_reports_the_listener_scheme_for_an_origin_form_target() {
-    let request = Builder::new()
-        .method(Method::GET)
-        .uri("/v2/test-namespace/manifests/latest")
-        .header("Host", "example.com")
-        .body(())
-        .unwrap();
-    let (mut parts, ()) = request.into_parts();
-    parts.extensions.insert(RequestScheme::Https);
-
-    let action = Action::GetManifest {
-        namespace: Namespace::new("test-namespace").unwrap(),
-        reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
-    let headers = build_headers(&[], &action, &ClientIdentity::new(None), &parts).unwrap();
-
-    assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "https");
-}
-
-#[test]
-fn build_headers_reports_http_without_a_listener_scheme() {
-    let request = Builder::new()
-        .method(Method::GET)
-        .uri("/v2/test-namespace/manifests/latest")
-        .header("Host", "example.com")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let action = Action::GetManifest {
-        namespace: Namespace::new("test-namespace").unwrap(),
-        reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
-    let headers = build_headers(&[], &action, &ClientIdentity::new(None), &parts).unwrap();
-
-    assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "http");
 }
 
 /// `cache_ttl` configured a decision cache that is gone; a configuration

@@ -3,12 +3,13 @@ use std::fmt;
 use std::fs::write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::str::FromStr;
 use std::time::Duration;
 
 use tokio::process::Command;
 use tokio::time::sleep;
 
-use crate::error::{GateError, GateResult, ensure, fail};
+use crate::error::{GateError, GateResult, ensure};
 
 /// Delay step between chaos rounds: round N gets killed N steps in, so the
 /// walk dies at a different point every time.
@@ -82,7 +83,9 @@ impl AngosRunner {
             .stdin(Stdio::null())
             .output()
             .await
-            .map_err(|e| fail(format!("failed to spawn angos {}: {e}", args.join(" "))))?;
+            .map_err(|e| {
+                GateError::Failure(format!("failed to spawn angos {}: {e}", args.join(" ")))
+            })?;
         let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
         write(log_path, &combined)?;
@@ -107,7 +110,7 @@ impl AngosRunner {
         match &self.mode {
             RunnerMode::Binary(_) => {
                 let mut child = self
-                    .command(&["scrub"])
+                    .command_with(&self.config, &["scrub"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -138,10 +141,6 @@ impl AngosRunner {
             }
         }
         Ok(())
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        self.command_with(&self.config, args)
     }
 
     fn command_with(&self, config: &str, args: &[&str]) -> Command {
@@ -202,21 +201,18 @@ pub struct ScrubSummary {
     pub failures: u64,
 }
 
-impl ScrubSummary {
+impl FromStr for ScrubSummary {
+    type Err = GateError;
+
     /// Parse the last summary line from a run's combined output. Counting
     /// starts after the marker so tracing timestamps never pollute the parse.
-    pub fn parse(output: &str) -> GateResult<Self> {
-        let line = output
-            .lines()
-            .rev()
-            .find(|line| line.contains(SUMMARY_MARKER))
-            .ok_or_else(|| fail("no scrub summary in output"))?;
-        let Some(idx) = line.find(SUMMARY_MARKER) else {
-            return Err(fail("no scrub summary in output"));
-        };
-        let counters: Vec<u64> = line[idx..]
+    fn from_str(output: &str) -> GateResult<Self> {
+        let idx = output
+            .rfind(SUMMARY_MARKER)
+            .ok_or_else(|| GateError::Failure("no scrub summary in output".into()))?;
+        let line = output[idx..].lines().next().unwrap_or_default();
+        let counters: Vec<u64> = line
             .split(|ch: char| !ch.is_ascii_digit())
-            .filter(|token| !token.is_empty())
             .filter_map(|token| token.parse().ok())
             .collect();
         ensure(counters.len() == 5, || {
@@ -230,7 +226,9 @@ impl ScrubSummary {
             failures: counters[4],
         })
     }
+}
 
+impl ScrubSummary {
     /// Whether the run proposed or performed no action at all.
     pub fn is_all_zero(&self) -> bool {
         let total = self.repairs + self.quarantined + self.corrupt + self.failures;
@@ -262,4 +260,28 @@ async fn run_quiet(mut cmd: Command) -> GateResult<()> {
         .status()
         .await?;
     ensure(status.success(), || format!("command exited with {status}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_reads_the_last_summary_and_ignores_timestamps() {
+        let output = "2026-11-01T10:00:00Z scrub complete: walked 9, 9 repairs, 9 quarantined, 9 corrupt, 9 failures\n\
+            2026-11-01T10:00:01Z scrub complete: walked 12, 1 repairs, 0 quarantined, 2 corrupt, 3 failures\n\
+            trailing log line 42\n";
+        let summary: ScrubSummary = output.parse().unwrap();
+        assert_eq!(
+            [
+                summary.walked,
+                summary.repairs,
+                summary.quarantined,
+                summary.corrupt,
+                summary.failures
+            ],
+            [12, 1, 0, 2, 3]
+        );
+        assert!("no marker here".parse::<ScrubSummary>().is_err());
+    }
 }

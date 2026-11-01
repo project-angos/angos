@@ -3,12 +3,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use http::request::Parts;
 use tracing::{debug, error, instrument};
-use x509_parser::{certificate::X509Certificate, prelude::FromDer};
+use x509_parser::certificate::X509Certificate;
+use x509_parser::prelude::FromDer;
 
-use crate::{
-    auth::{AuthMiddleware, AuthResult, Error},
-    identity::{ClientCertificate, ClientIdentity},
-};
+use crate::auth::{AuthMiddleware, AuthResult, Error};
+use crate::identity::{ClientCertificate, ClientIdentity};
 
 /// Extension type for passing peer certificate data from TLS layer
 #[derive(Clone)]
@@ -85,14 +84,13 @@ impl AuthMiddleware for MtlsValidator {
 pub mod tests {
     use std::sync::Arc;
 
+    use tokio::runtime::Builder;
     use tracing::Level;
 
     use super::*;
-    use crate::test_fixtures::{
-        logging::LogCapture,
-        mtls::{cert_der, minimal_cert_der},
-        requests::empty_parts,
-    };
+    use crate::test_fixtures::logging::LogCapture;
+    use crate::test_fixtures::mtls::{cert_der, minimal_cert_der};
+    use crate::test_fixtures::requests::empty_parts;
 
     /// This must remain the ONLY test driving the parse-error branch: `tracing` caches callsite
     /// interest process-globally, so a second test under a non-capturing
@@ -108,9 +106,7 @@ pub mod tests {
             .finish();
 
         let (result, identity) = tracing::subscriber::with_default(subscriber, || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
+            let runtime = Builder::new_current_thread().build().unwrap();
             runtime.block_on(async {
                 let validator = MtlsValidator;
                 let mut parts = empty_parts();

@@ -41,25 +41,24 @@
 //! `part_size` `UploadPart` each time `part_size` bytes accumulate and staging
 //! the sub-`part_size` remainder, buffering up to `part_size` at a time.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 
 use angos_s3_client::{Backend as S3Backend, Error as S3Error, UploadedPart};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    sync::mpsc,
-};
-use tokio_util::{
-    io::{ReaderStream, StreamReader},
-    task::AbortOnDropHandle,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::spawn;
+use tokio::sync::mpsc;
+use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::task::AbortOnDropHandle;
 
+use crate::object::dir_prefix;
 use crate::{
     BoxedReader, ByteStream, Children, ChildrenPage, Error, KeyStream, MultipartUploadPage,
     ObjectMeta, ObjectStore, Page, PendingMultipartUpload, PresignedStore, channel_stream,
-    object::dir_prefix,
 };
 
 mod range_scan;
@@ -90,15 +89,6 @@ pub struct Builder {
 }
 
 impl Builder {
-    fn new(client: Arc<S3Backend>) -> Self {
-        Self {
-            client,
-            part_size: DEFAULT_PART_SIZE,
-            uniform_parts: false,
-            range_concurrency: DEFAULT_RANGE_CONCURRENCY,
-        }
-    }
-
     /// Max concurrent range chains a truncated whole-directory or whole-store
     /// scan fans out to. Defaults to [`DEFAULT_RANGE_CONCURRENCY`].
     #[must_use]
@@ -155,7 +145,12 @@ impl Backend {
     /// optional fluent setters on the returned builder.
     #[must_use]
     pub fn builder(client: Arc<S3Backend>) -> Builder {
-        Builder::new(client)
+        Builder {
+            client,
+            part_size: DEFAULT_PART_SIZE,
+            uniform_parts: false,
+            range_concurrency: DEFAULT_RANGE_CONCURRENCY,
+        }
     }
 
     /// Recover an upload's in-flight state from S3: the open multipart upload id
@@ -179,7 +174,7 @@ impl Backend {
         let mut key_marker: Option<String> = None;
         let mut upload_id_marker: Option<String> = None;
         loop {
-            let (uploads, next_key, next_upload_id) = self
+            let listing = self
                 .client
                 .list_multipart_uploads(
                     Some(key),
@@ -187,16 +182,16 @@ impl Backend {
                     upload_id_marker.as_deref(),
                 )
                 .await?;
-            for upload in uploads {
+            for upload in listing.uploads {
                 if upload.key == key {
                     return Ok(Some(upload.upload_id));
                 }
             }
-            if next_key.is_none() {
+            if listing.next_key_marker.is_none() {
                 return Ok(None);
             }
-            key_marker = next_key;
-            upload_id_marker = next_upload_id;
+            key_marker = listing.next_key_marker;
+            upload_id_marker = listing.next_upload_id_marker;
         }
     }
 
@@ -216,11 +211,12 @@ impl Backend {
     async fn abort_multiparts_at(&self, key: &str) -> Result<(), Error> {
         let mut aborted: HashSet<String> = HashSet::new();
         loop {
-            let (uploads, _, _) = self
+            let listing = self
                 .client
                 .list_multipart_uploads(Some(key), None, None)
                 .await?;
-            let pending: Vec<_> = uploads
+            let pending: Vec<_> = listing
+                .uploads
                 .into_iter()
                 .filter(|u| u.key == key && !aborted.contains(&u.upload_id))
                 .collect();
@@ -261,10 +257,13 @@ impl Backend {
     where
         R: AsyncRead + Unpin + Send,
     {
-        let (parts_to_emit, emit_size, restaged) =
-            plan_known_length_parts(self.uniform_parts, self.part_size, available);
+        let PartPlan {
+            count,
+            emit_size,
+            restaged,
+        } = plan_known_length_parts(self.uniform_parts, self.part_size, available);
 
-        for _ in 0..parts_to_emit {
+        for _ in 0..count {
             let part_number = next_part_number(parts)?;
             // Open the multipart lazily, only when a part actually needs
             // flushing.
@@ -384,10 +383,10 @@ impl ObjectStore for Backend {
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
-        let (size, _, last_modified) = self.client.head_object(key).await?;
+        let head = self.client.head_object(key).await?;
         Ok(ObjectMeta {
-            size,
-            last_modified,
+            size: head.size,
+            last_modified: head.last_modified,
         })
     }
 
@@ -401,11 +400,14 @@ impl ObjectStore for Backend {
         // S3 rejects StartAfter alongside a continuation token; the token
         // already encodes the position, so it wins.
         let start_after = if token.is_some() { None } else { start_after };
-        let (items, next_token) = self
+        let listing = self
             .client
             .list_objects(prefix, n, token, start_after)
             .await?;
-        Ok(Page { items, next_token })
+        Ok(Page {
+            items: listing.keys,
+            next_token: listing.next_token,
+        })
     }
 
     async fn list_children(
@@ -419,15 +421,15 @@ impl ObjectStore for Backend {
         // express "after this child name": a directory child's own keys sort
         // after the bare name, and a sibling like `v1.2` sorts before `v1/`.
         // So bound on the bare name and drop what the contract excludes.
-        let (sub_prefixes, objects, next_token) = self
+        let listing = self
             .client
             .list_prefixes(prefix, "/", n, token, start_after.clone())
             .await?;
         let after = start_after.as_deref();
         Ok(ChildrenPage {
-            sub_prefixes: children_after(sub_prefixes, after),
-            objects: children_after(objects, after),
-            next_token,
+            sub_prefixes: children_after(listing.prefixes, after),
+            objects: children_after(listing.objects, after),
+            next_token: listing.next_token,
         })
     }
 
@@ -596,12 +598,13 @@ impl ObjectStore for Backend {
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
     ) -> Result<MultipartUploadPage, Error> {
-        let (uploads, next_key_marker, next_upload_id_marker) = self
+        let listing = self
             .client
             .list_multipart_uploads(None, key_marker, upload_id_marker)
             .await?;
         Ok(MultipartUploadPage {
-            uploads: uploads
+            uploads: listing
+                .uploads
                 .into_iter()
                 .map(|u| PendingMultipartUpload {
                     key: u.key,
@@ -609,8 +612,8 @@ impl ObjectStore for Backend {
                     initiated_at: u.initiated_at,
                 })
                 .collect(),
-            next_key_marker,
-            next_upload_id_marker,
+            next_key_marker: listing.next_key_marker,
+            next_upload_id_marker: listing.next_upload_id_marker,
         })
     }
 }
@@ -627,24 +630,43 @@ impl PresignedStore for Backend {
     }
 }
 
-/// Split a known-length append of `available` bytes into `(count, emit_size,
-/// restaged)`: `count` parts of exactly `emit_size` to flush now, and the
-/// trailing bytes to restage. Every emitted size stays within the S3 part
-/// bounds, so a part is never rejected for being too small or too large.
-fn plan_known_length_parts(uniform: bool, part_size: u64, available: u64) -> (u64, u64, u64) {
+/// How a known-length append splits: `count` parts of exactly `emit_size` to
+/// flush now, and `restaged` trailing bytes to stage for the next call.
+struct PartPlan {
+    count: u64,
+    emit_size: u64,
+    restaged: u64,
+}
+
+/// Plan a known-length append of `available` bytes. Every emitted size stays
+/// within the S3 part bounds, so a part is never rejected for being too small
+/// or too large.
+fn plan_known_length_parts(uniform: bool, part_size: u64, available: u64) -> PartPlan {
     if uniform {
-        let full = available / part_size;
-        return (full, part_size, available - full * part_size);
+        let count = available / part_size;
+        return PartPlan {
+            count,
+            emit_size: part_size,
+            restaged: available - count * part_size,
+        };
     }
     if available < part_size.max(MIN_PART_SIZE) {
-        return (0, 0, available);
+        return PartPlan {
+            count: 0,
+            emit_size: 0,
+            restaged: available,
+        };
     }
     // One part per call, unless that would breach the per-part ceiling: then
     // the fewest equal parts that fit under it, which leaves at most `count`
     // bytes to restage rather than a second huge part to hold in memory.
     let count = available.div_ceil(MAX_PART_SIZE);
     let emit_size = available / count;
-    (count, emit_size, available - count * emit_size)
+    PartPlan {
+        count,
+        emit_size,
+        restaged: available - count * emit_size,
+    }
 }
 
 /// Children strictly after `start_after` by bare name, matching the FS
@@ -729,7 +751,7 @@ where
     let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
     let body = channel_stream(rx);
 
-    let upload_handle = AbortOnDropHandle::new(tokio::spawn({
+    let upload_handle = AbortOnDropHandle::new(spawn({
         let client = client.clone();
         let key = key.to_string();
         let upload_id = upload_id.to_string();

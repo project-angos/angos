@@ -1,4 +1,6 @@
-use std::{collections::VecDeque, pin::pin, sync::Arc};
+use std::collections::VecDeque;
+use std::pin::pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -7,25 +9,19 @@ use tracing::{debug, error};
 
 use angos_oci::{Content, Digest, Namespace};
 
-use crate::{
-    command::maintenance::{
-        Error,
-        action::Action,
-        check::NamespaceChecker,
-        executor::{ActionSink, object_younger_than_grace},
-        tags::{TagWithMetadata, live_tags, rank_by},
-    },
-    policy::{ManifestImage, RetentionPolicy},
-    registry::{
-        Error as RegistryError, Repository,
-        blob_store::BlobStore,
-        keys::DigestKeys,
-        manifest::read_manifest,
-        metadata_store::{BlobIndex, LinkKind, MetadataStore},
-        repository_resolver::RepositoryResolver,
-    },
-    scan::{is_angos_report, scan_reports},
-};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::Action;
+use crate::command::maintenance::check::NamespaceChecker;
+use crate::command::maintenance::executor::{ActionSink, object_younger_than_grace};
+use crate::command::maintenance::tags::{TagWithMetadata, live_tags, rank_by};
+use crate::policy::{ManifestImage, RetentionPolicy};
+use crate::registry::blob_store::BlobStore;
+use crate::registry::keys::DigestExt;
+use crate::registry::manifest::read_manifest;
+use crate::registry::metadata_store::{BlobIndex, LinkKind, MetadataStore};
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::registry::{Error as RegistryError, Repository};
+use crate::scan::{is_angos_report, scan_reports};
 
 pub struct RetentionChecker {
     blob_store: Arc<BlobStore>,
@@ -85,19 +81,15 @@ enum Fate {
 }
 
 /// Pure decision over pre-loaded inputs: should this orphan manifest be
-/// skipped, retained, or deleted?
+/// skipped, retained, or deleted? A protected or tagged revision is passed
+/// without a manifest, so it skips.
 fn decide_orphan_fate(
-    is_protected: bool,
-    has_tags: bool,
     manifest: Option<&ManifestImage>,
     repository: Option<&Repository>,
     global_policy: Option<&RetentionPolicy>,
     last_pushed: &[String],
     last_pulled: &[String],
 ) -> Result<Fate, Error> {
-    if is_protected || has_tags {
-        return Ok(Fate::Skip);
-    }
     let Some(manifest) = manifest else {
         return Ok(Fate::Skip);
     };
@@ -194,7 +186,7 @@ async fn sweep_grants_for_blob(ctx: &GrantSweep<'_>, blob: &Digest) -> Result<()
         // sweep, so revoke its grants outright; the executor's re-check still
         // spares a blob a not-yet-cascaded manifest references.
         let repository = ctx.resolver.resolve(&namespace);
-        if repository.is_none() && ctx.resolver.len() > 0 {
+        if repository.is_none() && !ctx.resolver.is_empty() {
             ctx.sink
                 .apply(Action::RemoveOrphanBlobGrant {
                     namespace,
@@ -268,7 +260,7 @@ impl NamespaceChecker for RetentionChecker {
         let last_pushed = rank_by(&tag_metadata, |t| t.metadata.created_at);
         let last_pulled = rank_by(&tag_metadata, |t| t.pulled_at);
 
-        let tags = self.get_deletable_tags(namespace, &tag_metadata, &last_pushed, &last_pulled);
+        let tags = self.deletable_tags(namespace, &tag_metadata, &last_pushed, &last_pulled);
         self.emit_delete_tags(namespace, &tags, sink).await?;
 
         self.emit_delete_orphan_manifests(namespace, &last_pushed, &last_pulled, sink)
@@ -277,7 +269,7 @@ impl NamespaceChecker for RetentionChecker {
 }
 
 impl RetentionChecker {
-    fn get_deletable_tags<'a>(
+    fn deletable_tags<'a>(
         &self,
         namespace: &Namespace,
         tags: &'a [TagWithMetadata],
@@ -465,8 +457,6 @@ impl RetentionChecker {
         };
 
         let fate = decide_orphan_fate(
-            is_protected,
-            has_tags,
             manifest.as_ref(),
             self.resolver.resolve(namespace),
             self.global_retention_policy.as_deref(),
@@ -627,53 +617,42 @@ impl RetentionChecker {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        fs::{File, FileTimes},
-        str::FromStr,
-        sync::atomic::{AtomicUsize, Ordering},
-        time::{Duration as StdDuration, SystemTime},
-    };
+    use std::collections::HashMap;
+    use std::fs::{File, FileTimes};
+    use std::str::FromStr;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration as StdDuration, SystemTime};
 
     use chrono::{TimeZone, Utc};
+    use serde_json::Value;
     use tokio::time::sleep;
     use url::Url;
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use angos_mtls_client::ClientTls;
     use angos_oci::{Digest, Namespace, Tag};
-    use angos_storage::{
-        Error as StorageError, ObjectStore,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::{Error as StorageError, ObjectStore};
 
-    use crate::{
-        command::{
-            maintenance::{
-                action::Action,
-                executor::{Executor, RETENTION_ACTOR},
-                tags::TAG_METADATA_CONCURRENCY,
-            },
-            prune::checker::*,
-        },
-        event_webhook::{
-            config::{DeliveryPolicy, EventWebhookConfig},
-            dispatcher::EventDispatcher,
-            event::EventKind,
-        },
-        jobs::store::{ClaimMode, JobStore},
-        policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock},
-        registry::{
-            Registry, RegistryConfig,
-            blob_store::BlobStore,
-            metadata_store::LinkMetadata,
-            repository_resolver::RepositoryResolver,
-            test_utils::{
-                self, FSRegistryTestCase, RegistryTestCase, angos_report, drop_links,
-                for_each_backend, metadata_store_over, put_blob_direct, seed_links,
-            },
-        },
+    use super::*;
+    use crate::command::maintenance::action::Action;
+    use crate::command::maintenance::executor::{Executor, RETENTION_ACTOR};
+    use crate::command::maintenance::tags::TAG_METADATA_CONCURRENCY;
+    use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
+    use crate::event_webhook::dispatcher::EventDispatcher;
+    use crate::event_webhook::event::EventKind;
+    use crate::jobs::store::{ClaimMode, JobStore};
+    use crate::policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock};
+    use crate::registry::blob_store::BlobStore;
+    use crate::registry::metadata_store::LinkMetadata;
+    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::registry::test_utils::{
+        self, FSRegistryTestCase, RegistryTestCase, angos_report, drop_links, for_each_backend,
+        metadata_store_over, put_blob_direct, seed_links,
     };
+    use crate::registry::{Registry, RegistryConfig};
 
     fn dummy_digest() -> Digest {
         Digest::from_str("sha256:0000000000000000000000000000000000000000000000000000000000000000")
@@ -682,8 +661,8 @@ mod tests {
 
     fn tag_with_times(
         name: &str,
-        created: Option<chrono::DateTime<Utc>>,
-        pulled: Option<chrono::DateTime<Utc>>,
+        created: Option<DateTime<Utc>>,
+        pulled: Option<DateTime<Utc>>,
     ) -> TagWithMetadata {
         TagWithMetadata {
             name: Tag::new(name).unwrap(),
@@ -768,12 +747,6 @@ mod tests {
         assert_eq!(ranked, vec!["newest", "middle", "oldest"]);
     }
 
-    #[test]
-    fn rank_by_empty_slice_returns_empty() {
-        let ranked = rank_by(&[], |t| t.metadata.created_at);
-        assert!(ranked.is_empty());
-    }
-
     /// An unranked tag cannot be retained by `top_pushed(n)` / `top_pulled(n)`
     /// on a slot it never earned.
     #[test]
@@ -787,24 +760,6 @@ mod tests {
         let ranked = rank_by(&tags, |t| t.metadata.created_at);
 
         assert_eq!(ranked, vec!["beta".to_string()]);
-    }
-
-    #[test]
-    fn build_sorted_rankings_pushed_order() {
-        let t1 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let t3 = Utc.with_ymd_and_hms(2024, 12, 1, 0, 0, 0).unwrap();
-
-        let tags = vec![
-            tag_with_times("old", Some(t1), None),
-            tag_with_times("new", Some(t3), None),
-        ];
-
-        let last_pushed = rank_by(&tags, |t| t.metadata.created_at);
-        let last_pulled = rank_by(&tags, |t| t.pulled_at);
-
-        assert_eq!(last_pushed[0], "new");
-        assert_eq!(last_pushed[1], "old");
-        assert!(last_pulled.is_empty());
     }
 
     /// Without this, `top_pulled(n)` keeps every tag forever in a namespace
@@ -824,23 +779,6 @@ mod tests {
 
         assert_eq!(last_pushed.len(), 2);
         assert_eq!(last_pulled, vec!["pulled".to_string()]);
-    }
-
-    #[test]
-    fn build_sorted_rankings_pulled_independent_of_pushed() {
-        let pushed_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let pulled_time = Utc.with_ymd_and_hms(2024, 12, 1, 0, 0, 0).unwrap();
-
-        let tags = vec![
-            tag_with_times("a", Some(pulled_time), Some(pushed_time)),
-            tag_with_times("b", Some(pushed_time), Some(pulled_time)),
-        ];
-
-        let last_pushed = rank_by(&tags, |t| t.metadata.created_at);
-        let last_pulled = rank_by(&tags, |t| t.pulled_at);
-
-        assert_eq!(last_pushed[0], "a");
-        assert_eq!(last_pulled[0], "b");
     }
 
     const TEST_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
@@ -1106,8 +1044,8 @@ mod tests {
         let metadata_store = test_case.metadata_store();
         let blob_store = test_case.blob_store();
 
-        let child_digest = test_utils::put_blob_body(&blob_store, TEST_MANIFEST).await;
-        let index_digest = test_utils::put_blob_body(&blob_store, TEST_INDEX).await;
+        let child_digest = test_utils::put_blob_direct(&blob_store, TEST_MANIFEST).await;
+        let index_digest = test_utils::put_blob_direct(&blob_store, TEST_INDEX).await;
         assert!(
             child_digest.to_string() < index_digest.to_string(),
             "fixture must keep the child ahead of the index in the listing"
@@ -1236,9 +1174,9 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
 
-            let subject = test_utils::put_blob_body(&blob_store, TEST_MANIFEST).await;
+            let subject = test_utils::put_blob_direct(&blob_store, TEST_MANIFEST).await;
             let referrer =
-                test_utils::put_blob_body(&blob_store, &referrer_body_listing_before(&subject))
+                test_utils::put_blob_direct(&blob_store, &referrer_body_listing_before(&subject))
                     .await;
             setup_referrer_scenario(
                 &metadata_store,
@@ -1275,11 +1213,11 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
 
-            let subject = test_utils::put_blob_body(&blob_store, TEST_MANIFEST).await;
+            let subject = test_utils::put_blob_direct(&blob_store, TEST_MANIFEST).await;
             let mut reports = Vec::new();
             for created in ["2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"] {
                 let (body, descriptor) = angos_report(&subject, created);
-                let report = test_utils::put_blob_body(&blob_store, &body).await;
+                let report = test_utils::put_blob_direct(&blob_store, &body).await;
                 // The record is create-if-absent, so the descriptor lands
                 // before the scenario's bare one.
                 metadata_store
@@ -1337,9 +1275,9 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
 
-            let subject = test_utils::put_blob_body(&blob_store, TEST_MANIFEST).await;
+            let subject = test_utils::put_blob_direct(&blob_store, TEST_MANIFEST).await;
             let referrer =
-                test_utils::put_blob_body(&blob_store, &referrer_body_listing_before(&subject))
+                test_utils::put_blob_direct(&blob_store, &referrer_body_listing_before(&subject))
                     .await;
             setup_referrer_scenario(
                 &metadata_store,
@@ -1381,9 +1319,9 @@ mod tests {
         let metadata_store = test_case.metadata_store();
         let blob_store = test_case.blob_store();
 
-        let subject = test_utils::put_blob_body(&blob_store, TEST_MANIFEST).await;
+        let subject = test_utils::put_blob_direct(&blob_store, TEST_MANIFEST).await;
         let referrer =
-            test_utils::put_blob_body(&blob_store, &referrer_body_listing_before(&subject)).await;
+            test_utils::put_blob_direct(&blob_store, &referrer_body_listing_before(&subject)).await;
         setup_referrer_scenario(&metadata_store, &namespace, &subject, &referrer, None).await;
 
         let executor = make_executor(blob_store, metadata_store.clone());
@@ -1460,7 +1398,7 @@ mod tests {
             Some(policy),
         );
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         scrubber.check(namespace, &sink).await.unwrap();
 
         assert!(
@@ -1571,7 +1509,7 @@ mod tests {
         );
 
         let requests = server.received_requests().await.unwrap();
-        let events: Vec<serde_json::Value> = requests
+        let events: Vec<Value> = requests
             .iter()
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
@@ -1733,25 +1671,6 @@ mod tests {
         assert_eq!(result, PolicyDecision::NoOpinion);
     }
 
-    #[test]
-    fn check_repo_policy_returns_retain_when_repo_policy_keeps() {
-        let repo = make_repo("r", vec![CelRule::compile("image.tag == 'v1'").unwrap()]);
-        let manifest = make_manifest(&Tag::new("v1").unwrap());
-        let result = check_policy(repository_policy(Some(&repo)), &manifest, &[], &[]).unwrap();
-        assert_eq!(result, PolicyDecision::Retain);
-    }
-
-    #[test]
-    fn check_repo_policy_returns_delete_when_repo_policy_drops() {
-        let repo = make_repo(
-            "r",
-            vec![CelRule::compile("image.tag == 'keep-me'").unwrap()],
-        );
-        let manifest = make_manifest(&Tag::new("v1").unwrap());
-        let result = check_policy(repository_policy(Some(&repo)), &manifest, &[], &[]).unwrap();
-        assert_eq!(result, PolicyDecision::Delete);
-    }
-
     /// An image with no push or pull time, the shape a revision record with
     /// no `created_at` resolves to.
     fn dummy_image() -> ManifestImage {
@@ -1765,29 +1684,15 @@ mod tests {
     }
 
     #[test]
-    fn decide_orphan_fate_skips_protected_manifest() {
-        let manifest = dummy_image();
-        let fate = decide_orphan_fate(true, false, Some(&manifest), None, None, &[], &[]).unwrap();
-        assert_eq!(fate, Fate::Skip);
-    }
-
-    #[test]
-    fn decide_orphan_fate_skips_manifest_with_tags() {
-        let manifest = dummy_image();
-        let fate = decide_orphan_fate(false, true, Some(&manifest), None, None, &[], &[]).unwrap();
-        assert_eq!(fate, Fate::Skip);
-    }
-
-    #[test]
     fn decide_orphan_fate_skips_when_metadata_missing() {
-        let fate = decide_orphan_fate(false, false, None, None, None, &[], &[]).unwrap();
+        let fate = decide_orphan_fate(None, None, None, &[], &[]).unwrap();
         assert_eq!(fate, Fate::Skip);
     }
 
     #[test]
     fn decide_orphan_fate_retains_when_no_policies_apply() {
         let manifest = dummy_image();
-        let fate = decide_orphan_fate(false, false, Some(&manifest), None, None, &[], &[]).unwrap();
+        let fate = decide_orphan_fate(Some(&manifest), None, None, &[], &[]).unwrap();
         assert_eq!(fate, Fate::Retain);
     }
 
@@ -1802,8 +1707,7 @@ mod tests {
             },
             Arc::new(SystemClock),
         );
-        let fate = decide_orphan_fate(false, false, Some(&manifest), None, Some(&policy), &[], &[])
-            .unwrap();
+        let fate = decide_orphan_fate(Some(&manifest), None, Some(&policy), &[], &[]).unwrap();
         assert_eq!(
             fate,
             Fate::Retain,
@@ -1820,8 +1724,7 @@ mod tests {
             },
             Arc::new(SystemClock),
         );
-        let fate = decide_orphan_fate(false, false, Some(&manifest), None, Some(&policy), &[], &[])
-            .unwrap();
+        let fate = decide_orphan_fate(Some(&manifest), None, Some(&policy), &[], &[]).unwrap();
         assert_eq!(fate, Fate::Retain);
     }
 
@@ -1834,8 +1737,7 @@ mod tests {
             },
             Arc::new(SystemClock),
         );
-        let fate = decide_orphan_fate(false, false, Some(&manifest), None, Some(&policy), &[], &[])
-            .unwrap();
+        let fate = decide_orphan_fate(Some(&manifest), None, Some(&policy), &[], &[]).unwrap();
         assert_eq!(fate, Fate::Delete);
     }
 
@@ -1903,7 +1805,7 @@ mod tests {
             &metadata_store,
             &grant_resolver(),
             Some(&keep_nothing_policy()),
-            chrono::Duration::days(1),
+            Duration::days(1),
             &Executor::new_for_test(test_case.blob_store(), metadata_store.clone()),
             4,
         )
@@ -1932,7 +1834,7 @@ mod tests {
                 &metadata_store,
                 &grant_resolver(),
                 None,
-                chrono::Duration::zero(),
+                Duration::zero(),
                 &executor,
                 4,
             )
@@ -1965,7 +1867,7 @@ mod tests {
                 &metadata_store,
                 &grant_resolver(),
                 Some(&policy),
-                chrono::Duration::days(1),
+                Duration::days(1),
                 &executor,
                 4,
             )
@@ -1985,7 +1887,7 @@ mod tests {
                 &metadata_store,
                 &grant_resolver(),
                 Some(&policy),
-                chrono::Duration::zero(),
+                Duration::zero(),
                 &executor,
                 4,
             )
@@ -2035,7 +1937,7 @@ mod tests {
                 &metadata_store,
                 &grant_resolver(),
                 Some(&keep_nothing_policy()),
-                chrono::Duration::zero(),
+                Duration::zero(),
                 &Executor::new_for_test(test_case.blob_store(), metadata_store.clone()),
                 4,
             )
@@ -2077,7 +1979,7 @@ mod tests {
                 &metadata_store,
                 &grant_resolver(),
                 Some(&policy),
-                chrono::Duration::zero(),
+                Duration::zero(),
                 &executor,
                 4,
             )

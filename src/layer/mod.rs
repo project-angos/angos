@@ -6,26 +6,24 @@
 //! a repository's index policy applies to enqueues one [`INDEX_LAYER_KIND`]
 //! job per layer; any other image is indexed the first time someone asks.
 
-use std::{
-    cell::Cell,
-    ffi::OsStr,
-    io::{self, BufRead, BufReader, Read, Write},
-    mem,
-    path::Path,
-};
+use std::cell::Cell;
+use std::ffi::OsStr;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::mem;
+use std::path::Path;
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha512};
+use tar::{Archive, Entry, EntryType};
 
 use angos_extension_service::{EntryKind, FileContent, LayerEntry, Secret, SecretKind};
 use angos_inflate::{Checkpoint, Inflater};
-use angos_oci::{Content, Digest, Manifest};
+use angos_oci::{Content, Digest, Manifest, Namespace};
 
-use crate::jobs::{
-    Queue,
-    store::{Error, JobEnvelope},
-};
+use crate::jobs::Queue;
+use crate::jobs::store::{Error, JobEnvelope};
 
 pub mod elf;
 pub mod pem;
@@ -187,7 +185,7 @@ const INTERPRETERS: [(&str, &str); 12] = [
 /// asked: the listing is keyed by the digest and shared like the blob is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexLayerPayload {
-    pub namespace: angos_oci::Namespace,
+    pub namespace: Namespace,
     pub digest: Digest,
     /// Walk the layer again even when a listing exists.
     #[serde(default)]
@@ -200,24 +198,22 @@ pub fn build_envelope(payload: &IndexLayerPayload) -> Result<JobEnvelope, Error>
     JobEnvelope::new(
         Queue::Index,
         INDEX_LAYER_KIND,
-        format!("{}.{}", Queue::Index, payload.digest),
+        &format!("{}.{}", Queue::Index, payload.digest),
         payload,
     )
 }
 
-/// Whether a layer media type names a tar stream the indexer can walk: plain
-/// or gzipped, in the OCI or Docker spelling. zstd layers are not.
-pub fn is_filesystem_layer(media_type: &str) -> bool {
-    media_type.contains(".tar") && !media_type.contains("zstd")
-}
-
-/// The digests of a plain image manifest's walkable layers; empty for an
-/// index, a referrer or an artifact.
+/// The digests of a plain image manifest's walkable layers: tar streams the
+/// indexer can walk, plain or gzipped, in the OCI or Docker spelling. Empty
+/// for an index, a referrer or an artifact; zstd layers are skipped.
 pub fn filesystem_layers(manifest: &Manifest) -> Vec<Digest> {
     match &manifest.content {
         Content::Image { layers, .. } if manifest.is_plain_image() => layers
             .iter()
-            .filter(|layer| is_filesystem_layer(layer.media_type.as_ref()))
+            .filter(|layer| {
+                let media_type: &str = layer.media_type.as_ref();
+                media_type.contains(".tar") && !media_type.contains("zstd")
+            })
             .map(|layer| layer.digest.clone())
             .collect(),
         _ => Vec::new(),
@@ -279,23 +275,23 @@ fn mime_type(path: &str, head: &[u8]) -> String {
         .extension()
         .and_then(OsStr::to_str)
         .unwrap_or_default();
-    SOURCE_TYPES
+    if let Some((_, mime)) = SOURCE_TYPES
         .iter()
         .find(|(known, _)| known.eq_ignore_ascii_case(extension))
-        .map(|(_, mime)| (*mime).to_string())
-        .or_else(|| {
-            mime_guess::from_ext(extension)
-                .first()
-                .map(|mime| mime.to_string())
-        })
-        .or_else(|| script_type(head).map(str::to_string))
-        .unwrap_or_else(|| {
-            if head.contains(&0) {
-                "application/octet-stream".to_string()
-            } else {
-                "text/plain".to_string()
-            }
-        })
+    {
+        return (*mime).to_string();
+    }
+    if let Some(mime) = mime_guess::from_ext(extension).first() {
+        return mime.to_string();
+    }
+    if let Some(mime) = script_type(head) {
+        return mime.to_string();
+    }
+    if head.contains(&0) {
+        "application/octet-stream".to_string()
+    } else {
+        "text/plain".to_string()
+    }
 }
 
 /// The media type of a `#!` line's interpreter, looked up past `env` and a
@@ -402,7 +398,7 @@ impl SecretScanner {
     fn scan(&mut self, line: &[u8]) {
         // A PEM block's base64 opens the line after its `BEGIN` line.
         if let Some(opened) = self.key_opened.take()
-            && base64_run(line) >= 16
+            && line.iter().take_while(|&&byte| is_base64(byte)).count() >= 16
         {
             self.found.push(Secret {
                 kind: SecretKind::PrivateKey,
@@ -413,7 +409,9 @@ impl SecretScanner {
         for at in positions(line, KEY_MARKER) {
             // A block opens its line, unless it is a GCP service account's JSON value.
             let before = line[..at].trim_ascii_start();
-            if !before.starts_with(b"-----BEGIN ") && find(before, b"\"private_key\"").is_none() {
+            if !before.starts_with(b"-----BEGIN ")
+                && positions(before, b"\"private_key\"").next().is_none()
+            {
                 continue;
             }
             let rest = &line[at + KEY_MARKER.len()..];
@@ -421,19 +419,19 @@ impl SecretScanner {
                 self.key_opened = Some(self.number);
             } else if rest
                 .strip_prefix(b"\\n")
-                .is_some_and(|body| base64_run(body) >= 16)
+                .is_some_and(|body| body.iter().take_while(|&&byte| is_base64(byte)).count() >= 16)
             {
                 kinds.push(SecretKind::PrivateKey);
             }
         }
-        self.registry |= find(line, b"\"auths\"").is_some();
+        self.registry |= positions(line, b"\"auths\"").next().is_some();
         if self.registry && registry_login(line) {
             kinds.push(SecretKind::RegistryAuth);
         }
         let login = match self.login {
             Some(SecretKind::NpmToken) => npm_token(line),
             Some(SecretKind::GitCredentials) => credential_url(line),
-            Some(SecretKind::Netrc) => find(line, b"password ").is_some(),
+            Some(SecretKind::Netrc) => positions(line, b"password ").next().is_some(),
             _ => false,
         };
         if login {
@@ -466,7 +464,7 @@ fn tokens(line: &[u8]) -> impl Iterator<Item = SecretKind> + '_ {
             let random = body.iter().copied().all(shape.body)
                 && body.iter().any(u8::is_ascii_digit)
                 && body.iter().any(u8::is_ascii_alphabetic)
-                && find(run, b"EXAMPLE").is_none();
+                && positions(run, b"EXAMPLE").next().is_none();
             random.then_some(shape.kind)
         })
 }
@@ -487,7 +485,14 @@ fn is_key_id(byte: u8) -> bool {
 fn kubeconfig_key(line: &[u8]) -> bool {
     line.trim_ascii_start()
         .strip_prefix(b"client-key-data:")
-        .is_some_and(|value| base64_run(value.trim_ascii_start()) >= 16)
+        .is_some_and(|value| {
+            value
+                .trim_ascii_start()
+                .iter()
+                .take_while(|&&byte| is_base64(byte))
+                .count()
+                >= 16
+        })
 }
 
 /// A kubeconfig user's bearer `token`, set to a value rather than a placeholder.
@@ -513,17 +518,12 @@ fn aws_secret(line: &[u8]) -> bool {
         .is_some_and(|value| {
             value.len() == 40
                 && value.iter().copied().all(is_base64)
-                && find(value, b"EXAMPLE").is_none()
+                && positions(value, b"EXAMPLE").next().is_none()
         })
 }
 
 fn is_base64(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
-}
-
-/// How many base64 characters `bytes` opens with.
-fn base64_run(bytes: &[u8]) -> usize {
-    bytes.iter().take_while(|&&byte| is_base64(byte)).count()
 }
 
 /// Whether an `"auth"` of a Docker `config.json` is set to a value on `line`.
@@ -579,10 +579,6 @@ fn credential_url(line: &[u8]) -> bool {
         && !line.contains(char::is_whitespace)
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    positions(haystack, needle).next()
-}
-
 /// Where `needle` starts in `haystack`, every time.
 fn positions<'a>(haystack: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
     haystack
@@ -594,7 +590,7 @@ fn positions<'a>(haystack: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = u
 
 /// The capabilities a tar entry's `security.capability` attribute permits, as
 /// its PAX header carries it.
-fn entry_capabilities<R: Read>(entry: &mut tar::Entry<'_, R>) -> io::Result<Vec<String>> {
+fn entry_capabilities<R: Read>(entry: &mut Entry<'_, R>) -> io::Result<Vec<String>> {
     let Some(extensions) = entry.pax_extensions()? else {
         return Ok(Vec::new());
     };
@@ -767,21 +763,27 @@ type ChunkSink<'a> = &'a mut dyn FnMut(Vec<Checkpoint>) -> io::Result<()>;
 /// The tar stream behind a layer: inflated, its checkpoints handed on a chunk
 /// at a time, or the bytes as they are.
 enum Source<'a, R: Read> {
-    Gzip(Box<Inflater<BufReader<R>>>, ChunkSink<'a>),
-    Plain(BufReader<R>, u64),
+    Gzip {
+        inflater: Box<Inflater<BufReader<R>>>,
+        sink: ChunkSink<'a>,
+    },
+    Plain {
+        reader: BufReader<R>,
+        count: u64,
+    },
 }
 
 impl<R: Read> Read for Source<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Source::Gzip(inflater, sink) => {
+            Source::Gzip { inflater, sink } => {
                 let n = inflater.read(buf)?;
                 if let Some(chunk) = inflater.take_checkpoints(CHUNK_CHECKPOINTS) {
                     sink(chunk)?;
                 }
                 Ok(n)
             }
-            Source::Plain(reader, count) => {
+            Source::Plain { reader, count } => {
                 let n = reader.read(buf)?;
                 *count += n as u64;
                 Ok(n)
@@ -794,7 +796,7 @@ impl<R: Read> Read for Source<'_, R> {
 /// opaque marker of `a`; the rest keep their kind. Paths lose the `./` and
 /// trailing `/` tar spellings so the same file is named the same in every
 /// layer.
-fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, EntryKind)> {
+fn classify(raw: &str, tar_kind: EntryType) -> Option<(String, EntryKind)> {
     let path = raw.trim_start_matches("./").trim_matches('/');
     if path.is_empty() || path == "." {
         return None;
@@ -819,7 +821,7 @@ fn classify(raw: &str, tar_kind: tar::EntryType) -> Option<(String, EntryKind)> 
         EntryKind::Symlink
     } else if tar_kind.is_hard_link() {
         EntryKind::Hardlink
-    } else if tar_kind.is_file() || tar_kind == tar::EntryType::Continuous {
+    } else if tar_kind.is_file() || tar_kind == EntryType::Continuous {
         EntryKind::File
     } else {
         EntryKind::Other
@@ -845,12 +847,12 @@ pub fn index_stream<R: Read>(
         store_chunk(starts.len() - 1, chunk)
     };
     let mut source = if compressed {
-        Source::Gzip(
-            Box::new(Inflater::new(reader, CHECKPOINT_EVERY)?),
-            &mut sink,
-        )
+        Source::Gzip {
+            inflater: Box::new(Inflater::new(reader, CHECKPOINT_EVERY)?),
+            sink: &mut sink,
+        }
     } else {
-        Source::Plain(reader, 0)
+        Source::Plain { reader, count: 0 }
     };
 
     let mut entries = Vec::new();
@@ -861,7 +863,7 @@ pub fn index_stream<R: Read>(
             ceiling: Cell::new(limits.max_size),
             max_size: limits.max_size,
         };
-        let mut archive = tar::Archive::new(Capped {
+        let mut archive = Archive::new(Capped {
             inner: &mut source,
             budget: &budget,
         });
@@ -915,17 +917,17 @@ pub fn index_stream<R: Read>(
     }
 
     let uncompressed_size = match source {
-        Source::Gzip(mut inflater, sink) => {
+        Source::Gzip { mut inflater, sink } => {
             if let Some(chunk) = inflater.take_checkpoints(1) {
                 sink(chunk)?;
             }
             inflater.position()
         }
-        Source::Plain(_, count) => count,
+        Source::Plain { count, .. } => count,
     };
     // Stable, so a path the tar repeats keeps its last entry last.
     entries.sort_by(|a: &LayerEntry, b: &LayerEntry| a.path.cmp(&b.path));
-    let chunks = entries
+    let chunks: Vec<String> = entries
         .chunks(CHUNK_ENTRIES)
         .filter_map(|chunk| chunk.first().map(|entry| entry.path.clone()))
         .collect();

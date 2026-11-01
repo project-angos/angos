@@ -6,13 +6,11 @@ use tracing::{debug, warn};
 
 use angos_oci::{Digest, Namespace};
 
-use crate::{
-    command::{
-        maintenance::{Error, action::Action},
-        scrub::validate::Validator,
-    },
-    registry::{Error as RegistryError, metadata_store::LinkKind},
-};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::Action;
+use crate::command::scrub::validate::Validator;
+use crate::registry::Error as RegistryError;
+use crate::registry::metadata_store::LinkKind;
 
 impl Validator {
     /// Validate one reference key of `digest`'s blob index: the link that

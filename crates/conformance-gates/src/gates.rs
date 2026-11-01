@@ -7,11 +7,11 @@ use reqwest::StatusCode;
 use tokio::time::sleep;
 
 use crate::angos::{AngosRunner, ScrubSummary};
-use crate::error::{GateResult, ensure, fail};
+use crate::error::{GateError, GateResult, ensure};
 use crate::registry::RegistryClient;
 use crate::seed::{
     EXPECTED_CORRUPT, EXPECTED_FAILURES_RUN1, EXPECTED_MIN_REPAIRS, EXPECTED_QUARANTINED, GATE_NS,
-    GATE_TAG, GATE2_NS, ORPHAN_FAILED_JOB_KEY, ORPHAN_PENDING_JOB_KEY, seed_defects,
+    GATE_TAG, GATE2_NS, ORPHAN_FAILED_JOB_KEY, ORPHAN_PENDING_JOB_KEY, Probes, seed_defects,
 };
 use crate::store::{GateStore, Snapshot, sha256_hex, snapshot_diff, write_snapshot};
 
@@ -40,21 +40,17 @@ pub struct GateContext {
 }
 
 impl GateContext {
-    fn state_path(&self, name: &str) -> PathBuf {
-        self.state_dir.join(name)
-    }
-
     async fn scrub_logged(&self, log_name: &str) -> GateResult<ScrubSummary> {
         let output = self
             .runner
-            .run_logged(&["scrub"], &self.state_path(log_name))
+            .run_logged(&["scrub"], &self.state_dir.join(log_name))
             .await?;
-        ScrubSummary::parse(&output)
+        output.parse()
     }
 
     async fn snapshot_to(&self, name: &str) -> GateResult<Snapshot> {
         let snap = self.store.snapshot().await?;
-        write_snapshot(&self.state_path(name), &snap)?;
+        write_snapshot(&self.state_dir.join(name), &snap)?;
         Ok(snap)
     }
 }
@@ -77,11 +73,17 @@ pub async fn healthy(ctx: &GateContext) -> GateResult<()> {
     let before_dry = ctx.snapshot_to("snap-before-dry").await?;
     let dry_output = ctx
         .runner
-        .run_logged(&["scrub", "--dry-run"], &ctx.state_path("scrub-dry.log"))
+        .run_logged(
+            &["scrub", "--dry-run"],
+            &ctx.state_dir.join("scrub-dry.log"),
+        )
         .await?;
     let prune_dry = ctx
         .runner
-        .run_logged(&["prune", "--dry-run"], &ctx.state_path("prune-dry.log"))
+        .run_logged(
+            &["prune", "--dry-run"],
+            &ctx.state_dir.join("prune-dry.log"),
+        )
         .await?;
     let after_dry = ctx.snapshot_to("snap-after-dry").await?;
     let dry_diff = snapshot_diff(&before_dry, &after_dry);
@@ -89,7 +91,7 @@ pub async fn healthy(ctx: &GateContext) -> GateResult<()> {
         format!("a dry run modified the store:\n{}", report_keys(&dry_diff))
     })?;
 
-    let summary = ScrubSummary::parse(&dry_output)?;
+    let summary: ScrubSummary = dry_output.parse()?;
     println!("{summary}");
     ensure(summary.is_all_zero(), || {
         "dry-run scrub proposed changes on a healthy store".to_string()
@@ -144,22 +146,58 @@ pub async fn healthy(ctx: &GateContext) -> GateResult<()> {
 /// Full defect matrix: pinned per-class counters on the first run, fixpoint
 /// within bounded runs, per-artifact end states, blast-radius snapshot diff,
 /// decoy survival, and the prune window pin.
-#[allow(clippy::too_many_lines)]
 pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
     let baseline = ctx.snapshot_to("snap-baseline").await?;
 
     let probes = seed_defects(&ctx.store, &ctx.registry).await?;
     write(
-        ctx.state_path("probes.json"),
+        ctx.state_dir.join("probes.json"),
         serde_json::to_vec_pretty(&probes)?,
     )?;
 
-    // Run 1: every independent defect class must be counted exactly.
+    pin_first_run(ctx).await?;
+    pin_repairs(ctx, &probes, &baseline).await?;
+    pin_prune_window(ctx, &probes).await?;
+
+    // The quarantine's contents were verified above; empty it like the
+    // operator would, then require the store to still converge with no
+    // actions at all.
+    ctx.store.delete_prefix("_lost_and_found").await?;
+    let post_cleanup = ctx.scrub_logged("scrub-post-cleanup.log").await?;
+    ensure(post_cleanup.is_all_zero(), || {
+        format!("store did not stay converged after the prune sweeps: {post_cleanup}")
+    })?;
+
+    // Audit self-test: the digest audit must actually detect corruption, or
+    // every audit pass in these gates is vacuous. Corrupt one tagged layer in
+    // place, expect the audit to fail, restore, expect it to pass.
+    let layer_key = probes.gate_layer_data();
+    let original = ctx.store.body(&layer_key).await?.ok_or_else(|| {
+        GateError::Failure("gate layer bytes missing before the audit self-test".into())
+    })?;
+    ctx.store.put(&layer_key, b"corrupted layer bytes").await?;
+    ensure(ctx.registry.audit_digests(1).await.is_err(), || {
+        "the digest audit failed to detect corrupted layer bytes".to_string()
+    })?;
+    ctx.store.put(&layer_key, &original).await?;
+
+    ctx.registry.audit_digests(AUDIT_FLOOR).await?;
+    println!(
+        "GATE corruption: PASS (counters pinned, {} end-states verified, blast radius clean, \
+         decoys alive, prune sweeps pinned both sides of the window, audit teeth proven)",
+        probes.gone_keys().len()
+    );
+    Ok(())
+}
+
+/// Run 1: every independent defect class must be counted exactly, and the
+/// always-on job sweep must reap exactly the two config orphans.
+async fn pin_first_run(ctx: &GateContext) -> GateResult<()> {
     let run1_log = ctx
         .runner
-        .run_logged(&["scrub"], &ctx.state_path("scrub-1.log"))
+        .run_logged(&["scrub"], &ctx.state_dir.join("scrub-1.log"))
         .await?;
-    let run1 = ScrubSummary::parse(&run1_log)?;
+    let run1: ScrubSummary = run1_log.parse()?;
     println!("{run1}");
     ensure(run1.quarantined == EXPECTED_QUARANTINED, || {
         format!(
@@ -204,7 +242,12 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
             format!("{what} survived the always-on scrub sweep")
         })?;
     }
+    Ok(())
+}
 
+/// Fixpoint within bounded runs, per-artifact end states, blast-radius
+/// snapshot diff, decoy survival, and both gate images still pullable.
+async fn pin_repairs(ctx: &GateContext, probes: &Probes, baseline: &Snapshot) -> GateResult<()> {
     // Cascading repairs (a recreated link derives more state) must reach a
     // fixpoint within a bounded number of runs.
     let mut attempts = 1;
@@ -265,7 +308,7 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
     // the seeded prefixes; anything else means scrub damaged innocent data.
     let after_repair = ctx.snapshot_to("snap-after-repair").await?;
     let prefixes = probes.blast_prefixes();
-    let out_of_radius: Vec<String> = snapshot_diff(&baseline, &after_repair)
+    let out_of_radius: Vec<String> = snapshot_diff(baseline, &after_repair)
         .into_iter()
         .filter(|key| !prefixes.iter().any(|prefix| key.starts_with(prefix)))
         .collect();
@@ -300,7 +343,12 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
             format!("{ns} layer bytes corrupted")
         })?;
     }
+    Ok(())
+}
 
+/// The prune window pinned on both sides, then the collector reclaiming the
+/// bytes prune revoked.
+async fn pin_prune_window(ctx: &GateContext, probes: &Probes) -> GateResult<()> {
     // Prune window pin: a session backdated past the window is reaped, the
     // fresh decoy survives.
     let old_ts = (Utc::now() - TimeDelta::hours(2))
@@ -311,17 +359,18 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
     ctx.store
         .put(
             &session_json,
-            format!(r#"{{"last_activity":"{old_ts}","committed_offset":18,"hash_state":""}}"#),
+            format!(r#"{{"last_activity":"{old_ts}","committed_offset":18,"hash_state":""}}"#)
+                .as_bytes(),
         )
         .await?;
     ctx.store
         .put(
             &format!("v2/repositories/{GATE_NS}/_uploads/{old_uuid}/data"),
-            "stale upload bytes",
+            b"stale upload bytes",
         )
         .await?;
     ctx.runner
-        .run_logged(&["prune"], &ctx.state_path("prune.log"))
+        .run_logged(&["prune"], &ctx.state_dir.join("prune.log"))
         .await?;
     ensure(!ctx.store.exists(&session_json).await?, || {
         "prune kept an upload past the -u window".to_string()
@@ -357,7 +406,7 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
         .run_with_config(
             &retention_config,
             &["prune"],
-            &ctx.state_path("prune-retention.log"),
+            &ctx.state_dir.join("prune-retention.log"),
         )
         .await?;
     ensure(ctx.store.exists(&probes.grant_only_data()).await?, || {
@@ -374,7 +423,7 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
         .run_with_config(
             &retention_config,
             &["prune", "-u", "1s"],
-            &ctx.state_path("prune-aggressive.log"),
+            &ctx.state_dir.join("prune-aggressive.log"),
         )
         .await?;
     for (key, what) in [
@@ -411,37 +460,6 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
             probes.grant_only_data()
         )
     })?;
-
-    // The quarantine's contents were verified above; empty it like the
-    // operator would, then require the store to still converge with no
-    // actions at all.
-    ctx.store.delete_prefix("_lost_and_found").await?;
-    let post_cleanup = ctx.scrub_logged("scrub-post-cleanup.log").await?;
-    ensure(post_cleanup.is_all_zero(), || {
-        format!("store did not stay converged after the prune sweeps: {post_cleanup}")
-    })?;
-
-    // Audit self-test: the digest audit must actually detect corruption, or
-    // every audit pass in these gates is vacuous. Corrupt one tagged layer in
-    // place, expect the audit to fail, restore, expect it to pass.
-    let layer_key = probes.gate_layer_data();
-    let original = ctx
-        .store
-        .body(&layer_key)
-        .await?
-        .ok_or_else(|| fail("gate layer bytes missing before the audit self-test"))?;
-    ctx.store.put(&layer_key, "corrupted layer bytes").await?;
-    ensure(ctx.registry.audit_digests(1).await.is_err(), || {
-        "the digest audit failed to detect corrupted layer bytes".to_string()
-    })?;
-    ctx.store.put(&layer_key, original).await?;
-
-    ctx.registry.audit_digests(AUDIT_FLOOR).await?;
-    println!(
-        "GATE corruption: PASS (counters pinned, {} end-states verified, blast radius clean, \
-         decoys alive, prune sweeps pinned both sides of the window, audit teeth proven)",
-        probes.gone_keys().len()
-    );
     Ok(())
 }
 
@@ -489,7 +507,7 @@ fn write_retention_config(ctx: &GateContext) -> GateResult<String> {
     config.push_str(
         "\n[repository.\"conformance\".retention_policy]\nrules = ['image.tag != null']\n",
     );
-    let path = ctx.state_path("config-retention.toml");
+    let path = ctx.state_dir.join("config-retention.toml");
     write(&path, config)?;
     let absolute = canonicalize(&path)?;
     Ok(absolute.to_string_lossy().into_owned())

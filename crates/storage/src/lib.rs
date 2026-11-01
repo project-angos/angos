@@ -40,8 +40,9 @@ pub use crate::object::{KeyStream, ObjectStore};
 pub use crate::pagination::paginated;
 pub use crate::presigned::PresignedStore;
 pub use crate::types::{Children, ChildrenPage, ObjectMeta, Page};
-pub use crate::upload_session::channel_stream;
-pub use crate::upload_session::{ByteStream, MultipartUploadPage, PendingMultipartUpload};
+pub use crate::upload_session::{
+    ByteStream, MultipartUploadPage, PendingMultipartUpload, channel_stream,
+};
 
 /// Boxed `AsyncRead` returned by [`ObjectStore::get_stream`]. Matches the
 /// shape `blob_store` already uses so future migrations don't need a

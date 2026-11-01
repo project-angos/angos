@@ -5,11 +5,11 @@
 
 use std::sync::LazyLock;
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use p256::{
-    PublicKey,
-    elliptic_curve::{pkcs8::DecodePublicKey, sec1::ToSec1Point},
-};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use p256::PublicKey;
+use p256::elliptic_curve::pkcs8::DecodePublicKey;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use rcgen::KeyPair;
 
 struct OidcKey {

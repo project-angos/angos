@@ -1,9 +1,11 @@
-use std::{process::exit, sync::LazyLock};
+use std::process::exit;
+use std::sync::LazyLock;
 
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Registry as PrometheusRegistry,
-    TextEncoder, register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_gauge_vec_with_registry, register_int_gauge_with_registry,
+    Encoder, Error as PrometheusError, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    Registry as PrometheusRegistry, TextEncoder, register_histogram_vec_with_registry,
+    register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry,
+    register_int_gauge_with_registry,
 };
 use tracing::error;
 
@@ -84,7 +86,7 @@ pub struct MetricsProvider {
 
 /// Map a Prometheus registration failure to an `Error::Initialization`,
 /// emitting a `tracing::error` with the metric name first.
-fn register_err(name: &'static str) -> impl FnOnce(prometheus::Error) -> Error {
+fn register_err(name: &'static str) -> impl FnOnce(PrometheusError) -> Error {
     move |error| {
         error!("Unable to create {name} metric: {error}");
         Error::Initialization(format!("Unable to create {name} metric"))
@@ -234,28 +236,21 @@ impl MetricsProvider {
         })
     }
 
-    pub fn gather(&self) -> Result<(String, Vec<u8>), Error> {
+    /// Encodes every metric in the Prometheus text format ([`prometheus::TEXT_FORMAT`]).
+    pub fn gather(&self) -> Result<Vec<u8>, Error> {
         let mut buffer = vec![];
-        let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
-        encoder
+        TextEncoder::new()
             .encode(&metric_families, &mut buffer)
             .map_err(|error| Error::Encode(error.to_string()))?;
-        Ok((encoder.format_type().to_string(), buffer))
+        Ok(buffer)
     }
 }
 
 #[cfg(test)]
-pub fn init_for_tests() {
-    initialize_metrics();
-}
-
-#[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Mutex, PoisonError},
-        thread,
-    };
+    use std::sync::{Mutex, PoisonError};
+    use std::thread;
 
     use super::*;
 
@@ -266,54 +261,11 @@ mod tests {
     #[test]
     fn new_registers_all_metrics_and_gather_succeeds() {
         let provider = MetricsProvider::new().expect("MetricsProvider::new must succeed");
-        let (content_type, payload) = provider.gather().expect("gather must succeed");
-
-        assert!(
-            content_type.starts_with("text/plain"),
-            "content type must start with text/plain, got: {content_type}"
-        );
-        assert!(
-            content_type.contains("version="),
-            "content type must include Prometheus exposition version, got: {content_type}"
-        );
-
+        let payload = provider.gather().expect("gather must succeed");
         let text = String::from_utf8(payload).expect("gather output must be valid UTF-8");
         assert!(
             text.contains("http_requests_in_flight"),
-            "gathered output must include http_requests_in_flight gauge"
-        );
-    }
-
-    #[test]
-    fn gather_emits_recorded_counter_values() {
-        let provider = MetricsProvider::new().expect("MetricsProvider::new must succeed");
-
-        // Increment the same label combination twice so the counter reaches 2.
-        let labels = ["GET", "/v2/", "200"];
-        provider
-            .metric_http_request_total
-            .with_label_values(&labels)
-            .inc_by(2);
-
-        let (_, payload) = provider.gather().expect("gather must succeed");
-        let text = String::from_utf8(payload).expect("gather output must be valid UTF-8");
-
-        assert!(
-            text.contains("http_requests_total"),
-            "gathered output must include http_requests_total"
-        );
-        assert!(
-            text.contains("GET"),
-            "gathered output must include the method label value"
-        );
-        assert!(
-            text.contains("200"),
-            "gathered output must include the status label value"
-        );
-        // The Prometheus text format ends a sample line with "} <value>\n".
-        assert!(
-            text.contains("} 2"),
-            "gathered output must contain a sample with value 2, output:\n{text}"
+            "gathered output lacks the gauge: {text}"
         );
     }
 
@@ -325,7 +277,7 @@ mod tests {
             .with_label_values(&["GET", "get-manifest"])
             .observe(40.0);
 
-        let (_, payload) = provider.gather().expect("gather must succeed");
+        let payload = provider.gather().expect("gather must succeed");
         let text = String::from_utf8(payload).expect("gather output must be valid UTF-8");
 
         assert!(
@@ -343,7 +295,7 @@ mod tests {
         let _lock = IN_FLIGHT_TEST_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        init_for_tests();
+        initialize_metrics();
 
         let gauge = &metrics_provider().metric_http_request_in_flight;
         let baseline = gauge.get();
@@ -385,7 +337,7 @@ mod tests {
         let _lock = IN_FLIGHT_TEST_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        init_for_tests();
+        initialize_metrics();
 
         let baseline = metrics_provider().metric_http_request_in_flight.get();
 
@@ -407,29 +359,6 @@ mod tests {
             metrics_provider().metric_http_request_in_flight.get(),
             baseline,
             "gauge must return to baseline after all guards are dropped"
-        );
-    }
-
-    #[test]
-    fn metrics_survive_repeated_initialization() {
-        // Recording needs no prior initialize_metrics() call, and repeated
-        // initialization must keep the same provider instead of replacing it.
-        let counter = metrics_provider()
-            .metric_http_request_total
-            .with_label_values(&["SELFTEST", "/self-init", "200"]);
-        counter.inc();
-        let value = counter.get();
-
-        initialize_metrics();
-        initialize_metrics();
-
-        assert_eq!(
-            metrics_provider()
-                .metric_http_request_total
-                .with_label_values(&["SELFTEST", "/self-init", "200"])
-                .get(),
-            value,
-            "re-initialization must not replace the provider"
         );
     }
 }

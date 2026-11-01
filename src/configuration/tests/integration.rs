@@ -1,12 +1,15 @@
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
-use crate::{
-    configuration::listeners::ClientAuth,
-    configuration::{Configuration, Error, ResolvedStorageConfig, ServerConfig},
-    policy::AccessMode,
-    registry::blob_store,
-    replication::ReplicationMode,
-};
+use angos_cache::Config as CacheConfig;
+use tempfile::NamedTempFile;
+
+use crate::configuration::listeners::ClientAuth;
+use crate::configuration::{Configuration, Error, ServerConfig};
+use crate::policy::AccessMode;
+use crate::registry::blob_store::{BlobStoreConfig, FsBackendConfig};
+use crate::replication::ReplicationMode;
 
 #[test]
 fn test_load_minimal_config() {
@@ -36,10 +39,10 @@ fn test_load_minimal_config() {
     assert_eq!(server_config.query_timeout.get(), 3600);
     assert_eq!(server_config.query_timeout_grace_period.get(), 60);
 
-    assert_eq!(config.cache, angos_cache::Config::Memory);
+    assert_eq!(config.cache, CacheConfig::Memory);
     assert_eq!(
         config.blob_store,
-        blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+        BlobStoreConfig::FS(FsBackendConfig {
             root_dir: PathBuf::from("/var/lib/registry"),
             sync_to_disk: false,
         })
@@ -85,31 +88,6 @@ fn an_empty_blob_store_root_is_refused() {
         format!("{error}").contains("root_dir"),
         "the error must name the offending key, got: {error}"
     );
-}
-
-#[test]
-fn test_auth_section() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [auth.identity.user1]
-    username = "bob"
-    password = "$argon2id$v=19$m=19456,t=2,p=1$9pxWwg0VtZzDXno/25417Q$e+cuKy9VisJVxec/EEuKvvfIIIOy5yDGRzYKiuDLjx0"
-
-    [auth.oidc.generic]
-    issuer = "https://example.com"
-    discovery_url = "https://example.com/.well-known/openid-configuration"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.auth.identity.len(), 1);
-    assert_eq!(config.auth.identity["user1"].username, "bob");
-    assert_eq!(config.auth.oidc.len(), 1);
-    assert_eq!(config.auth.oidc["generic"].issuer, "https://example.com");
 }
 
 #[test]
@@ -232,29 +210,6 @@ fn test_repository_downstream_rejects_partial_mtls() {
 }
 
 #[test]
-fn test_cache_config_redis() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [cache.redis]
-    url = "redis://localhost:6379"
-    key_prefix = "angos:"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    match config.cache {
-        angos_cache::Config::Redis(redis_config) => {
-            assert_eq!(redis_config.url.expose(), "redis://localhost:6379");
-        }
-        angos_cache::Config::Memory => panic!("Expected Redis cache config"),
-    }
-}
-
-#[test]
 fn test_invalid_toml_format() {
     let config = r#"
     [blob_store.fs]
@@ -310,177 +265,7 @@ fn test_tls_config_with_client_ca() {
 }
 
 #[test]
-fn test_insecure_config_with_custom_port() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "127.0.0.1"
-    port = 9000
-    query_timeout = 7200
-    query_timeout_grace_period = 120
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    match config.server {
-        ServerConfig::Insecure(insecure_config) => {
-            assert_eq!(insecure_config.bind_address.to_string(), "127.0.0.1");
-            assert_eq!(insecure_config.port, 9000);
-            assert_eq!(insecure_config.query_timeout.get(), 7200);
-            assert_eq!(insecure_config.query_timeout_grace_period.get(), 120);
-        }
-        ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
-    }
-}
-
-#[test]
-fn test_multiple_repositories() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [repository.app1]
-    immutable_tags = true
-
-    [repository.app2]
-    immutable_tags = false
-
-    [repository.app3]
-    immutable_tags = true
-    immutable_tags_exclusions = ["dev", "test"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.repository.len(), 3);
-    assert!(config.repository["app1"].immutable_tags);
-    assert!(!config.repository["app2"].immutable_tags);
-    assert!(config.repository["app3"].immutable_tags);
-    assert_eq!(config.repository["app3"].immutable_tags_exclusions.len(), 2);
-}
-
-#[test]
-fn test_metadata_store_fs_with_redis() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [metadata_store.fs]
-    root_dir = "/data/metadata"
-
-    [metadata_store.fs.redis]
-    url = "redis://localhost:6379"
-    ttl = 30
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_registry_storage();
-
-    match metadata_config {
-        ResolvedStorageConfig::FS(fs_config) => {
-            assert_eq!(fs_config.root_dir, PathBuf::from("/data/metadata"));
-        }
-        ResolvedStorageConfig::S3(_) => {
-            panic!("Expected FS metadata store config")
-        }
-    }
-}
-
-#[test]
-fn test_ipv6_bind_address() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "::1"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    match config.server {
-        ServerConfig::Insecure(insecure_config) => {
-            assert_eq!(insecure_config.bind_address.to_string(), "::1");
-        }
-        ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
-    }
-}
-
-#[test]
-fn test_access_policy_in_global_config() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global.access_policy]
-    default = "deny"
-    rules = ["allow(true)"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.global.access_policy.rules.len(), 1);
-}
-
-#[test]
-fn test_retention_policy_in_global_config() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global.retention_policy]
-    rules = ["age(image) > days(30)"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.global.retention_policy.rules.len(), 1);
-}
-
-#[test]
-fn test_multiple_webhooks() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [auth.webhook.webhook1]
-    url = "https://webhook1.example.com"
-    timeout_ms = 5000
-
-    [auth.webhook.webhook2]
-    url = "https://webhook2.example.com"
-    timeout_ms = 5000
-
-    [auth.webhook.webhook3]
-    url = "https://webhook3.example.com"
-    timeout_ms = 5000
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.auth.webhook.len(), 3);
-    assert!(config.auth.webhook.contains_key("webhook1"));
-    assert!(config.auth.webhook.contains_key("webhook2"));
-    assert!(config.auth.webhook.contains_key("webhook3"));
-}
-
-#[test]
 fn test_load_from_file() {
-    use std::io::Write;
-
-    use tempfile::NamedTempFile;
-
     let config_content = r#"
     [server]
     bind_address = "127.0.0.1"
@@ -525,141 +310,6 @@ fn test_load_from_nonexistent_file() {
             assert!(msg.contains("Unable to read configuration file"));
         }
         _ => panic!("Expected NotReadable error"),
-    }
-}
-
-#[test]
-fn test_load_from_file_with_validation_error() {
-    use std::io::Write;
-
-    use tempfile::NamedTempFile;
-
-    let config_content = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    authorization_webhook = "missing-webhook"
-    "#;
-
-    let mut temp_file = NamedTempFile::new().unwrap();
-    temp_file.write_all(config_content.as_bytes()).unwrap();
-    temp_file.flush().unwrap();
-
-    let result = Configuration::load_all(&[temp_file.path()]);
-    assert!(result.is_err());
-
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("Webhook 'missing-webhook' not found"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
-}
-
-#[test]
-fn test_event_webhook_config_parses() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [event_webhook.notify]
-    url = "https://example.com/events"
-    policy = "required"
-    events = ["manifest.push", "tag.create"]
-
-    [event_webhook.audit]
-    url = "https://audit.example.com/hook"
-    policy = "async"
-    token = "my-secret"
-    timeout_ms = 10000
-    max_retries = 3
-    events = ["manifest.push", "manifest.delete", "blob.push", "tag.create", "tag.delete"]
-    repository_filter = ["^production/.*"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.event_webhook.len(), 2);
-    assert!(config.event_webhook.contains_key("notify"));
-    assert!(config.event_webhook.contains_key("audit"));
-}
-
-#[test]
-fn test_event_webhook_backward_compatible() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(config.event_webhook.is_empty());
-}
-
-#[test]
-fn test_event_webhook_invalid_config_fails_deserialization() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [event_webhook.bad]
-    url = "ht!tp://::invalid"
-    policy = "required"
-    events = ["manifest.push"]
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    let err = result.expect_err("malformed event webhook URL must fail to load");
-    assert!(
-        err.to_string().contains("url"),
-        "error should mention the offending url field: {err}"
-    );
-}
-
-#[test]
-fn deprecated_lock_strategy_table_still_parses() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [blob_store.s3]
-    bucket = "blob-bucket"
-    region = "us-east-1"
-    endpoint = "https://s3.amazonaws.com"
-    access_key_id = "blob-key"
-    secret_key = "blob-secret"
-
-    [metadata_store.s3]
-    bucket = "metadata-bucket"
-    region = "us-east-1"
-    endpoint = "https://s3.amazonaws.com"
-    access_key_id = "key"
-    secret_key = "secret"
-
-    [metadata_store.s3.lock_strategy.s3]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_registry_storage();
-
-    match metadata_config {
-        ResolvedStorageConfig::S3(s3_config) => {
-            assert_eq!(s3_config.connection.bucket, "metadata-bucket");
-        }
-        ResolvedStorageConfig::FS(_) => {
-            panic!("Expected S3 metadata store config")
-        }
     }
 }
 

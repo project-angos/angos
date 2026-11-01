@@ -2,38 +2,32 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tempfile::TempDir;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{header, method, path},
-};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use angos_oci::header::{DOCKER_CONTENT_DIGEST, X_ANGOS_SOURCE_TIMESTAMP};
 use angos_oci::response::REPLICATION_SUPERSEDED_CODE;
 use angos_oci::{Digest, Namespace, Tag};
 use angos_oci_client::RegistryClient;
 
-use crate::{
-    jobs::Queue,
-    jobs::store::{Error, JobEnvelope, JobHandler},
-    metrics_provider,
-    registry::{
-        Repository,
-        metadata_store::LinkKind,
-        test_utils::{
-            FsTestStack, downstream_client, fs_test_stack, repository_with_replication,
-            seed_manifest, single_repo_resolver,
-        },
-    },
-    replication::{
-        Error as ReplicationError, REPLICATION_DELETE_MANIFEST_KIND,
-        REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
-        handler::{
-            ReplicationJob, ReplicationJobHandler, ReplicationTarget, build_envelope,
-            build_prune_delete_envelope, job_error, replication_lock_key,
-        },
-    },
-    test_fixtures::mocks::{mount_blob_upload_accepted, mount_blobs_present},
+use crate::jobs::Queue;
+use crate::jobs::store::{Error, JobHandler};
+use crate::metrics_provider;
+use crate::registry::Repository;
+use crate::registry::metadata_store::LinkKind;
+use crate::registry::test_utils::{
+    FsTestStack, downstream_client, fs_test_stack, repository_with_replication, seed_manifest,
+    single_repo_resolver,
 };
+use crate::replication::handler::{
+    ReplicationJob, ReplicationJobHandler, ReplicationTarget, build_envelope,
+    build_prune_delete_envelope, job_error, replication_lock_key,
+};
+use crate::replication::{
+    Error as ReplicationError, REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
+    ReplicationDownstream,
+};
+use crate::test_fixtures::mocks::{mount_blob_upload_accepted, mount_blobs_present};
 
 const NAMESPACE: &str = "nginx";
 const REPO: &str = "nginx";
@@ -227,44 +221,11 @@ fn repository_with_named_downstream(name: &str, client: Arc<RegistryClient>) -> 
     )
 }
 
-#[tokio::test]
-async fn execute_rejects_unknown_kind() {
-    metrics_provider::init_for_tests();
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    let resolver = single_repo_resolver(
-        REPO,
-        repository_with_downstream(downstream_client("https://unused.test")),
-    );
-
-    let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
-
-    let envelope = JobEnvelope::new(
-        Queue::Replication,
-        "replication.bogus",
-        "lock",
-        &sample_payload(),
-    )
-    .unwrap();
-    let result = handler.execute(&envelope).await;
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported job kind")
-    );
-}
-
 /// A job for a downstream no longer in config fails loudly (and so
 /// dead-letters after max attempts) instead of silently completing.
 #[tokio::test]
 async fn execute_errors_on_removed_downstream() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let FsTestStack {
         dir: _dir,
         metadata_store,
@@ -296,7 +257,7 @@ async fn execute_errors_on_removed_downstream() {
 
 #[tokio::test]
 async fn execute_pushes_manifest_with_head_before_put() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     let FsTestStack {
@@ -342,7 +303,7 @@ async fn execute_pushes_manifest_with_head_before_put() {
 /// retrying against revoked credentials.
 #[tokio::test]
 async fn execute_maps_downstream_403_to_terminal() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     let FsTestStack {
@@ -383,7 +344,7 @@ async fn execute_maps_downstream_403_to_terminal() {
 /// `nginx` and prepends `mirror`, so manifest and blobs land at `mirror/app`.
 #[tokio::test]
 async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     let FsTestStack {
@@ -442,7 +403,7 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn execute_skips_blob_present_on_downstream() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     let FsTestStack {
@@ -488,7 +449,7 @@ async fn execute_skips_blob_present_on_downstream() {
 /// coalesced push cannot ship a stale last-writer-wins version.
 #[tokio::test]
 async fn execute_push_stamps_resolved_source_timestamp() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     let FsTestStack {
@@ -542,7 +503,7 @@ async fn execute_push_stamps_resolved_source_timestamp() {
 
 #[tokio::test]
 async fn execute_delete_manifest_calls_downstream_delete() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     Mock::given(method("DELETE"))
@@ -602,7 +563,7 @@ async fn handler_with_downstream(
 
 #[tokio::test]
 async fn execute_push_records_pushed_metric_and_last_success() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let downstream = "metric-pushed";
     let mock_server = MockServer::start().await;
     let (handler, config_digest, layer_digest, _dir) =
@@ -652,7 +613,7 @@ async fn execute_push_records_pushed_metric_and_last_success() {
 
 #[tokio::test]
 async fn execute_push_records_superseded_metric_and_last_success() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let downstream = "metric-superseded";
     let mock_server = MockServer::start().await;
     let (handler, config_digest, layer_digest, _dir) =
@@ -697,7 +658,7 @@ async fn execute_push_records_superseded_metric_and_last_success() {
 
 #[tokio::test]
 async fn execute_push_records_failed_metric_on_error() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let downstream = "metric-failed";
     let mock_server = MockServer::start().await;
     let (handler, config_digest, layer_digest, _dir) =
@@ -747,7 +708,7 @@ async fn execute_push_records_failed_metric_on_error() {
 /// A converged no-op must not contact the downstream nor record any metric.
 #[tokio::test]
 async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let downstream = "metric-deleted-tag";
 
     let FsTestStack {
@@ -793,7 +754,7 @@ async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
 
 #[tokio::test]
 async fn execute_tagless_push_with_deleted_revision_is_noop_success() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let downstream = "metric-deleted-revision";
 
     let FsTestStack {

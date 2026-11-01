@@ -1,9 +1,7 @@
 //! Tracing capture for tests that assert on emitted log lines.
 
-use std::{
-    io::{self, Write},
-    sync::{Arc, Mutex},
-};
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
 

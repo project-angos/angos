@@ -12,24 +12,19 @@ use tracing::info;
 
 use super::orphan_jobs;
 
-use crate::{
-    command::{
-        bootstrap,
-        maintenance::{
-            Error,
-            executor::{ActionSink, Executor, run_sink},
-            walk::{self, WalkStats},
-        },
-        reconcile,
-        scrub::validate::{Pass, Validator},
-    },
-    configuration::Configuration,
-    jobs::store::{ClaimMode, JobStore},
-    registry::{
-        Registry, blob_store::BlobStore, keys::REF_ROOT, metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-};
+use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::executor::{ActionSink, Executor, run_sink};
+use crate::command::maintenance::walk::{self, WalkStats};
+use crate::command::reconcile;
+use crate::command::scrub::validate::{Pass, Validator};
+use crate::configuration::Configuration;
+use crate::jobs::store::{ClaimMode, JobStore};
+use crate::registry::Registry;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::keys::REF_ROOT;
+use crate::registry::metadata_store::MetadataStore;
+use crate::registry::repository_resolver::RepositoryResolver;
 
 /// Default per-pass concurrency, shared by the scrub walk and the prune
 /// sweeps.
@@ -72,7 +67,7 @@ pub struct Command {
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let bootstrap::MaintenanceContext {
+        let MaintenanceContext {
             blob_store,
             metadata_store,
             repositories,
@@ -172,16 +167,18 @@ impl Command {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
     use bytes::Bytes;
     use tempfile::TempDir;
 
     use angos_oci::Namespace;
 
-    use crate::command::scrub::command::*;
-    use crate::{
-        command::maintenance::action::LOST_AND_FOUND_PREFIX,
-        registry::{keys::GC_ROOT, test_utils::seed_manifest},
-    };
+    use super::*;
+    use crate::command::maintenance::action::LOST_AND_FOUND_PREFIX;
+    use crate::registry::keys::GC_ROOT;
+    use crate::registry::test_utils::seed_manifest;
 
     fn scrub_config(root: &str) -> Configuration {
         let toml = format!(
@@ -274,9 +271,9 @@ mod tests {
             let mut again = Command::new(&options(false, 4), &config).await.unwrap();
             again.run().await.unwrap();
             let stats = &again.stats;
-            let emitted = stats.repairs.load(std::sync::atomic::Ordering::Relaxed)
-                + stats.quarantined.load(std::sync::atomic::Ordering::Relaxed)
-                + stats.corrupt.load(std::sync::atomic::Ordering::Relaxed);
+            let emitted = stats.repairs.load(Ordering::Relaxed)
+                + stats.quarantined.load(Ordering::Relaxed)
+                + stats.corrupt.load(Ordering::Relaxed);
             if emitted == 0 {
                 break;
             }
@@ -325,7 +322,7 @@ mod tests {
                 .unwrap();
             command.run().await.unwrap();
 
-            let keys = std::sync::Mutex::new(Vec::new());
+            let keys = Mutex::new(Vec::new());
             walk::for_each_key(command.metadata_store.object_store(), "", 1, |key| {
                 keys.lock().unwrap().push(key);
                 async {}

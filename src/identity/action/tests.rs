@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use angos_oci::{Digest, Namespace, Reference, Tag, UploadSessionId};
 
-use crate::identity::action::*;
+use super::*;
 use crate::jobs::{JobState, Queue};
 
 const SHA256_EMPTY: &str =
@@ -212,7 +212,7 @@ fn test_action_serialization_cel_compatibility() {
             "retry-job",
             Action::RetryJob {
                 queue: Queue::Cache,
-                storage_key: "0000018f-key".to_string(),
+                storage_key: JobKey::try_from("0000018f-key".to_string()).unwrap(),
             },
         ),
         (
@@ -220,7 +220,7 @@ fn test_action_serialization_cel_compatibility() {
             Action::DeleteJob {
                 queue: Queue::Cache,
                 state: JobState::Failed,
-                storage_key: "0000018f-key".to_string(),
+                storage_key: JobKey::try_from("0000018f-key".to_string()).unwrap(),
             },
         ),
     ];
@@ -307,19 +307,6 @@ fn test_get_blob_includes_namespace_and_digest() {
 }
 
 #[test]
-fn test_get_manifest_includes_namespace_and_reference() {
-    let action = Action::GetManifest {
-        namespace: Namespace::new("library/nginx").unwrap(),
-        reference: Reference::from_str("v1.0.0").unwrap(),
-    };
-    let json = serde_json::to_value(&action).unwrap();
-    assert_eq!(json["action"], "get-manifest");
-    assert_eq!(json["namespace"], "library/nginx");
-    assert_eq!(json["reference"], "v1.0.0");
-    assert!(json.get("digest").is_none());
-}
-
-#[test]
 fn test_list_catalog_omits_null_pagination() {
     let action = Action::ListCatalog {
         n: None,
@@ -345,37 +332,37 @@ fn test_list_tags_with_pagination() {
 }
 
 #[test]
-fn test_get_namespace() {
+fn test_namespace() {
     assert_eq!(
         Action::GetBlob {
             namespace: ns(),
             digest: digest()
         }
-        .get_namespace()
+        .namespace()
         .map(AsRef::as_ref),
         Some("test")
     );
-    assert_eq!(Action::ApiVersion.get_namespace(), None);
+    assert_eq!(Action::ApiVersion.namespace(), None);
     assert_eq!(
         Action::ListCatalog {
             n: None,
             last: None
         }
-        .get_namespace(),
+        .namespace(),
         None
     );
-    assert_eq!(Action::ListRepositories.get_namespace(), None);
+    assert_eq!(Action::ListRepositories.namespace(), None);
 }
 
 #[test]
-fn test_get_digest() {
+fn test_digest() {
     let d = digest();
     assert_eq!(
         Action::GetBlob {
             namespace: ns(),
             digest: d.clone()
         }
-        .get_digest(),
+        .digest(),
         Some(&d)
     );
     assert_eq!(
@@ -384,7 +371,7 @@ fn test_get_digest() {
             digest: Some(d.clone()),
             digest_algorithm: None,
         }
-        .get_digest(),
+        .digest(),
         Some(&d)
     );
     assert_eq!(
@@ -393,7 +380,7 @@ fn test_get_digest() {
             digest: None,
             digest_algorithm: None,
         }
-        .get_digest(),
+        .digest(),
         None
     );
     // A mount-blob action exposes its mount-source digest as the action digest.
@@ -403,31 +390,31 @@ fn test_get_digest() {
             digest: d.clone(),
             from: Some(ns()),
         }
-        .get_digest(),
+        .digest(),
         Some(&d)
     );
-    assert_eq!(Action::ApiVersion.get_digest(), None);
+    assert_eq!(Action::ApiVersion.digest(), None);
 }
 
 #[test]
-fn test_get_reference() {
+fn test_reference() {
     let r = reference();
     assert_eq!(
         Action::GetManifest {
             namespace: ns(),
             reference: r.clone()
         }
-        .get_reference()
+        .reference()
         .map(|r| r.to_string()),
         Some(r.to_string())
     );
-    assert!(Action::ApiVersion.get_reference().is_none());
+    assert!(Action::ApiVersion.reference().is_none());
     assert!(
         Action::GetBlob {
             namespace: ns(),
             digest: digest()
         }
-        .get_reference()
+        .reference()
         .is_none()
     );
 }

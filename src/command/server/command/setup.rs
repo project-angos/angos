@@ -1,29 +1,33 @@
-use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::time::timeout;
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
 use angos_cache::Cache;
 
-use crate::{
-    cache_fill::CacheFillJobHandler,
-    command::{bootstrap, server::error::Error},
-    configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig},
-    event_webhook::dispatcher::EventDispatcher,
-    jobs::{
-        Queue,
-        runner::claim_loop,
-        store::{self as job_store, ClaimMode, JobHandler, JobStore, QueueDepthRefresh},
-    },
-    layer::{IndexLimits, handler::IndexLayerJobHandler},
-    registry::{
-        Registry, RegistryConfig, blob_store::BlobStore, metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-    replication::ReplicationJobHandler,
-    scan::handler::ScanJobHandler,
+use crate::cache_fill::CacheFillJobHandler;
+use crate::command::bootstrap;
+use crate::command::server::error::Error;
+use crate::configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig};
+use crate::event_webhook::dispatcher::EventDispatcher;
+use crate::jobs::Queue;
+use crate::jobs::runner::claim_loop;
+use crate::jobs::store::{
+    ClaimMode, JobHandler, JobStore, QueueDepthRefresh, ensure_claim_support,
 };
+use crate::layer::IndexLimits;
+use crate::layer::handler::IndexLayerJobHandler;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::MetadataStore;
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::registry::{Registry, RegistryConfig};
+use crate::replication::ReplicationJobHandler;
+use crate::scan::handler::ScanJobHandler;
+
 /// A built registry and what the server owns around it: the handle its
 /// queue-depth gauges refresh from when `[global.job_queue]` is configured,
 /// and otherwise the claim loops draining the in-process queue.
@@ -36,6 +40,7 @@ pub struct BuiltRegistry {
 /// The claim loops draining the server's own job queue, and the handles that
 /// stop them. Holds no loop when `[global.job_queue]` leaves draining to
 /// `angos worker`.
+#[derive(Default)]
 pub struct InProcessLoops {
     shutdown: CancellationToken,
     tracker: TaskTracker,
@@ -60,14 +65,6 @@ impl InProcessLoops {
         }
     }
 
-    /// No loops, so nothing to stop.
-    fn none() -> Self {
-        Self {
-            shutdown: CancellationToken::new(),
-            tracker: TaskTracker::new(),
-        }
-    }
-
     /// Stop claiming, without waiting on the jobs in flight. Used for the
     /// generation a reload displaces, which finishes what it holds while the
     /// generation replacing it claims the rest.
@@ -86,9 +83,6 @@ impl InProcessLoops {
     }
 }
 
-/// Spawn `cache_loops` and `replication_loops` claim loops draining
-/// `job_store`. Replication drains only when a downstream is configured: an
-/// always-empty queue would just storm the object store with `LIST`s.
 /// How many in-process loops each queue gets.
 struct LoopCounts {
     cache: NonZeroUsize,
@@ -96,6 +90,9 @@ struct LoopCounts {
     index: NonZeroUsize,
 }
 
+/// Spawn the claim loops draining `job_store`. Replication drains only when a
+/// downstream is configured: an always-empty queue would just storm the object
+/// store with `LIST`s.
 fn spawn_in_process_loops(
     job_store: &Arc<JobStore>,
     resolver: &Arc<RepositoryResolver>,
@@ -105,7 +102,7 @@ fn spawn_in_process_loops(
     counts: &LoopCounts,
     index_limits: IndexLimits,
 ) -> InProcessLoops {
-    let loops = InProcessLoops::none();
+    let loops = InProcessLoops::default();
 
     // Any image may be indexed on demand, so the queue always drains.
     let index_handler: Arc<dyn JobHandler> = Arc::new(IndexLayerJobHandler::new(
@@ -190,7 +187,7 @@ pub async fn build_registry(
     // the loops spawned here drain it until the server stops them.
     let (job_store, depth_refresh, in_process_loops) =
         if let Some(jq_config) = &config.global.job_queue {
-            let claim_mode = job_store::ensure_claim_support(&metadata_store).await?;
+            let claim_mode = ensure_claim_support(&metadata_store).await?;
             let job_store: Arc<JobStore> = Arc::new(JobStore::with_retry_policy(
                 &metadata_store,
                 "server",
@@ -202,7 +199,7 @@ pub async fn build_registry(
                 period: Duration::from_secs(jq_config.pending_refresh_interval_secs),
                 ready_horizon_secs: jq_config.pending_ready_horizon_secs,
             };
-            (job_store, Some(refresh), InProcessLoops::none())
+            (job_store, Some(refresh), InProcessLoops::default())
         } else {
             // Atomic mode: in-process draining runs no startup probe to pick one.
             let job_store: Arc<JobStore> = Arc::new(JobStore::new(
@@ -276,42 +273,35 @@ pub async fn build_registry(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use tempfile::TempDir;
     use tokio::time::{sleep, timeout};
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
-    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use angos_oci::header::DOCKER_CONTENT_DIGEST;
     use angos_oci::{Namespace, Tag};
     use angos_oci_client::RegistryClient;
 
     use super::{InProcessLoops, LoopCounts, spawn_in_process_loops};
-    use crate::{
-        configuration::global::{
-            DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
-            DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS, GlobalConfig,
-        },
-        jobs::{
-            Queue,
-            store::{ClaimMode, JobEnvelope, JobStore},
-        },
-        metrics_provider::init_for_tests,
-        registry::{
-            Registry, RegistryConfig, Repository,
-            blob_store::BlobStore,
-            manifest::DispatchTarget,
-            metadata_store::MetadataStore,
-            test_utils::{
-                FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,
-                repository_with_replication, seed_manifest, single_repo_resolver,
-            },
-        },
-        replication::REPLICATION_PUSH_MANIFEST_KIND,
+    use crate::configuration::global::{
+        DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
+        DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS, GlobalConfig,
     };
+    use crate::jobs::Queue;
+    use crate::jobs::store::{ClaimMode, JobEnvelope, JobStore};
+    use crate::metrics_provider::initialize_metrics;
+    use crate::registry::blob_store::BlobStore;
+    use crate::registry::manifest::DispatchTarget;
+    use crate::registry::metadata_store::MetadataStore;
+    use crate::registry::test_utils::{
+        FsTestStack, downstream_client, fs_test_stack, repository_with_downstream,
+        repository_with_replication, seed_manifest, single_repo_resolver,
+    };
+    use crate::registry::{Registry, RegistryConfig, Repository};
+    use crate::replication::REPLICATION_PUSH_MANIFEST_KIND;
 
     const NAMESPACE: &str = "nginx";
     const REPO: &str = "nginx";
@@ -328,7 +318,7 @@ mod tests {
     }
 
     fn build_stack(repository: Repository) -> InProcessStack {
-        init_for_tests();
+        initialize_metrics();
         let FsTestStack {
             dir,
             metadata_store,
@@ -412,7 +402,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let repository = stack.registry.get_repository_for_namespace(&namespace).ok();
+        let repository = stack.registry.repository_for_namespace(&namespace).ok();
         let tag = Tag::new("v1").unwrap();
         stack
             .registry
@@ -488,7 +478,7 @@ mod tests {
                 JobEnvelope::new(
                     Queue::Replication,
                     REPLICATION_PUSH_MANIFEST_KIND,
-                    format!("{}.eu:nginx:v1", Queue::Replication),
+                    &format!("{}.eu:nginx:v1", Queue::Replication),
                     &(),
                 )
                 .unwrap(),

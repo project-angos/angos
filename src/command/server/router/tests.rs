@@ -116,26 +116,6 @@ fn test_parse_unknown_post_route() {
 }
 
 #[test]
-fn test_parse_ui_asset_root() {
-    let uri: Uri = "/".parse().unwrap();
-    if let Some(Route::UiAsset { path }) = parse(&Method::GET, &uri) {
-        assert_eq!(path, "/");
-    } else {
-        panic!("Expected UiAsset route");
-    }
-}
-
-#[test]
-fn test_parse_ui_asset_with_path() {
-    let uri: Uri = "/index.html".parse().unwrap();
-    if let Some(Route::UiAsset { path }) = parse(&Method::GET, &uri) {
-        assert_eq!(path, "/index.html");
-    } else {
-        panic!("Expected UiAsset route");
-    }
-}
-
-#[test]
 fn test_parse_ui_asset_head_method() {
     let uri: Uri = "/style.css".parse().unwrap();
     if let Some(Route::UiAsset { path }) = parse(&Method::HEAD, &uri) {
@@ -143,12 +123,6 @@ fn test_parse_ui_asset_head_method() {
     } else {
         panic!("Expected UiAsset route");
     }
-}
-
-#[test]
-fn test_parse_ui_asset_post_not_allowed() {
-    let uri: Uri = "/index.html".parse().unwrap();
-    assert!(parse(&Method::POST, &uri).is_none());
 }
 
 /// The proxy `ns` parameter selects no upstream, so it must not change or

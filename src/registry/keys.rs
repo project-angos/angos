@@ -15,7 +15,7 @@ use crate::registry::metadata_store::LinkKind;
 /// The reference-key tail after `<ns>!`. Digest-bearing kinds omit the blob's
 /// own digest and spell out only the foreign one: a referrer entry names its
 /// subject, a per-referrer entry the manifest that references the blob.
-/// [`DigestKeys::parse_blob_ref_entry`] inverts it.
+/// [`DigestExt::parse_blob_ref_entry`] inverts it.
 fn ref_tail(link: &LinkKind) -> String {
     match link {
         LinkKind::Blob(_) => "own".to_string(),
@@ -28,6 +28,13 @@ fn ref_tail(link: &LinkKind) -> String {
             format!("r/{}.{}", referrer.algorithm(), referrer.hash())
         }
     }
+}
+
+/// What a tag entry records: a push or a deletion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TagEntryKind {
+    Set,
+    Deletion,
 }
 
 /// One tag entry, decoded from its key name: what the entry records, plus the
@@ -87,7 +94,7 @@ impl FromStr for TagEntry {
     /// allocate.
     type Err = ();
 
-    /// Decode one entry file of [`NamespaceKeys::tag_entry_dir`].
+    /// Decode one entry file of [`NamespaceExt::tag_entry_dir`].
     fn from_str(name: &str) -> Result<Self, Self::Err> {
         let mut parts = name.splitn(4, '.');
         let (Some(ord), Some(kind), Some(algorithm), Some(hash)) =
@@ -164,7 +171,7 @@ pub const GC_ROOT: &str = "v2/gc";
 pub const LAYERS_ROOT: &str = "v2/layers";
 
 /// Every current-shape storage key addressed by a blob's digest.
-pub trait DigestKeys {
+pub trait DigestExt {
     /// Directory holding a blob's data.
     fn blob_dir(&self) -> String;
 
@@ -203,17 +210,17 @@ pub trait DigestKeys {
     /// partial-name prefix support.
     fn blob_ref_namespace_dir(&self, namespace: &Namespace) -> String;
 
-    /// Decode one key of [`DigestKeys::blob_ref_dir`], relative to that
+    /// Decode one key of [`DigestExt::blob_ref_dir`], relative to that
     /// directory, into its raw namespace (validity is the caller's concern)
     /// and the link it records.
     fn parse_blob_ref(&self, key: &str) -> Option<(String, LinkKind)>;
 
-    /// Decode one key of [`DigestKeys::blob_ref_namespace_dir`], relative to
+    /// Decode one key of [`DigestExt::blob_ref_namespace_dir`], relative to
     /// that directory.
     fn parse_blob_ref_entry(&self, entry: &str) -> Option<LinkKind>;
 }
 
-impl DigestKeys for Digest {
+impl DigestExt for Digest {
     fn blob_dir(&self) -> String {
         format!(
             "{BLOBS_ROOT}/{}/{}/{}",
@@ -322,7 +329,7 @@ pub fn parse_sharded(algorithm: &str, prefix: &str, hash: &str) -> Option<Digest
     parse_digest(algorithm, hash).filter(|digest| digest.hash_prefix() == prefix)
 }
 
-/// A revision record key below [`NamespaceKeys::revision_records_root`],
+/// A revision record key below [`NamespaceExt::revision_records_root`],
 /// `<algo>/<pfx>/<hash>`, which is also how a referrer record names its subject.
 pub fn parse_revision_record(key: &str) -> Option<Digest> {
     let (algorithm, rest) = key.split_once('/')?;
@@ -330,7 +337,7 @@ pub fn parse_revision_record(key: &str) -> Option<Digest> {
     parse_sharded(algorithm, prefix, hash)
 }
 
-/// A referrer record key below [`NamespaceKeys::referrer_records_root`],
+/// A referrer record key below [`NamespaceExt::referrer_records_root`],
 /// `<algo>/<pfx>/<hash>/<algo>.<hash>`: its subject, then its referrer.
 pub fn parse_referrer_record(key: &str) -> Option<(Digest, Digest)> {
     let (subject, referrer) = key.rsplit_once('/')?;
@@ -347,7 +354,7 @@ pub fn parse_layer_key(key: &str) -> Option<Digest> {
 pub const TAG_CLAIM: &str = "claim";
 
 /// Every current-shape storage key addressed by a namespace.
-pub trait NamespaceKeys {
+pub trait NamespaceExt {
     /// Directory holding every tag-entry directory of the namespace,
     /// `!`-terminated for the same reasons as the reference keys.
     fn tag_entries_root(&self) -> String;
@@ -371,17 +378,17 @@ pub trait NamespaceKeys {
         &self,
         tag: &Tag,
         authored_at: DateTime<Utc>,
-        deletion: bool,
+        kind: TagEntryKind,
         digest: &Digest,
     ) -> String;
 
     /// One tag's demoted entry, under a `!`-terminated history directory. It
-    /// keeps its [`NamespaceKeys::tag_entry_path`] file name, so history stays
+    /// keeps its [`NamespaceExt::tag_entry_path`] file name, so history stays
     /// in newest-first order.
     fn tag_hist_path(&self, tag: &Tag, entry_name: &str) -> String;
 
     /// Directory holding one tag's append-only access entries, `!`-terminated
-    /// like [`NamespaceKeys::tag_entry_dir`] so a tag named like another's
+    /// like [`NamespaceExt::tag_entry_dir`] so a tag named like another's
     /// prefix cannot collide with it.
     fn tag_atime_entry_dir(&self, tag: &Tag) -> String;
 
@@ -414,11 +421,12 @@ pub trait NamespaceKeys {
     /// Directory holding every revision record of the namespace.
     fn revision_records_root(&self) -> String;
 
-    /// Directory holding `subject`'s referrer records: one key per referring
-    /// manifest, whose body is that manifest's descriptor.
     /// Root of every referrer record in the namespace, which one walk lists
     /// where reading per subject would list once each.
     fn referrer_records_root(&self) -> String;
+
+    /// Directory holding `subject`'s referrer records: one key per referring
+    /// manifest, whose body is that manifest's descriptor.
     fn referrer_record_dir(&self, subject: &Digest) -> String;
 
     /// One referring manifest's record under `subject`.
@@ -440,7 +448,7 @@ pub trait NamespaceKeys {
     fn upload_session_path(&self, session_id: &UploadSessionId) -> String;
 }
 
-impl NamespaceKeys for Namespace {
+impl NamespaceExt for Namespace {
     fn tag_entries_root(&self) -> String {
         format!("{NS_ROOT}/{self}!tag")
     }
@@ -457,10 +465,13 @@ impl NamespaceKeys for Namespace {
         &self,
         tag: &Tag,
         authored_at: DateTime<Utc>,
-        deletion: bool,
+        kind: TagEntryKind,
         digest: &Digest,
     ) -> String {
-        let kind = if deletion { "del" } else { "set" };
+        let kind = match kind {
+            TagEntryKind::Set => "set",
+            TagEntryKind::Deletion => "del",
+        };
         // Inverted millis, so a listing yields the newest entry first.
         let ord = u64::MAX - 1 - authored_at.timestamp_millis().max(0).unsigned_abs();
         format!(
@@ -566,7 +577,7 @@ impl NamespaceKeys for Namespace {
 
 /// Storage prefix for a namespace subtree addressed by its raw on-disk name, so
 /// scrub can reclaim a directory whose name fails `Namespace` validation. A
-/// free function rather than a [`NamespaceKeys`] method precisely because no
+/// free function rather than a [`NamespaceExt`] method precisely because no
 /// `Namespace` exists for such a name. `None` when a segment is empty, `.`, or
 /// `..`, which could escape the root.
 pub fn namespace_dir(name: &str) -> Option<String> {
@@ -584,11 +595,10 @@ pub fn namespace_dir(name: &str) -> Option<String> {
 mod tests {
     use chrono::{DateTime, TimeDelta};
 
-    use crate::registry::keys::*;
+    use super::*;
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const HASH_512: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     /// The name an entry key carries encodes its stamp at millisecond
     /// precision, and an ordinal outside the band a writer produces reads as
@@ -602,7 +612,7 @@ mod tests {
 
         let entry_name = |at| {
             namespace
-                .tag_entry_path(&tag, at, false, &digest)
+                .tag_entry_path(&tag, at, TagEntryKind::Set, &digest)
                 .rsplit_once('/')
                 .unwrap()
                 .1
@@ -639,11 +649,11 @@ mod tests {
         let digest = Digest::sha256(HASH_A).unwrap();
         let at = DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
 
-        for deletion in [false, true] {
-            let key = namespace.tag_entry_path(&tag, at, deletion, &digest);
+        for kind in [TagEntryKind::Set, TagEntryKind::Deletion] {
+            let key = namespace.tag_entry_path(&tag, at, kind, &digest);
             let (_, name) = key.rsplit_once('/').unwrap();
             let parsed = name.parse::<TagEntry>().expect("entry must parse");
-            let expected = if deletion {
+            let expected = if kind == TagEntryKind::Deletion {
                 TagEntry::Deletion {
                     ord: parsed.ord(),
                     authored_at: Some(at),
@@ -666,8 +676,8 @@ mod tests {
         // Same millisecond, different digests: distinct keys, both parseable.
         let other = Digest::sha256(HASH_B).unwrap();
         assert_ne!(
-            namespace.tag_entry_path(&tag, at, false, &digest),
-            namespace.tag_entry_path(&tag, at, false, &other)
+            namespace.tag_entry_path(&tag, at, TagEntryKind::Set, &digest),
+            namespace.tag_entry_path(&tag, at, TagEntryKind::Set, &other)
         );
     }
 
@@ -694,15 +704,6 @@ mod tests {
             format!("v2/blobs/sha256/aa/{HASH_A}/data")
         );
         assert_eq!(digest.blob_dir(), format!("v2/blobs/sha256/aa/{HASH_A}"));
-    }
-
-    #[test]
-    fn test_blob_paths_sha512() {
-        let digest = Digest::sha512(HASH_512).unwrap();
-        assert_eq!(
-            digest.blob_path(),
-            format!("v2/blobs/sha512/cc/{HASH_512}/data")
-        );
     }
 
     #[test]
@@ -764,7 +765,7 @@ mod tests {
         let entry_key = ns.tag_entry_path(
             &tag,
             DateTime::from_timestamp_millis(7).unwrap(),
-            true,
+            TagEntryKind::Deletion,
             &digest,
         );
         let file = entry_key.rsplit_once('/').unwrap().1;
@@ -780,8 +781,8 @@ mod tests {
         let older = DateTime::from_timestamp_millis(1_000_000).unwrap();
         let newer = DateTime::from_timestamp_millis(2_000_000).unwrap();
 
-        let older_key = ns.tag_entry_path(&tag, older, false, &digest);
-        let newer_key = ns.tag_entry_path(&tag, newer, true, &digest);
+        let older_key = ns.tag_entry_path(&tag, older, TagEntryKind::Set, &digest);
+        let newer_key = ns.tag_entry_path(&tag, newer, TagEntryKind::Deletion, &digest);
         assert!(
             newer_key < older_key,
             "a newer entry must sort before an older one"

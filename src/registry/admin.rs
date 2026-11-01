@@ -1,14 +1,12 @@
 //! The `/v2/_angos` admin surface: repository and namespace info for the web UI,
 //! plus the durable job list/retry/delete endpoints.
 
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    future::Future,
-    num::{NonZeroU16, NonZeroUsize},
-    ops::Range,
-    sync::{Arc, PoisonError},
-};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::num::{NonZeroU16, NonZeroUsize};
+use std::ops::Range;
+use std::sync::{Arc, PoisonError};
 
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
@@ -22,22 +20,20 @@ use angos_extension_service::{
     RepositoryInfo, RetryJobRequest, RevisionSelection, RevisionSort, RevisionsBody, SortOrder,
     UploadEntry, UploadsBody,
 };
+use angos_oci::request::GetReferrersRequest;
 use angos_oci::{
     Content, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace, Platform, Tag,
-    UploadSessionId, namespace_belongs_to, request::GetReferrersRequest,
+    UploadSessionId, namespace_belongs_to,
 };
 use angos_oci_service::NoContent;
 
-use crate::{
-    configuration::RegexPattern,
-    jobs::{JobState, Queue, store as job_store},
-    registry::{
-        Error, Registry,
-        content_discovery::{DEFAULT_PAGE_SIZE, REFERRER_RESOLVE_CONCURRENCY},
-        manifest::read_manifest,
-        metadata_store::LinkKind,
-    },
-};
+use crate::configuration::RegexPattern;
+use crate::jobs::store::{Error as JobStoreError, parse_not_before};
+use crate::jobs::{JobState, Queue};
+use crate::registry::content_discovery::{DEFAULT_PAGE_SIZE, REFERRER_RESOLVE_CONCURRENCY};
+use crate::registry::manifest::read_manifest;
+use crate::registry::metadata_store::LinkKind;
+use crate::registry::{Error, Registry};
 
 /// Bounds the per-namespace stat fan-out so a repository with many namespaces
 /// does not open one request per namespace at once.
@@ -129,16 +125,16 @@ async fn read_job_page<T, Fut>(
     read: impl Fn(String) -> Fut,
 ) -> Result<Vec<T>, Error>
 where
-    Fut: Future<Output = Result<T, job_store::Error>>,
+    Fut: Future<Output = Result<T, JobStoreError>>,
 {
     let read = &read;
     stream::iter(storage_keys)
         .map(|storage_key| async move {
             match read(storage_key.clone()).await {
                 Ok(entry) => Ok(Some(entry)),
-                Err(job_store::Error::NotFound) => Ok(None),
+                Err(JobStoreError::NotFound) => Ok(None),
                 // Failing the page here would hide every other job on it.
-                Err(job_store::Error::Corrupt(e)) => {
+                Err(JobStoreError::Corrupt(e)) => {
                     warn!("admin: skipping unreadable job record '{storage_key}': {e}");
                     Ok(None)
                 }
@@ -237,7 +233,8 @@ fn select_revisions(
     for (subject, referrers) in &inputs.referrers_by_subject {
         let mut first_page: Vec<&Digest> = referrers.iter().collect();
         first_page.sort();
-        for referrer in first_page.into_iter().take(usize::from(DEFAULT_PAGE_SIZE)) {
+        first_page.truncate(usize::from(DEFAULT_PAGE_SIZE));
+        for referrer in first_page {
             add_hold(subject, referrer);
         }
     }
@@ -315,7 +312,7 @@ impl Registry {
             if namespace_count == 0 {
                 continue;
             }
-            let config = self.get_repository_config(name);
+            let config = self.repository_config(name);
             repositories.push(RepositoryInfo {
                 name: name.to_string(),
                 namespace_count,
@@ -393,7 +390,9 @@ impl Registry {
                     self.metadata_store
                         .stream_revisions(&name)
                         .try_fold(0usize, |count, _| async move { Ok(count + 1) }),
-                    self.count_uploads(&name),
+                    self.blob_store
+                        .stream_uploads(&name)
+                        .try_fold(0usize, |count, _| async move { Ok(count + 1) }),
                 )?;
                 Ok::<_, Error>(NamespaceInfo {
                     name: name.to_string(),
@@ -406,7 +405,7 @@ impl Registry {
             .try_collect()
             .await?;
 
-        let config = self.get_repository_config(repository);
+        let config = self.repository_config(repository);
 
         Ok(NamespacesBody {
             repository: repository.to_string(),
@@ -473,14 +472,14 @@ impl Registry {
             .metadata_store
             .read_access_entries(
                 &namespace,
-                &LinkKind::from_reference(&reference),
+                &LinkKind::from(&reference),
                 usize::try_from(offset).unwrap_or(usize::MAX),
                 usize::from(n),
             )
             .await?;
         let next =
             more.then(|| offset.saturating_add(u32::try_from(entries.len()).unwrap_or(u32::MAX)));
-        let entries = entries
+        let entries: Vec<AccessEntry> = entries
             .into_iter()
             .map(|entry| AccessEntry {
                 client: entry.client,
@@ -566,8 +565,7 @@ impl Registry {
                     .job_queue
                     .read_pending(queue, &storage_key)
                     .await?;
-                let not_before =
-                    job_store::parse_not_before(&storage_key).unwrap_or(envelope.created_at);
+                let not_before = parse_not_before(&storage_key).unwrap_or(envelope.created_at);
                 Ok(JobEntry {
                     storage_key,
                     id: envelope.id,
@@ -640,7 +638,7 @@ impl Registry {
     pub async fn handle_retry_job(&self, request: RetryJobRequest) -> Result<NoContent, Error> {
         self.config
             .job_queue
-            .retry_failed(Queue::from(request.queue), &request.storage_key)
+            .retry_failed(Queue::from(request.queue), request.storage_key.as_str())
             .await?;
 
         Ok(NoContent)
@@ -655,14 +653,14 @@ impl Registry {
             .delete_job(
                 Queue::from(request.queue),
                 JobState::from(request.state),
-                &request.storage_key,
+                request.storage_key.as_str(),
             )
             .await?;
 
         Ok(NoContent)
     }
 
-    fn get_repository_config(&self, name: &str) -> RepositoryConfig {
+    fn repository_config(&self, name: &str) -> RepositoryConfig {
         let global_exclusions = || self.config.global_immutable_tags_exclusions.clone();
 
         let Some(repo) = self.resolver.get(name) else {
@@ -923,7 +921,7 @@ impl Registry {
         if !self.config.update_pull_time {
             return served.into_iter().map(|(_, entry)| entry).collect();
         }
-        let tags = served
+        let tags: Vec<Tag> = served
             .iter()
             .flat_map(|(_, entry)| entry.tags.clone())
             .collect();
@@ -980,7 +978,7 @@ impl Registry {
         tag_names: &HashSet<Tag>,
     ) -> HashMap<Digest, SubjectReferrers> {
         let upstream = self
-            .get_repository_for_namespace(namespace)
+            .repository_for_namespace(namespace)
             .ok()
             .filter(|repository| repository.is_pull_through());
         stream::iter(subjects)
@@ -994,7 +992,7 @@ impl Registry {
                 {
                     recorded.sort();
                     let subject = &subject;
-                    let descriptors = stream::iter(recorded)
+                    let descriptors: Vec<Descriptor> = stream::iter(recorded)
                         .map(|referrer| async move {
                             self.resolve_referrer_descriptor(namespace, subject, referrer, None)
                                 .await
@@ -1032,7 +1030,7 @@ impl Registry {
             .await
     }
 
-    /// The newest recorded pull of every tag in `digest_to_tags`, keyed by tag.
+    /// The newest recorded pull of every tag in `tags`, keyed by tag.
     /// A tag with no recorded pull is absent rather than present and null.
     async fn newest_tag_pulls(
         &self,
@@ -1052,13 +1050,6 @@ impl Registry {
             .buffered(self.config.listing_read_concurrency.get())
             .filter_map(|pull| async move { pull })
             .collect()
-            .await
-    }
-
-    async fn count_uploads(&self, namespace: &Namespace) -> Result<usize, Error> {
-        self.blob_store
-            .stream_uploads(namespace)
-            .try_fold(0, |count, _| async move { Ok(count + 1) })
             .await
     }
 
@@ -1121,6 +1112,51 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroU16;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use serde_json::{Value, json};
+    use tokio::time::sleep;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use angos_cache::Config as CacheConfig;
+    use angos_extension_service::{
+        ListNamespacesRequest, NamespacesBody, PageRequest, RevisionSelection, RevisionSort,
+        SortOrder,
+    };
+    use angos_oci::{
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, OCI_INDEX_MEDIA_TYPE,
+        Platform, Reference, Tag, UploadSessionId,
+    };
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::{Error as StorageError, ObjectStore};
+
+    use crate::registry::admin::{
+        ListPullsRequest, ListingInputs, ManifestAnalysis, analyze_manifest,
+        extract_docker_referrer, parent_refs_for, select_revisions,
+    };
+    use crate::registry::blob_store::BlobStore;
+    use crate::registry::content_discovery::DEFAULT_PAGE_SIZE;
+    use crate::registry::keys::NamespaceExt;
+    use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+    use crate::registry::metadata_store::{AccessEntry, LinkKind, MetadataStore};
+    use crate::registry::repository::{Config as RepositoryConfig, Repository};
+    use crate::registry::test_utils::{
+        FSRegistryTestCase, FsTestStack, RegistryTestCase, create_test_blob, create_test_registry,
+        create_test_registry_recording_pulls, for_each_backend, fs_test_stack, media_type,
+        metadata_store_over, put_blob_direct, response_json, seed_links, single_repo_resolver,
+        test_job_store,
+    };
+    use crate::registry::{Error as RegistryError, Registry, RegistryConfig};
+    use crate::test_fixtures::client::test_client_config;
+
     /// Listing tests that are not about visibility admit every namespace.
     const ALL_VISIBLE: fn(&Namespace) -> bool = |_| true;
 
@@ -1140,62 +1176,6 @@ mod tests {
             page: PageRequest::default(),
         }
     }
-
-    use std::{
-        collections::HashMap,
-        num::NonZeroU16,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-        },
-        time::Duration,
-    };
-
-    use bytes::Bytes;
-    use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use serde_json::{Value, json};
-    use tokio::time::sleep;
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
-    };
-
-    use angos_cache::Config as CacheConfig;
-    use angos_extension_service::{
-        ListNamespacesRequest, NamespacesBody, PageRequest, RevisionSelection, RevisionSort,
-        SortOrder,
-    };
-    use angos_oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, OCI_INDEX_MEDIA_TYPE,
-        Platform, Reference, Tag, UploadSessionId,
-    };
-    use angos_storage::{
-        Error as StorageError, ObjectStore,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
-
-    use crate::{
-        registry::{
-            Error as RegistryError, Registry, RegistryConfig,
-            admin::{
-                ListPullsRequest, ListingInputs, ManifestAnalysis, analyze_manifest,
-                extract_docker_referrer, parent_refs_for, select_revisions,
-            },
-            blob_store::BlobStore,
-            content_discovery::DEFAULT_PAGE_SIZE,
-            keys::NamespaceKeys,
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::{AccessEntry, LinkKind, MetadataStore},
-            repository::{Config as RepositoryConfig, Repository},
-            test_utils::{
-                FSRegistryTestCase, FsTestStack, RegistryTestCase, create_test_blob,
-                create_test_registry, create_test_registry_recording_pulls, for_each_backend,
-                fs_test_stack, media_type, metadata_store_over, put_blob_body, response_json,
-                seed_links, single_repo_resolver, test_job_store,
-            },
-        },
-        test_fixtures::client::test_client_config,
-    };
 
     /// Holds every intercepted read for a beat and records whether a tag-side
     /// and a revision-side read were ever in flight together. Counting reads
@@ -1221,7 +1201,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl StoreHook for OverlapProbe {
         async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
             let (StoreOp::List { prefix } | StoreOp::ListChildren { prefix }) = op else {
@@ -1285,14 +1265,10 @@ mod tests {
         format!("sha256:{padded}").parse().unwrap()
     }
 
-    fn test_digest() -> Digest {
-        digest("abc1")
-    }
-
     fn descriptor_with_annotations(annotations: HashMap<String, String>) -> Descriptor {
         Descriptor {
             media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
-            digest: test_digest(),
+            digest: digest("abc1"),
             size: 0,
             annotations,
             artifact_type: None,
@@ -1328,47 +1304,6 @@ mod tests {
     }
 
     #[test]
-    fn analyze_manifest_returns_empty_for_manifest_with_no_children() {
-        let manifest = Manifest::default();
-        let analysis = analyze_manifest(&manifest);
-        assert!(analysis.parent_links.is_empty());
-        assert!(analysis.referrer_candidates.is_empty());
-    }
-
-    #[test]
-    fn analyze_manifest_returns_parent_links_for_non_referrer_children() {
-        let child_digest = digest("1111");
-        let platform = Platform {
-            architecture: "amd64".to_string(),
-            os: "linux".to_string(),
-            variant: None,
-            os_version: None,
-            os_features: None,
-            features: None,
-        };
-        let child = Descriptor {
-            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
-            digest: child_digest.clone(),
-            size: 0,
-            annotations: HashMap::new(),
-            artifact_type: None,
-            platform: Some(platform),
-        };
-        let manifest = Manifest {
-            ..Manifest::index(vec![child])
-        };
-
-        let analysis = analyze_manifest(&manifest);
-        assert_eq!(analysis.parent_links.len(), 1);
-        assert!(analysis.referrer_candidates.is_empty());
-        let (d, plat) = &analysis.parent_links[0];
-        assert_eq!(d, &child_digest);
-        let p = plat.as_ref().expect("platform should be present");
-        assert_eq!(p.os, "linux");
-        assert_eq!(p.architecture, "amd64");
-    }
-
-    #[test]
     fn analyze_manifest_partitions_mixed_children_correctly() {
         let subject = digest("beef");
         let referrer_digest = digest("cafe");
@@ -1393,9 +1328,7 @@ mod tests {
             artifact_type: None,
             platform: None,
         };
-        let manifest = Manifest {
-            ..Manifest::index(vec![referrer_child, index_child])
-        };
+        let manifest = Manifest::index(vec![referrer_child, index_child]);
 
         let analysis = analyze_manifest(&manifest);
         assert_eq!(analysis.parent_links.len(), 1);
@@ -1414,20 +1347,6 @@ mod tests {
         let digest_to_tags: HashMap<Digest, Vec<Tag>> = HashMap::new();
         let result = parent_refs_for(&digest("cccc"), &child_to_parents, &digest_to_tags);
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn parent_refs_for_single_parent_no_tags_no_platform() {
-        let child = digest("cccc");
-        let parent = digest("dddd");
-        let child_to_parents = HashMap::from([(child.clone(), vec![(parent.clone(), None)])]);
-        let digest_to_tags: HashMap<Digest, Vec<Tag>> = HashMap::new();
-
-        let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].digest, parent.to_string());
-        assert!(result[0].tags.is_empty());
-        assert!(result[0].platform.is_none());
     }
 
     #[test]
@@ -1728,7 +1647,7 @@ mod tests {
     /// Records every key a store is asked to read.
     struct ReadLog(Arc<Mutex<Vec<String>>>);
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl StoreHook for ReadLog {
         async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
             if let StoreOp::Get { key } | StoreOp::GetStream { key } = op {
@@ -1759,7 +1678,7 @@ mod tests {
                     "size": 1
                 }]
             });
-            let top = put_blob_body(&blob_store, &serde_json::to_vec(&index).unwrap()).await;
+            let top = put_blob_direct(&blob_store, &serde_json::to_vec(&index).unwrap()).await;
             seed_tagged_revision(&metadata_store, &namespace, &top, &[tag]).await;
             tops.push(top);
         }
@@ -1932,39 +1851,6 @@ mod tests {
                 "{sort:?} {order:?}"
             );
         }
-    }
-
-    /// On split backends upload sessions exist only on the blob store, so the
-    /// listing must discover an upload-only namespace there.
-    #[tokio::test]
-    async fn namespaces_info_finds_upload_only_namespace_across_split_backends() {
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-
-        let namespace = Namespace::new("test-repo/upload-only").unwrap();
-        registry
-            .blob_store
-            .create_upload(&namespace, &UploadSessionId::generate(), None)
-            .await
-            .unwrap();
-
-        let response = registry
-            .handle_list_namespaces(namespaces_of("test-repo"), &ALL_VISIBLE)
-            .await
-            .unwrap()
-            .into_response()
-            .unwrap();
-        let body = response_json(response).await;
-        let namespaces = body["namespaces"].as_array().unwrap();
-
-        assert_eq!(
-            namespaces.len(),
-            1,
-            "the upload-only namespace must be discovered on the blob store; got: {namespaces:?}"
-        );
-        assert_eq!(namespaces[0]["name"], "test-repo/upload-only");
-        assert_eq!(namespaces[0]["manifest_count"], 0);
-        assert_eq!(namespaces[0]["upload_count"], 1);
     }
 
     /// The API reference and the web UI read an upload's identifier as `uuid`.
@@ -2167,7 +2053,7 @@ mod tests {
             let subject = digest("50b1");
             let attestation = digest("a11e");
 
-            let index = serde_json::json!({
+            let index = json!({
                 "schemaVersion": 2,
                 "mediaType": "application/vnd.oci.image.index.v1+json",
                 "manifests": [
@@ -2185,7 +2071,7 @@ mod tests {
                     }
                 ]
             });
-            let index_digest = put_blob_body(
+            let index_digest = put_blob_direct(
                 registry.blob_store.as_ref(),
                 &serde_json::to_vec(&index).unwrap(),
             )

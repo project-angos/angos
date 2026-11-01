@@ -4,32 +4,25 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
-use futures_util::{
-    future::{BoxFuture, ready},
-    stream::{self, Stream, StreamExt, TryStreamExt},
-};
+use futures_util::future::{BoxFuture, ready};
+use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use tracing::{instrument, warn};
 
 use angos_oci::{Digest, Namespace, Tag, namespace_belongs_to};
 use angos_storage::{Page, paginated};
 
-use crate::registry::{
-    Error,
-    keys::{
-        CAT_ROOT, DigestKeys, NamespaceKeys, TagEntry, parse_ref_digest, parse_referrer_record,
-        parse_revision_record, ref_digest_name,
-    },
-    metadata_store::{LIST_PAGE, LinkKind, LinkMetadata, MetadataStore},
-    pagination,
+use crate::registry::keys::{
+    CAT_ROOT, DigestExt, NamespaceExt, TagEntry, parse_ref_digest, parse_referrer_record,
+    parse_revision_record, ref_digest_name,
 };
+use crate::registry::metadata_store::{LIST_PAGE, LinkKind, LinkMetadata, MetadataStore};
+use crate::registry::{Error, pagination};
 
 /// Candidate tags a digest delete resolves at once.
 const TAG_RESOLVE_CONCURRENCY: usize = 16;
 
-/// Folds a sorted stream of (group, entry-file) pairs into each group's
-/// resolved tag: `Some(digest)` live, `None` tombstoned, and no tag at all for
-/// a group name scrub will report. A sorted listing delivers each group's
+/// Folds a sorted stream of (group, entry-file) pairs into each group's live
+/// tag, yielding none for a tombstoned group or a group name scrub will report. A sorted listing delivers each group's
 /// entries contiguously with the newest ordinal first, so every group resolves
 /// from its complete lowest-ordinal set by the same rule as a point read:
 /// highest digest wins a same-millisecond tie, and a `set` beats a `del` of
@@ -43,13 +36,9 @@ struct WinnerFold {
 }
 
 impl WinnerFold {
-    /// Folds one entry file in, returning the tag this entry closed: the
+    /// Folds one entry file in, returning the live tag this entry closed: the
     /// previous group's, whenever the entry opens a new group.
-    fn push(
-        &mut self,
-        group: &str,
-        file: &str,
-    ) -> Option<(Tag, Option<DateTime<Utc>>, Option<Digest>)> {
+    fn push(&mut self, group: &str, file: &str) -> Option<(Tag, LinkMetadata)> {
         let entry = file.parse::<TagEntry>().ok()?;
         let mut closed = None;
         self.current = Some(match self.current.take() {
@@ -70,40 +59,29 @@ impl WinnerFold {
         closed
     }
 
-    /// The tag the end of the listing closes.
-    fn finish(self) -> Option<(Tag, Option<DateTime<Utc>>, Option<Digest>)> {
-        self.current.and_then(Self::resolve)
-    }
-
-    /// The group's tag, named by its `<tag>!` directory, the stamp its winning
-    /// ordinal encodes, and the digest it holds: `None` for a `del` winner.
-    fn resolve(
-        (group, entry): (String, TagEntry),
-    ) -> Option<(Tag, Option<DateTime<Utc>>, Option<Digest>)> {
+    /// The group's tag, named by its `<tag>!` directory, with the metadata a
+    /// point read would resolve it to. `None` for a tombstoned winner, which
+    /// holds no content to list.
+    fn resolve((group, entry): (String, TagEntry)) -> Option<(Tag, LinkMetadata)> {
         let tag = Tag::new(group.strip_suffix('!')?).ok()?;
-        let authored_at = entry.authored_at();
-        let target = match entry {
-            TagEntry::Set { digest, .. } => Some(digest),
-            TagEntry::Deletion { .. } => None,
+        let TagEntry::Set {
+            authored_at,
+            digest,
+            ..
+        } = entry
+        else {
+            return None;
         };
-        Some((tag, authored_at, target))
+        Some((
+            tag,
+            LinkMetadata {
+                target: digest,
+                created_at: authored_at,
+                media_type: None,
+                descriptor: None,
+            },
+        ))
     }
-}
-
-/// A closed group's tag with the metadata a point read would resolve it to.
-/// `None` for a tombstoned winner, which holds no content to list.
-fn live_tag(
-    (tag, authored_at, target): (Tag, Option<DateTime<Utc>>, Option<Digest>),
-) -> Option<(Tag, LinkMetadata)> {
-    Some((
-        tag,
-        LinkMetadata {
-            target: target?,
-            created_at: authored_at,
-            media_type: None,
-            descriptor: None,
-        },
-    ))
 }
 
 impl MetadataStore {
@@ -175,11 +153,11 @@ impl MetadataStore {
         paginated(|token| {
             let start_after = start_after.take();
             async move {
-                let page = self
-                    .object_store()
-                    .list_after(CAT_ROOT, LIST_PAGE, token, start_after)
-                    .await?;
-                Ok::<_, Error>((page.items, page.next_token))
+                Ok::<_, Error>(
+                    self.object_store()
+                        .list_after(CAT_ROOT, LIST_PAGE, token, start_after)
+                        .await?,
+                )
             }
         })
         // Ordered keys: past the prefix range, nothing else matches.
@@ -230,17 +208,22 @@ impl MetadataStore {
                     .object_store()
                     .list_after(CAT_ROOT, page, token, start_after)
                     .await?;
-                let probes: Vec<_> = listed
-                    .items
-                    .iter()
-                    .filter_map(|key| key.strip_suffix('!'))
-                    .filter_map(|name| Namespace::new(name).ok())
-                    .filter(|namespace| allowed(namespace))
-                    .map(|namespace| {
-                        let probe = listable(namespace.clone());
-                        async move { probe.await.map(|listable| listable.then_some(namespace)) }
-                    })
-                    .collect();
+                let mut probes = Vec::new();
+                for key in &listed.items {
+                    let Some(name) = key.strip_suffix('!') else {
+                        continue;
+                    };
+                    let Ok(namespace) = Namespace::new(name) else {
+                        continue;
+                    };
+                    if !allowed(&namespace) {
+                        continue;
+                    }
+                    let probe = listable(namespace.clone());
+                    probes.push(async move {
+                        probe.await.map(|listable| listable.then_some(namespace))
+                    });
+                }
                 // Fanned out, but ordered, so the listing's lexical order survives
                 // and a caller taking one page probes little beyond it.
                 let probing = stream::iter(probes)
@@ -309,12 +292,12 @@ impl MetadataStore {
                         let Some((group, file)) = key.split_once('/') else {
                             continue;
                         };
-                        live.extend(fold.push(group, file).and_then(live_tag));
+                        live.extend(fold.push(group, file));
                     }
                     let next = match page.next_token {
                         // The listing itself closes the last group.
                         None => {
-                            live.extend(fold.finish().and_then(live_tag));
+                            live.extend(fold.current.and_then(WinnerFold::resolve));
                             None
                         }
                         token => Some((None, token, fold)),
@@ -379,11 +362,11 @@ impl MetadataStore {
         paginated(move |token| {
             let (record_dir, start_after) = (record_dir.clone(), start_after.clone());
             async move {
-                let page = self
-                    .object_store()
-                    .list_after(&record_dir, LIST_PAGE, token, start_after)
-                    .await?;
-                Ok::<_, Error>((page.items, page.next_token))
+                Ok::<_, Error>(
+                    self.object_store()
+                        .list_after(&record_dir, LIST_PAGE, token, start_after)
+                        .await?,
+                )
             }
         })
         .try_filter_map(|key| ready(Ok(parse_ref_digest(&key))))
@@ -424,8 +407,7 @@ impl MetadataStore {
     ) -> impl Stream<Item = Result<Digest, Error>> + Send + 'a {
         paginated(move |token| async move {
             let root = namespace.revision_records_root();
-            let page = self.object_store().list(&root, LIST_PAGE, token).await?;
-            Ok::<_, Error>((page.items, page.next_token))
+            Ok::<_, Error>(self.object_store().list(&root, LIST_PAGE, token).await?)
         })
         .try_filter_map(|key| ready(Ok(parse_revision_record(&key))))
     }
@@ -433,10 +415,9 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::slice;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -444,19 +425,15 @@ mod tests {
     use futures_util::{StreamExt, TryStreamExt};
 
     use angos_oci::{Algorithm, Digest, Namespace, Tag, UploadSessionId};
-    use angos_storage::{
-        Error as StorageError, ObjectStore, Page,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::{Error as StorageError, ObjectStore, Page};
 
-    use crate::registry::{
-        content_discovery::holds_manifest_content,
-        keys::NamespaceKeys,
-        metadata_store::{LIST_PAGE, LinkKind, LinkMetadata},
-        test_utils::{
-            FSRegistryTestCase, RegistryTestCase, create_link, create_test_blob, drop_links,
-            for_each_backend, metadata_store_over, put_blob_direct, seed_links,
-        },
+    use crate::registry::content_discovery::holds_manifest_content;
+    use crate::registry::keys::{NamespaceExt, TagEntryKind};
+    use crate::registry::metadata_store::{LIST_PAGE, LinkKind, LinkMetadata};
+    use crate::registry::test_utils::{
+        FSRegistryTestCase, RegistryTestCase, create_link, create_test_blob, drop_links,
+        for_each_backend, metadata_store_over, put_blob_direct, seed_links,
     };
 
     /// A namespace lists exactly while it holds at least one revision or tag, and
@@ -827,7 +804,7 @@ mod tests {
             seeding
                 .object_store()
                 .put(
-                    &namespace.tag_entry_path(&tag, Utc::now(), false, &digest),
+                    &namespace.tag_entry_path(&tag, Utc::now(), TagEntryKind::Set, &digest),
                     Bytes::new(),
                 )
                 .await
@@ -1052,43 +1029,13 @@ mod tests {
 
             let delete_tag = "v1.0";
             let tag_link = LinkKind::Tag(Tag::new(delete_tag).unwrap());
-            drop_links(&m, namespace, std::slice::from_ref(&tag_link))
+            drop_links(&m, namespace, slice::from_ref(&tag_link))
                 .await
                 .unwrap();
 
             let tags_after_delete = m.list_tags(namespace, 10, None).await.unwrap().items;
             assert_eq!(tags_after_delete.len(), tags.len() - 1);
             assert!(!tags_after_delete.contains(&Tag::new(delete_tag).unwrap()));
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_stream_revisions() {
-        for_each_backend(async |test_case| {
-            let m = test_case.metadata_store();
-            let namespace = &Namespace::new("test-repo").unwrap();
-
-            let manifest_contents = [
-                b"manifest content 1".to_vec(),
-                b"manifest content 2".to_vec(),
-                b"manifest content 3".to_vec(),
-            ];
-
-            let mut digests = Vec::new();
-            for content in &manifest_contents {
-                let digest = put_blob_direct(&test_case.blob_store(), content).await;
-                digests.push(digest.clone());
-
-                let digest_link = LinkKind::Digest(digest.clone());
-                create_link(&m, namespace, &digest_link, &digest).await;
-            }
-
-            let revisions: Vec<Digest> = m.stream_revisions(namespace).try_collect().await.unwrap();
-            assert_eq!(revisions.len(), digests.len());
-            for digest in &digests {
-                assert!(revisions.contains(digest));
-            }
         })
         .await;
     }

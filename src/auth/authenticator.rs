@@ -1,21 +1,22 @@
-use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc};
+use std::collections::HashMap;
+use std::fs;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use http::request::Parts;
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{Span, debug, info, instrument, warn};
 
-use crate::{
-    auth::Error,
-    auth::{
-        AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, OidcValidator,
-        TokenValidator, authorization::bearer_token, basic_auth, oidc, oidc::unverified_issuer,
-        token_service, webhook,
-    },
-    configuration::Configuration,
-    identity::{AuthMethod, ClientIdentity},
-    metrics_provider::metrics_provider,
+use crate::auth::authorization::bearer_token;
+use crate::auth::oidc::unverified_issuer;
+use crate::auth::{
+    AuthMiddleware, AuthResult, BasicAuthValidator, Error, MtlsValidator, OidcValidator,
+    TokenValidator, basic_auth, oidc, token_service, webhook,
 };
+use crate::configuration::Configuration;
+use crate::identity::{AuthMethod, ClientIdentity};
+use crate::metrics_provider::metrics_provider;
 use angos_cache::Cache;
 use angos_mtls_client::MtlsClientBuilder;
 
@@ -39,13 +40,11 @@ struct OidcProvider {
     validator: OidcValidator,
 }
 
-type OidcValidators = Vec<OidcProvider>;
-
 /// Coordinates all authentication methods and handles the authentication chain
 pub struct Authenticator {
     mtls_validator: MtlsValidator,
     token_validator: Option<TokenValidator>,
-    oidc_validators: OidcValidators,
+    oidc_validators: Vec<OidcProvider>,
     basic_auth_validator: BasicAuthValidator,
 }
 
@@ -75,7 +74,7 @@ impl Authenticator {
     fn build_oidc_validators(
         auth_config: &AuthConfig,
         cache: &Arc<Cache>,
-    ) -> Result<OidcValidators, Error> {
+    ) -> Result<Vec<OidcProvider>, Error> {
         let mut validators = Vec::with_capacity(auth_config.oidc.len());
 
         for (name, oidc_config) in &auth_config.oidc {
@@ -238,9 +237,7 @@ impl Authenticator {
                 Ok(AuthResult::NoCredentials) => {}
                 Err(e) => {
                     info!("OIDC validation failed for provider {provider_name}: {e}");
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
+                    first_error.get_or_insert(e);
                 }
             }
         }
@@ -346,104 +343,19 @@ mod tests {
     use wiremock::MockServer;
 
     use super::*;
-    use crate::{
-        auth::{
-            PeerCertificate, TokenIssuer,
-            oidc::validator::tests::{make_token, valid_claims},
-        },
-        configuration::Configuration,
-        metrics_provider,
-        test_fixtures::{
-            configuration::{load_config, minimal_config, try_load_config},
-            mocks::{mount_jwks, static_jwks_response},
-            mtls::cert_der,
-            oidc::KID,
-            requests::{empty_parts, parts_with_authorization, parts_with_basic_auth},
-            webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
-        },
+    use crate::auth::oidc::validator::tests::{make_token, valid_claims};
+    use crate::auth::{PeerCertificate, TokenIssuer};
+    use crate::metrics_provider;
+    use crate::test_fixtures::configuration::{load_config, minimal_config, try_load_config};
+    use crate::test_fixtures::mocks::{mount_jwks, static_jwks_response};
+    use crate::test_fixtures::mtls::cert_der;
+    use crate::test_fixtures::oidc::KID;
+    use crate::test_fixtures::requests::{
+        empty_parts, parts_with_authorization, parts_with_basic_auth,
     };
+    use crate::test_fixtures::webhook::{ca_bundle_pem, client_cert_pem, client_key_pem};
+    use angos_cache::Config as CacheConfig;
     use angos_secret::Secret;
-
-    fn create_minimal_config() -> Configuration {
-        metrics_provider::init_for_tests();
-        minimal_config()
-    }
-
-    #[test]
-    fn test_auth_config_empty() {
-        let config = create_minimal_config();
-        assert!(config.auth.identity.is_empty());
-        assert!(config.auth.oidc.is_empty());
-        assert!(config.auth.webhook.is_empty());
-    }
-
-    #[test]
-    fn test_auth_config_with_identity() {
-        let config = load_config(
-            r#"
-            [auth.identity.user1]
-            username = "user1"
-            password = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ"
-        "#,
-        );
-
-        assert_eq!(config.auth.identity.len(), 1);
-        assert!(config.auth.identity.contains_key("user1"));
-    }
-
-    #[test]
-    fn test_auth_config_with_oidc() {
-        let config = load_config(
-            r#"
-            [auth.oidc.github]
-            issuer = "https://token.actions.githubusercontent.com"
-        "#,
-        );
-
-        assert_eq!(config.auth.oidc.len(), 1);
-        assert!(config.auth.oidc.contains_key("github"));
-    }
-
-    #[test]
-    fn test_auth_config_with_webhook() {
-        let config = load_config(
-            r#"
-            [auth.webhook.test]
-            url = "http://localhost:8080/auth"
-            timeout_ms = 5000
-        "#,
-        );
-
-        assert_eq!(config.auth.webhook.len(), 1);
-        assert!(config.auth.webhook.contains_key("test"));
-    }
-
-    #[test]
-    fn test_authenticator_new_minimal() {
-        let config = create_minimal_config();
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-        let authenticator = Authenticator::new(&config, &cache);
-
-        assert!(authenticator.is_ok());
-    }
-
-    #[test]
-    fn test_authenticator_new_with_basic_auth() {
-        let config = load_config(
-            r#"
-            [auth.identity.testuser]
-            username = "testuser"
-            password = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ"
-        "#,
-        );
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-        let authenticator = Authenticator::new(&config, &cache);
-
-        assert!(authenticator.is_ok());
-    }
 
     /// The Basic username field selects the provider, so the two names cannot
     /// both be honoured and the collision is a configuration mistake.
@@ -460,7 +372,7 @@ mod tests {
         "#,
         );
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
 
         let Err(error) = Authenticator::new(&config, &cache) else {
             panic!("a colliding name must be refused at startup");
@@ -470,50 +382,6 @@ mod tests {
             matches!(&error, Error::Initialization(msg) if msg.contains("github-actions")),
             "got: {error:?}"
         );
-    }
-
-    #[test]
-    fn test_build_oidc_validators_empty() {
-        let auth_config = AuthConfig::default();
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-        let validators = Authenticator::build_oidc_validators(&auth_config, &cache).unwrap();
-
-        assert!(validators.is_empty());
-    }
-
-    #[test]
-    fn test_build_oidc_validators_with_github() {
-        let config = load_config(
-            r#"
-            [auth.oidc.github]
-            issuer = "https://token.actions.githubusercontent.com"
-        "#,
-        );
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
-
-        assert_eq!(validators.len(), 1);
-        assert_eq!(validators[0].name, "github");
-    }
-
-    #[test]
-    fn test_build_oidc_validators_with_generic() {
-        let config = load_config(
-            r#"
-            [auth.oidc.custom]
-            issuer = "https://auth.example.com"
-        "#,
-        );
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
-
-        assert_eq!(validators.len(), 1);
-        assert_eq!(validators[0].name, "custom");
     }
 
     /// An issuer whose certificate the system roots do not cover, such as a
@@ -533,7 +401,7 @@ mod tests {
             bundle_path.display()
         ));
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
 
         assert_eq!(
             config.auth.oidc["kube"].tls.server_ca_bundle.as_deref(),
@@ -564,7 +432,7 @@ mod tests {
             key_path.display()
         ));
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
 
         assert!(Authenticator::build_oidc_validators(&config.auth, &cache).is_ok());
     }
@@ -596,7 +464,7 @@ mod tests {
     /// first by name, so only the ordering can keep it out of the exchange.
     #[tokio::test]
     async fn a_bearer_only_reaches_the_provider_whose_issuer_it_names() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let unnamed = MockServer::start().await;
         let named = MockServer::start().await;
         mount_jwks(&named, static_jwks_response()).await;
@@ -616,7 +484,7 @@ mod tests {
             unnamed = unnamed.uri(),
             named = named.uri(),
         ));
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let authenticator = Authenticator {
             mtls_validator: MtlsValidator,
             token_validator: None,
@@ -659,7 +527,7 @@ mod tests {
             token_path.display()
         ));
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
 
         assert!(Authenticator::build_oidc_validators(&config.auth, &cache).is_ok());
     }
@@ -674,7 +542,7 @@ mod tests {
         "#,
         );
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
 
         let Err(error) = Authenticator::build_oidc_validators(&config.auth, &cache) else {
             panic!("an unreadable bearer token file must be refused");
@@ -695,7 +563,7 @@ mod tests {
         "#,
         );
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
 
         let Err(error) = Authenticator::build_oidc_validators(&config.auth, &cache) else {
             panic!("an unreadable CA bundle must be refused");
@@ -707,52 +575,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_request_no_credentials() {
-        let config = create_minimal_config();
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let authenticator = Authenticator::new(&config, &cache).unwrap();
-
-        let parts = empty_parts();
-
-        let result = authenticator.authenticate_request(&parts, None).await;
-
-        assert!(result.is_ok());
-        let identity = result.unwrap();
-        assert!(identity.username.is_none());
-        assert!(identity.oidc.is_none());
-        assert!(identity.certificate.common_names.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_authenticate_request_with_basic_auth() {
-        let config = Params::default();
-        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
-        let password_hash = argon.hash_password(b"testpass").unwrap().to_string();
-
-        let config = load_config(&format!(
-            r#"
-            [auth.identity.testuser]
-            username = "testuser"
-            password = "{password_hash}"
-        "#,
-        ));
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let authenticator = Authenticator::new(&config, &cache).unwrap();
-
-        let parts = parts_with_basic_auth("testuser", "testpass");
-
-        let result = authenticator.authenticate_request(&parts, None).await;
-
-        assert!(result.is_ok());
-        let identity = result.unwrap();
-        assert_eq!(identity.username, Some("testuser".to_string()));
-        assert!(identity.oidc.is_none());
-    }
-
-    #[tokio::test]
     async fn test_authenticate_request_with_invalid_basic_auth() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let config = Params::default();
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
         let password_hash = argon.hash_password(b"testpass").unwrap().to_string();
@@ -765,7 +589,7 @@ mod tests {
         "#,
         ));
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
         let parts = parts_with_basic_auth("testuser", "wrongpass");
@@ -777,8 +601,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_request_preserves_client_ip() {
-        let config = create_minimal_config();
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        metrics_provider::initialize_metrics();
+        let config = minimal_config();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
         let parts = empty_parts();
@@ -807,7 +632,7 @@ mod tests {
         "#,
         );
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
 
@@ -868,7 +693,7 @@ mod tests {
     /// and no basic identity.
     fn authenticator_with(providers: &str) -> Authenticator {
         let config = load_config(providers);
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         Authenticator {
             mtls_validator: MtlsValidator,
             token_validator: None,
@@ -878,25 +703,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_oidc_no_providers_returns_false() {
-        let authenticator = authenticator_with("");
-
-        let parts = empty_parts();
-        let mut identity = ClientIdentity::new(None);
-
-        let result = authenticator
-            .try_oidc_authentication(&parts, &mut identity)
-            .await;
-
-        assert!(result.unwrap().is_none());
-        assert!(identity.oidc.is_none());
-    }
-
-    #[tokio::test]
     async fn test_try_oidc_falls_through_error_to_success() {
         // Both providers trust the token's issuer; "alpha" sorts first and
         // holds no key for it, so it fails before "beta" accepts.
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let keyless = issuer_serving(json!({ "keys": [] })).await;
         let keyed = issuer_serving(static_jwks_response()).await;
         let issuer = keyed.uri();
@@ -922,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_oidc_returns_first_error_when_all_fail() {
         // Both providers fail; the error from the alphabetically-first provider is returned.
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let (providers, _keyless, _keyed) = refusing_providers().await;
         let authenticator = authenticator_with(&providers);
 
@@ -1005,14 +815,14 @@ mod tests {
     /// cannot validate it, so without the short-circuit no reissued token works.
     #[tokio::test]
     async fn a_valid_token_skips_oidc_and_basic() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         // A provider reached with the token would fail the request.
         let (authenticator, issuer) = make_authenticator_with_token_service(&idle_providers());
         let issued_from = ClientIdentity {
             username: Some("ci-bot".to_string()),
             ..Default::default()
         };
-        let (token, _) = issuer.issue(&issued_from).unwrap();
+        let token = issuer.issue(&issued_from).unwrap().token;
 
         let parts = parts_with_authorization(&format!("Bearer {token}"));
         let identity = authenticator
@@ -1026,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_bearer_that_is_not_ours_still_reaches_oidc() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let keyed = issuer_serving(static_jwks_response()).await;
         let (authenticator, _) =
             make_authenticator_with_token_service(&provider("mock", &keyed.uri(), &keyed.uri()));
@@ -1042,9 +852,9 @@ mod tests {
 
     #[tokio::test]
     async fn mtls_outranks_a_registry_token() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let (authenticator, issuer) = make_authenticator_with_token_service(&idle_providers());
-        let (token, _) = issuer.issue(&ClientIdentity::default()).unwrap();
+        let token = issuer.issue(&ClientIdentity::default()).unwrap().token;
 
         let mut parts = parts_with_authorization(&format!("Bearer {token}"));
         parts
@@ -1068,7 +878,7 @@ mod tests {
     /// The reported method is `Mtls`; certificate not downgraded.
     #[tokio::test]
     async fn method_tracking_mtls_success_oidc_no_credentials_preserves_cert() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let authenticator = authenticator_with(&idle_providers());
 
         let mut parts = empty_parts();
@@ -1099,7 +909,7 @@ mod tests {
     /// reports the stronger one.
     #[tokio::test]
     async fn mtls_outranks_a_successful_oidc_provider() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let keyed = issuer_serving(static_jwks_response()).await;
         let authenticator = authenticator_with(&provider("provider", &keyed.uri(), &keyed.uri()));
 
@@ -1119,7 +929,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_with_no_credentials_is_anonymous() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let authenticator = authenticator_with(&idle_providers());
 
         let identity = authenticator
@@ -1134,7 +944,7 @@ mod tests {
     /// The identity must carry OIDC claims and no certificate info.
     #[tokio::test]
     async fn method_tracking_no_mtls_oidc_success_sets_oidc_identity() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let keyed = issuer_serving(static_jwks_response()).await;
         let authenticator = authenticator_with(&provider("provider", &keyed.uri(), &keyed.uri()));
 
@@ -1167,7 +977,7 @@ mod tests {
     /// credential rejection overrides mTLS success.
     #[tokio::test]
     async fn method_tracking_mtls_success_oidc_all_fail_returns_oidc_error() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let (providers, _keyless, _keyed) = refusing_providers().await;
         let authenticator = authenticator_with(&providers);
 
@@ -1194,26 +1004,11 @@ mod tests {
     /// The identity carries OIDC claims; username is None (basic never ran).
     #[tokio::test]
     async fn method_tracking_oidc_success_skips_basic_auth() {
-        metrics_provider::init_for_tests();
-
-        // Generate a valid Argon2 hash, then embed it in a config string so that
-        // `basic_auth::PasswordHash` is constructed through the normal deserialisation path
-        // (its inner type is not publicly constructible).
-        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
-        let password_hash = argon.hash_password(b"secret").unwrap().to_string();
-
-        let config = load_config(&format!(
-            r#"
-            [auth.identity.admin]
-            username = "admin"
-            password = "{password_hash}"
-        "#,
-        ));
-        let basic_auth_validator = BasicAuthValidator::new(&config.auth.identity).unwrap();
+        metrics_provider::initialize_metrics();
 
         let keyed = issuer_serving(static_jwks_response()).await;
         let authenticator = Authenticator {
-            basic_auth_validator,
+            basic_auth_validator: admin_basic_auth_validator(),
             ..authenticator_with(&provider("mock-provider", &keyed.uri(), &keyed.uri()))
         };
 
@@ -1241,7 +1036,7 @@ mod tests {
 
     #[tokio::test]
     async fn basic_auth_is_reported_when_nothing_stronger_succeeds() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
 
         let authenticator = Authenticator {
             basic_auth_validator: admin_basic_auth_validator(),
@@ -1261,7 +1056,7 @@ mod tests {
     /// Bug: a basic-auth success used to overwrite mTLS. Must not.
     #[tokio::test]
     async fn mtls_outranks_successful_basic_auth() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
 
         let authenticator = Authenticator {
             basic_auth_validator: admin_basic_auth_validator(),

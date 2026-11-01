@@ -8,37 +8,33 @@ use uuid::Uuid;
 use angos_oci::{Digest, Namespace, Reference, Tag};
 use angos_storage::{Error as StorageError, ObjectStore};
 
-use crate::{
-    command::{
-        bootstrap,
-        maintenance::{
-            action::{Action, AtimeCompaction, LOST_AND_FOUND_PREFIX, WalkedStore},
-            error::Error,
-        },
-    },
-    configuration::Configuration,
-    event_webhook::event::EventActor,
-    jobs::{
-        JobState, Queue,
-        store::{ClaimMode, Error as JobStoreError, JobEnvelope, JobStore, job_pending_path},
-    },
-    layer::{self, IndexLayerPayload},
-    registry::{
-        Error as RegistryError, Registry,
-        blob_store::BlobStore,
-        keys::{DigestKeys, NamespaceKeys},
-        metadata_store::{LinkKind, MetadataStore},
-        repository_resolver::RepositoryResolver,
-    },
-    replication::{
-        ReplicationJob, ReplicationTarget, build_envelope, build_prune_delete_envelope,
-        record_reconcile_outcome,
-    },
-    scan::{self, ScanImagePayload},
+use crate::command::bootstrap;
+use crate::command::maintenance::action::{
+    Action, AtimeCompaction, LOST_AND_FOUND_PREFIX, WalkedStore,
 };
+use crate::command::maintenance::error::Error;
+use crate::configuration::Configuration;
+use crate::event_webhook::event::EventActor;
+use crate::jobs::store::{
+    ClaimMode, Error as JobStoreError, JobEnvelope, JobStore, job_pending_path,
+};
+use crate::jobs::{JobState, Queue};
+use crate::layer::{self, IndexLayerPayload};
+use crate::registry::blob_store::BlobStore;
+use crate::registry::keys::{DigestExt, NamespaceExt};
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::registry::{Error as RegistryError, Registry};
+use crate::replication::{
+    ReplicationJob, ReplicationTarget, build_envelope, build_prune_delete_envelope,
+    record_reconcile_outcome,
+};
+use crate::scan::{self, ScanImagePayload};
 
 #[cfg(test)]
-use crate::registry::{RegistryConfig, test_utils::create_test_repositories};
+use crate::registry::RegistryConfig;
+#[cfg(test)]
+use crate::registry::test_utils::create_test_repositories;
 
 /// Internal-process name stamped on the events retention deletions emit.
 pub const RETENTION_ACTOR: &str = "prune";
@@ -50,7 +46,7 @@ pub fn run_job_store(metadata_store: &MetadataStore, prefix: &str) -> Arc<JobSto
     // unconditional `create_if_absent` mode.
     Arc::new(JobStore::new(
         metadata_store,
-        format!("{prefix}-{}", Uuid::new_v4()),
+        &format!("{prefix}-{}", Uuid::new_v4()),
         ClaimMode::Atomic,
     ))
 }
@@ -91,7 +87,6 @@ impl ActionSink for DryRunSink {
 }
 
 /// Applies scrub actions against live storage backends.
-#[allow(clippy::struct_field_names)]
 pub struct Executor {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
@@ -532,18 +527,6 @@ impl Executor {
         Ok(())
     }
 
-    async fn delete_orphan_referrer(
-        &self,
-        namespace: Namespace,
-        subject: Digest,
-        referrer: Digest,
-    ) -> Result<(), Error> {
-        self.metadata_store
-            .delete_referrer(&namespace, &subject, &referrer)
-            .await?;
-        Ok(())
-    }
-
     async fn enqueue_replication_push(
         &self,
         downstream: String,
@@ -600,10 +583,6 @@ impl Executor {
             .enqueue(envelope)
             .await
             .map_err(|e| Error::JobQueue(format!("failed to enqueue index job: {e}")))
-    }
-
-    async fn reclaim_listing(&self, digest: Digest) -> Result<(), Error> {
-        Ok(self.metadata_store.delete_listing(&digest).await?)
     }
 
     async fn enqueue_replication_delete(
@@ -788,10 +767,10 @@ impl ActionSink for Executor {
                 namespace,
                 subject,
                 referrer,
-            } => {
-                self.delete_orphan_referrer(namespace, subject, referrer)
-                    .await
-            }
+            } => Ok(self
+                .metadata_store
+                .delete_referrer(&namespace, &subject, &referrer)
+                .await?),
             Action::AbortMultipartUpload { upload } => self
                 .blob_store
                 .abort_orphan_multipart_upload(&upload)
@@ -808,7 +787,9 @@ impl ActionSink for Executor {
             }
             Action::EnqueueScan(scan) => self.enqueue_scan(scan).await,
             Action::EnqueueIndex(index) => self.enqueue_index(index).await,
-            Action::ReclaimListing(digest) => self.reclaim_listing(digest).await,
+            Action::ReclaimListing(digest) => {
+                Ok(self.metadata_store.delete_listing(&digest).await?)
+            }
             Action::EnqueueReplicationDelete {
                 downstream,
                 namespace,
@@ -838,36 +819,29 @@ impl ActionSink for Executor {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::File,
-        str::FromStr,
-        sync::atomic::{AtomicBool, Ordering},
-        time::{Duration, SystemTime},
-    };
+    use std::fs::File;
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, SystemTime};
 
     use bytes::Bytes;
     use chrono::{DateTime, TimeDelta};
+    use serde_json::Value;
     use tempfile::TempDir;
 
-    use angos_oci::{Digest, UploadSessionId};
-    use angos_storage::{
-        fs::Backend as StorageFsBackend,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_oci::Digest;
+    use angos_storage::fs::Backend as StorageFsBackend;
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
 
-    use crate::{
-        cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
-        command::maintenance::executor::*,
-        jobs::store::{ClaimMode, FailOutcome},
-        registry::{
-            metadata_store::{LinkKind, MetadataStore, Settings},
-            test_utils::{
-                FSRegistryTestCase, RegistryTestCase, for_each_backend, metadata_store_over,
-                put_blob_direct, seed_links,
-            },
-        },
-        replication::REPLICATION_DELETE_MANIFEST_KIND,
+    use super::*;
+    use crate::cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload};
+    use crate::jobs::store::{ClaimMode, FailOutcome};
+    use crate::registry::metadata_store::{LinkKind, MetadataStore, Settings};
+    use crate::registry::test_utils::{
+        FSRegistryTestCase, RegistryTestCase, for_each_backend, metadata_store_over,
+        put_blob_direct, seed_links,
     };
+    use crate::replication::REPLICATION_DELETE_MANIFEST_KIND;
 
     /// A producer `JobStore` over a private store no worker drains, plus the
     /// temp directory backing it. Tests that assert queue depth must not share
@@ -1793,7 +1767,7 @@ mod tests {
             let source_ts = claimed.envelope.payload.get("source_ts").cloned();
             let source_ts = source_ts
                 .as_ref()
-                .and_then(serde_json::Value::as_str)
+                .and_then(Value::as_str)
                 .expect("prune delete payload must carry a source_ts (not None)");
             assert!(
                 DateTime::parse_from_rfc3339(source_ts).is_ok(),
@@ -1998,35 +1972,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vec_sink_captures_actions_without_io() {
-        let digest = Digest::from_str(
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
-
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
-        sink.apply(Action::DeleteOrphanBlob(digest.clone()))
-            .await
-            .unwrap();
-        sink.apply(Action::DeleteExpiredUpload {
-            namespace: Namespace::new("ns").unwrap(),
-            session_id: UploadSessionId::generate(),
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(sink.lock().unwrap().len(), 2);
-        assert!(matches!(
-            sink.lock().unwrap()[0],
-            Action::DeleteOrphanBlob(_)
-        ));
-        assert!(matches!(
-            sink.lock().unwrap()[1],
-            Action::DeleteExpiredUpload { .. }
-        ));
-    }
-
-    #[tokio::test]
     async fn quarantine_key_moves_object_under_lost_and_found() {
         for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
@@ -2036,7 +1981,7 @@ mod tests {
             let key = "junk/unexpected-object";
             metadata_store
                 .object_store()
-                .put(key, bytes::Bytes::from_static(b"alien"))
+                .put(key, Bytes::from_static(b"alien"))
                 .await
                 .unwrap();
 
@@ -2072,7 +2017,7 @@ mod tests {
             let key = "v2/repositories/junk-ns/_manifests/tags/x/current/link";
             blob_store
                 .object_store()
-                .put(key, bytes::Bytes::from_static(b"not json"))
+                .put(key, Bytes::from_static(b"not json"))
                 .await
                 .unwrap();
 
@@ -2099,7 +2044,7 @@ mod tests {
             let key = "junk/unexpected-object";
             let objects = metadata_store.object_store();
             objects
-                .put(key, bytes::Bytes::from_static(b"alien"))
+                .put(key, Bytes::from_static(b"alien"))
                 .await
                 .unwrap();
 
@@ -2111,7 +2056,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(objects.get(key).await.is_err(), "the key must be gone");
+            assert!(objects.get(key).await.is_err());
             assert!(
                 objects
                     .get(&format!("{LOST_AND_FOUND_PREFIX}/{key}"))

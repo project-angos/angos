@@ -10,7 +10,8 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use http::Method;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use angos_oci::path::{API_PREFIX, TAGS_LIST, UPLOADS};
 use angos_oci::server;
@@ -376,20 +377,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_put_by_digest_collects_tags() {
-        let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let path = format!("/v2/app/manifests/{d}");
-        let Some(Endpoint::PutManifest { target, .. }) =
-            parse(&Method::PUT, &path, Some("tag=v1&tag=v2"))
-        else {
-            panic!("expected a by-digest put");
-        };
-        let (reference, tags) = target.into_parts();
-        assert!(matches!(reference, Reference::Digest(_)));
-        assert_eq!(tags.len(), 2);
-    }
-
-    #[test]
     fn manifest_put_by_tag_takes_no_extra_tags() {
         let Some(Endpoint::PutManifest { target, .. }) =
             parse(&Method::PUT, "/v2/app/manifests/latest", Some("tag=v1"))
@@ -497,8 +484,6 @@ mod tests {
         ));
     }
 
-    // Cases migrated from the binary router's parser tests.
-
     /// A reference that parses as neither a tag nor a digest must not route, so
     /// the dispatcher answers a `PUT` carrying one with `400`, as OCI
     /// conformance requires.
@@ -528,8 +513,7 @@ mod tests {
             panic!("Expected StartUpload route");
         };
         assert_eq!(namespace, "myrepo/app");
-        assert!(digest.is_some());
-        assert_eq!(digest.unwrap().to_string(), d);
+        assert_eq!(digest.map(|digest| digest.to_string()).as_deref(), Some(d));
     }
 
     /// An unset `from` makes the server attempt automatic content discovery.

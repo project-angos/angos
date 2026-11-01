@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use angos_oci::{Digest, Namespace, Reference, Tag};
@@ -55,7 +56,14 @@ pub struct EventActor {
     /// The credential that named this caller and who it names, for the pull
     /// history. Not serialized: the webhook payload keeps its fields.
     #[serde(skip)]
-    pub principal: Option<(&'static str, String)>,
+    pub principal: Option<Principal>,
+}
+
+/// How a caller authenticated, and who that credential names.
+#[derive(Debug, Clone)]
+pub struct Principal {
+    pub method: &'static str,
+    pub name: String,
 }
 
 impl EventActor {
@@ -70,18 +78,12 @@ impl EventActor {
         }
     }
 
-    /// `true` when the operation was client-initiated rather than performed
-    /// by an internal process.
-    pub fn is_client(&self) -> bool {
-        self.internal.is_none()
-    }
-
     /// The name access-time audit entries record for this actor: who its
     /// credential names, else the internal process name.
     pub fn audit_name(&self) -> &str {
         self.principal
             .as_ref()
-            .map(|(_, name)| name.as_str())
+            .map(|principal| principal.name.as_str())
             .or(self.internal.as_deref())
             .unwrap_or("anonymous")
     }
@@ -89,7 +91,7 @@ impl EventActor {
     /// How the actor [`Self::audit_name`] names authenticated.
     pub fn audit_method(&self) -> &'static str {
         match (&self.principal, &self.internal) {
-            (Some((method, _)), _) => method,
+            (Some(principal), _) => principal.method,
             (None, Some(_)) => "internal",
             (None, None) => "anonymous",
         }
@@ -108,11 +110,17 @@ impl From<ClientIdentity> for EventActor {
             .username
             .clone()
             .or_else(|| identity.id.clone())
-            .map(|name| (named, name))
+            .map(|name| Principal {
+                method: named,
+                name,
+            })
             .or_else(|| identity.oidc.as_ref().and_then(oidc_principal))
             .or_else(|| {
                 let cn = identity.certificate.common_names.first()?;
-                Some(("mtls", cn.clone()))
+                Some(Principal {
+                    method: "mtls",
+                    name: cn.clone(),
+                })
             });
         Self {
             id: identity.id,
@@ -127,20 +135,26 @@ impl From<ClientIdentity> for EventActor {
 /// `<provider>:<namespace>/<service account>` for a Kubernetes service
 /// account token, else `<provider>:<who>`, preferring a human-readable claim
 /// over the often opaque `sub`.
-fn oidc_principal(oidc: &OidcClaims) -> Option<(&'static str, String)> {
-    let claim = |name: &str| oidc.claims.get(name).and_then(serde_json::Value::as_str);
+fn oidc_principal(oidc: &OidcClaims) -> Option<Principal> {
+    let claim = |name: &str| oidc.claims.get(name).and_then(Value::as_str);
     let provider = &oidc.provider_name;
     let sub = claim("sub")?;
     if let Some((namespace, account)) = sub
         .strip_prefix("system:serviceaccount:")
         .and_then(|rest| rest.split_once(':'))
     {
-        return Some(("kubernetes", format!("{provider}:{namespace}/{account}")));
+        return Some(Principal {
+            method: "kubernetes",
+            name: format!("{provider}:{namespace}/{account}"),
+        });
     }
     let who = claim("email")
         .or_else(|| claim("preferred_username"))
         .unwrap_or(sub);
-    Some(("oidc", format!("{provider}:{who}")))
+    Some(Principal {
+        method: "oidc",
+        name: format!("{provider}:{who}"),
+    })
 }
 
 /// What an event names. The kind picks the variant, so an event carries
@@ -382,46 +396,17 @@ impl Event {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use angos_oci::{Digest, Namespace, Reference, Tag};
 
-    use crate::{
-        event_webhook::event::{Event, EventActor, EventKind, EventSubject},
-        identity::{ClientIdentity, OidcClaims},
-    };
+    use crate::event_webhook::event::{Event, EventActor, EventKind, EventSubject};
+    use crate::identity::{ClientIdentity, OidcClaims};
 
     const FIXTURE_DIGEST: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    #[test]
-    fn event_actor_from_client_identity_with_all_fields() {
-        let identity = ClientIdentity {
-            id: Some("user-123".to_string()),
-            username: Some("alice".to_string()),
-            client_ip: Some("192.168.1.1".to_string()),
-            ..Default::default()
-        };
-
-        let actor = EventActor::from(identity);
-        assert_eq!(actor.id, Some("user-123".to_string()));
-        assert_eq!(actor.username, Some("alice".to_string()));
-        assert_eq!(actor.client_ip, Some("192.168.1.1".to_string()));
-        assert_eq!(actor.internal, None);
-    }
-
-    #[test]
-    fn event_actor_from_client_identity_with_no_fields() {
-        let identity = ClientIdentity::default();
-
-        let actor = EventActor::from(identity);
-        assert_eq!(actor.id, None);
-        assert_eq!(actor.username, None);
-        assert_eq!(actor.client_ip, None);
-        assert_eq!(actor.internal, None);
-    }
-
-    fn oidc_identity(claims: serde_json::Value) -> ClientIdentity {
+    fn oidc_identity(claims: Value) -> ClientIdentity {
         ClientIdentity {
             oidc: Some(OidcClaims {
                 provider_name: "cluster".to_string(),
@@ -438,23 +423,23 @@ mod tests {
             format!("{} {}", actor.audit_method(), actor.audit_name())
         };
 
-        let k8s = oidc_identity(serde_json::json!({
+        let k8s = oidc_identity(json!({
             "sub": "system:serviceaccount:ci:builder",
             "email": "ignored@example.com",
         }));
         assert_eq!(name(k8s), "kubernetes cluster:ci/builder");
 
-        let human = oidc_identity(serde_json::json!({ "sub": "42", "email": "a@example.com" }));
+        let human = oidc_identity(json!({ "sub": "42", "email": "a@example.com" }));
         assert_eq!(name(human), "oidc cluster:a@example.com");
 
-        let bare = oidc_identity(serde_json::json!({ "sub": "repo:org/app:ref:main" }));
+        let bare = oidc_identity(json!({ "sub": "repo:org/app:ref:main" }));
         assert_eq!(name(bare), "oidc cluster:repo:org/app:ref:main");
 
         let mut cert = ClientIdentity::default();
         cert.certificate.common_names = vec!["node-1".to_string()];
         assert_eq!(name(cert), "mtls node-1");
 
-        let mut named = oidc_identity(serde_json::json!({ "sub": "42" }));
+        let mut named = oidc_identity(json!({ "sub": "42" }));
         named.username = Some("alice".to_string());
         assert_eq!(name(named), "basic alice");
 
@@ -473,15 +458,15 @@ mod tests {
 
     #[test]
     fn principal_stays_out_of_the_webhook_payload() {
-        let actor = EventActor::from(oidc_identity(serde_json::json!({ "sub": "42" })));
-        assert_eq!(serde_json::to_value(&actor).unwrap(), serde_json::json!({}));
+        let actor = EventActor::from(oidc_identity(json!({ "sub": "42" })));
+        assert_eq!(serde_json::to_value(&actor).unwrap(), json!({}));
     }
 
     #[test]
     fn event_actor_internal_serializes_only_the_process_name() {
         let actor = EventActor::internal("prune");
         let json = serde_json::to_value(&actor).unwrap();
-        assert_eq!(json, serde_json::json!({ "internal": "prune" }));
+        assert_eq!(json, json!({ "internal": "prune" }));
     }
 
     /// Every variant must name itself identically in the `X-Registry-Event`

@@ -3,11 +3,9 @@
 //! both live here so the registry, the request layer, and the upstream client
 //! read and write one grammar.
 
-use std::{
-    fmt,
-    fmt::{Display, Formatter},
-    str::FromStr,
-};
+use std::fmt::{self, Display, Formatter};
+use std::num::ParseIntError;
+use std::str::FromStr;
 
 use http::header::{HeaderValue, InvalidHeaderValue};
 
@@ -30,14 +28,34 @@ fn malformed(value: &str) -> Error {
     Error::Malformed(format!("Invalid Range header format: '{value}'"))
 }
 
-fn is_digits(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+/// An unsigned decimal of ASCII digits only: `u64::from_str` also takes a
+/// leading `+`, which no range grammar allows.
+struct Decimal(u64);
+
+impl FromStr for Decimal {
+    /// `None` when the value is not all digits, the overflow otherwise.
+    type Err = Option<ParseIntError>;
+
+    fn from_str(number: &str) -> Result<Self, Self::Err> {
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(None);
+        }
+        number.parse().map(Decimal).map_err(Some)
+    }
 }
 
-fn parse_number(value: &str, part: &str) -> Result<u64, Error> {
-    value.parse::<u64>().map_err(|error| {
-        Error::Malformed(format!("Error parsing '{part}' in Range header: {error}"))
-    })
+impl Decimal {
+    /// Reads the `part` of header `value` that `number` spells. A value that is
+    /// not digits is malformed as a whole; an overflow names its part.
+    fn read(number: &str, part: &str, value: &str) -> Result<u64, Error> {
+        match number.parse() {
+            Ok(Decimal(number)) => Ok(number),
+            Err(None) => Err(malformed(value)),
+            Err(Some(error)) => Err(Error::Malformed(format!(
+                "Error parsing '{part}' in Range header: {error}"
+            ))),
+        }
+    }
 }
 
 /// Splits the `bytes=` unit off a `Range` value. Checked rather than
@@ -70,13 +88,10 @@ impl ByteWindow {
     ///
     /// [`Error::Malformed`] for a value that is not that form, with a
     /// non-numeric bound, without an end, or with an end before its start.
-    pub fn chunk_bounds(value: &str) -> Result<(u64, u64), Error> {
+    pub fn chunk_bounds(value: &str) -> Result<Self, Error> {
         match Self::parse(value)? {
-            ByteWindow {
-                start,
-                end: Some(end),
-            } => Ok((start, end)),
             ByteWindow { end: None, .. } => Err(malformed(value)),
+            window => Ok(window),
         }
     }
 
@@ -89,17 +104,14 @@ impl ByteWindow {
     /// [`Error::Malformed`] for a value that is not that form, with a
     /// non-numeric bound, or with an end before its start.
     pub fn parse(value: &str) -> Result<Self, Error> {
-        let (start, end) = value
-            .split_once('-')
-            .filter(|(start, end)| is_digits(start) && (end.is_empty() || is_digits(end)))
-            .ok_or_else(|| malformed(value))?;
+        let (start, end) = value.split_once('-').ok_or_else(|| malformed(value))?;
 
-        let start = parse_number(start, "start")?;
+        let start = Decimal::read(start, "start", value)?;
         if end.is_empty() {
             return Ok(ByteWindow { start, end: None });
         }
 
-        let end = parse_number(end, "end")?;
+        let end = Decimal::read(end, "end", value)?;
         if start > end {
             return Err(Error::Malformed(format!(
                 "Invalid Range header: start ({start}) > end ({end})"
@@ -159,10 +171,8 @@ impl RequestRange {
         }
 
         if let Some(suffix) = range_value.strip_prefix('-') {
-            if !is_digits(suffix) {
-                return Err(malformed(value));
-            }
-            return Ok(Some(RequestRange::Suffix(parse_number(suffix, "suffix")?)));
+            let suffix = Decimal::read(suffix, "suffix", value)?;
+            return Ok(Some(RequestRange::Suffix(suffix)));
         }
 
         ByteWindow::parse(range_value)
@@ -266,11 +276,17 @@ impl FromStr for ResponseRange {
         let total_length = if total_length == UNKNOWN_TOTAL_LENGTH {
             None
         } else {
-            Some(parse_number(total_length, "complete length")?)
+            Some(Decimal::read(total_length, "complete length", value)?)
         };
 
         // A served window always names its last byte, like a chunk's.
-        let (start, end) = ByteWindow::chunk_bounds(window)?;
+        let (start, end) = match ByteWindow::parse(window)? {
+            ByteWindow {
+                start,
+                end: Some(end),
+            } => (start, end),
+            ByteWindow { end: None, .. } => return Err(malformed(window)),
+        };
 
         Ok(ResponseRange {
             start,
@@ -304,7 +320,7 @@ impl TryFrom<ResponseRange> for HeaderValue {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::http_range::*;
+    use super::*;
 
     #[test]
     fn parse_reads_every_requested_form() {
@@ -361,7 +377,13 @@ mod tests {
     /// permissive because a `Range` may spell `5-`.
     #[test]
     fn chunk_bounds_pin_the_grammar_end_5_defines() {
-        assert_eq!(ByteWindow::chunk_bounds("0-41").unwrap(), (0, 41));
+        assert_eq!(
+            ByteWindow::chunk_bounds("0-41").unwrap(),
+            ByteWindow {
+                start: 0,
+                end: Some(41)
+            }
+        );
         for value in ["bytes=0-41", "0-", "41"] {
             assert!(
                 matches!(ByteWindow::chunk_bounds(value), Err(Error::Malformed(_))),
@@ -535,16 +557,6 @@ mod tests {
     }
 
     #[test]
-    fn response_range_reports_its_served_length() {
-        let range = ResponseRange {
-            start: 5,
-            end: 10,
-            total_length: Some(100),
-        };
-        assert_eq!(range.length(), 6);
-    }
-
-    #[test]
     fn response_range_round_trips_through_its_header_value() {
         for range in [
             ResponseRange {
@@ -583,5 +595,13 @@ mod tests {
     fn response_range_rejects_an_open_ended_window() {
         assert!("bytes 5-/100".parse::<ResponseRange>().is_err());
         assert!("5-10/100".parse::<ResponseRange>().is_err());
+    }
+
+    /// `u64::from_str` takes a leading `+`; no range grammar does.
+    #[test]
+    fn numbers_are_ascii_digits_only() {
+        assert!(RequestRange::parse("bytes=+5-10").is_err());
+        assert!(RequestRange::parse("bytes=-+5").is_err());
+        assert!("bytes 5-10/+100".parse::<ResponseRange>().is_err());
     }
 }

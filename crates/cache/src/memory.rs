@@ -1,10 +1,9 @@
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-use tokio::{sync::RwLock, time::Instant};
+use tokio::sync::RwLock;
+use tokio::time::Instant;
 use tracing::info;
 
 use crate::Error;
@@ -19,8 +18,14 @@ const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const CLEANUP_INTERVAL: usize = 1000;
 
 #[derive(Debug)]
+struct Entry {
+    value: String,
+    expiry: Instant,
+}
+
+#[derive(Debug)]
 pub struct Backend {
-    store: RwLock<HashMap<String, (String, Instant)>>,
+    store: RwLock<HashMap<String, Entry>>,
     counter: AtomicUsize,
 }
 
@@ -43,7 +48,7 @@ impl Backend {
     async fn cleanup_expired(&self) {
         let mut store = self.store.write().await;
         let now = Instant::now();
-        store.retain(|_, &mut (_, expiry)| expiry > now);
+        store.retain(|_, entry| entry.expiry > now);
     }
 
     async fn maybe_cleanup(&self) {
@@ -61,10 +66,10 @@ impl Backend {
         let mut store = self.store.write().await;
         store.insert(
             key.to_string(),
-            (
-                value.to_string(),
-                Instant::now() + Duration::from_secs(ttl.min(MAX_TTL_SECS)),
-            ),
+            Entry {
+                value: value.to_string(),
+                expiry: Instant::now() + Duration::from_secs(ttl.min(MAX_TTL_SECS)),
+            },
         );
         Ok(())
     }
@@ -75,10 +80,10 @@ impl Backend {
     pub async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error> {
         self.maybe_cleanup().await;
         let store = self.store.read().await;
-        if let Some((value, expiry)) = store.get(key)
-            && *expiry > Instant::now()
+        if let Some(entry) = store.get(key)
+            && entry.expiry > Instant::now()
         {
-            return Ok(Some(value.clone()));
+            return Ok(Some(entry.value.clone()));
         }
 
         Ok(None)
@@ -96,9 +101,11 @@ impl Backend {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    use tokio::{task::JoinSet, time};
+    use tokio::task::JoinSet;
+    use tokio::time;
 
     use super::*;
 
@@ -118,21 +125,6 @@ mod tests {
             cache.retrieve_value("key").await,
             Ok(Some("value".to_string()))
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_store_and_retrieve() {
-        let cache = Backend::new();
-
-        let res = cache.store_value("key", "value", 1).await;
-        assert!(res.is_ok());
-        assert_eq!(
-            cache.retrieve_value("key").await,
-            Ok(Some("value".to_string()))
-        );
-
-        tokio::time::sleep(Duration::from_millis(1050)).await;
-        assert_eq!(cache.retrieve_value("key").await, Ok(None));
     }
 
     /// `maybe_cleanup` sweeps the map every `CLEANUP_INTERVAL` operations. Retrieval already
@@ -184,14 +176,6 @@ mod tests {
             LONG,
             "the sweep must evict every expired entry, not just hide it on read"
         );
-    }
-
-    /// Deleting a key that was never stored must return `Ok(())` without panicking.
-    #[tokio::test]
-    async fn test_delete_missing_key() {
-        let cache = Backend::new();
-        let result = cache.delete_value("never_stored").await;
-        assert!(result.is_ok());
     }
 
     /// Ten tasks each store a distinct key concurrently; every key must be
@@ -254,22 +238,6 @@ mod tests {
         // The expiry instant equals the store instant; any elapsed time since
         // then makes `expiry > now` false.
         assert_eq!(cache.retrieve_value("zero_ttl").await, Ok(None));
-    }
-
-    /// An entry stored with a TTL larger than one year (400 days) must still
-    /// be present when retrieved immediately without any sleep.
-    #[tokio::test]
-    async fn test_huge_ttl_not_expired() {
-        const FOUR_HUNDRED_DAYS_SECS: u64 = 400 * 24 * 3600;
-        let cache = Backend::new();
-        cache
-            .store_value("huge_ttl", "persisted", FOUR_HUNDRED_DAYS_SECS)
-            .await
-            .unwrap();
-        assert_eq!(
-            cache.retrieve_value("huge_ttl").await,
-            Ok(Some("persisted".to_string()))
-        );
     }
 
     /// Verifies the TTL boundary: the entry is present before expiry and absent

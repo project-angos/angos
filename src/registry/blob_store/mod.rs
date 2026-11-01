@@ -10,12 +10,10 @@ pub mod hashing;
 mod multipart_cleanup;
 pub mod upload_session;
 
-use std::{
-    fmt::{self, Debug, Formatter},
-    num::NonZeroUsize,
-    sync::Arc,
-    time::Duration,
-};
+use std::fmt::{self, Debug, Formatter};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -23,14 +21,12 @@ use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use tracing::{instrument, warn};
 
 use angos_oci::{Algorithm, Digest};
-use angos_storage::Error as StorageError;
-use angos_storage::{BoxedReader, ObjectStore, PresignedStore, paginated};
-
-use crate::registry::{
-    Error,
-    keys::{BLOBS_ROOT, DigestKeys, namespace_dir},
-    pagination,
+use angos_storage::{
+    BoxedReader, Error as StorageError, ObjectStore, Page, PresignedStore, paginated,
 };
+
+use crate::registry::keys::{BLOBS_ROOT, DigestExt, namespace_dir};
+use crate::registry::{Error, pagination};
 #[cfg(test)]
 pub use config::TransportFields;
 pub use config::{BlobStoreConfig, FsBackendConfig, S3BackendConfig};
@@ -142,7 +138,10 @@ impl BlobStore {
                 let root = root.clone();
                 async move {
                     let page = self.object.list_children(&root, 1000, token, None).await?;
-                    Ok::<_, Error>((page.sub_prefixes, page.next_token))
+                    Ok::<_, Error>(Page {
+                        items: page.sub_prefixes,
+                        next_token: page.next_token,
+                    })
                 }
             })
             .try_collect::<Vec<String>>()
@@ -165,7 +164,7 @@ impl BlobStore {
             let prefix = prefix.clone();
             async move {
                 let page = self.object.list(&prefix, 1000, token).await?;
-                let blobs = page
+                let blobs: Vec<Digest> = page
                     .items
                     .into_iter()
                     .filter_map(|key| {
@@ -173,7 +172,10 @@ impl BlobStore {
                         Digest::with_algorithm(algorithm, hash).ok()
                     })
                     .collect();
-                Ok((blobs, page.next_token))
+                Ok(Page {
+                    items: blobs,
+                    next_token: page.next_token,
+                })
             }
         })
     }

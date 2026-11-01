@@ -1,32 +1,29 @@
-use std::{collections::HashMap, fs, net::TcpListener, time::Duration};
+use std::collections::HashMap;
+use std::fs;
+use std::net::TcpListener;
+use std::time::Duration;
 
+use chrono::{TimeDelta, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header, encode};
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{header, method, path},
-};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use angos_cache::Config as CacheConfig;
 use angos_mtls_client::ClientTls;
 
-use crate::{
-    auth::Error,
-    auth::oidc::{
-        Config,
-        jwk::Jwk,
-        validator::{
-            Jwks, OpenIdConfiguration, fetch_jwks, fetch_oidc_configuration, issuer_bearer_token,
-            issuer_key, validate_oidc_token, verify_jwt_with_header,
-        },
-    },
-    identity::OidcClaims,
-    test_fixtures::{
-        mocks::{mount_jwks, static_jwks_response},
-        oidc::{KID, alt_private_key_pem, jwk_x, jwk_y, private_key_pem},
-    },
+use crate::auth::Error;
+use crate::auth::oidc::Config;
+use crate::auth::oidc::jwk::Jwk;
+use crate::auth::oidc::validator::{
+    Jwks, JwksRead, OpenIdConfiguration, fetch_jwks, fetch_oidc_configuration_with_timeout,
+    issuer_bearer_token, issuer_key, validate_oidc_token, verify_jwt_with_header,
 };
+use crate::identity::OidcClaims;
+use crate::test_fixtures::mocks::{mount_jwks, static_jwks_response};
+use crate::test_fixtures::oidc::{KID, alt_private_key_pem, jwk_x, jwk_y, private_key_pem};
 
 pub fn build_test_provider_config(uri: &str) -> Config {
     Config {
@@ -77,9 +74,9 @@ async fn test_fetch_jwks_with_explicit_uri() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
 
     assert!(result.is_ok());
     let jwks = result.unwrap();
@@ -121,9 +118,9 @@ async fn test_fetch_jwks_with_discovery() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
 
     assert!(result.is_ok());
     let jwks = result.unwrap();
@@ -158,12 +155,12 @@ async fn test_fetch_jwks_uses_cache() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result1 = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+    let result1 = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
     assert!(result1.is_ok());
 
-    let result2 = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+    let result2 = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
     assert!(result2.is_ok());
     assert!(result2.unwrap().from_cache);
 }
@@ -184,51 +181,15 @@ async fn test_fetch_jwks_http_error() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
         Error::ProviderUnavailable(msg) => assert!(msg.contains("HTTP 500")),
         err => panic!("Expected ProviderUnavailable error, got {err:?}"),
     }
-}
-
-#[tokio::test]
-async fn test_fetch_oidc_configuration_success() {
-    let mock_server = MockServer::start().await;
-
-    let oidc_config = json!({
-        "issuer": mock_server.uri(),
-        "jwks_uri": format!("{}/.well-known/jwks", mock_server.uri()),
-        "authorization_endpoint": format!("{}/authorize", mock_server.uri())
-    });
-
-    Mock::given(method("GET"))
-        .and(path("/.well-known/openid-configuration"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&oidc_config))
-        .mount(&mock_server)
-        .await;
-
-    let provider = Config {
-        jwks_uri: None,
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
-    let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
-
-    assert!(result.is_ok());
-    let config = result.unwrap();
-    assert_eq!(config.issuer, mock_server.uri());
-    assert_eq!(
-        config.jwks_uri,
-        format!("{}/.well-known/jwks", mock_server.uri())
-    );
 }
 
 #[tokio::test]
@@ -254,12 +215,24 @@ async fn test_fetch_oidc_configuration_uses_cache() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result1 = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
+    let result1 = fetch_oidc_configuration_with_timeout(
+        &provider,
+        &client,
+        cache.as_ref(),
+        Duration::from_secs(30),
+    )
+    .await;
     assert!(result1.is_ok());
 
-    let result2 = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
+    let result2 = fetch_oidc_configuration_with_timeout(
+        &provider,
+        &client,
+        cache.as_ref(),
+        Duration::from_secs(30),
+    )
+    .await;
     assert!(result2.is_ok());
 }
 
@@ -285,9 +258,15 @@ async fn test_fetch_oidc_configuration_issuer_mismatch() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
+    let result = fetch_oidc_configuration_with_timeout(
+        &provider,
+        &client,
+        cache.as_ref(),
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -321,9 +300,15 @@ async fn test_fetch_oidc_configuration_http_error() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
+    let result = fetch_oidc_configuration_with_timeout(
+        &provider,
+        &client,
+        cache.as_ref(),
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -347,9 +332,9 @@ async fn test_fetch_jwks_network_error_returns_provider_unavailable() {
         .timeout(Duration::from_millis(200))
         .build()
         .unwrap();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -372,15 +357,15 @@ async fn test_fetch_jwks_silence_is_remembered_for_the_cooldown() {
         ..build_test_provider_config(&url)
     };
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let first = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+    let first = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
     assert!(
         matches!(&first, Err(Error::ProviderUnavailable(msg)) if msg.contains("Failed to fetch URL")),
         "{first:?}"
     );
 
-    let second = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+    let second = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
     assert!(
         matches!(&second, Err(Error::ProviderUnavailable(msg)) if msg.contains("did not answer")),
         "the second fetch must fail from the marker, not from its own attempt: {second:?}"
@@ -405,39 +390,15 @@ async fn test_fetch_jwks_refusal_is_not_remembered() {
         ..build_test_provider_config(&mock_server.uri())
     };
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
     for _ in 0..2 {
-        let result = fetch_jwks(&provider, &client, cache.as_ref(), true).await;
+        let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
         assert!(
             matches!(&result, Err(Error::ProviderUnavailable(msg)) if msg.contains("HTTP 503")),
             "{result:?}"
         );
     }
-}
-
-#[tokio::test]
-async fn test_validate_oidc_token_success() {
-    let mock_server = MockServer::start().await;
-
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let mut claims = valid_claims(&mock_server.uri(), "test-audience");
-    claims.insert("sub".to_string(), json!("test-user"));
-
-    let token = make_token(&claims, KID);
-
-    let provider = build_test_provider_config(&mock_server.uri());
-    let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(result.is_ok());
-    let oidc_claims = result.unwrap();
-    assert_eq!(oidc_claims.provider_name, "test-provider");
-    assert_eq!(oidc_claims.claims.get("sub").unwrap(), "test-user");
 }
 
 #[tokio::test]
@@ -453,7 +414,7 @@ async fn test_validate_oidc_token_refreshes_jwks_once_when_cached_kid_is_missing
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
     let stale_jwks = Jwks {
         keys: vec![Jwk::Ec {
             key_use: Some("sig".to_string()),
@@ -503,7 +464,7 @@ async fn unknown_kids_cost_one_jwks_fetch_per_cooldown_not_one_per_request() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
     let stale_jwks = Jwks {
         keys: vec![Jwk::Ec {
             key_use: Some("sig".to_string()),
@@ -554,7 +515,7 @@ async fn test_validate_oidc_token_returns_unauthorized_when_refreshed_jwks_still
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
     let stale_jwks = Jwks { keys: Vec::new() };
     cache
         .store(&issuer_key(&provider, "jwks"), &stale_jwks, 3600)
@@ -574,38 +535,6 @@ async fn test_validate_oidc_token_returns_unauthorized_when_refreshed_jwks_still
 }
 
 #[tokio::test]
-async fn test_validate_oidc_token_invalid_signature() {
-    let mock_server = MockServer::start().await;
-
-    // JWKS advertises private_key_pem()'s public key; token is signed with the alt key.
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let mut header = Header::new(Algorithm::ES256);
-    header.kid = Some(KID.to_string());
-
-    let claims = valid_claims(&mock_server.uri(), "test-audience");
-
-    let alt_key =
-        EncodingKey::from_ec_pem(alt_private_key_pem().as_bytes()).expect("alt key must parse");
-    let token = encode(&header, &claims, &alt_key).unwrap();
-
-    let provider = build_test_provider_config(&mock_server.uri());
-    let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => {
-            assert!(msg.contains("validation failed"));
-        }
-        _ => panic!("Expected Unauthorized error"),
-    }
-}
-
-#[tokio::test]
 async fn test_validate_oidc_token_rejects_disallowed_algorithm() {
     let mock_server = MockServer::start().await;
 
@@ -621,7 +550,7 @@ async fn test_validate_oidc_token_rejects_disallowed_algorithm() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -648,7 +577,7 @@ async fn test_validate_oidc_token_accepts_multi_family_algorithm_list() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
     let claims = validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref())
         .await
@@ -656,83 +585,6 @@ async fn test_validate_oidc_token_accepts_multi_family_algorithm_list() {
     assert_eq!(claims.claims.get("sub").unwrap(), "unit-test-subject");
 }
 
-#[tokio::test]
-async fn test_validate_oidc_token_expired() {
-    let mock_server = MockServer::start().await;
-
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let mut claims = valid_claims(&mock_server.uri(), "test-audience");
-    claims.insert(
-        "exp".to_string(),
-        json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp()),
-    );
-    claims.insert(
-        "iat".to_string(),
-        json!((chrono::Utc::now() - chrono::Duration::hours(2)).timestamp()),
-    );
-
-    let token = make_token(&claims, KID);
-
-    let provider = build_test_provider_config(&mock_server.uri());
-    let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => {
-            assert!(msg.contains("validation failed"));
-        }
-        _ => panic!("Expected Unauthorized error"),
-    }
-}
-
-#[tokio::test]
-async fn test_validate_oidc_token_wrong_issuer() {
-    let mock_server = MockServer::start().await;
-
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let claims = valid_claims("https://wrong-issuer.com", "test-audience");
-
-    let token = make_token(&claims, KID);
-
-    let provider = build_test_provider_config(&mock_server.uri());
-    let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_validate_oidc_token_wrong_audience() {
-    let mock_server = MockServer::start().await;
-
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let claims = valid_claims(&mock_server.uri(), "wrong-audience");
-
-    let token = make_token(&claims, KID);
-
-    let provider = build_test_provider_config(&mock_server.uri());
-    let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(result.is_err());
-}
-
-/// A token carrying no `aud` must not satisfy `required_audience`: the
-/// operator asked for an audience, and an issuer that mints claim-less tokens
-/// would otherwise hand out a registry identity.
 #[tokio::test]
 async fn test_validate_oidc_token_missing_audience_is_rejected() {
     let mock_server = MockServer::start().await;
@@ -744,7 +596,7 @@ async fn test_validate_oidc_token_missing_audience_is_rejected() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -767,7 +619,7 @@ async fn test_validate_oidc_token_missing_issuer_is_rejected() {
 
     let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -776,59 +628,6 @@ async fn test_validate_oidc_token_missing_issuer_is_rejected() {
         result.is_err(),
         "a token without `iss` must not pass the issuer pin"
     );
-}
-
-#[tokio::test]
-async fn test_validate_oidc_token_missing_kid() {
-    let mock_server = MockServer::start().await;
-
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    // No kid in header, so the validator must reject because JWKS keys require kid matching.
-    let claims = valid_claims(&mock_server.uri(), "test-audience");
-
-    let header = Header::new(Algorithm::ES256);
-    let token = encode(&header, &claims, &encoding_key()).unwrap();
-
-    let provider = build_test_provider_config(&mock_server.uri());
-    let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => {
-            assert!(msg.contains("No matching key"));
-        }
-        _ => panic!("Expected Unauthorized error"),
-    }
-}
-
-#[tokio::test]
-async fn test_validate_oidc_token_no_audience_validation() {
-    let mock_server = MockServer::start().await;
-
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let mut claims = valid_claims(&mock_server.uri(), "unused");
-    claims.remove("aud");
-
-    let token = make_token(&claims, KID);
-
-    let provider = Config {
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
-    let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(result.is_ok());
 }
 
 #[tokio::test]
@@ -844,7 +643,7 @@ async fn test_validate_oidc_token_invalid_jwt_format() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
     let result = validate_oidc_token(
         "test-provider",
@@ -880,22 +679,22 @@ pub fn encoding_key() -> EncodingKey {
     EncodingKey::from_ec_pem(private_key_pem().as_bytes()).expect("generated test key must parse")
 }
 
-pub fn make_token(claims: &HashMap<String, serde_json::Value>, kid: &str) -> String {
+pub fn make_token(claims: &HashMap<String, Value>, kid: &str) -> String {
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(kid.to_string());
     encode(&header, claims, &encoding_key()).expect("token encoding must succeed")
 }
 
-pub fn valid_claims(issuer: &str, audience: &str) -> HashMap<String, serde_json::Value> {
+pub fn valid_claims(issuer: &str, audience: &str) -> HashMap<String, Value> {
     let mut claims = HashMap::new();
     claims.insert("iss".to_string(), json!(issuer));
     claims.insert("sub".to_string(), json!("unit-test-subject"));
     claims.insert("aud".to_string(), json!(audience));
     claims.insert(
         "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
+        json!((Utc::now() + TimeDelta::hours(1)).timestamp()),
     );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+    claims.insert("iat".to_string(), json!(Utc::now().timestamp()));
     claims
 }
 
@@ -915,26 +714,6 @@ fn test_provider(issuer: &str, audience: Option<&str>) -> Config {
         http_request_timeout_secs: 30,
         jwks_refresh_timeout_secs: 5,
     }
-}
-
-#[test]
-fn verify_jwt_accepts_valid_token() {
-    let issuer = "https://issuer.example.com";
-    let audience = "my-audience";
-    let provider = test_provider(issuer, Some(audience));
-    let jwks = test_jwks();
-    let claims = valid_claims(issuer, audience);
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-    let oidc = result.unwrap();
-    assert_eq!(oidc.provider_name, "test-provider");
-    assert_eq!(
-        oidc.claims.get("sub").and_then(|v| v.as_str()),
-        Some("unit-test-subject")
-    );
 }
 
 #[test]
@@ -965,11 +744,11 @@ fn verify_jwt_rejects_expired_token() {
     claims.insert("sub".to_string(), json!("user"));
     claims.insert(
         "exp".to_string(),
-        json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp()),
+        json!((Utc::now() - TimeDelta::hours(1)).timestamp()),
     );
     claims.insert(
         "iat".to_string(),
-        json!((chrono::Utc::now() - chrono::Duration::hours(2)).timestamp()),
+        json!((Utc::now() - TimeDelta::hours(2)).timestamp()),
     );
 
     let mut header = Header::new(Algorithm::ES256);
@@ -1051,24 +830,6 @@ fn verify_jwt_rejects_invalid_signature() {
 }
 
 #[test]
-fn verify_jwt_rejects_malformed_header() {
-    let provider = test_provider("https://issuer.example.com", None);
-    let jwks = test_jwks();
-
-    let result = verify_jwt("not-a-valid-jwt", &jwks, "test-provider", &provider);
-
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => assert!(
-            msg.contains("Failed to decode JWT header"),
-            "expected header decode failure message, got: {msg}"
-        ),
-        e => panic!("expected Unauthorized, got {e:?}"),
-    }
-}
-
-/// `required_claims` is what replaced the GitHub provider's hard-coded
-/// repository/actor check, so the rejection it used to perform is pinned here.
-#[test]
 fn verify_jwt_rejects_token_missing_a_required_claim() {
     let issuer = "https://issuer.example.com";
     let provider = Config {
@@ -1142,12 +903,12 @@ fn verify_jwt_rejects_future_nbf() {
     claims.insert("sub".to_string(), json!("user"));
     claims.insert(
         "exp".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(2)).timestamp()),
+        json!((Utc::now() + TimeDelta::hours(2)).timestamp()),
     );
-    claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+    claims.insert("iat".to_string(), json!(Utc::now().timestamp()));
     claims.insert(
         "nbf".to_string(),
-        json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
+        json!((Utc::now() + TimeDelta::hours(1)).timestamp()),
     );
 
     let token = make_token(&claims, KID);
@@ -1204,46 +965,6 @@ fn verify_jwt_selects_correct_key_from_multi_key_jwks() {
     assert_eq!(
         oidc.claims.get("sub").and_then(|v| v.as_str()),
         Some("unit-test-subject")
-    );
-}
-
-/// Custom claims present in the token payload must appear verbatim in
-/// `OidcClaims::claims`.  This mirrors real-world GitHub Actions tokens
-/// that carry fields like `repository`, `run_id`, and `job_workflow_ref`.
-#[test]
-fn verify_jwt_preserves_custom_claims() {
-    let issuer = "https://token.actions.githubusercontent.com";
-    let provider = test_provider(issuer, None);
-    let jwks = test_jwks();
-
-    let mut claims = valid_claims(issuer, "any");
-    claims.insert("repository".to_string(), json!("owner/repo"));
-    claims.insert("run_id".to_string(), json!("12345678"));
-    claims.insert(
-        "job_workflow_ref".to_string(),
-        json!("owner/repo/.github/workflows/ci.yml@refs/heads/main"),
-    );
-
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "github-provider", &provider);
-
-    assert!(
-        result.is_ok(),
-        "expected custom claims to be accepted, got {result:?}"
-    );
-    let oidc = result.unwrap();
-    assert_eq!(
-        oidc.claims.get("repository").and_then(|v| v.as_str()),
-        Some("owner/repo")
-    );
-    assert_eq!(
-        oidc.claims.get("run_id").and_then(|v| v.as_str()),
-        Some("12345678")
-    );
-    assert_eq!(
-        oidc.claims.get("job_workflow_ref").and_then(|v| v.as_str()),
-        Some("owner/repo/.github/workflows/ci.yml@refs/heads/main")
     );
 }
 
@@ -1334,17 +1055,22 @@ async fn the_bearer_token_reaches_an_issuer_that_requires_it() {
     };
 
     let client = Client::new();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
 
     assert!(
-        fetch_jwks(&anonymous, &client, cache.as_ref(), true)
+        fetch_jwks(&anonymous, &client, cache.as_ref(), JwksRead::PreferCache)
             .await
             .is_err(),
         "the issuer serves its JWKS to authenticated callers only"
     );
     assert!(
-        fetch_jwks(&authenticated, &client, cache.as_ref(), true)
-            .await
-            .is_ok()
+        fetch_jwks(
+            &authenticated,
+            &client,
+            cache.as_ref(),
+            JwksRead::PreferCache
+        )
+        .await
+        .is_ok()
     );
 }

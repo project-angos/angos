@@ -1,10 +1,7 @@
-use crate::{
-    auth,
-    command::{bootstrap, server::error::Error},
-    configuration, event_webhook,
-    jobs::store as job_store,
-    metrics_provider, registry,
-};
+use crate::command::bootstrap;
+use crate::command::server::error::Error;
+use crate::jobs::store as job_store;
+use crate::{auth, configuration, event_webhook, metrics_provider, registry};
 
 impl From<registry::Error> for Error {
     fn from(error: registry::Error) -> Self {

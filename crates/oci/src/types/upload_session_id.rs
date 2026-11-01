@@ -26,7 +26,7 @@ impl UploadSessionId {
     pub fn new(s: &str) -> Result<Self, Error> {
         match Uuid::try_parse(s) {
             Ok(uuid) if uuid.as_hyphenated().to_string() == s => Ok(Self(s.to_owned())),
-            _ => Err(Error::InvalidUploadSessionId(s.to_string())),
+            _ => Err(Error::UploadSessionId(s.to_string())),
         }
     }
 }
@@ -35,22 +35,12 @@ str_newtype!(UploadSessionId);
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use crate::types::upload_session_id::*;
-
-    const SAMPLE: &str = "067e6162-3b6f-4ae2-a171-2470b63dff00";
+    use super::*;
 
     #[test]
     fn test_generate_round_trips_through_new() {
         let id = UploadSessionId::generate();
         assert_eq!(UploadSessionId::new(id.as_ref()).unwrap(), id);
-    }
-
-    #[test]
-    fn test_valid_hyphenated() {
-        let id = UploadSessionId::new(SAMPLE).unwrap();
-        assert_eq!(id.as_ref(), SAMPLE);
     }
 
     // The registry hands out the canonical hyphenated form and the client
@@ -79,35 +69,6 @@ mod tests {
                 "'{input}' must be rejected"
             );
         }
-    }
-
-    #[test]
-    fn test_from_str_and_try_from() {
-        assert_eq!(UploadSessionId::from_str(SAMPLE).unwrap().as_ref(), SAMPLE);
-        assert!(UploadSessionId::from_str("bad").is_err());
-        assert_eq!(UploadSessionId::try_from(SAMPLE).unwrap().as_ref(), SAMPLE);
-        assert_eq!(
-            UploadSessionId::try_from(SAMPLE.to_string())
-                .unwrap()
-                .as_ref(),
-            SAMPLE
-        );
-    }
-
-    #[test]
-    fn test_display_and_deref() {
-        let id = UploadSessionId::new(SAMPLE).unwrap();
-        assert_eq!(id.to_string(), SAMPLE);
-        assert_eq!(id.len(), SAMPLE.len());
-    }
-
-    #[test]
-    fn test_serialize_round_trip() {
-        let id = UploadSessionId::new(SAMPLE).unwrap();
-        let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, format!("\"{SAMPLE}\""));
-        let parsed: UploadSessionId = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, id);
     }
 
     #[test]

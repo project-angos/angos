@@ -8,7 +8,8 @@ pub mod scan;
 
 use argh::FromArgs;
 
-use crate::{command::maintenance::Error, configuration::Configuration};
+use crate::command::maintenance::Error;
+use crate::configuration::Configuration;
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(

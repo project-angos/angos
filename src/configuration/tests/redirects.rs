@@ -1,7 +1,5 @@
-use crate::{
-    configuration::{Configuration, GlobalConfig},
-    test_fixtures::configuration::config_toml,
-};
+use crate::configuration::{Configuration, GlobalConfig};
+use crate::test_fixtures::configuration::config_toml;
 
 #[test]
 fn redirect_flags_default_to_true() {

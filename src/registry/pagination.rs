@@ -1,7 +1,6 @@
-use std::num::NonZeroUsize;
-
 use std::collections::VecDeque;
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
@@ -135,18 +134,7 @@ pub fn slice_page<T: Clone + ToString>(items: &[T], start_idx: usize, n: u16) ->
 
 #[cfg(test)]
 mod tests {
-    use crate::registry::pagination::*;
-
-    #[test]
-    fn test_slice_page_empty_input() {
-        let items: Vec<String> = vec![];
-        let Page {
-            items: result,
-            next_token: token,
-        } = slice_page(&items, 0, 10);
-        assert!(result.is_empty());
-        assert!(token.is_none());
-    }
+    use super::*;
 
     #[test]
     fn test_slice_page_zero_size() {

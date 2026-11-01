@@ -4,11 +4,11 @@ use bytes::Bytes;
 
 use angos_oci::{Digest, Namespace, Tag, UploadSessionId};
 
-use crate::{
-    jobs::{JobState, Queue},
-    registry::{blob_store::OrphanMultipartUpload, metadata_store::LinkKind},
-};
-use crate::{layer::IndexLayerPayload, scan::ScanImagePayload};
+use crate::jobs::{JobState, Queue};
+use crate::layer::IndexLayerPayload;
+use crate::registry::blob_store::OrphanMultipartUpload;
+use crate::registry::metadata_store::LinkKind;
+use crate::scan::ScanImagePayload;
 
 /// Root prefix quarantined keys are moved under, preserving their original
 /// path below it. The walk knows the prefix, so quarantined objects are never

@@ -3,20 +3,20 @@
 //! live here; which keys a request writes, and in what order, is the OCI
 //! service's to decide.
 
-use std::{
-    fmt::{self, Display, Formatter},
-    num::{NonZeroU32, NonZeroUsize},
-    sync::Arc,
-};
+use std::fmt::{self, Display, Formatter};
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, de::Error as DeError};
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer};
 use tracing::instrument;
 
 use angos_oci::{Descriptor, Digest, MediaType, Namespace, Reference, Tag};
 use angos_storage::ObjectStore;
 
-use crate::registry::{Error, keys::REPOS_ROOT, pagination};
+use crate::registry::keys::REPOS_ROOT;
+use crate::registry::{Error, pagination};
 
 pub mod access_time;
 mod blob_index;
@@ -50,9 +50,9 @@ pub enum LinkKind {
     ReferencedBy(Digest),
 }
 
-impl LinkKind {
-    /// The link a client names by tag or by digest.
-    pub fn from_reference(reference: &Reference) -> Self {
+/// The link a client names by tag or by digest.
+impl From<&Reference> for LinkKind {
+    fn from(reference: &Reference) -> Self {
         match reference {
             Reference::Tag(s) => LinkKind::Tag(s.clone()),
             Reference::Digest(d) => LinkKind::Digest(d.clone()),
@@ -304,10 +304,11 @@ impl MetadataStore {
 mod tests {
     use angos_oci::{MediaType, Namespace, Tag};
 
-    use crate::registry::{
-        Error,
-        metadata_store::{LinkKind, record::RevisionRecord},
-        test_utils::{create_link, drop_links, for_each_backend, put_blob_direct, seed_links},
+    use crate::registry::Error;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::metadata_store::record::RevisionRecord;
+    use crate::registry::test_utils::{
+        create_link, drop_links, for_each_backend, put_blob_direct, seed_links,
     };
 
     /// A tag and a revision written by `write_link` read back with the target

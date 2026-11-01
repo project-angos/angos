@@ -9,7 +9,8 @@ use angos_storage::fs::Backend as FsBackend;
 use angos_storage::s3::Backend as S3Store;
 use angos_storage::{Error as StorageError, ObjectStore, paginated};
 use bytes::Bytes;
-use futures_util::{TryStreamExt, stream};
+use futures_util::TryStreamExt;
+use futures_util::stream;
 use sha2::{Digest, Sha256};
 
 use crate::error::{GateError, GateResult};
@@ -41,15 +42,18 @@ impl GateStore {
         let store: Arc<dyn ObjectStore> = match mode.as_str() {
             "fs" => {
                 let root = require_env("GATE_DATA_ROOT")?;
-                Arc::new(FsBackend::builder(root).build())
+                Arc::new(FsBackend::builder(Path::new(&root)).build())
             }
             "s3" => {
                 let config = BackendConfig {
                     endpoint: require_env("GATE_ENDPOINT")?,
                     bucket: require_env("GATE_BUCKET")?,
-                    access_key_id: env_or("AWS_ACCESS_KEY_ID", "root"),
-                    secret_key: env_or("AWS_SECRET_ACCESS_KEY", "roottoor"),
-                    region: env_or("AWS_DEFAULT_REGION", "us-east-1"),
+                    access_key_id: env::var("AWS_ACCESS_KEY_ID")
+                        .unwrap_or_else(|_| "root".to_string()),
+                    secret_key: env::var("AWS_SECRET_ACCESS_KEY")
+                        .unwrap_or_else(|_| "roottoor".to_string()),
+                    region: env::var("AWS_DEFAULT_REGION")
+                        .unwrap_or_else(|_| "us-east-1".to_string()),
                     ..BackendConfig::default()
                 };
                 let client = S3Client::new(&config)?;
@@ -93,8 +97,8 @@ impl GateStore {
     }
 
     /// Write raw bytes at `key`, creating or replacing the object.
-    pub async fn put(&self, key: &str, body: impl Into<Bytes>) -> GateResult<()> {
-        self.store.put(key, body.into()).await?;
+    pub async fn put(&self, key: &str, body: &[u8]) -> GateResult<()> {
+        self.store.put(key, Bytes::copy_from_slice(body)).await?;
         Ok(())
     }
 
@@ -113,8 +117,7 @@ impl GateStore {
     /// Every key under `prefix`, across pages.
     pub async fn keys_under(&self, prefix: &str) -> GateResult<Vec<String>> {
         paginated(|token| async move {
-            let page = self.store.list(prefix, LIST_PAGE_SIZE, token).await?;
-            Ok::<_, GateError>((page.items, page.next_token))
+            Ok::<_, GateError>(self.store.list(prefix, LIST_PAGE_SIZE, token).await?)
         })
         .try_collect()
         .await
@@ -163,8 +166,7 @@ impl GateStore {
     /// listing straight into up to `SNAPSHOT_CONCURRENCY` concurrent reads.
     pub async fn snapshot(&self) -> GateResult<Snapshot> {
         paginated(|token| async move {
-            let page = self.store.list("", LIST_PAGE_SIZE, token).await?;
-            Ok::<_, GateError>((page.items, page.next_token))
+            Ok::<_, GateError>(self.store.list("", LIST_PAGE_SIZE, token).await?)
         })
         .map_ok(|key| {
             let store = Arc::clone(&self.store);
@@ -215,8 +217,4 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 fn require_env(name: &str) -> GateResult<String> {
     env::var(name).map_err(|_| GateError::Environment(format!("{name} must be set")))
-}
-
-fn env_or(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_string())
 }

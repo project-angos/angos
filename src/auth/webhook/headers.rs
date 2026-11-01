@@ -1,12 +1,10 @@
-use std::str::FromStr;
-
-use http::{HeaderMap, HeaderName, HeaderValue, request::Parts};
+use http::request::Parts;
+use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 
-use crate::{
-    auth::Error,
-    identity::{Action, ClientIdentity, RequestScheme},
-};
+use crate::auth::Error;
+use crate::auth::webhook::config::ForwardHeader;
+use crate::identity::{Action, ClientIdentity, RequestScheme};
 
 static X_FORWARDED_METHOD: &str = "X-Forwarded-Method";
 static X_FORWARDED_PROTO: &str = "X-Forwarded-Proto";
@@ -24,18 +22,13 @@ static X_REGISTRY_CERTIFICATE_O: &str = "X-Registry-Certificate-O";
 static X_REGISTRY_OIDC_PROVIDER: &str = "X-Registry-OIDC-Provider";
 static X_REGISTRY_OIDC_SUBJECT: &str = "X-Registry-OIDC-Subject";
 
-pub fn build_header_name(name: &str) -> Result<HeaderName, Error> {
-    HeaderName::from_str(name)
-        .map_err(|e| Error::Execution(format!("Invalid header name '{name}': {e}")))
-}
-
 pub fn build_header_value(value: &str) -> Result<HeaderValue, Error> {
     HeaderValue::from_str(value)
         .map_err(|e| Error::Execution(format!("Invalid header value '{value}': {e}")))
 }
 
 pub fn build_headers(
-    forward_headers: &[String],
+    forward_headers: &[ForwardHeader],
     action: &Action,
     identity: &ClientIdentity,
     parts: &Parts,
@@ -63,16 +56,16 @@ pub fn build_headers(
 
     // The registry action under authorization.
     headers.insert(X_REGISTRY_ACTION, build_header_value(action.action_name())?);
-    if let Some(namespace) = action.get_namespace() {
+    if let Some(namespace) = action.namespace() {
         headers.insert(X_REGISTRY_NAMESPACE, build_header_value(namespace)?);
     }
-    if let Some(reference) = action.get_reference() {
+    if let Some(reference) = action.reference() {
         headers.insert(
             X_REGISTRY_REFERENCE,
             build_header_value(&reference.to_string())?,
         );
     }
-    if let Some(digest) = action.get_digest() {
+    if let Some(digest) = action.digest() {
         headers.insert(X_REGISTRY_DIGEST, build_header_value(&digest.to_string())?);
     }
 
@@ -103,9 +96,9 @@ pub fn build_headers(
 
     // Operator-selected client headers, forwarded verbatim. A repeated header
     // carries every one of its values.
-    for name in forward_headers {
-        for value in parts.headers.get_all(name) {
-            headers.append(build_header_name(name)?, value.clone());
+    for header in forward_headers {
+        for value in parts.headers.get_all(header.name()) {
+            headers.append(header.name().clone(), value.clone());
         }
     }
 
@@ -116,17 +109,15 @@ pub fn build_headers(
 mod tests {
     use std::collections::HashMap;
 
-    use http::{Request, request::Parts};
+    use http::Request;
+    use http::request::Parts;
     use serde_json::json;
 
     use angos_oci::{Namespace, Reference, Tag};
 
+    use crate::auth::webhook::config::ForwardHeader;
     use crate::auth::webhook::headers::build_headers;
     use crate::identity::{Action, ClientIdentity, OidcClaims, RequestScheme};
-
-    fn anonymous() -> ClientIdentity {
-        ClientIdentity::new(None)
-    }
 
     fn identity_with_oidc(provider_name: &str, subject: &str) -> ClientIdentity {
         let mut id = ClientIdentity::new(None);
@@ -159,16 +150,17 @@ mod tests {
         // extension; the webhook must forward that, not the listener's raw one.
         let mut parts = parts_with_headers(&[]);
         parts.extensions.insert(RequestScheme::Https);
-        let headers = build_headers(&[], &get_manifest("v1"), &anonymous(), &parts).unwrap();
+        let headers =
+            build_headers(&[], &get_manifest("v1"), &ClientIdentity::new(None), &parts).unwrap();
         assert_eq!(headers.get("X-Forwarded-Proto").unwrap(), "https");
     }
 
     #[test]
     fn every_value_of_a_repeated_forwarded_header_is_kept() {
         let headers = build_headers(
-            &["X-Tenant".to_string()],
+            &[ForwardHeader::try_from("X-Tenant".to_string()).unwrap()],
             &Action::ApiVersion,
-            &anonymous(),
+            &ClientIdentity::new(None),
             &parts_with_headers(&[("X-Tenant", "tenant-a"), ("X-Tenant", "tenant-b")]),
         )
         .unwrap();

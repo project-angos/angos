@@ -10,7 +10,8 @@
 
 use std::io::Cursor;
 
-use base64::{Engine, prelude::BASE64_STANDARD};
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use futures_util::stream::Stream;
@@ -19,17 +20,12 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tracing::{instrument, warn};
 
 use angos_oci::{Algorithm, Digest, Namespace, UploadSessionId};
-use angos_storage::{Error as StorageError, paginated};
+use angos_storage::{Error as StorageError, Page, paginated};
 
-use crate::registry::{
-    Error,
-    blob_store::{
-        BlobStore, UploadSummary,
-        hashing::{HashState, Hasher, HashingReader, hashing_stream},
-    },
-    keys::{DigestKeys, NamespaceKeys, REPOS_ROOT},
-    pagination,
-};
+use crate::registry::blob_store::hashing::{HashState, Hasher, HashingReader, hashing_stream};
+use crate::registry::blob_store::{BlobStore, UploadSummary};
+use crate::registry::keys::{DigestExt, NamespaceExt, REPOS_ROOT};
+use crate::registry::{Error, pagination};
 
 /// Bytes peeked from a chunked (`None`) body to tell an empty finalize from
 /// one carrying data.
@@ -118,12 +114,15 @@ impl BlobStore {
             async move {
                 let page = self.object.list_children(&root, 1000, token, None).await?;
                 // A directory naming no session is scrub's to quarantine.
-                let sessions = page
+                let sessions: Vec<UploadSessionId> = page
                     .sub_prefixes
                     .iter()
                     .filter_map(|name| name.parse().ok())
                     .collect();
-                Ok((sessions, page.next_token))
+                Ok(Page {
+                    items: sessions,
+                    next_token: page.next_token,
+                })
             }
         })
     }

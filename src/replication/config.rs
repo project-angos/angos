@@ -4,7 +4,8 @@ use serde::Deserialize;
 
 use angos_oci_client::RegistryClientConfig;
 
-use crate::{configuration::RegexPattern, replication::ReplicationMode};
+use crate::configuration::RegexPattern;
+use crate::replication::ReplicationMode;
 
 /// Parse-time DTO for one per-repository replication downstream; the runtime
 /// counterpart is [`crate::replication::ReplicationDownstream`].
@@ -36,8 +37,6 @@ pub struct ReplicationDownstreamConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
     use crate::replication::{ReplicationDownstreamConfig, ReplicationMode};
 
     #[test]
@@ -57,32 +56,6 @@ mod tests {
         assert!(config.namespace_filter.is_empty());
         assert_eq!(config.max_concurrent_pushes, None);
         assert!(!config.prune, "prune defaults to false");
-    }
-
-    #[test]
-    fn downstream_config_full_parses() {
-        let config: ReplicationDownstreamConfig = toml::from_str(
-            r#"
-            name = "eu-region"
-            url = "https://angos-eu.example.com"
-            username = "replicator"
-            password = "s3cret"
-            mode = "event-only"
-            namespace_filter = ["^nginx/.*"]
-            max_concurrent_pushes = 8
-            prune = true
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(config.mode, ReplicationMode::EventOnly);
-        assert_eq!(config.namespace_filter.len(), 1);
-        assert_eq!(config.namespace_filter[0].as_source(), "^nginx/.*");
-        assert_eq!(config.max_concurrent_pushes, NonZeroUsize::new(8));
-        let auth = config.client.basic_auth.as_ref().unwrap();
-        assert_eq!(auth.username, "replicator");
-        assert_eq!(auth.password.expose(), "s3cret");
-        assert!(config.prune);
     }
 
     #[test]

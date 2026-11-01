@@ -1,15 +1,15 @@
 use std::time::Duration;
 
-use http::{HeaderMap, request::Parts};
-use reqwest::{Client, StatusCode};
+use http::HeaderMap;
+use http::request::Parts;
+use reqwest::{Client, Error as ReqwestError, Response, StatusCode};
 use tracing::warn;
 
-use crate::{
-    auth::Error,
-    auth::webhook::{config::Config, headers::build_headers},
-    identity::{Action, ClientIdentity},
-    metrics_provider::metrics_provider,
-};
+use crate::auth::Error;
+use crate::auth::webhook::config::Config;
+use crate::auth::webhook::headers::build_headers;
+use crate::identity::{Action, ClientIdentity};
+use crate::metrics_provider::metrics_provider;
 
 pub struct WebhookAuthorizer {
     name: String,
@@ -22,17 +22,15 @@ impl WebhookAuthorizer {
         &self.name
     }
 
-    pub fn new(name: String, config: Config, client: Client) -> Result<Self, Error> {
-        config.validate().map_err(Error::Initialization)?;
-
-        Ok(Self {
+    pub fn new(name: String, config: Config, client: Client) -> Self {
+        Self {
             name,
             config,
             client,
-        })
+        }
     }
 
-    async fn do_request(&self, headers: &HeaderMap) -> Result<reqwest::Response, reqwest::Error> {
+    async fn do_request(&self, headers: &HeaderMap) -> Result<Response, ReqwestError> {
         let mut request = self
             .client
             .get(self.config.url.clone())

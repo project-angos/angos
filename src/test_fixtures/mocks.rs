@@ -2,10 +2,8 @@
 //! the OIDC JWKS endpoint and the downstream registry blob API.
 
 use serde_json::{Value, json};
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use angos_oci::Digest;
 use angos_oci::header::DOCKER_CONTENT_DIGEST;

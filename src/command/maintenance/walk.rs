@@ -1,16 +1,15 @@
 //! Raw-key walk over one object store, with bounded per-key concurrency.
 
 use std::future::Future;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::TryStreamExt;
 
 use angos_storage::ObjectStore;
 
-use crate::{command::maintenance::error::Error, registry::Error as RegistryError};
+use crate::command::maintenance::error::Error;
+use crate::registry::Error as RegistryError;
 
 /// Run `process` over every key under `prefix` in `store`, at most
 /// `concurrency` keys in flight at once. Keys are absolute (the prefix is

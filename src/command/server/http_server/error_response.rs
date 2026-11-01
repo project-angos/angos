@@ -1,9 +1,7 @@
 use http_body_util::Full;
-use hyper::{
-    Response, StatusCode,
-    body::Bytes,
-    header::{ALLOW, CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE},
-};
+use hyper::body::Bytes;
+use hyper::header::{ALLOW, CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE};
+use hyper::{Response, StatusCode};
 
 use angos_oci::response::{ErrorCode, RECLAMATION_IN_PROGRESS_CODE};
 use angos_transport::ResponseBody;
@@ -17,7 +15,7 @@ const BASIC_AUTH_CHALLENGE: &str = r#"Basic realm="Angos", charset="UTF-8""#;
 /// is that registry's refusal, and our realm would buy the client nothing.
 pub fn error_to_response(
     error: &Error,
-    request_id: Option<&String>,
+    request_id: Option<&str>,
     challenge: Option<HeaderValue>,
 ) -> Response<ResponseBody> {
     let Ok(body) = serde_json::to_vec(&error.error_body(request_id)) else {

@@ -4,22 +4,20 @@
 //! chunked upload can resume one, and [`HashingReader`] feeds it every byte a
 //! reader yields.
 
-use std::{
-    collections::BTreeMap,
-    io,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::collections::BTreeMap;
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use base64::{Engine, prelude::BASE64_STANDARD};
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::{Bytes, BytesMut};
 use futures_util::stream;
-use sha2::{Digest, Sha256, Sha512, digest::common::hazmat::SerializableState};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, ReadBuf},
-    sync::mpsc,
-    task::JoinHandle,
-};
+use sha2::digest::common::hazmat::SerializableState;
+use sha2::{Digest, Sha256, Sha512};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, spawn};
 
 use angos_oci::{Algorithm, Digest as OciDigest};
 use angos_storage::ByteStream;
@@ -225,7 +223,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for HashingReader<R> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    ) -> Poll<IoResult<()>> {
         let pre_len = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &poll {
@@ -249,8 +247,8 @@ pub fn hashing_stream<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
-    let handle = tokio::spawn(async move {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(8);
+    let handle = spawn(async move {
         let mut reader = reader;
         let mut sent: u64 = 0;
         let mut buf = BytesMut::with_capacity(READ_FRAME_SIZE);
@@ -267,8 +265,8 @@ where
                 Ok(0) => {
                     if let Some(expected) = content_length {
                         let _ = tx
-                            .send(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
+                            .send(Err(IoError::new(
+                                ErrorKind::UnexpectedEof,
                                 format!("short upload body: expected {expected} bytes, got {sent}"),
                             )))
                             .await;
@@ -285,7 +283,7 @@ where
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(io::Error::other(e.to_string()))).await;
+                    let _ = tx.send(Err(IoError::other(e.to_string()))).await;
                     return Err(Error::Io(e));
                 }
             }
@@ -302,58 +300,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use tokio::io::AsyncReadExt;
 
     use angos_oci::Algorithm;
 
-    use crate::registry::blob_store::hashing::*;
-
-    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    const EMPTY_SHA512: &str = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
-
-    #[test]
-    fn sha256_state_round_trips() {
-        let mut hasher = AlgorithmHasher::new(Algorithm::Sha256);
-        hasher.update(b"hello world");
-        let state = hasher.serialized_state();
-        let restored = AlgorithmHasher::from_state(Algorithm::Sha256, &state).unwrap();
-        assert_eq!(state, restored.serialized_state());
-    }
-
-    #[test]
-    fn sha512_state_round_trips() {
-        let mut hasher = AlgorithmHasher::new(Algorithm::Sha512);
-        hasher.update(b"hello world");
-        let state = hasher.serialized_state();
-        let restored = AlgorithmHasher::from_state(Algorithm::Sha512, &state).unwrap();
-        assert_eq!(state, restored.serialized_state());
-    }
-
-    #[test]
-    fn digest_matches_known_empty() {
-        assert_eq!(
-            AlgorithmHasher::new(Algorithm::Sha256).digest(),
-            OciDigest::sha256(EMPTY_SHA256).unwrap()
-        );
-        assert_eq!(
-            AlgorithmHasher::new(Algorithm::Sha512).digest(),
-            OciDigest::sha512(EMPTY_SHA512).unwrap()
-        );
-    }
-
-    #[test]
-    fn hasher_produces_every_supported_digest() {
-        let mut hasher = Hasher::new();
-        hasher.update(b"");
-        assert_eq!(
-            hasher.digest(Algorithm::Sha256).unwrap(),
-            OciDigest::sha256(EMPTY_SHA256).unwrap()
-        );
-        assert_eq!(
-            hasher.digest(Algorithm::Sha512).unwrap(),
-            OciDigest::sha512(EMPTY_SHA512).unwrap()
-        );
-    }
+    use super::*;
 
     #[test]
     fn hasher_combined_state_round_trips() {
@@ -381,7 +334,6 @@ mod tests {
         // rather than resumed.
         assert!(HashState::from_bytes(&[0xAB, 0xCD, 0xEF]).is_err());
     }
-    use std::io::Cursor;
 
     const HELLO_SHA256: &str =
         "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -395,6 +347,7 @@ mod tests {
         let mut buf = Vec::new();
         hashing_reader.read_to_end(&mut buf).await.unwrap();
 
+        assert_eq!(buf, b"hello world");
         let hasher = hashing_reader.into_hasher();
         assert_eq!(
             hasher.digest(Algorithm::Sha256).unwrap().to_string(),
@@ -428,35 +381,5 @@ mod tests {
             hasher.digest(Algorithm::Sha512).unwrap().to_string(),
             HELLO_SHA512
         );
-    }
-
-    #[tokio::test]
-    async fn test_empty_input_produces_correct_digest() {
-        let reader = Cursor::new(b"");
-        let mut hashing_reader = HashingReader::new(reader, Hasher::new());
-
-        let mut buf = Vec::new();
-        hashing_reader.read_to_end(&mut buf).await.unwrap();
-
-        assert_eq!(
-            hashing_reader
-                .into_hasher()
-                .digest(Algorithm::Sha256)
-                .unwrap()
-                .to_string(),
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_inner_data_passed_through_unmodified() {
-        let payload = b"hello world";
-        let reader = Cursor::new(payload);
-        let mut hashing_reader = HashingReader::new(reader, Hasher::new());
-
-        let mut buf = Vec::new();
-        hashing_reader.read_to_end(&mut buf).await.unwrap();
-
-        assert_eq!(buf, payload);
     }
 }

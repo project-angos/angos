@@ -1,20 +1,24 @@
 mod classify;
 
-use std::{
-    collections::HashSet,
-    fs,
-    path::{Path, PathBuf, absolute},
-    sync::Arc,
-    time::Duration,
-};
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf, absolute};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use classify::{ChangeKind, classify_event, merge_change_kind};
-use notify::{Event, RecursiveMode, Watcher};
-use tokio::{spawn, sync::mpsc, task::JoinHandle, time::timeout};
+use notify::{
+    Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher,
+};
+use tokio::spawn;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-use crate::configuration::{Configuration, Error, ServerConfig, listeners::ServerTlsConfig};
+use crate::configuration::listeners::ServerTlsConfig;
+use crate::configuration::{Configuration, Error, ServerConfig};
 
 /// Window during which filesystem events are coalesced into a single reload.
 /// Editors typically emit several `Modify`/`Create`/`Remove` events per save
@@ -90,7 +94,7 @@ impl ConfigWatcher {
     }
 }
 
-fn handle_notify_result(res: Result<Event, notify::Error>, tx: &mpsc::Sender<Event>) {
+fn handle_notify_result(res: Result<Event, NotifyError>, tx: &mpsc::Sender<Event>) {
     match res {
         Ok(event) => {
             let _ = tx.blocking_send(event);
@@ -188,8 +192,8 @@ fn build_watcher(
     config_dirs: &HashSet<PathBuf>,
     tls_dirs: &HashSet<PathBuf>,
     tx: mpsc::Sender<Event>,
-) -> Result<notify::RecommendedWatcher, Error> {
-    let mut watcher = notify::recommended_watcher(move |res| handle_notify_result(res, &tx))?;
+) -> Result<RecommendedWatcher, Error> {
+    let mut watcher = recommended_watcher(move |res| handle_notify_result(res, &tx))?;
     for dir in config_dirs {
         watcher.watch(dir, RecursiveMode::NonRecursive)?;
     }
@@ -213,7 +217,7 @@ struct WatchedDirs {
 
 impl WatchedDirs {
     fn new(raw: HashSet<PathBuf>) -> Self {
-        let matchable = raw.iter().flat_map(|dir| match_forms(dir)).collect();
+        let matchable: HashSet<PathBuf> = raw.iter().flat_map(|dir| match_forms(dir)).collect();
         Self { raw, matchable }
     }
 }
@@ -229,8 +233,9 @@ struct WatchedConfig {
 
 impl WatchedConfig {
     fn new(paths: Vec<PathBuf>) -> Self {
-        let matchable_paths = paths.iter().flat_map(|path| match_forms(path)).collect();
-        let dirs = paths.iter().map(|path| parent_dir(path)).collect();
+        let matchable_paths: HashSet<PathBuf> =
+            paths.iter().flat_map(|path| match_forms(path)).collect();
+        let dirs: HashSet<PathBuf> = paths.iter().map(|path| parent_dir(path)).collect();
         Self {
             paths,
             matchable_paths,
@@ -273,7 +278,7 @@ struct WatchState<'a> {
     tls_dirs: WatchedDirs,
     cached_config: &'a mut Option<Configuration>,
     notifier: &'a dyn ConfigNotifier,
-    _watcher: notify::RecommendedWatcher,
+    _watcher: RecommendedWatcher,
 }
 
 /// Why [`run_event_loop`] handed control back to [`watch_config_loop`].

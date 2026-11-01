@@ -1,11 +1,8 @@
-use std::{
-    fmt,
-    fmt::{Display, Formatter},
-    str::FromStr,
-};
+use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
 
 use http::header::{HeaderValue, InvalidHeaderValue};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest as Sha2Digest, Sha256, Sha512};
 
 use crate::types::Error;
@@ -69,7 +66,7 @@ impl FromStr for Algorithm {
         match s {
             "sha256" => Ok(Algorithm::Sha256),
             "sha512" => Ok(Algorithm::Sha512),
-            other => Err(Error::InvalidDigest(format!(
+            other => Err(Error::Digest(format!(
                 "Unsupported digest algorithm '{other}'"
             ))),
         }
@@ -115,10 +112,20 @@ impl Digest {
     ///
     /// Returns an error when `hash` is not the algorithm's exact length in
     /// lowercase hex.
-    pub fn with_algorithm(algorithm: Algorithm, hash: impl Into<Box<str>>) -> Result<Self, Error> {
-        let hash = hash.into();
-        validate_hex(algorithm, &hash)?;
-        Ok(Digest { algorithm, hash })
+    pub fn with_algorithm(algorithm: Algorithm, hash: &str) -> Result<Self, Error> {
+        // Uppercase hex MUST NOT be used per the OCI image spec.
+        if hash.len() != algorithm.hex_len()
+            || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(Error::Digest(format!(
+                "Invalid {} hash '{hash}'",
+                algorithm.as_str()
+            )));
+        }
+        Ok(Digest {
+            algorithm,
+            hash: hash.into(),
+        })
     }
 
     /// Build a sha256 digest from a bare hash.
@@ -126,7 +133,7 @@ impl Digest {
     /// # Errors
     ///
     /// Returns an error when `hash` is not 64 lowercase hex characters.
-    pub fn sha256(hash: impl Into<Box<str>>) -> Result<Self, Error> {
+    pub fn sha256(hash: &str) -> Result<Self, Error> {
         Self::with_algorithm(Algorithm::Sha256, hash)
     }
 
@@ -135,7 +142,7 @@ impl Digest {
     /// # Errors
     ///
     /// Returns an error when `hash` is not 128 lowercase hex characters.
-    pub fn sha512(hash: impl Into<Box<str>>) -> Result<Self, Error> {
+    pub fn sha512(hash: &str) -> Result<Self, Error> {
         Self::with_algorithm(Algorithm::Sha512, hash)
     }
 
@@ -163,20 +170,6 @@ impl Digest {
     }
 }
 
-/// Validate a bare hash: exactly `algorithm.hex_len()` lowercase hex chars
-/// (`/[a-f0-9]+/`; uppercase MUST NOT be used per the OCI image spec).
-fn validate_hex(algorithm: Algorithm, hash: &str) -> Result<(), Error> {
-    if hash.len() != algorithm.hex_len()
-        || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err(Error::InvalidDigest(format!(
-            "Invalid {} hash '{hash}'",
-            algorithm.as_str()
-        )));
-    }
-    Ok(())
-}
-
 impl FromStr for Digest {
     type Err = Error;
 
@@ -190,7 +183,7 @@ impl TryFrom<&str> for Digest {
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         let (algorithm, hash) = s.split_once(':').ok_or_else(|| {
-            Error::InvalidDigest(format!(
+            Error::Digest(format!(
                 "Digest must be in the format 'algorithm:hash', got '{s}'"
             ))
         })?;
@@ -217,7 +210,7 @@ impl Display for Digest {
 impl Serialize for Digest {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
         serializer.serialize_str(&self.to_string())
     }
@@ -235,7 +228,7 @@ impl TryFrom<&Digest> for HeaderValue {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::digest::*;
+    use super::*;
 
     const VALID_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const VALID_HASH_512: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -246,21 +239,6 @@ mod tests {
         assert_eq!(digest.algorithm(), Algorithm::Sha256);
         assert_eq!(digest.hash(), VALID_HASH);
         assert_eq!(digest.hash_prefix(), "01");
-    }
-
-    #[test]
-    fn test_parse_sha512() {
-        let digest = Digest::from_str(&format!("sha512:{VALID_HASH_512}")).unwrap();
-        assert_eq!(digest.algorithm(), Algorithm::Sha512);
-        assert_eq!(digest.hash(), VALID_HASH_512);
-        assert_eq!(digest.hash_prefix(), "01");
-    }
-
-    #[test]
-    fn test_algorithm_as_str_and_display() {
-        assert_eq!(Algorithm::Sha256.as_str(), "sha256");
-        assert_eq!(Algorithm::Sha512.as_str(), "sha512");
-        assert_eq!(Algorithm::Sha512.to_string(), "sha512");
     }
 
     /// The image spec spells both the algorithm and the encoded hash in
@@ -280,18 +258,21 @@ mod tests {
             // 128 is a valid sha512 but too long for sha256.
             format!("sha512:{VALID_HASH}"),
             format!("sha256:{VALID_HASH_512}"),
+            // Missing or extra pieces around the `algorithm:hash` split.
+            String::new(),
+            "sha256nocolon".to_string(),
+            format!(":{VALID_HASH}"),
+            "sha256:".to_string(),
+            format!("sha256:{}", "z".repeat(64)),
+            format!("sha256:abc:{VALID_HASH}"),
+            format!(" sha256:{VALID_HASH}"),
+            format!("sha256:{VALID_HASH}\n"),
         ] {
             assert!(
                 Digest::from_str(&value).is_err(),
                 "'{value}' is not a digest the image spec defines"
             );
         }
-    }
-
-    #[test]
-    fn test_display() {
-        let digest = Digest::sha256(VALID_HASH).unwrap();
-        assert_eq!(digest.to_string(), format!("sha256:{VALID_HASH}"));
     }
 
     #[test]
@@ -314,94 +295,5 @@ mod tests {
         let digest = Digest::from_bytes(Algorithm::Sha512, b"");
         let expected = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
         assert_eq!(digest, Digest::sha512(expected).unwrap());
-    }
-
-    #[test]
-    fn test_rejects_empty_string() {
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str("") else {
-            panic!("expected error");
-        };
-        assert!(msg.contains("''"), "msg: {msg}");
-    }
-
-    #[test]
-    fn test_rejects_no_colon() {
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str("sha256nocolon") else {
-            panic!("expected error");
-        };
-        assert!(msg.contains("'sha256nocolon'"), "msg: {msg}");
-    }
-
-    #[test]
-    fn test_rejects_empty_algorithm() {
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!(":{VALID_HASH}")) else {
-            panic!("expected error");
-        };
-        assert_eq!(msg, "Unsupported digest algorithm ''");
-    }
-
-    #[test]
-    fn test_rejects_empty_hash() {
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str("sha256:") else {
-            panic!("expected error");
-        };
-        assert_eq!(msg, "Invalid sha256 hash ''");
-    }
-
-    #[test]
-    fn test_rejects_invalid_hex_chars() {
-        let invalid_hash = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!("sha256:{invalid_hash}"))
-        else {
-            panic!("expected error");
-        };
-        assert!(msg.contains(invalid_hash), "msg: {msg}");
-    }
-
-    #[test]
-    fn test_rejects_hash_too_short() {
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str("sha256:abc") else {
-            panic!("expected error");
-        };
-        assert!(msg.contains("'abc'"), "msg: {msg}");
-    }
-
-    #[test]
-    fn test_rejects_hash_too_long() {
-        let long_hash = format!("{VALID_HASH}a");
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!("sha256:{long_hash}"))
-        else {
-            panic!("expected error");
-        };
-        assert!(msg.contains(&long_hash), "msg: {msg}");
-    }
-
-    #[test]
-    fn test_rejects_multiple_colons() {
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!("sha256:abc:{VALID_HASH}"))
-        else {
-            panic!("expected error");
-        };
-        assert!(msg.contains(&format!("'abc:{VALID_HASH}'")), "msg: {msg}");
-    }
-
-    #[test]
-    fn test_rejects_leading_whitespace() {
-        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!(" sha256:{VALID_HASH}"))
-        else {
-            panic!("expected error");
-        };
-        assert!(msg.contains("' sha256'"), "msg: {msg}");
-    }
-
-    #[test]
-    fn test_rejects_trailing_newline() {
-        let hash_with_newline = format!("{VALID_HASH}\n");
-        let Err(Error::InvalidDigest(msg)) =
-            Digest::from_str(&format!("sha256:{hash_with_newline}"))
-        else {
-            panic!("expected error");
-        };
-        assert!(msg.contains(&hash_with_newline), "msg: {msg}");
     }
 }

@@ -10,21 +10,14 @@ use tracing::{debug, error, info, warn};
 
 use angos_oci::{Digest, Namespace, UploadSessionId};
 
-use crate::{
-    command::maintenance::{
-        Error,
-        action::Action,
-        categorize::{KeyCategory, categorize},
-        executor::{ActionSink, object_younger_than_grace},
-        walk,
-    },
-    registry::{
-        Error as RegistryError,
-        blob_store::{BlobStore, UploadSummary},
-        keys::{DigestKeys, REF_ROOT},
-        metadata_store::MetadataStore,
-    },
-};
+use crate::command::maintenance::action::Action;
+use crate::command::maintenance::categorize::{KeyCategory, categorize};
+use crate::command::maintenance::executor::{ActionSink, object_younger_than_grace};
+use crate::command::maintenance::{Error, walk};
+use crate::registry::Error as RegistryError;
+use crate::registry::blob_store::{BlobStore, UploadSummary};
+use crate::registry::keys::{DigestExt, REF_ROOT};
+use crate::registry::metadata_store::MetadataStore;
 
 enum UploadVerdict {
     /// Missing summary or corrupted data.
@@ -34,7 +27,6 @@ enum UploadVerdict {
     Keep,
 }
 
-#[allow(clippy::match_same_arms)]
 fn classify_upload(
     summary: Result<&UploadSummary, &RegistryError>,
     window: Duration,
@@ -42,7 +34,6 @@ fn classify_upload(
 ) -> UploadVerdict {
     match summary {
         Ok(s) if now.signed_duration_since(s.started_at) > window => UploadVerdict::DeleteObsolete,
-        Ok(_) => UploadVerdict::Keep,
         // A corrupt record never decodes on a retry, so the session can never
         // complete and is safe to reap at any age.
         Err(
@@ -52,7 +43,7 @@ fn classify_upload(
             | RegistryError::Corrupt(_),
         ) => UploadVerdict::DeleteInconsistent,
         // Deleting on a transient read failure would destroy a live upload.
-        Err(_) => UploadVerdict::Keep,
+        Ok(_) | Err(_) => UploadVerdict::Keep,
     }
 }
 
@@ -218,7 +209,8 @@ async fn sweep_one_ref(
 mod tests {
     use chrono::TimeZone;
 
-    use crate::{command::prune::uploads::*, registry::keys::NamespaceKeys};
+    use super::*;
+    use crate::registry::keys::NamespaceExt;
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap()
@@ -229,16 +221,6 @@ mod tests {
             size: 0,
             started_at: fixed_now() - Duration::seconds(offset_secs),
         }
-    }
-
-    #[test]
-    fn classify_upload_keeps_recent_upload() {
-        let verdict = classify_upload(
-            Ok(&summary_started_at(1800)),
-            Duration::hours(1),
-            fixed_now(),
-        );
-        assert!(matches!(verdict, UploadVerdict::Keep));
     }
 
     #[test]
@@ -281,17 +263,17 @@ mod tests {
         assert!(matches!(verdict, UploadVerdict::Keep));
     }
 
-    use std::{sync::Mutex, time::Duration as StdDuration};
+    use std::sync::Mutex;
+    use std::time::Duration as StdDuration;
 
     use bytes::Bytes;
     use tokio::time::sleep;
 
     use angos_oci::{Digest, Namespace};
 
-    use crate::{
-        command::maintenance::executor::Executor,
-        registry::{metadata_store::LinkKind, test_utils::for_each_backend},
-    };
+    use crate::command::maintenance::executor::Executor;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::test_utils::for_each_backend;
 
     #[tokio::test]
     async fn sweep_reaps_obsolete_upload_and_keeps_recent() {

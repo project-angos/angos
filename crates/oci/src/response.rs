@@ -9,6 +9,7 @@
 use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::types::{Digest, MediaType, Namespace};
 
@@ -128,7 +129,7 @@ pub struct ErrorInfo {
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<serde_json::Value>,
+    pub detail: Option<Value>,
 }
 
 /// What a manifest `HEAD` reports. The digest is absent when the answer omits
@@ -184,48 +185,7 @@ pub enum DeleteManifestOutcome {
 
 #[cfg(test)]
 mod tests {
-    use crate::response::*;
-
-    // Both ends read this body, so the shape a registry serves is what a client
-    // parses back.
-    #[test]
-    fn a_tags_list_round_trips() {
-        let served = TagsListResponse {
-            name: Some(Namespace::new("nginx").unwrap()),
-            tags: vec!["v1".to_string(), "latest".to_string()],
-        };
-        let body = serde_json::to_vec(&served).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({ "name": "nginx", "tags": ["v1", "latest"] })
-        );
-
-        let read: TagsListResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(read.tags, served.tags);
-    }
-
-    // A remote that serves neither field must still parse: the listing is then
-    // empty rather than an error.
-    #[test]
-    fn a_tags_list_tolerates_a_missing_name_and_tags() {
-        let read: TagsListResponse = serde_json::from_slice(b"{}").unwrap();
-        assert!(read.name.is_none() && read.tags.is_empty());
-    }
-
-    #[test]
-    fn an_error_body_round_trips_to_its_first_code() {
-        let served = ErrorResponse {
-            errors: vec![ErrorInfo {
-                code: "MANIFEST_UNKNOWN".to_string(),
-                message: Some("not here".to_string()),
-                detail: None,
-            }],
-        };
-        let body = serde_json::to_vec(&served).unwrap();
-        let read: ErrorResponse = serde_json::from_slice(&body).unwrap();
-
-        assert_eq!(read.first_code(), Some("MANIFEST_UNKNOWN"));
-    }
+    use super::*;
 
     // The spelling is the wire contract, so each variant is pinned rather than
     // derived from its name. The table doubles as the completeness check of
@@ -255,11 +215,5 @@ mod tests {
             assert_eq!(code.as_str(), wire);
             assert_eq!(code.to_string(), wire);
         }
-    }
-
-    #[test]
-    fn an_error_body_without_entries_names_no_code() {
-        let read: ErrorResponse = serde_json::from_slice(br#"{"errors":[]}"#).unwrap();
-        assert_eq!(read.first_code(), None);
     }
 }

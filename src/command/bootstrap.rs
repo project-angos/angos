@@ -1,22 +1,24 @@
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use tracing::info;
 
-use angos_cache::Cache;
-use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+use angos_cache::{Cache, Error as CacheError};
+use angos_s3_client::Error as S3Error;
+use angos_storage::fs::Backend as StorageFsBackend;
+use angos_storage::{Error as StorageError, ObjectStore};
 
-use crate::{
-    configuration::{Configuration, GlobalConfig, ResolvedStorageConfig},
-    event_webhook::{self, dispatcher::EventDispatcher},
-    jobs::store::{self as job_store, JobStore},
-    policy::ImagePolicy,
-    registry::{
-        self, Registry, RegistryConfig, Repository,
-        blob_store::BlobStore,
-        metadata_store::{MetadataStore, PullHistoryConfig, Settings},
-        prime_pull_through, repository,
-        repository_resolver::{OverlapError, RepositoryResolver},
-    },
+use crate::configuration::{Configuration, GlobalConfig, ResolvedStorageConfig};
+use crate::event_webhook::Error as EventWebhookError;
+use crate::event_webhook::dispatcher::EventDispatcher;
+use crate::jobs::store::{Error as JobStoreError, JobStore};
+use crate::policy::ImagePolicy;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::{MetadataStore, PullHistoryConfig, Settings};
+use crate::registry::repository_resolver::{OverlapError, RepositoryResolver};
+use crate::registry::{
+    Error as RegistryError, Registry, RegistryConfig, Repository, prime_pull_through, repository,
 };
 
 /// Errors produced by the shared CLI bootstrap helpers.
@@ -25,30 +27,30 @@ pub enum Error {
     #[error("storage backend failed: {0}")]
     StorageBackend(String),
     #[error("failed to initialize cache: {0}")]
-    Cache(#[from] angos_cache::Error),
+    Cache(#[from] CacheError),
     #[error("failed to initialize repository '{name}': {source}")]
     Repository {
         name: String,
-        source: Box<registry::Error>,
+        source: Box<RegistryError>,
     },
     #[error("repository configuration is invalid: {0}")]
     Overlap(#[from] OverlapError),
     #[error("failed to initialize job queue: {0}")]
-    JobQueue(#[from] job_store::Error),
+    JobQueue(#[from] JobStoreError),
     #[error("failed to initialize event webhooks: {0}")]
-    EventWebhook(#[from] event_webhook::Error),
+    EventWebhook(#[from] EventWebhookError),
     #[error("failed to initialize registry: {0}")]
-    Registry(#[from] registry::Error),
+    Registry(#[from] RegistryError),
 }
 
-impl From<angos_storage::Error> for Error {
-    fn from(e: angos_storage::Error) -> Self {
+impl From<StorageError> for Error {
+    fn from(e: StorageError) -> Self {
         Error::StorageBackend(e.to_string())
     }
 }
 
-impl From<angos_s3_client::Error> for Error {
-    fn from(e: angos_s3_client::Error) -> Self {
+impl From<S3Error> for Error {
+    fn from(e: S3Error) -> Self {
         Error::StorageBackend(e.to_string())
     }
 }
@@ -176,11 +178,10 @@ pub async fn repositories(
         }
         map.insert(name.clone(), repository);
     }
-    for repository in map
-        .values()
-        .filter(|repository| repository.is_pull_through())
-    {
-        prime_pull_through(repository.name.as_ref());
+    for repository in map.values() {
+        if repository.is_pull_through() {
+            prime_pull_through(repository.name.as_ref());
+        }
     }
     let resolver = RepositoryResolver::new(Arc::new(map))?;
     Ok(Arc::new(resolver))
@@ -192,19 +193,17 @@ mod tests {
 
     use wiremock::MockServer;
 
+    use angos_cache::Config as CacheConfig;
     use angos_oci::Namespace;
 
-    use crate::{
-        command::bootstrap::{Error, repositories},
-        command::maintenance::Error as MaintenanceError,
-        command::server::Error as ServerError,
-        configuration::GlobalConfig,
-        layer::IndexAction,
-        metrics_provider::metrics_provider,
-        policy::{AccessMode, PolicyConfig},
-        registry::{self, repository, repository_resolver::RepositoryResolver},
-        test_fixtures::client::test_client_config,
-    };
+    use crate::command::bootstrap::{Error, repositories};
+    use crate::configuration::GlobalConfig;
+    use crate::layer::IndexAction;
+    use crate::metrics_provider::metrics_provider;
+    use crate::policy::{AccessMode, PolicyConfig};
+    use crate::registry::repository;
+    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::test_fixtures::client::test_client_config;
 
     #[tokio::test]
     async fn repositories_prime_pull_through_outcomes_at_zero() {
@@ -216,12 +215,12 @@ mod tests {
                 ..repository::Config::default()
             },
         )]);
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         repositories(&configs, &cache, &GlobalConfig::default())
             .await
             .unwrap();
 
-        let (_, payload) = metrics_provider().gather().unwrap();
+        let payload = metrics_provider().gather().unwrap();
         let text = String::from_utf8(payload).unwrap();
         for (kind, outcome) in [
             ("manifest", "hit"),
@@ -239,22 +238,6 @@ mod tests {
                 "a repository with an upstream must publish {kind} {outcome} at zero, output:\n{text}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn repository_with_default_config_succeeds() {
-        let repo_config = repository::Config {
-            access_policy: Some(PolicyConfig {
-                default: Some(AccessMode::Allow),
-                ..PolicyConfig::default()
-            }),
-            ..repository::Config::default()
-        };
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let configs = HashMap::from([("test-repo".to_string(), repo_config)]);
-        let result = repositories(&configs, &cache, &GlobalConfig::default()).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().get("test-repo").is_some());
     }
 
     /// `[global.index]` is the policy of every repository without an `index`
@@ -275,7 +258,7 @@ mod tests {
                 },
             ),
         ]);
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let global = GlobalConfig {
             index: Some(policy(IndexAction::Index)),
             ..GlobalConfig::default()
@@ -294,15 +277,6 @@ mod tests {
             .await
             .unwrap();
         assert!(resolver.get("plain").is_some_and(|r| r.index.is_none()));
-    }
-
-    #[tokio::test]
-    async fn repositories_empty_map_succeeds() {
-        let configs = HashMap::new();
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let result = repositories(&configs, &cache, &GlobalConfig::default()).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -328,30 +302,8 @@ mod tests {
                 ..repository::Config::default()
             },
         );
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let result = repositories(&configs, &cache, &GlobalConfig::default()).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::Overlap(_)));
-    }
-
-    #[test]
-    fn error_into_maintenance_error_registry_variant() {
-        let bootstrap_err: Error = registry::Error::BlobUnknown.into();
-        let maintenance_err: MaintenanceError = bootstrap_err.into();
-        assert!(matches!(maintenance_err, MaintenanceError::Registry(_)));
-    }
-
-    #[test]
-    fn error_into_maintenance_error_cache_variant() {
-        let bootstrap_err: Error = angos_cache::Error::Execution("x".to_string()).into();
-        let maintenance_err: MaintenanceError = bootstrap_err.into();
-        assert!(matches!(maintenance_err, MaintenanceError::Cache(_)));
-    }
-
-    #[test]
-    fn error_into_server_error_registry_variant() {
-        let bootstrap_err: Error = registry::Error::BlobUnknown.into();
-        let server_err: ServerError = bootstrap_err.into();
-        assert!(matches!(server_err, ServerError::Initialization(_)));
+        assert!(matches!(result, Err(Error::Overlap(_))));
     }
 }

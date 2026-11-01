@@ -1,20 +1,20 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use http::request::Parts;
-use reqwest::{Client, redirect::Policy};
+use reqwest::Client;
+use reqwest::redirect::Policy;
 use tracing::{debug, info, instrument, warn};
 
 use angos_oci::Namespace;
 use angos_oci::request::BlobMount;
 
-use crate::{
-    auth::Error,
-    auth::webhook::{self, WebhookAuthorizer},
-    configuration::Configuration,
-    identity::{Action, ClientIdentity},
-    policy::{AccessPolicy, PolicyDecision},
-    registry::{Registry, Repository},
-};
+use crate::auth::Error;
+use crate::auth::webhook::WebhookAuthorizer;
+use crate::configuration::Configuration;
+use crate::identity::{Action, ClientIdentity};
+use crate::policy::{AccessPolicy, PolicyDecision, RepositoryPolicy};
+use crate::registry::{Registry, Repository};
 use angos_mtls_client::{ClientTls, MtlsClientBuilder};
 
 const ACCESS_DENIED: &str = "Access denied";
@@ -62,16 +62,16 @@ impl Authorizer {
         request: &Parts,
         registry: &Registry,
     ) -> Result<(), Error> {
-        let namespace = action.get_namespace();
+        let namespace = action.namespace();
         let repository =
-            namespace.and_then(|namespace| registry.get_repository_for_namespace(namespace).ok());
+            namespace.and_then(|namespace| registry.repository_for_namespace(namespace).ok());
 
         debug!("Evaluating global access policy");
         enforce_policy(
             self.global_access_policy.evaluate(
                 action,
                 identity,
-                self.has_repository_policy(repository),
+                self.repository_policy(repository),
             ),
             "global",
             identity,
@@ -145,7 +145,7 @@ impl Authorizer {
 
         if let Some(access_policy) = &auth_repo.access_policy {
             enforce_policy(
-                access_policy.evaluate(action, identity, true),
+                access_policy.evaluate(action, identity, RepositoryPolicy::Declared),
                 &format!("repository '{}'", repository.name),
                 identity,
             )?;
@@ -182,7 +182,7 @@ impl Authorizer {
         identity: &ClientIdentity,
         registry: &Registry,
     ) -> bool {
-        let repository = registry.get_repository_for_namespace(namespace).ok();
+        let repository = registry.repository_for_namespace(namespace).ok();
         // A repository is listable when the client could list its tags: the
         // catalog is a listing, so it gates on the same read.
         let action = Action::ListTags {
@@ -193,7 +193,7 @@ impl Authorizer {
         let global = self.global_access_policy.evaluate(
             &action,
             identity,
-            self.has_repository_policy(repository),
+            self.repository_policy(repository),
         );
         if !matches!(global, PolicyDecision::Allow) {
             return false;
@@ -204,7 +204,7 @@ impl Authorizer {
         match self.repositories.get(repository.name.as_ref()) {
             Some(auth_repo) => auth_repo.access_policy.as_ref().is_none_or(|policy| {
                 matches!(
-                    policy.evaluate(&action, identity, true),
+                    policy.evaluate(&action, identity, RepositoryPolicy::Declared),
                     PolicyDecision::Allow
                 )
             }),
@@ -216,10 +216,15 @@ impl Authorizer {
     /// policy, so that policy decides it after the global one. Global rules read
     /// it as `has_repository_policy()` to hand the decision over instead of
     /// restating every repository rule globally.
-    fn has_repository_policy(&self, repository: Option<&Repository>) -> bool {
-        repository
+    fn repository_policy(&self, repository: Option<&Repository>) -> RepositoryPolicy {
+        let declared = repository
             .and_then(|repository| self.repositories.get(repository.name.as_ref()))
-            .is_some_and(|auth_repo| auth_repo.access_policy.is_some())
+            .is_some_and(|auth_repo| auth_repo.access_policy.is_some());
+        if declared {
+            RepositoryPolicy::Declared
+        } else {
+            RepositoryPolicy::Undeclared
+        }
     }
 }
 
@@ -233,26 +238,20 @@ fn build_webhooks(
         let client = if let Some(client) = clients.get(&webhook_config.tls) {
             client.clone()
         } else {
-            let client = build_webhook_client(webhook_config).map_err(|e| {
-                Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
-            })?;
+            let client = MtlsClientBuilder::new()
+                .with_redirect_policy(Policy::none())
+                .with_tls(&webhook_config.tls)
+                .build()
+                .map_err(|e| {
+                    Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
+                })?;
             clients.insert(webhook_config.tls.clone(), client.clone());
             client
         };
-        let authorizer = WebhookAuthorizer::new(name.clone(), webhook_config.clone(), client)
-            .map_err(|e| {
-                Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
-            })?;
+        let authorizer = WebhookAuthorizer::new(name.clone(), webhook_config.clone(), client);
         webhooks.insert(name.clone(), Arc::new(authorizer));
     }
     Ok(webhooks)
-}
-
-fn build_webhook_client(config: &webhook::Config) -> Result<Client, String> {
-    MtlsClientBuilder::new()
-        .with_redirect_policy(Policy::none())
-        .with_tls(&config.tls)
-        .build()
 }
 
 fn build_repositories(

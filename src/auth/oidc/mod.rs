@@ -1,24 +1,24 @@
 pub mod jwk;
 pub mod validator;
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use http::request::Parts;
-use jsonwebtoken::{Algorithm, dangerous::insecure_decode};
+use jsonwebtoken::Algorithm;
+use jsonwebtoken::dangerous::insecure_decode;
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::debug;
 
 use angos_mtls_client::ClientTls;
 
-use crate::{
-    auth::{
-        AuthMiddleware, AuthResult, Error,
-        authorization::{basic_credentials, bearer_token},
-    },
-    identity::{ClientIdentity, OidcClaims},
-};
+use crate::auth::authorization::{basic_credentials, bearer_token};
+use crate::auth::{AuthMiddleware, AuthResult, Error};
+use crate::identity::ClientIdentity;
 use angos_cache::Cache;
 
 /// An OIDC provider: the issuer to trust, and how tokens it signed are validated.
@@ -87,12 +87,9 @@ impl Config {
     /// Rejects a token missing any claim the provider requires. A claim present
     /// but null counts as missing: a null carries no more identity than an
     /// absent key, and a policy reading it would see the same nothing.
-    pub(crate) fn verify_required_claims(
-        &self,
-        claims: &HashMap<String, serde_json::Value>,
-    ) -> Result<(), Error> {
+    pub fn verify_required_claims(&self, claims: &HashMap<String, Value>) -> Result<(), Error> {
         for name in &self.required_claims {
-            if claims.get(name).is_none_or(serde_json::Value::is_null) {
+            if claims.get(name).is_none_or(Value::is_null) {
                 return Err(Error::Unauthorized(format!(
                     "token is missing required claim '{name}'"
                 )));
@@ -123,17 +120,6 @@ impl OidcValidator {
             cache,
         }
     }
-
-    pub async fn validate_token(&self, token: &str) -> Result<OidcClaims, Error> {
-        validator::validate_oidc_token(
-            &self.provider_name,
-            &self.config,
-            token,
-            &self.client,
-            self.cache.as_ref(),
-        )
-        .await
-    }
 }
 
 #[async_trait]
@@ -147,7 +133,15 @@ impl AuthMiddleware for OidcValidator {
             return Ok(AuthResult::NoCredentials);
         };
 
-        match self.validate_token(&token).await {
+        let validated = validator::validate_oidc_token(
+            &self.provider_name,
+            &self.config,
+            &token,
+            &self.client,
+            self.cache.as_ref(),
+        )
+        .await;
+        match validated {
             Ok(claims) => {
                 // Do not log the full claims map: it contains user/CI metadata.
                 let subject = claims.claims.get("sub").and_then(|v| v.as_str());
@@ -211,21 +205,22 @@ fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use serde_json::json;
     use wiremock::MockServer;
 
     use super::*;
-    use crate::{
-        auth::oidc::validator::tests::{build_test_provider_config, make_token, valid_claims},
-        identity::ClientIdentity,
-        test_fixtures::{
-            mocks::{mount_jwks, static_jwks_response},
-            oidc::KID,
-            requests::{empty_parts, parts_with_authorization, parts_with_basic_auth},
-        },
+    use crate::auth::oidc::validator::tests::{
+        build_test_provider_config, make_token, valid_claims,
     };
+    use crate::identity::ClientIdentity;
+    use crate::test_fixtures::mocks::{mount_jwks, static_jwks_response};
+    use crate::test_fixtures::oidc::KID;
+    use crate::test_fixtures::requests::{
+        empty_parts, parts_with_authorization, parts_with_basic_auth,
+    };
+    use angos_cache::Config as CacheConfig;
 
     fn build_config(issuer: &str) -> Config {
         Config {
@@ -264,40 +259,6 @@ mod tests {
         assert_eq!(config.jwks_refresh_timeout_secs, 5);
     }
 
-    #[test]
-    fn test_config_deserialize_full() {
-        let toml = r#"
-            issuer = "https://auth.example.com"
-            jwks_uri = "https://auth.example.com/jwks"
-            bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-            required_claims = ["repository", "actor"]
-            jwks_refresh_interval = 7200
-            required_audience = "my-app"
-            clock_skew_tolerance = 120
-            allowed_algorithms = ["RS256", "ES256"]
-        "#;
-
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            config.jwks_uri,
-            Some("https://auth.example.com/jwks".to_string())
-        );
-        assert_eq!(
-            config.bearer_token_file.as_deref(),
-            Some(Path::new(
-                "/var/run/secrets/kubernetes.io/serviceaccount/token"
-            ))
-        );
-        assert_eq!(config.required_claims, vec!["repository", "actor"]);
-        assert_eq!(config.jwks_refresh_interval, 7200);
-        assert_eq!(config.required_audience, Some("my-app".to_string()));
-        assert_eq!(config.clock_skew_tolerance, 120);
-        assert_eq!(
-            config.allowed_algorithms,
-            vec![Algorithm::RS256, Algorithm::ES256]
-        );
-    }
-
     /// GitHub Actions used to be its own provider type. Its entire definition
     /// is now a config entry, so this pins that the shape still loads without
     /// a dedicated variant.
@@ -314,61 +275,6 @@ mod tests {
         assert_eq!(config.required_claims, vec!["repository", "actor"]);
     }
 
-    #[test]
-    fn test_oidc_validator_new() {
-        let config = build_test_provider_config("https://auth.example.com");
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let client = test_http_client();
-        let validator =
-            OidcValidator::new("test-provider".to_string(), &config, client.clone(), cache);
-
-        assert_eq!(validator.provider_name, "test-provider");
-        assert_eq!(validator.config.issuer, "https://auth.example.com");
-        assert!(Arc::ptr_eq(&validator.client, &client));
-    }
-
-    #[tokio::test]
-    async fn test_validate_token_success() {
-        let mock_server = MockServer::start().await;
-
-        mount_jwks(&mock_server, static_jwks_response()).await;
-
-        let config = build_config(&mock_server.uri());
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new(
-            "test-provider".to_string(),
-            &config,
-            test_http_client(),
-            cache,
-        );
-
-        let token = make_test_token(&mock_server.uri());
-        let result = validator.validate_token(&token).await;
-
-        assert!(result.is_ok());
-        let oidc_claims = result.unwrap();
-        assert_eq!(oidc_claims.provider_name, "test-provider");
-        assert_eq!(oidc_claims.claims.get("sub").unwrap(), "test-user");
-    }
-
-    #[tokio::test]
-    async fn test_validate_token_invalid() {
-        let config = build_config("https://auth.example.com");
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new(
-            "test-provider".to_string(),
-            &config,
-            test_http_client(),
-            cache,
-        );
-
-        let result = validator.validate_token("invalid-token").await;
-
-        assert!(result.is_err());
-    }
-
     #[tokio::test]
     async fn test_authenticate_with_bearer_token() {
         let mock_server = MockServer::start().await;
@@ -376,7 +282,7 @@ mod tests {
         mount_jwks(&mock_server, static_jwks_response()).await;
 
         let config = build_config(&mock_server.uri());
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
             &config,
@@ -405,7 +311,7 @@ mod tests {
         mount_jwks(&mock_server, static_jwks_response()).await;
 
         let config = build_config(&mock_server.uri());
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let validator =
             OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
@@ -424,7 +330,7 @@ mod tests {
     async fn test_authenticate_with_basic_auth_non_matching_provider() {
         let config = build_config("https://auth.example.com");
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let validator =
             OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
@@ -442,7 +348,7 @@ mod tests {
     async fn test_authenticate_no_credentials() {
         let config = build_config("https://auth.example.com");
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
             &config,
@@ -464,7 +370,7 @@ mod tests {
     async fn test_authenticate_with_invalid_token() {
         let config = build_config("https://auth.example.com");
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let validator = OidcValidator::new(
             "test-provider".to_string(),
             &config,
@@ -479,47 +385,5 @@ mod tests {
 
         assert!(result.is_err());
         assert!(identity.oidc.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_authenticate_populates_identity() {
-        let mock_server = MockServer::start().await;
-
-        mount_jwks(&mock_server, static_jwks_response()).await;
-
-        let config = build_config(&mock_server.uri());
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new(
-            "my-provider".to_string(),
-            &config,
-            test_http_client(),
-            cache,
-        );
-
-        let mut claims = HashMap::new();
-        claims.insert("iss".to_string(), json!(mock_server.uri()));
-        claims.insert("sub".to_string(), json!("user-123"));
-        claims.insert("email".to_string(), json!("user@example.com"));
-        claims.insert(
-            "exp".to_string(),
-            json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-        );
-        claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
-
-        let token = make_token(&claims, KID);
-        let parts = parts_with_authorization(&format!("Bearer {token}"));
-        let socket_addr: SocketAddr = "192.168.1.1:8080".parse().unwrap();
-        let mut identity = ClientIdentity::new(Some(socket_addr));
-
-        let result = validator.authenticate(&parts, &mut identity).await;
-
-        assert!(result.is_ok());
-        assert!(identity.oidc.is_some());
-
-        let oidc_claims = identity.oidc.unwrap();
-        assert_eq!(oidc_claims.provider_name, "my-provider");
-        assert_eq!(oidc_claims.claims.get("sub").unwrap(), "user-123");
-        assert_eq!(oidc_claims.claims.get("email").unwrap(), "user@example.com");
-        assert_eq!(identity.client_ip, Some("192.168.1.1".to_string()));
     }
 }

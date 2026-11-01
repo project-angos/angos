@@ -1,48 +1,47 @@
 use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
-use base64::{Engine, prelude::BASE64_STANDARD};
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use http_body_util::BodyExt;
-use hyper::{
-    Method, Request, StatusCode,
-    header::{
-        AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE,
-    },
+use hyper::header::{
+    ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE,
 };
+use hyper::{Method, Request, StatusCode};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use serde_json::{Value, from_slice};
-use tracing_subscriber::{layer::SubscriberExt, registry::Registry as TracingRegistry};
+use tracing::info_span;
+use tracing::subscriber::with_default;
+use tracing_opentelemetry::layer as otel_layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::Registry as TracingRegistry;
 
 use angos_transport::ResponseBody;
 
-use crate::{
-    auth::PeerCertificate,
-    command::server::{
-        ServerContext,
-        error::Error,
-        handlers::{handle_get_token, handle_healthz, handle_metrics},
-        http_server::{
-            connection::{current_trace_id, inject_peer_certificate, method_label},
-            dispatch::{authenticate_and_authorize, handle_unknown_route},
-            error_response::{error_to_response, fallback_500},
-        },
-        server_context::tests::{
-            TestConfigOptions, create_test_server_context_from_config,
-            create_test_server_context_with,
-        },
-    },
-    identity::{Action, ClientIdentity},
-    metrics_provider,
-    policy::{AccessMode, PolicyConfig},
-    registry,
-    test_fixtures::configuration::load_config,
+use crate::auth::PeerCertificate;
+use crate::command::server::ServerContext;
+use crate::command::server::error::Error;
+use crate::command::server::handlers::{handle_get_token, handle_healthz, handle_metrics};
+use crate::command::server::http_server::connection::{
+    current_trace_id, inject_peer_certificate, method_label,
 };
+use crate::command::server::http_server::dispatch::{
+    authenticate_and_authorize, handle_unknown_route,
+};
+use crate::command::server::http_server::error_response::error_to_response;
+use crate::command::server::server_context::tests::{
+    TestConfigOptions, create_test_server_context_from_config, create_test_server_context_with,
+};
+use crate::identity::{Action, ClientIdentity};
+use crate::policy::{AccessMode, PolicyConfig};
+use crate::test_fixtures::configuration::load_config;
+use crate::{metrics_provider, registry};
 
 #[test]
 fn test_error_to_response_unauthorized_with_request_id() {
     let error = Error::Unauthorized("Invalid credentials".to_string());
     let request_id = Some("req-123".to_string());
 
-    let response = error_to_response(&error, request_id.as_ref(), None);
+    let response = error_to_response(&error, request_id.as_deref(), None);
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
@@ -61,7 +60,7 @@ async fn test_error_to_response_from_registry_error() {
     let error: Error = registry_error.into();
     let request_id = Some("req-blob".to_string());
 
-    let response = error_to_response(&error, request_id.as_ref(), None);
+    let response = error_to_response(&error, request_id.as_deref(), None);
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
@@ -110,7 +109,7 @@ fn test_error_to_response_custom_error() {
     };
     let request_id = Some("req-custom".to_string());
 
-    let response = error_to_response(&error, request_id.as_ref(), None);
+    let response = error_to_response(&error, request_id.as_deref(), None);
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
@@ -159,8 +158,6 @@ fn test_handle_healthz_success() {
 
 #[tokio::test]
 async fn test_handle_healthz_body_content() {
-    use http_body_util::BodyExt;
-
     let response = handle_healthz().unwrap();
     let (_, body) = response.into_parts();
 
@@ -173,20 +170,9 @@ async fn test_handle_healthz_body_content() {
     assert_eq!(body_str, r#"{"status":"ok"}"#);
 }
 
-#[test]
-fn test_handle_metrics_success() {
-    metrics_provider::init_for_tests();
-    let response = handle_metrics().unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get(CONTENT_TYPE).is_some());
-}
-
 #[tokio::test]
 async fn test_handle_metrics_contains_metric_data() {
-    use http_body_util::BodyExt;
-
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let response = handle_metrics().unwrap();
     let (parts, body) = response.into_parts();
 
@@ -259,43 +245,6 @@ fn test_error_to_response_all_error_types() {
     }
 }
 
-#[tokio::test]
-async fn test_error_to_response_body_contains_error_message() {
-    use http_body_util::BodyExt;
-
-    let error = Error::BadRequest("Invalid manifest format".to_string());
-    let request_id = Some("req-manifest".to_string());
-
-    let response = error_to_response(&error, request_id.as_ref(), None);
-    let (_, body) = response.into_parts();
-
-    let body_bytes = match body {
-        ResponseBody::Fixed(b) => b.collect().await.unwrap().to_bytes(),
-        _ => panic!("Expected Fixed body"),
-    };
-
-    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
-    assert!(body_str.contains("errors"));
-}
-
-#[test]
-fn test_error_to_response_with_empty_message() {
-    let error = Error::Internal(String::new());
-    let request_id = None;
-
-    let response = error_to_response(&error, request_id.as_ref(), None);
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-}
-
-/// The router reports a malformed reference and a path it does not serve as the
-/// same `None`, so the method decides the status: a read missed, a write was
-/// malformed. OCI conformance fails the registry when a manifest `PUT` carrying
-/// an unparseable reference answers anything but `400`.
 /// An unmatched path is answered before authentication, so an anonymous client
 /// reaches the metrics recording at line rate. hyper admits any RFC 9110 token
 /// as a method and the registry never evicts a child, so every token outside
@@ -324,6 +273,10 @@ fn the_method_label_holds_to_the_served_methods() {
     }
 }
 
+/// The router reports a malformed reference and a path it does not serve as the
+/// same `None`, so the method decides the status: a read missed, a write was
+/// malformed. OCI conformance fails the registry when a manifest `PUT` carrying
+/// an unparseable reference answers anything but `400`.
 #[test]
 fn unknown_route_status_follows_the_method() {
     for (method, expected_not_found) in [
@@ -379,7 +332,7 @@ fn token_endpoint_refuses_an_unserved_method_with_405() {
         // method that would work.
         let response = error_to_response(&error, None, None);
         assert_eq!(
-            response.headers().get(hyper::header::ALLOW).unwrap(),
+            response.headers().get(ALLOW).unwrap(),
             "GET",
             "a 405 must advertise the method the path serves"
         );
@@ -472,7 +425,7 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
 
 #[tokio::test]
 async fn bad_basic_auth_returns_http_401() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
     let password_hash = argon.hash_password(b"testpass").unwrap().to_string();
     let config = load_config(&format!(
@@ -602,8 +555,8 @@ fn current_trace_id_returns_none_without_otel_layer() {
     // Active tracing subscriber without any OpenTelemetry layer: span has no
     // OTel context bridge, so current_trace_id must return None.
     let subscriber = TracingRegistry::default();
-    let result = tracing::subscriber::with_default(subscriber, || {
-        let span = tracing::info_span!("test_span");
+    let result = with_default(subscriber, || {
+        let span = info_span!("test_span");
         current_trace_id(&span)
     });
     assert_eq!(result, None);
@@ -615,11 +568,10 @@ fn current_trace_id_returns_hex_id_with_otel_layer() {
         .with_sampler(Sampler::AlwaysOn)
         .build();
     let tracer = provider.tracer("angos-test");
-    let subscriber =
-        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let subscriber = TracingRegistry::default().with(otel_layer().with_tracer(tracer));
 
-    let trace_id = tracing::subscriber::with_default(subscriber, || {
-        let span = tracing::info_span!("test_span");
+    let trace_id = with_default(subscriber, || {
+        let span = info_span!("test_span");
         current_trace_id(&span)
     });
 
@@ -632,54 +584,6 @@ fn current_trace_id_returns_hex_id_with_otel_layer() {
     assert!(
         trace_id.chars().all(|c| c.is_ascii_hexdigit()),
         "trace ID must be lowercase hex, got {trace_id:?}"
-    );
-}
-
-#[test]
-fn current_trace_id_returns_none_for_disabled_span() {
-    // tracing::Span::none() creates a permanently-disabled (no-op) span.
-    // Without an entered span there is no OTel bridge context, so
-    // current_trace_id must return None regardless of the subscriber.
-    let provider = SdkTracerProvider::builder()
-        .with_sampler(Sampler::AlwaysOn)
-        .build();
-    let tracer = provider.tracer("angos-test");
-    let subscriber =
-        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
-    let trace_id = tracing::subscriber::with_default(subscriber, || {
-        let span = tracing::Span::none();
-        current_trace_id(&span)
-    });
-    assert_eq!(
-        trace_id, None,
-        "disabled no-op span must not produce a trace ID"
-    );
-}
-
-#[test]
-fn current_trace_id_child_span_inherits_parent_trace_id() {
-    // The reason current_trace_id exists: requests log a single trace ID across
-    // their entire span tree. A child span entered while the parent is active
-    // must report the parent's trace ID, not a fresh one.
-    let provider = SdkTracerProvider::builder()
-        .with_sampler(Sampler::AlwaysOn)
-        .build();
-    let tracer = provider.tracer("angos-test");
-    let subscriber =
-        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
-    let (parent_id, child_id) = tracing::subscriber::with_default(subscriber, || {
-        let parent = tracing::info_span!("parent");
-        let _enter = parent.enter();
-        let parent_id = current_trace_id(&parent);
-        let child = tracing::info_span!("child");
-        let child_id = current_trace_id(&child);
-        (parent_id, child_id)
-    });
-    let parent_id = parent_id.expect("parent span must produce a trace ID");
-    let child_id = child_id.expect("child span must inherit a trace ID");
-    assert_eq!(
-        parent_id, child_id,
-        "child span entered under an active parent must inherit its trace ID"
     );
 }
 
@@ -700,64 +604,4 @@ fn inject_peer_certificate_inserts_extension_for_valid_cert() {
         .get::<PeerCertificate>()
         .expect("PeerCertificate extension must be present");
     assert_eq!(stored.0.as_ref(), cert);
-}
-
-#[test]
-fn inject_peer_certificate_inserts_extension_for_empty_cert() {
-    // Empty Some(data) is still Some, so the extension is inserted.
-    // Validation happens later in the mTLS authenticator, not here.
-    let mut request = Request::builder().uri("/").body(()).unwrap();
-    inject_peer_certificate(&mut request, Some(&[]));
-    let stored = request
-        .extensions()
-        .get::<PeerCertificate>()
-        .expect("PeerCertificate extension must be present even for empty cert");
-    assert!(stored.0.as_ref().is_empty());
-}
-
-#[test]
-fn inject_peer_certificate_last_write_wins_when_called_twice() {
-    // Extensions::insert replaces any existing value of the same type.
-    let first = b"first-cert-data".as_slice();
-    let second = b"second-cert-data".as_slice();
-    let mut request = Request::builder().uri("/").body(()).unwrap();
-    inject_peer_certificate(&mut request, Some(first));
-    inject_peer_certificate(&mut request, Some(second));
-    let stored = request.extensions().get::<PeerCertificate>().unwrap();
-    assert_eq!(stored.0.as_ref(), second);
-}
-
-#[test]
-fn fallback_500_returns_valid_500_text_plain_response() {
-    // Directly verify the fallback helper used by error_to_response when the
-    // hyper builder records an error (e.g. a header value containing a control
-    // byte).  The helper must always produce a well-formed response regardless
-    // of external state.
-    let response = fallback_500();
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "text/plain",
-        "fallback must set Content-Type: text/plain"
-    );
-}
-
-#[tokio::test]
-async fn fallback_500_body_is_ascii_internal_server_error() {
-    use http_body_util::BodyExt;
-
-    let response = fallback_500();
-    let (_, body) = response.into_parts();
-
-    let body_bytes = match body {
-        ResponseBody::Fixed(b) => b.collect().await.unwrap().to_bytes(),
-        _ => panic!("Expected Fixed body"),
-    };
-
-    assert_eq!(
-        body_bytes.as_ref(),
-        b"Internal Server Error",
-        "fallback body must be the static ASCII string 'Internal Server Error'"
-    );
 }

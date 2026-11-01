@@ -114,6 +114,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -172,7 +173,6 @@ dependencies = [
  "chrono",
  "hex",
  "http",
- "regex",
  "serde",
  "serde_json",
  "sha2",

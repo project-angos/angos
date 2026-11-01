@@ -6,19 +6,14 @@ use tracing::warn;
 use angos_oci::{Digest, Namespace};
 use angos_storage::Error as StorageError;
 
-use crate::registry::keys::DigestKeys;
-use crate::{
-    command::{
-        maintenance::{
-            Error,
-            action::{Action, WalkedStore},
-            categorize::UploadArtifact,
-            executor::object_younger_than_grace,
-        },
-        scrub::validate::Validator,
-    },
-    registry::{Error as RegistryError, blob_store::upload_session::SessionFile},
-};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::{Action, WalkedStore};
+use crate::command::maintenance::categorize::UploadArtifact;
+use crate::command::maintenance::executor::object_younger_than_grace;
+use crate::command::scrub::validate::Validator;
+use crate::registry::Error as RegistryError;
+use crate::registry::blob_store::upload_session::SessionFile;
+use crate::registry::keys::DigestExt;
 
 impl Validator {
     /// Validate one blob's `data` object against its (already healed) index.

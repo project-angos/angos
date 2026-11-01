@@ -22,8 +22,9 @@ use crate::{
 };
 
 /// Single-frame [`ByteStream`] over `body`.
-pub fn frame(body: impl Into<Bytes>) -> ByteStream {
-    let bytes = body.into();
+#[must_use]
+pub fn frame(body: &[u8]) -> ByteStream {
+    let bytes = Bytes::copy_from_slice(body);
     Box::pin(stream::once(async move { Ok(bytes) }))
 }
 
@@ -108,125 +109,119 @@ impl<S, H> HookedStore<S, H> {
     }
 }
 
-macro_rules! delegate_object_store {
-    ($inner:ty) => {
-        #[async_trait]
-        impl<H: StoreHook> ObjectStore for HookedStore<$inner, H> {
-            async fn get(&self, key: &str) -> Result<Vec<u8>, Error> {
-                self.hook.before(StoreOp::Get { key }).await?;
-                self.inner.get(key).await
-            }
+#[async_trait]
+impl<H: StoreHook> ObjectStore for HookedStore<Arc<dyn ObjectStore>, H> {
+    async fn get(&self, key: &str) -> Result<Vec<u8>, Error> {
+        self.hook.before(StoreOp::Get { key }).await?;
+        self.inner.get(key).await
+    }
 
-            async fn get_stream(
-                &self,
-                key: &str,
-                offset: Option<u64>,
-            ) -> Result<(BoxedReader, u64), Error> {
-                self.hook.before(StoreOp::GetStream { key }).await?;
-                self.inner.get_stream(key, offset).await
-            }
+    async fn get_stream(
+        &self,
+        key: &str,
+        offset: Option<u64>,
+    ) -> Result<(BoxedReader, u64), Error> {
+        self.hook.before(StoreOp::GetStream { key }).await?;
+        self.inner.get_stream(key, offset).await
+    }
 
-            async fn create_if_absent(&self, key: &str, data: Bytes) -> Result<bool, Error> {
-                self.hook.before(StoreOp::Put { key, data: &data }).await?;
-                self.inner.create_if_absent(key, data).await
-            }
+    async fn create_if_absent(&self, key: &str, data: Bytes) -> Result<bool, Error> {
+        self.hook.before(StoreOp::Put { key, data: &data }).await?;
+        self.inner.create_if_absent(key, data).await
+    }
 
-            async fn put(&self, key: &str, data: Bytes) -> Result<(), Error> {
-                self.hook.before(StoreOp::Put { key, data: &data }).await?;
-                self.inner.put(key, data).await
-            }
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), Error> {
+        self.hook.before(StoreOp::Put { key, data: &data }).await?;
+        self.inner.put(key, data).await
+    }
 
-            async fn delete(&self, key: &str) -> Result<(), Error> {
-                self.hook.before(StoreOp::Delete { key }).await?;
-                self.inner.delete(key).await
-            }
+    async fn delete(&self, key: &str) -> Result<(), Error> {
+        self.hook.before(StoreOp::Delete { key }).await?;
+        self.inner.delete(key).await
+    }
 
-            async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
-                self.hook.before(StoreOp::DeletePrefix { prefix }).await?;
-                self.inner.delete_prefix(prefix).await
-            }
+    async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
+        self.hook.before(StoreOp::DeletePrefix { prefix }).await?;
+        self.inner.delete_prefix(prefix).await
+    }
 
-            async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
-                self.hook.before(StoreOp::Head { key }).await?;
-                self.inner.head(key).await
-            }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
+        self.hook.before(StoreOp::Head { key }).await?;
+        self.inner.head(key).await
+    }
 
-            async fn list(
-                &self,
-                prefix: &str,
-                n: u16,
-                token: Option<String>,
-            ) -> Result<Page<String>, Error> {
-                self.hook.before(StoreOp::List { prefix }).await?;
-                self.inner.list(prefix, n, token).await
-            }
+    async fn list(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+    ) -> Result<Page<String>, Error> {
+        self.hook.before(StoreOp::List { prefix }).await?;
+        self.inner.list(prefix, n, token).await
+    }
 
-            async fn list_after(
-                &self,
-                prefix: &str,
-                n: u16,
-                token: Option<String>,
-                start_after: Option<String>,
-            ) -> Result<Page<String>, Error> {
-                self.hook.before(StoreOp::List { prefix }).await?;
-                self.inner.list_after(prefix, n, token, start_after).await
-            }
+    async fn list_after(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+        start_after: Option<String>,
+    ) -> Result<Page<String>, Error> {
+        self.hook.before(StoreOp::List { prefix }).await?;
+        self.inner.list_after(prefix, n, token, start_after).await
+    }
 
-            async fn list_children(
-                &self,
-                prefix: &str,
-                n: u16,
-                token: Option<String>,
-                start_after: Option<String>,
-            ) -> Result<ChildrenPage, Error> {
-                self.hook.before(StoreOp::ListChildren { prefix }).await?;
-                self.inner
-                    .list_children(prefix, n, token, start_after)
-                    .await
-            }
+    async fn list_children(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+        start_after: Option<String>,
+    ) -> Result<ChildrenPage, Error> {
+        self.hook.before(StoreOp::ListChildren { prefix }).await?;
+        self.inner
+            .list_children(prefix, n, token, start_after)
+            .await
+    }
 
-            async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error> {
-                self.hook
-                    .before(StoreOp::Copy {
-                        source,
-                        destination,
-                    })
-                    .await?;
-                self.inner.copy(source, destination).await
-            }
+    async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error> {
+        self.hook
+            .before(StoreOp::Copy {
+                source,
+                destination,
+            })
+            .await?;
+        self.inner.copy(source, destination).await
+    }
 
-            async fn write_upload(
-                &self,
-                key: &str,
-                body: ByteStream,
-                len: Option<u64>,
-            ) -> Result<u64, Error> {
-                self.hook.before(StoreOp::WriteUpload { key }).await?;
-                self.inner.write_upload(key, body, len).await
-            }
+    async fn write_upload(
+        &self,
+        key: &str,
+        body: ByteStream,
+        len: Option<u64>,
+    ) -> Result<u64, Error> {
+        self.hook.before(StoreOp::WriteUpload { key }).await?;
+        self.inner.write_upload(key, body, len).await
+    }
 
-            async fn complete_upload(&self, key: &str) -> Result<(), Error> {
-                self.hook.before(StoreOp::CompleteUpload { key }).await?;
-                self.inner.complete_upload(key).await
-            }
+    async fn complete_upload(&self, key: &str) -> Result<(), Error> {
+        self.hook.before(StoreOp::CompleteUpload { key }).await?;
+        self.inner.complete_upload(key).await
+    }
 
-            async fn abort_upload(&self, key: &str) -> Result<(), Error> {
-                self.hook.before(StoreOp::AbortUpload { key }).await?;
-                self.inner.abort_upload(key).await
-            }
+    async fn abort_upload(&self, key: &str) -> Result<(), Error> {
+        self.hook.before(StoreOp::AbortUpload { key }).await?;
+        self.inner.abort_upload(key).await
+    }
 
-            async fn list_multipart_uploads(
-                &self,
-                key_marker: Option<&str>,
-                upload_id_marker: Option<&str>,
-            ) -> Result<MultipartUploadPage, Error> {
-                self.hook.before(StoreOp::ListMultipartUploads).await?;
-                self.inner
-                    .list_multipart_uploads(key_marker, upload_id_marker)
-                    .await
-            }
-        }
-    };
+    async fn list_multipart_uploads(
+        &self,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+    ) -> Result<MultipartUploadPage, Error> {
+        self.hook.before(StoreOp::ListMultipartUploads).await?;
+        self.inner
+            .list_multipart_uploads(key_marker, upload_id_marker)
+            .await
+    }
 }
-
-delegate_object_store!(Arc<dyn ObjectStore>);

@@ -1,13 +1,11 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use angos_backoff::Backoff;
+use angos_mtls_client::MtlsClientBuilder;
+use angos_secret::Secret;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
@@ -20,17 +18,11 @@ use url::Url;
 #[cfg(test)]
 mod tests;
 
-use crate::{
-    configuration::{Configuration, RegexPattern},
-    event_webhook::{
-        Error,
-        config::{DeliveryPolicy, EventWebhookConfig},
-        event::{Event, EventKind},
-    },
-    metrics_provider::metrics_provider,
-};
-use angos_mtls_client::MtlsClientBuilder;
-use angos_secret::Secret;
+use crate::configuration::{Configuration, RegexPattern};
+use crate::event_webhook::Error;
+use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
+use crate::event_webhook::event::{Event, EventKind};
+use crate::metrics_provider::metrics_provider;
 
 pub struct EventDispatcher {
     endpoints: HashMap<String, WebhookEndpoint>,
@@ -148,9 +140,8 @@ impl Delivery {
     }
 
     async fn send_with_retries(&self) -> Result<(), String> {
-        // A `loop` (not a bounded `for`) so the exhaustion path carries the last
-        // error in hand and returns from inside, with no post-loop `Option` to
-        // unwrap: the final attempt is the only exit besides an early success.
+        // A `loop` rather than a `for` so the final attempt returns with its
+        // error in hand, leaving no post-loop `Option` to unwrap.
         let mut first_err: Option<String> = None;
         let mut attempt = 0;
 
@@ -168,7 +159,8 @@ impl Delivery {
                 let first_err = first_err.as_deref().unwrap_or(&last_err);
                 return Err(format_retry_failure(
                     self.max_retries + 1,
-                    (first_err, &last_err),
+                    first_err,
+                    &last_err,
                 ));
             }
             first_err.get_or_insert(last_err);
@@ -184,12 +176,6 @@ impl Delivery {
     }
 }
 
-fn serialize_event(event: &Event) -> Result<(Bytes, &'static str), Error> {
-    let body = serde_json::to_vec(event)
-        .map_err(|e| Error::Dispatch(format!("Failed to serialize event: {e}")))?;
-    Ok((Bytes::from(body), event.kind().as_str()))
-}
-
 fn compute_signature(secret: &str, body: &[u8]) -> Result<String, String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .map_err(|e| format!("failed to initialize HMAC for the webhook signature: {e}"))?;
@@ -197,12 +183,11 @@ fn compute_signature(secret: &str, body: &[u8]) -> Result<String, String> {
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-fn format_retry_failure(attempts: u32, errors: (&str, &str)) -> String {
-    match errors {
-        (f, l) if f == l => format!("after {attempts} attempt(s): {f}"),
-        (f, l) => {
-            format!("after {attempts} attempt(s); first error: {f}; last error: {l}")
-        }
+fn format_retry_failure(attempts: u32, first: &str, last: &str) -> String {
+    if first == last {
+        format!("after {attempts} attempt(s): {first}")
+    } else {
+        format!("after {attempts} attempt(s); first error: {first}; last error: {last}")
     }
 }
 
@@ -269,7 +254,7 @@ impl EventDispatcher {
             return Ok(None);
         }
         // A repository naming no webhook inherits the global ones.
-        let repositories = config
+        let repositories: HashMap<String, Vec<String>> = config
             .repository
             .iter()
             .filter(|(_, repository)| !repository.event_webhooks.is_empty())
@@ -285,10 +270,6 @@ impl EventDispatcher {
 
     pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.drain_in_flight().await;
-    }
-
-    async fn drain_in_flight(&self) {
         // Closing is what lets the wait return; the shutdown flag above is
         // what stops another delivery being tracked after it.
         self.in_flight.close();
@@ -335,17 +316,20 @@ impl EventDispatcher {
     /// required-policy failure is surfaced only after all endpoints got their
     /// delivery, so one failing webhook cannot starve the others.
     pub async fn dispatch(&self, event: &Event) -> Result<(), Error> {
-        let (body, event_kind_header) = serialize_event(event)?;
+        let body = serde_json::to_vec(event)
+            .map(Bytes::from)
+            .map_err(|e| Error::Dispatch(format!("Failed to serialize event: {e}")))?;
+        let event_kind_header = event.kind().as_str();
         let enabled = self
             .repositories
             .get(&event.repository)
             .unwrap_or(&self.global);
 
         let mut first_required_failure = None;
-        for (name, endpoint) in enabled
-            .iter()
-            .filter_map(|name| self.endpoints.get_key_value(name))
-        {
+        for name in enabled {
+            let Some(endpoint) = self.endpoints.get(name) else {
+                continue;
+            };
             if !endpoint.matches_event(event.kind(), &event.repository) {
                 continue;
             }

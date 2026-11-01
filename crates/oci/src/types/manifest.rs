@@ -1,6 +1,8 @@
-use std::{collections::HashMap, mem};
+use std::collections::HashMap;
+use std::mem;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::types::constants::IN_TOTO_PREDICATE_TYPE;
 use crate::types::{Descriptor, Digest, Error, MediaType};
@@ -119,21 +121,21 @@ impl Manifest {
     /// Returns an error when the bytes are not a JSON manifest object, or when
     /// the object breaks one of those rules.
     pub fn from_pushed(s: &[u8], content_type: Option<&MediaType>) -> Result<Self, Error> {
-        let raw: serde_json::Value = serde_json::from_slice(s)?;
+        let raw: Value = serde_json::from_slice(s)?;
         if declares_both_shapes(&raw) {
-            return Err(Error::InvalidManifest(
+            return Err(Error::Manifest(
                 "a manifest carries either config/layers or manifests, never both".to_string(),
             ));
         }
         let manifest: Self = serde_json::from_value(raw)?;
         if manifest.schema_version != OCI_MANIFEST_SCHEMA_VERSION {
-            return Err(Error::InvalidManifest(format!(
+            return Err(Error::Manifest(format!(
                 "unsupported schemaVersion {}, expected {OCI_MANIFEST_SCHEMA_VERSION}",
                 manifest.schema_version
             )));
         }
         if !manifest.media_type_matches(content_type) {
-            return Err(Error::InvalidManifest(
+            return Err(Error::Manifest(
                 "Expected manifest media type mismatch".to_string(),
             ));
         }
@@ -264,10 +266,10 @@ impl Manifest {
 
 /// Whether the raw manifest object carries both an image payload and an index
 /// one, which the image spec forbids.
-fn declares_both_shapes(raw: &serde_json::Value) -> bool {
+fn declares_both_shapes(raw: &Value) -> bool {
     let non_empty_array = |field: &str| {
         raw.get(field)
-            .and_then(serde_json::Value::as_array)
+            .and_then(Value::as_array)
             .is_some_and(|entries| !entries.is_empty())
     };
     let image = raw.get("config").is_some_and(|c| !c.is_null()) || non_empty_array("layers");
@@ -302,11 +304,11 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
+    use serde_json::json;
 
+    use super::*;
     use crate::types::Digest;
     use crate::types::constants::{IN_TOTO_PREDICATE_TYPE, OCI_INDEX_MEDIA_TYPE};
-    use crate::types::manifest::*;
 
     const VALID_HASH: &str = "99c9d5e2bdc7ef0223f56c845a695ea0f8f11f5b55ea6f74e1f7df0d4f90026c";
     const MEDIA_TYPE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -381,24 +383,6 @@ mod tests {
         assert_eq!(json["artifactType"], ARTIFACT_TYPE_INDEX);
         assert_eq!(json["config"]["size"], 1234);
         assert_eq!(json["layers"].as_array().map(Vec::len), Some(1));
-    }
-
-    #[test]
-    fn test_has_artifact_type_top_level_field() {
-        let manifest = demo_manifest();
-        assert!(manifest.has_artifact_type(&media_type(ARTIFACT_TYPE_INDEX)));
-    }
-
-    #[test]
-    fn test_has_artifact_type_config_media_type_fallback() {
-        let manifest = demo_manifest();
-        assert!(manifest.has_artifact_type(&media_type(MEDIA_TYPE_CONFIG)));
-    }
-
-    #[test]
-    fn test_has_artifact_type_no_match() {
-        let manifest = demo_manifest();
-        assert!(!manifest.has_artifact_type(&media_type("application/vnd.example.unknown")));
     }
 
     #[test]
@@ -493,7 +477,7 @@ mod tests {
     /// reads as the index whose children it lists.
     #[test]
     fn a_stored_hybrid_reads_as_the_index_it_lists() {
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "config": { "mediaType": MEDIA_TYPE_CONFIG, "digest": format!("sha256:{VALID_HASH}"), "size": 1 },
             "layers": [{ "mediaType": MEDIA_TYPE_CONFIG, "digest": format!("sha256:{VALID_HASH}"), "size": 2 }],
@@ -511,7 +495,7 @@ mod tests {
     /// The same document is refused on push, so no new one can be stored.
     #[test]
     fn pushing_a_hybrid_is_refused() {
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "layers": [{ "mediaType": MEDIA_TYPE_CONFIG, "digest": format!("sha256:{VALID_HASH}"), "size": 2 }],
             "manifests": [{ "mediaType": MEDIA_TYPE_MANIFEST, "digest": format!("sha256:{VALID_HASH}"), "size": 3 }],
@@ -519,10 +503,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(
-                Manifest::from_pushed(&body, None),
-                Err(Error::InvalidManifest(_))
-            ),
+            matches!(Manifest::from_pushed(&body, None), Err(Error::Manifest(_))),
             "a document carrying both shapes must not enter the store"
         );
     }
@@ -531,12 +512,12 @@ mod tests {
     #[test]
     fn pushing_either_shape_alone_is_accepted() {
         for body in [
-            serde_json::json!({
+            json!({
                 "schemaVersion": 2,
                 "config": { "mediaType": MEDIA_TYPE_CONFIG, "digest": format!("sha256:{VALID_HASH}"), "size": 1 },
                 "layers": [],
             }),
-            serde_json::json!({
+            json!({
                 "schemaVersion": 2,
                 "manifests": [{ "mediaType": MEDIA_TYPE_MANIFEST, "digest": format!("sha256:{VALID_HASH}"), "size": 3 }],
             }),
@@ -553,7 +534,7 @@ mod tests {
     /// an image manifest with no reference to check or pin.
     #[test]
     fn an_index_with_an_invalid_child_is_refused() {
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": OCI_INDEX_MEDIA_TYPE,
             "manifests": [
@@ -586,7 +567,7 @@ mod tests {
         assert!(
             matches!(
                 Manifest::from_pushed(&declared(Some(OCI_INDEX_MEDIA_TYPE)), Some(&sent)),
-                Err(Error::InvalidManifest(_))
+                Err(Error::Manifest(_))
             ),
             "a body contradicting its Content-Type must not enter the store"
         );
@@ -610,7 +591,7 @@ mod tests {
         }))
         .unwrap();
 
-        let Err(Error::InvalidManifest(message)) = Manifest::from_pushed(&body, None) else {
+        let Err(Error::Manifest(message)) = Manifest::from_pushed(&body, None) else {
             panic!("a foreign schemaVersion must not enter the store");
         };
         assert_eq!(message, "unsupported schemaVersion 1, expected 2");

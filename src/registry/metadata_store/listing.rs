@@ -10,10 +10,10 @@ use angos_extension_service::LayerEntry;
 use angos_oci::Digest;
 use angos_storage::Error as StorageError;
 
-use crate::{
-    layer::{Checkpoints, Listing},
-    registry::{Error, keys::DigestKeys, metadata_store::MetadataStore},
-};
+use crate::layer::{Checkpoints, Listing};
+use crate::registry::Error;
+use crate::registry::keys::DigestExt;
+use crate::registry::metadata_store::MetadataStore;
 
 impl MetadataStore {
     /// A layer's listing; `None` when it was never indexed.

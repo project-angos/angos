@@ -1,35 +1,36 @@
-use std::{iter::once, pin::pin, slice};
+use std::iter::once;
+use std::pin::pin;
+use std::slice;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::{
-    future::{join_all, try_join_all},
-    stream::{self, StreamExt, TryStreamExt},
-};
+use futures_util::future::{join_all, try_join_all};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::join;
 use tracing::{debug, error, instrument, warn};
 
+use angos_oci::request::{
+    DeleteManifestRequest, GetManifestRequest, HeadManifestRequest, PutManifestRequest,
+};
 use angos_oci::{
     Content, Descriptor, Digest, Manifest, MediaRange, MediaType, Namespace, Reference, Tag,
-    request::{DeleteManifestRequest, GetManifestRequest, HeadManifestRequest, PutManifestRequest},
 };
 use angos_oci_service::{Accepted, ManifestDescriptor, ManifestGet, ManifestWritten};
 
-use crate::{
-    cache_fill::CACHE_ACTOR,
-    event_webhook::event::{Event, EventActor},
-    jobs::Queue,
-    layer,
-    policy::ImagePolicy,
-    registry::{
-        Error, Registry, Repository,
-        blob_store::BlobStore,
-        metadata_store::{LinkKind, LinkMetadata},
-        record_pull_through, repository_name,
-    },
-    replication::{ReplicationDownstream, ReplicationJob, ReplicationTarget, build_envelope},
-    scan,
+use crate::cache_fill::CACHE_ACTOR;
+use crate::event_webhook::event::{Event, EventActor};
+use crate::jobs::Queue;
+use crate::layer;
+use crate::policy::ImagePolicy;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::{LinkKind, LinkMetadata};
+use crate::registry::{Error, Registry, Repository, record_pull_through, repository_name};
+use crate::replication::{
+    ReplicationDownstream, ReplicationJob, ReplicationTarget, build_envelope,
 };
+use crate::scan::{self, ScanImagePayload};
+
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Referenced digests a push checks the ownership of at once.
@@ -170,19 +171,21 @@ fn push_pins(
     subject: Option<&Digest>,
     referenced: &[Digest],
 ) -> Vec<(Digest, LinkKind)> {
-    once(LinkKind::Digest(digest.clone()))
-        .chain(tags.iter().map(|tag| LinkKind::Tag(tag.clone())))
-        .chain(subject.map(|subject| LinkKind::Referrer {
+    let mut pins = vec![(digest.clone(), LinkKind::Digest(digest.clone()))];
+    for tag in tags {
+        pins.push((digest.clone(), LinkKind::Tag(tag.clone())));
+    }
+    if let Some(subject) = subject {
+        let link = LinkKind::Referrer {
             subject: subject.clone(),
             referrer: digest.clone(),
-        }))
-        .map(|link| (digest.clone(), link))
-        .chain(
-            referenced
-                .iter()
-                .map(|target| (target.clone(), LinkKind::ReferencedBy(digest.clone()))),
-        )
-        .collect()
+        };
+        pins.push((digest.clone(), link));
+    }
+    for target in referenced {
+        pins.push((target.clone(), LinkKind::ReferencedBy(digest.clone())));
+    }
+    pins
 }
 
 /// The digests `manifest` references, in manifest order: an image's config
@@ -296,8 +299,8 @@ async fn needs_upstream_pull(
 }
 
 impl Registry {
-    #[instrument(skip(actor))]
     /// `HEAD /v2/<name>/manifests/<reference>`: the manifest's descriptor.
+    #[instrument(skip(actor))]
     pub async fn handle_head_manifest(
         &self,
         actor: Option<EventActor>,
@@ -305,7 +308,7 @@ impl Registry {
     ) -> Result<ManifestDescriptor, Error> {
         let anonymous = EventActor::default();
         let client = actor.as_ref().unwrap_or(&anonymous);
-        let repository = self.get_repository_for_namespace(&request.namespace).ok();
+        let repository = self.repository_for_namespace(&request.namespace).ok();
         match repository.filter(|repository| repository.is_pull_through()) {
             Some(upstream) => {
                 let is_tag_immutable = self.is_reference_immutable(repository, &request.reference);
@@ -330,7 +333,7 @@ impl Registry {
             .head_local_manifest(namespace, reference)
             .await
             .map_err(|error| hosted_manifest_error(namespace, reference, error))?;
-        self.record_manifest_pull(namespace, &LinkKind::from_reference(reference), client)
+        self.record_manifest_pull(namespace, &LinkKind::from(reference), client)
             .await?;
         Ok(meta)
     }
@@ -365,7 +368,7 @@ impl Registry {
         if !matches!(serveable, ServeLocal::Miss) {
             self.record_manifest_pull(
                 &request.namespace,
-                &LinkKind::from_reference(&request.reference),
+                &LinkKind::from(&request.reference),
                 client,
             )
             .await?;
@@ -447,7 +450,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<ManifestDescriptor, Error> {
-        let blob_link = LinkKind::from_reference(reference);
+        let blob_link = LinkKind::from(reference);
         // Stamped by the caller once the metadata is actually served: a HEAD
         // that falls through to an upstream refresh is stamped by that path.
         let link = self.metadata_store.read_link(namespace, &blob_link).await?;
@@ -647,7 +650,7 @@ impl Registry {
         reference: &Reference,
         client: &EventActor,
     ) -> Result<ManifestGet, Error> {
-        let blob_link = LinkKind::from_reference(reference);
+        let blob_link = LinkKind::from(reference);
         let link = self
             .read_manifest_link(namespace, &blob_link, client)
             .await?;
@@ -655,7 +658,7 @@ impl Registry {
         // A tag entry can outlive its manifest, whose bytes wait for the
         // collector, so a tag resolving to a deleted revision must read as
         // gone; the probe runs alongside the body read.
-        let (revision, content) = tokio::join!(
+        let (revision, content) = join!(
             self.probe_revision_for_tag(namespace, reference, &link.target),
             self.blob_store.read(&link.target),
         );
@@ -846,10 +849,9 @@ impl Registry {
     /// Reference keys land first, are cleared against collector runs, and have
     /// their bytes re-checked, since a reclaim that missed them deleted its
     /// bytes before the clearance passed; so no record ever points at reclaimed
-    /// bytes. The revision record lands
-    /// next, which is what makes the digest resolvable; the referrer back-link
-    /// and the tag entries land last, so a resolvable tag always implies a
-    /// complete manifest. A crash between any two leaves an over-approximated
+    /// bytes. The revision record lands next, which is what makes the digest
+    /// resolvable; the referrer back-link and the tag entries land last, so a
+    /// resolvable tag always implies a complete manifest. A crash between any two leaves an over-approximated
     /// reference or a tagless revision, both legal.
     async fn write_pushed_keys(
         &self,
@@ -929,7 +931,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<(), Error> {
-        let client_initiated = actor.as_ref().is_none_or(EventActor::is_client);
+        let client_initiated = actor.as_ref().is_none_or(|actor| actor.internal.is_none());
         let resolved_repository = self.resolver.resolve(namespace);
         let repository = repository_name(resolved_repository);
         // Intent-first emission: the events fire before the delete, so a
@@ -1135,12 +1137,13 @@ impl Registry {
         }))
     }
 
+    /// `GET /v2/<name>/manifests/<reference>`: the manifest or a redirect to it.
+    ///
     /// Resolves a manifest GET to a presigned redirect or the manifest body,
     /// then emits `manifest.pull` for the served digest. The redirect fast-path
     /// needs the caller's consent (a client opts out with
     /// `X-Angos-No-Redirect`) and an authoritative target.
     #[instrument(skip(self, request))]
-    /// `GET /v2/<name>/manifests/<reference>`: the manifest or a redirect to it.
     pub async fn handle_get_manifest(
         &self,
         actor: Option<EventActor>,
@@ -1149,7 +1152,7 @@ impl Registry {
     ) -> Result<ManifestGet, Error> {
         let anonymous = EventActor::default();
         let client = actor.as_ref().unwrap_or(&anonymous);
-        let repository = self.get_repository_for_namespace(&request.namespace).ok();
+        let repository = self.repository_for_namespace(&request.namespace).ok();
         let repository_name = repository_name(repository);
 
         let response = match repository.filter(|repository| repository.is_pull_through()) {
@@ -1330,7 +1333,7 @@ impl Registry {
             if downstream.enqueues_for(namespace.as_ref()) {
                 return Some(
                     self.metadata_store
-                        .read_link(namespace, &LinkKind::from_reference(reference))
+                        .read_link(namespace, &LinkKind::from(reference))
                         .await,
                 );
             }
@@ -1445,7 +1448,7 @@ impl Registry {
     /// Fire-and-forget enqueue of the scan job for an image that just landed;
     /// a failure is logged and counted but never fails the client's write.
     async fn dispatch_scan(&self, namespace: &Namespace, digest: &Digest) {
-        let payload = scan::ScanImagePayload {
+        let payload = ScanImagePayload {
             namespace: namespace.clone(),
             digest: digest.clone(),
             force: false,
@@ -1560,54 +1563,41 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::Cursor,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-    };
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use chrono::{Duration, SubsecRound};
     use futures_util::future::join_all;
-    use http::{
-        StatusCode,
-        header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
-    };
+    use http::StatusCode;
+    use http::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
     use serde_json::json;
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{any, method, path},
-    };
+    use wiremock::matchers::{any, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use angos_oci::{
-        Algorithm, MediaType, Namespace, Tag,
-        header::{DOCKER_CONTENT_DIGEST, OCI_TAG},
-        request::{DeleteBlobRequest, PutManifestRequest},
-        response::REPLICATION_SUPERSEDED_CODE,
-    };
-    use angos_storage::{
-        Error as StorageError, ObjectStore,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_cache::Config as CacheConfig;
+    use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_TAG};
+    use angos_oci::request::{DeleteBlobRequest, PutManifestRequest};
+    use angos_oci::response::REPLICATION_SUPERSEDED_CODE;
+    use angos_oci::{Algorithm, MediaType, Namespace, Tag};
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::{Error as StorageError, ObjectStore};
 
-    use crate::{
-        command::server::Error as ServerError,
-        metrics_provider,
-        registry::{
-            Error, Registry,
-            keys::{DigestKeys, GC_ROOT, NamespaceKeys},
-            manifest::*,
-            metadata_store::LinkKind,
-            repository::Config as RepositoryConfig,
-            test_utils::{
-                FSRegistryTestCase, RegistryTestCase, create_test_registry,
-                create_test_registry_recording_pulls, create_test_registry_with, drop_links,
-                for_each_backend, get_blob, metadata_store_over, response_body, response_digest,
-                response_header, upload_blob,
-            },
-        },
-        test_fixtures::client::test_client_config,
+    use crate::command::server::Error as ServerError;
+    use crate::metrics_provider;
+    use crate::registry::keys::{DigestExt, GC_ROOT, NamespaceExt};
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::repository::Config as RepositoryConfig;
+    use crate::registry::test_utils::{
+        FSRegistryTestCase, RegistryTestCase, create_test_registry,
+        create_test_registry_recording_pulls, create_test_registry_with, drop_links,
+        for_each_backend, get_blob, metadata_store_over, response_body, response_digest,
+        response_header, upload_blob,
     };
+    use crate::registry::{Error, Registry};
+    use crate::test_fixtures::client::test_client_config;
+
+    use super::*;
 
     /// The content arm of a manifest read. These tests never enable redirects, so
     /// a read always resolves to bytes.
@@ -1808,7 +1798,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("never/configured").unwrap();
-            assert!(registry.get_repository_for_namespace(namespace).is_err());
+            assert!(registry.repository_for_namespace(namespace).is_err());
 
             let (content, media_type) = create_test_manifest(registry, namespace).await;
             let tag = Reference::Tag(Tag::new("latest").unwrap());
@@ -1857,7 +1847,7 @@ mod tests {
 
             let stored_manifest = registry
                 .get_manifest_direct(
-                    registry.get_repository_for_namespace(namespace).ok(),
+                    registry.repository_for_namespace(namespace).ok(),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
                     Reference::Tag(Tag::new(tag).unwrap()),
@@ -2164,7 +2154,7 @@ mod tests {
                 .await
                 .expect("missing subject should not reject manifest push");
 
-            let subject = MISSING_SUBJECT_DIGEST.parse().unwrap();
+            let subject: Digest = MISSING_SUBJECT_DIGEST.parse().unwrap();
             let digest = response.digest.clone();
             let link = LinkKind::Referrer {
                 subject,
@@ -2280,7 +2270,7 @@ mod tests {
             "attacker must not gain read access to a config it never uploaded"
         );
 
-        let repository = permissive.get_repository_for_namespace(&attacker).unwrap();
+        let repository = permissive.repository_for_namespace(&attacker).unwrap();
         let outcome = get_blob(&permissive, repository, &[], &attacker, &layer_digest, None)
             .await
             .map(|_| ());
@@ -2327,7 +2317,7 @@ mod tests {
             "attacker must not gain read access to a child manifest it never uploaded"
         );
 
-        let repository = permissive.get_repository_for_namespace(&attacker).unwrap();
+        let repository = permissive.repository_for_namespace(&attacker).unwrap();
         let outcome = permissive
             .get_manifest_direct(
                 Some(repository),
@@ -2389,7 +2379,7 @@ mod tests {
         );
         assert!(ownership.can_read(&namespace, &layer_digest).await.unwrap());
 
-        let repository = permissive.get_repository_for_namespace(&namespace).unwrap();
+        let repository = permissive.repository_for_namespace(&namespace).unwrap();
         permissive
             .get_manifest_direct(
                 Some(repository),
@@ -2424,7 +2414,7 @@ mod tests {
     }
 
     async fn pull_through_repository(server: &MockServer) -> Repository {
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = RepositoryConfig {
             upstream: vec![test_client_config(server.uri())],
             ..Default::default()
@@ -2519,7 +2509,7 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
         let repository = Repository::new(
             REPOSITORY,
             &RepositoryConfig {
@@ -2627,7 +2617,7 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
         let repository = Repository::new(
             REPOSITORY,
             &RepositoryConfig {
@@ -2699,7 +2689,7 @@ mod tests {
             )
             .mount(&upstream)
             .await;
-        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
         let repository = Repository::new(
             name,
             &RepositoryConfig {
@@ -2953,10 +2943,7 @@ mod tests {
             .await
             .expect_err("a blob-store fault must abort the delete, not commit a partial cascade");
 
-        let repository = case
-            .registry()
-            .get_repository_for_namespace(namespace)
-            .unwrap();
+        let repository = case.registry().repository_for_namespace(namespace).unwrap();
         case.registry()
             .get_manifest_direct(
                 Some(repository),
@@ -3079,7 +3066,7 @@ mod tests {
             },
         ));
         let registry = create_test_registry(case.blob_store(), metadata_store_over(hooked));
-        let repository = registry.get_repository_for_namespace(&namespace).unwrap();
+        let repository = registry.repository_for_namespace(&namespace).unwrap();
 
         let error = registry
             .get_manifest_direct(
@@ -3119,7 +3106,7 @@ mod tests {
 
             let manifest = registry
                 .get_manifest_direct(
-                    registry.get_repository_for_namespace(namespace).ok(),
+                    registry.repository_for_namespace(namespace).ok(),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
                     Reference::Tag(Tag::new(tag).unwrap()),
@@ -3136,7 +3123,7 @@ mod tests {
 
             let manifest = registry
                 .get_manifest_direct(
-                    registry.get_repository_for_namespace(namespace).ok(),
+                    registry.repository_for_namespace(namespace).ok(),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
                     Reference::Digest(response.digest.clone()),
@@ -3348,7 +3335,7 @@ mod tests {
             assert!(
                 registry
                     .get_manifest_direct(
-                        registry.get_repository_for_namespace(namespace).ok(),
+                        registry.repository_for_namespace(namespace).ok(),
                         &[MediaRange::from(media_type.clone())],
                         namespace,
                         Reference::Tag(Tag::new(tag).unwrap()),
@@ -3372,7 +3359,7 @@ mod tests {
             assert!(
                 registry
                     .get_manifest_direct(
-                        registry.get_repository_for_namespace(namespace).ok(),
+                        registry.repository_for_namespace(namespace).ok(),
                         &[MediaRange::from(media_type.clone())],
                         namespace,
                         Reference::Digest(response.digest.clone()),
@@ -3490,7 +3477,7 @@ mod tests {
             );
             let resolved = registry
                 .get_manifest_direct(
-                    registry.get_repository_for_namespace(namespace).ok(),
+                    registry.repository_for_namespace(namespace).ok(),
                     &[MediaRange::from(media_type.clone())],
                     namespace,
                     Reference::Tag(fresh),
@@ -3705,21 +3692,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_malformed_json_yields_same_error_shape() {
+    async fn a_malformed_manifest_is_refused_as_invalid_json() {
         let malformed = b"not json";
-
-        let parse_err = Manifest::from_slice(malformed)
-            .map_err(|e| Error::manifest_invalid(&e))
-            .expect_err("expected Err from a malformed body");
-        match parse_err {
-            crate::registry::Error::ManifestInvalid(s) => {
-                assert!(
-                    s.starts_with("invalid manifest JSON:"),
-                    "the parse error should start with 'invalid manifest JSON:'; got: {s}"
-                );
-            }
-            other => panic!("expected ManifestInvalid from the parse error mapper, got {other:?}"),
-        }
 
         // Parse failure is detected before any blob/metadata store access, so a
         // single backend exercises the full path.
@@ -3736,7 +3710,7 @@ mod tests {
             .await
             .expect_err("expected Err from put_manifest");
         match put_err {
-            crate::registry::Error::ManifestInvalid(s) => {
+            Error::ManifestInvalid(s) => {
                 assert!(
                     s.starts_with("invalid manifest JSON:"),
                     "put_manifest error should start with 'invalid manifest JSON:'; got: {s}"
@@ -3803,31 +3777,8 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_without_layers_links_only_its_config() {
-        let body = serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-            "config": {
-                "mediaType": "application/vnd.docker.container.image.v1+json",
-                "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                "size": 100
-            },
-            "layers": []
-        }))
-        .unwrap();
-
-        let manifest = Manifest::from_slice(&body).expect("empty layers must parse successfully");
-        let referenced = referenced_digests(&manifest);
-        assert_eq!(
-            referenced.len(),
-            1,
-            "only the config is referenced: {referenced:?}"
-        );
-    }
-
-    #[test]
     fn a_subject_only_manifest_references_nothing() {
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "subject": {
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -3843,7 +3794,7 @@ mod tests {
 
     #[test]
     fn an_index_references_each_of_its_children() {
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::to_vec(&json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.index.v1+json",
         "manifests": [
@@ -3956,7 +3907,7 @@ mod tests {
             );
 
             let repository = registry
-                .get_repository_for_namespace(namespace)
+                .repository_for_namespace(namespace)
                 .expect("get repository failed");
             let stored_manifest = registry
                 .get_manifest_direct(
@@ -4031,7 +3982,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+            let repository = registry.repository_for_namespace(namespace).unwrap();
 
             for i in 0..20 {
                 assert!(
@@ -4073,7 +4024,7 @@ mod tests {
                 .await
                 .unwrap()
                 .items;
-            assert_eq!(tags.len(), 20, "expected exactly 20 remaining tags");
+            assert_eq!(tags.len(), 20);
         })
         .await;
     }
@@ -4102,11 +4053,7 @@ mod tests {
                 .read_link(namespace, &digest_link)
                 .await
                 .unwrap();
-            assert_eq!(
-                link_meta.media_type,
-                Some(media_type.clone()),
-                "Digest link should have media_type stored"
-            );
+            assert_eq!(link_meta.media_type, Some(media_type.clone()));
 
             // Tag resolution carries no media type: it reads entry key names
             // alone, and the revision record above serves it.
@@ -4160,49 +4107,6 @@ mod tests {
         "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .parse()
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn store_manifest_writes_blob_and_links() {
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-        let namespace = Namespace::new("test-repo").unwrap();
-
-        let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
-        let expected_digest = Digest::sha256_of_bytes(&manifest_bytes);
-
-        let response = registry
-            .put_manifest_direct(
-                &namespace,
-                &Reference::Tag(Tag::new("v1").unwrap()),
-                Some(&media_type),
-                &manifest_bytes,
-            )
-            .await
-            .unwrap();
-
-        let stored_digest = response.digest.clone();
-        assert_eq!(stored_digest, expected_digest);
-
-        let link = registry
-            .metadata_store
-            .read_link(&namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
-            .await
-            .unwrap();
-        assert_eq!(link.target, expected_digest);
-
-        let body = registry.blob_store.read(&expected_digest).await.unwrap();
-        assert_eq!(body, manifest_bytes);
-
-        let blob_index = registry
-            .metadata_store
-            .read_blob_index(&expected_digest)
-            .await
-            .unwrap();
-        assert!(
-            blob_index.contains_key(&namespace),
-            "blob-index must contain namespace after manifest push"
-        );
     }
 
     /// Regression for the cross-store isolation bug: with the blob and metadata
@@ -4260,85 +4164,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn store_manifest_is_idempotent() {
-        // Pushing the same manifest bytes twice must not fail: PutIfAbsent for
-        // blob-data is idempotent; link writes overwrite with the same data.
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-        let namespace = Namespace::new("test-repo").unwrap();
-
-        let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
-
-        registry
-            .put_manifest_direct(
-                &namespace,
-                &Reference::Tag(Tag::new("v1").unwrap()),
-                Some(&media_type),
-                &manifest_bytes,
-            )
-            .await
-            .unwrap();
-
-        registry
-            .put_manifest_direct(
-                &namespace,
-                &Reference::Tag(Tag::new("v1").unwrap()),
-                Some(&media_type),
-                &manifest_bytes,
-            )
-            .await
-            .unwrap();
-
-        let digest = Digest::sha256_of_bytes(&manifest_bytes);
-        let link = registry
-            .metadata_store
-            .read_link(&namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
-            .await
-            .unwrap();
-        assert_eq!(link.target, digest);
-    }
-
-    #[tokio::test]
-    async fn delete_manifest_removes_the_revision_link() {
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-        let namespace = Namespace::new("test-repo").unwrap();
-
-        let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
-        let digest = Digest::sha256_of_bytes(&manifest_bytes);
-
-        registry
-            .put_manifest_direct(
-                &namespace,
-                &Reference::Tag(Tag::new("v1").unwrap()),
-                Some(&media_type),
-                &manifest_bytes,
-            )
-            .await
-            .unwrap();
-
-        registry
-            .metadata_store
-            .read_link(&namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
-            .await
-            .unwrap();
-
-        registry
-            .remove_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
-            .await
-            .unwrap();
-
-        let result = registry
-            .metadata_store
-            .read_link(&namespace, &LinkKind::Digest(digest.clone()))
-            .await;
-        assert!(
-            matches!(result, Err(Error::NotFound)),
-            "digest link should be gone after delete, got: {result:?}"
-        );
-    }
-
     // Receiver-side last-writer-wins (LWW)
 
     async fn seed_tag(
@@ -4364,17 +4189,11 @@ mod tests {
         (content, media_type)
     }
 
-    /// Tag state persists its timestamp at millisecond precision (the entry
-    /// ordinal), so exact round-trip assertions feed ms-precision inputs.
-    fn entry_ms(ts: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp_millis(ts.timestamp_millis()).unwrap()
-    }
-
     async fn local_created_at(
         registry: &Registry,
         namespace: &Namespace,
         tag: &str,
-    ) -> chrono::DateTime<chrono::Utc> {
+    ) -> DateTime<Utc> {
         registry
             .metadata_store
             .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
@@ -4393,7 +4212,9 @@ mod tests {
         let tag = "latest";
 
         let (content, media_type) = create_test_manifest(registry, namespace).await;
-        let source_ts = entry_ms(chrono::Utc::now() - chrono::Duration::hours(3));
+        // Tag state persists its timestamp at millisecond precision (the entry
+        // ordinal), so the exact round-trip assertion feeds a ms-precision input.
+        let source_ts = (Utc::now() - Duration::hours(3)).trunc_subsecs(3);
 
         registry
             .handle_put_manifest(
@@ -4424,7 +4245,7 @@ mod tests {
         let namespace = &Namespace::new("lww-repo").unwrap();
         let tag = "latest";
 
-        let before = chrono::Utc::now();
+        let before = Utc::now();
         let (content, media_type) = create_test_manifest(registry, namespace).await;
         registry
             .handle_put_manifest(
@@ -4456,7 +4277,7 @@ mod tests {
 
         let (content, media_type) = seed_tag(registry, namespace, tag).await;
         let created_at = local_created_at(registry, namespace, tag).await;
-        let older = created_at - chrono::Duration::seconds(60);
+        let older = created_at - Duration::seconds(60);
 
         let result = registry
             .handle_put_manifest(
@@ -4488,7 +4309,7 @@ mod tests {
 
         let (content, media_type) = seed_tag(registry, namespace, tag).await;
         let created_at = local_created_at(registry, namespace, tag).await;
-        let newer = created_at + chrono::Duration::seconds(60);
+        let newer = created_at + Duration::seconds(60);
 
         registry
             .handle_put_manifest(
@@ -4572,7 +4393,7 @@ mod tests {
 
         let ((larger, larger_mt), (smaller, smaller_mt)) =
             two_manifests_by_digest_order(registry, namespace).await;
-        let ts = chrono::Utc::now() - chrono::Duration::hours(1);
+        let ts = Utc::now() - Duration::hours(1);
 
         registry
             .handle_put_manifest(
@@ -4619,7 +4440,7 @@ mod tests {
         let ((larger, larger_mt), (smaller, smaller_mt)) =
             two_manifests_by_digest_order(registry, namespace).await;
         let larger_digest = Digest::sha256_of_bytes(&larger);
-        let ts = chrono::Utc::now() - chrono::Duration::hours(1);
+        let ts = Utc::now() - Duration::hours(1);
 
         registry
             .handle_put_manifest(
@@ -4708,7 +4529,7 @@ mod tests {
             registry,
             &namespace,
             &manifest_digest,
-            std::slice::from_ref(&layer_digest),
+            slice::from_ref(&layer_digest),
             ReferencePolicy::Strict,
         )
         .await
@@ -4744,7 +4565,7 @@ mod tests {
             registry,
             &namespace,
             &manifest_digest,
-            std::slice::from_ref(&layer_digest),
+            slice::from_ref(&layer_digest),
             ReferencePolicy::Strict,
         )
         .await
@@ -4853,7 +4674,7 @@ mod tests {
             registry,
             &namespace,
             &manifest_digest,
-            std::slice::from_ref(&layer_digest),
+            slice::from_ref(&layer_digest),
             ReferencePolicy::Trusted,
         )
         .await
@@ -4956,7 +4777,7 @@ mod tests {
         let tag = "fresh";
 
         let (content, media_type) = create_test_manifest(registry, namespace).await;
-        let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
+        let very_old = Utc::now() - Duration::days(3650);
 
         registry
             .handle_put_manifest(
@@ -4975,31 +4796,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_put_manifest_without_source_ts_skips_lww() {
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("lww-repo").unwrap();
-        let tag = "latest";
-
-        let (content, media_type) = seed_tag(registry, namespace, tag).await;
-
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content),
-            )
-            .await
-            .expect("client write (no source_ts) must skip LWW");
-    }
-
-    #[tokio::test]
     async fn accept_put_manifest_digest_reference_skips_lww() {
         let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
@@ -5007,7 +4803,7 @@ mod tests {
 
         let (content, media_type) = create_test_manifest(registry, namespace).await;
         let digest = Digest::sha256_of_bytes(&content);
-        let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
+        let very_old = Utc::now() - Duration::days(3650);
 
         registry
             .handle_put_manifest(
@@ -5034,7 +4830,7 @@ mod tests {
 
         seed_tag(registry, namespace, tag).await;
         let created_at = local_created_at(registry, namespace, tag).await;
-        let older = created_at - chrono::Duration::seconds(60);
+        let older = created_at - Duration::seconds(60);
 
         let result = registry
             .remove_manifest(
@@ -5067,7 +4863,7 @@ mod tests {
 
         seed_tag(registry, namespace, tag).await;
         let created_at = local_created_at(registry, namespace, tag).await;
-        let newer = created_at + chrono::Duration::seconds(60);
+        let newer = created_at + Duration::seconds(60);
 
         registry
             .remove_manifest(
@@ -5163,7 +4959,7 @@ mod tests {
             "the never-wins ordinal must decode to no author timestamp"
         );
 
-        let ancient = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let ancient = DateTime::from_timestamp(0, 0).unwrap();
         registry
             .remove_manifest(
                 None,
@@ -5192,8 +4988,7 @@ mod tests {
 
         let (content, _) = seed_tag(registry, namespace, tag).await;
         let digest = Digest::sha256_of_bytes(&content);
-        let older =
-            local_created_at(registry, namespace, tag).await - chrono::Duration::seconds(60);
+        let older = local_created_at(registry, namespace, tag).await - Duration::seconds(60);
 
         let result = registry
             .remove_manifest(
@@ -5231,8 +5026,7 @@ mod tests {
 
         let (content, _) = seed_tag(registry, namespace, tag).await;
         let digest = Digest::sha256_of_bytes(&content);
-        let newer =
-            local_created_at(registry, namespace, tag).await + chrono::Duration::seconds(60);
+        let newer = local_created_at(registry, namespace, tag).await + Duration::seconds(60);
 
         registry
             .remove_manifest(None, Some(newer), namespace, &Reference::Digest(digest))
@@ -5263,11 +5057,11 @@ mod tests {
         let created_at = local_created_at(registry, namespace, tag).await;
 
         // Suppressed: the stamped source_ts predates the local tag.
-        let decided_before = created_at - chrono::Duration::seconds(60);
+        let decided_before = created_at - Duration::seconds(60);
         let stamped = decided_before.to_rfc3339();
-        let reparsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+        let reparsed = DateTime::parse_from_rfc3339(&stamped)
             .expect("stamped source_ts must be valid RFC 3339")
-            .with_timezone(&chrono::Utc);
+            .with_timezone(&Utc);
 
         let result = registry
             .remove_manifest(
@@ -5289,11 +5083,11 @@ mod tests {
             .expect("a superseded prune delete must preserve the downstream tag");
 
         // Proceeds: the stamped source_ts is newer than the local tag.
-        let decided_after = created_at + chrono::Duration::seconds(60);
+        let decided_after = created_at + Duration::seconds(60);
         let stamped = decided_after.to_rfc3339();
-        let reparsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+        let reparsed = DateTime::parse_from_rfc3339(&stamped)
             .expect("stamped source_ts must be valid RFC 3339")
-            .with_timezone(&chrono::Utc);
+            .with_timezone(&Utc);
 
         registry
             .remove_manifest(
@@ -5320,8 +5114,8 @@ mod tests {
         let conflict: ServerError = Error::Conflict("immutable".to_string()).into();
 
         // Both are 409, but the OCI codes differ so the sender can disambiguate.
-        assert_eq!(superseded.status_code(), http::StatusCode::CONFLICT);
-        assert_eq!(conflict.status_code(), http::StatusCode::CONFLICT);
+        assert_eq!(superseded.status_code(), StatusCode::CONFLICT);
+        assert_eq!(conflict.status_code(), StatusCode::CONFLICT);
 
         let superseded_json = serde_json::to_value(superseded.error_body(None)).unwrap();
         let conflict_json = serde_json::to_value(conflict.error_body(None)).unwrap();
@@ -5336,38 +5130,30 @@ mod tests {
         );
     }
 
-    #[cfg(test)]
     mod noop_suppression_tests {
         //! No-op suppression (loop prevention): an inbound manifest write that does
         //! not change local state must not be re-dispatched. The harness shares one
         //! object store and spawns no drain, so enqueued jobs persist for counting.
 
-        use std::{io::Cursor, sync::Arc};
+        use std::io::Cursor;
+        use std::sync::Arc;
 
         use chrono::{Duration, Utc};
         use tempfile::TempDir;
 
-        use angos_oci::{
-            Digest, MediaType, Namespace, Reference, Tag, request::PutManifestRequest,
-        };
+        use angos_oci::request::PutManifestRequest;
+        use angos_oci::{Digest, MediaType, Namespace, Reference, Tag};
 
-        use crate::{
-            jobs::{
-                Queue,
-                store::{ClaimMode, JobStore},
-            },
-            registry::{
-                Registry, RegistryConfig,
-                manifest::tests::{create_test_manifest, manifest_with_references},
-                metadata_store::LinkKind,
-                test_utils::{
-                    FsTestStack, downstream_client, drop_links, fs_test_stack,
-                    repository_with_downstream, single_repo_resolver, sole_pending_payload,
-                    upload_blob,
-                },
-            },
-            replication::REPLICATION_DELETE_MANIFEST_KIND,
+        use crate::jobs::Queue;
+        use crate::jobs::store::{ClaimMode, JobStore};
+        use crate::registry::manifest::tests::{create_test_manifest, manifest_with_references};
+        use crate::registry::metadata_store::LinkKind;
+        use crate::registry::test_utils::{
+            FsTestStack, downstream_client, drop_links, fs_test_stack, repository_with_downstream,
+            single_repo_resolver, sole_pending_payload, upload_blob,
         };
+        use crate::registry::{Registry, RegistryConfig};
+        use crate::replication::REPLICATION_DELETE_MANIFEST_KIND;
 
         const REPO: &str = "nginx";
         const NAMESPACE: &str = "nginx";
@@ -5935,7 +5721,6 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
     mod dispatch_replication_tests {
         use std::sync::Arc;
 
@@ -5945,26 +5730,20 @@ mod tests {
 
         use angos_oci::{Digest, Namespace, Reference, Tag};
 
-        use crate::{
-            jobs::{
-                Queue,
-                store::{ClaimMode, JobStore},
-            },
-            metrics_provider::init_for_tests,
-            registry::{
-                Registry, RegistryConfig, Repository,
-                manifest::tests::{
-                    DispatchTarget, MISSING_SUBJECT_DIGEST, create_test_manifest_with_subject,
-                },
-                test_utils::{
-                    FsTestStack, downstream_client, fs_test_stack, repository_with_replication,
-                    single_repo_resolver, sole_pending_payload,
-                },
-            },
-            replication::{
-                REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
-                ReplicationDownstream, ReplicationJob, ReplicationMode,
-            },
+        use crate::jobs::Queue;
+        use crate::jobs::store::{ClaimMode, JobStore};
+        use crate::metrics_provider::initialize_metrics;
+        use crate::registry::manifest::tests::{
+            DispatchTarget, MISSING_SUBJECT_DIGEST, create_test_manifest_with_subject,
+        };
+        use crate::registry::test_utils::{
+            FsTestStack, downstream_client, fs_test_stack, repository_with_replication,
+            single_repo_resolver, sole_pending_payload,
+        };
+        use crate::registry::{Registry, RegistryConfig, Repository};
+        use crate::replication::{
+            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
+            ReplicationDownstream, ReplicationJob, ReplicationMode,
         };
 
         const REPO: &str = "nginx";
@@ -5996,10 +5775,6 @@ mod tests {
             )
         }
 
-        fn repository_with_downstream() -> Repository {
-            repository_with(ReplicationMode::EventReconcile, Vec::new())
-        }
-
         /// A `Registry` whose job store is caller-held so the test can count
         /// pending jobs.
         fn build_registry_with(repository: Repository) -> (Arc<Registry>, Arc<JobStore>, TempDir) {
@@ -6022,14 +5797,14 @@ mod tests {
 
         /// [`build_registry_with`] with one `event+reconcile` downstream.
         fn build_registry() -> (Arc<Registry>, Arc<JobStore>, TempDir) {
-            build_registry_with(repository_with_downstream())
+            build_registry_with(repository_with(ReplicationMode::EventReconcile, Vec::new()))
         }
 
         /// The payload carries the correct downstream/namespace/tag/digest/kind and
         /// a populated `source_ts`.
         #[tokio::test]
         async fn dispatch_replication_payload_is_well_formed() {
-            init_for_tests();
+            initialize_metrics();
             let (registry, job_store, _dir) = build_registry();
 
             let namespace = Namespace::new(NAMESPACE).unwrap();
@@ -6070,7 +5845,7 @@ mod tests {
         /// job carrying its own name.
         #[tokio::test]
         async fn dispatch_replication_enqueues_one_job_per_downstream() {
-            init_for_tests();
+            initialize_metrics();
             let (registry, job_store, _dir) = build_registry_with(repository_with_replication(
                 REPO,
                 vec![
@@ -6123,7 +5898,7 @@ mod tests {
         /// subject still listing the referrer, so the job has to carry it.
         #[tokio::test]
         async fn a_digest_delete_carries_the_referrer_subject() {
-            init_for_tests();
+            initialize_metrics();
             let (registry, job_store, _dir) = build_registry();
 
             let namespace = Namespace::new(NAMESPACE).unwrap();
@@ -6173,7 +5948,7 @@ mod tests {
         /// delete outrank a recreate authored in between.
         #[tokio::test]
         async fn dispatch_replication_uses_provided_source_ts_verbatim() {
-            init_for_tests();
+            initialize_metrics();
             let (registry, job_store, _dir) = build_registry();
 
             let namespace = Namespace::new(NAMESPACE).unwrap();
@@ -6201,7 +5976,7 @@ mod tests {
 
         #[tokio::test]
         async fn dispatch_replication_skips_reconcile_only_downstream() {
-            init_for_tests();
+            initialize_metrics();
             let (registry, job_store, _dir) =
                 build_registry_with(repository_with(ReplicationMode::ReconcileOnly, Vec::new()));
 
@@ -6234,7 +6009,7 @@ mod tests {
 
         #[tokio::test]
         async fn dispatch_replication_skips_non_matching_namespace_filter() {
-            init_for_tests();
+            initialize_metrics();
             let (registry, job_store, _dir) = build_registry_with(repository_with(
                 ReplicationMode::EventReconcile,
                 vec![Regex::new("^other/.*").unwrap()],
@@ -6288,7 +6063,7 @@ mod tests {
 
         // Seed the newer local tag at a known recent source_ts so created_at is
         // stamped deterministically rather than from the wall clock.
-        let newer_ts = Utc::now() - chrono::Duration::seconds(10);
+        let newer_ts = Utc::now() - Duration::seconds(10);
         let seeded = registry
             .handle_put_manifest(
                 None,
@@ -6315,7 +6090,7 @@ mod tests {
                     reference: tag(),
                     content_type: Some(media_type.clone()),
                     tags: Vec::new(),
-                    source_ts: Some(newer_ts - chrono::Duration::seconds(60)),
+                    source_ts: Some(newer_ts - Duration::seconds(60)),
                 },
                 Cursor::new(manifest_a),
             )

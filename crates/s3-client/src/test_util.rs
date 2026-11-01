@@ -29,25 +29,27 @@ pub fn test_endpoint() -> String {
 /// Canonical [`BackendConfig`] for integration tests against the live test
 /// backend, isolated under `key_prefix`. Callers override the remaining
 /// fields with struct-update syntax.
-pub fn integration_config(key_prefix: impl Into<String>) -> BackendConfig {
+#[must_use]
+pub fn integration_config(key_prefix: String) -> BackendConfig {
     BackendConfig {
         access_key_id: TEST_ACCESS_KEY.to_string(),
         secret_key: TEST_SECRET_KEY.to_string(),
         endpoint: test_endpoint(),
         bucket: TEST_BUCKET.to_string(),
         region: TEST_REGION.to_string(),
-        key_prefix: key_prefix.into(),
+        key_prefix,
         ..BackendConfig::default()
     }
 }
 
 /// Dummy [`BackendConfig`] for unit tests that never reach a live backend
 /// (config validation, wiremock servers).
-pub fn mock_config(endpoint: impl Into<String>) -> BackendConfig {
+#[must_use]
+pub fn mock_config(endpoint: String) -> BackendConfig {
     BackendConfig {
         access_key_id: "key".to_string(),
         secret_key: "secret".to_string(),
-        endpoint: endpoint.into(),
+        endpoint,
         bucket: "test-bucket".to_string(),
         region: "us-east-1".to_string(),
         ..BackendConfig::default()

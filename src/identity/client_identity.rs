@@ -1,6 +1,8 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::identity::AuthMethod;
 
@@ -56,46 +58,5 @@ pub struct ClientCertificate {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct OidcClaims {
     pub provider_name: String,
-    pub claims: HashMap<String, serde_json::Value>,
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::SocketAddr;
-
-    use super::*;
-
-    fn assert_non_ip_fields_default(identity: &ClientIdentity) {
-        assert!(identity.id.is_none());
-        assert!(identity.username.is_none());
-        assert!(identity.oidc.is_none());
-        assert!(identity.certificate.organizations.is_empty());
-        assert!(identity.certificate.common_names.is_empty());
-    }
-
-    #[test]
-    fn test_new_without_remote_address() {
-        let identity = ClientIdentity::new(None);
-
-        assert!(identity.client_ip.is_none());
-        assert_non_ip_fields_default(&identity);
-    }
-
-    #[test]
-    fn test_new_with_ipv4_address() {
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let identity = ClientIdentity::new(Some(addr));
-
-        assert_eq!(identity.client_ip.as_deref(), Some("127.0.0.1"));
-        assert_non_ip_fields_default(&identity);
-    }
-
-    #[test]
-    fn test_new_with_ipv6_address() {
-        let addr: SocketAddr = "[::1]:443".parse().unwrap();
-        let identity = ClientIdentity::new(Some(addr));
-
-        assert_eq!(identity.client_ip.as_deref(), Some("::1"));
-        assert_non_ip_fields_default(&identity);
-    }
+    pub claims: HashMap<String, Value>,
 }

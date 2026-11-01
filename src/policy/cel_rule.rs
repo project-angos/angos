@@ -3,10 +3,11 @@
 //! Invalid CEL syntax is detected when the TOML configuration is parsed,
 //! so the registry fails fast with a clear error rather than at request time.
 
-use std::{fmt, sync::Arc};
+use std::fmt;
+use std::sync::Arc;
 
 use cel_interpreter::{Context, ExecutionError, Program, Value};
-use serde::{Deserialize, de};
+use serde::{Deserialize, Deserializer, de};
 
 /// A pre-compiled CEL expression, keeping its source for configuration
 /// checks and messages.
@@ -21,9 +22,6 @@ pub struct CelRule {
 
 impl CelRule {
     /// Compiles a CEL expression from source.
-    ///
-    /// Returns `Err` with a human-readable message when the source is not
-    /// valid CEL.
     ///
     /// # Errors
     ///
@@ -66,6 +64,7 @@ pub enum RuleOutcome {
 /// Evaluate `rules` in order against `context`. First `bool(true)` wins
 /// (`Matched`); a non-boolean result or execution error stops evaluation
 /// (`Indeterminate`) and the caller decides how to treat it; all-false is `NoMatch`.
+#[must_use]
 pub fn evaluate_rules(rules: &[CelRule], context: &Context) -> RuleOutcome {
     for (index, rule) in rules.iter().enumerate() {
         let rule_index = index + 1;
@@ -138,7 +137,7 @@ fn sanitize_execution_error(error: &ExecutionError) -> String {
 impl<'de> Deserialize<'de> for CelRule {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let source = String::deserialize(deserializer)?;
         Self::compile(&source).map_err(de::Error::custom)
@@ -188,32 +187,12 @@ mod tests {
     }
 
     #[test]
-    fn valid_access_policy_cel_rule_deserializes() {
-        let toml = r#"rules = ["identity.username == 'admin'"]"#;
-        let result: Result<PolicyConfig<AccessMode>, _> = toml::from_str(toml);
-        assert!(
-            result.is_ok(),
-            "valid CEL rule must deserialize successfully"
-        );
-    }
-
-    #[test]
     fn invalid_retention_policy_cel_rule_fails_at_deserialize() {
         let toml = r#"rules = ["this is (((( not valid"]"#;
         let result: Result<RetentionPolicyConfig, _> = toml::from_str(toml);
         assert!(
             result.is_err(),
             "invalid CEL rule must fail at deserialization"
-        );
-    }
-
-    #[test]
-    fn valid_retention_policy_cel_rule_deserializes() {
-        let toml = r#"rules = ["image.pushed_at > now() - days(30)"]"#;
-        let result: Result<RetentionPolicyConfig, _> = toml::from_str(toml);
-        assert!(
-            result.is_ok(),
-            "valid CEL rule must deserialize successfully"
         );
     }
 

@@ -1,36 +1,38 @@
 //! The `_angos/` extension's wire vocabulary at the registry edge. The
-//! job-administration types ([`ext::Queue`]/[`ext::JobState`]) are the
+//! job-administration types ([`ExtQueue`]/[`ExtJobState`]) are the
 //! extension's own, so they convert into the job engine's
-//! [`jobs::Queue`]/[`jobs::JobState`] here.
+//! [`Queue`]/[`JobState`] here.
 
-use angos_extension_service as ext;
+use angos_extension_service::{
+    JobState as ExtJobState, LayerEntry, LayerListing, Queue as ExtQueue,
+};
 
-use crate::jobs;
-use crate::layer;
+use crate::jobs::{JobState, Queue};
+use crate::layer::Listing;
 
-impl From<ext::Queue> for jobs::Queue {
-    fn from(queue: ext::Queue) -> Self {
+impl From<ExtQueue> for Queue {
+    fn from(queue: ExtQueue) -> Self {
         match queue {
-            ext::Queue::Cache => jobs::Queue::Cache,
-            ext::Queue::Replication => jobs::Queue::Replication,
-            ext::Queue::Scan => jobs::Queue::Scan,
-            ext::Queue::Index => jobs::Queue::Index,
+            ExtQueue::Cache => Queue::Cache,
+            ExtQueue::Replication => Queue::Replication,
+            ExtQueue::Scan => Queue::Scan,
+            ExtQueue::Index => Queue::Index,
         }
     }
 }
 
-impl From<ext::JobState> for jobs::JobState {
-    fn from(state: ext::JobState) -> Self {
+impl From<ExtJobState> for JobState {
+    fn from(state: ExtJobState) -> Self {
         match state {
-            ext::JobState::Pending => jobs::JobState::Pending,
-            ext::JobState::Failed => jobs::JobState::Failed,
+            ExtJobState::Pending => JobState::Pending,
+            ExtJobState::Failed => JobState::Failed,
         }
     }
 }
 
 /// The wire listing of a layer: its stored listing and every entry of it.
-pub fn layer_listing(listing: &layer::Listing, entries: Vec<ext::LayerEntry>) -> ext::LayerListing {
-    ext::LayerListing {
+pub fn layer_listing(listing: &Listing, entries: Vec<LayerEntry>) -> LayerListing {
+    LayerListing {
         refreshing: listing.is_outdated(),
         compressed: listing.compressed,
         uncompressed_size: listing.uncompressed_size,

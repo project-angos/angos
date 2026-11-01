@@ -1,10 +1,9 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use reqwest::{Certificate, Client, ClientBuilder, Identity, redirect::Policy};
+use reqwest::redirect::Policy;
+use reqwest::{Certificate, Client, ClientBuilder, Identity};
 use rustls::RootCertStore;
 use rustls_native_certs::CertificateResult;
 use serde::Deserialize;
@@ -244,7 +243,6 @@ fn load_identity(identity: &MtlsIdentity) -> Result<Identity, String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-
     use std::sync::LazyLock;
 
     use rcgen::{
@@ -307,23 +305,11 @@ mod tests {
         }
     });
 
-    fn ca_bundle_pem() -> &'static str {
-        &FIXTURES.ca_bundle
-    }
-
-    fn client_cert_pem() -> &'static str {
-        &FIXTURES.client_cert
-    }
-
-    fn client_key_pem() -> &'static str {
-        &FIXTURES.client_key
-    }
-
     #[test]
     fn load_certificate_bundle_parses_pem_bundle() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let file_path = tmp_dir.path().join("bundle.pem");
-        fs::write(&file_path, ca_bundle_pem()).unwrap();
+        fs::write(&file_path, &FIXTURES.ca_bundle).unwrap();
 
         let loaded_certificates = load_certificate_bundle(&file_path).unwrap();
         assert_eq!(loaded_certificates.len(), 2);
@@ -346,7 +332,7 @@ mod tests {
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let file_path = tmp_dir.path().join("bundle.pem");
-        fs::write(&file_path, ca_bundle_pem()).unwrap();
+        fs::write(&file_path, &FIXTURES.ca_bundle).unwrap();
 
         let client = MtlsClientBuilder::new()
             .with_tls(&ClientTls {
@@ -381,7 +367,7 @@ mod tests {
             self_signed_ca_der("System CA"),
             CertificateDer::from(vec![0u8; 16]),
         ];
-        let configured = Certificate::from_pem_bundle(ca_bundle_pem().as_bytes()).unwrap();
+        let configured = Certificate::from_pem_bundle(FIXTURES.ca_bundle.as_bytes()).unwrap();
 
         let roots = collect_roots(system, configured).expect("roots must be collected");
 
@@ -396,7 +382,7 @@ mod tests {
     /// no TLS connection could ever verify, so the client is not built.
     #[test]
     fn roots_need_a_system_or_a_configured_certificate() {
-        let configured = Certificate::from_pem_bundle(ca_bundle_pem().as_bytes()).unwrap();
+        let configured = Certificate::from_pem_bundle(FIXTURES.ca_bundle.as_bytes()).unwrap();
         assert_eq!(
             collect_roots(CertificateResult::default(), configured)
                 .unwrap()
@@ -410,10 +396,10 @@ mod tests {
     fn load_identity_parses_certificate_and_key() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let cert_file_path = tmp_dir.path().join("certificate.pem");
-        fs::write(&cert_file_path, client_cert_pem()).unwrap();
+        fs::write(&cert_file_path, &FIXTURES.client_cert).unwrap();
 
         let key_file_path = tmp_dir.path().join("private-key.pem");
-        fs::write(&key_file_path, client_key_pem()).unwrap();
+        fs::write(&key_file_path, &FIXTURES.client_key).unwrap();
 
         let identity = MtlsIdentity {
             certificate: cert_file_path,
@@ -421,7 +407,7 @@ mod tests {
         };
         assert!(load_identity(&identity).is_ok());
 
-        fs::write(&key_file_path, ca_bundle_pem()).unwrap();
+        fs::write(&key_file_path, &FIXTURES.ca_bundle).unwrap();
         assert!(load_identity(&identity).is_err());
     }
 
@@ -432,10 +418,10 @@ mod tests {
     fn load_identity_accepts_a_certificate_without_a_trailing_newline() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let cert_file_path = tmp_dir.path().join("certificate.pem");
-        fs::write(&cert_file_path, client_cert_pem().trim_end()).unwrap();
+        fs::write(&cert_file_path, FIXTURES.client_cert.trim_end()).unwrap();
 
         let key_file_path = tmp_dir.path().join("private-key.pem");
-        fs::write(&key_file_path, client_key_pem()).unwrap();
+        fs::write(&key_file_path, &FIXTURES.client_key).unwrap();
 
         let identity = load_identity(&MtlsIdentity {
             certificate: cert_file_path,

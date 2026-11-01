@@ -10,14 +10,10 @@ use futures_util::TryStreamExt;
 
 use angos_oci::{Digest, Namespace, Tag};
 
-use crate::{
-    command::maintenance::error::Error,
-    policy::{ImagePolicy, ManifestImage},
-    registry::{
-        Error as RegistryError,
-        metadata_store::{LinkKind, LinkMetadata, MetadataStore},
-    },
-};
+use crate::command::maintenance::error::Error;
+use crate::policy::{ImagePolicy, ManifestImage};
+use crate::registry::Error as RegistryError;
+use crate::registry::metadata_store::{LinkKind, LinkMetadata, MetadataStore};
 
 /// Fan-out for the per-tag link-metadata reads feeding the rankings.
 /// Fixed rather than derived from `--concurrency`, which already bounds the
@@ -74,6 +70,7 @@ pub fn rank_by(
 
 /// A namespace's tags with both rankings, what an image policy is judged
 /// against.
+#[derive(Default)]
 pub struct Rankings {
     pub tags: Vec<TagWithMetadata>,
     pub last_pushed: Vec<String>,

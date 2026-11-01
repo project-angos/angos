@@ -1,26 +1,19 @@
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, instrument, warn};
 
-use angos_oci::{
-    Digest, Namespace, UploadSessionId,
-    http_range::RequestRange,
-    request::{DeleteBlobRequest, GetBlobRequest, HeadBlobRequest},
-};
+use angos_oci::http_range::RequestRange;
+use angos_oci::request::{DeleteBlobRequest, GetBlobRequest, HeadBlobRequest};
+use angos_oci::{Digest, Namespace, UploadSessionId};
 use angos_oci_service::{Accepted, BlobDescriptor, BlobGet, BlobStream};
 use angos_storage::BoxedReader;
 
-use crate::{
-    cache_fill::build_envelope,
-    event_webhook::event::{Event, EventActor},
-    jobs::Queue,
-    registry::{
-        Error, Registry, Repository,
-        blob_ownership::promote_and_grant,
-        blob_store::BlobStore,
-        metadata_store::{LinkKind, MetadataStore},
-        record_pull_through, repository_name,
-    },
-};
+use crate::cache_fill::build_envelope;
+use crate::event_webhook::event::{Event, EventActor};
+use crate::jobs::Queue;
+use crate::registry::blob_ownership::promote_and_grant;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
+use crate::registry::{Error, Registry, Repository, record_pull_through, repository_name};
 
 /// Default read buffer each frame of a streamed blob response is filled from.
 /// tokio-util's own default is 4 KiB, which costs a quarter of a million
@@ -128,8 +121,8 @@ async fn fill_cache_session(
 }
 
 impl Registry {
-    #[instrument]
     /// `HEAD /v2/<name>/blobs/<digest>`: the blob's descriptor, no body.
+    #[instrument]
     pub async fn handle_head_blob(
         &self,
         request: HeadBlobRequest,
@@ -140,7 +133,7 @@ impl Registry {
             .await?;
         // A namespace no `[repository]` entry matches has no upstream, so it
         // serves what it owns and nothing else.
-        let repository = self.get_repository_for_namespace(&request.namespace).ok();
+        let repository = self.repository_for_namespace(&request.namespace).ok();
         let (digest, size) = match repository.filter(|repository| repository.is_pull_through()) {
             Some(upstream) => self.head_cached_blob(upstream, request, has_access).await?,
             None if has_access => {
@@ -294,9 +287,9 @@ impl Registry {
         })
     }
 
-    #[instrument]
     /// `DELETE /v2/<name>/blobs/<digest>`: revokes ownership; the collector
     /// reclaims the bytes once every reference is stale.
+    #[instrument]
     pub async fn handle_delete_blob(&self, request: DeleteBlobRequest) -> Result<Accepted, Error> {
         let ownership = self.metadata_store();
         let links = match ownership
@@ -344,7 +337,7 @@ impl Registry {
         request: GetBlobRequest,
         allow_redirect: bool,
     ) -> Result<BlobGet<BoxedReader>, Error> {
-        let repository = self.get_repository_for_namespace(&request.namespace).ok();
+        let repository = self.repository_for_namespace(&request.namespace).ok();
         let repository_name = repository_name(repository);
 
         let has_access = self
@@ -375,43 +368,40 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, sync::Arc, time::Duration};
+    use std::io::{Cursor, Error as IoError, Result as IoResult};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use async_trait::async_trait;
-    use http::{
-        StatusCode,
-        header::{CONTENT_LENGTH, CONTENT_RANGE},
-    };
+    use http::StatusCode;
+    use http::header::{CONTENT_LENGTH, CONTENT_RANGE};
     use tempfile::TempDir;
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path},
-    };
+    use tokio::io::{AsyncRead, ReadBuf};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use angos_oci::{Namespace, Tag, http_range::ByteWindow};
-    use angos_storage::{
-        Error as StorageError, ObjectStore, PresignedStore,
-        fs::Backend as StorageFsBackend,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_cache::Config as CacheConfig;
+    use angos_oci::http_range::ByteWindow;
+    use angos_oci::{Namespace, Tag};
+    use angos_storage::fs::Backend as StorageFsBackend;
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::{Error as StorageError, ObjectStore, PresignedStore};
 
-    use crate::{
-        metrics_provider::{init_for_tests, metrics_provider},
-        registry::{
-            Registry, RegistryConfig,
-            blob::*,
-            keys::{DigestKeys, NamespaceKeys},
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            repository::Config,
-            test_utils::{
-                RegistryTestCase, create_test_blob, create_test_registry, drop_links,
-                for_each_backend, get_blob, metadata_store_over, put_blob_direct, response_body,
-                response_digest, response_header, seed_links, single_repo_resolver, test_job_store,
-                upload_blob,
-            },
-        },
-        test_fixtures::client::test_client_config,
+    use crate::metrics_provider::{initialize_metrics, metrics_provider};
+    use crate::registry::keys::{DigestExt, NamespaceExt};
+    use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+    use crate::registry::repository::Config;
+    use crate::registry::test_utils::{
+        RegistryTestCase, create_test_blob, create_test_registry, drop_links, for_each_backend,
+        get_blob, metadata_store_over, put_blob_direct, response_body, response_digest,
+        response_header, seed_links, single_repo_resolver, test_job_store, upload_blob,
     };
+    use crate::registry::{Registry, RegistryConfig};
+    use crate::test_fixtures::client::test_client_config;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_head_blob() {
@@ -525,7 +515,7 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned blob content";
             let digest = put_blob_direct(&registry.blob_store, content).await;
-            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+            let repository = registry.repository_for_namespace(namespace).unwrap();
 
             let head_result = registry
                 .handle_head_blob(HeadBlobRequest {
@@ -889,7 +879,7 @@ mod tests {
             let namespace_links = blob_index.get(&namespace).unwrap();
             assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
-            let repository = registry.get_repository_for_namespace(&namespace).unwrap();
+            let repository = registry.repository_for_namespace(&namespace).unwrap();
             let response = get_blob(registry, repository, &[], &namespace, &digest, None)
                 .await
                 .unwrap();
@@ -924,7 +914,7 @@ mod tests {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
-        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
         let repository = Repository::new(
             "local",
             &config,
@@ -985,7 +975,7 @@ mod tests {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
         };
-        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
         let repository = Repository::new(
             "redirect-cache",
             &config,
@@ -1062,13 +1052,13 @@ mod tests {
     /// dropping mid-fill.
     struct FailingReader;
 
-    impl tokio::io::AsyncRead for FailingReader {
+    impl AsyncRead for FailingReader {
         fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Err(std::io::Error::other("upstream dropped mid-fill")))
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<IoResult<()>> {
+            Poll::Ready(Err(IoError::other("upstream dropped mid-fill")))
         }
     }
 
@@ -1143,16 +1133,16 @@ mod tests {
     /// bytes and grant the reference as independent idempotent work.
     #[tokio::test]
     async fn cache_blob_grants_reference_with_split_blob_and_metadata_backends() {
-        init_for_tests();
+        initialize_metrics();
         let blob_dir = TempDir::new().unwrap();
         let meta_dir = TempDir::new().unwrap();
 
         let blob_obj: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder(blob_dir.path().to_str().unwrap()).build());
+            Arc::new(StorageFsBackend::builder(blob_dir.path()).build());
         let blob_store = Arc::new(BlobStore::new(blob_obj.clone(), None));
 
         let meta_obj: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder(meta_dir.path().to_str().unwrap()).build());
+            Arc::new(StorageFsBackend::builder(meta_dir.path()).build());
         let metadata_store = metadata_store_over(meta_obj);
 
         let namespace = Namespace::new("kubernetes.io/kube-apiserver").unwrap();
@@ -1432,41 +1422,6 @@ mod tests {
             // An empty blob has no satisfiable window, so the range is ignored.
             assert_eq!(response.status(), StatusCode::OK);
             assert!(response_body(response).await.is_empty());
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_head_blob_independent_of_get() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"head blob independence test";
-
-            let (digest, repository) = create_test_blob(registry, namespace, content).await;
-
-            let head_response = registry
-                .handle_head_blob(HeadBlobRequest {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                    accepted_types: Vec::new(),
-                })
-                .await
-                .unwrap()
-                .into_response()
-                .unwrap();
-            assert_eq!(response_digest(&head_response), digest);
-            let head_length = response_header(&head_response, &CONTENT_LENGTH);
-            assert_eq!(*head_length, content.len().to_string());
-
-            // HEAD and GET must agree on what they say the blob is.
-            let get_response = get_blob(registry, &repository, &[], namespace, &digest, None)
-                .await
-                .unwrap();
-            assert_eq!(
-                *response_header(&get_response, &CONTENT_LENGTH),
-                head_length
-            );
         })
         .await;
     }

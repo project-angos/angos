@@ -4,7 +4,8 @@
 //! running server or a worker drains the jobs. Nothing runs this pass on its
 //! own: a `CronJob` or a timer schedules it, as for `prune`.
 
-use std::{pin::pin, sync::Arc};
+use std::pin::pin;
+use std::sync::Arc;
 
 use argh::FromArgs;
 use async_trait::async_trait;
@@ -14,25 +15,19 @@ use tracing::info;
 
 use angos_oci::Namespace;
 
-use crate::{
-    command::{
-        bootstrap,
-        maintenance::{
-            Error,
-            action::Action,
-            check::{self, NamespaceChecker},
-            executor::{ActionSink, Executor, run_job_store, run_sink},
-            tags::Rankings,
-        },
-        scrub::default_concurrency,
-    },
-    configuration::Configuration,
-    registry::{
-        blob_store::BlobStore, manifest::read_manifest, metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-    scan::{ScanImagePayload, scan_reports},
-};
+use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::Action;
+use crate::command::maintenance::check::{self, NamespaceChecker};
+use crate::command::maintenance::executor::{ActionSink, Executor, run_job_store, run_sink};
+use crate::command::maintenance::tags::Rankings;
+use crate::command::scrub::default_concurrency;
+use crate::configuration::Configuration;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::manifest::read_manifest;
+use crate::registry::metadata_store::MetadataStore;
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::scan::{ScanImagePayload, scan_reports};
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -75,16 +70,10 @@ impl NamespaceChecker for ScanChecker {
         };
         // Only the rules read the tags, so a policy without any skips them.
         let rankings = if policy.has_rules() && !self.force {
-            Some(Rankings::read(&self.metadata_store, namespace).await?)
+            Rankings::read(&self.metadata_store, namespace).await?
         } else {
-            None
+            Rankings::default()
         };
-        let empty = Rankings {
-            tags: Vec::new(),
-            last_pushed: Vec::new(),
-            last_pulled: Vec::new(),
-        };
-        let rankings = rankings.as_ref().unwrap_or(&empty);
 
         let mut revisions = pin!(self.metadata_store.stream_revisions(namespace));
         while let Some(digest) = revisions.next().await {
@@ -130,7 +119,7 @@ impl NamespaceChecker for ScanChecker {
 }
 
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
-    let bootstrap::MaintenanceContext {
+    let MaintenanceContext {
         blob_store,
         metadata_store,
         repositories,
@@ -168,27 +157,19 @@ mod tests {
     use angos_oci::{Digest, Namespace};
 
     use super::ScanChecker;
-    use crate::{
-        command::maintenance::{
-            action::Action,
-            check::{self, NamespaceChecker},
-            executor::Executor,
-        },
-        jobs::{
-            Queue,
-            store::{ClaimMode, JobStore},
-        },
-        policy::{CelRule, ImagePolicy, PolicyConfig},
-        registry::{
-            Repository,
-            metadata_store::LinkKind,
-            test_utils::{
-                FsTestStack, angos_report, fs_test_stack, repository_with_replication, seed_links,
-                seed_manifest, single_repo_resolver,
-            },
-        },
-        scan::{ScanAction, ScanImagePayload},
+    use crate::command::maintenance::action::Action;
+    use crate::command::maintenance::check::{self, NamespaceChecker};
+    use crate::command::maintenance::executor::Executor;
+    use crate::jobs::Queue;
+    use crate::jobs::store::{ClaimMode, JobStore};
+    use crate::policy::{CelRule, ImagePolicy, PolicyConfig};
+    use crate::registry::Repository;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::test_utils::{
+        FsTestStack, angos_report, fs_test_stack, repository_with_replication, seed_links,
+        seed_manifest, single_repo_resolver,
     };
+    use crate::scan::{ScanAction, ScanImagePayload};
 
     /// A repository scanning under `default` and `rules`.
     fn scanning_repository(default: Option<ScanAction>, rules: &[&str]) -> Repository {

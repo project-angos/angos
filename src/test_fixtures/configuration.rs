@@ -1,7 +1,5 @@
-use crate::{
-    configuration::{Configuration, Error},
-    metrics_provider,
-};
+use crate::configuration::{Configuration, Error};
+use crate::metrics_provider;
 
 pub const MINIMAL_CONFIG_TOML: &str = r#"
     [blob_store.fs]
@@ -27,7 +25,7 @@ pub const MINIMAL_CONFIG_TOML: &str = r#"
 ///
 /// Panics if the built-in TOML fixture becomes invalid.
 pub fn minimal_config() -> Configuration {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     Configuration::load_from_str(MINIMAL_CONFIG_TOML).unwrap()
 }
 
@@ -53,6 +51,6 @@ pub fn load_config(extra: &str) -> Configuration {
 ///
 /// Returns an error when the appended TOML makes the configuration invalid.
 pub fn try_load_config(extra: &str) -> Result<Configuration, Error> {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     Configuration::load_from_str(&config_toml(extra))
 }

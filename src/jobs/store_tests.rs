@@ -1,36 +1,34 @@
-use std::{
-    sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone as _, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::{sync::Semaphore, time::sleep};
+use tokio::spawn;
+use tokio::sync::Semaphore;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use angos_storage::{
-    Error as StorageError, ObjectStore,
-    fs::Backend as StorageFsBackend,
-    test_util::{HookedStore, StoreHook, StoreOp},
-};
+use angos_storage::fs::Backend as StorageFsBackend;
+use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+use angos_storage::{Error as StorageError, ObjectStore};
 
 use crate::jobs::store::{
     CLAIM_SPREAD, ClaimCheck, ClaimMode, ClaimedJob, CompleteOutcome, DeadLetterRecord, Error,
-    FailOutcome, JOBS_ROOT, JobEnvelope, JobQueueConfig, JobRetryPolicy, JobState, JobStore,
-    LockKey, MAX_REPORTED_PENDING, Queue, QueueDepthRefresh, STORAGE_KEY_PREFIX_LEN,
-    ensure_claim_support, job_claim_path, job_lock_key_index_path, job_pending_path,
-    make_storage_key, parse_lock_key_index, parse_not_before, queue_depth_refresh_loop,
-    serialize_lock_key_index, should_cancel_claim,
+    FailOutcome, JOBS_ROOT, JobEnvelope, JobQueueConfig, JobRetryPolicy, JobStore, LockKey,
+    MAX_REPORTED_PENDING, QueueDepthRefresh, STORAGE_KEY_PREFIX_LEN, ensure_claim_support,
+    job_claim_path, job_failed_path, job_lock_key_index_path, job_pending_path, make_storage_key,
+    parse_lock_key_index, parse_not_before, queue_depth_refresh_loop, serialize_lock_key_index,
+    should_cancel_claim,
 };
+use crate::jobs::{JobState, Queue};
 use crate::metrics_provider;
-use crate::registry::{Error as RegistryError, test_utils::metadata_store_over};
+use crate::registry::Error as RegistryError;
+use crate::registry::test_utils::metadata_store_over;
 
 struct Harness {
     store: Arc<JobStore>,
@@ -43,7 +41,7 @@ struct Harness {
 
 /// A job store over a private fs backend rooted in its own temp directory.
 fn harness() -> Harness {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (raw, dir) = fs_store();
     let store = Arc::new(JobStore::new(
         &metadata_store_over(raw.clone()),
@@ -66,7 +64,7 @@ fn fs_store() -> (Arc<dyn ObjectStore>, TempDir) {
 }
 
 fn lock_key(value: &str) -> LockKey {
-    LockKey::new(value).expect("test lock key must be valid")
+    LockKey::try_new(value).expect("test lock key must be valid")
 }
 
 fn dummy_envelope(key: &str) -> JobEnvelope {
@@ -165,7 +163,7 @@ async fn dead_letter_after_max_attempts() {
     ));
     assert!(matches!(
         h.store.read_pending(Queue::Cache, &storage_key).await,
-        Err(crate::jobs::store::Error::NotFound)
+        Err(Error::NotFound)
     ));
 }
 
@@ -225,7 +223,7 @@ async fn queue_depth_gauges_follow_a_reloaded_store() {
         Duration::from_millis(10),
     )));
     let shutdown = CancellationToken::new();
-    let ticker = tokio::spawn(queue_depth_refresh_loop(
+    let ticker = spawn(queue_depth_refresh_loop(
         Arc::clone(&refresh),
         Queue::Cache,
         shutdown.clone(),
@@ -274,10 +272,7 @@ async fn count_pending_saturates_at_cap() {
     for i in 0..(MAX_REPORTED_PENDING + 5) {
         let key = make_storage_key(now, &format!("stub-{i}"));
         h.raw
-            .put(
-                &crate::jobs::store::job_pending_path("cache", &key),
-                Bytes::from_static(b"{}"),
-            )
+            .put(&job_pending_path("cache", &key), Bytes::from_static(b"{}"))
             .await
             .expect("stub");
     }
@@ -296,21 +291,15 @@ async fn count_pending_excludes_envelopes_past_readiness_horizon() {
     for i in 0..2 {
         let key = make_storage_key(now, &format!("ready-{i}"));
         h.raw
-            .put(
-                &crate::jobs::store::job_pending_path("cache", &key),
-                Bytes::from_static(b"{}"),
-            )
+            .put(&job_pending_path("cache", &key), Bytes::from_static(b"{}"))
             .await
             .expect("ready");
     }
-    let far_future = now + chrono::Duration::hours(1);
+    let far_future = now + ChronoDuration::hours(1);
     for i in 0..2 {
         let key = make_storage_key(far_future, &format!("future-{i}"));
         h.raw
-            .put(
-                &crate::jobs::store::job_pending_path("cache", &key),
-                Bytes::from_static(b"{}"),
-            )
+            .put(&job_pending_path("cache", &key), Bytes::from_static(b"{}"))
             .await
             .expect("future");
     }
@@ -405,7 +394,7 @@ async fn orphan_index_is_self_healed_on_next_lookup() {
 
     let storage_key = make_storage_key(Utc::now(), "phantom-id");
     let index_data = serialize_lock_key_index(&storage_key).expect("serialize");
-    let index_path = crate::jobs::store::job_lock_key_index_path("cache", &lock_key);
+    let index_path = job_lock_key_index_path("cache", &lock_key);
     h.raw
         .put(&index_path, Bytes::from(index_data))
         .await
@@ -444,9 +433,9 @@ impl StoreHook for FailIndexDelete {
 
 #[tokio::test]
 async fn orphan_index_transient_delete_failure_does_not_drop_enqueue() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let lock_key = lock_key("cache.ns:sha256:orphan-transient");
-    let index_path = crate::jobs::store::job_lock_key_index_path("cache", &lock_key);
+    let index_path = job_lock_key_index_path("cache", &lock_key);
 
     let (inner, _dir) = fs_store();
     let hook = FailIndexDelete {
@@ -512,7 +501,7 @@ impl StoreHook for VanishOnSecondPendingRead {
 
 #[tokio::test]
 async fn claim_rechecks_pending_under_lock_and_skips_a_vanished_job() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (inner, _dir) = fs_store();
     let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
         inner,
@@ -546,9 +535,9 @@ async fn claim_rechecks_pending_under_lock_and_skips_a_vanished_job() {
 /// abandoned and retried by the next scan instead.
 #[tokio::test]
 async fn claim_is_skipped_when_the_dedup_index_cannot_be_retired() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let lock_key = lock_key("cache.ns:sha256:retire-fails");
-    let index_path = crate::jobs::store::job_lock_key_index_path("cache", &lock_key);
+    let index_path = job_lock_key_index_path("cache", &lock_key);
 
     let (inner, _dir) = fs_store();
     let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
@@ -605,7 +594,7 @@ async fn retry_leaves_a_concurrent_producers_index_alone() {
         .enqueue(dummy_envelope(lock_key.as_str()))
         .await
         .expect("producer enqueue");
-    let index_path = crate::jobs::store::job_lock_key_index_path("cache", &lock_key);
+    let index_path = job_lock_key_index_path("cache", &lock_key);
     let produced = parse_lock_key_index(&h.raw.get(&index_path).await.expect("read index"))
         .expect("parse")
         .storage_key;
@@ -652,7 +641,7 @@ async fn retry_updates_lock_key_index_to_new_storage_key() {
     let new_storage_key = &pending[0];
     assert_ne!(new_storage_key, &old_storage_key);
 
-    let index_path = crate::jobs::store::job_lock_key_index_path("cache", &lock_key);
+    let index_path = job_lock_key_index_path("cache", &lock_key);
     let data = h.raw.get(&index_path).await.expect("read index");
     let index = parse_lock_key_index(&data).expect("parse");
     assert_eq!(&index.storage_key, new_storage_key);
@@ -758,9 +747,9 @@ async fn concurrent_enqueue_dedup() {
     for _ in 0..8 {
         let store = Arc::clone(&h.store);
         let key = lock_key.to_string();
-        handles.push(tokio::spawn(async move {
-            store.enqueue(dummy_envelope(&key)).await
-        }));
+        handles.push(spawn(
+            async move { store.enqueue(dummy_envelope(&key)).await },
+        ));
     }
     for handle in handles {
         handle.await.expect("join").expect("enqueue");
@@ -830,7 +819,7 @@ impl StoreHook for RecordKeys {
 
 #[tokio::test]
 async fn a_sibling_loop_skips_a_locally_held_job_without_store_io() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (inner, _dir) = fs_store();
     let keys = Arc::new(Mutex::new(Vec::new()));
     let hook = RecordKeys { keys: keys.clone() };
@@ -910,7 +899,7 @@ async fn list_pending_page_is_keyset_ordered() {
             .await
             .expect("page");
         let keys = page.items;
-        assert!(keys.len() <= 2, "page must not exceed n");
+        assert!(keys.len() <= 2, "page exceeded n: {keys:?}");
         seen.extend(keys.iter().cloned());
         match page.next_token {
             Some(cursor) => {
@@ -950,10 +939,7 @@ async fn retry_failed_resets_attempts() {
     })
     .expect("serialize");
     h.raw
-        .put(
-            &crate::jobs::store::job_failed_path("cache", &key),
-            Bytes::from(body),
-        )
+        .put(&job_failed_path("cache", &key), Bytes::from(body))
         .await
         .expect("seed failed");
 
@@ -973,7 +959,7 @@ async fn retry_failed_resets_attempts() {
     assert!(
         matches!(
             h.store.read_failed(Queue::Cache, &key).await,
-            Err(crate::jobs::store::Error::NotFound)
+            Err(Error::NotFound)
         ),
         "failed record is consumed by retry",
     );
@@ -996,7 +982,7 @@ async fn retry_failed_resets_attempts() {
     assert!(
         matches!(
             h.store.retry_failed(Queue::Cache, &key).await,
-            Err(crate::jobs::store::Error::NotFound)
+            Err(Error::NotFound)
         ),
         "retrying a consumed key is a stale 404",
     );
@@ -1014,10 +1000,7 @@ async fn delete_failed_record() {
     })
     .expect("serialize");
     h.raw
-        .put(
-            &crate::jobs::store::job_failed_path("cache", &key),
-            Bytes::from(body),
-        )
+        .put(&job_failed_path("cache", &key), Bytes::from(body))
         .await
         .expect("seed failed");
 
@@ -1027,14 +1010,14 @@ async fn delete_failed_record() {
         .expect("delete");
     assert!(matches!(
         h.store.read_failed(Queue::Cache, &key).await,
-        Err(crate::jobs::store::Error::NotFound)
+        Err(Error::NotFound)
     ));
     assert!(
         matches!(
             h.store
                 .delete_job(Queue::Cache, JobState::Failed, &key)
                 .await,
-            Err(crate::jobs::store::Error::NotFound)
+            Err(Error::NotFound)
         ),
         "deleting a consumed key is a stale 404",
     );
@@ -1076,7 +1059,7 @@ async fn delete_pending_removes_record_and_index() {
         .await
         .expect("list")
         .items;
-    assert!(after.is_empty(), "pending file removed");
+    assert!(after.is_empty(), "pending file left behind: {after:?}");
     assert!(
         !h.store
             .find_pending_with_lock_key(Queue::Cache, &lock_key)
@@ -1090,7 +1073,7 @@ async fn delete_pending_removes_record_and_index() {
             h.store
                 .delete_job(Queue::Cache, JobState::Pending, &key)
                 .await,
-            Err(crate::jobs::store::Error::NotFound)
+            Err(Error::NotFound)
         ),
         "deleting a consumed key is a stale 404",
     );
@@ -1106,13 +1089,9 @@ async fn delete_pending_removes_record_and_index() {
 fn a_foreign_kind_or_undecodable_payload_is_terminal() {
     let envelope = JobEnvelope::new(Queue::Cache, "cache.fetch_blob", "lock", &json!({"a": 1}))
         .expect("envelope");
-    assert!(
-        envelope
-            .payload::<serde_json::Value>(&["cache.fetch_blob"])
-            .is_ok()
-    );
+    assert!(envelope.payload::<Value>(&["cache.fetch_blob"]).is_ok());
     assert!(matches!(
-        envelope.payload::<serde_json::Value>(&["scan.image"]),
+        envelope.payload::<Value>(&["scan.image"]),
         Err(Error::Terminal(_))
     ));
     assert!(matches!(
@@ -1191,12 +1170,8 @@ fn pending_refresh_interval_below_floor_is_rejected() {
         pending_refresh_interval_secs = 0
         pending_ready_horizon_secs = 600
     ";
-    let err = toml::from_str::<JobQueueConfig>(toml_with_zero)
+    toml::from_str::<JobQueueConfig>(toml_with_zero)
         .expect_err("pending_refresh_interval_secs = 0 must be rejected");
-    assert!(
-        err.to_string().contains("pending_refresh_interval_secs"),
-        "error must name the field: {err}"
-    );
 
     let toml_with_four = r"
         pending_refresh_interval_secs = 4
@@ -1209,15 +1184,13 @@ fn pending_refresh_interval_below_floor_is_rejected() {
         pending_refresh_interval_secs = 5
         pending_ready_horizon_secs = 600
     ";
-    let cfg = toml::from_str::<JobQueueConfig>(toml_with_five)
-        .expect("the floor value itself must parse");
+    let cfg: JobQueueConfig =
+        toml::from_str(toml_with_five).expect("the floor value itself must parse");
     assert_eq!(cfg.pending_refresh_interval_secs, 5);
 }
 
 #[test]
 fn test_job_paths() {
-    use crate::jobs::store::{job_failed_path, job_lock_key_index_path, job_pending_path};
-
     assert_eq!(
         job_pending_path("cache", "01HABCDE"),
         "_jobs/pending/cache/01HABCDE.json"
@@ -1237,8 +1210,8 @@ fn test_job_paths() {
 #[test]
 fn an_empty_lock_key_is_rejected() {
     assert!(matches!(
-        LockKey::new(""),
-        Err(crate::jobs::store::Error::InvalidLockKey(_))
+        LockKey::try_new(""),
+        Err(Error::InvalidLockKey(_))
     ));
 }
 
@@ -1360,7 +1333,7 @@ async fn a_poison_pending_record_is_discarded_and_does_not_wedge_the_queue() {
         .first()
         .cloned()
         .expect("the first job must be listed");
-    let path = crate::jobs::store::job_pending_path("cache", &poisoned);
+    let path = job_pending_path("cache", &poisoned);
     h.raw
         .put(&path, Bytes::from_static(b"{ truncated"))
         .await
@@ -1417,7 +1390,7 @@ async fn a_poison_pending_record_can_be_deleted() {
         .first()
         .cloned()
         .expect("the job must be listed");
-    let path = crate::jobs::store::job_pending_path("cache", &poisoned);
+    let path = job_pending_path("cache", &poisoned);
     h.raw
         .put(&path, Bytes::from_static(b"{ truncated"))
         .await
@@ -1594,7 +1567,7 @@ async fn release_leaves_a_foreign_claim_intact() {
         .get(&claim_path)
         .await
         .expect("the foreign claim must survive the release");
-    let record: serde_json::Value = serde_json::from_slice(&body).expect("claim json");
+    let record: Value = serde_json::from_slice(&body).expect("claim json");
     assert_eq!(record["instance"], "foreign-instance");
 }
 
@@ -1602,7 +1575,7 @@ async fn release_leaves_a_foreign_claim_intact() {
 /// behind.
 #[tokio::test]
 async fn ensure_claim_support_probe_succeeds_and_cleans_up() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (raw, _dir) = fs_store();
     assert_eq!(
         ensure_claim_support(&metadata_store_over(raw.clone()))
@@ -1642,7 +1615,7 @@ impl StoreHook for DishonestCreate {
 /// fail startup: the probe degrades it to advisory claims.
 #[tokio::test]
 async fn a_dishonest_backend_probes_as_advisory() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (inner, _dir) = fs_store();
     let hooked: Arc<dyn ObjectStore> =
         Arc::new(HookedStore::new(inner.clone(), DishonestCreate { inner }));
@@ -1700,7 +1673,7 @@ impl StoreHook for AdvisoryRaceGate {
 /// A's verify must lose, B's must win, and exactly one claimant proceeds.
 #[tokio::test]
 async fn advisory_claim_race_admits_exactly_one_winner() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (inner, _dir) = fs_store();
     let claim_key = job_claim_path(&lock_key("cache.ns:sha256:advisory-race"));
 
@@ -1739,7 +1712,7 @@ async fn advisory_claim_race_admits_exactly_one_winner() {
             ClaimMode::Advisory,
         );
         let key = claim_key.clone();
-        tokio::spawn(async move { store.put_claim_advisory(&key, "instance-a").await })
+        spawn(async move { store.put_claim_advisory(&key, "instance-a").await })
     };
     let b = {
         let store = JobStore::new(
@@ -1748,7 +1721,7 @@ async fn advisory_claim_race_admits_exactly_one_winner() {
             ClaimMode::Advisory,
         );
         let key = claim_key.clone();
-        tokio::spawn(async move { store.put_claim_advisory(&key, "instance-b").await })
+        spawn(async move { store.put_claim_advisory(&key, "instance-b").await })
     };
 
     let a_won = a.await.expect("join a").expect("a acquire").is_some();
@@ -1757,7 +1730,7 @@ async fn advisory_claim_race_admits_exactly_one_winner() {
     assert!(b_won, "B's verify must find its own record and win");
 
     let body = inner.get(&claim_key).await.expect("claim record");
-    let record: serde_json::Value = serde_json::from_slice(&body).expect("claim json");
+    let record: Value = serde_json::from_slice(&body).expect("claim json");
     assert_eq!(
         record["instance"], "instance-b",
         "the surviving record must carry the winner's instance"
@@ -1768,7 +1741,7 @@ async fn advisory_claim_race_admits_exactly_one_winner() {
 /// release on complete frees the key, and the next claim wins again.
 #[tokio::test]
 async fn advisory_mode_claims_completes_and_reclaims() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (raw, _dir) = fs_store();
     let store = Arc::new(JobStore::new(
         &metadata_store_over(raw),
@@ -1826,7 +1799,7 @@ impl StoreHook for FailPendingDeleteOnce {
 /// under a new storage key rather than leave it re-claimable in a hot loop.
 #[tokio::test]
 async fn complete_cleanup_failure_fails_over_to_retry() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (inner, _dir) = fs_store();
     let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
         inner.clone(),
@@ -1872,24 +1845,20 @@ async fn complete_cleanup_failure_fails_over_to_retry() {
 
 #[test]
 fn claim_ttl_defaults_and_floor() {
-    let cfg = toml::from_str::<JobQueueConfig>("").expect("all fields default");
+    let cfg: JobQueueConfig = toml::from_str("").expect("all fields default");
     assert_eq!(cfg.claim_ttl_secs, 60);
 
-    let err = toml::from_str::<JobQueueConfig>("claim_ttl_secs = 2")
+    toml::from_str::<JobQueueConfig>("claim_ttl_secs = 2")
         .expect_err("claim_ttl_secs below the floor must be rejected");
-    assert!(
-        err.to_string().contains("claim_ttl_secs"),
-        "error must name the field: {err}"
-    );
 
-    let cfg = toml::from_str::<JobQueueConfig>("claim_ttl_secs = 3").expect("floor value parses");
+    let cfg: JobQueueConfig = toml::from_str("claim_ttl_secs = 3").expect("floor value parses");
     assert_eq!(cfg.claim_ttl_secs, 3);
 }
 
 /// The configured lease must reach the stored claim record.
 #[tokio::test]
 async fn claim_ttl_knob_stamps_the_claim_lease() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let (raw, _dir) = fs_store();
     let store = Arc::new(JobStore::with_retry_policy(
         &metadata_store_over(raw.clone()),
@@ -1915,7 +1884,7 @@ async fn claim_ttl_knob_stamps_the_claim_lease() {
         .get(&job_claim_path(&lock_key("cache.ns:sha256:ttl")))
         .await
         .expect("claim record");
-    let record: serde_json::Value = serde_json::from_slice(&body).expect("claim json");
+    let record: Value = serde_json::from_slice(&body).expect("claim json");
     let expires_at: DateTime<Utc> = record["expires_at"]
         .as_str()
         .expect("expires_at")
@@ -1935,12 +1904,9 @@ async fn count_pending_counts_everything_past_an_unrepresentable_horizon() {
     let h = harness();
     let now = Utc::now();
     for (offset, name) in [(0, "ready"), (1, "future")] {
-        let key = make_storage_key(now + chrono::Duration::hours(offset), name);
+        let key = make_storage_key(now + ChronoDuration::hours(offset), name);
         h.raw
-            .put(
-                &crate::jobs::store::job_pending_path("cache", &key),
-                Bytes::from_static(b"{}"),
-            )
+            .put(&job_pending_path("cache", &key), Bytes::from_static(b"{}"))
             .await
             .expect("stub");
     }

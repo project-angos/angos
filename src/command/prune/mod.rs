@@ -12,18 +12,12 @@ use tracing::warn;
 
 pub use checker::RetentionChecker;
 
-use crate::{
-    command::{
-        bootstrap,
-        maintenance::{
-            Error, check,
-            executor::{Executor, run_sink},
-        },
-        scrub::default_concurrency,
-    },
-    configuration::Configuration,
-    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock, rules_use_pull_time},
-};
+use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::maintenance::executor::{Executor, run_sink};
+use crate::command::maintenance::{Error, check};
+use crate::command::scrub::default_concurrency;
+use crate::configuration::Configuration;
+use crate::policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock, rules_use_pull_time};
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -97,7 +91,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
     ensure_pull_time_rules_are_recorded(config)?;
     let window = Duration::from_std(options.uploads.into())
         .map_err(|e| Error::Initialization(format!("Upload window is invalid: {e}")))?;
-    let bootstrap::MaintenanceContext {
+    let MaintenanceContext {
         blob_store: blob_backend,
         metadata_store,
         repositories,
@@ -164,8 +158,10 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         )
         .await,
     ];
-    for failed in sweeps.into_iter().filter_map(Result::err) {
-        warn!("prune: sweep failed: {failed}");
+    for sweep in sweeps {
+        if let Err(e) = sweep {
+            warn!("prune: sweep failed: {e}");
+        }
     }
 
     // Drains in-flight async webhook deliveries before the process exits.
@@ -178,18 +174,17 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        policy::CelRule, registry::repository, test_fixtures::configuration::minimal_config,
-    };
-
-    fn rule(s: &str) -> CelRule {
-        CelRule::compile(s).unwrap()
-    }
+    use crate::policy::CelRule;
+    use crate::registry::repository;
+    use crate::test_fixtures::configuration::minimal_config;
 
     fn config_with_global_rules(sources: &[&str]) -> Configuration {
         let mut config = minimal_config();
         config.global.retention_policy = RetentionPolicyConfig {
-            rules: sources.iter().map(|s| rule(s)).collect(),
+            rules: sources
+                .iter()
+                .map(|s| CelRule::compile(s).unwrap())
+                .collect(),
         };
         config
     }
@@ -205,7 +200,7 @@ mod tests {
     #[test]
     fn global_retention_policy_with_rules_returns_some() {
         let config = RetentionPolicyConfig {
-            rules: vec![rule("image.pushed_at > now() - days(30)")],
+            rules: vec![CelRule::compile("image.pushed_at > now() - days(30)").unwrap()],
         };
         let result = global_retention_policy(&config);
 
@@ -228,7 +223,9 @@ mod tests {
             "team".to_string(),
             repository::Config {
                 retention_policy: RetentionPolicyConfig {
-                    rules: vec![rule("image.last_pulled_at > now() - days(7)")],
+                    rules: vec![
+                        CelRule::compile("image.last_pulled_at > now() - days(7)").unwrap(),
+                    ],
                 },
                 ..Default::default()
             },

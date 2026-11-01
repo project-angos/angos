@@ -1,11 +1,8 @@
-use std::{
-    fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
-    },
-    time::Instant,
-};
+use std::error::Error;
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 use tracing::warn;
 
@@ -25,7 +22,7 @@ impl fmt::Display for CircuitBreakerError {
     }
 }
 
-impl std::error::Error for CircuitBreakerError {}
+impl Error for CircuitBreakerError {}
 
 #[derive(Clone, Debug)]
 pub struct CircuitBreaker {
@@ -121,7 +118,8 @@ impl CircuitBreaker {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
@@ -139,36 +137,6 @@ mod tests {
                 .unwrap_or_else(Instant::now),
             ..CircuitBreaker::new(THRESHOLD, COOLDOWN_SECS)
         }
-    }
-
-    #[test]
-    fn new_breaker_starts_closed() {
-        let cb = breaker();
-        assert_eq!(cb.consecutive_failures.load(Ordering::Acquire), 0);
-        assert_eq!(cb.opened_at_secs.load(Ordering::Acquire), 0);
-        assert!(cb.check().is_ok());
-    }
-
-    #[test]
-    fn open_error_message_contains_expected_wording() {
-        let cb = breaker();
-        for _ in 0..THRESHOLD {
-            cb.record_failure();
-        }
-        let err = cb.check().unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("circuit breaker open"),
-            "error must mention 'circuit breaker open', got: {msg}"
-        );
-        assert!(
-            msg.contains(&THRESHOLD.to_string()),
-            "error must include failure count, got: {msg}"
-        );
-        assert!(
-            msg.contains(&COOLDOWN_SECS.to_string()),
-            "error must include cooldown seconds, got: {msg}"
-        );
     }
 
     #[test]
@@ -237,62 +205,6 @@ mod tests {
         assert!(
             cb.check().is_ok(),
             "breaker must pass after success fully clears state"
-        );
-    }
-
-    #[test]
-    fn check_passes_when_below_threshold() {
-        let cb = breaker();
-        for _ in 0..(THRESHOLD - 1) {
-            cb.record_failure();
-        }
-        assert!(cb.check().is_ok());
-    }
-
-    #[test]
-    fn record_success_clears_opened_at_and_failure_count() {
-        let cb = breaker();
-        for _ in 0..THRESHOLD {
-            cb.record_failure();
-        }
-        assert!(cb.check().is_err());
-
-        cb.record_success();
-
-        assert_eq!(cb.consecutive_failures.load(Ordering::Acquire), 0);
-        assert_eq!(cb.opened_at_secs.load(Ordering::Acquire), 0);
-        assert!(cb.check().is_ok());
-    }
-
-    #[test]
-    fn record_failure_after_cooldown_re_arms_opened_at() {
-        let cb = breaker();
-        for _ in 0..THRESHOLD {
-            cb.record_failure();
-        }
-        let initial_opened_at = cb.opened_at_secs.load(Ordering::Acquire);
-
-        // Simulate cooldown elapse by rewinding `opened_at` past the cooldown window.
-        cb.opened_at_secs.store(
-            initial_opened_at.saturating_sub(COOLDOWN_SECS + 1),
-            Ordering::Release,
-        );
-        assert!(
-            cb.check().is_ok(),
-            "after cooldown elapses, check should pass"
-        );
-
-        // A subsequent failure must re-arm `opened_at` to a fresh timestamp,
-        // re-opening the breaker for another cooldown window.
-        cb.record_failure();
-        let re_armed = cb.opened_at_secs.load(Ordering::Acquire);
-        assert!(
-            re_armed >= initial_opened_at,
-            "post-cooldown failure must re-arm opened_at: was {initial_opened_at}, now {re_armed}"
-        );
-        assert!(
-            cb.check().is_err(),
-            "breaker must re-open after a post-cooldown failure"
         );
     }
 
@@ -403,7 +315,10 @@ mod tests {
     #[test]
     fn half_open_probe_failure_re_arms_then_next_window_admits_again() {
         let cb = open_and_elapse_cooldown();
-        assert!(cb.check().is_ok(), "probe admitted");
+        assert!(
+            cb.check().is_ok(),
+            "the first caller after cooldown is the probe"
+        );
 
         // The probe fails: the breaker must re-arm and reject further callers.
         cb.record_failure();

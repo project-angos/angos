@@ -6,6 +6,8 @@
 //! assigns, which the spec keeps opaque, so only the receiving side of those
 //! operations names a session by [`UploadSessionId`].
 
+use std::slice;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
@@ -40,7 +42,7 @@ impl ManifestPutTarget {
     #[must_use]
     pub fn created_tags(&self) -> &[Tag] {
         match self {
-            Self::Tag(tag) => std::slice::from_ref(tag),
+            Self::Tag(tag) => slice::from_ref(tag),
             Self::Digest { tags, .. } => tags,
         }
     }

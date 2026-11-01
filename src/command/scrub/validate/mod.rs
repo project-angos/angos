@@ -11,25 +11,22 @@ mod reference;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex, atomic::Ordering},
-};
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tracing::warn;
 
 use angos_oci::Digest;
 
-use crate::{
-    command::maintenance::{
-        Error,
-        action::{Action, WalkedStore},
-        categorize::{KeyCategory, categorize},
-        executor::{ActionSink, object_younger_than_grace},
-        walk::WalkStats,
-    },
-    registry::{Error as RegistryError, blob_store::BlobStore, metadata_store::MetadataStore},
-};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::{Action, WalkedStore};
+use crate::command::maintenance::categorize::{KeyCategory, categorize};
+use crate::command::maintenance::executor::{ActionSink, object_younger_than_grace};
+use crate::command::maintenance::walk::WalkStats;
+use crate::registry::Error as RegistryError;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::MetadataStore;
 
 /// One of the three walk passes. Later passes rely on earlier repairs: links
 /// are healed and grants reconciled before entries are pruned against them,
@@ -126,8 +123,8 @@ impl Validator {
                 self.validate_referrer_record(&namespace, &subject, &referrer)
                     .await
             }
-            (Pass::MetadataLinks, KeyCategory::JobRecord { queue, state }) => {
-                self.validate_job_record(key, queue, state).await
+            (Pass::MetadataLinks, KeyCategory::JobRecord { state, .. }) => {
+                self.validate_job_record(key, state).await
             }
             (Pass::MetadataLinks, KeyCategory::JobIndex { queue }) => {
                 self.validate_job_index(key, queue).await
@@ -217,28 +214,28 @@ impl Validator {
     /// Claim a once-per-container emission. Returns `false` when another key
     /// of the same container already claimed it.
     pub fn claim(&self, token: String) -> bool {
-        match self.handled.lock() {
-            Ok(mut handled) => handled.insert(token),
-            Err(poisoned) => poisoned.into_inner().insert(token),
-        }
+        self.handled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(token)
     }
 
     /// Record that the reference walk read a live reference to `digest`. The
     /// walk enumerates the whole store, so this is an independent witness
     /// against the per-blob listing blob GC decides from.
     pub fn record_reference_seen(&self, digest: &Digest) {
-        match self.seen_refs.lock() {
-            Ok(mut refs) => refs.insert(digest.clone()),
-            Err(poisoned) => poisoned.into_inner().insert(digest.clone()),
-        };
+        self.seen_refs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(digest.clone());
     }
 
     /// Whether the reference walk read a live reference to `digest`.
     pub fn reference_walk_saw(&self, digest: &Digest) -> bool {
-        match self.seen_refs.lock() {
-            Ok(refs) => refs.contains(digest),
-            Err(poisoned) => poisoned.into_inner().contains(digest),
-        }
+        self.seen_refs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(digest)
     }
 }
 

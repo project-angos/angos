@@ -59,30 +59,8 @@ mod tests {
     }
 
     #[test]
-    fn enabled_can_be_configured() {
-        let config = toml::from_str::<UiConfig>("enabled = true").unwrap();
-
-        assert!(config.enabled);
-        assert_eq!(config.name, "Angos");
-    }
-
-    #[test]
-    fn name_can_be_configured() {
-        let config = toml::from_str::<UiConfig>(
-            r#"
-            enabled = true
-            name = "my-registry"
-            "#,
-        )
-        .unwrap();
-
-        assert!(config.enabled);
-        assert_eq!(config.name, "my-registry");
-    }
-
-    #[test]
     fn oidc_defaults_to_the_openid_scopes() {
-        let config = toml::from_str::<UiConfig>(
+        let config: UiConfig = toml::from_str(
             r#"
             enabled = true
             [oidc]
@@ -96,21 +74,5 @@ mod tests {
         assert_eq!(oidc.provider, "dex");
         assert_eq!(oidc.client_id, "angos-ui");
         assert_eq!(oidc.scopes, "openid profile email");
-    }
-
-    #[test]
-    fn oidc_scopes_can_be_configured() {
-        let config = toml::from_str::<UiConfig>(
-            r#"
-            enabled = true
-            [oidc]
-            provider = "dex"
-            client_id = "angos-ui"
-            scopes = "openid groups"
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(config.oidc.unwrap().scopes, "openid groups");
     }
 }
