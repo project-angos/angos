@@ -177,67 +177,52 @@ pub enum Action {
 }
 
 impl fmt::Display for Action {
-    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Action::DeleteOrphanBlob(digest) => {
-                write!(f, "delete orphan blob '{digest}'")
-            }
+            Action::DeleteOrphanBlob(digest) => write!(f, "delete orphan blob '{digest}'"),
             Action::RemoveBlobIndexLink {
                 namespace,
                 blob,
                 link,
-            } => {
-                write!(
-                    f,
-                    "remove invalid link from blob index '{namespace}/{blob}': '{link}'"
-                )
-            }
+            } => write!(
+                f,
+                "remove invalid link from blob index '{namespace}/{blob}': '{link}'"
+            ),
             Action::GrantBlobIndexLink {
                 namespace,
                 blob,
                 link,
-            } => {
-                write!(
-                    f,
-                    "grant missing blob-index entry '{namespace}/{blob}': '{link}'"
-                )
-            }
+            } => write!(
+                f,
+                "grant missing blob-index entry '{namespace}/{blob}': '{link}'"
+            ),
             Action::DemoteTagEntry {
                 namespace,
                 tag,
                 entry_name,
-            } => {
-                write!(
-                    f,
-                    "demote superseded tag entry '{namespace}:{tag}' ({entry_name}) to history"
-                )
-            }
+            } => write!(
+                f,
+                "demote superseded tag entry '{namespace}:{tag}' ({entry_name}) to history"
+            ),
             Action::EnsureCatalogIndex { namespace } => {
                 write!(f, "write missing catalog index key for '{namespace}'")
             }
-            Action::ReapCatalogIndex { namespace } => {
-                write!(
-                    f,
-                    "remove catalog index key of emptied namespace '{namespace}'"
-                )
-            }
-            Action::RemoveOrphanBlobGrant { namespace, blob } => {
-                write!(
-                    f,
-                    "revoke orphaned blob-ownership grant '{namespace}/{blob}' (no manifest references it)"
-                )
-            }
+            Action::ReapCatalogIndex { namespace } => write!(
+                f,
+                "remove catalog index key of emptied namespace '{namespace}'"
+            ),
+            Action::RemoveOrphanBlobGrant { namespace, blob } => write!(
+                f,
+                "revoke orphaned blob-ownership grant '{namespace}/{blob}' (no manifest references it)"
+            ),
             Action::RecreateLink {
                 namespace,
                 link,
                 target,
-            } => {
-                write!(
-                    f,
-                    "recreate invalid link from namespace '{namespace}': '{link}' -> '{target}'"
-                )
-            }
+            } => write!(
+                f,
+                "recreate invalid link from namespace '{namespace}': '{link}' -> '{target}'"
+            ),
             Action::DeleteTag {
                 namespace,
                 tag,
@@ -255,47 +240,67 @@ impl fmt::Display for Action {
             Action::DeleteExpiredUpload {
                 namespace,
                 session_id,
-            } => {
-                write!(f, "delete expired upload '{namespace}/{session_id}'")
-            }
+            } => write!(f, "delete expired upload '{namespace}/{session_id}'"),
             Action::DeleteOrphanReferrer {
                 namespace,
                 subject,
                 referrer,
-            } => {
-                write!(
-                    f,
-                    "delete orphan referrer '{namespace}': subject {subject} <- {referrer}"
-                )
+            } => write!(
+                f,
+                "delete orphan referrer '{namespace}': subject {subject} <- {referrer}"
+            ),
+            Action::AbortMultipartUpload { upload } => write!(
+                f,
+                "abort orphan multipart upload '{}' ({})",
+                upload.key, upload.upload_id
+            ),
+            Action::ReclaimListing(digest) => write!(f, "reclaim listing of layer '{digest}'"),
+            Action::EnqueueReplicationPush { .. }
+            | Action::EnqueueReplicationDelete { .. }
+            | Action::EnqueueIndex(_)
+            | Action::EnqueueScan(_)
+            | Action::DeleteOrphanJob { .. }
+            | Action::DeleteOrphanJobIndex { .. } => self.fmt_job_action(f),
+            Action::QuarantineKey { store, key } => {
+                write!(f, "quarantine unrecognized {store} key '{key}'")
             }
-            Action::AbortMultipartUpload { upload } => {
-                write!(
-                    f,
-                    "abort orphan multipart upload '{}' ({})",
-                    upload.key, upload.upload_id
-                )
+            Action::DeleteUnknownKey { store, key } => {
+                write!(f, "delete unrecognized {store} key '{key}'")
             }
+            Action::DeleteCorruptObject { store, key } => {
+                write!(f, "delete corrupt {store} object '{key}'")
+            }
+            Action::CompactAtime(AtimeCompaction { chunks, retired }) => write!(
+                f,
+                "write {} access chunks and retire {} access-time keys",
+                chunks.len(),
+                retired.len()
+            ),
+        }
+    }
+}
+
+impl Action {
+    /// Formats the actions that enqueue or delete jobs; `fmt` dispatches only those here.
+    fn fmt_job_action(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
             Action::EnqueueReplicationPush {
                 downstream,
                 namespace,
                 tag,
                 digest,
-            } => {
-                write!(
-                    f,
-                    "enqueue replication push of '{namespace}:{tag}' ({digest}) to downstream '{downstream}'"
-                )
-            }
+            } => write!(
+                f,
+                "enqueue replication push of '{namespace}:{tag}' ({digest}) to downstream '{downstream}'"
+            ),
             Action::EnqueueReplicationDelete {
                 downstream,
                 namespace,
                 tag,
-            } => {
-                write!(
-                    f,
-                    "enqueue replication delete of '{namespace}:{tag}' on downstream '{downstream}'"
-                )
-            }
+            } => write!(
+                f,
+                "enqueue replication delete of '{namespace}:{tag}' on downstream '{downstream}'"
+            ),
             Action::EnqueueIndex(index) => {
                 let forced = if index.force { " (forced)" } else { "" };
                 write!(
@@ -304,7 +309,6 @@ impl fmt::Display for Action {
                     index.namespace, index.digest
                 )
             }
-            Action::ReclaimListing(digest) => write!(f, "reclaim listing of layer '{digest}'"),
             Action::EnqueueScan(scan) => {
                 let forced = if scan.force { " (forced)" } else { "" };
                 write!(
@@ -332,27 +336,11 @@ impl fmt::Display for Action {
                 queue,
                 key,
                 storage_key,
-            } => {
-                write!(
-                    f,
-                    "delete orphan {queue} job index '{key}' (pending job '{storage_key}' does not exist)"
-                )
-            }
-            Action::QuarantineKey { store, key } => {
-                write!(f, "quarantine unrecognized {store} key '{key}'")
-            }
-            Action::DeleteUnknownKey { store, key } => {
-                write!(f, "delete unrecognized {store} key '{key}'")
-            }
-            Action::DeleteCorruptObject { store, key } => {
-                write!(f, "delete corrupt {store} object '{key}'")
-            }
-            Action::CompactAtime(AtimeCompaction { chunks, retired }) => write!(
+            } => write!(
                 f,
-                "write {} access chunks and retire {} access-time keys",
-                chunks.len(),
-                retired.len()
+                "delete orphan {queue} job index '{key}' (pending job '{storage_key}' does not exist)"
             ),
+            _ => unreachable!("fmt dispatches only job actions here"),
         }
     }
 }
