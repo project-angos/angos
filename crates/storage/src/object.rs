@@ -1,17 +1,16 @@
-use std::{borrow::Cow, pin::Pin};
+use std::borrow::Cow;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
 use tracing::warn;
 
-use crate::{
-    BoxedReader,
-    error::Error,
-    pagination::paginated,
-    types::{Children, ChildrenPage, ObjectMeta, Page},
-    upload_session::{ByteStream, MultipartUploadPage},
-};
+use crate::BoxedReader;
+use crate::error::Error;
+use crate::pagination::paginated;
+use crate::types::{Children, ChildrenPage, ObjectMeta, Page};
+use crate::upload_session::{ByteStream, MultipartUploadPage};
 
 /// A lazily-streamed flat enumeration of object keys, one `Result` per key.
 /// [`ObjectStore::list_all`] returns this boxed form so it stays object-safe
@@ -67,9 +66,8 @@ pub fn dir_prefix(prefix: &str) -> Cow<'_, str> {
 /// call, so nothing has to be persisted by the caller between calls. The staged
 /// remainder lives at a `staged/<offset>` child of the upload key's
 /// container: the backend derives that location from `key` alone (it replaces
-/// `key`'s
-/// final path segment with `staged/<offset>`, where `offset` is the number of
-/// bytes already committed to parts). This mirrors the historical
+/// `key`'s final path segment with `staged/<offset>`, where `offset` is the
+/// number of bytes already committed to parts). This mirrors the historical
 /// `.../_uploads/<uuid>/staged/<offset>` layout so it stays backward
 /// compatible.
 #[async_trait]
@@ -162,10 +160,7 @@ pub trait ObjectStore: Send + Sync {
     /// pages drained one at a time as the stream is polled: what a caller that
     /// stops at a key, or reads newest first, walks.
     fn list_in_order<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
-        Box::pin(paginated(move |token| async move {
-            let page = self.list(prefix, 1000, token).await?;
-            Ok((page.items, page.next_token))
-        }))
+        Box::pin(paginated(move |token| self.list(prefix, 1000, token)))
     }
 
     /// Flat-recursive enumeration of *every* key under `prefix`, streamed
@@ -295,19 +290,15 @@ pub async fn verified_move<S: ObjectStore + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use tempfile::TempDir;
 
-    use crate::{
-        Error, ObjectStore, fs,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use crate::test_util::{HookedStore, StoreHook, StoreOp};
+    use crate::{Error, ObjectStore, fs};
 
     use super::MOVE_COPY_ATTEMPTS;
 

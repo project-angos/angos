@@ -5,24 +5,23 @@ mod auth;
 mod error;
 mod write;
 
-use std::{
-    collections::HashSet, fmt::Display, future::Future, io, str::FromStr, sync::Arc, time::Duration,
-};
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::io;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use reqwest::{
-    Client, Method, RequestBuilder, Response, StatusCode,
-    header::{
-        ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LINK,
-        RANGE,
-    },
-    redirect::Policy,
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, AsHeaderName, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue,
+    LINK, RANGE,
 };
+use reqwest::redirect::Policy;
+use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    sync::Mutex,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::Mutex;
 use tokio_util::io::StreamReader;
 use tracing::{debug, instrument, warn};
 use url::Url;
@@ -37,11 +36,13 @@ use angos_oci::request::{
 use angos_oci::response::{ManifestHeadResponse, ManifestResponse, TagsListResponse};
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaRange, MediaType, Tag};
 
-pub use crate::{error::Error, write::UploadSession};
 use angos_cache::Cache;
 use angos_mtls_client::{BasicAuth, ClientTls, MtlsClientBuilder};
 use angos_secret::Secret;
-use auth::token_index_cache_key;
+
+use crate::auth::token_index_cache_key;
+pub use crate::error::Error;
+pub use crate::write::UploadSession;
 
 /// Classifies a non-success read status: a true 404 maps to `not_found` so
 /// callers can tell a genuinely absent object from a transient probe failure,
@@ -89,7 +90,7 @@ fn response_media_type(response: &Response) -> Option<MediaType> {
 /// operation).
 fn parse_header<T: FromStr>(
     response: &Response,
-    header: impl reqwest::header::AsHeaderName + Display,
+    header: impl AsHeaderName + Display,
 ) -> Result<T, Error> {
     let name = header.to_string();
     response
@@ -204,16 +205,19 @@ impl RegistryClient {
         }
     }
 
-    /// Resolves the HTTP client (TLS, redirects, timeout) and basic-auth
-    /// credentials from a parsed [`RegistryClientConfig`].
+    /// Builds a registry client from a parsed [`RegistryClientConfig`]; the
+    /// single production construction path for upstreams and replication
+    /// downstreams.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Initialization`] when the TLS files cannot be loaded or
     /// the HTTP client cannot be built.
-    fn resolve_config_fields(
+    pub fn from_config(
         config: &RegistryClientConfig,
-    ) -> Result<(Client, Option<BasicAuth>), Error> {
+        cache: Arc<Cache>,
+        max_manifest_size_bytes: usize,
+    ) -> Result<Self, Error> {
         // No whole-transfer deadline: a connect bound plus a per-read stall
         // bound so replicating a large blob is not capped by total time.
         let client = MtlsClientBuilder::new()
@@ -223,28 +227,11 @@ impl RegistryClient {
             .with_tls(&config.tls)
             .build()
             .map_err(Error::Initialization)?;
-        Ok((client, config.basic_auth.clone()))
-    }
-
-    /// Builds a registry client from a parsed [`RegistryClientConfig`]; the
-    /// single production construction path for upstreams and replication
-    /// downstreams.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot
-    /// be built.
-    pub fn from_config(
-        config: &RegistryClientConfig,
-        cache: Arc<Cache>,
-        max_manifest_size_bytes: usize,
-    ) -> Result<Self, Error> {
-        let (client, basic_auth) = Self::resolve_config_fields(config)?;
 
         Ok(Self::new(
             config.url.clone(),
             client,
-            basic_auth,
+            config.basic_auth.clone(),
             cache,
             max_manifest_size_bytes,
         ))

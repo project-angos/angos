@@ -11,13 +11,14 @@
 use std::num::NonZeroU16;
 
 use http::Method;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::Deserialize;
 
 use angos_oci::path::API_PREFIX;
 use angos_oci::{Digest, Namespace, Reference, Tag};
 
 use crate::{
-    JobState, ListNamespacesRequest, PageRequest, Queue, RevisionSelection, RevisionSort, SortOrder,
+    JobKey, JobState, ListNamespacesRequest, PageRequest, Queue, RevisionSelection, RevisionSort,
+    SortOrder,
 };
 
 /// The two forms the extension is reached under. The spec fixes the
@@ -79,12 +80,12 @@ pub enum Endpoint {
         after: Option<String>,
     },
     /// `POST /v2/_angos/jobs/failed?key=`.
-    RetryJob { queue: Queue, storage_key: String },
+    RetryJob { queue: Queue, storage_key: JobKey },
     /// `DELETE /v2/_angos/jobs/{failed,pending}?key=`.
     DeleteJob {
         queue: Queue,
         state: JobState,
-        storage_key: String,
+        storage_key: JobKey,
     },
 }
 
@@ -121,10 +122,6 @@ pub fn parse(method: &Method, path: &str, query: Option<&str>) -> Option<Endpoin
     // The marker is a whole path segment, so a namespace may hold the name.
     let (namespace, rest) = api_path.split_once(REPOSITORY_EXTENSION)?;
     repository_extension(method, Namespace::new(namespace).ok()?, rest, query)
-}
-
-fn parse_query<T: DeserializeOwned>(params: Option<&str>) -> Option<T> {
-    serde_html_form::from_str(params.unwrap_or_default()).ok()
 }
 
 #[derive(Deserialize)]
@@ -170,13 +167,14 @@ fn default_jobs_queue() -> Queue {
 /// `_angos/<component>/<module>`: what the registry as a whole answers. The
 /// `ui/config` path is left to the host's UI, not claimed here.
 fn registry_extension(method: &Method, path: &str, params: Option<&str>) -> Option<Endpoint> {
+    let params = params.unwrap_or_default();
     match *method {
         Method::GET => match path {
             "repositories/list" => {
-                let OrderQuery { order } = parse_query(params)?;
+                let OrderQuery { order } = serde_html_form::from_str(params).ok()?;
                 Some(Endpoint::ListRepositories {
                     order,
-                    page: parse_query(params)?,
+                    page: serde_html_form::from_str(params).ok()?,
                 })
             }
             "namespaces/list" => {
@@ -184,33 +182,33 @@ fn registry_extension(method: &Method, path: &str, params: Option<&str>) -> Opti
                     repository,
                     under,
                     order,
-                } = parse_query(params)?;
+                } = serde_html_form::from_str(params).ok()?;
                 Some(Endpoint::ListNamespaces(ListNamespacesRequest {
                     repository,
                     under,
                     order,
-                    page: parse_query(params)?,
+                    page: serde_html_form::from_str(params).ok()?,
                 }))
             }
             "jobs/list" => {
                 let JobsQuery {
                     n, after, queue, ..
-                } = parse_query(params)?;
+                } = serde_html_form::from_str(params).ok()?;
                 Some(Endpoint::ListJobs { queue, n, after })
             }
             "jobs/failed" => {
                 let JobsQuery {
                     n, after, queue, ..
-                } = parse_query(params)?;
+                } = serde_html_form::from_str(params).ok()?;
                 Some(Endpoint::ListFailedJobs { queue, n, after })
             }
             _ => None,
         },
         Method::POST if path == "jobs/failed" => {
-            let JobsQuery { queue, key, .. } = parse_query(params)?;
+            let JobsQuery { queue, key, .. } = serde_html_form::from_str(params).ok()?;
             Some(Endpoint::RetryJob {
                 queue,
-                storage_key: key.filter(|key| is_job_key(key))?,
+                storage_key: JobKey::try_from(key?).ok()?,
             })
         }
         Method::DELETE => {
@@ -219,11 +217,11 @@ fn registry_extension(method: &Method, path: &str, params: Option<&str>) -> Opti
                 "jobs/pending" => JobState::Pending,
                 _ => return None,
             };
-            let JobsQuery { queue, key, .. } = parse_query(params)?;
+            let JobsQuery { queue, key, .. } = serde_html_form::from_str(params).ok()?;
             Some(Endpoint::DeleteJob {
                 queue,
                 state,
-                storage_key: key.filter(|key| is_job_key(key))?,
+                storage_key: JobKey::try_from(key?).ok()?,
             })
         }
         _ => None,
@@ -241,6 +239,7 @@ fn repository_extension(
     if *method != Method::GET {
         return None;
     }
+    let params = params.unwrap_or_default();
 
     // `layers/<digest>/entries`, `layers/<digest>/file?path=` and
     // `layers/<digest>/details?path=`.
@@ -250,7 +249,7 @@ fn repository_extension(
         return match module {
             "entries" => Some(Endpoint::ListLayerEntries { namespace, digest }),
             "file" => {
-                let LayerFileQuery { path, download } = parse_query(params)?;
+                let LayerFileQuery { path, download } = serde_html_form::from_str(params).ok()?;
                 Some(Endpoint::GetLayerFile {
                     namespace,
                     digest,
@@ -259,7 +258,7 @@ fn repository_extension(
                 })
             }
             "details" => {
-                let LayerFileQuery { path, .. } = parse_query(params)?;
+                let LayerFileQuery { path, .. } = serde_html_form::from_str(params).ok()?;
                 Some(Endpoint::GetLayerFileDetails {
                     namespace,
                     digest,
@@ -276,13 +275,13 @@ fn repository_extension(
                 sort,
                 order,
                 digest,
-            } = parse_query(params)?;
+            } = serde_html_form::from_str(params).ok()?;
             let selection = match digest {
                 Some(digest) => RevisionSelection::Digest(digest),
                 None => RevisionSelection::Page {
                     sort,
                     order,
-                    page: parse_query(params)?,
+                    page: serde_html_form::from_str(params).ok()?,
                 },
             };
             Some(Endpoint::ListRevisions {
@@ -292,14 +291,14 @@ fn repository_extension(
         }
         "uploads/list" => Some(Endpoint::ListUploads {
             namespace,
-            page: parse_query(params)?,
+            page: serde_html_form::from_str(params).ok()?,
         }),
         "pulls/list" => {
-            let PullsQuery { tag, digest } = parse_query(params)?;
+            let PullsQuery { tag, digest } = serde_html_form::from_str(params).ok()?;
             Some(Endpoint::ListPulls {
                 namespace,
                 reference: pulls_reference(tag, digest)?,
-                page: parse_query(params)?,
+                page: serde_html_form::from_str(params).ok()?,
             })
         }
         _ => None,
@@ -326,12 +325,6 @@ fn pulls_reference(tag: Option<Tag>, digest: Option<Digest>) -> Option<Reference
         (None, Some(digest)) => Some(Reference::Digest(digest)),
         _ => None,
     }
-}
-
-/// The job a mutation addresses. A storage key is one path-free token, so one
-/// holding a `/` is refused.
-fn is_job_key(key: &str) -> bool {
-    !key.is_empty() && !key.contains('/')
 }
 
 #[cfg(test)]
@@ -475,8 +468,11 @@ mod tests {
                 ..
             })
         ));
-        // A key with a slash is refused.
+        // A key with a slash, or an empty one, is refused.
         assert!(parse(&Method::POST, "/v2/_angos/jobs/failed", Some("key=a/b")).is_none());
+        assert!(parse(&Method::POST, "/v2/_angos/jobs/failed", Some("key=")).is_none());
+        assert!(JobKey::try_from(String::new()).is_err());
+        assert!(JobKey::try_from("a/b".to_string()).is_err());
     }
 
     #[test]
@@ -626,7 +622,7 @@ mod tests {
             }) => {
                 assert_eq!(queue, Queue::Cache);
                 assert_eq!(state, JobState::Failed);
-                assert_eq!(storage_key, "0000018b-abc");
+                assert_eq!(storage_key.as_str(), "0000018b-abc");
             }
             other => panic!("expected DeleteJob(Failed), got {other:?}"),
         }

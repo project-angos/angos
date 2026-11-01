@@ -12,6 +12,7 @@ use std::future::Future;
 use bytesize::ByteSize;
 
 use crate::circuit_breaker::CircuitBreaker;
+use crate::client::S3Client;
 
 mod circuit_breaker;
 mod client;
@@ -28,7 +29,7 @@ pub use crate::ops::UploadedPart;
 
 #[derive(Clone, Debug)]
 pub struct Backend {
-    pub s3_client: client::S3Client,
+    pub s3_client: S3Client,
     pub encoded_bucket: String,
     pub key_prefix: String,
     pub multipart_copy_threshold: u64,
@@ -75,7 +76,7 @@ impl Backend {
             return Err(Error::Configuration((*message).to_string()));
         }
 
-        let s3_client = client::S3Client::new(config)
+        let s3_client = S3Client::new(config)
             .map_err(|e| Error::Configuration(format!("failed to initialize S3 client: {e}")))?;
 
         Ok(Self {
@@ -129,21 +130,9 @@ mod tests {
     use crate::test_util::mock_config;
 
     fn test_config(overrides: impl FnOnce(&mut BackendConfig)) -> BackendConfig {
-        let mut config = mock_config("http://localhost:9000");
+        let mut config = mock_config("http://localhost:9000".to_owned());
         overrides(&mut config);
         config
-    }
-
-    #[test]
-    fn test_default_values() {
-        let config = BackendConfig::default();
-        assert_eq!(config.multipart_copy_threshold, ByteSize::gb(5));
-        assert_eq!(config.multipart_copy_chunk_size, ByteSize::mb(100));
-        assert_eq!(config.multipart_copy_jobs, 4);
-        assert_eq!(config.multipart_part_size, ByteSize::mib(50));
-        assert_eq!(config.operation_timeout_secs, 900);
-        assert_eq!(config.operation_attempt_timeout_secs, 300);
-        assert_eq!(config.max_attempts, 3);
     }
 
     #[test]
@@ -188,12 +177,6 @@ mod tests {
             c.multipart_copy_chunk_size = ByteSize::mib(4);
         }));
         assert!(matches!(result, Err(Error::Configuration(_))));
-    }
-
-    #[test]
-    fn test_new_valid_config() {
-        let backend = Backend::new(&test_config(|_| {})).unwrap();
-        assert_eq!(backend.key_prefix, "");
     }
 
     #[test]

@@ -1,49 +1,46 @@
-use std::{
-    cell::RefCell,
-    io::{self, Cursor, Read, Write},
-    sync::Arc,
-};
+use std::cell::RefCell;
+use std::io::{self, Cursor, Read, Write};
+use std::sync::Arc;
 
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use http::StatusCode;
 use http_body_util::BodyExt;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
+use serde_json::Value;
+use tar::{Builder, EntryType, Header};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use angos_cache::Config as CacheConfig;
+use angos_extension_service::SecretKind::{
+    self, AwsAccessKey, AwsCredentials, GitCredentials, GithubToken, GitlabToken, Kubeconfig,
+    Netrc, NpmToken, PrivateKey, RegistryAuth, SlackToken, StripeKey,
+};
 use angos_extension_service::{
     ElfDetails, EntryKind, LayerEntriesRequest, LayerFileDetailsRequest, LayerFileRequest,
-    SecretKind::{
-        self, AwsAccessKey, AwsCredentials, GitCredentials, GithubToken, GitlabToken, Kubeconfig,
-        Netrc, NpmToken, PrivateKey, RegistryAuth, SlackToken, StripeKey,
-    },
 };
 use angos_oci::http_range::RequestRange;
-use angos_oci::{Digest, Namespace};
+use angos_oci::request::PutManifestRequest;
+use angos_oci::{Digest, MediaType, Namespace, Reference};
 
-use crate::{
-    jobs::{
-        Queue,
-        store::{ClaimMode, JobStore},
-    },
-    layer::IndexAction,
-    layer::{
-        Checkpoints, IndexLayerPayload, IndexLimits, Listing, SecretScanner, classify, elf,
-        extract_gzip, handler::IndexLayerJobHandler, index_stream, mime_type, pem,
-    },
-    policy::{ImagePolicy, PolicyConfig},
-    registry::{
-        Error as RegistryError, Registry, RegistryConfig, Repository,
-        keys::DigestKeys,
-        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        repository::Config,
-        test_utils::{
-            fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
-        },
-    },
-    test_fixtures::{client::test_client_config, tls},
+use crate::jobs::Queue;
+use crate::jobs::store::{ClaimMode, JobStore};
+use crate::layer::handler::IndexLayerJobHandler;
+use crate::layer::{
+    Checkpoints, IndexAction, IndexLayerPayload, IndexLimits, Listing, SecretScanner, classify,
+    elf, extract_gzip, index_stream, mime_type, pem,
 };
+use crate::policy::{ImagePolicy, PolicyConfig};
+use crate::registry::keys::DigestExt;
+use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+use crate::registry::repository::Config;
+use crate::registry::test_utils::{
+    fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
+};
+use crate::registry::{Error as RegistryError, Registry, RegistryConfig, Repository};
+use crate::test_fixtures::client::test_client_config;
+use crate::test_fixtures::tls;
 
 /// No bound: the tests below exercise what indexing records, not what it refuses.
 const LIMITS: IndexLimits = IndexLimits {
@@ -55,9 +52,9 @@ const LIMITS: IndexLimits = IndexLimits {
 /// a name too long for the classic header, with `padding` bytes of filler
 /// first so a checkpoint lands before the interesting entries.
 fn layer_tar(padding: usize) -> Vec<u8> {
-    let mut builder = tar::Builder::new(Vec::new());
-    let mut add = |path: &str, kind: tar::EntryType, data: &[u8], link: Option<&str>| {
-        let mut header = tar::Header::new_gnu();
+    let mut builder = Builder::new(Vec::new());
+    let mut add = |path: &str, kind: EntryType, data: &[u8], link: Option<&str>| {
+        let mut header = Header::new_gnu();
         header.set_entry_type(kind);
         header.set_size(data.len() as u64);
         header.set_mode(0o644);
@@ -75,34 +72,29 @@ fn layer_tar(padding: usize) -> Vec<u8> {
         }
     };
     let filler: Vec<u8> = (0..padding).map(|i| b"lorem ipsum "[i % 12]).collect();
-    add("./filler.bin", tar::EntryType::Regular, &filler, None);
-    add("./usr/", tar::EntryType::Directory, &[], None);
-    add("./usr/bin/", tar::EntryType::Directory, &[], None);
+    add("./filler.bin", EntryType::Regular, &filler, None);
+    add("./usr/", EntryType::Directory, &[], None);
+    add("./usr/bin/", EntryType::Directory, &[], None);
     add(
         "./usr/bin/hello",
-        tar::EntryType::Regular,
+        EntryType::Regular,
         b"#!/bin/sh\necho hello\n",
         None,
     );
-    add("./usr/bin/hi", tar::EntryType::Symlink, &[], Some("hello"));
+    add("./usr/bin/hi", EntryType::Symlink, &[], Some("hello"));
     add(
         "./usr/bin/hello-again",
-        tar::EntryType::Link,
+        EntryType::Link,
         &[],
         Some("usr/bin/hello"),
     );
-    add("./etc/.wh.motd", tar::EntryType::Regular, &[], None);
-    add(
-        "./var/cache/.wh..wh..opq",
-        tar::EntryType::Regular,
-        &[],
-        None,
-    );
+    add("./etc/.wh.motd", EntryType::Regular, &[], None);
+    add("./var/cache/.wh..wh..opq", EntryType::Regular, &[], None);
     let long = format!(
         "./opt/{}/deep.txt",
         "a-rather-long-directory-name-".repeat(5)
     );
-    add(&long, tar::EntryType::Regular, b"deep", None);
+    add(&long, EntryType::Regular, b"deep", None);
     builder.into_inner().expect("tar bytes")
 }
 
@@ -114,9 +106,9 @@ fn gzip(data: &[u8]) -> Vec<u8> {
 
 #[test]
 fn classify_names_whiteouts_and_normalises_paths() {
-    let file = tar::EntryType::Regular;
+    let file = EntryType::Regular;
     assert_eq!(
-        classify("./usr/bin/", tar::EntryType::Directory),
+        classify("./usr/bin/", EntryType::Directory),
         Some(("usr/bin".to_string(), EntryKind::Dir))
     );
     assert_eq!(
@@ -131,8 +123,8 @@ fn classify_names_whiteouts_and_normalises_paths() {
         classify("var/cache/.wh..wh..opq", file),
         Some(("var/cache".to_string(), EntryKind::Opaque))
     );
-    assert_eq!(classify("./", tar::EntryType::Directory), None);
-    assert_eq!(classify(".", tar::EntryType::Directory), None);
+    assert_eq!(classify("./", EntryType::Directory), None);
+    assert_eq!(classify(".", EntryType::Directory), None);
 }
 
 #[test]
@@ -317,12 +309,12 @@ fn capabilities_come_from_the_security_xattr() {
     for word in [1u32 << 13, 0, 1 << 7, 0] {
         value.extend(word.to_le_bytes());
     }
-    let mut builder = tar::Builder::new(Vec::new());
+    let mut builder = Builder::new(Vec::new());
     builder
         .append_pax_extensions([("SCHILY.xattr.security.capability", value.as_slice())])
         .unwrap();
     for path in ["usr/bin/ping", "usr/bin/true"] {
-        let mut header = tar::Header::new_gnu();
+        let mut header = Header::new_gnu();
         header.set_size(4);
         header.set_mode(0o755);
         header.set_uid(0);
@@ -338,7 +330,11 @@ fn capabilities_come_from_the_security_xattr() {
     )
     .unwrap();
     assert_eq!(entries[0].capabilities, ["cap_net_raw", "cap_bpf"]);
-    assert!(entries[1].capabilities.is_empty());
+    assert!(
+        entries[1].capabilities.is_empty(),
+        "{:?}",
+        entries[1].capabilities
+    );
 }
 
 /// The listing carries every entry, sorted by path, with its kind and offset,
@@ -436,7 +432,7 @@ fn indexes_a_gzipped_layer_and_extracts_a_file_from_a_checkpoint() {
     })
     .unwrap();
     assert!(!plain.compressed);
-    assert!(plain.checkpoints.is_empty());
+    assert!(plain.checkpoints.is_empty(), "{:?}", plain.checkpoints);
     assert_eq!(plain_entries, entries);
 }
 
@@ -486,16 +482,16 @@ fn indexing_refuses_a_layer_past_its_limits() {
     assert!(refused(&tar, small));
     assert!(refused(&tar, few));
 
-    let mut builder = tar::Builder::new(Vec::new());
-    let mut long_name = tar::Header::new_gnu();
-    long_name.set_entry_type(tar::EntryType::GNULongName);
+    let mut builder = Builder::new(Vec::new());
+    let mut long_name = Header::new_gnu();
+    long_name.set_entry_type(EntryType::GNULongName);
     long_name.set_size(2 * 1024 * 1024);
     long_name.set_cksum();
     builder
         .append(&long_name, io::repeat(b'a').take(2 * 1024 * 1024))
         .unwrap();
     builder
-        .append_data(&mut tar::Header::new_gnu(), "file", io::empty())
+        .append_data(&mut Header::new_gnu(), "file", io::empty())
         .unwrap();
     assert!(refused(&builder.into_inner().unwrap(), LIMITS));
 }
@@ -596,7 +592,7 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
     let response = entries(&namespace).await.unwrap().into_response().unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let listing: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(listing["entries"].as_array().map(Vec::len), Some(9));
     assert_eq!(listing["refreshing"], false);
 
@@ -716,7 +712,7 @@ async fn an_older_listing_is_served_and_walked_again() {
     let zipped = response.into_body().collect().await.unwrap().to_bytes();
     let mut json = Vec::new();
     GzDecoder::new(&zipped[..]).read_to_end(&mut json).unwrap();
-    let served: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let served: Value = serde_json::from_slice(&json).unwrap();
     let served_entries = served["entries"].as_array().expect("entries");
     assert_eq!(served_entries.len(), 9);
     assert!(
@@ -835,10 +831,10 @@ async fn the_file_endpoint_serves_a_range() {
 async fn a_file_is_found_across_entry_chunks() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let mut builder = tar::Builder::new(Vec::new());
+    let mut builder = Builder::new(Vec::new());
     for index in 0..5000 {
         let body = format!("file {index}\n");
-        let mut header = tar::Header::new_gnu();
+        let mut header = Header::new_gnu();
         header.set_size(body.len() as u64);
         header.set_mode(0o644);
         header.set_uid(0);
@@ -849,8 +845,8 @@ async fn a_file_is_found_across_entry_chunks() {
             .unwrap();
     }
     // Sorting first, in the first chunk, to a file in the last one.
-    let mut link = tar::Header::new_gnu();
-    link.set_entry_type(tar::EntryType::Link);
+    let mut link = Header::new_gnu();
+    link.set_entry_type(EntryType::Link);
     link.set_size(0);
     link.set_mode(0o644);
     link.set_uid(0);
@@ -1070,14 +1066,14 @@ fn pem_blocks_decode_certificates_and_name_the_rest() {
 async fn details_describe_binaries_and_certificates() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let mut builder = tar::Builder::new(Vec::new());
+    let mut builder = Builder::new(Vec::new());
     let files: [(&str, &[u8]); 3] = [
         ("usr/bin/app", &elf_binary(128 * 1024, 100 * 1024)),
         ("etc/ssl/cert.pem", tls::server_cert_pem().as_bytes()),
         ("etc/motd", b"hello\n"),
     ];
     for (path, data) in files {
-        let mut header = tar::Header::new_gnu();
+        let mut header = Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_mode(0o755);
         header.set_uid(0);
@@ -1147,10 +1143,6 @@ async fn details_describe_binaries_and_certificates() {
 /// none for the config or a zstd layer, and none at all without the flag.
 #[tokio::test]
 async fn a_push_enqueues_an_index_job_per_tar_layer_of_an_indexing_repository() {
-    use std::io::Cursor;
-
-    use angos_oci::{MediaType, Reference, request::PutManifestRequest};
-
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
     let (_, config, layer) =
@@ -1227,7 +1219,7 @@ async fn the_entries_endpoint_fills_the_cache_of_a_pull_through_layer() {
         upstream: vec![test_client_config(upstream.uri())],
         ..Default::default()
     };
-    let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache_backend = CacheConfig::Memory.to_backend().unwrap();
     let repository = Repository::new(
         "mirror",
         &config,

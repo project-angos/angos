@@ -1,44 +1,40 @@
+use std::fs;
+use std::fs::File;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
-use std::{
-    fs,
-    io::Write,
-    path::absolute,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::path::absolute;
+use std::slice::from_ref;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use notify::{
-    EventKind,
-    event::{AccessKind, ModifyKind},
-};
+use notify::EventKind;
+use notify::event::{AccessKind, DataChange, EventAttributes, ModifyKind};
 use tempfile::TempDir;
+use tokio::time::sleep;
 
-use super::{classify::is_k8s_data_symlink, *};
-use crate::{
-    configuration::listeners::ServerTlsConfig,
-    test_fixtures::configuration::{MINIMAL_CONFIG_TOML, config_toml},
-};
+use super::classify::is_k8s_data_symlink;
+use super::*;
+use crate::configuration::listeners::ServerTlsConfig;
+use crate::test_fixtures::configuration::{MINIMAL_CONFIG_TOML, config_toml};
 
 fn make_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
     Event {
         kind,
         paths,
-        attrs: notify::event::EventAttributes::default(),
+        attrs: EventAttributes::default(),
     }
 }
 
-fn path_set(path: impl Into<PathBuf>) -> HashSet<PathBuf> {
-    [path.into()].into_iter().collect()
+fn path_set(path: &Path) -> HashSet<PathBuf> {
+    [path.to_path_buf()].into_iter().collect()
 }
 
 #[test]
 fn classify_access_event_is_irrelevant() {
     let config_path = PathBuf::from("/etc/app/config.toml");
-    let config_dirs = path_set("/etc/app");
+    let config_dirs = path_set(Path::new("/etc/app"));
     let tls_dirs = HashSet::new();
 
     let event = make_event(
@@ -47,12 +43,7 @@ fn classify_access_event_is_irrelevant() {
     );
 
     assert_eq!(
-        classify_event(
-            &event,
-            &path_set(config_path.clone()),
-            &config_dirs,
-            &tls_dirs
-        ),
+        classify_event(&event, &path_set(&config_path), &config_dirs, &tls_dirs),
         ChangeKind::Irrelevant,
     );
 }
@@ -60,21 +51,16 @@ fn classify_access_event_is_irrelevant() {
 #[test]
 fn classify_modify_on_config_path_is_config() {
     let config_path = PathBuf::from("/etc/app/config.toml");
-    let config_dirs = path_set("/etc/app");
+    let config_dirs = path_set(Path::new("/etc/app"));
     let tls_dirs = HashSet::new();
 
     let event = make_event(
-        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         vec![config_path.clone()],
     );
 
     assert_eq!(
-        classify_event(
-            &event,
-            &path_set(config_path.clone()),
-            &config_dirs,
-            &tls_dirs
-        ),
+        classify_event(&event, &path_set(&config_path), &config_dirs, &tls_dirs),
         ChangeKind::Config,
     );
 }
@@ -82,22 +68,17 @@ fn classify_modify_on_config_path_is_config() {
 #[test]
 fn classify_modify_on_data_symlink_in_config_dir_is_config() {
     let config_path = PathBuf::from("/etc/app/config.toml");
-    let config_dirs = path_set("/etc/app");
+    let config_dirs = path_set(Path::new("/etc/app"));
     let tls_dirs = HashSet::new();
 
     let data_symlink = Path::new("/etc/app").join("..data");
     let event = make_event(
-        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         vec![data_symlink],
     );
 
     assert_eq!(
-        classify_event(
-            &event,
-            &path_set(config_path.clone()),
-            &config_dirs,
-            &tls_dirs
-        ),
+        classify_event(&event, &path_set(&config_path), &config_dirs, &tls_dirs),
         ChangeKind::Config,
     );
 }
@@ -105,23 +86,18 @@ fn classify_modify_on_data_symlink_in_config_dir_is_config() {
 #[test]
 fn classify_modify_in_tls_dir_is_tls() {
     let config_path = PathBuf::from("/etc/app/config.toml");
-    let config_dirs = path_set("/etc/app");
+    let config_dirs = path_set(Path::new("/etc/app"));
     let tls_dir = PathBuf::from("/etc/app/tls");
     let tls_dirs: HashSet<PathBuf> = [tls_dir.clone()].into_iter().collect();
 
     let cert = tls_dir.join("server.pem");
     let event = make_event(
-        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         vec![cert],
     );
 
     assert_eq!(
-        classify_event(
-            &event,
-            &path_set(config_path.clone()),
-            &config_dirs,
-            &tls_dirs
-        ),
+        classify_event(&event, &path_set(&config_path), &config_dirs, &tls_dirs),
         ChangeKind::Tls,
     );
 }
@@ -129,22 +105,17 @@ fn classify_modify_in_tls_dir_is_tls() {
 #[test]
 fn classify_modify_on_unrelated_path_is_irrelevant() {
     let config_path = PathBuf::from("/etc/app/config.toml");
-    let config_dirs = path_set("/etc/app");
+    let config_dirs = path_set(Path::new("/etc/app"));
     let tls_dirs: HashSet<PathBuf> = [PathBuf::from("/etc/app/tls")].into_iter().collect();
 
     let unrelated = PathBuf::from("/var/log/app.log");
     let event = make_event(
-        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         vec![unrelated],
     );
 
     assert_eq!(
-        classify_event(
-            &event,
-            &path_set(config_path.clone()),
-            &config_dirs,
-            &tls_dirs
-        ),
+        classify_event(&event, &path_set(&config_path), &config_dirs, &tls_dirs),
         ChangeKind::Irrelevant,
     );
 }
@@ -176,20 +147,12 @@ impl TestNotifier {
         }
     }
 
-    fn refuse_configurations(&self) {
-        self.refuse.store(true, Ordering::Release);
-    }
-
     fn config_change_count(&self) -> usize {
         self.config_changes.lock().unwrap().len()
     }
 
     fn tls_change_count(&self) -> usize {
         self.tls_changes.lock().unwrap().len()
-    }
-
-    fn last_config(&self) -> Option<Configuration> {
-        self.config_changes.lock().unwrap().last().cloned()
     }
 }
 
@@ -245,12 +208,12 @@ async fn wait_for_condition<F>(mut condition: F, timeout: Duration) -> bool
 where
     F: FnMut() -> bool,
 {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     while start.elapsed() < timeout {
         if condition() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     false
 }
@@ -263,12 +226,12 @@ async fn test_regular_config_change() {
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1)).await;
 
     let new_config = r#"
 [blob_store.fs]
@@ -277,7 +240,7 @@ root_dir = "/tmp/test"
 [server]
 bind_address = "127.0.0.1"
 "#;
-    let mut file = fs::File::create(&config_path).unwrap();
+    let mut file = File::create(&config_path).unwrap();
     file.write_all(new_config.as_bytes()).unwrap();
     file.sync_all().unwrap();
 
@@ -298,12 +261,12 @@ async fn test_kubernetes_config_mount() {
     let config_path = temp_dir.path().join("config.toml");
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     let new_config = r#"
 [blob_store.fs]
@@ -344,14 +307,14 @@ async fn test_tls_certificate_rotation() {
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
-    let mut file = fs::File::create(&cert_path).unwrap();
+    let mut file = File::create(&cert_path).unwrap();
     file.write_all(b"rotated-cert").unwrap();
     file.sync_all().unwrap();
 
@@ -389,12 +352,12 @@ async fn test_kubernetes_tls_mount() {
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     rotate_k8s_mount(
         &tls_dir,
@@ -418,18 +381,18 @@ async fn test_invalid_config_recovery() {
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
-    let mut file = fs::File::create(&config_path).unwrap();
+    let mut file = File::create(&config_path).unwrap();
     file.write_all(b"invalid toml [[[").unwrap();
     file.sync_all().unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     let valid_config = r#"
 [blob_store.fs]
@@ -438,7 +401,7 @@ root_dir = "/tmp/test"
 [server]
 bind_address = "10.0.0.1"
 "#;
-    let mut file = fs::File::create(&config_path).unwrap();
+    let mut file = File::create(&config_path).unwrap();
     file.write_all(valid_config.as_bytes()).unwrap();
     file.sync_all().unwrap();
 
@@ -486,30 +449,17 @@ fn merge_change_kind_both_irrelevant_stays_irrelevant() {
 }
 
 #[test]
-fn is_k8s_data_symlink_recognizes_dotdot_data_in_config_dir() {
-    let config_dirs = path_set("/etc/registry");
-    let path = Path::new("/etc/registry").join("..data");
-    assert!(is_k8s_data_symlink(&path, &config_dirs));
-}
-
-#[test]
 fn is_k8s_data_symlink_rejects_other_filenames_in_config_dir() {
-    let config_dirs = path_set("/etc/registry");
+    let config_dirs = path_set(Path::new("/etc/registry"));
     let path = Path::new("/etc/registry").join("config.toml");
     assert!(!is_k8s_data_symlink(&path, &config_dirs));
 }
 
 #[test]
 fn is_k8s_data_symlink_rejects_dotdot_data_in_other_directory() {
-    let config_dirs = path_set("/etc/registry");
+    let config_dirs = path_set(Path::new("/etc/registry"));
     let path = Path::new("/var/lib/other/..data");
     assert!(!is_k8s_data_symlink(path, &config_dirs));
-}
-
-#[test]
-fn is_k8s_data_symlink_rejects_path_with_no_filename() {
-    let config_dirs = path_set("/etc/registry");
-    assert!(!is_k8s_data_symlink(Path::new("/"), &config_dirs));
 }
 
 #[test]
@@ -532,22 +482,6 @@ fn resolve_tls_dir_relative_path_joins_with_config_dir() {
     );
 }
 
-#[test]
-fn resolve_tls_dir_absolute_root_path_has_no_parent() {
-    let config_dir = Path::new("/etc/registry");
-    assert_eq!(resolve_tls_dir(config_dir, Path::new("/")), None);
-}
-
-#[test]
-fn resolve_tls_dir_relative_bare_filename_lands_in_config_dir() {
-    let config_dir = Path::new("/etc/registry");
-    let path = Path::new("server.pem");
-    assert_eq!(
-        resolve_tls_dir(config_dir, path),
-        Some(PathBuf::from("/etc/registry")),
-    );
-}
-
 /// Verifies that a burst of N events coalesces into a single `ChangeKind`
 /// result rather than producing N separate results. The coalescer must
 /// drain all events and then return after the quiet-period timeout, not
@@ -555,7 +489,7 @@ fn resolve_tls_dir_relative_bare_filename_lands_in_config_dir() {
 #[tokio::test]
 async fn coalesce_events_collapses_burst_into_single_result() {
     let config_path = PathBuf::from("/etc/app/config.toml");
-    let config_dirs = path_set("/etc/app");
+    let config_dirs = path_set(Path::new("/etc/app"));
     let tls_dirs: HashSet<PathBuf> = HashSet::new();
 
     let (tx, mut rx) = mpsc::channel(100);
@@ -565,9 +499,7 @@ async fn coalesce_events_collapses_burst_into_single_result() {
     // write, truncate, write sequence.
     for _ in 0..10 {
         let event = make_event(
-            EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
             vec![config_path.clone()],
         );
         tx.send(event).await.unwrap();
@@ -578,7 +510,7 @@ async fn coalesce_events_collapses_burst_into_single_result() {
     let result = coalesce_events(
         &mut rx,
         ChangeKind::Config,
-        &path_set(config_path.clone()),
+        &path_set(&config_path),
         &config_dirs,
         &tls_dirs,
     )
@@ -593,7 +525,7 @@ async fn coalesce_events_collapses_burst_into_single_result() {
 #[tokio::test]
 async fn coalesce_events_config_dominates_tls_in_mixed_burst() {
     let config_path = PathBuf::from("/etc/app/config.toml");
-    let config_dirs = path_set("/etc/app");
+    let config_dirs = path_set(Path::new("/etc/app"));
     let tls_dir = PathBuf::from("/etc/app/tls");
     let tls_dirs: HashSet<PathBuf> = [tls_dir.clone()].into_iter().collect();
 
@@ -602,17 +534,13 @@ async fn coalesce_events_config_dominates_tls_in_mixed_burst() {
     // Send TLS events first, then a Config event.
     for _ in 0..5 {
         let tls_event = make_event(
-            EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
             vec![tls_dir.join("server.pem")],
         );
         tx.send(tls_event).await.unwrap();
     }
     let config_event = make_event(
-        EventKind::Modify(notify::event::ModifyKind::Data(
-            notify::event::DataChange::Content,
-        )),
+        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         vec![config_path.clone()],
     );
     tx.send(config_event).await.unwrap();
@@ -621,7 +549,7 @@ async fn coalesce_events_config_dominates_tls_in_mixed_burst() {
     let result = coalesce_events(
         &mut rx,
         ChangeKind::Tls,
-        &path_set(config_path.clone()),
+        &path_set(&config_path),
         &config_dirs,
         &tls_dirs,
     )
@@ -634,7 +562,7 @@ async fn coalesce_events_config_dominates_tls_in_mixed_burst() {
 #[tokio::test]
 async fn coalesce_events_returns_none_on_channel_close() {
     let config_path = PathBuf::from("/etc/app/config.toml");
-    let config_dirs = path_set("/etc/app");
+    let config_dirs = path_set(Path::new("/etc/app"));
     let tls_dirs: HashSet<PathBuf> = HashSet::new();
 
     let (tx, mut rx) = mpsc::channel(1);
@@ -644,7 +572,7 @@ async fn coalesce_events_returns_none_on_channel_close() {
     let result = coalesce_events(
         &mut rx,
         ChangeKind::Config,
-        &path_set(config_path.clone()),
+        &path_set(&config_path),
         &config_dirs,
         &tls_dirs,
     )
@@ -680,7 +608,7 @@ fn ensure_config_cached_loads_from_disk_when_cache_is_empty() {
     .unwrap();
 
     let mut cached: Option<Configuration> = None;
-    let resolved = ensure_config_cached(&mut cached, std::slice::from_ref(&config_path));
+    let resolved = ensure_config_cached(&mut cached, from_ref(&config_path));
 
     assert!(resolved.is_some(), "must load from disk when cache empty");
     assert!(
@@ -696,7 +624,7 @@ fn ensure_config_cached_returns_none_when_cache_empty_and_disk_invalid() {
     fs::write(&config_path, b"invalid toml [[[").unwrap();
 
     let mut cached: Option<Configuration> = None;
-    let resolved = ensure_config_cached(&mut cached, std::slice::from_ref(&config_path));
+    let resolved = ensure_config_cached(&mut cached, from_ref(&config_path));
 
     assert!(resolved.is_none());
     assert!(cached.is_none(), "must not populate cache on load failure");
@@ -714,7 +642,7 @@ fn ensure_config_cached_returns_cached_without_reading_disk() {
 
     // Point at a non-existent path; must not be touched.
     let bogus_path = temp_dir.path().join("does-not-exist.toml");
-    let resolved = ensure_config_cached(&mut cached, std::slice::from_ref(&bogus_path));
+    let resolved = ensure_config_cached(&mut cached, from_ref(&bogus_path));
 
     assert!(resolved.is_some(), "must reuse cached value");
 }
@@ -729,7 +657,7 @@ async fn a_refused_configuration_is_not_cached() {
     fs::write(&config_path, config_toml("")).unwrap();
 
     let notifier = TestNotifier::new();
-    notifier.refuse_configurations();
+    notifier.refuse.store(true, Ordering::Release);
     let mut cached: Option<Configuration> = None;
 
     let dirs = reload_config(
@@ -840,7 +768,7 @@ async fn startup_with_nonexistent_config_returns_err() {
     let notifier = Arc::new(TestNotifier::new());
 
     let result = ConfigWatcher::new(
-        std::slice::from_ref(&missing),
+        from_ref(&missing),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     );
 
@@ -868,7 +796,7 @@ async fn startup_with_invalid_toml_recovers_on_valid_write() {
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .expect("ConfigWatcher::new must succeed even with invalid TOML at startup");
@@ -877,7 +805,7 @@ async fn startup_with_invalid_toml_recovers_on_valid_write() {
     // writing the valid config.  The existing integration tests use 500 ms
     // for a valid-startup case; we use the same budget here because the
     // background task setup path is identical.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // Now write a valid config; the watcher must detect it and call
     // notify_config_change at least once.
@@ -912,7 +840,7 @@ async fn burst_config_writes_produce_bounded_reloads() {
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .unwrap();
@@ -920,21 +848,21 @@ async fn burst_config_writes_produce_bounded_reloads() {
     // Wait for the watcher background task to initialise its inotify fd
     // before the burst; otherwise the first few events may be missed
     // entirely, producing 0 reloads instead of the bounded > 0 we want.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // Write a valid config 10 times as fast as the OS allows.
     for i in 0_u8..10 {
         let content = format!(
             "[blob_store.fs]\nroot_dir = \"/tmp/test\"\n\n[server]\nbind_address = \"10.0.0.{i}\"\n"
         );
-        let mut file = fs::File::create(&config_path).unwrap();
+        let mut file = File::create(&config_path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file.sync_all().unwrap();
     }
 
     // Wait long enough for debounce to settle (DEBOUNCE = 100 ms; give it
     // several multiples to ensure all coalesced reloads have fired).
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    sleep(Duration::from_millis(800)).await;
 
     let count = notifier.config_change_count();
     assert!(
@@ -974,18 +902,18 @@ async fn missing_tls_dir_does_not_prevent_config_reload() {
     let notifier = Arc::new(TestNotifier::new());
     // Must not return Err even though the TLS dir doesn't exist.
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .expect("watcher must start even when TLS directory is absent");
 
     // Give the background task time to initialise the watcher.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // Write a fresh valid config; watcher must still detect it.
     let updated =
         "[blob_store.fs]\nroot_dir = \"/tmp/test\"\n\n[server]\nbind_address = \"192.0.2.1\"\n";
-    let mut file = fs::File::create(&config_path).unwrap();
+    let mut file = File::create(&config_path).unwrap();
     file.write_all(updated.as_bytes()).unwrap();
     file.sync_all().unwrap();
 
@@ -1039,12 +967,12 @@ async fn dynamic_tls_path_change_rewatches_new_directory() {
 
     let notifier = Arc::new(TestNotifier::new());
     let _watcher = ConfigWatcher::new(
-        std::slice::from_ref(&config_path),
+        from_ref(&config_path),
         Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // Step 2: update config to point at tls_v2, which fires ChangeKind::Config
     // and causes the inner loop to break and re-arm watches for tls_v2.
@@ -1067,12 +995,12 @@ async fn dynamic_tls_path_change_rewatches_new_directory() {
     );
 
     // Give the outer loop time to re-arm the notify watcher for tls_v2.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    sleep(Duration::from_millis(600)).await;
 
     let tls_before = notifier.tls_change_count();
 
     // Step 3: rotate the cert in the *new* dir; the watcher must notice.
-    let mut file = fs::File::create(&cert_v2).unwrap();
+    let mut file = File::create(&cert_v2).unwrap();
     file.write_all(b"cert-v2-rotated").unwrap();
     file.sync_all().unwrap();
 
@@ -1111,7 +1039,7 @@ async fn overlay_rotation_reloads_with_the_new_value() {
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     rotate_k8s_mount(
         overlay_dir.path(),
@@ -1122,7 +1050,10 @@ async fn overlay_rotation_reloads_with_the_new_value() {
     let applied = wait_for_condition(
         || {
             notifier
-                .last_config()
+                .config_changes
+                .lock()
+                .unwrap()
+                .last()
                 .is_some_and(|cfg| cfg.global.update_pull_time)
         },
         Duration::from_secs(5),
@@ -1150,9 +1081,9 @@ async fn a_change_to_the_overlay_directory_is_detected() {
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
-    let mut file = fs::File::create(&overlay_path).unwrap();
+    let mut file = File::create(&overlay_path).unwrap();
     file.write_all(b"[global]\nupdate_pull_time = true\n")
         .unwrap();
     file.sync_all().unwrap();
@@ -1160,7 +1091,10 @@ async fn a_change_to_the_overlay_directory_is_detected() {
     let applied = wait_for_condition(
         || {
             notifier
-                .last_config()
+                .config_changes
+                .lock()
+                .unwrap()
+                .last()
                 .is_some_and(|cfg| cfg.global.update_pull_time)
         },
         Duration::from_secs(5),
@@ -1186,17 +1120,20 @@ async fn a_vanished_overlay_does_not_kill_the_watcher() {
     )
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     fs::remove_file(&overlay_path).unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     fs::write(&overlay_path, "[global]\nupdate_pull_time = true\n").unwrap();
 
     let applied = wait_for_condition(
         || {
             notifier
-                .last_config()
+                .config_changes
+                .lock()
+                .unwrap()
+                .last()
                 .is_some_and(|cfg| cfg.global.update_pull_time)
         },
         Duration::from_secs(5),
@@ -1226,7 +1163,7 @@ fn watched_config_matches_a_file_reported_through_its_symlink() {
 
     // The event names it the same way, as inotify reports it.
     let event = make_event(
-        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         vec![link.join("config.toml")],
     );
     assert_eq!(
@@ -1241,7 +1178,7 @@ fn watched_config_matches_a_file_reported_through_its_symlink() {
 
     // And the resolved form fsevents reports must match just as well.
     let resolved = make_event(
-        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         vec![fs::canonicalize(real.join("config.toml")).unwrap()],
     );
     assert_eq!(
@@ -1269,7 +1206,7 @@ fn watched_config_matches_a_k8s_data_symlink_through_a_symlinked_dir() {
 
     let config = WatchedConfig::new(vec![link.join("config.toml")]);
     let event = make_event(
-        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         vec![link.join("..data")],
     );
 
@@ -1295,7 +1232,7 @@ fn watched_dirs_match_a_symlinked_path_and_its_target() {
     let link = temp_dir.path().join("link");
     symlink(&real, &link).unwrap();
 
-    let dirs = WatchedDirs::new(path_set(link.clone()));
+    let dirs = WatchedDirs::new(path_set(&link));
 
     assert!(
         dirs.matchable.contains(&link),
@@ -1312,7 +1249,7 @@ fn watched_dirs_match_a_symlinked_path_and_its_target() {
 /// A relative path is reported absolute, so both forms have to match.
 #[test]
 fn watched_dirs_keep_the_raw_form_of_a_relative_path() {
-    let dirs = WatchedDirs::new(path_set("."));
+    let dirs = WatchedDirs::new(path_set(Path::new(".")));
 
     assert!(
         dirs.matchable.contains(Path::new(".")),

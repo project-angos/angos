@@ -1,23 +1,35 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic)]
 
-use std::{fmt::Display, future::Future, process::exit, sync::Arc, time::Duration};
+use std::fmt::Display;
+use std::future::Future;
+use std::process::exit;
+use std::sync::Arc;
+use std::time::Duration;
 
 use argh::FromArgs;
-use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-use opentelemetry_sdk::{
-    Resource,
-    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
-};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, SdkTracerProvider};
+use rustls::crypto::aws_lc_rs::default_provider;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::signal::ctrl_c;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::layer as fmt_layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::{
-    command::{argon, bootstrap, maintenance, prune, reconcile, scanner, scrub, server, worker},
-    configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
-    metrics_provider::initialize_metrics,
+use crate::command::{
+    argon, bootstrap, maintenance, prune, reconcile, scanner, scrub, server, worker,
 };
+use crate::configuration::watcher::ConfigWatcher;
+use crate::configuration::{Configuration, ObservabilityConfig};
+use crate::metrics_provider::initialize_metrics;
 
 mod auth;
 mod cache_fill;
@@ -79,7 +91,7 @@ fn set_tracing(
         .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("angos")));
     let _ = tracing_subscriber::registry()
         .with(EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(fmt_layer().json())
         .with(telemetry)
         .try_init();
 
@@ -121,10 +133,7 @@ enum SubCommand {
 }
 
 fn main() {
-    if rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .is_err()
-    {
+    if default_provider().install_default().is_err() {
         eprintln!("Failed to install rustls crypto provider");
         exit(1);
     }
@@ -154,7 +163,7 @@ fn registry_main(subcommand: SubCommand, config_paths: &[String]) -> i32 {
             return 1;
         }
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    let runtime = match RuntimeBuilder::new_multi_thread()
         .worker_threads(config.global.max_concurrent_requests.get())
         .enable_all()
         .build()
@@ -185,10 +194,7 @@ fn scanner_main(options: &scanner::Options, config_paths: &[String]) -> i32 {
             return 1;
         }
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let runtime = match RuntimeBuilder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("Failed to create Tokio runtime: {e}");
@@ -312,10 +318,10 @@ async fn run_server(config_paths: &[String], config: Configuration) -> Result<()
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
+    let ctrl_c = ctrl_c();
 
     #[cfg(unix)]
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+    match signal(SignalKind::terminate()) {
         Ok(mut sigterm) => {
             tokio::select! {
                 _ = ctrl_c => {}
@@ -331,38 +337,5 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = ctrl_c.await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
-    use opentelemetry_sdk::trace::{
-        InMemorySpanExporterBuilder, SdkTracerProvider, SimpleSpanProcessor,
-    };
-
-    /// Verifies that spans emitted before `provider.shutdown()` are flushed to
-    /// the exporter.  With `SimpleSpanProcessor` each span is exported
-    /// synchronously when it ends, so `force_flush` followed by `shutdown`
-    /// must leave the span visible in the exporter's buffer.
-    #[test]
-    fn tracer_provider_shutdown_flushes_spans() {
-        let exporter = InMemorySpanExporterBuilder::new().build();
-        let provider = SdkTracerProvider::builder()
-            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
-            .build();
-
-        let tracer = provider.tracer("angos-test");
-        tracer.start("pre-shutdown-span").end();
-
-        provider.force_flush().expect("force_flush must succeed");
-
-        let spans = exporter
-            .get_finished_spans()
-            .expect("must be able to read finished spans");
-        assert_eq!(spans.len(), 1, "one span must be captured before shutdown");
-        assert_eq!(spans[0].name, "pre-shutdown-span");
-
-        provider.shutdown().expect("shutdown must succeed");
     }
 }

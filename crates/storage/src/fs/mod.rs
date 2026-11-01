@@ -13,27 +13,24 @@
 //! bytes to the canonical location, since an append that is still in flight
 //! keeps writing to the file it opened.
 
-use std::{
-    fs::{File, FileType},
-    io::{self, ErrorKind, Read, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
-};
+use std::fs::{File, FileType, hard_link};
+use std::io::{self, ErrorKind, Read, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt, TryStreamExt, stream::try_unfold};
+use futures_util::stream::try_unfold;
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
-use tokio::{
-    fs,
-    io::{AsyncSeekExt, AsyncWriteExt},
-    task::{spawn_blocking, yield_now},
-};
+use tokio::fs;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, copy as async_copy};
+use tokio::task::{spawn_blocking, yield_now};
 use tokio_util::io::StreamReader;
 
+use crate::object::{dir_prefix, verified_move};
 use crate::{
     BoxedReader, ByteStream, Children, ChildrenPage, Error, KeyStream, ObjectMeta, ObjectStore,
     Page,
-    object::{dir_prefix, verified_move},
 };
 
 /// Filename prefix for the temp files [`atomic_write`] creates next to their
@@ -57,13 +54,6 @@ pub struct Builder {
 }
 
 impl Builder {
-    fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            sync_to_disk: false,
-        }
-    }
-
     /// When `true`, every write `fsync`s before the temp-file rename. Adds
     /// durability at the cost of a syscall per write.
     #[must_use]
@@ -94,8 +84,11 @@ impl Backend {
     /// all object keys are resolved. Other settings are optional fluent setters
     /// on the returned builder.
     #[must_use]
-    pub fn builder(root: impl Into<PathBuf>) -> Builder {
-        Builder::new(root.into())
+    pub fn builder(root: &Path) -> Builder {
+        Builder {
+            root: root.to_path_buf(),
+            sync_to_disk: false,
+        }
     }
 
     fn full_path(&self, key: &str) -> PathBuf {
@@ -108,9 +101,6 @@ impl Backend {
     /// Returns the open file handle and the file's size **before** the open,
     /// so the upload can report its new total size without a separate `head`
     /// call.
-    ///
-    /// Private: this is an upload implementation detail, not part of the
-    /// [`ObjectStore`] trait surface.
     ///
     /// # Errors
     /// Returns [`Error::Backend`] when the file cannot be opened.
@@ -131,11 +121,6 @@ impl Backend {
     /// deletion. Walks parents upward until it reaches the first non-empty
     /// parent or `root_dir` (exclusive). The store root is the only ceiling.
     /// Errors are suppressed.
-    ///
-    /// Private: empty-directory pruning is an FS implementation detail with no
-    /// meaning on S3, so it never crosses the [`ObjectStore`] trait surface.
-    /// [`Backend::delete`] and [`Backend::delete_prefix`] invoke it for
-    /// callers; nothing outside this module triggers it directly.
     async fn prune_empty_ancestors(&self, key: &str) {
         // Lexically resolve `.`/`..` BEFORE touching the filesystem. `full_path`
         // does a bare `root.join(key)`, and `Path::starts_with` is purely
@@ -338,16 +323,17 @@ async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Erro
     .await
 }
 
-/// Split directory entries into `(sub_prefixes, objects)` by file type.
-fn partition_entries(
-    entries: impl IntoIterator<Item = (String, FileType)>,
-) -> (Vec<String>, Vec<String>) {
+/// Split directory entries into sub-prefixes and objects by file type.
+fn partition_entries(entries: impl IntoIterator<Item = (String, FileType)>) -> Children {
     let (dirs, files): (Vec<_>, Vec<_>) = entries
         .into_iter()
         .partition(|(_, file_type)| file_type.is_dir());
     let names =
         |entries: Vec<(String, FileType)>| entries.into_iter().map(|(name, _)| name).collect();
-    (names(dirs), names(files))
+    Children {
+        sub_prefixes: names(dirs),
+        objects: names(files),
+    }
 }
 
 /// Sorted list of immediate entries; missing dir yields an empty vector.
@@ -450,7 +436,7 @@ impl ObjectStore for Backend {
         // temp file is fully written before the name appears.
         write_beside(&target, "create_if_absent", move |parent| {
             let temp = staged_file(parent, sync, |file| file.write_all(&data))?;
-            match std::fs::hard_link(temp.path(), &link) {
+            match hard_link(temp.path(), &link) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
                 Err(e) => Err(e),
@@ -555,7 +541,10 @@ impl ObjectStore for Backend {
         let upper = (lower + n as usize).min(entries.len());
         let slice = &entries[lower..upper];
 
-        let (sub_prefixes, objects) = partition_entries(slice.iter().cloned());
+        let Children {
+            sub_prefixes,
+            objects,
+        } = partition_entries(slice.iter().cloned());
 
         let next_token = (upper < entries.len())
             .then(|| slice.last().map(|(name, _)| name.clone()))
@@ -572,11 +561,7 @@ impl ObjectStore for Backend {
     /// the directory once per page.
     async fn list_all_children(&self, prefix: &str) -> Result<Children, Error> {
         let entries = read_dir_sorted(&self.full_path(prefix)).await?;
-        let (sub_prefixes, objects) = partition_entries(entries);
-        Ok(Children {
-            sub_prefixes,
-            objects,
-        })
+        Ok(partition_entries(entries))
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error> {
@@ -618,7 +603,7 @@ impl ObjectStore for Backend {
             return Ok(current);
         }
         let mut reader = StreamReader::new(body.map_err(io::Error::other));
-        let written = tokio::io::copy(&mut reader, &mut file).await?;
+        let written = async_copy(&mut reader, &mut file).await?;
         if let Some(expected) = len
             && written != expected
         {

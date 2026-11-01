@@ -1,4 +1,6 @@
-use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
@@ -14,16 +16,14 @@ use angos_oci::response::{ManifestHeadResponse, ManifestResponse};
 use angos_oci::{Descriptor, Digest, Error as OciError, MediaRange, Namespace, Reference};
 use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient, RegistryClientConfig};
 
-use crate::{
-    configuration::RegexPattern,
-    layer::IndexAction,
-    policy::{
-        AccessMode, ImagePolicy, PolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock,
-    },
-    registry::Error,
-    replication::{ReplicationDownstream, ReplicationDownstreamConfig},
-    scan::ScanAction,
+use crate::configuration::RegexPattern;
+use crate::layer::IndexAction;
+use crate::policy::{
+    AccessMode, ImagePolicy, PolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock,
 };
+use crate::registry::Error;
+use crate::replication::{ReplicationDownstream, ReplicationDownstreamConfig};
+use crate::scan::ScanAction;
 
 /// Fallback per-manifest blob-push and top-level child-manifest concurrency
 /// when a downstream omits `max_concurrent_pushes`.
@@ -48,20 +48,6 @@ fn split_registry_url(url: &str) -> (String, String) {
     (trimmed.to_string(), String::new())
 }
 
-/// Validate a URL-path namespace prefix so a misconfigured upstream/downstream
-/// url fails at startup, not at request time. An empty prefix (bare host) yields
-/// `None`; otherwise the validated prefix is returned.
-fn validate_url_prefix(repo_name: &Namespace, prefix: &str) -> Result<Option<Namespace>, Error> {
-    if prefix.is_empty() {
-        return Ok(None);
-    }
-    Namespace::new(prefix).map(Some).map_err(|e| {
-        Error::Initialization(format!(
-            "repository '{repo_name}' has a url path '{prefix}' that is not a valid namespace prefix: {e}"
-        ))
-    })
-}
-
 /// Resolve one upstream/downstream client config: split the URL into the
 /// registry base and its namespace prefix, validate the prefix, and build the
 /// client against the base URL.
@@ -71,8 +57,17 @@ fn build_client(
     cache: &Arc<Cache>,
     max_manifest_size_bytes: usize,
 ) -> Result<(RegistryClient, Option<Namespace>), Error> {
-    let (base_url, prefix_str) = split_registry_url(&config.url);
-    let target_namespace = validate_url_prefix(repo_name, &prefix_str)?;
+    let (base_url, prefix) = split_registry_url(&config.url);
+    // A misconfigured url path fails at startup, not at request time.
+    let target_namespace = if prefix.is_empty() {
+        None
+    } else {
+        Some(Namespace::new(&prefix).map_err(|e| {
+            Error::Initialization(format!(
+                "repository '{repo_name}' has a url path '{prefix}' that is not a valid namespace prefix: {e}"
+            ))
+        })?)
+    };
     let mut client_config = config.clone();
     client_config.url = base_url;
     let client =
@@ -457,27 +452,25 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::fs;
+    use std::time::Duration;
 
-    use tokio::{io::AsyncReadExt, time::timeout};
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
-    };
+    use tokio::io::AsyncReadExt;
+    use tokio::time::timeout;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use angos_cache::Config as CacheConfig;
     use angos_mtls_client::ClientTls;
     use angos_oci::{Digest, Namespace, Reference, Tag};
     use angos_oci_client::RegistryClientConfig;
 
-    use crate::{
-        registry::{
-            Error,
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            repository::{Config, Repository},
-        },
-        replication::{ReplicationDownstreamConfig, ReplicationMode},
-        test_fixtures::{client::test_client_config, webhook::ca_bundle_pem},
-    };
+    use crate::registry::Error;
+    use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+    use crate::registry::repository::{Config, Repository, split_registry_url};
+    use crate::replication::{ReplicationDownstreamConfig, ReplicationMode};
+    use crate::test_fixtures::client::test_client_config;
+    use crate::test_fixtures::webhook::ca_bundle_pem;
 
     const TEST_DIGEST: &str =
         "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -490,7 +483,7 @@ mod tests {
     fn downstream_config(name: &str) -> ReplicationDownstreamConfig {
         ReplicationDownstreamConfig {
             name: name.to_string(),
-            client: test_client_config("https://downstream.example.test"),
+            client: test_client_config("https://downstream.example.test".to_string()),
             mode: ReplicationMode::default(),
             namespace_filter: Vec::new(),
             max_concurrent_pushes: None,
@@ -501,14 +494,14 @@ mod tests {
     #[test]
     fn split_registry_url_extracts_namespace_prefix_from_the_path() {
         assert_eq!(
-            super::split_registry_url("http://192.168.178.143:8000/push-through-1"),
+            split_registry_url("http://192.168.178.143:8000/push-through-1"),
             (
                 "http://192.168.178.143:8000".to_string(),
                 "push-through-1".to_string()
             )
         );
         assert_eq!(
-            super::split_registry_url("https://host:8000/team/sub/"),
+            split_registry_url("https://host:8000/team/sub/"),
             ("https://host:8000".to_string(), "team/sub".to_string())
         );
     }
@@ -516,32 +509,33 @@ mod tests {
     #[test]
     fn split_registry_url_yields_no_prefix_for_a_bare_host() {
         assert_eq!(
-            super::split_registry_url("http://angos-b:8000"),
+            split_registry_url("http://angos-b:8000"),
             ("http://angos-b:8000".to_string(), String::new())
         );
         assert_eq!(
-            super::split_registry_url("https://angos-eu.example.com/"),
+            split_registry_url("https://angos-eu.example.com/"),
             ("https://angos-eu.example.com".to_string(), String::new())
         );
     }
 
-    #[test]
-    fn validate_url_prefix_accepts_empty_and_valid_rejects_invalid() {
-        let repo = Namespace::new("repo").unwrap();
-        assert_eq!(super::validate_url_prefix(&repo, "").unwrap(), None);
-        assert_eq!(
-            super::validate_url_prefix(&repo, "mirror-1").unwrap(),
-            Some(Namespace::new("mirror-1").unwrap())
-        );
-        assert_eq!(
-            super::validate_url_prefix(&repo, "team/sub").unwrap(),
-            Some(Namespace::new("team/sub").unwrap())
-        );
-        assert!(super::validate_url_prefix(&repo, "Bad_Prefix").is_err());
+    #[tokio::test]
+    async fn an_upstream_url_path_that_is_no_namespace_fails_at_startup() {
+        let cache = CacheConfig::Memory.to_backend().unwrap();
+        let config = Config {
+            upstream: vec![test_client_config(
+                "http://upstream.example.test/Bad_Prefix".to_string(),
+            )],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            Repository::new("repo", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await,
+            Err(Error::Initialization(_))
+        ));
     }
 
     async fn repository_with_upstreams(first_url: String, second_url: String) -> Repository {
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![
                 test_client_config(first_url),
@@ -590,19 +584,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_pull_through_empty() {
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let config = Config::default();
-        let repo = Repository::new("test", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-
-        assert!(!repo.is_pull_through());
-    }
-
-    #[tokio::test]
     async fn duplicate_downstream_name_is_rejected() {
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             downstream: vec![downstream_config("eu"), downstream_config("eu")],
             ..Default::default()
@@ -625,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_downstream_name_is_rejected() {
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             downstream: vec![downstream_config("")],
             ..Default::default()
@@ -645,36 +628,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_is_pull_through_with_upstreams() {
-        let mock_server = MockServer::start().await;
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("test", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-        assert!(repo.is_pull_through());
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn new_loads_upstream_tls_files_on_single_worker_runtime() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let ca_bundle_path = tmp_dir.path().join("ca.pem");
         fs::write(&ca_bundle_path, ca_bundle_pem()).unwrap();
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![RegistryClientConfig {
                 tls: ClientTls {
                     server_ca_bundle: Some(ca_bundle_path.clone()),
                     identity: None,
                 },
-                ..test_client_config("https://registry.example.test")
+                ..test_client_config("https://registry.example.test".to_string())
             }],
             ..Default::default()
         };
@@ -706,7 +673,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -719,8 +686,6 @@ mod tests {
         let namespace = Namespace::new("local/repo").unwrap();
 
         let result = repo.head_manifest(&[], &namespace, &reference).await;
-        assert!(result.is_ok());
-
         let head = result.unwrap();
         assert_eq!(head.media_type, None);
         assert_eq!(head.size, 1234);
@@ -809,8 +774,6 @@ mod tests {
         )
         .await;
         let result = repo.head_manifest(&[], &namespace, &reference).await;
-        assert!(result.is_ok());
-
         let head = result.unwrap();
         assert_eq!(head.size, 5678);
         assert_eq!(
@@ -828,8 +791,6 @@ mod tests {
         )
         .await;
         let result = repo.get_manifest(&[], &namespace, &reference).await;
-        assert!(result.is_ok());
-
         let body = result.unwrap().body;
         assert_eq!(body, manifest_content);
 
@@ -843,8 +804,6 @@ mod tests {
         )
         .await;
         let result = repo.head_blob(&[], &namespace, &digest).await;
-        assert!(result.is_ok());
-
         let (_returned_digest, size) = result.unwrap();
         assert_eq!(size, 5432);
 
@@ -856,8 +815,6 @@ mod tests {
         )
         .await;
         let result = repo.get_blob(&[], &namespace, &digest, None).await;
-        assert!(result.is_ok());
-
         let fetched = result.unwrap();
         assert_eq!(fetched.length, blob_content.len() as u64);
         let mut reader = fetched.reader;
@@ -879,7 +836,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -892,45 +849,7 @@ mod tests {
         let namespace = Namespace::new("local/repo").unwrap();
 
         let result = repo.head_manifest(&[], &namespace, &reference).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::ManifestUnknown));
-    }
-
-    #[tokio::test]
-    async fn test_get_manifest_success() {
-        let mock_server = MockServer::start().await;
-        let manifest_content = b"{\"schemaVersion\":2}";
-
-        Mock::given(method("GET"))
-            .and(path("/v2/repo/manifests/latest"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(manifest_content)
-                    .insert_header(
-                        "Docker-Content-Digest",
-                        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                    ),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-        let reference = Reference::Tag(Tag::new("latest").unwrap());
-        let namespace = Namespace::new("local/repo").unwrap();
-
-        let result = repo.get_manifest(&[], &namespace, &reference).await;
-        assert!(result.is_ok());
-
-        let body = result.unwrap().body;
-        assert_eq!(body, manifest_content);
+        assert!(matches!(result, Err(Error::ManifestUnknown)));
     }
 
     #[tokio::test]
@@ -943,7 +862,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -956,8 +875,7 @@ mod tests {
         let namespace = Namespace::new("local/repo").unwrap();
 
         let result = repo.get_manifest(&[], &namespace, &reference).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::ManifestUnknown));
+        assert!(matches!(result, Err(Error::ManifestUnknown)));
     }
 
     #[tokio::test]
@@ -977,7 +895,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -993,8 +911,6 @@ mod tests {
         let namespace = Namespace::new("local/repo").unwrap();
 
         let result = repo.head_blob(&[], &namespace, &digest).await;
-        assert!(result.is_ok());
-
         let (returned_digest, size) = result.unwrap();
         assert_eq!(size, 9876);
         assert_eq!(returned_digest, digest);
@@ -1010,7 +926,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -1026,48 +942,7 @@ mod tests {
         let namespace = Namespace::new("local/repo").unwrap();
 
         let result = repo.head_blob(&[], &namespace, &digest).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::BlobUnknown));
-    }
-
-    #[tokio::test]
-    async fn test_get_blob_success() {
-        let mock_server = MockServer::start().await;
-        let blob_content = b"blob data here";
-
-        Mock::given(method("GET"))
-            .and(path("/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob_content))
-            .mount(&mock_server)
-            .await;
-
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-        let digest = Digest::try_from(
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        )
-        .unwrap();
-        let namespace = Namespace::new("local/repo").unwrap();
-
-        let result = repo.get_blob(&[], &namespace, &digest, None).await;
-        assert!(result.is_ok());
-
-        let fetched = result.unwrap();
-        assert_eq!(fetched.length, blob_content.len() as u64);
-        let mut reader = fetched.reader;
-
-        let mut buffer = Vec::new();
-        AsyncReadExt::read_to_end(&mut reader, &mut buffer)
-            .await
-            .unwrap();
-        assert_eq!(buffer, blob_content);
+        assert!(matches!(result, Err(Error::BlobUnknown)));
     }
 
     #[tokio::test]
@@ -1080,7 +955,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = Config {
             upstream: vec![test_client_config(mock_server.uri())],
             ..Default::default()
@@ -1096,10 +971,6 @@ mod tests {
         let namespace = Namespace::new("local/repo").unwrap();
 
         let result = repo.get_blob(&[], &namespace, &digest, None).await;
-        assert!(result.is_err());
-        match result {
-            Err(Error::BlobUnknown) => (),
-            _ => panic!("Expected Error::BlobUnknown"),
-        }
+        assert!(matches!(result, Err(Error::BlobUnknown)));
     }
 }

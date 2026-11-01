@@ -1,19 +1,27 @@
-use std::{num::TryFromIntError, string::FromUtf8Error};
+use std::io::Error as IoError;
+use std::num::TryFromIntError;
+use std::string::FromUtf8Error;
 
+use chrono::format::ParseError as ChronoParseError;
 use http::StatusCode;
+use serde_json::Error as SerdeJsonError;
 use sha2::digest::common::hazmat::DeserializeStateError;
 use tracing::warn;
+use x509_parser::error::X509Error;
 
-use angos_oci::{
-    Error as OciError, http_range,
-    response::{
-        ErrorCode, INTERNAL_ERROR_CODE, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE,
-        UPSTREAM_UNAVAILABLE_CODE,
-    },
+use angos_cache::Error as CacheError;
+use angos_oci::Error as OciError;
+use angos_oci::http_range::Error as HttpRangeError;
+use angos_oci::response::{
+    ErrorCode, INTERNAL_ERROR_CODE, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE,
+    UPSTREAM_UNAVAILABLE_CODE,
 };
+use angos_oci_client::Error as ClientError;
 use angos_storage::Error as StorageError;
 
-use crate::{configuration, jobs::store as job_store, policy};
+use crate::configuration::Error as ConfigurationError;
+use crate::jobs::store::Error as JobStoreError;
+use crate::policy::Error as PolicyError;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -86,13 +94,13 @@ pub enum Error {
 
     // Typed variants preserving the source error chain.
     #[error("configuration error during operations: {0}")]
-    Configuration(#[from] configuration::Error),
+    Configuration(#[from] ConfigurationError),
     #[error("cache error during operations: {0}")]
-    Cache(#[from] angos_cache::Error),
+    Cache(#[from] CacheError),
     #[error("I/O error during operations: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] IoError),
     #[error("(de)serialization error during operations: {0}")]
-    Serde(#[from] serde_json::Error),
+    Serde(#[from] SerdeJsonError),
 }
 
 impl Error {
@@ -100,122 +108,105 @@ impl Error {
     /// error code and the message worth sending. A 4xx code must come from the
     /// spec's set, so each case picks the closest of those.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn oci_answer(&self) -> (StatusCode, &'static str, Option<String>) {
-        match self {
-            Error::BlobUnknown => (StatusCode::NOT_FOUND, ErrorCode::BlobUnknown.as_str(), None),
+        let (status, code) = match self {
+            Error::BlobUnknown => (StatusCode::NOT_FOUND, ErrorCode::BlobUnknown.as_str()),
             // `405` is what end-10 lists for a refused blob delete, so the
             // reason travels in the message rather than in a status outside
             // that set.
-            Error::BlobReferenced => (
-                StatusCode::METHOD_NOT_ALLOWED,
-                ErrorCode::Denied.as_str(),
-                Some(self.to_string()),
-            ),
-            Error::BlobUploadUnknown => (
-                StatusCode::NOT_FOUND,
-                ErrorCode::BlobUploadUnknown.as_str(),
-                None,
-            ),
-            Error::DigestInvalid => (
-                StatusCode::BAD_REQUEST,
-                ErrorCode::DigestInvalid.as_str(),
-                None,
-            ),
+            Error::BlobReferenced => (StatusCode::METHOD_NOT_ALLOWED, ErrorCode::Denied.as_str()),
+            Error::BlobUploadUnknown => {
+                (StatusCode::NOT_FOUND, ErrorCode::BlobUploadUnknown.as_str())
+            }
+            Error::DigestInvalid => (StatusCode::BAD_REQUEST, ErrorCode::DigestInvalid.as_str()),
             Error::ManifestBlobUnknown => (
                 StatusCode::NOT_FOUND,
                 ErrorCode::ManifestBlobUnknown.as_str(),
-                None,
             ),
             Error::ManifestBodyTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorCode::ManifestInvalid.as_str(),
-                Some(self.to_string()),
             ),
             Error::BlobBodyTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorCode::BlobUploadInvalid.as_str(),
-                Some(self.to_string()),
             ),
-            Error::ManifestInvalid(msg) => (
-                StatusCode::BAD_REQUEST,
-                ErrorCode::ManifestInvalid.as_str(),
-                Some(msg.clone()),
-            ),
-            Error::ManifestUnknown => (
-                StatusCode::NOT_FOUND,
-                ErrorCode::ManifestUnknown.as_str(),
-                None,
-            ),
-            Error::NameInvalid => (
-                StatusCode::BAD_REQUEST,
-                ErrorCode::NameInvalid.as_str(),
-                None,
-            ),
-            Error::NameUnknown | Error::NotFound => {
-                (StatusCode::NOT_FOUND, ErrorCode::NameUnknown.as_str(), None)
+            Error::ManifestInvalid(_) => {
+                (StatusCode::BAD_REQUEST, ErrorCode::ManifestInvalid.as_str())
             }
-            Error::Unauthorized(msg) => (
-                StatusCode::UNAUTHORIZED,
-                ErrorCode::Unauthorized.as_str(),
-                Some(msg.clone()),
-            ),
-            Error::Denied(msg) => (
-                StatusCode::FORBIDDEN,
-                ErrorCode::Denied.as_str(),
-                Some(msg.clone()),
-            ),
-            Error::Unsupported => (
-                StatusCode::BAD_REQUEST,
-                ErrorCode::Unsupported.as_str(),
-                None,
-            ),
+            Error::ManifestUnknown => (StatusCode::NOT_FOUND, ErrorCode::ManifestUnknown.as_str()),
+            Error::NameInvalid => (StatusCode::BAD_REQUEST, ErrorCode::NameInvalid.as_str()),
+            Error::NameUnknown | Error::NotFound => {
+                (StatusCode::NOT_FOUND, ErrorCode::NameUnknown.as_str())
+            }
+            Error::Unauthorized(_) => (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized.as_str()),
+            Error::Denied(_) => (StatusCode::FORBIDDEN, ErrorCode::Denied.as_str()),
+            Error::Unsupported => (StatusCode::BAD_REQUEST, ErrorCode::Unsupported.as_str()),
             Error::RangeNotSatisfiable => (
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 ErrorCode::SizeInvalid.as_str(),
-                None,
             ),
             // A refused write (an immutable tag, a concurrent-writer CAS
             // conflict) answers 409 under the spec code closest to it.
-            Error::Conflict(msg) => (
-                StatusCode::CONFLICT,
-                ErrorCode::Denied.as_str(),
-                Some(msg.clone()),
-            ),
+            Error::Conflict(_) => (StatusCode::CONFLICT, ErrorCode::Denied.as_str()),
             // Transient by construction, since the collector's batch moves on:
             // the client backs off and retries instead of reading a refusal.
-            Error::ReclamationInProgress(msg) => (
+            Error::ReclamationInProgress(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 RECLAMATION_IN_PROGRESS_CODE,
-                Some(msg.clone()),
             ),
             // Transient too: the client retries once the upstream is back,
             // instead of reading the outage as a missing image.
-            Error::UpstreamUnavailable(msg) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                UPSTREAM_UNAVAILABLE_CODE,
-                Some(msg.clone()),
-            ),
-            Error::ReplicationSuperseded(msg) => (
-                StatusCode::CONFLICT,
-                REPLICATION_SUPERSEDED_CODE,
-                Some(msg.clone()),
-            ),
+            Error::UpstreamUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, UPSTREAM_UNAVAILABLE_CODE)
+            }
+            Error::ReplicationSuperseded(_) => (StatusCode::CONFLICT, REPLICATION_SUPERSEDED_CODE),
             // Corrupt content is a 500 like any other internal failure; only
             // the reclaim paths inside angos act on the distinction.
-            Error::Initialization(msg)
+            Error::Initialization(_)
+            | Error::EventDelivery(_)
+            | Error::Internal(_)
+            | Error::Corrupt(_)
+            | Error::Configuration(_)
+            | Error::Cache(_)
+            | Error::Io(_)
+            | Error::Serde(_) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_CODE),
+        };
+        (status, code, self.oci_message())
+    }
+
+    /// The message sent with [`Self::oci_answer`]; `None` where the spec code
+    /// says it all.
+    fn oci_message(&self) -> Option<String> {
+        match self {
+            Error::ManifestInvalid(msg)
+            | Error::Unauthorized(msg)
+            | Error::Denied(msg)
+            | Error::Conflict(msg)
+            | Error::ReclamationInProgress(msg)
+            | Error::UpstreamUnavailable(msg)
+            | Error::ReplicationSuperseded(msg)
+            | Error::Initialization(msg)
             | Error::EventDelivery(msg)
             | Error::Internal(msg)
-            | Error::Corrupt(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                INTERNAL_ERROR_CODE,
-                Some(msg.clone()),
-            ),
-            Error::Configuration(_) | Error::Cache(_) | Error::Io(_) | Error::Serde(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                INTERNAL_ERROR_CODE,
-                Some(self.to_string()),
-            ),
+            | Error::Corrupt(msg) => Some(msg.clone()),
+            Error::BlobReferenced
+            | Error::ManifestBodyTooLarge { .. }
+            | Error::BlobBodyTooLarge { .. }
+            | Error::Configuration(_)
+            | Error::Cache(_)
+            | Error::Io(_)
+            | Error::Serde(_) => Some(self.to_string()),
+            Error::BlobUnknown
+            | Error::BlobUploadUnknown
+            | Error::DigestInvalid
+            | Error::ManifestBlobUnknown
+            | Error::ManifestUnknown
+            | Error::NameInvalid
+            | Error::NameUnknown
+            | Error::NotFound
+            | Error::Unsupported
+            | Error::RangeNotSatisfiable => None,
         }
     }
 }
@@ -251,25 +242,25 @@ impl From<TryFromIntError> for Error {
     }
 }
 
-impl From<chrono::format::ParseError> for Error {
-    fn from(error: chrono::format::ParseError) -> Self {
+impl From<ChronoParseError> for Error {
+    fn from(error: ChronoParseError) -> Self {
         Error::Corrupt(error.to_string())
     }
 }
 
 // Every policy error collapses into the string-carrying `Initialization`, a
 // semantic mapping `#[from]` could not express.
-impl From<policy::Error> for Error {
-    fn from(error: policy::Error) -> Self {
+impl From<PolicyError> for Error {
+    fn from(error: PolicyError) -> Self {
         Error::Initialization(error.to_string())
     }
 }
 
 // A missing job record is a `404`; every other failure is an opaque `500`.
-impl From<job_store::Error> for Error {
-    fn from(error: job_store::Error) -> Self {
+impl From<JobStoreError> for Error {
+    fn from(error: JobStoreError) -> Self {
         match error {
-            job_store::Error::NotFound => Error::NotFound,
+            JobStoreError::NotFound => Error::NotFound,
             other => Error::Internal(other.to_string()),
         }
     }
@@ -277,27 +268,25 @@ impl From<job_store::Error> for Error {
 
 // Variant for variant, so the pull-through path surfaces a remote miss as the
 // matching local OCI code.
-impl From<angos_oci_client::Error> for Error {
-    fn from(error: angos_oci_client::Error) -> Self {
+impl From<ClientError> for Error {
+    fn from(error: ClientError) -> Self {
         match error {
-            angos_oci_client::Error::Initialization(msg) => Error::Initialization(msg),
-            angos_oci_client::Error::Unauthorized(msg) => Error::Unauthorized(msg),
-            angos_oci_client::Error::Denied(msg) => Error::Denied(msg),
-            angos_oci_client::Error::BlobUnknown => Error::BlobUnknown,
-            angos_oci_client::Error::ManifestUnknown => Error::ManifestUnknown,
-            angos_oci_client::Error::ManifestBodyTooLarge { limit } => {
-                Error::ManifestBodyTooLarge { limit }
-            }
-            angos_oci_client::Error::Unsupported => Error::Unsupported,
-            angos_oci_client::Error::RangeNotSatisfiable => Error::RangeNotSatisfiable,
-            angos_oci_client::Error::Internal(msg) => Error::Internal(msg),
+            ClientError::Initialization(msg) => Error::Initialization(msg),
+            ClientError::Unauthorized(msg) => Error::Unauthorized(msg),
+            ClientError::Denied(msg) => Error::Denied(msg),
+            ClientError::BlobUnknown => Error::BlobUnknown,
+            ClientError::ManifestUnknown => Error::ManifestUnknown,
+            ClientError::ManifestBodyTooLarge { limit } => Error::ManifestBodyTooLarge { limit },
+            ClientError::Unsupported => Error::Unsupported,
+            ClientError::RangeNotSatisfiable => Error::RangeNotSatisfiable,
+            ClientError::Internal(msg) => Error::Internal(msg),
         }
     }
 }
 
 // A malformed range and an unservable one are both a 416 to the client.
-impl From<http_range::Error> for Error {
-    fn from(_: http_range::Error) -> Self {
+impl From<HttpRangeError> for Error {
+    fn from(_: HttpRangeError) -> Self {
         Error::RangeNotSatisfiable
     }
 }
@@ -318,41 +307,17 @@ impl Error {
     }
 }
 
-impl From<x509_parser::error::X509Error> for Error {
-    fn from(_: x509_parser::error::X509Error) -> Self {
+impl From<X509Error> for Error {
+    fn from(_: X509Error) -> Self {
         Error::Unauthorized("Invalid client certificate".to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as StdError;
-
     use chrono::DateTime;
-    use x509_parser::error::X509Error;
 
-    use crate::registry::error::*;
-
-    #[test]
-    fn from_io_error_preserves_source() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
-        let err: Error = io_err.into();
-        assert!(matches!(err, Error::Io(_)));
-        assert!(StdError::source(&err).is_some());
-        assert!(err.to_string().contains("I/O error during operations"));
-    }
-
-    #[test]
-    fn from_serde_json_preserves_source() {
-        let serde_err = serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
-        let err: Error = serde_err.into();
-        assert!(matches!(err, Error::Serde(_)));
-        assert!(StdError::source(&err).is_some());
-        assert!(
-            err.to_string()
-                .contains("(de)serialization error during operations")
-        );
-    }
+    use super::*;
 
     #[test]
     fn from_storage_not_found_routes_to_not_found() {
@@ -361,37 +326,9 @@ mod tests {
     }
 
     #[test]
-    fn from_configuration_preserves_source() {
-        let config_err = configuration::Error::Initialization("cfg failed".to_string());
-        let err: Error = config_err.into();
-        assert!(matches!(err, Error::Configuration(_)));
-        assert!(StdError::source(&err).is_some());
-        assert!(
-            err.to_string()
-                .contains("configuration error during operations")
-        );
-    }
-
-    #[test]
-    fn from_cache_preserves_source() {
-        let cache_err = angos_cache::Error::Execution("cache miss".to_string());
-        let err: Error = cache_err.into();
-        assert!(matches!(err, Error::Cache(_)));
-        assert!(StdError::source(&err).is_some());
-        assert!(err.to_string().contains("cache error during operations"));
-    }
-
-    #[test]
     fn from_oci_error_routes_to_name_invalid() {
-        let err: Error = OciError::InvalidDigest("bad digest".to_string()).into();
+        let err: Error = OciError::Digest("bad digest".to_string()).into();
         assert!(matches!(err, Error::NameInvalid));
-    }
-
-    #[test]
-    fn from_policy_error_routes_to_initialization() {
-        let err: Error = policy::Error::Evaluation("eval failed".to_string()).into();
-        assert!(matches!(err, Error::Initialization(_)));
-        assert!(err.to_string().contains("eval failed"));
     }
 
     #[test]

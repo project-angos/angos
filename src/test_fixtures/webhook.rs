@@ -1,8 +1,7 @@
 //! Dynamically generated webhook mTLS certificate fixtures for unit tests.
 //!
 //! `ca_bundle_pem()` is a PEM chain containing the CA-signed server leaf
-//! certificate followed by the CA certificate (matching the previous static
-//! layout so consumers do not break).
+//! certificate followed by the CA certificate.
 //!
 //! `client_cert_pem()` / `client_key_pem()` are a self-signed ECDSA P-256
 //! client identity (CN=philippe, O=admins).
@@ -41,7 +40,6 @@ static FIXTURES: LazyLock<WebhookFixtures> = LazyLock::new(|| {
         .signed_by(&leaf_kp, &ca_issuer)
         .expect("ca-signed leaf");
 
-    // Bundle = leaf || CA, matching the previous static layout.
     let ca_bundle_pem = format!("{}{}", leaf_cert.pem(), ca_cert.pem());
 
     // Client identity (CN=philippe, O=admins), self-signed.
@@ -62,14 +60,17 @@ static FIXTURES: LazyLock<WebhookFixtures> = LazyLock::new(|| {
     }
 });
 
+#[must_use]
 pub fn ca_bundle_pem() -> &'static str {
     &FIXTURES.ca_bundle
 }
 
+#[must_use]
 pub fn client_cert_pem() -> &'static str {
     &FIXTURES.client_cert
 }
 
+#[must_use]
 pub fn client_key_pem() -> &'static str {
     &FIXTURES.client_key
 }

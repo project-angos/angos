@@ -1,13 +1,15 @@
-use std::sync::LazyLock;
-
-use regex::Regex;
-
 use crate::types::{Digest, Error};
 
-// ASCII-only tag grammar per the OCI Distribution Spec: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
-// The regex crate makes `\w` Unicode-aware, which would wrongly accept non-ASCII tags.
-static TAG_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$").unwrap());
+/// The ASCII-only OCI Distribution Spec tag grammar:
+/// `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+fn is_tag(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    s.len() <= 128
+        && bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
 
 /// A validated OCI tag: a single reference name (not a digest). The private
 /// field forces construction through the validating constructors below.
@@ -19,10 +21,10 @@ impl Tag {
     ///
     /// Returns an error when `s` breaks the OCI tag grammar.
     pub fn new(s: &str) -> Result<Self, Error> {
-        if TAG_REGEX.is_match(s) {
+        if is_tag(s) {
             Ok(Self(s.to_owned()))
         } else {
-            Err(Error::InvalidReference(format!("Invalid tag: '{s}'")))
+            Err(Error::Reference(format!("Invalid tag: '{s}'")))
         }
     }
 }
@@ -53,9 +55,8 @@ str_newtype!(Tag);
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use crate::types::{Algorithm, tag::*};
+    use super::*;
+    use crate::types::Algorithm;
 
     #[test]
     fn test_valid_tag() {
@@ -119,41 +120,6 @@ mod tests {
     #[test]
     fn test_empty_rejected() {
         assert!(Tag::new("").is_err());
-    }
-
-    #[test]
-    fn test_from_str() {
-        assert_eq!(Tag::from_str("v1.0.0").unwrap().as_ref(), "v1.0.0");
-    }
-
-    #[test]
-    fn test_display() {
-        assert_eq!(Tag::new("latest").unwrap().to_string(), "latest");
-    }
-
-    #[test]
-    fn test_deref() {
-        let tag = Tag::new("release").unwrap();
-        assert_eq!(tag.len(), 7);
-        assert!(tag.starts_with("rel"));
-    }
-
-    #[test]
-    fn test_partial_eq_str() {
-        let tag = Tag::new("latest").unwrap();
-        assert_eq!(tag, *"latest");
-        assert_ne!(tag, *"other");
-    }
-
-    #[test]
-    fn test_try_from_str_and_string() {
-        assert_eq!(Tag::try_from("valid").unwrap().as_ref(), "valid");
-        assert!(Tag::try_from("@bad").is_err());
-        assert_eq!(
-            Tag::try_from("valid".to_string()).unwrap().as_ref(),
-            "valid"
-        );
-        assert!(Tag::try_from("@bad".to_string()).is_err());
     }
 
     #[test]

@@ -1,34 +1,32 @@
+use std::io::Cursor;
 use std::sync::Arc;
 
 use chrono::{TimeDelta, Utc};
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{header, method, path},
-};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use angos_cache::Config as CacheConfig;
 use angos_mtls_client::ClientTls;
-use angos_oci::{Digest, Namespace, Tag};
-
-use crate::{
-    jobs::{
-        Queue,
-        store::{ClaimMode, JobHandler, JobStore},
-    },
-    policy::{CelRule, ImagePolicy, PolicyConfig},
-    registry::{
-        Registry, RegistryConfig, Repository,
-        manifest::read_manifest,
-        test_utils::{
-            FsTestStack, fs_test_stack, repository_with_replication, seed_manifest,
-            single_repo_resolver,
-        },
-    },
-    scan::{
-        SARIF_MEDIA_TYPE, ScanAction, ScanConfig, ScanImagePayload, ScanSummary, build_envelope,
-        handler::ScanJobHandler, scan_reports,
-    },
-};
+use angos_oci::request::PutManifestRequest;
+use angos_oci::{Digest, MediaRange, MediaType, Namespace, Reference, Tag};
 use angos_secret::Secret;
+
+use crate::event_webhook::event::EventActor;
+use crate::jobs::Queue;
+use crate::jobs::store::{ClaimMode, JobHandler, JobStore};
+use crate::policy::{CelRule, ImagePolicy, PolicyConfig};
+use crate::registry::manifest::{DEFAULT_MAX_MANIFEST_SIZE_BYTES, read_manifest};
+use crate::registry::repository::Config as RepositoryConfig;
+use crate::registry::test_utils::{
+    FsTestStack, fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
+};
+use crate::registry::{Registry, RegistryConfig, Repository};
+use crate::scan::handler::ScanJobHandler;
+use crate::scan::{
+    SARIF_MEDIA_TYPE, ScanAction, ScanConfig, ScanImagePayload, ScanSummary, build_envelope,
+    scan_reports,
+};
+use crate::test_fixtures::client::test_client_config;
 
 const SARIF: &[u8] = br#"{"version":"2.1.0","runs":[]}"#;
 
@@ -157,13 +155,6 @@ async fn a_failing_scanner_fails_the_job() {
 /// job for the image it stores; the hit that follows enqueues nothing more.
 #[tokio::test]
 async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository() {
-    use angos_oci::{MediaRange, MediaType, Reference, Tag};
-
-    use crate::{
-        registry::repository::{Config as RepositoryConfig, Repository},
-        test_fixtures::client::test_client_config,
-    };
-
     let stack = fs_test_stack();
     let namespace = Namespace::new("mirror/web").unwrap();
     let job_store = Arc::new(JobStore::new(
@@ -195,8 +186,8 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
             scan: Some(scan_everything()),
             ..Default::default()
         },
-        &angos_cache::Config::Memory.to_backend().unwrap(),
-        crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        &CacheConfig::Memory.to_backend().unwrap(),
+        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     )
     .await
     .unwrap();
@@ -210,7 +201,7 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
     let repository = resolver.resolve(&namespace).unwrap();
     let accepted = [MediaRange::from(MediaType::oci_manifest())];
     let latest = Tag::new("latest").unwrap();
-    let client = crate::event_webhook::event::EventActor::default();
+    let client = EventActor::default();
     let pull = || {
         registry.get_manifest_direct(
             Some(repository),
@@ -241,10 +232,6 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
 /// enqueues nothing.
 #[tokio::test]
 async fn a_push_enqueues_a_scan_job_only_for_an_image_in_a_scanning_repository() {
-    use std::io::Cursor;
-
-    use angos_oci::{MediaType, Reference, request::PutManifestRequest};
-
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
     let (_, config, layer) =

@@ -1,13 +1,17 @@
 //! Builders for the request `Parts` handed to auth middlewares under test.
 
-use base64::{Engine, prelude::BASE64_STANDARD};
-use http::{Request, header::AUTHORIZATION, request::Parts};
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
+use http::Request;
+use http::header::AUTHORIZATION;
+use http::request::Parts;
 
 /// Parts of a bare GET request with no headers.
 ///
 /// # Panics
 ///
 /// Panics if the request cannot be built.
+#[must_use]
 pub fn empty_parts() -> Parts {
     Request::builder().body(()).unwrap().into_parts().0
 }
@@ -17,6 +21,7 @@ pub fn empty_parts() -> Parts {
 /// # Panics
 ///
 /// Panics if `uri` is not a valid URI.
+#[must_use]
 pub fn parts_with_uri(uri: &str) -> Parts {
     Request::builder().uri(uri).body(()).unwrap().into_parts().0
 }
@@ -36,6 +41,7 @@ pub fn parts_with_authorization(value: &str) -> Parts {
 }
 
 /// Parts carrying `Authorization: Basic base64(username:password)`.
+#[must_use]
 pub fn parts_with_basic_auth(username: &str, password: &str) -> Parts {
     let credentials = BASE64_STANDARD.encode(format!("{username}:{password}"));
     parts_with_authorization(&format!("Basic {credentials}"))

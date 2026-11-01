@@ -6,28 +6,24 @@
 //! put-settle-verify claims where the backend cannot enforce it), and each
 //! crash window re-runs work instead of losing it.
 
-use std::{
-    collections::HashSet,
-    fmt,
-    sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicU32, Ordering},
-    },
-    time::Duration,
-};
+use std::collections::HashSet;
+use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::TryStreamExt;
-use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use serde::de::{DeserializeOwned, Error as DeError};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use tokio::{
-    select, spawn,
-    task::JoinHandle,
-    time::{Interval, MissedTickBehavior, interval, sleep},
-};
+use tokio::task::JoinHandle;
+use tokio::time::{Interval, MissedTickBehavior, interval, sleep};
+use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -35,11 +31,10 @@ use uuid::Uuid;
 use angos_backoff::{Backoff, jitter_below};
 use angos_storage::{Error as StorageError, ObjectStore, Page};
 
-use crate::{
-    jobs::{JobState, Queue},
-    metrics_provider::metrics_provider,
-    registry::{Error as RegistryError, metadata_store::MetadataStore},
-};
+use crate::jobs::{JobState, Queue};
+use crate::metrics_provider::metrics_provider;
+use crate::registry::Error as RegistryError;
+use crate::registry::metadata_store::MetadataStore;
 
 pub const JOBS_ROOT: &str = "_jobs";
 
@@ -60,16 +55,24 @@ pub fn job_failed_path(queue: &str, id: &str) -> String {
 }
 
 /// Path to the `lock_key` to `storage_key` dedup index file, read for an O(1)
-/// lookup instead of scanning every pending body.
+/// lookup instead of scanning every pending body. Index and claim files are
+/// named by the key's hex SHA-256, so a key built from the longest namespace
+/// and tag still fits one file name.
 pub fn job_lock_key_index_path(queue: &str, lock_key: &LockKey) -> String {
-    format!("{JOBS_ROOT}/index/{queue}/{}.json", lock_key.file_name())
+    format!(
+        "{JOBS_ROOT}/index/{queue}/{}.json",
+        hex::encode(Sha256::digest(lock_key.as_str()))
+    )
 }
 
 /// Path of the claim key serialising execution of one `lock_key` across
 /// workers: created with `create_if_absent`, leased, refreshed by the holder,
 /// and deleted on release; a lapsed lease is taken over by deletion.
 fn job_claim_path(lock_key: &LockKey) -> String {
-    format!("{JOBS_ROOT}/claims/{}.json", lock_key.file_name())
+    format!(
+        "{JOBS_ROOT}/claims/{}.json",
+        hex::encode(Sha256::digest(lock_key.as_str()))
+    )
 }
 
 /// A job's per-key serialization token: at most one worker executes a given
@@ -82,18 +85,8 @@ impl LockKey {
     /// # Errors
     ///
     /// Returns [`Error::InvalidLockKey`] when `key` is empty.
-    pub fn new(key: impl Into<String>) -> Result<Self, Error> {
-        let key = key.into();
-        if key.is_empty() {
-            return Err(Error::InvalidLockKey("lock key is empty".to_string()));
-        }
-        Ok(Self(key))
-    }
-
-    /// The name of the key's index and claim files: its hex SHA-256, so a key
-    /// built from the longest namespace and tag still fits one file name.
-    fn file_name(&self) -> String {
-        hex::encode(Sha256::digest(self.0.as_bytes()))
+    pub fn try_new(key: &str) -> Result<Self, Error> {
+        Self::try_from(key.to_owned())
     }
 
     #[must_use]
@@ -106,12 +99,15 @@ impl TryFrom<String> for LockKey {
     type Error = Error;
 
     fn try_from(key: String) -> Result<Self, Error> {
-        Self::new(key)
+        if key.is_empty() {
+            return Err(Error::InvalidLockKey("lock key is empty".to_string()));
+        }
+        Ok(Self(key))
     }
 }
 
 impl Serialize for LockKey {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
     }
 }
@@ -297,7 +293,7 @@ const MIN_PENDING_REFRESH_INTERVAL_SECS: u64 = 5;
 fn at_least<'de, D: Deserializer<'de>, const MIN: u64>(deserializer: D) -> Result<u64, D::Error> {
     let value = u64::deserialize(deserializer)?;
     if value < MIN {
-        return Err(serde::de::Error::custom(format!("must be at least {MIN}")));
+        return Err(DeError::custom(format!("must be at least {MIN}")));
     }
     Ok(value)
 }
@@ -330,7 +326,7 @@ pub struct JobEnvelope {
     /// configured one so a caller can pin its own, zero included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_attempts: Option<u32>,
-    pub payload: serde_json::Value,
+    pub payload: Value,
 }
 
 impl JobEnvelope {
@@ -342,15 +338,15 @@ impl JobEnvelope {
     /// serialized.
     pub fn new<P: Serialize>(
         queue: Queue,
-        kind: impl Into<String>,
-        lock_key: impl Into<String>,
+        kind: &str,
+        lock_key: &str,
         payload: &P,
     ) -> Result<Self, Error> {
         Ok(Self {
             id: Uuid::new_v4().to_string(),
             queue,
-            kind: kind.into(),
-            lock_key: LockKey::new(lock_key)?,
+            kind: kind.to_owned(),
+            lock_key: LockKey::try_new(lock_key)?,
             created_at: Utc::now(),
             attempts: 0,
             max_attempts: None,
@@ -515,14 +511,6 @@ pub struct JobClaim {
     _reservation: Reservation,
 }
 
-impl JobClaim {
-    /// Whether the lease lapsed or another worker took the key over, in which
-    /// case the holder must stop touching queue state it no longer owns.
-    fn lost(&self) -> bool {
-        self.lost.is_cancelled()
-    }
-}
-
 impl Drop for JobClaim {
     fn drop(&mut self) {
         if let Some(refresher) = self.refresher.take() {
@@ -633,11 +621,7 @@ impl JobStore {
     /// queue always shares, with the default retry policy. `worker_id` is a
     /// structured-log tag (empty for producer-only instances) and `claim_mode`
     /// comes from [`ensure_claim_support`].
-    pub fn new(
-        metadata_store: &MetadataStore,
-        worker_id: impl Into<String>,
-        claim_mode: ClaimMode,
-    ) -> Self {
+    pub fn new(metadata_store: &MetadataStore, worker_id: &str, claim_mode: ClaimMode) -> Self {
         Self::with_retry_policy(
             metadata_store,
             worker_id,
@@ -649,7 +633,7 @@ impl JobStore {
     /// [`Self::new`] with an operator-configured retry policy.
     pub fn with_retry_policy(
         metadata_store: &MetadataStore,
-        worker_id: impl Into<String>,
+        worker_id: &str,
         claim_mode: ClaimMode,
         retry: JobRetryPolicy,
     ) -> Self {
@@ -661,7 +645,7 @@ impl JobStore {
         };
         Self {
             store: metadata_store.object_store().clone(),
-            worker_id: worker_id.into(),
+            worker_id: worker_id.to_owned(),
             claim_mode,
             retry_backoff: backoff(),
             claim_error_backoff: backoff(),
@@ -750,11 +734,7 @@ impl JobStore {
             .collect();
         // The backend's `next_token` says whether more entries exist, but the
         // cursor we hand back is our own last storage key.
-        let next_token = page
-            .next_token
-            .is_some()
-            .then(|| keys.last().cloned())
-            .flatten();
+        let next_token = page.next_token.and(keys.last().cloned());
         Ok(Page {
             items: keys,
             next_token,
@@ -1042,7 +1022,7 @@ impl JobStore {
         if let Some(refresher) = claim.refresher.take() {
             refresher.abort();
         }
-        if claim.lost() {
+        if claim.lost.is_cancelled() {
             return;
         }
         match self.store.get(&claim.key).await {
@@ -1237,7 +1217,7 @@ impl JobStore {
             storage_key,
             claim,
         } = claimed;
-        if claim.lost() {
+        if claim.lost.is_cancelled() {
             warn!(
                 lock_key = envelope.lock_key.as_str(),
                 "job queue: claim lapsed during execution; leaving cleanup to the new holder"
@@ -1307,7 +1287,7 @@ impl JobStore {
         next_at: DateTime<Utc>,
     ) -> Result<FailOutcome, Error> {
         // A lost claim must not touch queue state the key's new holder now owns.
-        if claim.lost() {
+        if claim.lost.is_cancelled() {
             warn!(
                 lock_key = updated.lock_key.as_str(),
                 "job queue: claim lapsed during execution; leaving the retry to the new holder"
@@ -1357,7 +1337,7 @@ impl JobStore {
             claim,
         } = claimed;
         // A lost claim must not touch queue state the key's new holder now owns.
-        if claim.lost() {
+        if claim.lost.is_cancelled() {
             warn!(
                 lock_key = envelope.lock_key.as_str(),
                 "job queue: claim lapsed during execution; leaving the dead-letter to the new holder"
@@ -1590,8 +1570,8 @@ pub async fn queue_depth_refresh_loop(
             period = current.period;
             timer = refresh_timer(period).await;
         }
-        let (store, ready_horizon_secs) = (&current.store, current.ready_horizon_secs);
-        match store.count_pending(queue, ready_horizon_secs).await {
+        let store = &current.store;
+        match store.count_pending(queue, current.ready_horizon_secs).await {
             Ok(count) => {
                 metrics_provider()
                     .job_queue_pending

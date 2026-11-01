@@ -28,6 +28,9 @@ pub const ORPHAN_PENDING_JOB_KEY: &str =
     "_jobs/pending/replication/0000000000000002-gate-orphan.json";
 pub const ORPHAN_FAILED_JOB_KEY: &str = "_jobs/failed/cache/0000000000000002-gate-orphan.json";
 
+/// Bytes of the orphan blob, seeded at its canonical path with no references.
+const ORPHAN_CONTENT: &[u8] = b"orphan-blob-bytes";
+
 /// Upload container of the seeded orphan multipart (s3 only): a real
 /// in-flight multipart with no session marker.
 pub const ORPHAN_MULTIPART_KEY: &str =
@@ -240,7 +243,6 @@ impl Probes {
 /// Push the two gate images and the decoy upload through the API, then
 /// damage the store directly: one defect per failure class the walk claims
 /// to handle. Returns the probes every later assertion derives from.
-#[allow(clippy::too_many_lines)]
 pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateResult<Probes> {
     let gate = registry
         .push_image(GATE_NS, GATE_TAG, b"scrub-gate-layer")
@@ -280,14 +282,13 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
         }
     }
 
-    let orphan_content = "orphan-blob-bytes";
     let probes = Probes {
-        gate_layer_digest: gate.layer_digest,
-        gate_config_digest: gate.config_digest,
-        gate_manifest_digest: gate.manifest_digest,
-        gate2_layer_digest: gate2.layer_digest,
-        gate2_manifest_digest: gate2.manifest_digest,
-        orphan_digest: sha256_hex(orphan_content.as_bytes()),
+        gate_layer_digest: gate.layer,
+        gate_config_digest: gate.config,
+        gate_manifest_digest: gate.manifest,
+        gate2_layer_digest: gate2.layer,
+        gate2_manifest_digest: gate2.manifest,
+        orphan_digest: sha256_hex(ORPHAN_CONTENT),
         missing_digest: sha256_hex(b"never-uploaded-content"),
         decoy_upload_path,
         grant_only_digest,
@@ -299,19 +300,26 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
         probes.decoy_upload_path
     );
 
+    damage_store(store, &probes).await?;
+    Ok(probes)
+}
+
+/// Damage the store directly: one defect per failure class the walk claims
+/// to handle.
+async fn damage_store(store: &GateStore, probes: &Probes) -> GateResult<()> {
     // Repair defects: deleted derivable links (layer, config, revision).
     for link in probes.recreated_links() {
         store.delete(&link).await?;
     }
 
     // A tag entry whose target blob does not exist.
-    store.put(&probes.dangling_tag_entry(), "{}").await?;
+    store.put(&probes.dangling_tag_entry(), b"{}").await?;
 
     // An upload directory whose namespace name fails validation.
     store
         .put(
             "v2/repositories/UPPER-UP/_uploads/00000000-0000-4000-8000-000000000000/data",
-            "zombie",
+            b"zombie",
         )
         .await?;
 
@@ -323,13 +331,13 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
                 &probes.orphan_digest[..2],
                 probes.orphan_digest
             ),
-            orphan_content,
+            ORPHAN_CONTENT,
         )
         .await?;
 
     // Orphan referrer: a record whose referrer manifest is not a current
     // revision.
-    store.put(&probes.orphan_referrer_record(), "{}").await?;
+    store.put(&probes.orphan_referrer_record(), b"{}").await?;
 
     // Corrupt-content defects, deleted outright by the walk.
     let corrupt: [(String, &str); 3] = [
@@ -347,12 +355,12 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
         ),
     ];
     for (key, body) in corrupt {
-        store.put(&key, body).await?;
+        store.put(&key, body.as_bytes()).await?;
     }
 
     // Alien keys, quarantined with bytes preserved.
     for alien in probes.aliens() {
-        store.put(&alien.key, alien.body).await?;
+        store.put(&alien.key, alien.body.as_bytes()).await?;
     }
 
     // Config-orphan jobs: structurally valid records whose targets left the
@@ -374,7 +382,7 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
         },
     });
     store
-        .put(ORPHAN_PENDING_JOB_KEY, serde_json::to_vec(&pending)?)
+        .put(ORPHAN_PENDING_JOB_KEY, &serde_json::to_vec(&pending)?)
         .await?;
     let failed = json!({
         "id": "gate-orphan-failed",
@@ -392,12 +400,12 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
         "failed_at": Utc::now(),
     });
     store
-        .put(ORPHAN_FAILED_JOB_KEY, serde_json::to_vec(&failed)?)
+        .put(ORPHAN_FAILED_JOB_KEY, &serde_json::to_vec(&failed)?)
         .await?;
 
-    let seeded = if multipart_seeded { 27 } else { 26 };
+    let seeded = if probes.multipart_seeded { 27 } else { 26 };
     println!("seeded {seeded} defects across 4 classes plus 2 decoys");
-    Ok(probes)
+    Ok(())
 }
 
 /// Canonical `data` key of a blob digest.

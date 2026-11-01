@@ -8,16 +8,15 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, TryStreamExt, future::ready};
+use futures_util::future::ready;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
 use angos_oci::Namespace;
 
-use crate::registry::{
-    Error,
-    keys::{NamespaceKeys, atime_entry_name, parse_atime_entry},
-    metadata_store::{LinkKind, MetadataStore},
-};
+use crate::registry::Error;
+use crate::registry::keys::{NamespaceExt, atime_entry_name, parse_atime_entry};
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
 
 /// The stored body of one access entry: who pulled, from where, and when.
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,20 +198,9 @@ mod tests {
     use angos_oci::{Digest, Namespace, Tag};
 
     use super::*;
-    use crate::registry::{
-        keys::NamespaceKeys,
-        metadata_store::{AccessEntry, LinkKind, MetadataStore},
-        test_utils::{FSRegistryTestCase, RegistryTestCase, seed_links},
-    };
-
-    /// A namespace and a pull-tracked link, for the name-grammar assertions.
-    fn namespace() -> Namespace {
-        Namespace::new("atime-grammar").unwrap()
-    }
-
-    fn tag_link() -> LinkKind {
-        LinkKind::Tag(Tag::new("v1").unwrap())
-    }
+    use crate::registry::keys::NamespaceExt;
+    use crate::registry::metadata_store::{AccessEntry, LinkKind, MetadataStore};
+    use crate::registry::test_utils::{FSRegistryTestCase, RegistryTestCase, seed_links};
 
     #[test]
     fn entry_names_round_trip_and_sort_newest_first() {
@@ -220,8 +208,9 @@ mod tests {
         let newer = DateTime::from_timestamp_millis(2_000_000).unwrap();
 
         let entry_name = |at, client| {
-            namespace()
-                .atime_entry_path(&tag_link(), at, client)
+            Namespace::new("atime-grammar")
+                .unwrap()
+                .atime_entry_path(&LinkKind::Tag(Tag::new("v1").unwrap()), at, client)
                 .unwrap()
                 .rsplit_once('/')
                 .unwrap()
@@ -242,10 +231,11 @@ mod tests {
     #[test]
     fn same_millisecond_stamps_from_distinct_clients_do_not_collide() {
         let at = DateTime::from_timestamp_millis(1_000_000).unwrap();
-        let namespace = namespace();
+        let namespace = Namespace::new("atime-grammar").unwrap();
+        let link = LinkKind::Tag(Tag::new("v1").unwrap());
         assert_ne!(
-            namespace.atime_entry_path(&tag_link(), at, "alice"),
-            namespace.atime_entry_path(&tag_link(), at, "bob")
+            namespace.atime_entry_path(&link, at, "alice"),
+            namespace.atime_entry_path(&link, at, "bob")
         );
     }
 

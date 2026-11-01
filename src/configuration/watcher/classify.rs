@@ -1,7 +1,5 @@
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use notify::{Event, EventKind};
 

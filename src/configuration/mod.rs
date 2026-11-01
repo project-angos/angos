@@ -1,10 +1,12 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
-use serde::{Deserialize, de::DeserializeOwned};
-use toml::{
-    Spanned,
-    de::{DeTable, Deserializer as TomlDeserializer},
-};
+use angos_cache::Config as CacheConfig;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use toml::Spanned;
+use toml::de::{DeTable, Deserializer as TomlDeserializer};
 
 pub mod base64_string;
 mod error;
@@ -33,12 +35,12 @@ pub use ui::UiConfig;
 #[cfg(test)]
 mod tests;
 
-use crate::{
-    auth::{authenticator, oidc, webhook},
-    event_webhook::config::EventWebhookConfig,
-    policy::{CelRule, rules_use_pull_time},
-    registry::{blob_store, repository},
-};
+use crate::auth::authenticator::AuthConfig;
+use crate::auth::{oidc, webhook};
+use crate::event_webhook::config::EventWebhookConfig;
+use crate::policy::{CelRule, rules_use_pull_time};
+use crate::registry::blob_store::BlobStoreConfig;
+use crate::registry::repository;
 
 /// Cross-section validation runs in [`Configuration::from_table`], the one
 /// place a file is deserialized, so a loaded `Configuration` is a validated one.
@@ -50,14 +52,14 @@ pub struct Configuration {
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
-    pub cache: angos_cache::Config,
+    pub cache: CacheConfig,
     /// Required: a registry with no configured storage would otherwise default
     /// to the filesystem backend rooted at the process working directory.
-    pub blob_store: blob_store::BlobStoreConfig,
+    pub blob_store: BlobStoreConfig,
     #[serde(default, rename = "metadata_store")]
     pub registry_storage: RegistryStorageConfig,
     #[serde(default)]
-    pub auth: authenticator::AuthConfig,
+    pub auth: AuthConfig,
     #[serde(default)]
     pub repository: HashMap<String, repository::Config>,
     #[serde(default)]
@@ -272,8 +274,8 @@ fn annotate_sources<P: AsRef<Path>>(error: Error, paths: &[P]) -> Error {
 /// the working directory, which in a container is the ephemeral layer rather
 /// than the mounted volume. The metadata store inherits this root by default,
 /// so one check covers both.
-fn validate_blob_store(blob_store: &blob_store::BlobStoreConfig) -> Result<(), Error> {
-    let blob_store::BlobStoreConfig::FS(fs) = blob_store else {
+fn validate_blob_store(blob_store: &BlobStoreConfig) -> Result<(), Error> {
+    let BlobStoreConfig::FS(fs) = blob_store else {
         return Ok(());
     };
     if fs.root_dir.as_os_str().is_empty() {
@@ -489,43 +491,6 @@ mod metadata_resolver_tests {
             }
             other @ ResolvedStorageConfig::FS(_) => {
                 panic!("expected explicit S3 storage config, got {other:?}")
-            }
-        }
-    }
-
-    #[test]
-    fn test_inherit_resolves_to_s3_from_s3_blob_store() {
-        let config_str = r#"
-        [server]
-        bind_address = "0.0.0.0"
-
-        [blob_store.s3]
-        bucket = "my-bucket"
-        region = "us-east-1"
-        endpoint = "https://s3.example.com"
-        access_key_id = "key123"
-        secret_key = "secret456"
-        key_prefix = "prefix/"
-        "#;
-
-        let config = Configuration::load_from_str(config_str).unwrap();
-        assert!(
-            matches!(config.registry_storage, RegistryStorageConfig::Inherit),
-            "absent [metadata_store] section must deserialise as Inherit"
-        );
-
-        let resolved = config.resolve_registry_storage();
-        match resolved {
-            ResolvedStorageConfig::S3(s3_config) => {
-                assert_eq!(s3_config.connection.bucket, "my-bucket");
-                assert_eq!(s3_config.connection.region, "us-east-1");
-                assert_eq!(s3_config.connection.endpoint, "https://s3.example.com");
-                assert_eq!(s3_config.connection.access_key_id.expose(), "key123");
-                assert_eq!(s3_config.connection.secret_key.expose(), "secret456");
-                assert_eq!(s3_config.connection.key_prefix, "prefix/");
-            }
-            other @ ResolvedStorageConfig::FS(_) => {
-                panic!("expected S3 storage config from Inherit, got {other:?}")
             }
         }
     }

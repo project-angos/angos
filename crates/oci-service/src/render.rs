@@ -9,14 +9,12 @@ use serde::Serialize;
 use tokio::io::AsyncRead;
 
 use angos_oci::server;
-use angos_transport::{ResponseBody, build_response};
+use angos_transport::{RenderError, ResponseBody, build_response};
 
 use crate::{
     Accepted, ApiVersion, BlobDescriptor, BlobGet, BlobStream, BlobWritten, ManifestDescriptor,
     ManifestGet, ManifestWritten, NoContent, Referrers, StartUpload, Tags, UploadSession,
 };
-
-use angos_transport::RenderError;
 
 type Rendered = Result<Response<ResponseBody>, RenderError>;
 

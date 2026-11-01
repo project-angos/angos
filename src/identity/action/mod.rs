@@ -2,6 +2,7 @@ use std::num::NonZeroU16;
 
 use serde::Serialize;
 
+use angos_extension_service::JobKey;
 use angos_oci::request::ManifestPutTarget;
 use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, UploadSessionId};
 
@@ -235,7 +236,7 @@ pub enum Action {
     RetryJob {
         queue: Queue,
         #[serde(skip)]
-        storage_key: String,
+        storage_key: JobKey,
     },
     #[serde(rename = "delete-job")]
     DeleteJob {
@@ -243,24 +244,15 @@ pub enum Action {
         #[serde(skip)]
         state: JobState,
         #[serde(skip)]
-        storage_key: String,
+        storage_key: JobKey,
     },
 }
 
+#[derive(Default)]
 struct ActionData<'a> {
     namespace: Option<&'a Namespace>,
     digest: Option<&'a Digest>,
     is_push: bool,
-}
-
-impl ActionData<'_> {
-    const fn none() -> Self {
-        Self {
-            namespace: None,
-            digest: None,
-            is_push: false,
-        }
-    }
 }
 
 impl Action {
@@ -303,7 +295,6 @@ impl Action {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn action_data(&self) -> ActionData<'_> {
         match self {
             Action::UiAsset { .. }
@@ -317,13 +308,13 @@ impl Action {
             | Action::ListRepositories
             | Action::ListNamespaces { .. }
             | Action::ListJobs { .. }
-            | Action::ListFailedJobs { .. } => ActionData::none(),
+            | Action::ListFailedJobs { .. } => ActionData::default(),
 
             // Job mutations carry no namespace/digest, but flag `is_push` so they
             // are treated as state-changing for any write-sensitive policy logic.
             Action::RetryJob { .. } | Action::DeleteJob { .. } => ActionData {
                 is_push: true,
-                ..ActionData::none()
+                ..ActionData::default()
             },
 
             Action::ListTags { namespace, .. }
@@ -335,14 +326,14 @@ impl Action {
             | Action::HeadManifest { namespace, .. }
             | Action::DeleteManifest { namespace, .. } => ActionData {
                 namespace: Some(namespace),
-                ..ActionData::none()
+                ..ActionData::default()
             },
 
             Action::PatchUpload { namespace, .. } | Action::DeleteUpload { namespace, .. } => {
                 ActionData {
                     namespace: Some(namespace),
                     is_push: true,
-                    ..ActionData::none()
+                    ..ActionData::default()
                 }
             }
 
@@ -380,26 +371,26 @@ impl Action {
             } => ActionData {
                 namespace: Some(namespace),
                 digest: Some(digest),
-                ..ActionData::none()
+                ..ActionData::default()
             },
 
             Action::PutManifest { namespace, .. } => ActionData {
                 namespace: Some(namespace),
                 is_push: true,
-                ..ActionData::none()
+                ..ActionData::default()
             },
         }
     }
 
-    pub fn get_namespace(&self) -> Option<&Namespace> {
+    pub fn namespace(&self) -> Option<&Namespace> {
         self.action_data().namespace
     }
 
-    pub fn get_digest(&self) -> Option<&Digest> {
+    pub fn digest(&self) -> Option<&Digest> {
         self.action_data().digest
     }
 
-    pub fn get_reference(&self) -> Option<Reference> {
+    pub fn reference(&self) -> Option<Reference> {
         match self {
             Action::GetManifest { reference, .. }
             | Action::HeadManifest { reference, .. }

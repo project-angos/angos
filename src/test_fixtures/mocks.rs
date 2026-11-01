@@ -2,10 +2,8 @@
 //! the OIDC JWKS endpoint and the downstream registry blob API.
 
 use serde_json::{Value, json};
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use angos_oci::Digest;
 use angos_oci::header::DOCKER_CONTENT_DIGEST;
@@ -13,6 +11,7 @@ use angos_oci::header::DOCKER_CONTENT_DIGEST;
 use crate::test_fixtures::oidc::{KID, jwk_x, jwk_y};
 
 /// The JWKS document advertising the `test_fixtures::oidc` primary key.
+#[must_use]
 pub fn static_jwks_response() -> Value {
     json!({
         "keys": [{

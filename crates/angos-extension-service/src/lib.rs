@@ -11,7 +11,8 @@
 //! interface's own vocabulary; these convert into the job engine's copies at
 //! the boundary.
 
-use std::{collections::HashMap, num::NonZeroU16};
+use std::collections::HashMap;
+use std::num::NonZeroU16;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,7 @@ pub use endpoint::{Endpoint, parse};
 #[cfg(feature = "hyper")]
 mod render;
 
-// ---- Repository / namespace listings --------------------------------------
+// Repository / namespace listings
 
 /// The direction a listing is sorted in, `?order=`.
 #[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +110,7 @@ pub struct ListNamespacesRequest {
     pub page: PageRequest,
 }
 
-// ---- Manifest (revision) listing ------------------------------------------
+// Manifest (revision) listing
 
 #[derive(Serialize, Debug, Clone)]
 pub struct ParentRef {
@@ -180,7 +181,7 @@ pub enum RevisionSelection {
     Digest(Digest),
 }
 
-// ---- Uploads / pull history -----------------------------------------------
+// Uploads / pull history
 
 #[derive(Serialize, Debug)]
 pub struct UploadEntry {
@@ -233,7 +234,7 @@ pub struct ListPullsRequest {
     pub page: PageRequest,
 }
 
-// ---- Layer filesystem index -----------------------------------------------
+// Layer filesystem index
 
 /// A tar entry's kind in a layer listing.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,7 +432,7 @@ pub struct LayerFile<R> {
     pub reader: R,
 }
 
-// ---- Durable-job administration -------------------------------------------
+// Durable-job administration
 
 /// The queue a job belongs to, the job-administration interface's own copy of
 /// the engine's queue set.
@@ -452,6 +453,29 @@ pub enum JobState {
     Failed,
 }
 
+/// The storage key a job mutation addresses: one path-free token, so it is
+/// never empty and never holds a `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobKey(String);
+
+impl JobKey {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for JobKey {
+    type Error = String;
+
+    fn try_from(key: String) -> Result<Self, Self::Error> {
+        if key.is_empty() || key.contains('/') {
+            return Err(format!("invalid job key: '{key}'"));
+        }
+        Ok(Self(key))
+    }
+}
+
 #[derive(Debug)]
 pub struct ListJobsRequest {
     pub queue: Queue,
@@ -462,14 +486,14 @@ pub struct ListJobsRequest {
 #[derive(Debug)]
 pub struct RetryJobRequest {
     pub queue: Queue,
-    pub storage_key: String,
+    pub storage_key: JobKey,
 }
 
 #[derive(Debug)]
 pub struct DeleteJobRequest {
     pub queue: Queue,
     pub state: JobState,
-    pub storage_key: String,
+    pub storage_key: JobKey,
 }
 
 #[derive(Serialize, Debug)]

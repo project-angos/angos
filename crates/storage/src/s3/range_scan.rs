@@ -31,7 +31,9 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use angos_s3_client::Backend as S3Backend;
 
-use crate::{Children, KeyStream, error::Error, pagination::paginated};
+use crate::error::Error;
+use crate::pagination::paginated;
+use crate::{Children, ChildrenPage, KeyStream, Page};
 
 /// One S3 list page per range scan.
 const RANGE_PAGE_SIZE: u16 = 1000;
@@ -48,7 +50,11 @@ pub async fn scan_all_children(
     concurrency: usize,
 ) -> Result<Children, Error> {
     // Probe: a single page settles any listing that fits in one.
-    let (sub_prefixes, objects, next_token) = children_page(client, prefix, None, None).await?;
+    let ChildrenPage {
+        sub_prefixes,
+        objects,
+        next_token,
+    } = children_page(client, prefix, None, None).await?;
     if next_token.is_none() {
         return Ok(Children {
             sub_prefixes,
@@ -76,8 +82,8 @@ async fn children_page(
     prefix: &str,
     token: Option<String>,
     after: Option<&str>,
-) -> Result<(Vec<String>, Vec<String>, Option<String>), Error> {
-    Ok(client
+) -> Result<ChildrenPage, Error> {
+    let listing = client
         .list_prefixes(
             prefix,
             "/",
@@ -85,7 +91,12 @@ async fn children_page(
             token,
             after.map(str::to_string),
         )
-        .await?)
+        .await?;
+    Ok(ChildrenPage {
+        sub_prefixes: listing.prefixes,
+        objects: listing.objects,
+        next_token: listing.next_token,
+    })
 }
 
 /// Drain the child-name range `[lo, hi)` serially: page from `lo`, keep in-range
@@ -96,18 +107,21 @@ async fn scan_children_range(
     lo: Option<&str>,
     hi: Option<&str>,
 ) -> Result<Children, Error> {
-    let (mut sub_prefixes, mut objects, mut next) = children_page(client, prefix, None, lo).await?;
+    let ChildrenPage {
+        mut sub_prefixes,
+        mut objects,
+        next_token: mut next,
+    } = children_page(client, prefix, None, lo).await?;
     let mut stop = retain_range(&mut sub_prefixes, &mut objects, lo, hi);
     while let Some(token) = next {
         if stop {
             break;
         }
-        let (mut page_prefixes, mut page_objects, page_next) =
-            children_page(client, prefix, Some(token), None).await?;
-        stop = retain_range(&mut page_prefixes, &mut page_objects, lo, hi);
-        sub_prefixes.append(&mut page_prefixes);
-        objects.append(&mut page_objects);
-        next = page_next;
+        let mut page = children_page(client, prefix, Some(token), None).await?;
+        stop = retain_range(&mut page.sub_prefixes, &mut page.objects, lo, hi);
+        sub_prefixes.append(&mut page.sub_prefixes);
+        objects.append(&mut page.objects);
+        next = page.next_token;
     }
     Ok(Children {
         sub_prefixes,
@@ -126,9 +140,13 @@ async fn scan_children_range_split(
     hi: Option<&str>,
     concurrency: usize,
 ) -> Result<Children, Error> {
-    let (mut sub_prefixes, mut objects, next) = children_page(client, prefix, None, lo).await?;
+    let ChildrenPage {
+        mut sub_prefixes,
+        mut objects,
+        next_token,
+    } = children_page(client, prefix, None, lo).await?;
     let stop = retain_range(&mut sub_prefixes, &mut objects, lo, hi);
-    if next.is_none() || stop {
+    if next_token.is_none() || stop {
         return Ok(Children {
             sub_prefixes,
             objects,
@@ -205,9 +223,9 @@ pub fn scan_all_keys<'a>(
     Box::pin(
         stream::once(async move {
             // Probe: a single page settles any listing that fits in one.
-            let (keys, next) = key_page(client, prefix, None, None).await?;
-            if next.is_none() {
-                let settled: KeyStream<'a> = Box::pin(stream::iter(keys.into_iter().map(Ok)));
+            let page = key_page(client, prefix, None, None).await?;
+            if page.next_token.is_none() {
+                let settled: KeyStream<'a> = Box::pin(stream::iter(page.items.into_iter().map(Ok)));
                 return Ok::<KeyStream<'a>, Error>(settled);
             }
             let ranges = partition_ranges(None, split_bounds(""), None);
@@ -227,10 +245,14 @@ async fn key_page(
     prefix: &str,
     token: Option<String>,
     after: Option<&str>,
-) -> Result<(Vec<String>, Option<String>), Error> {
-    Ok(client
+) -> Result<Page<String>, Error> {
+    let listing = client
         .list_objects(prefix, RANGE_PAGE_SIZE, token, after.map(str::to_string))
-        .await?)
+        .await?;
+    Ok(Page {
+        items: listing.keys,
+        next_token: listing.next_token,
+    })
 }
 
 /// Stream the key range `(lo, hi]`: page from just after `lo`, then stop at the

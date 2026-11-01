@@ -10,19 +10,16 @@ use tracing::warn;
 
 use angos_oci::{Digest, Namespace};
 
-use crate::{
-    event_webhook::{
-        dispatcher::EventDispatcher,
-        event::{Event, EventActor},
-    },
-    jobs::Queue,
-    jobs::store::{Error, JobEnvelope, JobHandler},
-    registry::{
-        Error as RegistryError, blob::cache_blob, blob_ownership, blob_ownership::GrantOutcome,
-        blob_store::BlobStore, metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-};
+use crate::event_webhook::dispatcher::EventDispatcher;
+use crate::event_webhook::event::{Event, EventActor};
+use crate::jobs::Queue;
+use crate::jobs::store::{Error, JobEnvelope, JobHandler};
+use crate::registry::Error as RegistryError;
+use crate::registry::blob::cache_blob;
+use crate::registry::blob_ownership::{self, GrantOutcome};
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::MetadataStore;
+use crate::registry::repository_resolver::RepositoryResolver;
 
 pub const CACHE_FETCH_BLOB_KIND: &str = "cache.fetch_blob";
 
@@ -51,7 +48,7 @@ pub fn build_envelope(namespace: &Namespace, digest: &Digest) -> Result<JobEnvel
     JobEnvelope::new(
         Queue::Cache,
         CACHE_FETCH_BLOB_KIND,
-        format!("{}.{namespace}:{digest}", Queue::Cache),
+        &format!("{}.{namespace}:{digest}", Queue::Cache),
         &payload,
     )
 }

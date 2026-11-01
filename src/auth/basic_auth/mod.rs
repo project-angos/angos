@@ -1,28 +1,24 @@
 #[cfg(test)]
 mod tests;
 
-use std::{
-    collections::HashMap,
-    fmt,
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
+use std::fmt;
+use std::time::{Duration, Instant};
 
-use argon2::{Argon2, PasswordVerifier};
+use argon2::{Argon2, PasswordHash as Argon2PasswordHash, PasswordVerifier};
 use async_trait::async_trait;
 use http::request::Parts;
-use serde::{Deserialize, de};
+use serde::{Deserialize, Deserializer, de};
 use tokio::time::sleep;
 use tracing::{debug, instrument};
 
-use super::{AuthMiddleware, AuthResult};
-use crate::{
-    auth::{Error, authorization::basic_credentials},
-    identity::ClientIdentity,
-};
+use crate::auth::authorization::basic_credentials;
+use crate::auth::{AuthMiddleware, AuthResult, Error};
+use crate::identity::ClientIdentity;
 
 /// An Argon2 password hash string, validated at deserialize time.
 #[derive(Clone)]
-pub struct PasswordHash(argon2::PasswordHash);
+pub struct PasswordHash(Argon2PasswordHash);
 
 impl fmt::Debug for PasswordHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -31,15 +27,15 @@ impl fmt::Debug for PasswordHash {
 }
 
 impl PasswordHash {
-    pub fn as_password_hash(&self) -> &argon2::PasswordHash {
+    pub fn as_password_hash(&self) -> &Argon2PasswordHash {
         &self.0
     }
 }
 
 impl<'de> Deserialize<'de> for PasswordHash {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let source = String::deserialize(deserializer)?;
-        argon2::PasswordHash::new(&source)
+        Argon2PasswordHash::new(&source)
             .map(Self)
             .map_err(|e| de::Error::custom(format!("invalid Argon2 password hash: {e}")))
     }
@@ -51,8 +47,14 @@ pub struct Config {
     pub password: PasswordHash,
 }
 
+/// A configured identity, keyed by its username.
+struct User {
+    id: String,
+    password: PasswordHash,
+}
+
 pub struct BasicAuthValidator {
-    users: HashMap<String, (String, PasswordHash)>,
+    users: HashMap<String, User>,
     /// Hash verified on the unknown-username path so a miss costs the same
     /// Argon2 work as a hit and response timing cannot enumerate usernames.
     timing_guard: PasswordHash,
@@ -78,15 +80,16 @@ const REJECTION_FLOOR: Duration = Duration::from_millis(20);
 /// otherwise collapse into whichever the map iterates last, making the
 /// winning identity id (used by CEL rules and webhooks) change across
 /// restarts.
-fn build_users(
-    identities: &HashMap<String, Config>,
-) -> Result<HashMap<String, (String, PasswordHash)>, Error> {
+fn build_users(identities: &HashMap<String, Config>) -> Result<HashMap<String, User>, Error> {
     let mut users = HashMap::with_capacity(identities.len());
     for (id, config) in identities {
         if users
             .insert(
                 config.username.clone(),
-                (id.clone(), config.password.clone()),
+                User {
+                    id: id.clone(),
+                    password: config.password.clone(),
+                },
             )
             .is_some()
         {
@@ -109,7 +112,7 @@ impl BasicAuthValidator {
         // parameters would leave a gap the guard exists to close.
         let timing_guard = match identities.values().next() {
             Some(config) => config.password.clone(),
-            None => argon2::PasswordHash::new(TIMING_GUARD_HASH)
+            None => Argon2PasswordHash::new(TIMING_GUARD_HASH)
                 .map(PasswordHash)
                 .map_err(|e| Error::Initialization(format!("invalid timing-guard hash: {e}")))?,
         };
@@ -119,9 +122,10 @@ impl BasicAuthValidator {
         })
     }
 
+    #[must_use]
     #[instrument(skip(self, password))]
     pub fn validate_credentials(&self, username: &str, password: &str) -> Option<String> {
-        let Some((identity_id, identity_password)) = self.users.get(username) else {
+        let Some(user) = self.users.get(username) else {
             // Burn the same Argon2 work as a real verification so response
             // timing cannot reveal whether the username exists.
             let _ = Argon2::default()
@@ -131,9 +135,9 @@ impl BasicAuthValidator {
         };
 
         match Argon2::default()
-            .verify_password(password.as_bytes(), identity_password.as_password_hash())
+            .verify_password(password.as_bytes(), user.password.as_password_hash())
         {
-            Ok(()) => Some(identity_id.clone()),
+            Ok(()) => Some(user.id.clone()),
             Err(error) => {
                 debug!("Password verification failed: {error}");
                 None

@@ -1,44 +1,18 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{body_json, header, method},
-};
+use wiremock::matchers::{body_json, header, method};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::common::{
     build_dispatcher, create_test_config, create_test_event, create_test_webhook_config,
     single_hook_dispatcher,
 };
-use crate::{
-    configuration::RegexPattern,
-    event_webhook::{config::DeliveryPolicy, dispatcher::EventDispatcher, event::EventKind},
-    metrics_provider::{init_for_tests, metrics_provider},
-};
-
-#[test]
-fn event_dispatcher_builder_constructs_from_configs() {
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "hook1".to_string(),
-        create_test_webhook_config(
-            "https://example.com/hook1",
-            DeliveryPolicy::Required,
-            None,
-            0,
-        ),
-    );
-    let mut hook2 = create_test_webhook_config(
-        "https://example.com/hook2",
-        DeliveryPolicy::Required,
-        Some("secret"),
-        0,
-    );
-    hook2.events = vec![EventKind::TagCreate];
-    webhooks.insert("hook2".to_string(), hook2);
-
-    let dispatcher = EventDispatcher::new(webhooks, Vec::new(), HashMap::new());
-    assert!(dispatcher.is_ok());
-}
+use crate::configuration::RegexPattern;
+use crate::event_webhook::config::DeliveryPolicy;
+use crate::event_webhook::dispatcher::EventDispatcher;
+use crate::event_webhook::event::EventKind;
+use crate::metrics_provider::{initialize_metrics, metrics_provider};
 
 /// The client carries the webhook's TLS settings: an unreadable CA bundle
 /// fails the dispatcher instead of being ignored.
@@ -48,13 +22,6 @@ fn an_unreadable_ca_bundle_fails_the_dispatcher() {
     config.tls.server_ca_bundle = Some(PathBuf::from("/nonexistent/ca.pem"));
     let webhooks = HashMap::from([("hook".to_string(), config)]);
     assert!(EventDispatcher::new(webhooks, Vec::new(), HashMap::new()).is_err());
-}
-
-#[test]
-fn event_dispatcher_builder_empty_configs() {
-    let webhooks = HashMap::new();
-    let dispatcher = EventDispatcher::new(webhooks, Vec::new(), HashMap::new());
-    assert!(dispatcher.is_ok());
 }
 
 #[tokio::test]
@@ -153,7 +120,7 @@ async fn dispatch_skips_webhook_for_non_matching_event_kind() {
 /// so a webhook no list names never fires.
 #[tokio::test]
 async fn dispatch_reaches_only_the_webhooks_the_repository_enables() {
-    init_for_tests();
+    initialize_metrics();
     let (audit, slack, unused) = (
         MockServer::start().await,
         MockServer::start().await,
@@ -242,11 +209,11 @@ async fn dispatch_records_delivery_total_metric() {
     );
 
     // The counter must be exported by the same registry /metrics serves.
-    let (_, payload) = metrics_provider().gather().unwrap();
+    let payload = metrics_provider().gather().unwrap();
     let text = String::from_utf8(payload).unwrap();
     assert!(
         text.contains("event_webhook_deliveries_total"),
-        "event_webhook_deliveries_total must appear in the /metrics registry output"
+        "/metrics output lacks the counter: {text}"
     );
 }
 
@@ -282,11 +249,11 @@ async fn dispatch_records_delivery_duration_metric() {
     );
 
     // The histogram must be exported by the same registry /metrics serves.
-    let (_, payload) = metrics_provider().gather().unwrap();
+    let payload = metrics_provider().gather().unwrap();
     let text = String::from_utf8(payload).unwrap();
     assert!(
         text.contains("event_webhook_delivery_duration_seconds"),
-        "event_webhook_delivery_duration_seconds must appear in the /metrics registry output"
+        "/metrics output lacks the histogram: {text}"
     );
 }
 

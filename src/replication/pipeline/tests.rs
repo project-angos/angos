@@ -1,39 +1,33 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::{Duration as StdDuration, Instant},
-};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use tempfile::TempDir;
-use wiremock::{
-    Mock, MockServer, Request, ResponseTemplate,
-    matchers::{header, method, path, query_param},
-};
+use wiremock::matchers::{header, method, path, query_param};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT};
+use angos_oci::constants::{DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE};
+use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, X_ANGOS_SOURCE_TIMESTAMP};
+use angos_oci::response::REPLICATION_SUPERSEDED_CODE;
 use angos_oci::{
     Digest, Manifest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE,
     Reference, Tag,
-    constants::{DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE},
 };
-use angos_oci::{header::X_ANGOS_SOURCE_TIMESTAMP, response::REPLICATION_SUPERSEDED_CODE};
 use angos_oci_client::{RegistryClient, UploadSession};
 
-use crate::{
-    metrics_provider,
-    registry::{
-        blob_store::BlobStore,
-        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        metadata_store::{LinkKind, MetadataStore},
-        test_utils::{FsTestStack, downstream_client, fs_test_stack, media_type, put_blob_direct},
-    },
-    replication::pipeline::{
-        MAX_INDEX_DEPTH, PushContext, PushOutcome, delete_manifest, push_blobs, push_manifest,
-    },
-    replication::{Error, ReplicationDownstream},
-    test_fixtures::mocks::mount_blob_upload_accepted,
+use crate::metrics_provider;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
+use crate::registry::test_utils::{
+    FsTestStack, downstream_client, fs_test_stack, media_type, put_blob_direct,
 };
+use crate::replication::pipeline::{
+    MAX_INDEX_DEPTH, PushContext, PushOutcome, delete_manifest, push_blobs, push_manifest,
+    upload_into_session,
+};
+use crate::replication::{Error, ReplicationDownstream};
+use crate::test_fixtures::mocks::mount_blob_upload_accepted;
 
 const NAMESPACE: &str = "nginx";
 
@@ -47,15 +41,6 @@ fn instant(rfc3339: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-fn test_blob_store() -> (Arc<BlobStore>, Arc<MetadataStore>, TempDir) {
-    let FsTestStack {
-        dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-    (blob_store, metadata_store, dir)
-}
-
 /// The modal test downstream: no remapping, four concurrent pushes.
 fn test_downstream(client: Arc<RegistryClient>) -> ReplicationDownstream {
     ReplicationDownstream::new("test".to_string(), client, 4)
@@ -65,8 +50,8 @@ fn test_downstream(client: Arc<RegistryClient>) -> ReplicationDownstream {
 /// timestamp.
 fn push_context<'a>(
     downstream: &'a ReplicationDownstream,
-    blob_store: &'a Arc<BlobStore>,
-    metadata_store: &'a Arc<MetadataStore>,
+    blob_store: &'a BlobStore,
+    metadata_store: &'a MetadataStore,
     namespace: &'a Namespace,
 ) -> PushContext<'a> {
     PushContext {
@@ -101,9 +86,13 @@ async fn mount_manifest_put(
 
 #[tokio::test]
 async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
@@ -145,7 +134,7 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
         .respond_with(move |request: &Request| {
-            let index: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let index: Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(
                 index["mediaType"], "application/vnd.oci.image.index.v1+json",
                 "fallback body must be an image index, not the referrer manifest"
@@ -180,9 +169,13 @@ async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
 /// discovering or filtering by them.
 #[tokio::test]
 async fn referrers_fallback_descriptor_carries_annotations_and_artifact_type() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
@@ -252,9 +245,13 @@ async fn referrers_fallback_descriptor_carries_annotations_and_artifact_type() {
 async fn referrers_fallback_put_is_timestamp_less() {
     // The fallback tag is a merged set, not an LWW register: a stamped PUT could
     // come back superseded and silently drop the just-merged descriptor.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let manifest = json!({
@@ -322,9 +319,13 @@ async fn referrers_fallback_put_is_timestamp_less() {
 async fn referrers_fallback_propagates_transient_get_error_without_clobbering() {
     // Treating a transient GET failure as "tag absent" would PUT an index
     // built from an empty base and drop the subject's sibling referrers.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
@@ -382,9 +383,13 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
 async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
     // Treating an unusable 200 body as an empty base would rebuild the index
     // from empty and drop the subject's existing sibling referrers.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     // Config-less manifest, so no blob upload mocks are needed.
@@ -443,9 +448,13 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
 async fn concurrent_same_subject_referrers_merge_without_lost_update() {
     // Without the per-subject lock both merges read the same base index and one
     // descriptor vanishes from the final PUT.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let referrer = |name: &str| {
@@ -474,7 +483,7 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
     // A stateful fallback endpoint: GET serves what the last PUT stored, so
     // the second merge sees the first descriptor only if the merges serialized.
     let fallback_tag = subject.referrers_fallback_tag();
-    let stored: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let stored: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let get_stored = stored.clone();
     let get_digest = subject.to_string();
     Mock::given(method("GET"))
@@ -500,7 +509,7 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
         .respond_with(move |request: &Request| {
-            let index: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let index: Value = serde_json::from_slice(&request.body).unwrap();
             *put_stored.lock().unwrap() = index["manifests"].as_array().unwrap().clone();
             ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, put_digest.as_str())
         })
@@ -536,9 +545,13 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
 
 #[tokio::test]
 async fn no_referrers_fallback_when_downstream_indexes_subject() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     let manifest = json!({
@@ -581,9 +594,13 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
 async fn index_lands_after_all_children_when_fanned_out() {
     // The parent index must land only after every child, and no child may be
     // dropped.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let mut child_digests = Vec::new();
     let mut manifests = Vec::new();
@@ -657,9 +674,13 @@ async fn index_lands_after_all_children_when_fanned_out() {
 
 #[tokio::test]
 async fn root_index_children_push_concurrently() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let mut manifests = Vec::new();
     for i in 0..4 {
@@ -718,9 +739,13 @@ async fn root_index_children_push_concurrently() {
 /// once per job: repeats would otherwise multiply at every nesting level.
 #[tokio::test]
 async fn a_manifest_named_many_times_is_pushed_once() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let leaf = serde_json::to_vec(&json!({
         "schemaVersion": 2,
@@ -811,9 +836,13 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
     // A sibling namespace already referencing the blobs becomes the mount `from`.
     const SIBLING: &str = "other/repo";
 
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let layer = put_blob_direct(&blob_store, b"layer-bytes").await;
@@ -882,9 +911,13 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
 async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
     const SIBLING: &str = "other/repo";
 
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let manifest = json!({
@@ -962,15 +995,19 @@ async fn seed_blobless_manifest(blob_store: &BlobStore) -> (Digest, Vec<u8>) {
 }
 
 /// An OCI error envelope body with the given `code`.
-fn oci_error_body(code: &str) -> serde_json::Value {
+fn oci_error_body(code: &str) -> Value {
     json!({ "errors": [{ "code": code, "message": "rejected" }] })
 }
 
 #[tokio::test]
 async fn push_manifest_stamps_source_timestamp_header() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     Mock::given(method("PUT"))
@@ -1004,9 +1041,13 @@ async fn push_manifest_stamps_source_timestamp_header() {
 async fn repeated_layer_digest_uploads_the_blob_once() {
     // Without dedup both entries HEAD-miss concurrently and both upload;
     // every mock is pinned to `.expect(1)`.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let layer = put_blob_direct(&blob_store, b"twice-listed layer").await;
     let manifest = json!({
@@ -1038,9 +1079,13 @@ async fn converged_skip_head_sends_standard_accept_headers() {
     // Without an `Accept` header a content-negotiating downstream may return a
     // converted representation whose digest never matches, so the converged
     // skip would never fire.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     let digest_str = manifest_digest.to_string();
@@ -1088,9 +1133,13 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
     // The converged skip runs before child recursion and the blob sweep,
     // so a redelivered already-converged manifest costs one manifest HEAD:
     // zero blob HEADs, zero uploads, zero PUTs.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let layer_a = put_blob_direct(&blob_store, b"layer-a-bytes").await;
@@ -1169,9 +1218,13 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
 async fn converged_child_skips_its_own_put_inside_index_recursion() {
     // Each recursed child runs its own converged HEAD-skip: a child the
     // downstream already holds is not re-PUT while the index still lands.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let child = json!({
         "schemaVersion": 2,
@@ -1231,9 +1284,13 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
 async fn blob_head_503_fails_the_push_without_upload_attempt() {
     // A transient blob-probe failure must fail the push so the job
     // retries; treating it as absent would start a pointless full upload.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let manifest = json!({
@@ -1284,9 +1341,13 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
 async fn failed_patch_cancels_the_upload_session() {
     // An upload failure must best-effort DELETE the open session exactly
     // once and still propagate the original upload error.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
     let manifest = json!({
@@ -1353,9 +1414,13 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
     // A prior attempt's primary PUT can land while its fallback PUT fails;
     // a blanket converged-skip would then never retry the fallback,
     // stranding the referrer.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
     // Config-less manifest, so no blob mocks are needed.
@@ -1413,9 +1478,13 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
 #[tokio::test]
 async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
     // The PUT must still run so receiver-side LWW can arbitrate the divergence.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     let other_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
@@ -1444,9 +1513,13 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
 async fn push_manifest_puts_when_downstream_head_returns_404() {
     // The probe must fail open: no HEAD mock is mounted, so wiremock answers
     // 404 and the PUT must still run.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
@@ -1465,9 +1538,13 @@ async fn push_manifest_puts_when_downstream_head_returns_404() {
 async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body() {
     // A body may omit `mediaType`; without the link recovery the PUT would
     // carry no `Content-Type` and the receiver rejects it 400.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let manifest = json!({ "schemaVersion": 2, "layers": [] });
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
@@ -1511,9 +1588,13 @@ async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body()
 async fn push_index_recovers_typeless_child_content_type_from_link() {
     // Child-recursion counterpart of the test above: a typeless child pushed
     // by digest must recover its Content-Type from its own revision link.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let child = json!({ "schemaVersion": 2, "layers": [] });
     let child_bytes = serde_json::to_vec(&child).unwrap();
@@ -1574,9 +1655,13 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
 
 #[tokio::test]
 async fn push_manifest_treats_lww_superseded_409_as_success() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     Mock::given(method("PUT"))
@@ -1603,9 +1688,13 @@ async fn push_manifest_treats_lww_superseded_409_as_success() {
 
 #[tokio::test]
 async fn push_manifest_propagates_immutable_409_as_error() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
     let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
 
     // A 409 with the immutable-tag `CONFLICT` code is not an LWW loss.
@@ -1632,8 +1721,12 @@ async fn push_manifest_propagates_immutable_409_as_error() {
 /// have the queue retry the same bytes until the budget dies.
 #[tokio::test]
 async fn push_manifest_rejects_invalid_content_as_terminal() {
-    metrics_provider::init_for_tests();
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    metrics_provider::initialize_metrics();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
     // The rejection precedes every HTTP call, so the downstream is unroutable
     // on purpose: a dialled request surfaces as `Client`, failing the assert.
     let downstream = test_downstream(downstream_client("http://127.0.0.1:1"));
@@ -1653,7 +1746,7 @@ async fn push_manifest_rejects_invalid_content_as_terminal() {
 
 #[tokio::test]
 async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     Mock::given(method("DELETE"))
@@ -1669,7 +1762,6 @@ async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
         .mount(&mock_server)
         .await;
 
-    let (_, _metadata_store, _dir) = test_blob_store();
     delete_manifest(
         &downstream_client(&mock_server.uri()),
         &Namespace::new(NAMESPACE).unwrap(),
@@ -1686,7 +1778,7 @@ async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
 
 #[tokio::test]
 async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     Mock::given(method("DELETE"))
@@ -1696,7 +1788,6 @@ async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
         .mount(&mock_server)
         .await;
 
-    let (_, _metadata_store, _dir) = test_blob_store();
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &Namespace::new(NAMESPACE).unwrap(),
@@ -1719,7 +1810,7 @@ async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
 async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
     // A downstream rejecting tag deletion with 405 must complete the job as
     // Unsupported, not error and dead-letter one job per deletion event.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     Mock::given(method("DELETE"))
@@ -1728,7 +1819,6 @@ async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
         .mount(&mock_server)
         .await;
 
-    let (_, _metadata_store, _dir) = test_blob_store();
     let outcome = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &Namespace::new(NAMESPACE).unwrap(),
@@ -1745,7 +1835,7 @@ async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
 
 #[tokio::test]
 async fn delete_manifest_propagates_non_superseded_409_as_error() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
 
     Mock::given(method("DELETE"))
@@ -1755,7 +1845,6 @@ async fn delete_manifest_propagates_non_superseded_409_as_error() {
         .mount(&mock_server)
         .await;
 
-    let (_, _metadata_store, _dir) = test_blob_store();
     let result = delete_manifest(
         &downstream_client(&mock_server.uri()),
         &Namespace::new(NAMESPACE).unwrap(),
@@ -1777,9 +1866,13 @@ async fn delete_manifest_propagates_non_superseded_409_as_error() {
 async fn upload_into_session_cancels_when_local_blob_read_fails() {
     // The session is already open; a missing local blob must cancel it, not
     // strand it on the downstream.
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let absent = Digest::sha256_of_bytes(b"never-written-locally");
     let session = UploadSession {
@@ -1796,7 +1889,7 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
     let downstream = test_downstream(downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let result = super::upload_into_session(&ctx, &absent, &session).await;
+    let result = upload_into_session(&ctx, &absent, &session).await;
     assert!(result.is_err(), "a missing local blob must fail the upload");
 
     // .expect(1) on the DELETE verifies the session was cancelled.
@@ -1818,9 +1911,8 @@ fn referrer_manifest(subject: &Digest) -> (Vec<u8>, Digest) {
 
 #[tokio::test]
 async fn deleting_last_referrer_removes_the_fallback_tag() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (_, _metadata_store, _dir) = test_blob_store();
 
     let subject = Digest::sha256_of_bytes(b"the-subject");
     let (referrer_body, referrer) = referrer_manifest(&subject);
@@ -1885,9 +1977,8 @@ async fn deleting_last_referrer_removes_the_fallback_tag() {
 
 #[tokio::test]
 async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (_, _metadata_store, _dir) = test_blob_store();
 
     let subject = Digest::sha256_of_bytes(b"shared-subject");
     let (referrer_body, referrer) = referrer_manifest(&subject);
@@ -1956,12 +2047,11 @@ async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
         .find(|r| r.method.as_str() == "PUT" && r.url.path().ends_with(fallback_tag.as_ref()))
         .map(|r| r.body)
         .expect("the fallback index must be re-PUT");
-    let digests: Vec<String> = serde_json::from_slice::<Value>(&put_body)
-        .ok()
-        .and_then(|v| v.get("manifests").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
+    let index: Value = serde_json::from_slice(&put_body).expect("the re-PUT index must be JSON");
+    let manifests = index["manifests"].as_array().cloned().unwrap_or_default();
+    let digests: Vec<String> = manifests
         .iter()
-        .filter_map(|m| m.get("digest").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|m| m["digest"].as_str().map(str::to_string))
         .collect();
     assert_eq!(
         digests,
@@ -1976,9 +2066,8 @@ async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
 /// subject carried in the payload can still name the stale descriptor.
 #[tokio::test]
 async fn a_retried_delete_prunes_the_fallback_index_from_the_carried_subject() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (_, _metadata_store, _dir) = test_blob_store();
 
     let subject = Digest::sha256_of_bytes(b"retried-subject");
     let (_, referrer) = referrer_manifest(&subject);
@@ -2039,9 +2128,13 @@ async fn a_retried_delete_prunes_the_fallback_index_from_the_carried_subject() {
 /// mid-transfer would leave its session open on the downstream until GC.
 #[tokio::test]
 async fn a_failing_blob_lets_its_siblings_finish_their_upload() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let failing = put_blob_direct(&blob_store, b"fails").await;
     let sibling = put_blob_direct(&blob_store, b"transfers").await;
@@ -2098,9 +2191,13 @@ async fn a_failing_blob_lets_its_siblings_finish_their_upload() {
 /// discover that is the memory exhaustion, so the size is asked first.
 #[tokio::test]
 async fn an_index_child_over_the_manifest_limit_is_refused_before_it_is_read() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     let oversized = vec![b'x'; DEFAULT_MAX_MANIFEST_SIZE_BYTES + 1];
     let child_digest = put_blob_direct(&blob_store, &oversized).await;
@@ -2135,9 +2232,13 @@ async fn an_index_child_over_the_manifest_limit_is_refused_before_it_is_read() {
 /// controls. Content addressing rules out a true cycle, leaving depth.
 #[tokio::test]
 async fn an_index_chain_deeper_than_the_cap_is_refused() {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-    let (blob_store, metadata_store, _dir) = test_blob_store();
+    let FsTestStack {
+        dir: _dir,
+        metadata_store,
+        blob_store,
+    } = fs_test_stack();
 
     // Innermost is a plain manifest; wrap it in one index per level.
     let leaf = json!({

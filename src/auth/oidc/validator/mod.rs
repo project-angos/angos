@@ -1,20 +1,21 @@
-use std::{collections::HashMap, fs, time::Duration};
+use std::collections::HashMap;
+use std::fs;
+use std::time::Duration;
 
 use jsonwebtoken::{Algorithm, Header, Validation, decode, decode_header};
-use reqwest::{Client, header::ACCEPT};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use reqwest::Client;
+use reqwest::header::ACCEPT;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::{
-    auth::Error,
-    auth::{
-        oidc::{Config, jwk::Jwk},
-        sha256_hex,
-    },
-    identity::OidcClaims,
-};
+use crate::auth::oidc::Config;
+use crate::auth::oidc::jwk::Jwk;
+use crate::auth::{Error, sha256_hex};
+use crate::identity::OidcClaims;
 use angos_cache::Cache;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -42,7 +43,14 @@ struct CachedJsonRequest<'a> {
     url: &'a str,
     ttl: u64,
     read_cache: bool,
-    fetch_timeout: Option<Duration>,
+    fetch_timeout: Duration,
+}
+
+/// Whether a JWKS load may be answered from the cache.
+#[derive(Clone, Copy, PartialEq)]
+enum JwksRead {
+    PreferCache,
+    Refetch,
 }
 
 pub async fn validate_oidc_token(
@@ -55,7 +63,7 @@ pub async fn validate_oidc_token(
     let header = decode_header(token)
         .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
 
-    let mut jwks = fetch_jwks(provider, client, cache, true).await?;
+    let mut jwks = fetch_jwks(provider, client, cache, JwksRead::PreferCache).await?;
     if jwks.from_cache
         && cached_jwks_misses_kid(&jwks.value, &header)
         && let Some(refreshed) = refresh_jwks_rate_limited(provider, client, cache).await?
@@ -108,12 +116,10 @@ fn verify_jwt_with_header(
     );
 
     let token_data =
-        decode::<HashMap<String, serde_json::Value>>(token, &decoding_key, &validation).map_err(
-            |e| {
-                warn!("JWT decode failed with error: {:?}", e);
-                Error::Unauthorized(format!("JWT validation failed: {e}"))
-            },
-        )?;
+        decode::<HashMap<String, Value>>(token, &decoding_key, &validation).map_err(|e| {
+            warn!("JWT decode failed with error: {:?}", e);
+            Error::Unauthorized(format!("JWT validation failed: {e}"))
+        })?;
 
     provider.verify_required_claims(&token_data.claims)?;
 
@@ -210,7 +216,7 @@ async fn query_json<T>(
     client: &Client,
     provider: &Config,
     url: &str,
-    fetch_timeout: Option<Duration>,
+    fetch_timeout: Duration,
 ) -> Result<T, FetchFailure>
 where
     T: DeserializeOwned,
@@ -246,21 +252,18 @@ where
         })
     };
 
-    match fetch_timeout {
-        Some(duration) => timeout(duration, fetch).await.map_err(|_| {
-            FetchFailure::Silent(Error::ProviderUnavailable(format!(
-                "Timed out fetching URL {url}"
-            )))
-        })?,
-        None => fetch.await,
-    }
+    timeout(fetch_timeout, fetch).await.map_err(|_| {
+        FetchFailure::Silent(Error::ProviderUnavailable(format!(
+            "Timed out fetching URL {url}"
+        )))
+    })?
 }
 
-async fn get_jwks_url(
+async fn resolve_jwks_url(
     provider: &Config,
     client: &Client,
     cache: &Cache,
-    fetch_timeout: Option<Duration>,
+    fetch_timeout: Duration,
 ) -> Result<String, Error> {
     if let Some(uri) = provider.jwks_uri.as_deref() {
         return Ok(uri.to_string());
@@ -364,23 +367,22 @@ where
     })
 }
 
-/// Load the provider's JWKS. With `read_cache` the cached document is preferred
+/// Load the provider's JWKS. With `PreferCache` the cached document is preferred
 /// under the normal request timeout, and `from_cache` on the result tells the
-/// caller whether it may still be stale for a just-rotated key; without it the
-/// fetch is forced under the shorter refresh timeout a rotated key id needs.
+/// caller whether it may still be stale for a just-rotated key; `Refetch` forces
+/// the fetch under the shorter refresh timeout a rotated key id needs.
 async fn fetch_jwks(
     provider: &Config,
     client: &Client,
     cache: &Cache,
-    read_cache: bool,
+    read: JwksRead,
 ) -> Result<CachedJson<Jwks>, Error> {
-    let timeout = Duration::from_secs(if read_cache {
-        provider.http_request_timeout_secs
-    } else {
-        provider.jwks_refresh_timeout_secs
+    let timeout = Duration::from_secs(match read {
+        JwksRead::PreferCache => provider.http_request_timeout_secs,
+        JwksRead::Refetch => provider.jwks_refresh_timeout_secs,
     });
     let cache_key = issuer_key(provider, "jwks");
-    let jwks_url = get_jwks_url(provider, client, cache, Some(timeout)).await?;
+    let jwks_url = resolve_jwks_url(provider, client, cache, timeout).await?;
     let fetched = fetch_cached_json::<Jwks, _>(
         CachedJsonRequest {
             client,
@@ -389,8 +391,8 @@ async fn fetch_jwks(
             cache_key: &cache_key,
             url: &jwks_url,
             ttl: provider.jwks_refresh_interval,
-            read_cache,
-            fetch_timeout: Some(timeout),
+            read_cache: read == JwksRead::PreferCache,
+            fetch_timeout: timeout,
         },
         |_| Ok(()),
     )
@@ -431,23 +433,16 @@ async fn refresh_jwks_rate_limited(
         .await;
 
     info!("Refreshing JWKS for issuer {}", provider.issuer);
-    fetch_jwks(provider, client, cache, false).await.map(Some)
-}
-
-#[cfg(test)]
-async fn fetch_oidc_configuration(
-    provider: &Config,
-    client: &Client,
-    cache: &Cache,
-) -> Result<OpenIdConfiguration, Error> {
-    fetch_oidc_configuration_with_timeout(provider, client, cache, None).await
+    fetch_jwks(provider, client, cache, JwksRead::Refetch)
+        .await
+        .map(Some)
 }
 
 async fn fetch_oidc_configuration_with_timeout(
     provider: &Config,
     client: &Client,
     cache: &Cache,
-    fetch_timeout: Option<Duration>,
+    fetch_timeout: Duration,
 ) -> Result<OpenIdConfiguration, Error> {
     let cache_key = issuer_key(provider, "config");
     let config_url = format!("{}/.well-known/openid-configuration", provider.issuer);

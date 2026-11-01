@@ -3,15 +3,18 @@
 //! `Reference::Tag`; emission is observed through a `required`-policy webhook
 //! pointed at a wiremock endpoint.
 
-use std::{collections::HashMap, io::Cursor, sync::Arc};
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use http::StatusCode;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use url::Url;
 use uuid::Uuid;
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use angos_mtls_client::ClientTls;
 use angos_oci::request::{
@@ -19,29 +22,22 @@ use angos_oci::request::{
 };
 use angos_oci::{Digest, MediaRange, MediaType, Namespace, Reference, Tag};
 
-use crate::metrics_provider::init_for_tests;
-use crate::{
-    event_webhook::{
-        config::{DeliveryPolicy, EventWebhookConfig},
-        dispatcher::EventDispatcher,
-        event::{EventActor, EventKind},
-    },
-    jobs::Queue,
-    jobs::store::{ClaimMode, JobStore},
-    registry::{
-        Registry, RegistryConfig, Repository,
-        metadata_store::LinkKind,
-        repository_resolver::RepositoryResolver,
-        test_utils::{
-            FsTestStack, create_test_repositories, downstream_client, fs_test_stack,
-            put_blob_direct, repository_with_downstream, repository_with_replication,
-            response_digest, single_repo_resolver, sole_pending_payload, test_job_store,
-            upload_blob,
-        },
-    },
-    replication::{
-        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
-    },
+use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
+use crate::event_webhook::dispatcher::EventDispatcher;
+use crate::event_webhook::event::{EventActor, EventKind};
+use crate::jobs::Queue;
+use crate::jobs::store::{ClaimMode, JobStore};
+use crate::metrics_provider::initialize_metrics;
+use crate::registry::metadata_store::LinkKind;
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::registry::test_utils::{
+    FsTestStack, create_test_repositories, downstream_client, fs_test_stack, put_blob_direct,
+    repository_with_downstream, repository_with_replication, response_digest, single_repo_resolver,
+    sole_pending_payload, test_job_store, upload_blob,
+};
+use crate::registry::{Registry, RegistryConfig, Repository};
+use crate::replication::{
+    REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
 };
 
 struct FsRegistryFixture {
@@ -102,7 +98,7 @@ impl FsRegistryFixture {
 }
 
 /// The event payloads the wiremock endpoint received, in delivery order.
-async fn received_events(server: &MockServer) -> Vec<serde_json::Value> {
+async fn received_events(server: &MockServer) -> Vec<Value> {
     server
         .received_requests()
         .await
@@ -112,7 +108,7 @@ async fn received_events(server: &MockServer) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn kinds_of(events: &[serde_json::Value]) -> Vec<String> {
+fn kinds_of(events: &[Value]) -> Vec<String> {
     events
         .iter()
         .map(|e| e["kind"].as_str().unwrap_or_default().to_string())
@@ -395,7 +391,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
         .expect("id must be a string")
         .parse()
         .expect("id must parse as a UUID");
-    assert_ne!(id, Uuid::nil(), "Event id must be a non-nil UUID");
+    assert_ne!(id, Uuid::nil());
 
     let timestamp: DateTime<Utc> = tag_create["timestamp"]
         .as_str()
@@ -412,7 +408,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
             .as_str()
             .unwrap_or_default()
             .is_empty(),
-        "Event repository must not be empty"
+        "no repository in {tag_create}"
     );
     assert_eq!(
         tag_create["namespace"],
@@ -422,11 +418,11 @@ async fn tag_push_event_payload_has_all_required_fields() {
     assert_eq!(tag_create["tag"], "stable");
     assert!(
         tag_create["reference"].is_string(),
-        "Event reference must be set"
+        "no reference in {tag_create}"
     );
     assert!(
         tag_create["digest"].is_string(),
-        "Event digest must be set on TagCreate"
+        "no digest in {tag_create}"
     );
 }
 
@@ -745,7 +741,7 @@ fn mirror_and_additive_downstreams() -> Vec<ReplicationDownstream> {
 
 #[tokio::test]
 async fn fresh_local_tag_push_enqueues_replication_job() {
-    init_for_tests();
+    initialize_metrics();
     let fixture = ReplicationFixture::new();
     let namespace = Namespace::new(REPLICATION_REPO).unwrap();
     let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
@@ -790,7 +786,7 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
 
 #[tokio::test]
 async fn tag_delete_enqueues_replication_delete_job() {
-    init_for_tests();
+    initialize_metrics();
     let fixture = ReplicationFixture::new();
     let namespace = Namespace::new(REPLICATION_REPO).unwrap();
     let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
@@ -848,7 +844,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
 /// `prune = true` downstream; the additive downstream keeps its copy.
 #[tokio::test]
 async fn retention_delete_mirrors_only_to_prune_downstreams() {
-    init_for_tests();
+    initialize_metrics();
     let fixture = ReplicationFixture::with_repository(repository_with_replication(
         REPLICATION_REPO,
         mirror_and_additive_downstreams(),
@@ -895,7 +891,7 @@ async fn retention_delete_mirrors_only_to_prune_downstreams() {
 
 #[tokio::test]
 async fn client_delete_mirrors_to_all_downstreams() {
-    init_for_tests();
+    initialize_metrics();
     let fixture = ReplicationFixture::with_repository(repository_with_replication(
         REPLICATION_REPO,
         mirror_and_additive_downstreams(),

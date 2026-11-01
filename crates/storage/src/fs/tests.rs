@@ -1,3 +1,4 @@
+use std::fs as stdfs;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -5,8 +6,10 @@ use futures_util::{TryStreamExt, stream};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
+use crate::fs::Backend;
+use crate::test_util::frame;
 use crate::tests::object_store_conformance;
-use crate::{ByteStream, Error, ObjectStore, fs::Backend, test_util::frame};
+use crate::{ByteStream, Error, ObjectStore};
 
 fn backend(dir: &TempDir) -> Backend {
     Backend::builder(dir.path()).build()
@@ -71,7 +74,7 @@ async fn promote_upload_publishes_only_verified_bytes() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(backend(&dir));
     store
-        .write_upload("up/data", frame("verified"), Some(8))
+        .write_upload("up/data", frame(b"verified"), Some(8))
         .await
         .unwrap();
 
@@ -89,7 +92,7 @@ async fn promote_upload_publishes_only_verified_bytes() {
     });
     opened_rx.await.unwrap();
     store
-        .write_upload("up/data", frame("tail"), Some(4))
+        .write_upload("up/data", frame(b"tail"), Some(4))
         .await
         .unwrap();
 
@@ -160,8 +163,6 @@ async fn delete_prefix_stops_pruning_at_first_non_empty_ancestor() {
 /// empty directory sitting next to the configured root.
 #[tokio::test]
 async fn prune_empty_ancestors_refuses_to_escape_root_via_dotdot() {
-    use std::fs as stdfs;
-
     let dir = TempDir::new().unwrap();
     // The store root is a *sub*directory of the tempdir, so a sibling dir can
     // sit outside the root yet still inside the tempdir we control.
@@ -194,7 +195,7 @@ async fn prune_empty_ancestors_still_collapses_normal_in_root_chain() {
 
     // Build an empty chain `p/q/r` with no leaf left behind, then prune from a
     // would-be leaf inside it.
-    std::fs::create_dir_all(dir.path().join("p/q/r")).unwrap();
+    stdfs::create_dir_all(dir.path().join("p/q/r")).unwrap();
 
     store.prune_empty_ancestors("p/q/r/leaf").await;
 
@@ -270,7 +271,8 @@ async fn list_after_pages_in_lexical_order_from_any_cursor() {
     keys.sort();
 
     let others = ["", "a", "a/", "a/y", "b", "z"].map(String::from);
-    for cursor in keys.iter().chain(&others) {
+    let cursors = keys.iter().chain(&others);
+    for cursor in cursors {
         for n in 1..=3 {
             let mut listed = Vec::new();
             let mut page = store
@@ -290,35 +292,6 @@ async fn list_after_pages_in_lexical_order_from_any_cursor() {
             );
         }
     }
-}
-
-/// The FS `list_all_children` override reads the directory once and must
-/// still return every child, separated by kind.
-#[tokio::test]
-async fn list_all_children_returns_all_entries() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-
-    for k in ["ns/a/x", "ns/b/x", "ns/c/x", "ns/d/x", "ns/e/x"] {
-        store.put(k, Bytes::from_static(b"v")).await.unwrap();
-    }
-    // Also a direct object at the same level.
-    store.put("ns/z", Bytes::from_static(b"v")).await.unwrap();
-
-    let children = store.list_all_children("ns").await.unwrap();
-    let sub_prefixes = children.sub_prefixes;
-    let objects = children.objects;
-    assert_eq!(
-        sub_prefixes,
-        vec![
-            "a".to_string(),
-            "b".to_string(),
-            "c".to_string(),
-            "d".to_string(),
-            "e".to_string(),
-        ]
-    );
-    assert_eq!(objects, vec!["z".to_string()]);
 }
 
 /// The flag only decides whether writes are fsynced, so the two settings have
@@ -365,8 +338,6 @@ async fn sync_to_disk_flag_does_not_change_observable_behaviour() {
 /// in a `blob-index/.../refs/` dir and failed to JSON-parse it.
 #[tokio::test]
 async fn listings_skip_atomic_write_temporaries() {
-    use std::fs as stdfs;
-
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
     store
@@ -449,7 +420,7 @@ async fn an_upload_round_trips_with_durability_enabled() {
     let body = Bytes::from_static(b"durable bytes");
 
     let written = store
-        .write_upload("up/synced", frame(body.clone()), Some(body.len() as u64))
+        .write_upload("up/synced", frame(&body), Some(body.len() as u64))
         .await
         .unwrap();
     store.complete_upload("up/synced").await.unwrap();

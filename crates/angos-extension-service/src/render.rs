@@ -8,14 +8,12 @@ use tokio::io::AsyncRead;
 
 use angos_oci::server;
 use angos_oci_service::render::paginated_json;
-use angos_transport::{ResponseBody, build_response, json_headers, json_response};
+use angos_transport::{RenderError, ResponseBody, build_response, json_headers, json_response};
 
 use crate::{
     FailedJobsBody, JobsBody, LayerEntries, LayerFile, LayerFileDetails, NamespacesBody, PullsBody,
     RepositoriesBody, RevisionsBody, UploadsBody,
 };
-
-use angos_transport::RenderError;
 
 type Rendered = Result<Response<ResponseBody>, RenderError>;
 

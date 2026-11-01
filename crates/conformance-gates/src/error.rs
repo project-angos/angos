@@ -1,3 +1,9 @@
+use std::io::Error as IoError;
+
+use angos_s3_client::Error as S3Error;
+use angos_storage::Error as StorageError;
+use reqwest::Error as HttpError;
+use serde_json::Error as JsonError;
 use thiserror::Error;
 
 pub type GateResult<T> = Result<T, GateError>;
@@ -12,21 +18,15 @@ pub enum GateError {
     #[error("environment: {0}")]
     Environment(String),
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] IoError),
     #[error("http: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] HttpError),
     #[error("storage: {0}")]
-    Storage(#[from] angos_storage::Error),
+    Storage(#[from] StorageError),
     #[error("s3 client: {0}")]
-    S3(#[from] angos_s3_client::Error),
+    S3(#[from] S3Error),
     #[error("json: {0}")]
-    Json(#[from] serde_json::Error),
-}
-
-/// Build a gate-assertion failure from a message.
-pub fn fail(msg: impl Into<String>) -> GateError {
-    let text = msg.into();
-    GateError::Failure(text)
+    Json(#[from] JsonError),
 }
 
 /// Assert a gate condition, producing the failure message lazily.

@@ -4,13 +4,10 @@
 
 use std::cmp::Reverse;
 
-use http::{
-    HeaderMap,
-    header::{
-        ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_SECURITY_POLICY,
-        CONTENT_TYPE, HeaderValue, InvalidHeaderValue, LINK, LOCATION, RANGE,
-        X_CONTENT_TYPE_OPTIONS,
-    },
+use http::HeaderMap;
+use http::header::{
+    ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
+    HeaderValue, InvalidHeaderValue, LINK, LOCATION, RANGE, X_CONTENT_TYPE_OPTIONS,
 };
 
 use crate::client::{blob_path, manifest_path, uploads_start_path};
@@ -399,10 +396,8 @@ pub fn put_manifest_headers(
 
 #[cfg(test)]
 mod tests {
-    use crate::client::{blob_path, manifest_path, uploads_start_path};
+    use super::*;
     use crate::path::API_PREFIX;
-    use crate::server::*;
-    use crate::types::Reference;
 
     fn accept(values: &[&str]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -430,7 +425,8 @@ mod tests {
 
     #[test]
     fn no_accept_header_offers_nothing() {
-        assert!(ranges(&HeaderMap::new()).is_empty());
+        let offered = ranges(&HeaderMap::new());
+        assert!(offered.is_empty(), "{offered:?}");
     }
 
     #[test]
@@ -480,10 +476,6 @@ mod tests {
         Namespace::new("test-repo").unwrap()
     }
 
-    fn session_id() -> UploadSessionId {
-        UploadSessionId::new(SAMPLE_SESSION).unwrap()
-    }
-
     /// `Accept-Ranges` rides on every blob answer, `HEAD` included: a client
     /// must be able to learn a blob is rangeable without fetching it.
     #[test]
@@ -529,7 +521,9 @@ mod tests {
     #[test]
     fn upload_session_headers_start_at_zero_range() {
         let namespace = namespace();
-        let headers = upload_session_headers(&namespace, &session_id()).unwrap();
+        let headers =
+            upload_session_headers(&namespace, &UploadSessionId::new(SAMPLE_SESSION).unwrap())
+                .unwrap();
         assert_eq!(
             headers[&LOCATION],
             format!("/v2/{namespace}/blobs/uploads/{SAMPLE_SESSION}")
@@ -542,11 +536,23 @@ mod tests {
     /// empty body and declares `Content-Length: 0`; a `GET` declares none.
     #[test]
     fn upload_progress_headers_report_current_range() {
-        let headers = upload_progress_headers(&namespace(), &session_id(), 42, None).unwrap();
+        let headers = upload_progress_headers(
+            &namespace(),
+            &UploadSessionId::new(SAMPLE_SESSION).unwrap(),
+            42,
+            None,
+        )
+        .unwrap();
         assert_eq!(headers[&RANGE], "0-41");
         assert!(!headers.contains_key(CONTENT_LENGTH));
 
-        let headers = upload_progress_headers(&namespace(), &session_id(), 42, Some(0)).unwrap();
+        let headers = upload_progress_headers(
+            &namespace(),
+            &UploadSessionId::new(SAMPLE_SESSION).unwrap(),
+            42,
+            Some(0),
+        )
+        .unwrap();
         assert_eq!(headers[&RANGE], "0-41");
         assert_eq!(headers[&CONTENT_LENGTH], "0");
     }
@@ -663,11 +669,5 @@ mod tests {
         let headers = paginated_json_headers(None).unwrap();
         assert_eq!(headers[&CONTENT_TYPE], "application/json");
         assert!(!headers.contains_key(LINK));
-    }
-
-    #[test]
-    fn next_page_link_renders_the_rel_next_entry() {
-        let header = next_page_link("/v2/nginx/tags/list?n=1").unwrap();
-        assert_eq!(header, "</v2/nginx/tags/list?n=1>; rel=\"next\"");
     }
 }

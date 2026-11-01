@@ -1,25 +1,23 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use argh::FromArgs;
 use tokio::time::timeout;
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::warn;
 
-use crate::{
-    command::server::command::setup::{BuiltRegistry, InProcessLoops},
-    command::{
-        bootstrap,
-        server::{
-            ServerContext,
-            error::Error,
-            listeners::{insecure::InsecureListener, tls::TlsListener},
-        },
-    },
-    configuration::{Configuration, ServerConfig, listeners::ServerTlsConfig},
-    jobs::Queue,
-    jobs::store::{QueueDepthRefresh, queue_depth_refresh_loop},
-};
+use crate::command::bootstrap;
+use crate::command::server::ServerContext;
+use crate::command::server::command::setup::{BuiltRegistry, InProcessLoops};
+use crate::command::server::error::Error;
+use crate::command::server::listeners::insecure::InsecureListener;
+use crate::command::server::listeners::tls::TlsListener;
+use crate::configuration::listeners::ServerTlsConfig;
+use crate::configuration::{Configuration, ServerConfig};
+use crate::jobs::Queue;
+use crate::jobs::store::{QueueDepthRefresh, queue_depth_refresh_loop};
 
 mod notifier;
 pub mod setup;

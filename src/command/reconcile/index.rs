@@ -7,11 +7,9 @@
 //! what a listing holds, and for dropping what on-demand opens left behind
 //! in repositories that do not index.
 
-use std::{
-    collections::HashSet,
-    pin::pin,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::HashSet;
+use std::pin::pin;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use argh::FromArgs;
 use async_trait::async_trait;
@@ -20,28 +18,20 @@ use tracing::info;
 
 use angos_oci::{Digest, Namespace};
 
-use crate::{
-    command::{
-        bootstrap,
-        maintenance::{
-            Error,
-            action::Action,
-            check::{self, NamespaceChecker},
-            executor::{ActionSink, Executor, run_job_store, run_sink},
-            tags::Rankings,
-            walk::for_each_key,
-        },
-    },
-    configuration::Configuration,
-    layer::{IndexLayerPayload, filesystem_layers},
-    registry::{
-        blob_store::BlobStore,
-        keys::{LAYERS_ROOT, parse_layer_key},
-        manifest::read_manifest,
-        metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-};
+use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::{Action, JobAction};
+use crate::command::maintenance::check::{self, NamespaceChecker};
+use crate::command::maintenance::executor::{ActionSink, Executor, run_job_store, run_sink};
+use crate::command::maintenance::tags::Rankings;
+use crate::command::maintenance::walk::for_each_key;
+use crate::configuration::Configuration;
+use crate::layer::{IndexLayerPayload, filesystem_layers};
+use crate::registry::blob_store::BlobStore;
+use crate::registry::keys::{LAYERS_ROOT, parse_layer_key};
+use crate::registry::manifest::read_manifest;
+use crate::registry::metadata_store::MetadataStore;
+use crate::registry::repository_resolver::RepositoryResolver;
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -84,16 +74,10 @@ impl NamespaceChecker for IndexChecker {
         };
         // Only the rules read the tags, so a policy without any skips them.
         let rankings = if policy.has_rules() {
-            Some(Rankings::read(&self.metadata_store, namespace).await?)
+            Rankings::read(&self.metadata_store, namespace).await?
         } else {
-            None
+            Rankings::default()
         };
-        let empty = Rankings {
-            tags: Vec::new(),
-            last_pushed: Vec::new(),
-            last_pulled: Vec::new(),
-        };
-        let rankings = rankings.as_ref().unwrap_or(&empty);
         let mut revisions = pin!(self.metadata_store.stream_revisions(namespace));
         while let Some(digest) = revisions.next().await {
             let digest = digest?;
@@ -118,11 +102,11 @@ impl NamespaceChecker for IndexChecker {
                 if !self.force && self.metadata_store.read_listing(&layer).await?.is_some() {
                     continue;
                 }
-                sink.apply(Action::EnqueueIndex(IndexLayerPayload {
+                sink.apply(Action::Job(JobAction::EnqueueIndex(IndexLayerPayload {
                     namespace: namespace.clone(),
                     digest: layer,
                     force: self.force,
-                }))
+                })))
                 .await?;
             }
         }
@@ -153,10 +137,10 @@ async fn reclaim_listings(
         },
     )
     .await?;
-    for digest in unwanted
+    let unwanted = unwanted
         .into_inner()
-        .unwrap_or_else(PoisonError::into_inner)
-    {
+        .unwrap_or_else(PoisonError::into_inner);
+    for digest in unwanted {
         sink.apply(Action::ReclaimListing(digest)).await?;
     }
     Ok(())
@@ -197,7 +181,7 @@ pub async fn reclaim_unused_listings(
 }
 
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
-    let bootstrap::MaintenanceContext {
+    let MaintenanceContext {
         blob_store,
         metadata_store,
         repositories,
@@ -224,25 +208,22 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Mutex};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
 
     use bytes::Bytes;
 
     use angos_oci::{Digest, Namespace};
 
     use super::{IndexChecker, reclaim_listings};
-    use crate::{
-        command::maintenance::{action::Action, check::NamespaceChecker},
-        layer::IndexAction,
-        policy::{ImagePolicy, PolicyConfig},
-        registry::{
-            keys::DigestKeys,
-            metadata_store::LinkKind,
-            test_utils::{
-                fs_test_stack, repository_with_replication, seed_links, seed_manifest,
-                single_repo_resolver,
-            },
-        },
+    use crate::command::maintenance::action::{Action, JobAction};
+    use crate::command::maintenance::check::NamespaceChecker;
+    use crate::layer::IndexAction;
+    use crate::policy::{ImagePolicy, PolicyConfig};
+    use crate::registry::keys::DigestExt;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::test_utils::{
+        fs_test_stack, repository_with_replication, seed_links, seed_manifest, single_repo_resolver,
     };
 
     fn enqueued(actions: &Mutex<Vec<Action>>) -> Vec<(String, bool)> {
@@ -251,7 +232,9 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|action| match action {
-                Action::EnqueueIndex(index) => Some((index.digest.to_string(), index.force)),
+                Action::Job(JobAction::EnqueueIndex(index)) => {
+                    Some((index.digest.to_string(), index.force))
+                }
                 _ => None,
             })
             .collect()

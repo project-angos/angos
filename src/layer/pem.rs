@@ -1,7 +1,8 @@
 //! The blocks of a PEM file, its certificates decoded.
 
 use chrono::DateTime;
-use x509_parser::{extensions::GeneralName, pem::Pem};
+use x509_parser::extensions::GeneralName;
+use x509_parser::pem::Pem;
 
 use angos_extension_service::{Certificate, PemBlock};
 

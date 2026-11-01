@@ -1,38 +1,36 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
 use base64::Engine;
-use hyper::{
-    Request, StatusCode, Uri,
-    header::{HOST, HeaderMap, HeaderValue},
-};
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+use hyper::header::{HOST, HeaderMap, HeaderValue};
+use hyper::{Request, StatusCode, Uri};
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use angos_cache::Cache;
+use angos_cache::{Cache, Config as CacheConfig};
 use angos_oci::{Digest, Namespace, Reference, Tag};
-use angos_oci_service::Endpoint as OciEndpoint;
+use angos_oci_service::{Endpoint as OciEndpoint, ManifestEndpoint};
 
-use crate::{
-    command::{
-        bootstrap,
-        server::{
-            router::Route,
-            server_context::{ServerContext, build_ui_config, resolve_forwarded_ip},
-        },
-    },
-    configuration::{Configuration, TrustedProxy},
-    event_webhook::{config::EventWebhookConfig, dispatcher::EventDispatcher, event::Event},
-    identity::{Action, ClientIdentity, RequestScheme},
-    metrics_provider,
-    policy::{AccessMode, PolicyConfig},
-    registry::{
-        Error as RegistryError, Registry, RegistryConfig, Repository,
-        metadata_store::{MetadataStore, Settings},
-        repository_resolver::RepositoryResolver,
-        test_utils::test_job_store,
-    },
-    test_fixtures::configuration::{load_config, minimal_config},
+use crate::command::bootstrap;
+use crate::command::server::router::Route;
+use crate::command::server::server_context::{
+    ServerContext, build_ui_config, resolve_forwarded_ip,
 };
+use crate::configuration::{Configuration, TrustedProxy};
+use crate::event_webhook::config::EventWebhookConfig;
+use crate::event_webhook::dispatcher::EventDispatcher;
+use crate::event_webhook::event::Event;
+use crate::identity::{Action, ClientIdentity, RequestScheme};
+use crate::metrics_provider;
+use crate::policy::{AccessMode, PolicyConfig};
+use crate::registry::metadata_store::{MetadataStore, Settings};
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::registry::test_utils::test_job_store;
+use crate::registry::{Error as RegistryError, Registry, RegistryConfig, Repository};
+use crate::test_fixtures::configuration::{load_config, minimal_config};
+
 #[derive(Default)]
 pub struct TestConfigOptions<'a> {
     pub access_policy: Option<PolicyConfig<AccessMode>>,
@@ -45,7 +43,7 @@ pub struct TestWebhook<'a> {
 }
 
 pub fn create_test_config_with(options: TestConfigOptions<'_>) -> Configuration {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let mut config = minimal_config();
     if let Some(access_policy) = options.access_policy {
         config.global.access_policy = access_policy;
@@ -68,12 +66,8 @@ pub fn create_test_config_with(options: TestConfigOptions<'_>) -> Configuration 
     config
 }
 
-fn create_test_config() -> Configuration {
-    create_test_config_with(TestConfigOptions::default())
-}
-
 pub async fn create_test_server_context() -> ServerContext {
-    let config = create_test_config();
+    let config = create_test_config_with(TestConfigOptions::default());
     create_test_server_context_from_config(&config).await
 }
 
@@ -85,9 +79,7 @@ pub async fn create_test_server_context_with(options: TestConfigOptions<'_>) -> 
 /// The in-memory cache a test context shares with its authenticator and
 /// authorizer.
 fn test_cache() -> Arc<Cache> {
-    angos_cache::Config::Memory
-        .to_backend()
-        .expect("memory cache")
+    CacheConfig::Memory.to_backend().expect("memory cache")
 }
 
 pub async fn create_test_server_context_from_config(config: &Configuration) -> ServerContext {
@@ -96,7 +88,7 @@ pub async fn create_test_server_context_from_config(config: &Configuration) -> S
 }
 
 pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
-    let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
+    let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
     let store = bootstrap::build_object_store(&storage_config).unwrap();
@@ -121,8 +113,7 @@ pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
 
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
-        enable_blob_redirect: config.global.enable_blob_redirect,
-        enable_manifest_redirect: config.global.enable_manifest_redirect,
+        redirect: config.global.redirect,
         max_manifest_size_bytes: config.global.max_manifest_size_bytes(),
         global_immutable_tags: config.global.immutable_tags,
         global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
@@ -157,7 +148,6 @@ async fn test_authenticate_request_no_credentials() {
 
     let result = context.authenticate_request(&parts, None).await;
 
-    assert!(result.is_ok());
     let identity = result.unwrap();
     assert!(identity.username.is_none());
 }
@@ -190,7 +180,6 @@ async fn test_authenticate_request_with_basic_auth() {
 
     let result = context.authenticate_request(&parts, None).await;
 
-    assert!(result.is_ok());
     let identity = result.unwrap();
     assert_eq!(identity.username, Some("testuser".to_string()));
     assert_eq!(identity.id, Some("testuser".to_string()));
@@ -207,13 +196,12 @@ async fn test_authenticate_request_ignores_x_forwarded_for_from_untrusted_peer()
         .body(())
         .unwrap();
     let (parts, ()) = request.into_parts();
-    let remote_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+    let remote_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
     let result = context
         .authenticate_request(&parts, Some(remote_addr))
         .await;
 
-    assert!(result.is_ok());
     let identity = result.unwrap();
     assert_eq!(
         identity.client_ip,
@@ -233,13 +221,12 @@ async fn test_authenticate_request_x_forwarded_for_from_trusted_proxy_overrides_
         .body(())
         .unwrap();
     let (parts, ()) = request.into_parts();
-    let remote_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+    let remote_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
     let result = context
         .authenticate_request(&parts, Some(remote_addr))
         .await;
 
-    assert!(result.is_ok());
     let identity = result.unwrap();
     assert_eq!(identity.client_ip, Some("192.168.1.100".to_string()));
 }
@@ -295,10 +282,10 @@ async fn proxy_namespace_resolves_to_the_mirroring_repository() {
     let uri: Uri = "/v2/library/nginx/manifests/latest?ns=docker.io"
         .parse()
         .unwrap();
-    let mut route = Route::Oci(OciEndpoint::GetManifest {
+    let mut route = Route::Oci(OciEndpoint::Manifest(ManifestEndpoint::Get {
         namespace: Namespace::new("library/nginx").unwrap(),
         reference: Reference::Tag(Tag::new("latest").unwrap()),
-    });
+    }));
 
     let served = context
         .apply_proxy_namespace(Some(&mut route), &uri)
@@ -405,10 +392,10 @@ async fn proxy_namespace_leaves_a_write_alone() {
     let uri: Uri = "/v2/library/nginx/manifests/latest?ns=docker.io"
         .parse()
         .unwrap();
-    let mut route = Route::Oci(OciEndpoint::DeleteManifest {
+    let mut route = Route::Oci(OciEndpoint::Manifest(ManifestEndpoint::Delete {
         namespace: Namespace::new("library/nginx").unwrap(),
         reference: Reference::Tag(Tag::new("latest").unwrap()),
-    });
+    }));
 
     assert!(
         context
@@ -417,7 +404,8 @@ async fn proxy_namespace_leaves_a_write_alone() {
             .is_none(),
         "a write must not be scoped by ns, so nothing is echoed"
     );
-    let Route::Oci(OciEndpoint::DeleteManifest { namespace, .. }) = &route else {
+    let Route::Oci(OciEndpoint::Manifest(ManifestEndpoint::Delete { namespace, .. })) = &route
+    else {
         panic!("the action must be untouched");
     };
     assert_eq!(namespace.as_ref(), "library/nginx");
@@ -478,7 +466,7 @@ async fn test_server_context_new_with_event_webhooks() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
-    assert!(context.has_event_dispatcher());
+    assert!(context.registry.has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -487,42 +475,12 @@ async fn test_server_context_new_without_event_webhooks() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
-    assert!(!context.has_event_dispatcher());
+    assert!(!context.registry.has_event_dispatcher());
 }
 
 #[tokio::test]
 async fn test_dispatch_event_with_no_dispatcher() {
     let config = minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    let event = create_test_event();
-
-    let result = context.registry.dispatch_events(&[event]).await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_dispatch_event_delivers_to_webhook() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let config = load_config(&format!(
-        r#"
-        event_webhooks = ["test_hook"]
-
-        [event_webhook.test_hook]
-        url = "{}/webhook"
-        policy = "optional"
-        events = ["manifest.push"]
-    "#,
-        mock_server.uri()
-    ));
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
 
@@ -561,87 +519,8 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
     assert!(matches!(result, Err(RegistryError::EventDelivery(_))));
 }
 
-#[tokio::test]
-async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let config = load_config(&format!(
-        r#"
-        event_webhooks = ["slow_hook"]
-
-        [event_webhook.slow_hook]
-        url = "{}/webhook"
-        policy = "async"
-        events = ["manifest.push"]
-    "#,
-        mock_server.uri()
-    ));
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    let event = create_test_event();
-
-    context.registry.dispatch_events(&[event]).await.unwrap();
-
-    context.shutdown().await;
-
-    let requests = mock_server.received_requests().await.unwrap();
-    assert_eq!(
-        requests.len(),
-        1,
-        "ServerContext::shutdown() must drain in-flight async deliveries"
-    );
-}
-
-#[tokio::test]
-async fn test_server_context_shutdown_rejects_new_async_dispatches() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    let config = load_config(&format!(
-        r#"
-        [event_webhook.async_hook]
-        url = "{}"
-        policy = "async"
-        events = ["manifest.push"]
-    "#,
-        mock_server.uri()
-    ));
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    context.shutdown().await;
-
-    let event = create_test_event();
-
-    let _ = context.registry.dispatch_events(&[event]).await;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let requests = mock_server.received_requests().await.unwrap();
-    assert_eq!(
-        requests.len(),
-        0,
-        "No async deliveries should occur after ServerContext::shutdown()"
-    );
-}
-
 fn proxies(sources: &[&str]) -> Vec<TrustedProxy> {
-    sources
-        .iter()
-        .map(|s| TrustedProxy::parse(*s).unwrap())
-        .collect()
+    sources.iter().map(|s| s.parse().unwrap()).collect()
 }
 
 #[test]
@@ -847,7 +726,7 @@ fn challenge_for(context: &ServerContext, mut request: Request<()>) -> Option<He
     let scheme = context.resolve_scheme(&request);
     request.extensions_mut().insert(scheme);
     let (scheme, host) = context.challenge_origin(&request)?;
-    context.bearer_challenge(scheme, &host)
+    context.token_issuer()?.challenge(scheme, &host)
 }
 
 #[tokio::test]

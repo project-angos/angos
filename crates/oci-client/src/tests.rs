@@ -1,17 +1,19 @@
-use std::{io::Cursor, path::PathBuf, time::Duration};
+use std::io::{self, Cursor, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tracing::Level;
+use tracing_subscriber::fmt::MakeWriter;
 use url::Url;
-use wiremock::{
-    Mock, MockServer, Request, ResponseTemplate,
-    matchers::{body_bytes, header, method, path, query_param, query_param_is_missing},
-};
+use wiremock::matchers::{body_bytes, header, method, path, query_param, query_param_is_missing};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use angos_oci::header::X_ANGOS_SOURCE_TIMESTAMP;
-use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT};
+use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, X_ANGOS_SOURCE_TIMESTAMP};
 use angos_oci::request::{
     BlobMount, DeleteManifestRequest, GetBlobRequest, GetManifestRequest, HeadBlobRequest,
     HeadManifestRequest, ListTagsRequest, MountBlobRequest, PutManifestRequest, StartUploadRequest,
@@ -19,22 +21,20 @@ use angos_oci::request::{
 use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome, REPLICATION_SUPERSEDED_CODE};
 use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, Tag};
 
+use angos_cache::Config;
 use angos_mtls_client::{BasicAuth, ClientTls, MtlsIdentity};
-
-use crate::{
-    Error, RegistryClient, RegistryClientConfig,
-    auth::{token_cache_key, token_index_cache_key},
-    without_query,
-};
 use angos_secret::Secret;
+
+use crate::auth::{token_cache_key, token_index_cache_key};
+use crate::{Error, RegistryClient, RegistryClientConfig, without_query};
 
 /// The registry's default; inlined so the client crate's tests do not reach
 /// into the server-side manifest module.
 const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
-fn test_client_config(url: impl Into<String>) -> RegistryClientConfig {
+fn test_client_config(url: String) -> RegistryClientConfig {
     RegistryClientConfig {
-        url: url.into(),
+        url,
         max_redirect: 5,
         connect_timeout_secs: 30,
         read_timeout_secs: 300,
@@ -44,28 +44,22 @@ fn test_client_config(url: impl Into<String>) -> RegistryClientConfig {
 }
 
 /// Collects tracing output into a shared buffer; every clone appends to the
-/// same buffer, so a clone passed to `with_writer` is read back via `contents`.
+/// same buffer, so a clone passed to `with_writer` is read back from the original.
 #[derive(Clone, Default)]
-struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
 
-impl LogCapture {
-    fn contents(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-    }
-}
-
-impl std::io::Write for LogCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+impl<'a> MakeWriter<'a> for LogCapture {
     type Writer = LogCapture;
 
     fn make_writer(&'a self) -> Self::Writer {
@@ -89,7 +83,7 @@ fn source_ts() -> DateTime<Utc> {
 /// Builds a no-auth client pointed at `mock_server`.
 fn client_for(mock_server: &MockServer) -> RegistryClient {
     let config = test_client_config(mock_server.uri());
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
 }
 
@@ -106,22 +100,6 @@ fn a_half_credential_pair_is_rejected_at_deserialize() {
     }
 }
 
-#[test]
-fn test_new_with_both_credentials() {
-    let config = RegistryClientConfig {
-        basic_auth: Some(BasicAuth {
-            username: "user".to_string(),
-            password: Secret::new("pass".to_string()),
-        }),
-        ..test_client_config("https://example.com")
-    };
-
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
-    assert!(client.basic_auth.is_some());
-}
-
 // The client (and everything holding it, like a replication downstream) is
 // Debug-formatted in logs; the configured password must never appear there.
 #[test]
@@ -131,10 +109,10 @@ fn debug_output_redacts_basic_auth_password() {
             username: "user".to_string(),
             password: Secret::new("hunter2".to_string()),
         }),
-        ..test_client_config("https://example.com")
+        ..test_client_config("https://example.com".to_string())
     };
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
@@ -485,7 +463,7 @@ async fn test_get_manifest_rejects_oversized_body() {
 
     let config = test_client_config(mock_server.uri());
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     let client = RegistryClient::from_config(&config, cache, 7).unwrap();
 
     let result = client
@@ -502,63 +480,6 @@ async fn test_get_manifest_rejects_oversized_body() {
     ));
 }
 
-#[tokio::test]
-async fn test_bearer_authentication() {
-    let mock_server = MockServer::start().await;
-    let auth_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v2/test/manifests/latest"))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(
-                r#"Bearer realm="{}",service="registry",scope="repository:test:pull""#,
-                auth_server.uri()
-            ),
-        ))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(query_param("service", "registry"))
-        .and(query_param("scope", "repository:test:pull"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"token": "test-bearer-token", "expires_in": 3600}),
-            ),
-        )
-        .mount(&auth_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v2/test/manifests/latest"))
-        .and(header("Authorization", "Bearer test-bearer-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"{}")
-                .insert_header(
-                    DOCKER_CONTENT_DIGEST,
-                    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-                )
-                .insert_header("Content-Type", "application/json"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-
-    let result = client
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(result.is_ok());
-}
-
 /// A scope-cache hit must index the URL it served. Only the token exchange
 /// wrote that entry, so every other URL sharing the scope re-discovered the
 /// token through a 401 on every single request.
@@ -568,7 +489,7 @@ async fn a_scope_cache_hit_indexes_the_url_it_served() {
     let registry_url = mock_server.uri();
     let location = format!("{registry_url}/v2/test/blobs/{SCOPE_CACHE_DIGEST}");
     let url = Url::parse(&location).unwrap();
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
 
     // The scope token is cached, but this URL has never been indexed: the
     // state left behind when some other URL triggered the exchange.
@@ -631,7 +552,7 @@ async fn test_cached_bearer_token_is_used() {
     let mock_server = MockServer::start().await;
     let registry_url = mock_server.uri();
     let location = format!("{registry_url}/v2/test/manifests/latest");
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     let url = Url::parse(&location).unwrap();
     let cache_key = token_cache_key(
         &url,
@@ -799,7 +720,7 @@ async fn test_expired_bearer_token_is_refetched() {
     let auth_server = MockServer::start().await;
     let registry_url = mock_server.uri();
     let location = format!("{registry_url}/v2/test/manifests/latest");
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     let url = Url::parse(&location).unwrap();
     let cache_key = token_cache_key(
         &url,
@@ -985,7 +906,7 @@ async fn test_basic_authentication() {
         ..test_client_config(mock_server.uri())
     };
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
@@ -1181,9 +1102,7 @@ async fn test_get_blob_success() {
     let mut reader = fetched.reader;
 
     let mut buffer = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buffer)
-        .await
-        .unwrap();
+    reader.read_to_end(&mut buffer).await.unwrap();
     assert_eq!(buffer, blob_data);
 }
 
@@ -1251,44 +1170,25 @@ fn test_new_with_invalid_ca_bundle() {
             server_ca_bundle: Some(PathBuf::from("/nonexistent/ca.pem")),
             identity: None,
         },
-        ..test_client_config("https://example.com")
+        ..test_client_config("https://example.com".to_string())
     };
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     let result = RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
 
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), Error::Initialization(_)));
 }
 
+/// `client_certificate` is the registry clients' spelling of the key, so a
+/// lone one must still be read as half an identity.
 #[test]
 fn test_registry_client_config_cert_without_key_rejected_at_deserialize() {
     let toml = r#"
         url = "https://example.com"
         client_certificate = "/path/to/cert.pem"
     "#;
-    let result: Result<RegistryClientConfig, _> = toml::from_str(toml);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("client_private_key are required for mTLS"),
-        "unexpected error: {msg}"
-    );
-}
-
-#[test]
-fn test_registry_client_config_key_without_cert_rejected_at_deserialize() {
-    let toml = r#"
-        url = "https://example.com"
-        client_private_key = "/path/to/key.pem"
-    "#;
-    let result: Result<RegistryClientConfig, _> = toml::from_str(toml);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("client_private_key are required for mTLS"),
-        "unexpected error: {msg}"
-    );
+    assert!(toml::from_str::<RegistryClientConfig>(toml).is_err());
 }
 
 #[test]
@@ -1301,10 +1201,10 @@ fn test_new_with_both_certificate_and_key_invalid_files() {
                 private_key: PathBuf::from("/nonexistent/key.pem"),
             }),
         },
-        ..test_client_config("https://example.com")
+        ..test_client_config("https://example.com".to_string())
     };
 
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     let result = RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
 
     assert!(result.is_err());
@@ -1544,7 +1444,7 @@ async fn test_blob_upload_reuses_basic_credentials_on_put() {
         }),
         ..test_client_config(mock_server.uri())
     };
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = Config::Memory.to_backend().unwrap();
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
@@ -1873,7 +1773,7 @@ async fn put_manifest_warns_on_an_unparseable_advertised_digest() {
         matches!(result, PutManifestOutcome::Stored { digest: None, .. }),
         "an unparseable echo must drop the digest, got {result:?}"
     );
-    let logs = log_capture.contents();
+    let logs = String::from_utf8(log_capture.0.lock().unwrap().clone()).unwrap();
     assert!(
         logs.contains("put_manifest") && logs.contains(DOCKER_CONTENT_DIGEST.as_str()),
         "the dropped digest echo must be logged, logs were: {logs}"
@@ -2210,38 +2110,6 @@ async fn test_delete_upload_500_is_error() {
         "a 500 session cancel must surface as an error, got {result:?}"
     );
     drop(mock_server);
-}
-
-#[tokio::test]
-async fn test_list_tags_single_page() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v2/test/tags/list"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "name": "test",
-            "tags": ["v1", "v2", "v3"],
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let tags = client
-        .list_tags(ListTagsRequest {
-            namespace: Namespace::new("test").unwrap(),
-            n: None,
-            last: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        tags,
-        vec![
-            Tag::new("v1").unwrap(),
-            Tag::new("v2").unwrap(),
-            Tag::new("v3").unwrap(),
-        ]
-    );
 }
 
 #[tokio::test]

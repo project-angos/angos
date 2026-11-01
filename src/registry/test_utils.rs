@@ -1,52 +1,52 @@
-use std::{collections::HashMap, io::Cursor, path::PathBuf, sync::Arc};
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use bytesize::ByteSize;
-use http::{
-    Response,
-    header::{HeaderName, HeaderValue},
-};
+use http::Response;
+use http::header::{HeaderName, HeaderValue};
 use http_body_util::BodyExt;
-use serde_json::json;
+use reqwest::Client;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use angos_cache::Config as CacheConfig;
+use angos_oci::header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID};
+use angos_oci::http_range::RequestRange;
+use angos_oci::request::{CompleteUploadRequest, GetBlobRequest, GetReferrersRequest};
 use angos_oci::{
     Descriptor, Digest, Manifest, MediaRange, MediaType, Namespace, Tag, UploadSessionId,
-    header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID},
-    http_range::RequestRange,
-    request::{CompleteUploadRequest, GetBlobRequest, GetReferrersRequest},
 };
 use angos_oci_client::RegistryClient;
-use angos_s3_client::{
-    Backend as S3HttpBackend,
-    test_util::{TEST_ACCESS_KEY, TEST_BUCKET, TEST_REGION, TEST_SECRET_KEY, test_endpoint},
+use angos_s3_client::Backend as S3HttpBackend;
+use angos_s3_client::test_util::{
+    TEST_ACCESS_KEY, TEST_BUCKET, TEST_REGION, TEST_SECRET_KEY, test_endpoint,
 };
 use angos_secret::Secret;
-use angos_storage::{
-    ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
-};
+use angos_storage::ObjectStore;
+use angos_storage::fs::Backend as StorageFsBackend;
+use angos_storage::s3::Backend as StorageS3Backend;
 use angos_transport::ResponseBody;
 
-use crate::{
-    configuration::{GlobalConfig, RegexPattern},
-    jobs::{
-        Queue,
-        store::{ClaimMode, JobStore},
-    },
-    metrics_provider,
-    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
-    registry::{
-        Error, Registry, RegistryConfig, Repository,
-        blob_store::{self, BlobStore, BlobStoreConfig},
-        keys::NamespaceKeys,
-        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        metadata_store::{LinkKind, MetadataStore, Settings},
-        repository_resolver::RepositoryResolver,
-        s3_connection::S3ConnectionConfig,
-    },
-    replication::{ReplicationDownstream, ReplicationJob},
+use crate::configuration::{GlobalConfig, RegexPattern};
+use crate::jobs::Queue;
+use crate::jobs::store::{ClaimMode, JobStore};
+use crate::metrics_provider;
+use crate::policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock};
+use crate::registry::blob_store::{
+    BlobStore, BlobStoreConfig, FsBackendConfig, S3BackendConfig, TransportFields,
 };
+use crate::registry::keys::NamespaceExt;
+use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+use crate::registry::metadata_store::{LinkKind, MetadataStore, Settings};
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::registry::s3_connection::S3ConnectionConfig;
+use crate::registry::{Error, Registry, RegistryConfig, Repository};
+use crate::replication::{ReplicationDownstream, ReplicationJob};
 
 /// Connection to the live S3 test backend, single-sourced from the s3-client
 /// fixtures so credentials, bucket, and the endpoint override live in one place.
@@ -72,14 +72,14 @@ pub struct FsTestStack {
 }
 
 pub fn fs_test_stack() -> FsTestStack {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
     let dir = TempDir::new().expect("temp dir for fs test stack");
     let metadata_store = Arc::new(MetadataStore::new(
-        Arc::new(StorageFsBackend::builder(dir.path().join("meta")).build()),
+        Arc::new(StorageFsBackend::builder(&dir.path().join("meta")).build()),
         Settings::default(),
     ));
     let blob_store = Arc::new(BlobStore::new(
-        Arc::new(StorageFsBackend::builder(dir.path().join("blob")).build()),
+        Arc::new(StorageFsBackend::builder(&dir.path().join("blob")).build()),
         None,
     ));
     FsTestStack {
@@ -133,7 +133,7 @@ pub fn test_job_store(metadata_store: &MetadataStore) -> Arc<JobStore> {
 }
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
-    metrics_provider::init_for_tests();
+    metrics_provider::initialize_metrics();
 
     let mut repositories = HashMap::new();
     repositories.insert(
@@ -166,8 +166,7 @@ pub fn create_test_registry_with(
 
     let config = RegistryConfig {
         update_pull_time: global.update_pull_time,
-        enable_blob_redirect: global.enable_blob_redirect,
-        enable_manifest_redirect: global.enable_manifest_redirect,
+        redirect: global.redirect,
         max_manifest_size_bytes: global.max_manifest_size_bytes(),
         max_blob_size_bytes: global.max_blob_size_bytes(),
         validate_manifest_references,
@@ -242,20 +241,6 @@ pub async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[
     digest
 }
 
-/// Seed `content` through the blob store, the one production reads bodies from.
-/// Seeding through the metadata store's object store instead only resolves when
-/// both share a root, which hides a split-backend bug.
-pub async fn put_blob_body(blob_store: &BlobStore, content: &[u8]) -> Digest {
-    let digest = Digest::sha256_of_bytes(content);
-    blob_store
-        .put_blob(&digest, Bytes::copy_from_slice(content))
-        .await
-        .unwrap();
-    digest
-}
-
-/// Write `content` at the canonical blob path through the raw `ObjectStore`,
-/// with no upload state machine and no namespace.
 /// Test seeding: make each `(link, target)` exist, through the same write the
 /// repair path uses. Batching is a fixture convenience; the store itself only
 /// ever writes one key at a time.
@@ -300,28 +285,16 @@ pub async fn drop_links(
     Ok(())
 }
 
-pub async fn create_link(
-    m: &Arc<MetadataStore>,
-    namespace: &str,
-    link: &LinkKind,
-    digest: &Digest,
-) {
+pub async fn create_link(m: &MetadataStore, namespace: &str, link: &LinkKind, digest: &Digest) {
     let namespace = Namespace::new(namespace).unwrap();
     seed_links(m, &namespace, &[(link.clone(), digest.clone())])
         .await
         .unwrap();
 }
 
-/// A metadata store of its own over the live S3 test backend, under a key
-/// prefix no other test shares.
-pub fn s3_metadata_store() -> Arc<MetadataStore> {
-    metrics_provider::init_for_tests();
-    let connection = s3_test_connection(format!("test-backend-{}", Uuid::new_v4()));
-    let http =
-        Arc::new(S3HttpBackend::new(&connection.to_client_config()).expect("s3 http client"));
-    metadata_store_over(Arc::new(StorageS3Backend::builder(http).build()))
-}
-
+/// Seed `content` through the blob store, the one production reads bodies from.
+/// Seeding through the metadata store's object store instead only resolves when
+/// both share a root, which hides a split-backend bug.
 pub async fn put_blob_direct(blob_store: &BlobStore, content: &[u8]) -> Digest {
     let digest = Digest::sha256_of_bytes(content);
     blob_store
@@ -370,7 +343,7 @@ pub async fn create_test_blob(
     namespace: &Namespace,
     content: &[u8],
 ) -> (Digest, Repository) {
-    let digest = put_blob_body(registry.blob_store.as_ref(), content).await;
+    let digest = put_blob_direct(&registry.blob_store, content).await;
 
     let tag_link = LinkKind::Tag(Tag::new("latest").unwrap());
     let layer_link = LinkKind::ReferencedBy(digest.clone());
@@ -399,7 +372,7 @@ pub async fn create_test_blob(
     (digest, repository)
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait(?Send)]
 pub trait RegistryTestCase {
     fn name(&self) -> &'static str;
     fn registry(&self) -> &Registry;
@@ -431,7 +404,7 @@ impl FSRegistryTestCase {
         let blob_path = temp_dir.path().join("blob");
         let meta_path = temp_dir.path().join("meta");
 
-        let config = BlobStoreConfig::FS(blob_store::FsBackendConfig {
+        let config = BlobStoreConfig::FS(FsBackendConfig {
             root_dir: blob_path,
             sync_to_disk: false,
         });
@@ -486,7 +459,7 @@ impl FSRegistryTestCase {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait(?Send)]
 impl RegistryTestCase for FSRegistryTestCase {
     fn name(&self) -> &'static str {
         "fs"
@@ -519,17 +492,17 @@ impl S3RegistryTestCase {
         let blob_connection = s3_test_connection(format!("{key_prefix}/blob"));
         let meta_connection = s3_test_connection(format!("{key_prefix}/meta"));
 
-        let s3_config = blob_store::S3BackendConfig {
+        let s3_config = S3BackendConfig {
             connection: blob_connection,
-            transport: blob_store::TransportFields {
+            transport: TransportFields {
                 multipart_copy_threshold: ByteSize::mib(5),
                 multipart_copy_chunk_size: ByteSize::mib(5),
                 multipart_part_size: ByteSize::mib(5),
-                ..blob_store::TransportFields::default()
+                ..TransportFields::default()
             },
         };
         let blob_store = Arc::new(
-            BlobStoreConfig::S3(s3_config)
+            BlobStoreConfig::S3(Box::new(s3_config))
                 .build_backend()
                 .expect("s3 blob backend"),
         );
@@ -552,7 +525,7 @@ impl S3RegistryTestCase {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait(?Send)]
 impl RegistryTestCase for S3RegistryTestCase {
     fn name(&self) -> &'static str {
         "s3"
@@ -587,10 +560,10 @@ impl RegistryTestCase for S3RegistryTestCase {
 /// A `RegistryClient` pointed at `uri` with a fresh in-memory cache; callers
 /// pass a placeholder URI when the client is never dialed.
 pub fn downstream_client(uri: &str) -> Arc<RegistryClient> {
-    let backend = angos_cache::Config::Memory.to_backend().unwrap();
+    let backend = CacheConfig::Memory.to_backend().unwrap();
     Arc::new(RegistryClient::new(
         uri.to_string(),
-        reqwest::Client::new(),
+        Client::new(),
         None,
         backend,
         DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -640,11 +613,7 @@ pub async fn sole_pending_payload(job_store: &JobStore) -> ReplicationJob {
         .list_pending(Queue::Replication, 16)
         .await
         .unwrap();
-    assert_eq!(
-        keys.len(),
-        1,
-        "expected exactly one pending replication job"
-    );
+    assert_eq!(keys.len(), 1, "pending replication jobs: {keys:?}");
     let envelope = job_store
         .read_pending(Queue::Replication, &keys[0])
         .await
@@ -763,6 +732,6 @@ pub async fn response_body(response: Response<ResponseBody>) -> Vec<u8> {
 }
 
 /// The JSON body a listing response served.
-pub async fn response_json(response: Response<ResponseBody>) -> serde_json::Value {
+pub async fn response_json(response: Response<ResponseBody>) -> Value {
     serde_json::from_slice(&response_body(response).await).expect("the body must be JSON")
 }

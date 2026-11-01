@@ -1,23 +1,25 @@
 //! The layer index job handler: walks a layer's tar stream and stores its
 //! listing.
 
-use std::{io, sync::Arc};
+use std::io;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::runtime::Handle;
+use tokio::task::spawn_blocking;
 use tokio_util::io::SyncIoBridge;
 use tracing::{debug, info};
 
 use angos_inflate::Checkpoint;
 use angos_oci::Digest;
 
-use crate::{
-    jobs::store::{Error, JobEnvelope, JobHandler},
-    layer::{
-        CHUNK_ENTRIES, Checkpoints, INDEX_LAYER_KIND, IndexLayerPayload, IndexLimits, index_stream,
-    },
-    registry::{Error as RegistryError, blob_store::BlobStore, metadata_store::MetadataStore},
+use crate::jobs::store::{Error, JobEnvelope, JobHandler};
+use crate::layer::{
+    CHUNK_ENTRIES, Checkpoints, INDEX_LAYER_KIND, IndexLayerPayload, IndexLimits, index_stream,
 };
+use crate::registry::Error as RegistryError;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::MetadataStore;
 
 pub struct IndexLayerJobHandler {
     blob_store: Arc<BlobStore>,
@@ -73,18 +75,17 @@ impl IndexLayerJobHandler {
                 .block_on(store.put_checkpoints(&layer, chunk, &checkpoints))
                 .map_err(io::Error::other)
         };
-        let (listing, entries) = tokio::task::spawn_blocking(move || {
-            index_stream(SyncIoBridge::new(reader), limits, store_chunk)
-        })
-        .await
-        .map_err(|e| Error::Execution(format!("index task failed: {e}")))?
-        .map_err(|e| match e.kind() {
-            // The same bytes pass the same limits on every attempt.
-            io::ErrorKind::FileTooLarge => {
-                Error::Terminal(format!("layer {digest} is too large to index: {e}"))
-            }
-            _ => Error::Execution(format!("indexing layer {digest} failed: {e}")),
-        })?;
+        let (listing, entries) =
+            spawn_blocking(move || index_stream(SyncIoBridge::new(reader), limits, store_chunk))
+                .await
+                .map_err(|e| Error::Execution(format!("index task failed: {e}")))?
+                .map_err(|e| match e.kind() {
+                    // The same bytes pass the same limits on every attempt.
+                    io::ErrorKind::FileTooLarge => {
+                        Error::Terminal(format!("layer {digest} is too large to index: {e}"))
+                    }
+                    _ => Error::Execution(format!("indexing layer {digest} failed: {e}")),
+                })?;
         for (chunk, entries) in entries.chunks(CHUNK_ENTRIES).enumerate() {
             self.metadata_store
                 .put_entries(digest, chunk, entries)

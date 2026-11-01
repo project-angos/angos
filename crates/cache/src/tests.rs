@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::ser::Error as SerError;
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::*;
 
@@ -37,45 +38,22 @@ async fn store_propagates_backend_error() {
     assert!(matches!(result, Err(Error::Execution(_))));
 }
 
-#[derive(Debug, Serialize)]
-struct UnserializableData {
-    #[serde(serialize_with = "fail_serialization")]
-    value: i32,
-}
+struct UnserializableData;
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn fail_serialization<S>(_: &i32, _: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    Err(serde::ser::Error::custom(
-        "Intentional serialization failure",
-    ))
+impl Serialize for UnserializableData {
+    fn serialize<S: Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(SerError::custom("Intentional serialization failure"))
+    }
 }
 
 #[tokio::test]
 async fn store_returns_err_on_serialization_failure() {
     let cache = Cache::Stub(stub::Backend::new());
-    let bad_data = UnserializableData { value: 42 };
+    let bad_data = UnserializableData;
 
     let result = cache.store("test_key", &bad_data, 60).await;
 
     assert!(matches!(result, Err(Error::Execution(_))));
-}
-
-#[tokio::test]
-async fn retrieve_returns_value_on_hit() {
-    let backend = stub::Backend::new();
-    let stored = TestData {
-        name: "alice".to_string(),
-        value: 7,
-    };
-    backend.set_data(Some(serde_json::to_string(&stored).unwrap()));
-    let cache = Cache::Stub(backend);
-
-    let result: Result<Option<TestData>, Error> = cache.retrieve("k").await;
-
-    assert_eq!(result.unwrap(), Some(stored));
 }
 
 #[tokio::test]

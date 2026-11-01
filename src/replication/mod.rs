@@ -1,7 +1,8 @@
 //! Bi-directional replication of OCI artifacts to per-repository downstreams.
 
-/// Single queue carries every replication job; the downstream is encoded in the
-/// `lock_key` and payload.
+// Single queue carries every replication job; the downstream is encoded in the
+// `lock_key` and payload.
+
 /// Push a manifest (and everything it references) to a downstream.
 pub const REPLICATION_PUSH_MANIFEST_KIND: &str = "replication.push_manifest";
 /// Delete a manifest on a downstream.

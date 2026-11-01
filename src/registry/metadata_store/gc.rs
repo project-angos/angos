@@ -29,7 +29,9 @@ use angos_backoff::Backoff;
 use angos_oci::Digest;
 use angos_storage::Error as StorageError;
 
-use crate::registry::{Error, keys::GC_ROOT, metadata_store::MetadataStore};
+use crate::registry::Error;
+use crate::registry::keys::GC_ROOT;
+use crate::registry::metadata_store::MetadataStore;
 
 /// Attempts and jittered backoff for a writer waiting out a collector run; a
 /// run only covers one batch, so the wait is short.
@@ -46,12 +48,6 @@ pub struct GcRun {
     pub end: Digest,
     pub expires_at: DateTime<Utc>,
     pub instance: String,
-}
-
-/// One collector run's range marker: the only key a writer and the collector
-/// both consult.
-fn gc_run_path(run: &str) -> String {
-    format!("{GC_ROOT}/{run}")
 }
 
 /// A held claim: the marker key plus the token that proves ownership on
@@ -82,7 +78,7 @@ impl MetadataStore {
     pub async fn gc_blocked(&self, digests: &[&Digest]) -> Result<bool, Error> {
         let mut runs = self.object_store().list_all(GC_ROOT);
         while let Some(run) = runs.try_next().await? {
-            let key = gc_run_path(&run);
+            let key = format!("{GC_ROOT}/{run}");
             let raw = match self.object_store().get(&key).await {
                 Ok(raw) => raw,
                 // Released between the listing and the read.
@@ -129,7 +125,7 @@ impl MetadataStore {
     /// because safety rests on [`Self::gc_refresh`], not on the timer.
     async fn gc_claim(&self, start: &Digest, end: &Digest) -> Result<GcClaim, Error> {
         let claim = GcClaim {
-            key: gc_run_path(&Uuid::new_v4().to_string()),
+            key: format!("{GC_ROOT}/{}", Uuid::new_v4()),
             instance: Uuid::new_v4().to_string(),
             start: start.clone(),
             end: end.clone(),
@@ -224,19 +220,13 @@ mod tests {
 
     use angos_oci::{Digest, MediaType, Namespace, Reference, Tag, UploadSessionId};
 
-    use crate::{
-        command::maintenance::{
-            action::Action,
-            executor::{ActionSink, Executor},
-        },
-        registry::{
-            Error,
-            blob_ownership::{GrantOutcome, grant_existing, promote_and_grant},
-            keys::{DigestKeys, GC_ROOT, NamespaceKeys},
-            metadata_store::{LinkKind, MetadataStore, Settings},
-            test_utils::{FSRegistryTestCase, RegistryTestCase, upload_blob},
-        },
-    };
+    use crate::command::maintenance::action::Action;
+    use crate::command::maintenance::executor::{ActionSink, Executor};
+    use crate::registry::Error;
+    use crate::registry::blob_ownership::{GrantOutcome, grant_existing, promote_and_grant};
+    use crate::registry::keys::{DigestExt, GC_ROOT, NamespaceExt};
+    use crate::registry::metadata_store::{LinkKind, MetadataStore, Settings};
+    use crate::registry::test_utils::{FSRegistryTestCase, RegistryTestCase, upload_blob};
     /// How long a released marker keeps blocking `store`, as a std duration
     /// to sleep on.
     fn linger(store: &MetadataStore) -> Duration {

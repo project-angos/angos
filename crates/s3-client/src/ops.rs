@@ -11,27 +11,24 @@
 //! "collect-the-whole-thing" wrappers stream into a single `Bytes` allocation
 //! sized from the `Content-Length` header so there is no resize churn.
 
-use std::{io, time::Duration};
+use std::io;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{Stream, StreamExt, TryStreamExt, stream};
-use reqwest::{
-    Method,
-    header::{HeaderMap, HeaderName},
-};
+use reqwest::Method;
+use reqwest::header::{HeaderMap, HeaderName};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
 
-use crate::{
-    Backend, Error,
-    client::{
-        QueryParam, S3Error, S3Response, SendOpts, content_length as parse_content_length,
-        content_md5_base64, copy_source, header_string, insert_header, last_modified, range_header,
-    },
-    xml,
+use crate::client::{
+    QueryParam, S3Error, S3Response, SendOpts, content_length as parse_content_length,
+    content_md5_base64, copy_source, header_string, insert_header, last_modified, range_header,
 };
+use crate::xml::{self, ListObjectsV2Output};
+use crate::{Backend, Error};
 
 const MAX_MULTIPART_COPY_PARTS: u32 = 10_000;
 
@@ -50,6 +47,37 @@ pub struct UploadedPart {
     pub part_number: u32,
     pub e_tag: String,
     pub size: u64,
+}
+
+/// What [`Backend::head_object`] reads off an object.
+#[derive(Debug)]
+pub struct ObjectHead {
+    pub size: u64,
+    pub last_modified: Option<DateTime<Utc>>,
+}
+
+/// One page of [`Backend::list_prefixes`], names relative to the listed path.
+#[derive(Debug)]
+pub struct PrefixListing {
+    pub prefixes: Vec<String>,
+    pub objects: Vec<String>,
+    pub next_token: Option<String>,
+}
+
+/// One page of [`Backend::list_objects`], keys relative to the listed path.
+#[derive(Debug)]
+pub struct ObjectListing {
+    pub keys: Vec<String>,
+    pub next_token: Option<String>,
+}
+
+/// One page of [`Backend::list_multipart_uploads`]; both markers are `None`
+/// once the listing is exhausted.
+#[derive(Debug)]
+pub struct MultipartUploadListing {
+    pub uploads: Vec<MultipartUpload>,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<String>,
 }
 
 /// Summary of one in-progress multipart upload returned by
@@ -112,29 +140,24 @@ impl Backend {
     /// Forwards [`Error`] from the underlying `HEAD`: HTTP failures,
     /// S3 protocol errors (404 ⇒ `NotFound`), or a tripped circuit breaker.
     pub async fn object_size(&self, path: &str) -> Result<u64, Error> {
-        self.head_object(path).await.map(|(size, _, _)| size)
+        self.head_object(path).await.map(|head| head.size)
     }
 
-    /// Single HEAD request returning size, `ETag`, and last-modified together,
-    /// avoiding a redundant follow-up `GET` when the caller needs all three.
+    /// Single HEAD request returning size and last-modified together, avoiding a
+    /// redundant follow-up `GET` when the caller needs both.
     ///
     /// # Errors
     /// Forwards [`Error`] from the underlying `HEAD`: HTTP failures,
     /// S3 protocol errors (404 ⇒ `NotFound`), missing/unparseable
     /// `Content-Length`, or a tripped circuit breaker.
-    pub async fn head_object(
-        &self,
-        path: &str,
-    ) -> Result<(u64, Option<String>, Option<DateTime<Utc>>), Error> {
+    pub async fn head_object(&self, path: &str) -> Result<ObjectHead, Error> {
         self.send_guarded(
             S3Request::new(Method::HEAD, self.full_key(path)),
             |response| {
-                let size = parse_content_length(&response.headers).map_err(io::Error::other)?;
-                Ok((
-                    size,
-                    header_string(&response.headers, "etag"),
-                    last_modified(&response.headers),
-                ))
+                Ok(ObjectHead {
+                    size: parse_content_length(&response.headers).map_err(io::Error::other)?,
+                    last_modified: last_modified(&response.headers),
+                })
             },
         )
         .await
@@ -174,10 +197,10 @@ impl Backend {
     /// # Errors
     /// Forwards [`Error`] from the underlying `PUT`: HTTP failures,
     /// S3 protocol errors, or a tripped circuit breaker.
-    pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), Error> {
+    pub async fn put_object(&self, path: &str, data: Bytes) -> Result<(), Error> {
         self.send_guarded(
             S3Request {
-                body: data.into(),
+                body: data,
                 ..S3Request::new(Method::PUT, self.full_key(path))
             },
             |_| Ok(()),
@@ -200,16 +223,12 @@ impl Backend {
     /// Returns [`Error::PreconditionFailed`] when an object already exists
     /// at `path`; otherwise forwards HTTP / S3 protocol errors as
     /// [`Error::Io`].
-    pub async fn put_object_if_not_exists(
-        &self,
-        path: &str,
-        data: impl Into<Bytes>,
-    ) -> Result<(), Error> {
+    pub async fn put_object_if_not_exists(&self, path: &str, data: Bytes) -> Result<(), Error> {
         let headers = single_header("if-none-match", "*").map_err(|e| Error::Io(e.to_string()))?;
         self.send_guarded(
             S3Request {
                 headers,
-                body: data.into(),
+                body: data,
                 opts: SendOpts {
                     non_idempotent: true,
                     ..SendOpts::default()
@@ -289,7 +308,7 @@ impl Backend {
         source_size: u64,
     ) -> Result<Vec<UploadedPart>, Error> {
         let ranges = copy_part_ranges(source_size, self.multipart_copy_chunk_size)?;
-        let mut parts = stream::iter(ranges)
+        let mut parts: Vec<UploadedPart> = stream::iter(ranges)
             .map(|range| async move {
                 let e_tag = self
                     .upload_part_copy(
@@ -307,7 +326,7 @@ impl Backend {
                 })
             })
             .buffer_unordered(self.multipart_copy_jobs.max(1))
-            .try_collect::<Vec<_>>()
+            .try_collect()
             .await?;
         parts.sort_by_key(|p| p.part_number);
         Ok(parts)
@@ -381,20 +400,20 @@ impl Backend {
         continuation_token: Option<String>,
         delimiter: Option<&str>,
         start_after: Option<String>,
-    ) -> Result<xml::ListObjectsV2Output, Error> {
+    ) -> Result<ListObjectsV2Output, Error> {
         let mut query = vec![
             QueryParam::new("list-type", "2"),
             QueryParam::new("prefix", full_prefix),
-            QueryParam::new("max-keys", max_keys.to_string()),
+            QueryParam::new("max-keys", &max_keys.to_string()),
         ];
         if let Some(d) = delimiter {
             query.push(QueryParam::new("delimiter", d));
         }
         if let Some(token) = continuation_token {
-            query.push(QueryParam::new("continuation-token", token));
+            query.push(QueryParam::new("continuation-token", &token));
         }
         if let Some(start_after) = start_after {
-            query.push(QueryParam::new("start-after", start_after));
+            query.push(QueryParam::new("start-after", &start_after));
         }
 
         self.send_guarded(
@@ -421,7 +440,7 @@ impl Backend {
         max_keys: u16,
         continuation_token: Option<String>,
         start_after: Option<String>,
-    ) -> Result<(Vec<String>, Vec<String>, Option<String>), Error> {
+    ) -> Result<PrefixListing, Error> {
         let full_prefix = ensure_trailing_slash(self.full_key(path));
         let full_start_after = start_after.map(|s| format!("{full_prefix}{s}"));
 
@@ -435,7 +454,7 @@ impl Backend {
             )
             .await?;
 
-        let prefixes = res
+        let prefixes: Vec<String> = res
             .common_prefixes
             .into_iter()
             .filter_map(|p| {
@@ -447,13 +466,16 @@ impl Backend {
                 })
             })
             .collect();
-        let objects = res
+        let objects: Vec<String> = res
             .contents
             .into_iter()
             .filter_map(|key| key.strip_prefix(&full_prefix).map(str::to_string))
             .collect();
-        let next_token = res.next_continuation_token;
-        Ok((prefixes, objects, next_token))
+        Ok(PrefixListing {
+            prefixes,
+            objects,
+            next_token: res.next_continuation_token,
+        })
     }
 
     /// `start_after` is a path-relative key the listing starts strictly after,
@@ -469,7 +491,7 @@ impl Backend {
         max_keys: u16,
         continuation_token: Option<String>,
         start_after: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
+    ) -> Result<ObjectListing, Error> {
         let full_prefix = ensure_trailing_slash(self.full_key(path));
         let full_start_after = start_after.map(|s| format!("{full_prefix}{s}"));
         let res = self
@@ -481,7 +503,7 @@ impl Backend {
                 full_start_after,
             )
             .await?;
-        let objects = res
+        let keys = res
             .contents
             .into_iter()
             .map(|key| {
@@ -491,8 +513,10 @@ impl Backend {
                     .to_string()
             })
             .collect();
-        let next_token = res.next_continuation_token;
-        Ok((objects, next_token))
+        Ok(ObjectListing {
+            keys,
+            next_token: res.next_continuation_token,
+        })
     }
 }
 
@@ -654,12 +678,12 @@ impl Backend {
         prefix: Option<&str>,
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
-    ) -> Result<(Vec<MultipartUpload>, Option<String>, Option<String>), Error> {
+    ) -> Result<MultipartUploadListing, Error> {
         // Always scoped: an unprefixed listing returns the bucket's uploads,
         // which on a shared bucket are another tenant's keys.
         let mut query = vec![
             QueryParam::marker("uploads"),
-            QueryParam::new("prefix", self.full_key(prefix.unwrap_or_default())),
+            QueryParam::new("prefix", &self.full_key(prefix.unwrap_or_default())),
         ];
         if let Some(m) = key_marker {
             query.push(QueryParam::new("key-marker", m));
@@ -694,11 +718,11 @@ impl Backend {
             })
             .collect();
 
-        Ok((
+        Ok(MultipartUploadListing {
             uploads,
-            parsed.next_key_marker,
-            parsed.next_upload_id_marker,
-        ))
+            next_key_marker: parsed.next_key_marker,
+            next_upload_id_marker: parsed.next_upload_id_marker,
+        })
     }
 
     /// # Errors
@@ -716,7 +740,7 @@ impl Backend {
         loop {
             let mut query = vec![QueryParam::new("uploadId", upload_id)];
             if let Some(marker) = part_number_marker {
-                query.push(QueryParam::new("part-number-marker", marker.to_string()));
+                query.push(QueryParam::new("part-number-marker", &marker.to_string()));
             }
             let parsed = self
                 .send_guarded(
@@ -839,7 +863,7 @@ fn single_header(name: &'static str, value: &str) -> Result<HeaderMap, S3Error> 
 
 fn part_query(upload_id: &str, part_number: u32) -> Vec<QueryParam> {
     vec![
-        QueryParam::new("partNumber", part_number.to_string()),
+        QueryParam::new("partNumber", &part_number.to_string()),
         QueryParam::new("uploadId", upload_id),
     ]
 }
@@ -863,28 +887,23 @@ fn ensure_trailing_slash(mut s: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::SocketAddr,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Instant,
-    };
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use bytesize::ByteSize;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        time::sleep,
-    };
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, query_param},
-    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::spawn;
+    use tokio::time::sleep;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::{BackendConfig, client::content_md5_base64, test_util::mock_config};
+    use crate::BackendConfig;
+    use crate::client::content_md5_base64;
+    use crate::test_util::mock_config;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -962,9 +981,7 @@ mod tests {
 
     #[test]
     fn copy_part_ranges_covers_source_without_gaps() {
-        let ranges = copy_part_ranges(12 * MIB, 5 * MIB)
-            .unwrap()
-            .collect::<Vec<_>>();
+        let ranges: Vec<CopyPartRange> = copy_part_ranges(12 * MIB, 5 * MIB).unwrap().collect();
         assert_eq!(ranges.len(), 3);
         assert_eq!((ranges[0].start, ranges[0].end), (0, 5 * MIB - 1));
         assert_eq!((ranges[1].start, ranges[1].end), (5 * MIB, 10 * MIB - 1));
@@ -1413,14 +1430,14 @@ mod tests {
     async fn trickling_body_server(body: &'static [u8]) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0u8; 1024];
             let _ = socket.read(&mut request).await;
             let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
             socket.write_all(head.as_bytes()).await.unwrap();
             for byte in body {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                sleep(Duration::from_millis(300)).await;
                 socket.write_all(&[*byte]).await.unwrap();
                 socket.flush().await.unwrap();
             }
@@ -1458,7 +1475,7 @@ mod tests {
     async fn a_stalled_streaming_download_still_fails() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0u8; 1024];
             let _ = socket.read(&mut request).await;
@@ -1468,7 +1485,7 @@ mod tests {
                 .unwrap();
             socket.flush().await.unwrap();
             // Never sends the body.
-            tokio::time::sleep(Duration::from_mins(1)).await;
+            sleep(Duration::from_mins(1)).await;
         });
 
         let backend = Backend::new(&fast_retry_config(format!("http://{addr}"))).unwrap();
@@ -1483,7 +1500,7 @@ mod tests {
             .await
             .expect_err("a stalled body must not hang forever");
 
-        assert_eq!(error.kind(), std::io::ErrorKind::Other, "got: {error:?}");
+        assert_eq!(error.kind(), io::ErrorKind::Other, "got: {error:?}");
     }
 
     /// The collected body is bounded by the length the response declares, so
@@ -1494,7 +1511,7 @@ mod tests {
     async fn a_body_longer_than_its_declared_length_is_truncated() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = vec![0u8; 1024];
                 let _ = socket.read(&mut request).await;
@@ -1585,7 +1602,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let counted = attempts.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 counted.fetch_add(1, Ordering::SeqCst);
                 let mut request = vec![0u8; 1024];

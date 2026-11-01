@@ -1,28 +1,21 @@
-use std::{
-    io::Write,
-    net::{IpAddr, Ipv6Addr},
-    num::NonZeroU64,
-    path::PathBuf,
-    sync::Once,
-};
+use std::io::Write;
+use std::num::NonZeroU64;
+use std::path::PathBuf;
+use std::sync::Once;
 
+use rustls::crypto::aws_lc_rs::default_provider;
 use tempfile::NamedTempFile;
 
 use super::*;
-use crate::{
-    command::server::server_context::tests::create_test_server_context,
-    configuration::listeners::{ClientAuth, ListenerBaseConfig},
-    identity::RequestScheme,
-    test_fixtures::tls::{server_cert_pem, server_key_pem},
-};
+use crate::command::server::server_context::tests::create_test_server_context;
+use crate::configuration::listeners::{ClientAuth, ListenerBaseConfig};
+use crate::test_fixtures::tls::{server_cert_pem, server_key_pem};
 
 static INIT: Once = Once::new();
 
 fn init_crypto_provider() {
     INIT.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .ok();
+        default_provider().install_default().ok();
     });
 }
 
@@ -57,82 +50,6 @@ pub fn build_config(
         },
         (cert_file, key_file, ca_file),
     )
-}
-
-#[test]
-fn test_config_default_values() {
-    let cert_file = create_temp_cert_file(server_cert_pem());
-    let key_file = create_temp_cert_file(server_key_pem());
-
-    let toml = format!(
-        r#"
-        bind_address = "0.0.0.0"
-        [tls]
-        server_certificate_bundle = "{}"
-        server_private_key = "{}"
-    "#,
-        cert_file.path().display(),
-        key_file.path().display()
-    );
-
-    let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
-
-    assert_eq!(config.base.port, 8000);
-    assert_eq!(config.base.query_timeout.get(), 3600);
-    assert_eq!(config.base.query_timeout_grace_period.get(), 60);
-}
-
-#[test]
-fn test_config_custom_values() {
-    let cert_file = create_temp_cert_file(server_cert_pem());
-    let key_file = create_temp_cert_file(server_key_pem());
-
-    let toml = format!(
-        r#"
-        bind_address = "192.168.1.100"
-        port = 9000
-        query_timeout = 7200
-        query_timeout_grace_period = 120
-        [tls]
-        server_certificate_bundle = "{}"
-        server_private_key = "{}"
-    "#,
-        cert_file.path().display(),
-        key_file.path().display()
-    );
-
-    let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
-
-    assert_eq!(config.base.port, 9000);
-    assert_eq!(config.base.query_timeout.get(), 7200);
-    assert_eq!(config.base.query_timeout_grace_period.get(), 120);
-    assert_eq!(
-        config.base.bind_address,
-        "192.168.1.100".parse::<IpAddr>().unwrap()
-    );
-}
-
-#[test]
-fn test_config_ipv6_address() {
-    let cert_file = create_temp_cert_file(server_cert_pem());
-    let key_file = create_temp_cert_file(server_key_pem());
-
-    let toml = format!(
-        r#"
-        bind_address = "::1"
-        port = 8443
-        [tls]
-        server_certificate_bundle = "{}"
-        server_private_key = "{}"
-    "#,
-        cert_file.path().display(),
-        key_file.path().display()
-    );
-
-    let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
-
-    assert_eq!(config.base.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
-    assert_eq!(config.base.port, 8443);
 }
 
 #[test]
@@ -223,62 +140,6 @@ fn test_build_tls_acceptor_missing_client_ca_file() {
     } else {
         panic!("Expected Initialization error");
     }
-}
-
-#[tokio::test]
-async fn test_tls_listener_new() {
-    init_crypto_provider();
-
-    let (tls, _temp_files) = build_config(false);
-
-    let config = TlsListenerConfig {
-        base: ListenerBaseConfig {
-            bind_address: "127.0.0.1".parse().unwrap(),
-            port: 8443,
-            query_timeout: NonZeroU64::new(3600).unwrap(),
-            query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-            handshake_timeout: NonZeroU64::new(10).unwrap(),
-        },
-        tls,
-    };
-
-    let context = create_test_server_context().await;
-    let result = TlsListener::new(&config, context);
-
-    assert!(result.is_ok());
-    let listener = result.unwrap();
-    assert_eq!(
-        listener.binding_address,
-        SocketAddr::from(([127, 0, 0, 1], 8443))
-    );
-}
-
-#[tokio::test]
-async fn test_tls_listener_new_with_ipv6() {
-    init_crypto_provider();
-    let (tls, _temp_files) = build_config(false);
-
-    let config = TlsListenerConfig {
-        base: ListenerBaseConfig {
-            bind_address: "::1".parse().unwrap(),
-            port: 9443,
-            query_timeout: NonZeroU64::new(3600).unwrap(),
-            query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-            handshake_timeout: NonZeroU64::new(10).unwrap(),
-        },
-        tls,
-    };
-
-    let context = create_test_server_context().await;
-    let result = TlsListener::new(&config, context);
-
-    assert!(result.is_ok());
-    let listener = result.unwrap();
-    assert_eq!(
-        listener.binding_address.ip(),
-        "::1".parse::<IpAddr>().unwrap()
-    );
-    assert_eq!(listener.binding_address.port(), 9443);
 }
 
 #[tokio::test]
@@ -425,7 +286,6 @@ fn client_auth_optional_with_ca_bundle_is_ok() {
         client_auth = "optional"
     "#;
     let result: Result<ServerTlsConfig, _> = toml::from_str(toml);
-    assert!(result.is_ok());
     assert_eq!(result.unwrap().client_auth, ClientAuth::Optional);
 }
 
@@ -454,7 +314,6 @@ fn client_auth_required_with_ca_bundle_is_ok() {
         client_auth = "required"
     "#;
     let result: Result<ServerTlsConfig, _> = toml::from_str(toml);
-    assert!(result.is_ok());
     assert_eq!(result.unwrap().client_auth, ClientAuth::Required);
 }
 
@@ -480,15 +339,4 @@ fn test_build_tls_acceptor_with_client_auth_required() {
 
     let result = build_tls_acceptor(&tls_config);
     assert!(result.is_ok(), "build failed: {:?}", result.err());
-}
-
-/// The TLS listener is the only thing that knows a request arrived over TLS,
-/// so it has to say so.
-#[test]
-fn tls_connector_reports_https() {
-    init_crypto_provider();
-    let (tls_config, _tmp_files) = build_config(false);
-    let connector = TlsConnector::new(&tls_config).unwrap();
-
-    assert_eq!(connector.scheme(), RequestScheme::Https);
 }

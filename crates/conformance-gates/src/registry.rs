@@ -1,5 +1,4 @@
 use std::env;
-use std::future::Future;
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
@@ -42,11 +41,10 @@ where
 
 /// An image pushed through the registry API; digests are hex without the
 /// `sha256:` prefix, the form the seeded store keys use.
-#[allow(clippy::struct_field_names)]
 pub struct PushedImage {
-    pub layer_digest: String,
-    pub config_digest: String,
-    pub manifest_digest: String,
+    pub layer: String,
+    pub config: String,
+    pub manifest: String,
 }
 
 /// OCI distribution API client for the registry under test.
@@ -137,9 +135,9 @@ impl RegistryClient {
             )
         })?;
         Ok(PushedImage {
-            layer_digest,
-            config_digest,
-            manifest_digest: sha256_hex(manifest.as_bytes()),
+            layer: layer_digest,
+            config: config_digest,
+            manifest: sha256_hex(manifest.as_bytes()),
         })
     }
 

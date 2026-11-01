@@ -9,25 +9,33 @@ mod tool;
 pub use config::ScannerConfig;
 pub use tool::Scanner;
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::convert::Infallible;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use argh::FromArgs;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::{Method, Request, Response, StatusCode, body::Incoming, service::service_fn};
+use hyper::body::Incoming;
+use hyper::header::HeaderValue;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
-use tokio::{
-    net::TcpListener,
-    signal,
-    sync::{RwLock, Semaphore},
-    time::sleep,
-};
+use tokio::net::TcpListener;
+use tokio::signal;
+use tokio::sync::{RwLock, Semaphore};
+use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use angos_mtls_client::BasicAuth;
 use angos_secret::Secret;
 
-use crate::{configuration::ObservabilityConfig, scan::ScanImagePayload};
+use crate::configuration::ObservabilityConfig;
+use crate::scan::{SARIF_MEDIA_TYPE, ScanImagePayload};
 
 /// A scan request names one image; cap the read well above that so a hostile
 /// body cannot exhaust memory.
@@ -43,7 +51,7 @@ pub enum Error {
     #[error("{0}")]
     Invalid(String),
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("scanner '{scanner}' failed: {message}")]
     Scanner {
         scanner: &'static str,
@@ -77,7 +85,7 @@ struct Service {
     token: Option<Secret<String>>,
     registry_authority: String,
     plain_http: bool,
-    credentials: Option<(String, String)>,
+    credentials: Option<BasicAuth>,
     scans: Arc<Semaphore>,
     /// Held shared by a scan and exclusively while the database is replaced.
     database: RwLock<()>,
@@ -90,11 +98,6 @@ pub async fn run(options: &Options, config: Option<ScannerConfig>) -> Result<(),
         .split_once("://")
         .map_or(url, |(_, rest)| rest)
         .to_string();
-    let credentials = config
-        .registry
-        .basic_auth
-        .as_ref()
-        .map(|auth| (auth.username.clone(), auth.password.expose().clone()));
     let permits = if options.scanner.serial() {
         if config.max_concurrent_scans.get() > 1 {
             warn!(
@@ -112,7 +115,7 @@ pub async fn run(options: &Options, config: Option<ScannerConfig>) -> Result<(),
         token: config.token.clone(),
         registry_authority: authority,
         plain_http: config.registry.url.starts_with("http://"),
-        credentials,
+        credentials: config.registry.basic_auth,
         scans: Arc::new(Semaphore::new(permits)),
         database: RwLock::new(()),
     });
@@ -152,10 +155,7 @@ async fn serve(address: SocketAddr, service: Arc<Service>) -> Result<(), Error> 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let handler = service_fn(move |request| handle(service.clone(), request));
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, handler)
-                .await
-            {
+            if let Err(e) = http1::Builder::new().serve_connection(io, handler).await {
                 debug!("scanner connection error: {e}");
             }
         });
@@ -233,7 +233,7 @@ async fn handle(
             info!("Scanned {image}");
             Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header("content-type", crate::scan::SARIF_MEDIA_TYPE)
+                .header("content-type", SARIF_MEDIA_TYPE)
                 .body(Full::new(Bytes::from(report)))
                 .unwrap_or_else(|_| text_response(StatusCode::INTERNAL_SERVER_ERROR, "")))
         }
@@ -245,7 +245,7 @@ async fn handle(
 }
 
 /// `Authorization: Bearer <token>`, compared in constant time.
-fn bearer_valid(token: &str, header: Option<&hyper::header::HeaderValue>) -> bool {
+fn bearer_valid(token: &str, header: Option<&HeaderValue>) -> bool {
     let Some(presented) = header
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))

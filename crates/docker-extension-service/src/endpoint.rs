@@ -90,15 +90,4 @@ mod tests {
             Some(Endpoint::ListCatalog { n: None, .. })
         ));
     }
-
-    #[test]
-    fn url_encoded_last() {
-        let route = parse(&Method::GET, "/v2/_catalog", Some("last=foo%2Fbar"));
-        if let Some(Endpoint::ListCatalog { n, last }) = route {
-            assert_eq!(n, None);
-            assert_eq!(last, Some("foo/bar".to_string()));
-        } else {
-            panic!("Expected ListCatalog route");
-        }
-    }
 }

@@ -1,15 +1,9 @@
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{header, method},
-};
+use wiremock::matchers::{header, method};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::event_webhook::{
-    config::DeliveryPolicy,
-    dispatcher::{
-        compute_signature,
-        tests::common::{create_test_event, single_hook_dispatcher},
-    },
-};
+use crate::event_webhook::config::DeliveryPolicy;
+use crate::event_webhook::dispatcher::compute_signature;
+use crate::event_webhook::dispatcher::tests::common::{create_test_event, single_hook_dispatcher};
 
 #[tokio::test]
 async fn dispatch_sends_hmac_signature_header() {

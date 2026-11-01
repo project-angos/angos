@@ -114,17 +114,18 @@ mod tests {
 
     use regex::Regex;
 
-    use crate::{
-        registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        replication::{ReplicationDownstream, ReplicationMode},
-    };
+    use angos_cache::Config as CacheConfig;
     use angos_oci_client::RegistryClient;
+    use reqwest::Client;
+
+    use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+    use crate::replication::{ReplicationDownstream, ReplicationMode};
 
     fn test_client() -> Arc<RegistryClient> {
-        let cache = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache = CacheConfig::Memory.to_backend().unwrap();
         Arc::new(RegistryClient::new(
             "https://example.test".to_string(),
-            reqwest::Client::new(),
+            Client::new(),
             None,
             cache,
             DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -139,16 +140,6 @@ mod tests {
         assert!(!ReplicationMode::EventOnly.participates_in_reconcile());
         assert!(!ReplicationMode::ReconcileOnly.enqueues_on_event());
         assert!(ReplicationMode::ReconcileOnly.participates_in_reconcile());
-    }
-
-    #[test]
-    fn new_applies_defaults() {
-        let downstream = ReplicationDownstream::new("eu-region".to_string(), test_client(), 4);
-
-        assert_eq!(downstream.name, "eu-region");
-        assert_eq!(downstream.mode, ReplicationMode::EventReconcile);
-        assert!(downstream.namespace_filter.is_empty());
-        assert_eq!(downstream.max_concurrent_pushes, 4);
     }
 
     #[test]

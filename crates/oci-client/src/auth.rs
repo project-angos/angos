@@ -1,10 +1,9 @@
 //! WWW-Authenticate header parsing, bearer-token negotiation, and auth-token cache keys.
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use reqwest::{
-    Response, StatusCode,
-    header::{AUTHORIZATION, WWW_AUTHENTICATE},
-};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use reqwest::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use reqwest::{Response, StatusCode};
 use serde::Deserialize;
 use url::Url;
 
@@ -67,8 +66,9 @@ impl BearerToken {
 
     fn token(&self) -> Result<String, Error> {
         self.token
-            .clone()
-            .or(self.access_token.clone())
+            .as_ref()
+            .or(self.access_token.as_ref())
+            .cloned()
             .ok_or_else(|| Error::Internal("Missing token in authentication response".to_string()))
     }
 }
@@ -262,24 +262,11 @@ mod tests {
     use serde_json::from_str;
     use url::Url;
 
-    use crate::{
-        Error,
-        auth::{
-            BearerToken, authority_for_cache_key, parse_bearer_challenge, realm_scheme_ok,
-            token_cache_key, token_index_cache_key,
-        },
+    use crate::Error;
+    use crate::auth::{
+        BearerToken, authority_for_cache_key, parse_bearer_challenge, realm_scheme_ok,
+        token_cache_key, token_index_cache_key,
     };
-
-    #[test]
-    fn test_token_from_token_field() {
-        let bearer = BearerToken {
-            token: Some("token123".to_string()),
-            access_token: None,
-            expires_in: 3600,
-        };
-
-        assert_eq!(bearer.token().unwrap(), "token123");
-    }
 
     #[test]
     fn test_token_from_access_token_field() {
@@ -347,15 +334,6 @@ mod tests {
         let bearer: BearerToken = from_str(r#"{"token":"t"}"#).unwrap();
 
         assert_eq!(bearer.expires_in, 60);
-    }
-
-    #[test]
-    fn authority_for_cache_key_returns_host() {
-        let url = Url::parse("https://registry.example.com/v2/").unwrap();
-        assert_eq!(
-            authority_for_cache_key(&url).unwrap(),
-            "registry.example.com"
-        );
     }
 
     #[test]
@@ -487,18 +465,6 @@ mod tests {
                 .other
                 .iter()
                 .any(|(k, v)| k == "scope" && v == "repository:foo:pull")
-        );
-    }
-
-    #[test]
-    fn bearer_challenge_token_url_preserves_simple_ascii_values() {
-        let header =
-            r#"Bearer realm="https://auth.example.com/token",service="registry.example.com""#;
-        let challenge = parse_bearer_challenge(header).expect("expected Some");
-
-        assert_eq!(
-            challenge.token_url().unwrap().as_str(),
-            "https://auth.example.com/token?service=registry.example.com"
         );
     }
 

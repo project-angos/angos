@@ -11,7 +11,8 @@
 //! `stream::once(async move { Ok(bytes) })`; producer/consumer callers wrap
 //! a [`tokio::sync::mpsc::Receiver`] with [`channel_stream`].
 
-use std::{io, pin::Pin};
+use std::io;
+use std::pin::Pin;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -55,8 +56,3 @@ pub struct MultipartUploadPage {
     pub next_key_marker: Option<String>,
     pub next_upload_id_marker: Option<String>,
 }
-
-// The upload methods (`write_upload`, `complete_upload`, `abort_upload`,
-// `list_multipart_uploads`) live on the
-// [`ObjectStore`](crate::ObjectStore) trait. This module owns only the value
-// types those methods exchange.

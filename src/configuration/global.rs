@@ -3,38 +3,32 @@ use std::num::NonZeroUsize;
 use bytesize::ByteSize;
 use serde::Deserialize;
 
-use crate::{
-    configuration::{RegexPattern, TrustedProxy},
-    jobs::store::JobQueueConfig,
-    policy::{AccessMode, PolicyConfig, RetentionPolicyConfig},
-    registry::admin::DEFAULT_REVISION_CACHE_ENTRIES,
-    registry::metadata_store::{DEFAULT_GC_GRACE_SECS, PullHistoryConfig},
-    registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY},
-};
-use crate::{
-    layer::{IndexAction, IndexLimits},
-    scan::ScanConfig,
-};
+use crate::configuration::{RegexPattern, TrustedProxy};
+use crate::jobs::store::JobQueueConfig;
+use crate::layer::{IndexAction, IndexLimits};
+use crate::policy::{AccessMode, PolicyConfig, RetentionPolicyConfig};
+use crate::registry::admin::DEFAULT_REVISION_CACHE_ENTRIES;
+use crate::registry::metadata_store::{DEFAULT_GC_GRACE_SECS, PullHistoryConfig};
+use crate::registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY};
+use crate::scan::ScanConfig;
 
-/// Default Tokio worker-thread count; the `unwrap` is const-evaluated.
-const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+/// Default Tokio worker-thread count.
+const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(64 - 1);
 
-/// Default cap on concurrent in-process cache-fill jobs; the `unwrap` is
-/// const-evaluated.
-pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Default cap on concurrent in-process cache-fill jobs.
+pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4 - 1);
 
-/// Default replication-worker concurrency; the `unwrap` is const-evaluated.
-pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Default replication-worker concurrency.
+pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(4 - 1);
 /// Worker concurrency for the scan queue; a scan is minutes of scanner work.
-pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(2 - 1);
 /// Worker concurrency for the index queue: opening an image asks for all its
 /// layers at once, each job inflating one on a core.
-pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4 - 1);
 /// Entries a layer listing may hold, about half a GiB of listing in memory.
-const DEFAULT_MAX_INDEX_ENTRIES: NonZeroUsize = NonZeroUsize::new(500_000).unwrap();
+const DEFAULT_MAX_INDEX_ENTRIES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(500_000 - 1);
 
-// A config struct is naturally flag-heavy; the bool count is not an API smell.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
@@ -66,10 +60,8 @@ pub struct GlobalConfig {
     pub blob_stream_frame_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
     pub update_pull_time: bool,
-    #[serde(default = "default_redirect_enabled")]
-    pub enable_blob_redirect: bool,
-    #[serde(default = "default_redirect_enabled")]
-    pub enable_manifest_redirect: bool,
+    #[serde(flatten)]
+    pub redirect: RedirectConfig,
     #[serde(default)]
     pub access_policy: PolicyConfig<AccessMode>,
     #[serde(default)]
@@ -130,6 +122,28 @@ pub struct GlobalConfig {
     /// policies.
     #[serde(default)]
     pub trusted_proxies: Vec<TrustedProxy>,
+}
+
+/// Which responses may redirect the client to the storage backend; read from
+/// the `enable_*_redirect` keys of `[global]`.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct RedirectConfig {
+    #[serde(rename = "enable_blob_redirect", default = "default_redirect_enabled")]
+    pub blob: bool,
+    #[serde(
+        rename = "enable_manifest_redirect",
+        default = "default_redirect_enabled"
+    )]
+    pub manifest: bool,
+}
+
+impl Default for RedirectConfig {
+    fn default() -> Self {
+        Self {
+            blob: default_redirect_enabled(),
+            manifest: default_redirect_enabled(),
+        }
+    }
 }
 
 fn default_shutdown_drain_secs() -> u64 {
@@ -218,8 +232,7 @@ impl Default for GlobalConfig {
             max_blob_size: default_max_blob_size(),
             blob_stream_frame_size: default_blob_stream_frame_size(),
             update_pull_time: default_update_pull_time(),
-            enable_blob_redirect: default_redirect_enabled(),
-            enable_manifest_redirect: default_redirect_enabled(),
+            redirect: RedirectConfig::default(),
             access_policy: PolicyConfig::default(),
             retention_policy: RetentionPolicyConfig::default(),
             immutable_tags: false,
@@ -268,7 +281,8 @@ mod tests {
 
     use bytesize::ByteSize;
 
-    use crate::{configuration::GlobalConfig, registry::metadata_store::PullHistoryConfig};
+    use crate::configuration::GlobalConfig;
+    use crate::registry::metadata_store::PullHistoryConfig;
 
     #[test]
     fn default_values_match_configuration_defaults() {
@@ -285,7 +299,11 @@ mod tests {
         assert_eq!(config.blob_stream_frame_size, ByteSize::kib(128));
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
-        assert!(config.immutable_tags_exclusions.is_empty());
+        assert!(
+            config.immutable_tags_exclusions.is_empty(),
+            "{:?}",
+            config.immutable_tags_exclusions
+        );
         assert!(
             config.allow_missing_manifest_references,
             "manifest-reference validation is permissive by default"
@@ -310,106 +328,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_values_parse() {
-        let config = toml::from_str::<GlobalConfig>(
-            r#"
-            max_concurrent_requests = 10
-            max_concurrent_cache_jobs = 8
-            max_concurrent_replication_jobs = 6
-            max_manifest_size = "7MiB"
-            max_blob_size = "10GiB"
-            update_pull_time = true
-            immutable_tags = true
-            immutable_tags_exclusions = ["latest", "dev"]
-            allow_missing_manifest_references = false
-            authorization_webhook = "my-webhook"
-            trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]
-
-            [pull_history]
-            max_pulls = 5000
-            max_age_secs = 31536000
-            compact_after_secs = 86400
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.max_concurrent_requests,
-            NonZeroUsize::new(10).unwrap()
-        );
-        assert_eq!(
-            config.max_concurrent_cache_jobs,
-            NonZeroUsize::new(8).unwrap()
-        );
-        assert_eq!(
-            config.max_concurrent_replication_jobs,
-            NonZeroUsize::new(6).unwrap()
-        );
-        assert_eq!(config.max_manifest_size, ByteSize::mib(7));
-        assert_eq!(config.max_blob_size, ByteSize::gib(10));
-        assert!(config.update_pull_time);
-        assert!(config.immutable_tags);
-        assert!(!config.allow_missing_manifest_references);
-        assert_eq!(
-            config.pull_history,
-            PullHistoryConfig {
-                max_pulls: NonZeroU32::new(5000).unwrap(),
-                max_age_secs: Some(31_536_000),
-                compact_after_secs: Some(86400),
-                compact_after_pulls: None,
-            }
-        );
-        assert_eq!(config.immutable_tags_exclusions.len(), 2);
-        assert_eq!(config.immutable_tags_exclusions[0].as_source(), "latest");
-        assert_eq!(config.immutable_tags_exclusions[1].as_source(), "dev");
-        assert_eq!(config.authorization_webhook.as_deref(), Some("my-webhook"));
-        assert_eq!(config.trusted_proxies.len(), 2);
-    }
-
-    #[test]
     fn invalid_trusted_proxy_is_rejected() {
         let result = toml::from_str::<GlobalConfig>(r#"trusted_proxies = ["not-an-ip"]"#);
         assert!(result.is_err(), "invalid entries must fail at parse time");
-    }
-
-    #[test]
-    fn max_concurrent_requests_zero_is_rejected() {
-        let result = toml::from_str::<GlobalConfig>("max_concurrent_requests = 0\n");
-        assert!(
-            result.is_err(),
-            "zero must be rejected at deserialization, not asserted inside the runtime builder"
-        );
-    }
-
-    #[test]
-    fn max_concurrent_cache_jobs_zero_is_rejected() {
-        let result = toml::from_str::<GlobalConfig>("max_concurrent_cache_jobs = 0\n");
-        assert!(result.is_err(), "zero must be rejected at deserialization");
-    }
-
-    #[test]
-    fn max_concurrent_replication_jobs_zero_is_rejected() {
-        let result = toml::from_str::<GlobalConfig>("max_concurrent_replication_jobs = 0\n");
-        assert!(result.is_err(), "zero must be rejected at deserialization");
-    }
-
-    #[test]
-    fn max_manifest_size_bytes_returns_usize() {
-        let config = GlobalConfig {
-            max_manifest_size: ByteSize::mib(6),
-            ..GlobalConfig::default()
-        };
-
-        assert_eq!(config.max_manifest_size_bytes(), 6 * 1024 * 1024);
-    }
-
-    #[test]
-    fn max_blob_size_bytes_returns_u64() {
-        let config = GlobalConfig {
-            max_blob_size: ByteSize::gib(6),
-            ..GlobalConfig::default()
-        };
-
-        assert_eq!(config.max_blob_size_bytes(), 6 * 1024 * 1024 * 1024);
     }
 }

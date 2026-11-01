@@ -9,7 +9,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// - Automatic memory clearing on drop via `ZeroizeOnDrop`
 /// - Debug output that hides the actual value
 /// - Transparent deserialization from TOML/JSON
-#[derive(Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Default, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
 #[serde(transparent)]
 pub struct Secret<T: Zeroize>(T);
 
@@ -23,21 +23,9 @@ impl<T: Zeroize> Secret<T> {
     }
 }
 
-impl<T: Zeroize + PartialEq> PartialEq for Secret<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
 impl<T: Zeroize> fmt::Debug for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[REDACTED]")
-    }
-}
-
-impl<T: Zeroize + Default> Default for Secret<T> {
-    fn default() -> Self {
-        Self(T::default())
     }
 }
 

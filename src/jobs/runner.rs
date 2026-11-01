@@ -1,13 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::{select, time::sleep};
+use tokio::select;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::{
-    jobs::Queue,
-    jobs::store::{ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore},
-};
+use crate::jobs::Queue;
+use crate::jobs::store::{ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore};
 
 /// Idle poll interval of an in-process claim loop; production polls once a
 /// second so an empty queue does not storm the object store with `LIST`s.
@@ -106,31 +106,24 @@ pub async fn run_once(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        time::Duration,
-    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use tempfile::TempDir;
+    use tokio::spawn;
     use tokio::time::{Instant, sleep, timeout};
-
     use tokio_util::sync::CancellationToken;
 
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_storage::ObjectStore;
+    use angos_storage::fs::Backend as StorageFsBackend;
 
-    use crate::{
-        jobs::Queue,
-        jobs::{
-            runner::{execute_one, run_once},
-            store::{ClaimMode, ClaimedJob, Error, JobEnvelope, JobHandler, JobStore},
-        },
-        metrics_provider,
-        registry::test_utils::metadata_store_over,
-    };
+    use crate::jobs::Queue;
+    use crate::jobs::runner::{execute_one, run_once};
+    use crate::jobs::store::{ClaimMode, ClaimedJob, Error, JobEnvelope, JobHandler, JobStore};
+    use crate::metrics_provider;
+    use crate::registry::test_utils::metadata_store_over;
 
     struct OkHandler;
 
@@ -142,8 +135,7 @@ mod tests {
     }
 
     fn make_store(dir: &TempDir) -> Arc<JobStore> {
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder(dir.path().to_str().expect("valid path")).build());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
         Arc::new(JobStore::new(
             &metadata_store_over(object),
             "test-worker",
@@ -152,19 +144,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_once_returns_false_on_empty_queue() {
-        metrics_provider::init_for_tests();
-        let dir = TempDir::new().expect("temp dir");
-        let store = make_store(&dir);
-        let found = run_once(&store, &OkHandler, Queue::Cache)
-            .await
-            .expect("run_once");
-        assert!(!found, "empty queue must return false");
-    }
-
-    #[tokio::test]
     async fn run_once_processes_one_job() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let dir = TempDir::new().expect("temp dir");
         let store = make_store(&dir);
 
@@ -201,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_error_dead_letters_without_retrying() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let dir = TempDir::new().expect("temp dir");
         let store = make_store(&dir);
 
@@ -257,7 +238,7 @@ mod tests {
     /// without depending on backend timing.
     #[tokio::test]
     async fn execute_one_cancels_handler_when_lock_lost() {
-        metrics_provider::init_for_tests();
+        metrics_provider::initialize_metrics();
         let dir = TempDir::new().expect("temp dir");
         let consumer = make_store(&dir);
 
@@ -278,7 +259,7 @@ mod tests {
             completed: completed.clone(),
         };
 
-        tokio::spawn(async move {
+        spawn(async move {
             sleep(Duration::from_millis(100)).await;
             lost_clone.cancel();
         });

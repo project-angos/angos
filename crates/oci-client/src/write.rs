@@ -2,15 +2,13 @@
 //!
 //! Byte-bodied requests reuse [`RegistryClient::send_with_auth_retry_capturing`]'s
 //! cached-token-then-single-refresh orchestration. The single-use stream in
-//! [`RegistryClient::patch_upload`] cannot be replayed, so it reuses the auth
+//! [`RegistryClient::put_upload`] cannot be replayed, so it reuses the auth
 //! header resolved when the session was opened ([`UploadSession::auth`]) and
 //! surfaces a `401` as an error instead of retrying.
 
 use bytes::Bytes;
-use reqwest::{
-    Body, Method, Response, StatusCode,
-    header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
-};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use reqwest::{Body, Method, Response, StatusCode};
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, instrument, warn};

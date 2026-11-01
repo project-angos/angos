@@ -9,15 +9,14 @@
 //! and the `tokenAttributes` that make the kubelet send a token belong to
 //! `CredentialProvider` in `k8s.io/kubelet/config/v1`.
 
-use std::{
-    collections::HashMap,
-    io::{Read, Write, stdin, stdout},
-    process::ExitCode,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::HashMap;
+use std::io::{Read, Write, stdin, stdout};
+use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use argh::FromArgs;
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 /// Cut off the cached credential before the token it carries expires, so a pull
@@ -92,7 +91,12 @@ fn run(arguments: &Arguments) -> Result<(), String> {
 
     let request: CredentialProviderRequest =
         serde_json::from_str(&body).map_err(|e| format!("failed to parse the request: {e}"))?;
-    let response = respond(arguments, &request, now_seconds())?;
+    // An unreadable clock reads as `u64::MAX`, which disables caching instead
+    // of extending it.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |since_epoch| since_epoch.as_secs());
+    let response = respond(arguments, &request, now)?;
     let response = serde_json::to_vec(&response)
         .map_err(|e| format!("failed to serialize the response: {e}"))?;
 
@@ -164,14 +168,6 @@ fn expiry_of(token: &str) -> Option<u64> {
     let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: Claims = serde_json::from_slice(&payload).ok()?;
     Some(claims.exp)
-}
-
-/// Seconds since the epoch, or `u64::MAX` when the clock is unreadable, so a
-/// clock angos cannot trust disables caching instead of extending it.
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(u64::MAX, |since_epoch| since_epoch.as_secs())
 }
 
 /// The registry host the kubelet matched, which keys the returned credential.

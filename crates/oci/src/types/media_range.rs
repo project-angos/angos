@@ -1,23 +1,24 @@
-use std::{
-    fmt::{Display, Formatter},
-    str::FromStr,
-    sync::LazyLock,
-};
+use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
 
-use regex::Regex;
-
+use crate::types::media_type::is_restricted_name;
 use crate::types::{Error, MediaType};
 
-// RFC 9110 media-range: `*/*`, `type/*` or `type/subtype`, each optionally
-// followed by parameters (a `q` weight above all). The name grammar matches
-// `MediaType`'s; only the two wildcard forms are additional, which is why an
-// `Accept` value cannot be a [`MediaType`].
-static MEDIA_RANGE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^(?:\*/\*|[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/(?:\*|[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}))(?:[ \t]*;.*)?$",
-    )
-    .unwrap()
-});
+/// An RFC 9110 media-range: `*/*`, `type/*` or `type/subtype`, each optionally
+/// followed by a single-line parameter section (a `q` weight above all). Only
+/// the two wildcard forms differ from the media-type grammar, which is why an
+/// `Accept` value cannot be a [`MediaType`].
+fn is_media_range(s: &str) -> bool {
+    let essence = match s.split_once(';') {
+        Some((_, parameters)) if parameters.contains('\n') => return false,
+        Some((essence, _)) => essence.trim_end_matches([' ', '\t']),
+        None => s,
+    };
+    essence == "*/*"
+        || essence.split_once('/').is_some_and(|(kind, subtype)| {
+            is_restricted_name(kind) && (subtype == "*" || is_restricted_name(subtype))
+        })
+}
 
 /// One member of an `Accept` header: what a client will take, which a
 /// [`MediaType`] cannot express because `*/*` and `type/*` are not media types.
@@ -29,12 +30,12 @@ pub struct MediaRange(String);
 impl MediaRange {
     /// # Errors
     ///
-    /// Returns [`Error::InvalidMediaRange`] when `s` is not a media range.
+    /// Returns [`Error::MediaRange`] when `s` is not a media range.
     pub fn new(s: &str) -> Result<Self, Error> {
-        if MEDIA_RANGE_REGEX.is_match(s) {
+        if is_media_range(s) {
             Ok(Self(s.to_owned()))
         } else {
-            Err(Error::InvalidMediaRange(s.to_string()))
+            Err(Error::MediaRange(s.to_string()))
         }
     }
 
@@ -60,7 +61,7 @@ impl FromStr for MediaRange {
 }
 
 impl Display for MediaRange {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }

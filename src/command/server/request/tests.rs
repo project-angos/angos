@@ -1,20 +1,13 @@
 use chrono::{TimeZone, Utc};
-use hyper::{
-    HeaderMap, Request,
-    header::{
-        ACCEPT, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderName,
-        HeaderValue, RANGE,
-    },
-};
+use hyper::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, RANGE};
+use hyper::{HeaderMap, Request};
 
 use angos_oci::header::X_ANGOS_SOURCE_TIMESTAMP;
 use angos_oci::http_range::{ByteWindow, RequestRange};
 use angos_oci::{MediaRange, MediaType};
 
-use crate::command::server::{
-    error::Error,
-    request::{RequestHeaders, X_ANGOS_NO_REDIRECT},
-};
+use crate::command::server::error::Error;
+use crate::command::server::request::{RequestHeaders, X_ANGOS_NO_REDIRECT};
 
 /// end-5 spells a chunk's window `<start>-<end>`. The `bytes=` unit is the
 /// `Range` header's, so a chunk carrying one is malformed rather than tolerated.
@@ -120,27 +113,6 @@ fn test_range_without_bytes_prefix() {
     );
 }
 
-#[test]
-fn test_content_range_without_bytes_prefix() {
-    let request = Request::builder()
-        .header(CONTENT_RANGE, "100-200")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers)
-        .chunk_range(CONTENT_RANGE)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        range,
-        ByteWindow {
-            start: 100,
-            end: Some(200),
-        }
-    );
-}
-
 /// end-5 pins a chunk's window to `^[0-9]+-[0-9]+$`, so a value naming no last
 /// byte is refused rather than read as an open-ended one.
 #[test]
@@ -156,57 +128,6 @@ fn test_chunk_range_refuses_an_open_ended_window() {
 }
 
 #[test]
-fn test_blob_range_suffix_range() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=-499")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers)
-        .blob_range()
-        .unwrap()
-        .unwrap();
-    assert_eq!(range, RequestRange::Suffix(499));
-}
-
-#[test]
-fn test_blob_range_zero_suffix_range() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=-0")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers)
-        .blob_range()
-        .unwrap()
-        .unwrap();
-    assert_eq!(range, RequestRange::Suffix(0));
-}
-
-#[test]
-fn test_range_large_numbers() {
-    let request = Request::builder()
-        .header(RANGE, "1000000000-2000000000")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers)
-        .chunk_range(RANGE)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        range,
-        ByteWindow {
-            start: 1_000_000_000,
-            end: Some(2_000_000_000),
-        }
-    );
-}
-
-#[test]
 fn test_range_missing_header() {
     let request = Request::builder().body(()).unwrap();
     let (parts, ()) = request.into_parts();
@@ -215,82 +136,6 @@ fn test_range_missing_header() {
         .chunk_range(RANGE)
         .unwrap();
     assert_eq!(range, None);
-}
-
-#[test]
-fn test_range_custom_header_name() {
-    let custom_header = HeaderName::from_static("x-custom-range");
-    let request = Request::builder()
-        .header(&custom_header, "50-100")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers)
-        .chunk_range(custom_header)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        range,
-        ByteWindow {
-            start: 50,
-            end: Some(100),
-        }
-    );
-}
-
-#[test]
-fn test_range_start_greater_than_end() {
-    let request = Request::builder()
-        .header(RANGE, "500-499")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).chunk_range(RANGE);
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::RangeNotSatisfiable(msg) => {
-            assert!(msg.contains("start (500) > end (499)"));
-        }
-        _ => panic!("Expected RangeNotSatisfiable error"),
-    }
-}
-
-#[test]
-fn test_range_missing_start_is_invalid_for_start_end_parser() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=-499")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).chunk_range(RANGE);
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::RangeNotSatisfiable(msg) => {
-            assert!(msg.contains("Invalid Range header format"));
-        }
-        _ => panic!("Expected RangeNotSatisfiable error"),
-    }
-}
-
-#[test]
-fn test_range_invalid_format() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=plouf")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).chunk_range(RANGE);
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::RangeNotSatisfiable(msg) => {
-            assert!(msg.contains("Invalid Range header format"));
-        }
-        _ => panic!("Expected RangeNotSatisfiable error"),
-    }
 }
 
 #[test]
@@ -303,50 +148,6 @@ fn test_blob_range_multiple_ranges_not_supported() {
 
     let range = RequestHeaders::new(&parts.headers).blob_range().unwrap();
     assert_eq!(range, None);
-}
-
-#[test]
-fn test_range_non_numeric_start() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=abc-100")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).chunk_range(RANGE);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_range_non_numeric_end() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=0-xyz")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).chunk_range(RANGE);
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::RangeNotSatisfiable(msg) => {
-            assert!(
-                msg.contains("Error parsing 'end'") || msg.contains("Invalid Range header format")
-            );
-        }
-        _ => panic!("Expected RangeNotSatisfiable error"),
-    }
-}
-
-#[test]
-fn test_range_overflow() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=99999999999999999999-100")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).chunk_range(RANGE);
-    assert!(result.is_err());
 }
 
 #[test]

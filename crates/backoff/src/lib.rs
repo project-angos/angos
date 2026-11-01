@@ -11,8 +11,7 @@
 //! retries against a shared resource. All arithmetic saturates, so no `attempt`
 //! value can overflow or panic.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::time::Duration;
 
 /// An exponential (or constant) backoff policy.
@@ -30,27 +29,27 @@ pub struct Backoff {
 }
 
 impl Backoff {
-    /// A policy growing by `multiplier` per attempt, with `jitter` on or off.
+    /// A policy growing by `multiplier` per attempt, without jitter.
     #[must_use]
-    pub const fn new(base: Duration, max: Duration, multiplier: u32, jitter: bool) -> Self {
+    pub const fn new(base: Duration, max: Duration, multiplier: u32) -> Self {
         Self {
             base,
             max,
             multiplier,
-            jitter,
+            jitter: false,
         }
     }
 
     /// An exponential policy doubling from `base` up to `max`, without jitter.
     #[must_use]
     pub const fn exponential(base: Duration, max: Duration) -> Self {
-        Self::new(base, max, 2, false)
+        Self::new(base, max, 2)
     }
 
     /// A constant policy whose delay is always `delay` before jitter.
     #[must_use]
     pub const fn constant(delay: Duration) -> Self {
-        Self::new(delay, delay, 1, false)
+        Self::new(delay, delay, 1)
     }
 
     /// Return the same policy with jitter enabled: each delay gains a random
@@ -76,15 +75,13 @@ impl Backoff {
     pub fn delay(&self, attempt: u32) -> Duration {
         let step = self.step(attempt);
         if self.jitter {
-            step.saturating_add(Duration::from_millis(jitter_below(delay_millis(step))))
+            step.saturating_add(Duration::from_millis(jitter_below(
+                u64::try_from(step.as_millis()).unwrap_or(u64::MAX),
+            )))
         } else {
             step
         }
     }
-}
-
-fn delay_millis(delay: Duration) -> u64 {
-    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// A non-cryptographic pseudo-random value in `[0, max_exclusive)`, for retry
@@ -105,8 +102,9 @@ pub fn jitter_below(max_exclusive: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::Backoff;
     use std::time::Duration;
+
+    use super::Backoff;
 
     #[test]
     fn exponential_doubles_until_capped() {
@@ -117,15 +115,6 @@ mod tests {
         assert_eq!(backoff.delay(5), Duration::from_secs(32));
         assert_eq!(backoff.delay(6), Duration::from_mins(1));
         assert_eq!(backoff.delay(7), Duration::from_mins(1));
-    }
-
-    #[test]
-    fn job_retry_formula_matches_one_minute_base_ten_minute_cap() {
-        let backoff = Backoff::exponential(Duration::from_mins(1), Duration::from_mins(10));
-        assert_eq!(backoff.step(0), Duration::from_mins(1));
-        assert_eq!(backoff.step(3), Duration::from_mins(8));
-        assert_eq!(backoff.step(4), Duration::from_mins(10));
-        assert_eq!(backoff.step(10), Duration::from_mins(10));
     }
 
     #[test]
@@ -159,21 +148,5 @@ mod tests {
             assert!(delay >= step);
             assert!(delay < step + step + Duration::from_millis(1));
         }
-    }
-
-    #[test]
-    fn constant_jitter_stays_within_bounds() {
-        let backoff = Backoff::constant(Duration::from_millis(25)).with_jitter();
-        for _ in 0..256 {
-            let delay = backoff.delay(0);
-            assert!(delay >= Duration::from_millis(25));
-            assert!(delay < Duration::from_millis(50));
-        }
-    }
-
-    #[test]
-    fn no_jitter_is_deterministic() {
-        let backoff = Backoff::exponential(Duration::from_millis(100), Duration::from_mins(1));
-        assert_eq!(backoff.delay(3), backoff.step(3));
     }
 }

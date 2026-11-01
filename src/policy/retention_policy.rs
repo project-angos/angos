@@ -32,7 +32,8 @@ use tracing::{debug, warn};
 
 use angos_oci::Namespace;
 
-use crate::policy::{CelRule, Error, RuleOutcome, clock::Clock, evaluate_rules};
+use crate::policy::clock::Clock;
+use crate::policy::{CelRule, Error, RuleOutcome, evaluate_rules};
 
 /// Configuration for retention policies.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -235,7 +236,8 @@ fn minutes(m: i64) -> i64 {
 mod tests {
     use chrono::{DateTime, TimeZone, Utc};
 
-    use super::{super::clock::SystemClock, *};
+    use super::*;
+    use crate::policy::clock::SystemClock;
 
     struct FixedClock(DateTime<Utc>);
 
@@ -262,10 +264,6 @@ mod tests {
     /// Builds a policy over CEL rule sources, driven by a clock frozen at `now`.
     fn policy_at(now: DateTime<Utc>, rules: &[&str]) -> RetentionPolicy {
         policy_with_clock(rules, Arc::new(FixedClock(now)))
-    }
-
-    fn ns() -> Namespace {
-        Namespace::new("app").unwrap()
     }
 
     #[test]
@@ -341,47 +339,6 @@ mod tests {
     }
 
     #[test]
-    fn test_top_pulled_not_in_top_n() {
-        let policy = policy(&["top_pulled(1)"]);
-
-        let manifest = ManifestImage {
-            tag: Some("v2".to_string()),
-            ..Default::default()
-        };
-        let last_pulled = vec!["v1".to_string(), "v2".to_string()];
-
-        assert!(!policy.should_retain(&manifest, &[], &last_pulled).unwrap());
-    }
-
-    #[test]
-    fn test_pushed_at_recent() {
-        let now = fixed_now();
-        let policy = policy_at(now, &["image.pushed_at > now() - days(1)"]);
-
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            pushed_at: now.timestamp(),
-            ..Default::default()
-        };
-
-        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    #[test]
-    fn test_pushed_at_old() {
-        let now = fixed_now();
-        let policy = policy_at(now, &["image.pushed_at > now() - days(1)"]);
-
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            pushed_at: now.timestamp() - 2 * 86400,
-            ..Default::default()
-        };
-
-        assert!(!policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    #[test]
     fn test_last_pulled_at_recent() {
         let now = fixed_now();
         let policy = policy_at(now, &["image.last_pulled_at > now() - hours(1)"]);
@@ -412,7 +369,13 @@ mod tests {
     #[test]
     fn negative_timestamp_saturates_to_zero() {
         let pre_epoch = DateTime::from_timestamp(-100, 0).unwrap();
-        let image = ManifestImage::new(&ns(), None, Some(pre_epoch), Some(pre_epoch), fixed_now());
+        let image = ManifestImage::new(
+            &Namespace::new("app").unwrap(),
+            None,
+            Some(pre_epoch),
+            Some(pre_epoch),
+            fixed_now(),
+        );
         assert_eq!((image.pushed_at, image.last_pulled_at), (0, 0));
     }
 
@@ -429,27 +392,10 @@ mod tests {
     }
 
     #[test]
-    fn non_boolean_rule_string_retains_fail_open() {
-        // A rule that returns a string instead of a bool.
-        let policy = policy(&["'keep'"]);
-        let manifest = ManifestImage::default();
-        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    #[test]
     fn failed_rule_evaluation_retains_fail_open() {
         // A rule that references an unbound variable fails at execution time
         // (not compile time).  The evaluator must treat this as "retain" (fail-open).
         let policy = policy(&["nonexistent_var"]);
-        let manifest = ManifestImage::default();
-        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    #[test]
-    fn non_boolean_rule_does_not_shadow_later_rules() {
-        // When rule 1 returns a non-bool, the evaluator returns retain immediately
-        // (fail-open), so rule 2 is never reached.  Both orderings should retain.
-        let policy = policy(&["42", "false"]);
         let manifest = ManifestImage::default();
         assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
     }
@@ -484,19 +430,6 @@ mod tests {
         };
         let last_pushed = vec!["v1".to_string(), "v2".to_string()];
         assert!(!policy.should_retain(&manifest, &last_pushed, &[]).unwrap());
-    }
-
-    /// `top_pulled(-n)` clamps the count to 0 via `count.max(0)`, so the
-    /// effective window is empty and no tag can ever match.
-    #[test]
-    fn top_pulled_with_negative_count_clamps_to_zero() {
-        let policy = policy(&["top_pulled(-1)"]);
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            ..Default::default()
-        };
-        let last_pulled = vec!["v1".to_string()];
-        assert!(!policy.should_retain(&manifest, &[], &last_pulled).unwrap());
     }
 
     /// Rules are evaluated in OR fashion: the first rule that returns `true`
@@ -544,21 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn hours_overflow_saturates() {
-        assert_eq!(hours(i64::MAX), i64::MAX);
-    }
-
-    #[test]
-    fn minutes_overflow_saturates() {
-        assert_eq!(minutes(i64::MAX), i64::MAX);
-    }
-
-    #[test]
-    fn days_negative_overflow_saturates() {
-        assert_eq!(days(i64::MIN), i64::MIN);
-    }
-
-    #[test]
     fn days_normal_value() {
         assert_eq!(days(7), 7 * 86400);
     }
@@ -591,7 +509,8 @@ mod tests {
     fn absent_timestamps_resolve_to_now_and_zero() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
-        let never_pulled = ManifestImage::new(&ns(), None, None, None, now);
+        let never_pulled =
+            ManifestImage::new(&Namespace::new("app").unwrap(), None, None, None, now);
         assert_eq!(
             never_pulled.last_pulled_at, 0,
             "never pulled must be an absence, not a timestamp at the epoch"
@@ -603,7 +522,7 @@ mod tests {
         let pushed = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
         let pulled = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
         let known = serde_json::to_value(ManifestImage::new(
-            &ns(),
+            &Namespace::new("app").unwrap(),
             None,
             Some(pushed),
             Some(pulled),

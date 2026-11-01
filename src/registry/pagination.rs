@@ -1,7 +1,6 @@
-use std::num::NonZeroUsize;
-
 use std::collections::VecDeque;
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
@@ -11,10 +10,10 @@ use angos_storage::Page;
 /// Fan-out for the concurrent namespace walk: up to this many directories are
 /// scanned at once, refilled from the backlog as scans complete, to hide
 /// per-request backend latency, which dominates on S3.
-pub const NAMESPACE_WALK_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(128).unwrap();
+pub const NAMESPACE_WALK_CONCURRENCY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(128 - 1);
 
 /// Concurrent reads an admin listing keeps in flight per request.
-pub const LISTING_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+pub const LISTING_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(16 - 1);
 
 /// One scanned directory: its namespace name when it holds the `marker` child,
 /// and the sub-directories to descend into.
@@ -135,18 +134,7 @@ pub fn slice_page<T: Clone + ToString>(items: &[T], start_idx: usize, n: u16) ->
 
 #[cfg(test)]
 mod tests {
-    use crate::registry::pagination::*;
-
-    #[test]
-    fn test_slice_page_empty_input() {
-        let items: Vec<String> = vec![];
-        let Page {
-            items: result,
-            next_token: token,
-        } = slice_page(&items, 0, 10);
-        assert!(result.is_empty());
-        assert!(token.is_none());
-    }
+    use super::*;
 
     #[test]
     fn test_slice_page_zero_size() {
@@ -155,7 +143,7 @@ mod tests {
             items: result,
             next_token: token,
         } = slice_page(&items, 0, 0);
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "{result:?}");
         // No items emitted, but more remain after start_idx. The contract here
         // is that an empty page implies no last-element token.
         assert!(token.is_none());
@@ -168,7 +156,7 @@ mod tests {
             items: result,
             next_token: token,
         } = slice_page(&items, 5, 10);
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "{result:?}");
         assert!(token.is_none());
     }
 

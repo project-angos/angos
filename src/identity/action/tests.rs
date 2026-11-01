@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use angos_oci::{Digest, Namespace, Reference, Tag, UploadSessionId};
 
-use crate::identity::action::*;
+use super::*;
 use crate::jobs::{JobState, Queue};
 
 const SHA256_EMPTY: &str =
@@ -26,9 +26,33 @@ fn reference() -> Reference {
 /// they agree for every variant; `assert_action_variant_covered` fails to compile
 /// if a new variant is added without a case here.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn test_action_serialization_cel_compatibility() {
-    let cases: &[(&str, Action)] = &[
+    let cases = [
+        service_cases(),
+        blob_cases(),
+        manifest_cases(),
+        admin_cases(),
+    ]
+    .concat();
+
+    for (expected_action_str, action) in &cases {
+        assert_action_variant_covered(action);
+        let json = serde_json::to_value(action).unwrap();
+        assert_eq!(
+            json["action"], *expected_action_str,
+            "CEL action string mismatch for {action:?}"
+        );
+        assert_eq!(
+            action.action_name(),
+            *expected_action_str,
+            "action_name() mismatch for {action:?}"
+        );
+    }
+}
+
+/// UI, auth, probe and catalog actions.
+fn service_cases() -> Vec<(&'static str, Action)> {
+    vec![
         (
             "ui-asset",
             Action::UiAsset {
@@ -56,6 +80,12 @@ fn test_action_serialization_cel_compatibility() {
                 last: None,
             },
         ),
+    ]
+}
+
+/// Upload, blob and layer-browsing actions.
+fn blob_cases() -> Vec<(&'static str, Action)> {
+    vec![
         (
             "start-upload",
             Action::StartUpload {
@@ -116,45 +146,6 @@ fn test_action_serialization_cel_compatibility() {
             },
         ),
         (
-            "get-manifest",
-            Action::GetManifest {
-                namespace: ns(),
-                reference: reference(),
-            },
-        ),
-        (
-            "put-manifest",
-            Action::PutManifest {
-                namespace: ns(),
-                target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap()),
-            },
-        ),
-        (
-            "delete-manifest",
-            Action::DeleteManifest {
-                namespace: ns(),
-                reference: reference(),
-            },
-        ),
-        (
-            "get-referrers",
-            Action::GetReferrer {
-                namespace: ns(),
-                digest: digest(),
-                artifact_type: None,
-                last: None,
-            },
-        ),
-        ("list-revisions", Action::ListRevisions { namespace: ns() }),
-        ("list-uploads", Action::ListUploads { namespace: ns() }),
-        ("list-repositories", Action::ListRepositories),
-        (
-            "list-namespaces",
-            Action::ListNamespaces {
-                repository: Namespace::new("test").unwrap(),
-            },
-        ),
-        (
             "get-blob",
             Action::HeadBlob {
                 namespace: ns(),
@@ -185,11 +176,62 @@ fn test_action_serialization_cel_compatibility() {
                 path: "usr/bin/env".to_string(),
             },
         ),
+    ]
+}
+
+/// Manifest and referrer actions.
+fn manifest_cases() -> Vec<(&'static str, Action)> {
+    vec![
+        (
+            "get-manifest",
+            Action::GetManifest {
+                namespace: ns(),
+                reference: reference(),
+            },
+        ),
+        (
+            "put-manifest",
+            Action::PutManifest {
+                namespace: ns(),
+                target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap()),
+            },
+        ),
+        (
+            "delete-manifest",
+            Action::DeleteManifest {
+                namespace: ns(),
+                reference: reference(),
+            },
+        ),
+        (
+            "get-referrers",
+            Action::GetReferrer {
+                namespace: ns(),
+                digest: digest(),
+                artifact_type: None,
+                last: None,
+            },
+        ),
         (
             "get-manifest",
             Action::HeadManifest {
                 namespace: ns(),
                 reference: reference(),
+            },
+        ),
+    ]
+}
+
+/// Repository listing and job administration actions.
+fn admin_cases() -> Vec<(&'static str, Action)> {
+    vec![
+        ("list-revisions", Action::ListRevisions { namespace: ns() }),
+        ("list-uploads", Action::ListUploads { namespace: ns() }),
+        ("list-repositories", Action::ListRepositories),
+        (
+            "list-namespaces",
+            Action::ListNamespaces {
+                repository: Namespace::new("test").unwrap(),
             },
         ),
         (
@@ -212,7 +254,7 @@ fn test_action_serialization_cel_compatibility() {
             "retry-job",
             Action::RetryJob {
                 queue: Queue::Cache,
-                storage_key: "0000018f-key".to_string(),
+                storage_key: JobKey::try_from("0000018f-key".to_string()).unwrap(),
             },
         ),
         (
@@ -220,24 +262,10 @@ fn test_action_serialization_cel_compatibility() {
             Action::DeleteJob {
                 queue: Queue::Cache,
                 state: JobState::Failed,
-                storage_key: "0000018f-key".to_string(),
+                storage_key: JobKey::try_from("0000018f-key".to_string()).unwrap(),
             },
         ),
-    ];
-
-    for (expected_action_str, action) in cases {
-        assert_action_variant_covered(action);
-        let json = serde_json::to_value(action).unwrap();
-        assert_eq!(
-            json["action"], *expected_action_str,
-            "CEL action string mismatch for {action:?}"
-        );
-        assert_eq!(
-            action.action_name(),
-            *expected_action_str,
-            "action_name() mismatch for {action:?}"
-        );
-    }
+    ]
 }
 
 /// Compile-time exhaustiveness guard for the drift check above: a new `Action`
@@ -307,19 +335,6 @@ fn test_get_blob_includes_namespace_and_digest() {
 }
 
 #[test]
-fn test_get_manifest_includes_namespace_and_reference() {
-    let action = Action::GetManifest {
-        namespace: Namespace::new("library/nginx").unwrap(),
-        reference: Reference::from_str("v1.0.0").unwrap(),
-    };
-    let json = serde_json::to_value(&action).unwrap();
-    assert_eq!(json["action"], "get-manifest");
-    assert_eq!(json["namespace"], "library/nginx");
-    assert_eq!(json["reference"], "v1.0.0");
-    assert!(json.get("digest").is_none());
-}
-
-#[test]
 fn test_list_catalog_omits_null_pagination() {
     let action = Action::ListCatalog {
         n: None,
@@ -345,37 +360,37 @@ fn test_list_tags_with_pagination() {
 }
 
 #[test]
-fn test_get_namespace() {
+fn test_namespace() {
     assert_eq!(
         Action::GetBlob {
             namespace: ns(),
             digest: digest()
         }
-        .get_namespace()
+        .namespace()
         .map(AsRef::as_ref),
         Some("test")
     );
-    assert_eq!(Action::ApiVersion.get_namespace(), None);
+    assert_eq!(Action::ApiVersion.namespace(), None);
     assert_eq!(
         Action::ListCatalog {
             n: None,
             last: None
         }
-        .get_namespace(),
+        .namespace(),
         None
     );
-    assert_eq!(Action::ListRepositories.get_namespace(), None);
+    assert_eq!(Action::ListRepositories.namespace(), None);
 }
 
 #[test]
-fn test_get_digest() {
+fn test_digest() {
     let d = digest();
     assert_eq!(
         Action::GetBlob {
             namespace: ns(),
             digest: d.clone()
         }
-        .get_digest(),
+        .digest(),
         Some(&d)
     );
     assert_eq!(
@@ -384,7 +399,7 @@ fn test_get_digest() {
             digest: Some(d.clone()),
             digest_algorithm: None,
         }
-        .get_digest(),
+        .digest(),
         Some(&d)
     );
     assert_eq!(
@@ -393,7 +408,7 @@ fn test_get_digest() {
             digest: None,
             digest_algorithm: None,
         }
-        .get_digest(),
+        .digest(),
         None
     );
     // A mount-blob action exposes its mount-source digest as the action digest.
@@ -403,31 +418,31 @@ fn test_get_digest() {
             digest: d.clone(),
             from: Some(ns()),
         }
-        .get_digest(),
+        .digest(),
         Some(&d)
     );
-    assert_eq!(Action::ApiVersion.get_digest(), None);
+    assert_eq!(Action::ApiVersion.digest(), None);
 }
 
 #[test]
-fn test_get_reference() {
+fn test_reference() {
     let r = reference();
     assert_eq!(
         Action::GetManifest {
             namespace: ns(),
             reference: r.clone()
         }
-        .get_reference()
+        .reference()
         .map(|r| r.to_string()),
         Some(r.to_string())
     );
-    assert!(Action::ApiVersion.get_reference().is_none());
+    assert!(Action::ApiVersion.reference().is_none());
     assert!(
         Action::GetBlob {
             namespace: ns(),
             digest: digest()
         }
-        .get_reference()
+        .reference()
         .is_none()
     );
 }

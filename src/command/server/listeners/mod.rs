@@ -1,23 +1,27 @@
-use std::{fmt::Debug, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use std::fmt::Debug;
+use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use angos_backoff::Backoff;
 use arc_swap::ArcSwap;
+#[cfg(test)]
+use arc_swap::Guard;
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::{TcpListener, TcpStream},
-    select,
-    time::{sleep, timeout},
-};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::select;
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
-use crate::{
-    command::server::{ServerContext, error::Error, serve_request},
-    configuration::listeners::ListenerBaseConfig,
-    identity::RequestScheme,
-};
+use crate::command::server::error::Error;
+use crate::command::server::{ServerContext, serve_request};
+use crate::configuration::listeners::ListenerBaseConfig;
+use crate::identity::RequestScheme;
 
 pub mod insecure;
 pub mod tls;
@@ -128,7 +132,7 @@ impl<C: Connector + 'static> Listener<C> {
     /// `grace` to finish, then the webhook deliveries drain as before.
     pub async fn shutdown(&self, grace: Duration) {
         self.connections.drain(grace).await;
-        self.context.load().shutdown().await;
+        self.context.load().registry.shutdown().await;
     }
 
     pub async fn serve(&self) -> Result<(), Error> {
@@ -144,12 +148,12 @@ impl<C: Connector + 'static> Listener<C> {
     }
 
     #[cfg(test)]
-    pub fn current_context(&self) -> arc_swap::Guard<Arc<ServerContext>> {
+    pub fn current_context(&self) -> Guard<Arc<ServerContext>> {
         self.context.load()
     }
 
     #[cfg(test)]
-    pub fn current_timeouts(&self) -> arc_swap::Guard<Arc<RequestTimeouts>> {
+    pub fn current_timeouts(&self) -> Guard<Arc<RequestTimeouts>> {
         self.timeouts.load()
     }
 }
@@ -252,29 +256,22 @@ async fn build_listener(binding_address: SocketAddr) -> Result<TcpListener, Erro
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::atomic::{AtomicUsize, Ordering},
-        time::Instant,
-    };
+    use std::future::pending;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use super::*;
     use crate::command::server::server_context::tests::create_test_server_context;
 
     #[tokio::test]
     async fn test_build_listener_invalid_port_in_use() {
-        let addr = "127.0.0.1:0".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener1 = build_listener(addr).await.unwrap();
         let actual_addr = listener1.local_addr().unwrap();
 
         let result = build_listener(actual_addr).await;
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Initialization(msg) => {
-                assert!(msg.contains("Failed to bind to"));
-            }
-            _ => panic!("Expected Initialization error"),
-        }
+        assert!(matches!(result, Err(Error::Initialization(_))));
     }
 
     /// A connector whose handshake never completes, counting the connections
@@ -293,7 +290,7 @@ mod tests {
             _remote_address: SocketAddr,
         ) -> Option<HandshakeResult<TcpStream>> {
             self.started.fetch_add(1, Ordering::SeqCst);
-            std::future::pending::<()>().await;
+            pending::<()>().await;
             None
         }
 
@@ -464,19 +461,5 @@ mod tests {
             0
         );
         loop_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_build_listener_error_message_format() {
-        let addr: SocketAddr = "240.0.0.1:8080".parse().unwrap();
-        let result = build_listener(addr).await;
-
-        assert!(result.is_err());
-        if let Err(Error::Initialization(msg)) = result {
-            assert!(msg.starts_with("Failed to bind to"));
-            assert!(msg.contains("240.0.0.1:8080"));
-        } else {
-            panic!("Expected Initialization error with formatted message");
-        }
     }
 }

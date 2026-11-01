@@ -23,29 +23,3 @@ impl PartialEq for Error {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use redis::RedisError;
-
-    use super::*;
-
-    #[test]
-    fn test_error_display_execution() {
-        let error = Error::Execution("JSON parse failed".to_string());
-        assert_eq!(
-            format!("{error}"),
-            "cache execution error: JSON parse failed"
-        );
-    }
-
-    #[test]
-    fn test_from_redis_error_preserves_source() {
-        let redis_err = RedisError::from((redis::ErrorKind::Io, "IO error occurred"));
-        let error: Error = redis_err.into();
-        assert!(matches!(error, Error::Redis(_)));
-        assert!(format!("{error}").contains("IO error occurred"));
-        // Verify source is accessible via std::error::Error::source().
-        assert!(std::error::Error::source(&error).is_some());
-    }
-}

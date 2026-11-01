@@ -3,10 +3,8 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use tokio::net::TcpStream;
 
-use crate::command::server::{
-    ServerContext,
-    listeners::{Connector, HandshakeResult, Listener},
-};
+use crate::command::server::ServerContext;
+use crate::command::server::listeners::{Connector, HandshakeResult, Listener};
 use crate::configuration::listeners::ListenerBaseConfig;
 use crate::identity::RequestScheme;
 

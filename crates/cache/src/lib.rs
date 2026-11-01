@@ -1,4 +1,5 @@
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 mod config;
 mod error;
@@ -72,7 +73,7 @@ impl Cache {
         let Some(cached) = self.retrieve_value(key).await? else {
             return Ok(None);
         };
-        let value = serde_json::from_str::<T>(&cached)
+        let value: T = serde_json::from_str(&cached)
             .map_err(|e| Error::Execution(format!("Failed to deserialize cached value: {e}")))?;
         Ok(Some(value))
     }

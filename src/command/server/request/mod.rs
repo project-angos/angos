@@ -3,10 +3,10 @@ use std::io;
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use http_body_util::BodyExt;
-use hyper::{
-    HeaderMap,
-    body::Incoming,
-    header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RANGE},
+use hyper::HeaderMap;
+use hyper::body::Incoming;
+use hyper::header::{
+    ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RANGE,
 };
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
@@ -71,18 +71,18 @@ impl<'a> RequestHeaders<'a> {
 
     /// Whether `Accept-Encoding` takes `gzip`, which a zero weight refuses.
     pub fn accepts_gzip(&self) -> bool {
-        self.headers
-            .get_all(ACCEPT_ENCODING)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .any(|coding| {
-                coding
-                    .split(';')
-                    .next()
-                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("gzip"))
-                    && server::quality(coding) > 0
-            })
+        for value in self.headers.get_all(ACCEPT_ENCODING) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            for coding in value.split(',') {
+                let name = coding.split(';').next().unwrap_or_default();
+                if name.trim().eq_ignore_ascii_case("gzip") && server::quality(coding) > 0 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn content_type(&self) -> Result<Option<MediaType>, Error> {
@@ -129,12 +129,7 @@ impl<'a> RequestHeaders<'a> {
         };
 
         ByteWindow::chunk_bounds(&range_header)
-            .map(|(start, end)| {
-                Some(ByteWindow {
-                    start,
-                    end: Some(end),
-                })
-            })
+            .map(Some)
             .map_err(|error| Error::RangeNotSatisfiable(error.to_string()))
     }
 

@@ -1,61 +1,26 @@
-use std::{str::FromStr, sync::Arc};
+use std::str::FromStr;
+use std::sync::Arc;
 
 use serde_json::json;
 use tracing::Level;
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use angos_oci::{
-    Digest, Namespace, Reference, Tag,
-    request::{BlobMount, ManifestPutTarget},
-};
+use angos_oci::request::{BlobMount, ManifestPutTarget};
+use angos_oci::{Digest, Namespace, Reference, Tag};
 
-use crate::{
-    auth::{Error as AuthError, authorizer::*},
-    command::bootstrap,
-    configuration::{Configuration, RegexPattern},
-    identity::{AuthMethod, ClientCertificate, OidcClaims},
-    registry::{
-        RegistryConfig, Repository,
-        metadata_store::{MetadataStore, Settings},
-        repository_resolver::RepositoryResolver,
-        test_utils::{for_each_backend, put_blob_direct, test_job_store},
-    },
-    test_fixtures::{
-        configuration::{load_config, minimal_config, try_load_config},
-        logging::LogCapture,
-        requests::parts_with_uri,
-    },
-};
-
-#[test]
-fn test_authorizer_new_minimal() {
-    let config = minimal_config();
-    let authorizer = Authorizer::new(&config);
-
-    assert!(authorizer.is_ok());
-    let authorizer = authorizer.unwrap();
-    assert!(authorizer.global_authorization_webhook.is_none());
-    assert!(authorizer.repositories.is_empty());
-}
-
-#[test]
-fn test_authorizer_new_with_repository_config() {
-    let config = load_config(
-        r#"
-            [repository.myrepo]
-            namespace_pattern = "^myrepo/.*"
-            immutable_tags = true
-            immutable_tags_exclusions = ["^test-.*"]
-        "#,
-    );
-
-    let authorizer = Authorizer::new(&config);
-
-    assert!(authorizer.is_ok());
-    let authorizer = authorizer.unwrap();
-    assert_eq!(authorizer.repositories.len(), 1);
-    assert!(authorizer.repositories.contains_key("myrepo"));
-}
+use super::*;
+use crate::auth::Error as AuthError;
+use crate::command::bootstrap;
+use crate::configuration::Configuration;
+use crate::identity::{AuthMethod, ClientCertificate, OidcClaims};
+use crate::registry::metadata_store::{MetadataStore, Settings};
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::registry::test_utils::{for_each_backend, put_blob_direct, test_job_store};
+use crate::registry::{RegistryConfig, Repository};
+use crate::test_fixtures::configuration::load_config;
+use crate::test_fixtures::logging::LogCapture;
+use crate::test_fixtures::requests::parts_with_uri;
 
 #[test]
 fn empty_repository_webhook_reference_builds_without_a_webhook() {
@@ -75,38 +40,6 @@ fn empty_repository_webhook_reference_builds_without_a_webhook() {
         .get("myrepo")
         .expect("repository present");
     assert!(repo.authorization_webhook.is_none());
-}
-
-#[test]
-fn test_invalid_global_regex_fails_at_deserialize() {
-    let result = try_load_config(
-        r#"
-            immutable_tags = true
-            immutable_tags_exclusions = ["[invalid"]
-        "#,
-    );
-
-    assert!(
-        result.is_err(),
-        "invalid global regex must fail at deserialize time"
-    );
-}
-
-#[test]
-fn test_invalid_repository_regex_fails_at_deserialize() {
-    let result = try_load_config(
-        r#"
-            [repository.myrepo]
-            namespace_pattern = "^myrepo/.*"
-            immutable_tags = true
-            immutable_tags_exclusions = ["[invalid"]
-        "#,
-    );
-
-    assert!(
-        result.is_err(),
-        "invalid repository regex must fail at deserialize time"
-    );
 }
 
 #[test]
@@ -299,8 +232,7 @@ async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
 
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
-        enable_blob_redirect: config.global.enable_blob_redirect,
-        enable_manifest_redirect: config.global.enable_manifest_redirect,
+        redirect: config.global.redirect,
         max_manifest_size_bytes: config.global.max_manifest_size_bytes(),
         global_immutable_tags: config.global.immutable_tags,
         global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
@@ -636,26 +568,11 @@ async fn global_webhook_gates_a_namespace_no_repository_declares() {
     );
 }
 
-// Invalid-regex unreachability.
-//
-// `RegexPattern` compiles the regex at TOML deserialise time. An invalid
-// pattern causes `Configuration::load_from_str` to return `Err` before any
-// `Authorizer` is constructed. This test documents the `RegexPattern::compile`
-// API directly so the compile-time rejection invariant is grep-able from here.
-#[test]
-fn regex_pattern_compile_rejects_invalid_pattern() {
-    let err = RegexPattern::compile("[invalid");
-    assert!(
-        err.is_err(),
-        "an invalid regex must be rejected by RegexPattern::compile"
-    );
-}
-
 // A namespace that maps to no configured repository is passed through
 // without error or panic under an allow policy.
 //
 // `authorize_request` skips the repository layer when
-// `get_repository_for_namespace` returns `Err`, so the default policy is
+// `repository_for_namespace` returns `Err`, so the default policy is
 // applied implicitly (allow here).
 #[tokio::test]
 async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {

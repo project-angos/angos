@@ -5,18 +5,19 @@
 use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
-use serde_json::Value;
+use serde_json::{Error as JsonError, Value};
 use tracing::{info, warn};
 
-use crate::{
-    cache_fill::CacheFetchBlobPayload,
-    command::maintenance::{Error, action::Action, executor::ActionSink},
-    jobs::store::{Error as JobStoreError, JobStore},
-    jobs::{JobState, Queue},
-    registry::{Repository, repository_resolver::RepositoryResolver},
-    replication::ReplicationJob,
-    scan::ScanImagePayload,
-};
+use crate::cache_fill::CacheFetchBlobPayload;
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::{Action, JobAction};
+use crate::command::maintenance::executor::ActionSink;
+use crate::jobs::store::{Error as JobStoreError, JobStore};
+use crate::jobs::{JobState, Queue};
+use crate::registry::Repository;
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::replication::ReplicationJob;
+use crate::scan::ScanImagePayload;
 
 /// Keyset page size for the pending and failed scans; pages are looped to
 /// exhaustion, so this only bounds memory per round-trip.
@@ -31,7 +32,7 @@ fn classify(
     queue: Queue,
     resolver: &RepositoryResolver,
     payload: Value,
-) -> Result<Option<String>, serde_json::Error> {
+) -> Result<Option<String>, JsonError> {
     match queue {
         // A downstream whose mode changed still resolves, so it is not an
         // orphan.
@@ -85,7 +86,7 @@ fn classify(
 }
 
 /// Scans every pending and dead-lettered job on one queue and emits
-/// [`Action::DeleteOrphanJob`] for each whose payload no longer resolves to
+/// [`JobAction::DeleteOrphanJob`] for each whose payload no longer resolves to
 /// configured state.
 pub struct OrphanJobChecker {
     job_store: Arc<JobStore>,
@@ -190,12 +191,12 @@ impl OrphanJobChecker {
                     continue;
                 };
                 orphans += 1;
-                sink.apply(Action::DeleteOrphanJob {
+                sink.apply(Action::Job(JobAction::DeleteOrphanJob {
                     queue,
                     state,
                     storage_key,
                     reason,
-                })
+                }))
                 .await?;
             }
 
@@ -239,38 +240,30 @@ pub async fn sweep_orphan_jobs(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     use serde_json::json;
 
     use angos_oci::{Namespace, Tag};
     use angos_oci_client::RegistryClient;
 
-    use crate::{
-        cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
-        command::{
-            maintenance::{
-                action::Action,
-                executor::{ActionSink, DryRunSink, Executor},
-            },
-            scrub::orphan_jobs::{OrphanJobChecker, classify},
-        },
-        jobs::{
-            JobState, Queue,
-            store::{ClaimMode, FailOutcome, JobEnvelope, JobStore},
-        },
-        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
-        registry::{
-            Repository,
-            metadata_store::MetadataStore,
-            repository::Upstream,
-            repository_resolver::RepositoryResolver,
-            test_utils::{FsTestStack, downstream_client, fs_test_stack},
-        },
-        replication::{
-            REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream, ReplicationJob,
-            ReplicationTarget, build_envelope,
-        },
+    use crate::cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload};
+    use crate::command::maintenance::action::{Action, JobAction};
+    use crate::command::maintenance::executor::{ActionSink, DryRunSink, Executor};
+    use crate::command::scrub::orphan_jobs::{OrphanJobChecker, classify};
+    use crate::jobs::store::{ClaimMode, FailOutcome, JobEnvelope, JobStore};
+    use crate::jobs::{JobState, Queue};
+    use crate::policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock};
+    use crate::registry::Repository;
+    use crate::registry::metadata_store::MetadataStore;
+    use crate::registry::repository::Upstream;
+    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::registry::test_utils::{FsTestStack, downstream_client, fs_test_stack};
+    use crate::replication::{
+        REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream, ReplicationJob, ReplicationTarget,
+        build_envelope,
     };
 
     const NAMESPACE: &str = "nginx";
@@ -291,17 +284,12 @@ mod tests {
         ))
     }
 
-    /// Never dialed by these checkers.
-    fn upstream_client() -> RegistryClient {
-        Arc::into_inner(downstream_client("http://127.0.0.1:1")).expect("unshared test client")
-    }
-
     fn repository(
         name: &str,
         upstreams: Vec<RegistryClient>,
         replication: Vec<ReplicationDownstream>,
     ) -> Repository {
-        let upstreams = upstreams
+        let upstreams: Vec<Upstream> = upstreams
             .into_iter()
             .map(|client| Upstream {
                 client,
@@ -336,7 +324,15 @@ mod tests {
         let mut repositories = HashMap::new();
         repositories.insert(
             REPO.to_string(),
-            repository(REPO, vec![upstream_client()], vec![downstream]),
+            repository(
+                REPO,
+                // Never dialed by these checkers.
+                vec![
+                    Arc::into_inner(downstream_client("http://127.0.0.1:1"))
+                        .expect("unshared test client"),
+                ],
+                vec![downstream],
+            ),
         );
         repositories.insert(
             LOCAL_REPO.to_string(),
@@ -369,7 +365,7 @@ mod tests {
         JobEnvelope::new(
             Queue::Cache,
             CACHE_FETCH_BLOB_KIND,
-            format!("{}.{namespace}:{DIGEST}", Queue::Cache),
+            &format!("{}.{namespace}:{DIGEST}", Queue::Cache),
             &payload,
         )
         .unwrap()
@@ -433,7 +429,7 @@ mod tests {
             .unwrap();
         assert_eq!(keys.len(), 1);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store, Queue::Replication)
             .check_all(&sink)
             .await
@@ -446,7 +442,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, storage_key, reason }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, storage_key, reason })
                 if *queue == Queue::Replication
                     && *state == JobState::Pending
                     && *storage_key == keys[0]
@@ -465,7 +461,7 @@ mod tests {
 
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store, Queue::Replication)
             .check_all(&sink)
             .await
@@ -490,7 +486,7 @@ mod tests {
         // The downstream name is configured, but only for `nginx`.
         enqueue_push(&job_store, DOWNSTREAM, GHOST_NAMESPACE).await;
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store, Queue::Replication)
             .check_all(&sink)
             .await
@@ -503,7 +499,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, reason, .. }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
                 if *queue == Queue::Replication
                     && *state == JobState::Pending
                     && reason.contains(GHOST_NAMESPACE)
@@ -522,7 +518,7 @@ mod tests {
         let envelope = build_envelope(&push_payload(REMOVED_DOWNSTREAM, NAMESPACE)).unwrap();
         dead_letter(&job_store, Queue::Replication, envelope).await;
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store, Queue::Replication)
             .check_all(&sink)
             .await
@@ -535,7 +531,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { state, reason, .. }
+            Action::Job(JobAction::DeleteOrphanJob { state, reason, .. })
                 if *state == JobState::Failed && reason.contains(REMOVED_DOWNSTREAM)
         ));
     }
@@ -558,7 +554,7 @@ mod tests {
         .unwrap();
         job_store.enqueue(envelope).await.unwrap();
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store.clone(), Queue::Replication)
             .check_all(&sink)
             .await
@@ -666,7 +662,7 @@ mod tests {
         let keys = job_store.list_pending(Queue::Cache, 10).await.unwrap();
         assert_eq!(keys.len(), 1);
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store, Queue::Cache)
             .check_all(&sink)
             .await
@@ -679,7 +675,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, storage_key, reason }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, storage_key, reason })
                 if *queue == Queue::Cache
                     && *state == JobState::Pending
                     && *storage_key == keys[0]
@@ -698,7 +694,7 @@ mod tests {
 
         enqueue_cache_fill(&job_store, NAMESPACE).await;
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store, Queue::Cache)
             .check_all(&sink)
             .await
@@ -723,7 +719,7 @@ mod tests {
         // Configured, but with no upstreams: a fill job can never fetch.
         enqueue_cache_fill(&job_store, LOCAL_REPO).await;
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store, Queue::Cache)
             .check_all(&sink)
             .await
@@ -736,7 +732,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, reason, .. }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
                 if *queue == Queue::Cache
                     && *state == JobState::Pending
                     && reason == "namespace 'local' is not configured for pull-through"
@@ -754,7 +750,7 @@ mod tests {
 
         dead_letter(&job_store, Queue::Cache, cache_envelope(GHOST_NAMESPACE)).await;
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store, Queue::Cache)
             .check_all(&sink)
             .await
@@ -767,7 +763,7 @@ mod tests {
         );
         assert!(matches!(
             &sink.lock().unwrap()[0],
-            Action::DeleteOrphanJob { queue, state, reason, .. }
+            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
                 if *queue == Queue::Cache
                     && *state == JobState::Failed
                     && reason.contains(GHOST_NAMESPACE)
@@ -792,7 +788,7 @@ mod tests {
         .unwrap();
         job_store.enqueue(envelope).await.unwrap();
 
-        let sink: std::sync::Mutex<Vec<Action>> = std::sync::Mutex::new(Vec::new());
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
         checker(job_store.clone(), Queue::Cache)
             .check_all(&sink)
             .await

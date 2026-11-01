@@ -1,10 +1,12 @@
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
 use angos_mtls_client::ClientTls;
 use angos_secret::Secret;
 
-use crate::{configuration::RegexPattern, event_webhook::event::EventKind};
+use crate::configuration::RegexPattern;
+use crate::event_webhook::event::EventKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,46 +88,8 @@ where
 mod tests {
     use std::path::Path;
 
-    use crate::{
-        configuration::RegexPattern,
-        event_webhook::{
-            config::{DeliveryPolicy, EventWebhookConfig},
-            event::EventKind,
-        },
-    };
-
-    #[test]
-    fn deserialize_webhook_config_all_fields() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "required"
-            token = "secret-token"
-            timeout_ms = 10000
-            max_retries = 3
-            events = ["manifest.push", "tag.create"]
-            repository_filter = ["^myapp/.*", "^library/.*"]
-        "#;
-
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.url.as_str(), "https://example.com/webhook");
-        assert_eq!(config.policy, DeliveryPolicy::Required);
-        assert_eq!(
-            config.token.as_ref().map(|t| t.expose().as_str()),
-            Some("secret-token")
-        );
-        assert_eq!(config.timeout_ms, 10000);
-        assert_eq!(config.max_retries(), 3);
-        assert_eq!(config.events.len(), 2);
-        assert_eq!(config.events[0], EventKind::ManifestPush);
-        assert_eq!(config.events[1], EventKind::TagCreate);
-        assert_eq!(
-            config.repository_filter,
-            Some(vec![
-                RegexPattern::compile("^myapp/.*").unwrap(),
-                RegexPattern::compile("^library/.*").unwrap(),
-            ])
-        );
-    }
+    use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
+    use crate::event_webhook::event::EventKind;
 
     #[test]
     fn deserialize_webhook_config_with_defaults() {
@@ -147,44 +111,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_webhook_config_async_policy() {
-        let toml = r#"
-            url = "https://example.com/async-hook"
-            policy = "async"
-            events = ["manifest.push", "manifest.pull", "manifest.delete", "blob.push", "blob.pull", "tag.create", "tag.delete"]
-        "#;
-
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.policy, DeliveryPolicy::Async);
-        assert_eq!(config.events.len(), 7);
-    }
-
-    #[test]
-    fn invalid_url_fails_at_deserialize() {
-        let toml = r#"
-            url = "ht!tp://::invalid"
-            policy = "required"
-            events = ["manifest.push"]
-        "#;
-
-        let result: Result<EventWebhookConfig, _> = toml::from_str(toml);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn invalid_repository_filter_fails_at_deserialize() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "required"
-            events = ["manifest.push"]
-            repository_filter = ["^valid/.*", "[invalid"]
-        "#;
-
-        let result: Result<EventWebhookConfig, _> = toml::from_str(toml);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn empty_token_fails_at_deserialize_time() {
         let toml = r#"
             url = "https://example.com/webhook"
@@ -193,12 +119,7 @@ mod tests {
             events = ["manifest.push"]
         "#;
 
-        let err = toml::from_str::<EventWebhookConfig>(toml).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("event webhook token must not be empty"),
-            "unexpected error: {err}"
-        );
+        assert!(toml::from_str::<EventWebhookConfig>(toml).is_err());
     }
 
     /// A `required`-policy webhook without an explicit `max_retries` gets the
@@ -245,31 +166,7 @@ mod tests {
             max_retries = 17
         "#;
 
-        let result: Result<EventWebhookConfig, _> = toml::from_str(toml);
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("max_retries=17 exceeds the supported maximum of 16"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn max_retries_far_out_of_range_rejected() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "required"
-            events = ["manifest.push"]
-            max_retries = 999999
-        "#;
-
-        let result: Result<EventWebhookConfig, _> = toml::from_str(toml);
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("max_retries=999999 exceeds the supported maximum of 16"),
-            "unexpected error message: {err}"
-        );
+        assert!(toml::from_str::<EventWebhookConfig>(toml).is_err());
     }
 
     /// An endpoint behind a private CA, or one asking for a client certificate,

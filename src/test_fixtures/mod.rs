@@ -8,21 +8,12 @@
 //! `crate::registry::test_utils`, which needs access to registry-private
 //! items.
 
-#[allow(clippy::must_use_candidate)]
 pub mod client;
-#[allow(clippy::must_use_candidate)]
 pub mod configuration;
-#[allow(clippy::must_use_candidate)]
 pub mod logging;
-#[allow(clippy::must_use_candidate)]
 pub mod mocks;
-#[allow(clippy::must_use_candidate)]
 pub mod mtls;
-#[allow(clippy::must_use_candidate)]
 pub mod oidc;
-#[allow(clippy::must_use_candidate)]
 pub mod requests;
-#[allow(clippy::must_use_candidate)]
 pub mod tls;
-#[allow(clippy::must_use_candidate)]
 pub mod webhook;

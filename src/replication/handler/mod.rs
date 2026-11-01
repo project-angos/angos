@@ -12,21 +12,17 @@ use tracing::debug;
 use angos_oci::{Digest, Namespace, Reference, Tag};
 use angos_oci_client::Error as RegistryClientError;
 
-use crate::{
-    jobs::Queue,
-    jobs::store::{Error, JobEnvelope, JobHandler},
-    metrics_provider::metrics_provider,
-    registry::{
-        Error as MetadataStoreError,
-        blob_store::BlobStore,
-        metadata_store::{LinkKind, MetadataStore},
-        repository_resolver::RepositoryResolver,
-    },
-    replication::{
-        Error as ReplicationError, REPLICATION_DELETE_MANIFEST_KIND,
-        REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
-        pipeline::{self, PushContext, PushOutcome},
-    },
+use crate::jobs::Queue;
+use crate::jobs::store::{Error, JobEnvelope, JobHandler};
+use crate::metrics_provider::metrics_provider;
+use crate::registry::Error as MetadataStoreError;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::replication::pipeline::{self, PushContext, PushOutcome};
+use crate::replication::{
+    Error as ReplicationError, REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
+    ReplicationDownstream,
 };
 
 /// Maps a replication error to a job error, dead-lettering a downstream
@@ -173,7 +169,7 @@ pub fn build_envelope(job: &ReplicationJob) -> Result<JobEnvelope, Error> {
     JobEnvelope::new(
         Queue::Replication,
         job.kind(),
-        replication_lock_key(job),
+        &replication_lock_key(job),
         job,
     )
 }
@@ -193,7 +189,7 @@ pub fn build_prune_delete_envelope(job: &ReplicationJob) -> Result<JobEnvelope, 
     JobEnvelope::new(
         Queue::Replication,
         job.kind(),
-        delete_lock_key_base(job.target()),
+        &delete_lock_key_base(job.target()),
         job,
     )
 }
@@ -265,15 +261,6 @@ impl ReplicationJobHandler {
                 .with_label_values(&[downstream])
                 .set(Utc::now().timestamp());
         }
-    }
-
-    /// Records a `failed` push for `downstream`: per-attempt, and counted for
-    /// every `Err`, including pre-flight and local-read failures.
-    fn record_failure(downstream: &str) {
-        metrics_provider()
-            .replication_push_total
-            .with_label_values(&[downstream, "failed"])
-            .inc();
     }
 
     /// Re-resolves the current local target for a push: a tag is re-read at
@@ -435,7 +422,14 @@ impl JobHandler for ReplicationJobHandler {
         // `attempt` overflows rustc's layout query depth in release builds.
         Box::pin(self.attempt(&job))
             .await
-            .inspect_err(|_| Self::record_failure(&job.target().downstream))?;
+            // A `failed` push is counted per attempt, for every `Err`,
+            // including pre-flight and local-read failures.
+            .inspect_err(|_| {
+                metrics_provider()
+                    .replication_push_total
+                    .with_label_values(&[job.target().downstream.as_str(), "failed"])
+                    .inc();
+            })?;
 
         Ok(())
     }

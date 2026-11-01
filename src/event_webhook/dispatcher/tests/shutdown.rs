@@ -1,6 +1,10 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+use tokio::time::sleep;
+
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::common::{
     build_dispatcher, create_test_event, create_test_webhook_config, single_hook_dispatcher,
@@ -74,7 +78,7 @@ async fn a_displaced_dispatcher_still_delivers_what_it_had_in_flight() {
         {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(20)).await;
     }
 
     assert_eq!(
@@ -106,7 +110,7 @@ async fn test_shutdown_rejects_new_async_dispatches() {
     drop(dispatcher.dispatch(&event).await);
 
     // Give any (unexpected) background task time to run
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(200)).await;
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(
@@ -121,7 +125,7 @@ async fn test_shutdown_with_no_in_flight_returns_immediately() {
     let webhooks = HashMap::new();
     let dispatcher = build_dispatcher(webhooks);
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     dispatcher.shutdown().await;
     let elapsed = start.elapsed();
 
@@ -203,7 +207,7 @@ async fn test_shutdown_drains_slow_tasks_to_completion() {
     );
     dispatcher.dispatch(&event).await.unwrap();
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     dispatcher.shutdown().await;
     let elapsed = start.elapsed();
 
@@ -240,16 +244,6 @@ async fn test_shutdown_is_idempotent() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // Calling shutdown twice must not panic or deadlock
-    dispatcher.shutdown().await;
-    dispatcher.shutdown().await;
-}
-
-#[tokio::test]
-async fn test_shutdown_is_idempotent_without_deliveries() {
-    let webhooks = HashMap::new();
-    let dispatcher = build_dispatcher(webhooks);
-
-    // Both calls must complete without panic or deadlock
     dispatcher.shutdown().await;
     dispatcher.shutdown().await;
 }

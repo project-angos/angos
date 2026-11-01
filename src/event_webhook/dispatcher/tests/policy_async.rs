@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{header, method},
-};
+use tokio::time::sleep;
+
+use wiremock::matchers::{header, method};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::common::{create_test_event, single_hook_dispatcher};
 use crate::event_webhook::config::DeliveryPolicy;
@@ -26,7 +26,7 @@ async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
     let dispatcher =
         single_hook_dispatcher("async-hook", &server.uri(), DeliveryPolicy::Async, None, 0);
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let result = dispatcher.dispatch(&event).await;
     let elapsed = start.elapsed();
 
@@ -84,7 +84,7 @@ async fn async_deliveries_do_not_accumulate() {
     // one entry per event.
     for _ in 0..20 {
         dispatcher.dispatch(&event).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        sleep(Duration::from_millis(5)).await;
     }
 
     let retained = dispatcher.in_flight.len();

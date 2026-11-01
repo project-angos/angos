@@ -1,30 +1,24 @@
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
-use hyper::{
-    Request, Uri,
-    header::{HOST, HeaderMap, HeaderValue},
-    http::{request::Parts, uri::Authority},
-};
+use hyper::header::{HOST, HeaderMap};
+use hyper::http::request::Parts;
+use hyper::http::uri::Authority;
+use hyper::{Request, Uri};
 use serde::Deserialize;
 use tracing::instrument;
 
+use angos_cache::Cache;
 use angos_oci::request::BlobMount;
 use angos_oci::{Namespace, namespace_belongs_to};
 
+use crate::auth::{Authenticator, Authorizer, TokenIssuer};
+use crate::command::server::error::Error;
 use crate::command::server::handlers::{UiConfigBody, UiOidcBody};
 use crate::command::server::router::Route;
-
-use crate::{
-    auth::{Authenticator, Authorizer, TokenIssuer},
-    command::server::error::Error,
-    configuration::{Configuration, TrustedProxy},
-    identity::{Action, ClientIdentity, RequestScheme},
-    registry::{self, Registry},
-};
-use angos_cache::Cache;
+use crate::configuration::{Configuration, TrustedProxy};
+use crate::identity::{Action, ClientIdentity, RequestScheme};
+use crate::registry::{Error as RegistryError, Registry};
 
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,
@@ -64,11 +58,6 @@ impl ServerContext {
         })
     }
 
-    #[cfg(test)]
-    pub fn has_event_dispatcher(&self) -> bool {
-        self.registry.has_event_dispatcher()
-    }
-
     pub fn token_issuer(&self) -> Option<&TokenIssuer> {
         self.token_issuer.as_ref()
     }
@@ -81,7 +70,7 @@ impl ServerContext {
     ///
     /// # Errors
     ///
-    /// Returns [`registry::Error::NameInvalid`] when nesting under the
+    /// Returns [`RegistryError::NameInvalid`] when nesting under the
     /// repository breaks the namespace length cap.
     pub fn apply_proxy_namespace(
         &self,
@@ -115,7 +104,7 @@ impl ServerContext {
             // one it asked for.
             *namespace = namespace
                 .prepend(&repository.name)
-                .map_err(|_| registry::Error::NameInvalid)?;
+                .map_err(|_| RegistryError::NameInvalid)?;
         }
 
         Ok(Some(ns))
@@ -144,16 +133,6 @@ impl ServerContext {
         Some((scheme, host.to_string()))
     }
 
-    /// The `WWW-Authenticate` challenge pointing clients at the token endpoint,
-    /// from an origin [`Self::challenge_origin`] captured.
-    pub fn bearer_challenge(&self, scheme: &str, host: &str) -> Option<HeaderValue> {
-        self.token_issuer.as_ref()?.challenge(scheme, host)
-    }
-
-    fn is_trusted_proxy(&self, peer: IpAddr) -> bool {
-        self.trusted_proxies.iter().any(|p| p.contains(peer))
-    }
-
     /// The scheme the client used, which behind a TLS-terminating proxy is not
     /// the scheme this server was reached on. Only a trusted peer's
     /// `X-Forwarded-Proto` is believed. Resolved once per request into the
@@ -161,7 +140,7 @@ impl ServerContext {
     /// never disagree about the same request.
     pub fn resolve_scheme<B>(&self, request: &Request<B>) -> RequestScheme {
         let peer = request.extensions().get::<SocketAddr>();
-        if peer.is_some_and(|peer| self.is_trusted_proxy(peer.ip()))
+        if peer.is_some_and(|peer| self.trusted_proxies.iter().any(|p| p.contains(peer.ip())))
             && let Some(proto) = request.headers().get("X-Forwarded-Proto")
             && let Ok(proto) = proto.to_str()
             && proto.trim().eq_ignore_ascii_case("https")
@@ -187,7 +166,7 @@ impl ServerContext {
             .authenticate_request(parts, remote_address)
             .await?;
         if let Some(peer) = remote_address
-            && self.is_trusted_proxy(peer.ip())
+            && self.trusted_proxies.iter().any(|p| p.contains(peer.ip()))
             && let Some(client_ip) = resolve_forwarded_ip(&parts.headers, &self.trusted_proxies)
         {
             identity.client_ip = Some(client_ip);
@@ -233,10 +212,6 @@ impl ServerContext {
             .authorize_mount_source(mount, identity, request, &self.registry)
             .await?)
     }
-
-    pub async fn shutdown(&self) {
-        self.registry.shutdown().await;
-    }
 }
 
 /// The document the UI reads at startup, with the sign-in provider's issuer
@@ -275,7 +250,7 @@ fn resolve_forwarded_ip(headers: &HeaderMap, proxies: &[TrustedProxy]) -> Option
             if entry.is_empty() {
                 continue;
             }
-            let ip = entry.parse::<IpAddr>().ok()?;
+            let ip: IpAddr = entry.parse().ok()?;
             if !proxies.iter().any(|p| p.contains(ip)) {
                 return Some(ip.to_canonical().to_string());
             }

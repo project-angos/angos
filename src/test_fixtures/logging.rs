@@ -1,9 +1,7 @@
 //! Tracing capture for tests that assert on emitted log lines.
 
-use std::{
-    io::{self, Write},
-    sync::{Arc, Mutex},
-};
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -18,6 +16,7 @@ impl LogCapture {
     /// # Panics
     ///
     /// Panics if the captured bytes are not valid UTF-8.
+    #[must_use]
     pub fn contents(&self) -> String {
         let bytes = self.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()

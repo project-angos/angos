@@ -7,12 +7,10 @@ use tokio::io::AsyncReadExt;
 use angos_oci::{Algorithm, Digest, Namespace, UploadSessionId};
 use angos_storage::test_util::frame;
 
-use crate::registry::{
-    Error,
-    blob_store::*,
-    keys::{DigestKeys, NamespaceKeys},
-    test_utils::{FSRegistryTestCase, RegistryTestCase, for_each_backend},
-};
+use super::*;
+use crate::registry::Error;
+use crate::registry::keys::{DigestExt, NamespaceExt};
+use crate::registry::test_utils::{FSRegistryTestCase, RegistryTestCase, for_each_backend};
 
 /// Seed `content` at its canonical blob path by driving the whole upload
 /// workflow, as production does.
@@ -171,24 +169,6 @@ async fn blob_operations() {
         assert_eq!(size, test_content.len() as u64);
 
         let (mut reader, _) = store.reader(&digest, None).await.unwrap();
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await.unwrap();
-        assert_eq!(buffer, test_content);
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn blob_reader_returns_size() {
-    for_each_backend(async |tc| {
-        let store = tc.blob_store();
-        let store = store.as_ref();
-        let test_content = b"blob reader size test content";
-        let digest = seed_blob(store, test_content).await;
-
-        let (mut reader, size) = store.reader(&digest, None).await.unwrap();
-        assert_eq!(size, test_content.len() as u64);
-
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await.unwrap();
         assert_eq!(buffer, test_content);
@@ -435,7 +415,8 @@ async fn the_empty_blob_reads_as_present() {
         let digest = seed_blob(&store, b"").await;
 
         assert_eq!(store.size(&digest).await.unwrap(), 0);
-        assert!(store.read(&digest).await.unwrap().is_empty());
+        let content = store.read(&digest).await.unwrap();
+        assert!(content.is_empty(), "{content:?}");
     })
     .await;
 }
@@ -472,7 +453,7 @@ async fn complete_upload_rejects_size_divergence() {
         let upload_key = namespace.upload_path(&session_id);
         store
             .object
-            .write_upload(&upload_key, frame(tail.clone()), Some(tail.len() as u64))
+            .write_upload(&upload_key, frame(&tail), Some(tail.len() as u64))
             .await
             .unwrap();
 
@@ -522,7 +503,7 @@ async fn append_fails_closed_on_size_divergence() {
         let upload_key = namespace.upload_path(session_id);
         store
             .object
-            .write_upload(&upload_key, frame(b"orphaned tail".to_vec()), Some(13))
+            .write_upload(&upload_key, frame(b"orphaned tail"), Some(13))
             .await
             .unwrap();
 

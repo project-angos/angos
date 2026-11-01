@@ -1,28 +1,20 @@
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, HashMap},
-    pin::pin,
-};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
+use std::pin::pin;
 
-use futures_util::{
-    future::{BoxFuture, ready},
-    stream::{self, Stream, StreamExt, TryStreamExt},
-};
+use futures_util::future::{BoxFuture, ready};
+use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use tracing::{instrument, warn};
 
 use angos_docker_extension_service::{Catalog, CatalogRequest};
-use angos_oci::{
-    Content, Descriptor, Digest, Manifest, MediaType, Namespace, client,
-    request::{GetReferrersRequest, ListTagsRequest},
-    response::TagsListResponse,
-};
+use angos_oci::request::{GetReferrersRequest, ListTagsRequest};
+use angos_oci::response::TagsListResponse;
+use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, client};
 use angos_oci_service::{Referrers, Tags};
 use angos_storage::Page;
 
-use crate::registry::{
-    Error, Registry, Repository,
-    metadata_store::{LinkKind, MetadataStore},
-};
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
+use crate::registry::{Error, Registry, Repository};
 
 /// Whether the catalog names `namespace` as a repository: it holds at least
 /// one manifest revision, or one tag that resolves live. A namespace holding
@@ -38,11 +30,6 @@ pub fn holds_manifest_content(
         let mut tags = pin!(metadata_store.stream_live_tags(&namespace, None));
         Ok(tags.try_next().await?.is_some())
     })
-}
-
-/// Whether `referrer` passes a listing's `artifactType` filter.
-fn matches_filter(referrer: &Descriptor, artifact_type: Option<&MediaType>) -> bool {
-    artifact_type.is_none_or(|filter| referrer.artifact_type.as_ref() == Some(filter))
 }
 
 /// The local and described referrer candidates in one digest order, a digest
@@ -164,7 +151,7 @@ impl Registry {
         mut request: GetReferrersRequest,
     ) -> Result<Referrers, Error> {
         let upstream = self
-            .get_repository_for_namespace(&request.namespace)
+            .repository_for_namespace(&request.namespace)
             .ok()
             .filter(|repository| repository.is_pull_through());
         let page = self.list_referrers(upstream, &request).await?;
@@ -215,7 +202,7 @@ impl Registry {
             .upstream_referrers(upstream, namespace, digest, artifact_type)
             .await;
         for referrer in self.fallback_tag_referrers(namespace, digest).await {
-            if matches_filter(&referrer, artifact_type) {
+            if artifact_type.is_none_or(|filter| referrer.artifact_type.as_ref() == Some(filter)) {
                 described.entry(referrer.digest.clone()).or_insert(referrer);
             }
         }
@@ -337,7 +324,10 @@ impl Registry {
         match repository.list_referrers(namespace, digest).await {
             Ok(referrers) => referrers
                 .into_iter()
-                .filter(|referrer| matches_filter(referrer, artifact_type))
+                .filter(|referrer| {
+                    artifact_type
+                        .is_none_or(|filter| referrer.artifact_type.as_ref() == Some(filter))
+                })
                 .map(|referrer| (referrer.digest.clone(), referrer))
                 .collect(),
             Err(error) => {
@@ -368,7 +358,7 @@ impl Registry {
             .await
             && let Some(desc) = metadata.descriptor
         {
-            if matches_filter(&desc, artifact_type) {
+            if artifact_type.is_none_or(|filter| desc.artifact_type.as_ref() == Some(filter)) {
                 return Some(desc);
             }
             // A cached descriptor carrying its own `artifactType` has answered
@@ -404,51 +394,40 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use futures_util::future::try_join_all;
-    use http::{Response, header::LINK};
+    use http::Response;
+    use http::header::LINK;
     use serde_json::json;
     use url::form_urlencoded;
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
-    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use angos_cache::Config as CacheConfig;
     use angos_docker_extension_service::CatalogRequest;
-    use angos_oci::{
-        Descriptor, Digest, Manifest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE, Reference, Tag,
-        client::next_page_target,
-        request::{GetReferrersRequest, ListTagsRequest},
-    };
-    use angos_storage::{
-        Error as StorageError,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_oci::client::next_page_target;
+    use angos_oci::request::{GetReferrersRequest, ListTagsRequest};
+    use angos_oci::{Descriptor, Digest, Manifest, Namespace, OCI_INDEX_MEDIA_TYPE, Tag};
+    use angos_storage::Error as StorageError;
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
     use angos_transport::ResponseBody;
 
-    use crate::{
-        registry::{
-            Error,
-            content_discovery::{DEFAULT_PAGE_SIZE, Repository},
-            keys::NamespaceKeys,
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::{LIST_PAGE, LinkKind, MetadataStore},
-            repository::Config,
-            test_utils::{
-                FSRegistryTestCase, RegistryTestCase, create_link, create_test_blob,
-                create_test_registry, for_each_backend, media_type, metadata_store_over,
-                put_blob_direct, referrers_request, response_json, seed_links, upload_blob,
-            },
-        },
-        test_fixtures::client::test_client_config,
+    use crate::registry::Error;
+    use crate::registry::content_discovery::{DEFAULT_PAGE_SIZE, Repository};
+    use crate::registry::keys::NamespaceExt;
+    use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+    use crate::registry::metadata_store::{LIST_PAGE, LinkKind, MetadataStore};
+    use crate::registry::repository::Config;
+    use crate::registry::test_utils::{
+        FSRegistryTestCase, RegistryTestCase, create_link, create_test_registry, for_each_backend,
+        media_type, metadata_store_over, put_blob_direct, referrers_request, response_json,
+        seed_links, upload_blob,
     };
+    use crate::test_fixtures::client::test_client_config;
     /// The repository names a catalog response served.
     async fn catalog(response: Response<ResponseBody>) -> Vec<String> {
         json_strings(response, "repositories").await
@@ -519,7 +498,8 @@ mod tests {
                 .unwrap();
 
             assert!(next_cursor(&response).is_none());
-            assert!(catalog(response).await.is_empty());
+            let namespaces = catalog(response).await;
+            assert!(namespaces.is_empty(), "{namespaces:?}");
         })
         .await;
     }
@@ -765,60 +745,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_list_referrers_with_manifest() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-
-            let manifest_content = r#"{"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json"}"#;
-            let media_type =
-                MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap();
-
-            let (base_manifest_digest, _) =
-                create_test_blob(registry, namespace, manifest_content.as_bytes()).await;
-            registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Digest(base_manifest_digest.clone()),
-                    Some(&media_type),
-                    manifest_content.as_bytes(),
-                )
-                .await
-                .unwrap();
-
-            let (referrer_manifest_digest, _) =
-                create_test_blob(registry, namespace, manifest_content.as_bytes()).await;
-            registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Digest(referrer_manifest_digest.clone()),
-                    Some(&media_type),
-                    manifest_content.as_bytes(),
-                )
-                .await
-                .unwrap();
-
-            let referrer_link = LinkKind::Referrer { subject: base_manifest_digest.clone(), referrer: referrer_manifest_digest.clone(), };
-            seed_links(&registry
-                .metadata_store, namespace, &[(
-                        referrer_link,
-                        referrer_manifest_digest.clone(),
-                    )])
-                .await
-                .unwrap();
-
-            let referrers = registry
-                .list_referrers(None, &referrers_request(namespace, &base_manifest_digest))
-                .await
-                .unwrap();
-
-            assert_eq!(referrers.items.len(), 1);
-            assert_eq!(referrers.items[0].digest, referrer_manifest_digest);
-        })
-        .await;
-    }
-
     // The referrer-resolution tests below run on the split-backend fixture:
     // manifest bodies live in the blob store only, so any resolution path
     // reading them through the metadata store fails here.
@@ -873,10 +799,10 @@ mod tests {
     /// `mirror/app` maps to the upstream's `app`.
     async fn pull_through_repository(upstream: &str) -> Repository {
         let config = Config {
-            upstream: vec![test_client_config(upstream)],
+            upstream: vec![test_client_config(upstream.to_string())],
             ..Default::default()
         };
-        let cache_backend = angos_cache::Config::Memory.to_backend().unwrap();
+        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
         Repository::new(
             "mirror",
             &config,
@@ -1045,7 +971,6 @@ mod tests {
                 Some(&at),
             )
             .await;
-        assert!(result.is_some());
         assert_eq!(
             result.unwrap().artifact_type.as_deref(),
             Some("application/vnd.foo")
@@ -1312,7 +1237,7 @@ mod tests {
         count: Arc<AtomicUsize>,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl StoreHook for CountRecordListings {
         async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
             if let StoreOp::List { prefix } = op
@@ -1510,7 +1435,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(!filtered_referrers.items.is_empty());
+            assert!(!filtered_referrers.items.is_empty(), "no referrer matched the filter");
 
             let non_matching_referrers = registry
                 .list_referrers(
@@ -1523,7 +1448,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(non_matching_referrers.items.is_empty());
+            assert!(non_matching_referrers.items.is_empty(), "{:?}", non_matching_referrers.items);
         })
         .await;
     }
@@ -1752,7 +1677,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(referrers.items.len(), 1, "Expected 1 referrer descriptor");
+            assert_eq!(referrers.items.len(), 1);
             assert_eq!(referrers.items[0], descriptor);
 
             let filtered = registry

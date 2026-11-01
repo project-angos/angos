@@ -4,18 +4,20 @@
 //! own operations as much as the server surface that answers the ones which
 //! never reach the registry (errors, tokens, UI assets, probes).
 
-use std::{
-    fmt, io,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::error::Error as StdError;
+use std::fmt;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE};
+use http::header::{CONTENT_TYPE, InvalidHeaderValue};
+use http::{Error as HttpError, HeaderMap, HeaderValue, Response, StatusCode};
 use http_body_util::{Full, StreamBody};
 use hyper::body::{Body, Frame};
 use serde::Serialize;
+use serde_json::Error as JsonError;
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 
@@ -27,24 +29,24 @@ type BytesFrameStream = Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, io::Error
 /// service and extension crates alike.
 #[derive(Debug)]
 pub enum RenderError {
-    Header(http::Error),
-    Serialize(serde_json::Error),
+    Header(HttpError),
+    Serialize(JsonError),
 }
 
-impl From<http::header::InvalidHeaderValue> for RenderError {
-    fn from(e: http::header::InvalidHeaderValue) -> Self {
+impl From<InvalidHeaderValue> for RenderError {
+    fn from(e: InvalidHeaderValue) -> Self {
         RenderError::Header(e.into())
     }
 }
 
-impl From<http::Error> for RenderError {
-    fn from(e: http::Error) -> Self {
+impl From<HttpError> for RenderError {
+    fn from(e: HttpError) -> Self {
         RenderError::Header(e)
     }
 }
 
-impl From<serde_json::Error> for RenderError {
-    fn from(e: serde_json::Error) -> Self {
+impl From<JsonError> for RenderError {
+    fn from(e: JsonError) -> Self {
         RenderError::Serialize(e)
     }
 }
@@ -58,7 +60,7 @@ impl fmt::Display for RenderError {
     }
 }
 
-impl std::error::Error for RenderError {}
+impl StdError for RenderError {}
 
 /// The headers of a plain JSON response, the shape most non-OCI endpoints
 /// serve.
@@ -76,7 +78,7 @@ pub fn json_headers() -> HeaderMap {
 pub fn json_response<T, E>(status: StatusCode, body: &T) -> Result<Response<ResponseBody>, E>
 where
     T: Serialize,
-    E: From<http::Error> + From<serde_json::Error>,
+    E: From<HttpError> + From<JsonError>,
 {
     Ok(build_response(
         status,
@@ -148,7 +150,7 @@ pub fn build_response(
     status: StatusCode,
     headers: HeaderMap,
     body: ResponseBody,
-) -> Result<Response<ResponseBody>, http::Error> {
+) -> Result<Response<ResponseBody>, HttpError> {
     let mut response = Response::builder().status(status).body(body)?;
     *response.headers_mut() = headers;
 

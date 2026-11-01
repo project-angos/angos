@@ -1,5 +1,7 @@
-use base64::{Engine, prelude::BASE64_STANDARD};
-use serde::{Deserialize, de};
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer};
 use zeroize::Zeroize;
 
 /// Bytes written in configuration as base64, decoded when the file is parsed.
@@ -24,20 +26,22 @@ impl From<Vec<u8>> for Base64String {
 }
 
 impl<'de> Deserialize<'de> for Base64String {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let encoded = String::deserialize(deserializer)?;
         BASE64_STANDARD
             .decode(&encoded)
             .map(Self)
-            .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))
+            .map_err(|e| DeError::custom(format!("invalid base64: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use toml::de::Error as TomlError;
+
     use super::*;
 
-    fn parse(encoded: &str) -> Result<Base64String, toml::de::Error> {
+    fn parse(encoded: &str) -> Result<Base64String, TomlError> {
         #[derive(Deserialize)]
         struct Holder {
             value: Base64String,

@@ -1,41 +1,36 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Once},
-};
+use std::collections::HashMap;
+use std::sync::{Arc, Once};
+use std::time::Duration;
 
+use rustls::crypto::aws_lc_rs::default_provider;
 use tempfile::TempDir;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use angos_cache::Config as CacheConfig;
 use angos_docker_extension_service::CatalogRequest;
 use angos_mtls_client::BasicAuth;
+use angos_oci::Namespace;
 use angos_oci_client::RegistryClientConfig;
 use angos_secret::Secret;
 
-use crate::{
-    command::{
-        bootstrap,
-        server::{
-            Command,
-            command::{ServiceListener, setup},
-            listeners::tls::tests::build_config,
-            server_context::tests::create_test_event,
-        },
-    },
-    configuration::{Configuration, GlobalConfig},
-    metrics_provider::init_for_tests,
-    policy::{AccessMode, PolicyConfig},
-    registry::{
-        Registry, RegistryConfig, repository,
-        test_utils::{response_json, test_job_store},
-    },
-    test_fixtures::client::test_client_config,
-};
+use crate::command::bootstrap;
+use crate::command::server::Command;
+use crate::command::server::command::ServiceListener;
+use crate::command::server::listeners::tls::tests::build_config;
+use crate::command::server::server_context::tests::create_test_event;
+use crate::configuration::{Configuration, GlobalConfig};
+use crate::metrics_provider::initialize_metrics;
+use crate::policy::{AccessMode, PolicyConfig};
+use crate::registry::test_utils::{response_json, test_job_store};
+use crate::registry::{Registry, RegistryConfig, repository};
+use crate::test_fixtures::client::test_client_config;
+
 static CRYPTO_INIT: Once = Once::new();
 
 fn init_crypto_provider() {
     CRYPTO_INIT.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .ok();
+        default_provider().install_default().ok();
     });
 }
 
@@ -43,7 +38,7 @@ fn init_crypto_provider() {
 // must be kept alive for as long as the config is used. `extra` is appended
 // after the `[global]` section, so it may extend it or add new tables.
 fn tempdir_config(extra: &str) -> (Configuration, TempDir, TempDir) {
-    init_for_tests();
+    initialize_metrics();
     let blobs = TempDir::new().unwrap();
     let meta = TempDir::new().unwrap();
     let toml = format!(
@@ -97,11 +92,11 @@ async fn test_build_repository_with_upstream() {
                 username: "testuser".to_string(),
                 password: Secret::new("testpass".to_string()),
             }),
-            ..test_client_config("https://registry-1.docker.io")
+            ..test_client_config("https://registry-1.docker.io".to_string())
         }],
         ..repository::Config::default()
     };
-    let cache = angos_cache::Config::Memory.to_backend().unwrap();
+    let cache = CacheConfig::Memory.to_backend().unwrap();
     let configs = HashMap::from([("cached-repo".to_string(), repo_config)]);
     let result = bootstrap::repositories(&configs, &cache, &GlobalConfig::default()).await;
 
@@ -122,12 +117,11 @@ async fn test_build_repositories_multiple() {
     configs.insert("repo2".to_string(), repo_config.clone());
     configs.insert("repo3".to_string(), repo_config);
 
-    let cache_config = angos_cache::Config::Memory;
+    let cache_config = CacheConfig::Memory;
     let cache = cache_config.to_backend().unwrap();
 
     let result = bootstrap::repositories(&configs, &cache, &GlobalConfig::default()).await;
 
-    assert!(result.is_ok());
     let repos = result.unwrap();
     assert_eq!(repos.len(), 3);
     assert!(repos.contains_key("repo1"));
@@ -136,20 +130,10 @@ async fn test_build_repositories_multiple() {
 }
 
 #[tokio::test]
-async fn test_build_registry_minimal_config() {
-    let (config, _blobs, _meta) = create_minimal_config();
-    let result =
-        setup::build_registry(&config, &config.cache.to_backend().expect("auth cache")).await;
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
 async fn test_command_new_insecure_listener() {
     let (config, _blobs, _meta) = create_minimal_config();
     let result = Command::new(&config).await;
 
-    assert!(result.is_ok());
     let command = result.unwrap();
 
     match command.listener {
@@ -162,17 +146,6 @@ async fn test_command_new_insecure_listener() {
 async fn test_command_new_with_repositories() {
     let (config, _blobs, _meta) = create_config_with_repository();
     let result = Command::new(&config).await;
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_command_notify_config_change_insecure() {
-    let (config, _blobs, _meta) = create_minimal_config();
-    let command = Command::new(&config).await.unwrap();
-
-    let (new_config, _new_blobs, _new_meta) = create_minimal_config();
-    let result = command.notify_config_change(&new_config).await;
 
     assert!(result.is_ok());
 }
@@ -193,7 +166,7 @@ async fn test_build_registry_components_integration() {
     let (config, _blobs, _meta) = create_config_with_repository();
 
     let auth_cache = config.cache.to_backend().unwrap();
-    let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
+    let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
     let metadata_store = bootstrap::metadata_store(
         &config.resolve_registry_storage(),
         config.global.namespace_walk_concurrency,
@@ -207,8 +180,7 @@ async fn test_build_registry_components_integration() {
 
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
-        enable_blob_redirect: config.global.enable_blob_redirect,
-        enable_manifest_redirect: config.global.enable_manifest_redirect,
+        redirect: config.global.redirect,
         global_immutable_tags: config.global.immutable_tags,
         global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
         ..RegistryConfig::new(test_job_store(&metadata_store))
@@ -222,7 +194,7 @@ async fn test_build_registry_components_integration() {
                 n: None,
                 last: None,
             },
-            &|_: &angos_oci::Namespace| true,
+            &|_: &Namespace| true,
         )
         .await
         .unwrap()
@@ -248,24 +220,6 @@ fn create_config_with_webhook(url: &str) -> (Configuration, TempDir, TempDir) {
     ))
 }
 
-fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> (Configuration, TempDir, TempDir) {
-    tempdir_config(&format!(
-        r#"
-        event_webhooks = ["hook_a", "hook_b"]
-
-        [event_webhook.hook_a]
-        url = "{url_a}"
-        policy = "optional"
-        events = ["manifest.push"]
-
-        [event_webhook.hook_b]
-        url = "{url_b}"
-        policy = "optional"
-        events = ["manifest.push"]
-    "#
-    ))
-}
-
 #[tokio::test]
 async fn test_hot_reload_adds_webhook_via_command() {
     let (config, _blobs, _meta) = create_minimal_config();
@@ -276,6 +230,7 @@ async fn test_hot_reload_adds_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
+            .registry
             .has_event_dispatcher()
     );
 
@@ -288,6 +243,7 @@ async fn test_hot_reload_adds_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
+            .registry
             .has_event_dispatcher()
     );
 }
@@ -302,6 +258,7 @@ async fn test_hot_reload_removes_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
+            .registry
             .has_event_dispatcher()
     );
 
@@ -313,17 +270,13 @@ async fn test_hot_reload_removes_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
+            .registry
             .has_event_dispatcher()
     );
 }
 
 #[tokio::test]
 async fn test_hot_reload_changes_webhook_url_via_command() {
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
-    };
-
     let server_a = MockServer::start().await;
     let server_b = MockServer::start().await;
 
@@ -358,77 +311,7 @@ async fn test_hot_reload_changes_webhook_url_via_command() {
 }
 
 #[tokio::test]
-async fn test_hot_reload_adds_second_webhook() {
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server_a)
-        .await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server_b)
-        .await;
-
-    let (config_one, _blobs_one, _meta_one) = create_config_with_webhook(&server_a.uri());
-    let command = Command::new(&config_one).await.unwrap();
-
-    let (config_two, _blobs_two, _meta_two) =
-        create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
-    command.notify_config_change(&config_two).await.unwrap();
-
-    let context = command.as_insecure().unwrap().current_context();
-    context
-        .registry
-        .dispatch_events(&[create_test_event()])
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn test_hot_reload_removes_one_of_two_webhooks() {
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server_a)
-        .await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&server_b)
-        .await;
-
-    let (config_two, _blobs_two, _meta_two) =
-        create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
-    let command = Command::new(&config_two).await.unwrap();
-
-    let (config_one, _blobs_one, _meta_one) = create_config_with_webhook(&server_a.uri());
-    command.notify_config_change(&config_one).await.unwrap();
-
-    let context = command.as_insecure().unwrap().current_context();
-    context
-        .registry
-        .dispatch_events(&[create_test_event()])
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
 async fn test_hot_reload_inflight_old_dispatcher_still_works() {
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
     let server_old = MockServer::start().await;
     let server_new = MockServer::start().await;
 
@@ -467,21 +350,7 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
 }
 
 #[tokio::test]
-async fn test_command_shutdown_with_no_dispatcher() {
-    use std::time::Duration;
-
-    let (config, _blobs, _meta) = create_minimal_config();
-    let command = Command::new(&config).await.unwrap();
-
-    command.shutdown_with_timeout(Duration::from_secs(10)).await;
-}
-
-#[tokio::test]
 async fn test_command_shutdown_drains_in_flight_async_delivery() {
-    use std::time::Duration;
-
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))

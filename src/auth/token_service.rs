@@ -11,7 +11,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use http::{HeaderValue, request::Parts};
+use http::HeaderValue;
+use http::request::Parts;
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
 };
@@ -19,14 +20,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
 
-use crate::{
-    auth::{
-        AuthMiddleware, AuthResult, Error, authenticator::AuthConfig, authorization::bearer_token,
-        sha256_hex,
-    },
-    configuration::Base64String,
-    identity::{ClientIdentity, OidcClaims},
-};
+use crate::auth::authenticator::AuthConfig;
+use crate::auth::authorization::bearer_token;
+use crate::auth::{AuthMiddleware, AuthResult, Error, sha256_hex};
+use crate::configuration::Base64String;
+use crate::identity::{ClientIdentity, OidcClaims};
 use angos_secret::Secret;
 
 /// Shortest HMAC key accepted, in decoded bytes, matching the HS256 hash output
@@ -107,6 +105,14 @@ fn fingerprint(auth: &AuthConfig, id: Option<&str>, oidc: Option<&OidcClaims>) -
     sha256_hex(json!([identity, provider]).to_string())
 }
 
+/// A signed token and its lifetime in seconds; the field names are the ones OCI
+/// clients read from the token response.
+#[derive(Serialize)]
+pub struct IssuedToken {
+    pub token: String,
+    pub expires_in: u64,
+}
+
 pub struct TokenIssuer {
     encoding: EncodingKey,
     ttl_secs: u64,
@@ -131,12 +137,12 @@ impl TokenIssuer {
         })
     }
 
-    /// Signs `identity` into a token, returning it with its lifetime in seconds.
+    /// Signs `identity` into a token.
     ///
     /// The certificate and client IP are left out on purpose: both are re-derived
     /// from the live request, so a certificate-bound identity never becomes a
     /// replayable bearer credential.
-    pub fn issue(&self, identity: &ClientIdentity) -> Result<(String, u64), Error> {
+    pub fn issue(&self, identity: &ClientIdentity) -> Result<IssuedToken, Error> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| Error::Execution(format!("System clock is before the Unix epoch: {e}")))?
@@ -155,7 +161,10 @@ impl TokenIssuer {
 
         let token = encode(&header, &claims, &self.encoding)
             .map_err(|e| Error::Execution(format!("Failed to sign token: {e}")))?;
-        Ok((token, self.ttl_secs))
+        Ok(IssuedToken {
+            token,
+            expires_in: self.ttl_secs,
+        })
     }
 
     /// The `WWW-Authenticate` value pointing clients at the token endpoint, using
@@ -266,11 +275,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{
-        auth::oidc::validator::tests::{encoding_key, make_token},
-        identity::{ClientCertificate, OidcClaims},
-        test_fixtures::{oidc::KID, requests::parts_with_authorization},
-    };
+    use crate::auth::oidc::validator::tests::{encoding_key, make_token};
+    use crate::identity::{ClientCertificate, OidcClaims};
+    use crate::test_fixtures::oidc::KID;
+    use crate::test_fixtures::requests::parts_with_authorization;
 
     const SECRET: [u8; 32] = [7; 32];
     const PROVIDER: &str = "github-actions";
@@ -345,7 +353,10 @@ mod tests {
     }
 
     async fn reissue(identity: &ClientIdentity) -> ClientIdentity {
-        let (token, _) = issuer().issue(identity).expect("issuing must succeed");
+        let token = issuer()
+            .issue(identity)
+            .expect("issuing must succeed")
+            .token;
         let parts = parts_with_authorization(&format!("Bearer {token}"));
         let mut restored = ClientIdentity::default();
         let result = validator()
@@ -379,7 +390,10 @@ mod tests {
         };
         issued_from.client_ip = Some("10.0.0.1".to_string());
 
-        let (token, _) = issuer().issue(&issued_from).expect("issuing must succeed");
+        let token = issuer()
+            .issue(&issued_from)
+            .expect("issuing must succeed")
+            .token;
         let parts = parts_with_authorization(&format!("Bearer {token}"));
 
         // What the live request established must survive validation untouched.
@@ -436,10 +450,11 @@ mod tests {
             secret_key: Secret::new(vec![9; 32].into()),
             ..config()
         };
-        let (token, _) = TokenIssuer::new(&other, &toml::from_str(AUTH).unwrap())
+        let token = TokenIssuer::new(&other, &toml::from_str(AUTH).unwrap())
             .unwrap()
             .issue(&oidc_identity())
-            .unwrap();
+            .unwrap()
+            .token;
         let parts = parts_with_authorization(&format!("Bearer {token}"));
 
         let error = validator()
@@ -453,7 +468,7 @@ mod tests {
     /// repointing the provider revokes the tokens minted before.
     #[tokio::test]
     async fn rejects_a_token_whose_credential_changed() {
-        let (token, _) = issuer().issue(&oidc_identity()).unwrap();
+        let token = issuer().issue(&oidc_identity()).unwrap().token;
         let parts = parts_with_authorization(&format!("Bearer {token}"));
 
         for (from, to) in [

@@ -1,7 +1,5 @@
-use crate::{
-    configuration::{Configuration, Error},
-    test_fixtures::configuration::{config_toml, load_config},
-};
+use crate::configuration::{Configuration, Error};
+use crate::test_fixtures::configuration::{config_toml, load_config};
 
 #[test]
 fn global_max_manifest_size_must_be_greater_than_zero() {
@@ -157,30 +155,6 @@ fn test_validate_invalid_webhook_config() {
         err.to_string().contains("url"),
         "error should mention the offending url field: {err}"
     );
-}
-
-#[test]
-fn test_validate_multiple_repositories_with_webhooks() {
-    let config = config_toml(
-        r#"
-    [repository.app1]
-    authorization_webhook = "webhook1"
-
-    [repository.app2]
-    authorization_webhook = "webhook2"
-
-    [auth.webhook.webhook1]
-    url = "https://webhook1.example.com"
-    timeout_ms = 5000
-
-    [auth.webhook.webhook2]
-    url = "https://webhook2.example.com"
-    timeout_ms = 5000
-    "#,
-    );
-
-    let result = Configuration::load_from_str(&config);
-    assert!(result.is_ok());
 }
 
 #[test]

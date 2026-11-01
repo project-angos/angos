@@ -1,45 +1,33 @@
-use std::{
-    io::Cursor,
-    num::NonZeroU32,
-    sync::{Arc, Mutex, atomic::Ordering},
-};
+use std::io::Cursor;
+use std::num::NonZeroU32;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
-use angos_oci::{
-    Digest, Namespace, Reference, Tag,
-    request::{DeleteBlobRequest, PutManifestRequest},
-};
+use angos_oci::request::{DeleteBlobRequest, PutManifestRequest};
+use angos_oci::{Digest, Namespace, Reference, Tag};
 
-use crate::{
-    command::{
-        maintenance::{
-            action::{Action, LOST_AND_FOUND_PREFIX},
-            executor::{ActionSink, Executor},
-            walk::{self, WalkStats},
-        },
-        scrub::validate::{Pass, Validator, link::chunk_writes},
-    },
-    jobs::{
-        Queue,
-        store::{JobEnvelope, LockKey, job_lock_key_index_path},
-    },
-    registry::{
-        Error as RegistryError,
-        blob_store::BlobStore,
-        keys::{DigestKeys, NamespaceKeys, REF_ROOT, atime_entry_name},
-        metadata_store::{
-            AccessEntry, LinkKind, MetadataStore, PullHistoryConfig, Settings,
-            access_time::ATIME_CHUNK_CAP,
-        },
-        test_utils::{
-            RegistryTestCase, create_test_registry_with, for_each_backend, fs_test_stack,
-            media_type, put_blob_direct, upload_blob,
-        },
-    },
+use crate::command::maintenance::action::{Action, LOST_AND_FOUND_PREFIX};
+use crate::command::maintenance::executor::{ActionSink, Executor};
+use crate::command::maintenance::walk::{self, WalkStats};
+use crate::command::scrub::validate::link::chunk_writes;
+use crate::command::scrub::validate::{Pass, Validator};
+use crate::jobs::Queue;
+use crate::jobs::store::{JobEnvelope, LockKey, job_lock_key_index_path};
+use crate::registry::Error as RegistryError;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::keys::{DigestExt, NamespaceExt, REF_ROOT, TagEntryKind, atime_entry_name};
+use crate::registry::metadata_store::access_time::ATIME_CHUNK_CAP;
+use crate::registry::metadata_store::{
+    AccessEntry, LinkKind, MetadataStore, PullHistoryConfig, Settings,
+};
+use crate::registry::test_utils::{
+    RegistryTestCase, create_test_registry_with, for_each_backend, fs_test_stack, media_type,
+    put_blob_direct, upload_blob,
 };
 
 /// Run the three walk passes over the test case's stores with `sink`,
@@ -153,10 +141,6 @@ async fn push_healthy_image(
         .await
         .expect("healthy push");
     (response.digest, config_digest, layer_digest)
-}
-
-fn tag(name: &str) -> LinkKind {
-    LinkKind::Tag(Tag::new(name).unwrap())
 }
 
 #[tokio::test]
@@ -319,7 +303,7 @@ async fn tag_targeting_missing_blob_is_removed() {
         let key = namespace.tag_entry_path(
             &Tag::new("dangling").unwrap(),
             Utc::now(),
-            false,
+            TagEntryKind::Set,
             &ghost_digest,
         );
         metadata_store
@@ -332,7 +316,7 @@ async fn tag_targeting_missing_blob_is_removed() {
 
         assert!(
             metadata_store
-                .read_link(namespace, &tag("dangling"))
+                .read_link(namespace, &LinkKind::Tag(Tag::new("dangling").unwrap()))
                 .await
                 .is_err(),
             "a tag targeting missing bytes must be removed"
@@ -979,11 +963,10 @@ async fn orphan_job_index_is_reclaimed_age_gated() {
     // The replication queue, so the test registry's in-process cache claim
     // loop does not drain the pending job out from under the walk.
     fn index_key(lock_key: &str) -> String {
-        job_lock_key_index_path("replication", &LockKey::new(lock_key).expect("lock key"))
-    }
-
-    fn index_body(storage_key: &str) -> Bytes {
-        Bytes::from(json!({ "storage_key": storage_key }).to_string())
+        job_lock_key_index_path(
+            "replication",
+            &LockKey::try_new(lock_key).expect("lock key"),
+        )
     }
 
     // Grace 0 (the shared fixtures): the orphan and the corrupt entry go.
@@ -993,13 +976,19 @@ async fn orphan_job_index_is_reclaimed_age_gated() {
 
         let orphan = index_key("orphan");
         objects
-            .put(&orphan, index_body("0000000000000000-vanished"))
+            .put(
+                &orphan,
+                Bytes::from_static(br#"{"storage_key":"0000000000000000-vanished"}"#),
+            )
             .await
             .unwrap();
 
         let live = index_key("live");
         objects
-            .put(&live, index_body("0000000000000000-live"))
+            .put(
+                &live,
+                Bytes::from_static(br#"{"storage_key":"0000000000000000-live"}"#),
+            )
             .await
             .unwrap();
         let envelope =
@@ -1041,7 +1030,10 @@ async fn orphan_job_index_is_reclaimed_age_gated() {
     let objects = stack.metadata_store.object_store();
     let young = index_key("young");
     objects
-        .put(&young, index_body("0000000000000000-vanished"))
+        .put(
+            &young,
+            Bytes::from_static(br#"{"storage_key":"0000000000000000-vanished"}"#),
+        )
         .await
         .unwrap();
     let sink: Arc<dyn ActionSink> = Arc::new(Executor::new_for_test(
@@ -1076,7 +1068,10 @@ async fn orphan_namespaces_are_left_alone_and_invalid_names_reclaimed() {
         scrub_apply(test_case).await;
 
         assert!(
-            metadata_store.read_link(orphan, &tag("v1")).await.is_ok(),
+            metadata_store
+                .read_link(orphan, &LinkKind::Tag(Tag::new("v1").unwrap()))
+                .await
+                .is_ok(),
             "an orphan namespace must survive scrub"
         );
         assert!(
@@ -1176,12 +1171,12 @@ async fn put_tag_entry(
     namespace: &Namespace,
     tag: &Tag,
     ts_millis: i64,
-    deletion: bool,
+    kind: TagEntryKind,
     digest: &Digest,
     body: &'static [u8],
 ) -> String {
     let ts = DateTime::from_timestamp_millis(ts_millis).unwrap();
-    let key = namespace.tag_entry_path(tag, ts, deletion, digest);
+    let key = namespace.tag_entry_path(tag, ts, kind, digest);
     metadata_store
         .object_store()
         .put(&key, Bytes::from_static(body))
@@ -1207,7 +1202,7 @@ async fn superseded_tag_entries_are_demoted_to_hist() {
             namespace,
             &tag,
             1_000_000,
-            false,
+            TagEntryKind::Set,
             &manifest_digest,
             b"{}",
         )
@@ -1217,7 +1212,7 @@ async fn superseded_tag_entries_are_demoted_to_hist() {
             namespace,
             &tag,
             2_000_000,
-            false,
+            TagEntryKind::Set,
             &manifest_digest,
             b"{}",
         )
@@ -1270,7 +1265,7 @@ async fn same_millisecond_tie_group_is_never_split() {
             namespace,
             &tag,
             ts,
-            false,
+            TagEntryKind::Set,
             &manifest_digest,
             b"{}",
         )
@@ -1280,7 +1275,7 @@ async fn same_millisecond_tie_group_is_never_split() {
             namespace,
             &tag,
             ts,
-            true,
+            TagEntryKind::Deletion,
             &manifest_digest,
             b"{}",
         )
@@ -1290,7 +1285,7 @@ async fn same_millisecond_tie_group_is_never_split() {
             namespace,
             &tag,
             ts - 10_000,
-            false,
+            TagEntryKind::Set,
             &manifest_digest,
             b"{}",
         )
@@ -1331,7 +1326,7 @@ async fn young_superseded_entry_is_kept() {
             namespace,
             &tag,
             1_000_000,
-            false,
+            TagEntryKind::Set,
             &manifest_digest,
             b"{}",
         )
@@ -1375,7 +1370,7 @@ async fn demoted_entries_leave_the_listing_and_keep_their_bodies() {
             namespace,
             &tag,
             1_000_000,
-            false,
+            TagEntryKind::Set,
             &manifest_digest,
             body_a,
         )
@@ -1385,7 +1380,7 @@ async fn demoted_entries_leave_the_listing_and_keep_their_bodies() {
             namespace,
             &tag,
             2_000_000,
-            false,
+            TagEntryKind::Set,
             &manifest_digest,
             body_b,
         )
@@ -1445,7 +1440,7 @@ async fn a_tracked_reference_is_pinned_by_its_entry_alone() {
         // still refuses, all off the reference entries alone.
         let registry = test_case.registry();
         let resolved = metadata_store
-            .read_link(namespace, &tag("v1"))
+            .read_link(namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
             .await
             .unwrap();
         assert_eq!(resolved.target, manifest_digest);

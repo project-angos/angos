@@ -10,22 +10,17 @@ use std::cmp::Reverse;
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use angos_oci::{Descriptor, Digest, Namespace};
-
-use crate::{
-    jobs::{
-        Queue,
-        store::{Error, JobEnvelope},
-    },
-    policy::PolicyConfig,
-    registry::{
-        Error as RegistryError,
-        metadata_store::{LinkKind, MetadataStore},
-    },
-};
 use angos_mtls_client::ClientTls;
+use angos_oci::{Descriptor, Digest, Namespace};
 use angos_secret::Secret;
+
+use crate::jobs::Queue;
+use crate::jobs::store::{Error, JobEnvelope};
+use crate::policy::PolicyConfig;
+use crate::registry::Error as RegistryError;
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
 
 pub const SCAN_IMAGE_KIND: &str = "scan.image";
 pub const SARIF_MEDIA_TYPE: &str = "application/sarif+json";
@@ -96,7 +91,7 @@ pub fn build_envelope(payload: &ScanImagePayload) -> Result<JobEnvelope, Error> 
     JobEnvelope::new(
         Queue::Scan,
         SCAN_IMAGE_KIND,
-        format!("{}.{}:{}", Queue::Scan, payload.namespace, payload.digest),
+        &format!("{}.{}:{}", Queue::Scan, payload.namespace, payload.digest),
         payload,
     )
 }
@@ -189,7 +184,7 @@ impl ScanSummary {
     /// Reads `report`, a SARIF document; anything else summarises as empty
     /// rather than failing the job, since the report is still worth keeping.
     pub fn of(report: &[u8]) -> Self {
-        let Ok(document) = serde_json::from_slice::<serde_json::Value>(report) else {
+        let Ok(document) = serde_json::from_slice::<Value>(report) else {
             return Self::default();
         };
         let Some(run) = document["runs"].get(0) else {
@@ -283,12 +278,12 @@ fn severity_word(word: &str) -> Option<Severity> {
 /// The scanner's own severity word when it states one (Trivy tags its rule
 /// with it, Grype writes it into the message), else the CVSS score bucketed
 /// the way GitHub code scanning does.
-fn severity(rule: Option<&serde_json::Value>, message: &str) -> Severity {
+fn severity(rule: Option<&Value>, message: &str) -> Severity {
     let tagged = rule
         .and_then(|rule| rule["properties"]["tags"].as_array())
         .into_iter()
         .flatten()
-        .filter_map(serde_json::Value::as_str)
+        .filter_map(Value::as_str)
         .find_map(severity_word);
     if let Some(severity) = tagged {
         return severity;

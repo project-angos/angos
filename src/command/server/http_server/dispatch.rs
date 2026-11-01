@@ -1,9 +1,10 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use hyper::{
-    Method, Request, Response, StatusCode, body::Incoming, header::CONTENT_RANGE,
-    http::request::Parts,
-};
+use hyper::body::Incoming;
+use hyper::header::CONTENT_RANGE;
+use hyper::http::request::Parts;
+use hyper::{Method, Request, Response, StatusCode};
 use tracing::instrument;
 
 use angos_docker_extension_service::{CatalogRequest, Endpoint as DockerEndpoint};
@@ -19,21 +20,19 @@ use angos_oci::request::{
     PutManifestRequest, StartUploadRequest, StartUploadTarget,
 };
 use angos_oci::response::ErrorCode;
-use angos_oci_service::{Endpoint as OciEndpoint, is_invalid_referrers_request};
-use angos_transport::ResponseBody;
-
-use crate::{
-    command::server::{
-        ServerContext,
-        error::Error,
-        handlers,
-        request::{RequestHeaders, incoming_into_async_read},
-        router::{self, Route},
-    },
-    event_webhook::event::EventActor,
-    identity::{Action, ClientIdentity},
-    registry,
+use angos_oci_service::{
+    Endpoint as OciEndpoint, ManifestEndpoint, UploadEndpoint, is_invalid_referrers_request,
 };
+use angos_transport::{ResponseBody, json_response};
+
+use crate::command::server::error::Error;
+use crate::command::server::request::{RequestHeaders, incoming_into_async_read};
+use crate::command::server::router::Route;
+use crate::command::server::{ServerContext, handlers, router};
+use crate::event_webhook::event::EventActor;
+use crate::identity::{Action, ClientIdentity};
+use crate::registry;
+use crate::registry::Error as RegistryError;
 
 #[instrument(skip(context, req, route))]
 pub async fn dispatch_request(
@@ -65,7 +64,6 @@ pub async fn authenticate_and_authorize(
     Ok(identity)
 }
 
-#[allow(clippy::too_many_lines)]
 #[instrument(skip(context, parts, incoming, identity))]
 async fn dispatch_route<'a>(
     context: &'a ServerContext,
@@ -74,14 +72,11 @@ async fn dispatch_route<'a>(
     incoming: Incoming,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let headers = RequestHeaders::new(&parts.headers);
     let registry = &context.registry;
-    // The authenticated caller, borrowed by whichever arm runs.
-    let actor = EventActor::from(identity.clone());
 
     match route {
         Route::UiAsset { path } if context.enable_ui => handlers::handle_ui_asset(&path),
-        Route::UiConfig if context.enable_ui => handlers::handle_ui_config(&context.ui_config),
+        Route::UiConfig if context.enable_ui => json_response(StatusCode::OK, &context.ui_config),
         Route::UiAsset { .. } | Route::UiConfig => handle_unknown_route(parts),
         Route::Token => {
             let Some(token_issuer) = context.token_issuer() else {
@@ -92,102 +87,38 @@ async fn dispatch_route<'a>(
 
             handlers::handle_get_token(token_issuer, identity)
         }
-        Route::Oci(OciEndpoint::CheckVersion) => Ok(registry::api_version().into_response()?),
-        Route::Oci(OciEndpoint::StartUpload {
-            namespace,
-            digest,
-            digest_algorithm,
-        }) => {
-            // A body with no `?digest=` has nothing to verify it against, so
-            // the request opens a session and the body is not read.
-            let content_length = headers.content_length()?;
-            Ok(registry
-                .handle_start_upload(
-                    Some(actor),
-                    StartUploadRequest {
-                        namespace,
-                        digest_algorithm,
-                        target: digest.map(|digest| StartUploadTarget {
-                            digest,
-                            content_length,
-                        }),
-                    },
-                    Box::new(incoming_into_async_read(incoming)),
-                )
-                .await?
-                .into_response()?)
-        }
-        Route::Oci(OciEndpoint::MountBlob {
-            namespace,
-            digest,
-            from,
-        }) => {
-            let mount = BlobMount { digest, from };
-            // A mount must not hand the caller bytes they could not otherwise
-            // read, so resolve a source namespace they may read from first.
-            let source = context
-                .authorize_mount_source(&mount, identity, parts)
-                .await?;
+        Route::Oci(endpoint) => dispatch_oci(context, endpoint, parts, incoming, identity).await,
+        Route::Docker(DockerEndpoint::ListCatalog { n, last }) => Ok(registry
+            .handle_list_catalog(CatalogRequest { n, last }, &|namespace: &Namespace| {
+                context.catalog_lists_namespace(namespace, identity)
+            })
+            .await?
+            .into_response()?),
+        Route::Angos(endpoint) => dispatch_angos(context, endpoint, parts, identity).await,
+        Route::Healthz => handlers::handle_healthz(),
+        Route::Readyz => handlers::handle_readyz(registry).await,
+        Route::Metrics => handlers::handle_metrics(),
+    }
+}
 
-            Ok(registry
-                .handle_mount_blob(Some(actor), MountBlobRequest { namespace, mount }, source)
-                .await?
-                .into_response()?)
+async fn dispatch_oci(
+    context: &ServerContext,
+    endpoint: OciEndpoint,
+    parts: &Parts,
+    incoming: Incoming,
+    identity: &ClientIdentity,
+) -> Result<Response<ResponseBody>, Error> {
+    let headers = RequestHeaders::new(&parts.headers);
+    let registry = &context.registry;
+    // The authenticated caller, borrowed by whichever arm runs.
+    let actor = EventActor::from(identity.clone());
+
+    match endpoint {
+        OciEndpoint::CheckVersion => Ok(registry::api_version().into_response()?),
+        OciEndpoint::Upload(endpoint) => {
+            dispatch_upload(context, endpoint, parts, incoming, identity).await
         }
-        Route::Oci(OciEndpoint::GetUpload {
-            namespace,
-            session_id,
-        }) => Ok(registry
-            .handle_upload_status(GetUploadRequest {
-                namespace,
-                session_id,
-            })
-            .await?
-            .into_status_response()?),
-        Route::Oci(OciEndpoint::PatchUpload {
-            namespace,
-            session_id,
-        }) => Ok(registry
-            .handle_patch_upload(
-                PatchUploadRequest {
-                    namespace,
-                    session_id,
-                    content_range: headers.chunk_range(CONTENT_RANGE)?,
-                    content_length: headers.content_length()?,
-                },
-                Box::new(incoming_into_async_read(incoming)),
-            )
-            .await?
-            .into_open_response()?),
-        Route::Oci(OciEndpoint::PutUpload {
-            namespace,
-            session_id,
-            digest,
-        }) => Ok(registry
-            .handle_complete_upload(
-                Some(actor),
-                CompleteUploadRequest {
-                    namespace,
-                    session_id,
-                    digest,
-                    content_range: headers.chunk_range(CONTENT_RANGE)?,
-                    content_length: headers.content_length()?,
-                },
-                Box::new(incoming_into_async_read(incoming)),
-            )
-            .await?
-            .into_response()?),
-        Route::Oci(OciEndpoint::DeleteUpload {
-            namespace,
-            session_id,
-        }) => Ok(registry
-            .handle_cancel_upload(DeleteUploadRequest {
-                namespace,
-                session_id,
-            })
-            .await?
-            .into_response()?),
-        Route::Oci(OciEndpoint::GetBlob { namespace, digest }) => Ok(registry
+        OciEndpoint::GetBlob { namespace, digest } => Ok(registry
             .handle_get_blob(
                 Some(actor),
                 GetBlobRequest {
@@ -200,7 +131,7 @@ async fn dispatch_route<'a>(
             )
             .await?
             .into_response(registry.blob_stream_frame_size())?),
-        Route::Oci(OciEndpoint::HeadBlob { namespace, digest }) => Ok(registry
+        OciEndpoint::HeadBlob { namespace, digest } => Ok(registry
             .handle_head_blob(HeadBlobRequest {
                 namespace,
                 digest,
@@ -208,14 +139,51 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Oci(OciEndpoint::DeleteBlob { namespace, digest }) => Ok(registry
+        OciEndpoint::DeleteBlob { namespace, digest } => Ok(registry
             .handle_delete_blob(DeleteBlobRequest { namespace, digest })
             .await?
             .into_response()?),
-        Route::Oci(OciEndpoint::GetManifest {
+        OciEndpoint::Manifest(endpoint) => {
+            dispatch_manifest(context, endpoint, parts, incoming, identity).await
+        }
+        OciEndpoint::GetReferrers {
+            namespace,
+            digest,
+            artifact_type,
+            last,
+        } => Ok(registry
+            .handle_get_referrers(GetReferrersRequest {
+                namespace,
+                digest,
+                artifact_type,
+                last,
+            })
+            .await?
+            .into_response()?),
+        OciEndpoint::ListTags { namespace, n, last } => Ok(registry
+            .handle_list_tags(ListTagsRequest { namespace, n, last })
+            .await?
+            .into_response()?),
+    }
+}
+
+/// The manifest endpoints, routed here by [`dispatch_oci`].
+async fn dispatch_manifest(
+    context: &ServerContext,
+    endpoint: ManifestEndpoint,
+    parts: &Parts,
+    incoming: Incoming,
+    identity: &ClientIdentity,
+) -> Result<Response<ResponseBody>, Error> {
+    let headers = RequestHeaders::new(&parts.headers);
+    let registry = &context.registry;
+    let actor = EventActor::from(identity.clone());
+
+    match endpoint {
+        ManifestEndpoint::Get {
             namespace,
             reference,
-        }) => Ok(registry
+        } => Ok(registry
             .handle_get_manifest(
                 Some(actor),
                 GetManifestRequest {
@@ -227,10 +195,10 @@ async fn dispatch_route<'a>(
             )
             .await?
             .into_response()?),
-        Route::Oci(OciEndpoint::HeadManifest {
+        ManifestEndpoint::Head {
             namespace,
             reference,
-        }) => Ok(registry
+        } => Ok(registry
             .handle_head_manifest(
                 Some(actor),
                 HeadManifestRequest {
@@ -241,7 +209,7 @@ async fn dispatch_route<'a>(
             )
             .await?
             .into_response()?),
-        Route::Oci(OciEndpoint::PutManifest { namespace, target }) => {
+        ManifestEndpoint::Put { namespace, target } => {
             let (reference, tags) = target.into_parts();
             let content_type = headers.content_type()?.ok_or(Error::BadRequest(
                 "No Content-Type header provided".to_string(),
@@ -262,10 +230,10 @@ async fn dispatch_route<'a>(
                 .await?
                 .into_response()?)
         }
-        Route::Oci(OciEndpoint::DeleteManifest {
+        ManifestEndpoint::Delete {
             namespace,
             reference,
-        }) => Ok(registry
+        } => Ok(registry
             .handle_delete_manifest(
                 Some(actor),
                 DeleteManifestRequest {
@@ -276,38 +244,137 @@ async fn dispatch_route<'a>(
             )
             .await?
             .into_response()?),
-        Route::Oci(OciEndpoint::GetReferrers {
+    }
+}
+
+/// The blob-upload session endpoints, routed here by [`dispatch_oci`].
+async fn dispatch_upload(
+    context: &ServerContext,
+    endpoint: UploadEndpoint,
+    parts: &Parts,
+    incoming: Incoming,
+    identity: &ClientIdentity,
+) -> Result<Response<ResponseBody>, Error> {
+    let headers = RequestHeaders::new(&parts.headers);
+    let registry = &context.registry;
+    let actor = EventActor::from(identity.clone());
+
+    match endpoint {
+        UploadEndpoint::Start {
             namespace,
             digest,
-            artifact_type,
-            last,
-        }) => Ok(registry
-            .handle_get_referrers(GetReferrersRequest {
+            digest_algorithm,
+        } => {
+            // A body with no `?digest=` has nothing to verify it against, so
+            // the request opens a session and the body is not read.
+            let content_length = headers.content_length()?;
+            Ok(registry
+                .handle_start_upload(
+                    Some(actor),
+                    StartUploadRequest {
+                        namespace,
+                        digest_algorithm,
+                        target: digest.map(|digest| StartUploadTarget {
+                            digest,
+                            content_length,
+                        }),
+                    },
+                    Box::new(incoming_into_async_read(incoming)),
+                )
+                .await?
+                .into_response()?)
+        }
+        UploadEndpoint::Mount {
+            namespace,
+            digest,
+            from,
+        } => {
+            let mount = BlobMount { digest, from };
+            // A mount must not hand the caller bytes they could not otherwise
+            // read, so resolve a source namespace they may read from first.
+            let source = context
+                .authorize_mount_source(&mount, identity, parts)
+                .await?;
+
+            Ok(registry
+                .handle_mount_blob(Some(actor), MountBlobRequest { namespace, mount }, source)
+                .await?
+                .into_response()?)
+        }
+        UploadEndpoint::Get {
+            namespace,
+            session_id,
+        } => Ok(registry
+            .handle_upload_status(GetUploadRequest {
                 namespace,
-                digest,
-                artifact_type,
-                last,
+                session_id,
+            })
+            .await?
+            .into_status_response()?),
+        UploadEndpoint::Patch {
+            namespace,
+            session_id,
+        } => Ok(registry
+            .handle_patch_upload(
+                PatchUploadRequest {
+                    namespace,
+                    session_id,
+                    content_range: headers.chunk_range(CONTENT_RANGE)?,
+                    content_length: headers.content_length()?,
+                },
+                Box::new(incoming_into_async_read(incoming)),
+            )
+            .await?
+            .into_open_response()?),
+        UploadEndpoint::Put {
+            namespace,
+            session_id,
+            digest,
+        } => Ok(registry
+            .handle_complete_upload(
+                Some(actor),
+                CompleteUploadRequest {
+                    namespace,
+                    session_id,
+                    digest,
+                    content_range: headers.chunk_range(CONTENT_RANGE)?,
+                    content_length: headers.content_length()?,
+                },
+                Box::new(incoming_into_async_read(incoming)),
+            )
+            .await?
+            .into_response()?),
+        UploadEndpoint::Delete {
+            namespace,
+            session_id,
+        } => Ok(registry
+            .handle_cancel_upload(DeleteUploadRequest {
+                namespace,
+                session_id,
             })
             .await?
             .into_response()?),
-        Route::Oci(OciEndpoint::ListTags { namespace, n, last }) => Ok(registry
-            .handle_list_tags(ListTagsRequest { namespace, n, last })
-            .await?
-            .into_response()?),
-        Route::Docker(DockerEndpoint::ListCatalog { n, last }) => Ok(registry
-            .handle_list_catalog(CatalogRequest { n, last }, &|namespace: &Namespace| {
-                context.catalog_lists_namespace(namespace, identity)
-            })
-            .await?
-            .into_response()?),
-        Route::Angos(AngosEndpoint::ListRevisions {
+    }
+}
+
+async fn dispatch_angos(
+    context: &ServerContext,
+    endpoint: AngosEndpoint,
+    parts: &Parts,
+    identity: &ClientIdentity,
+) -> Result<Response<ResponseBody>, Error> {
+    let headers = RequestHeaders::new(&parts.headers);
+    let registry = &context.registry;
+
+    match endpoint {
+        AngosEndpoint::ListRevisions {
             namespace,
             selection,
-        }) => Ok(registry
+        } => Ok(registry
             .handle_list_revisions(&namespace, selection)
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListLayerEntries { namespace, digest }) => Ok(registry
+        AngosEndpoint::ListLayerEntries { namespace, digest } => Ok(registry
             .handle_list_layer_entries(LayerEntriesRequest {
                 namespace,
                 digest,
@@ -315,12 +382,12 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::GetLayerFile {
+        AngosEndpoint::GetLayerFile {
             namespace,
             digest,
             path,
             download,
-        }) => Ok(registry
+        } => Ok(registry
             .handle_get_layer_file(LayerFileRequest {
                 namespace,
                 digest,
@@ -330,11 +397,11 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response(registry.blob_stream_frame_size())?),
-        Route::Angos(AngosEndpoint::GetLayerFileDetails {
+        AngosEndpoint::GetLayerFileDetails {
             namespace,
             digest,
             path,
-        }) => Ok(registry
+        } => Ok(registry
             .handle_get_layer_file_details(LayerFileDetailsRequest {
                 namespace,
                 digest,
@@ -342,15 +409,15 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListUploads { namespace, page }) => Ok(registry
+        AngosEndpoint::ListUploads { namespace, page } => Ok(registry
             .handle_list_uploads(&namespace, page)
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListPulls {
+        AngosEndpoint::ListPulls {
             namespace,
             reference,
             page,
-        }) => Ok(registry
+        } => Ok(registry
             .handle_list_pulls(ListPullsRequest {
                 namespace,
                 reference,
@@ -358,35 +425,35 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListRepositories { order, page }) => Ok(registry
+        AngosEndpoint::ListRepositories { order, page } => Ok(registry
             .handle_list_repositories(order, page, &|namespace: &Namespace| {
                 context.catalog_lists_namespace(namespace, identity)
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListNamespaces(request)) => Ok(registry
+        AngosEndpoint::ListNamespaces(request) => Ok(registry
             .handle_list_namespaces(request, &|namespace: &Namespace| {
                 context.catalog_lists_namespace(namespace, identity)
             })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListJobs { queue, n, after }) => Ok(registry
+        AngosEndpoint::ListJobs { queue, n, after } => Ok(registry
             .handle_list_jobs(ListJobsRequest { queue, n, after })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::ListFailedJobs { queue, n, after }) => Ok(registry
+        AngosEndpoint::ListFailedJobs { queue, n, after } => Ok(registry
             .handle_list_failed_jobs(ListJobsRequest { queue, n, after })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::RetryJob { queue, storage_key }) => Ok(registry
+        AngosEndpoint::RetryJob { queue, storage_key } => Ok(registry
             .handle_retry_job(RetryJobRequest { queue, storage_key })
             .await?
             .into_response()?),
-        Route::Angos(AngosEndpoint::DeleteJob {
+        AngosEndpoint::DeleteJob {
             queue,
             state,
             storage_key,
-        }) => Ok(registry
+        } => Ok(registry
             .handle_delete_job(DeleteJobRequest {
                 queue,
                 state,
@@ -394,9 +461,6 @@ async fn dispatch_route<'a>(
             })
             .await?
             .into_response()?),
-        Route::Healthz => handlers::handle_healthz(),
-        Route::Readyz => handlers::handle_readyz(registry).await,
-        Route::Metrics => handlers::handle_metrics(),
     }
 }
 
@@ -408,7 +472,7 @@ pub fn handle_unknown_route(parts: &Parts) -> Result<Response<ResponseBody>, Err
     // The referrers endpoint is the exception: the spec requires `400` from a
     // read whose digest or filter is malformed, not the miss below.
     if is_invalid_referrers_request(&parts.method, parts.uri.path()) {
-        return Err(registry::Error::DigestInvalid.into());
+        return Err(RegistryError::DigestInvalid.into());
     }
 
     // A path angos serves, reached with a method it does not: 405 says so, and

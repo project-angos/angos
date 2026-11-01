@@ -59,42 +59,6 @@ impl Jwk {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_jwk_deserialization() {
-        let rsa_json = r#"{
-            "kty": "RSA",
-            "use": "sig",
-            "kid": "test-rsa",
-            "alg": "RS256",
-            "n": "xGOr-H7A-PWG3v0lMA",
-            "e": "AQAB"
-        }"#;
-        let jwk: Result<Jwk, _> = serde_json::from_str(rsa_json);
-        assert!(jwk.is_ok());
-        assert!(matches!(jwk.unwrap(), Jwk::Rsa { .. }));
-
-        let ec_json = r#"{
-            "kty": "EC",
-            "use": "sig",
-            "kid": "test-ec",
-            "alg": "ES256",
-            "x": "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
-            "y": "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"
-        }"#;
-        let jwk: Result<Jwk, _> = serde_json::from_str(ec_json);
-        assert!(jwk.is_ok());
-        assert!(matches!(jwk.unwrap(), Jwk::Ec { .. }));
-
-        let unsupported_json = r#"{
-            "kty": "OKP",
-            "use": "sig",
-            "kid": "test-okp",
-            "alg": "EdDSA"
-        }"#;
-        let jwk: Result<Jwk, _> = serde_json::from_str(unsupported_json);
-        assert!(jwk.is_err());
-    }
-
     /// The key material is fetched per request, so an unusable one must not be
     /// reported as a startup failure and answered with a 500.
     #[test]

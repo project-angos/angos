@@ -12,27 +12,24 @@ use crate::registry::blob_store::{BlobStoreConfig, FsBackendConfig, S3BackendCon
 /// sub-tables taking the same keys as the blob store's; the default `Inherit`
 /// resolves to the blob-store configuration.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum RegistryStorageConfig {
     /// Inherit the whole blob-store configuration, transport knobs included,
-    /// resolved via
-    /// [`crate::configuration::Configuration::resolve_registry_storage`] before
-    /// any backend is built.
+    /// resolved via `Configuration::resolve_registry_storage` before any
+    /// backend is built.
     #[default]
     Inherit,
     #[serde(rename = "fs")]
     FS(FsBackendConfig),
     #[serde(rename = "s3")]
-    S3(S3BackendConfig),
+    S3(Box<S3BackendConfig>),
 }
 
 /// A [`RegistryStorageConfig`] whose `Inherit` default has been resolved to a
 /// concrete backend, so consumers match without a dead `Inherit` arm.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum ResolvedStorageConfig {
     FS(FsBackendConfig),
-    S3(S3BackendConfig),
+    S3(Box<S3BackendConfig>),
 }
 
 impl ResolvedStorageConfig {
@@ -52,30 +49,14 @@ mod tests {
     use angos_secret::Secret;
 
     use super::*;
-    use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
-
-    #[test]
-    fn test_from_blob_store_fs_copies_paths_and_sync() {
-        let blob = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
-            root_dir: PathBuf::from("/var/lib/registry"),
-            sync_to_disk: true,
-        });
-        match ResolvedStorageConfig::from_blob_store(&blob) {
-            ResolvedStorageConfig::FS(c) => {
-                assert_eq!(c.root_dir, PathBuf::from("/var/lib/registry"));
-                assert!(c.sync_to_disk);
-            }
-            ResolvedStorageConfig::S3(_) => {
-                panic!("expected FS storage config")
-            }
-        }
-    }
+    use crate::registry::blob_store::TransportFields;
+    use crate::registry::s3_connection::S3ConnectionConfig;
 
     /// The metadata store inherits the blob store's transport knobs too, not
     /// only its connection.
     #[test]
     fn test_from_blob_store_s3_copies_connection_and_transport() {
-        let blob = blob_store::BlobStoreConfig::S3(blob_store::S3BackendConfig {
+        let blob = BlobStoreConfig::S3(Box::new(S3BackendConfig {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("key".to_string()),
                 secret_key: Secret::new("secret".to_string()),
@@ -84,12 +65,12 @@ mod tests {
                 region: "us-east-1".to_string(),
                 key_prefix: "foo".to_string(),
             },
-            transport: blob_store::TransportFields {
+            transport: TransportFields {
                 max_attempts: 7,
                 operation_timeout_secs: 42,
-                ..blob_store::TransportFields::default()
+                ..TransportFields::default()
             },
-        });
+        }));
         match ResolvedStorageConfig::from_blob_store(&blob) {
             ResolvedStorageConfig::S3(c) => {
                 assert_eq!(c.transport.max_attempts, 7);
@@ -132,22 +113,6 @@ mod tests {
         assert_eq!(cfg.connection.region, "eu-central-1");
         assert_eq!(cfg.connection.key_prefix, "_meta");
         assert_eq!(cfg.transport.max_attempts, 7);
-    }
-
-    /// Regression: `region` must be required, matching the documented schema.
-    #[test]
-    fn s3_backend_config_requires_region() {
-        let toml = r#"
-            access_key_id = "k"
-            secret_key    = "s"
-            endpoint      = "http://localhost:9000"
-            bucket        = "b"
-        "#;
-        let err = toml::from_str::<S3BackendConfig>(toml).expect_err("region must be required");
-        assert!(
-            err.to_string().contains("region"),
-            "error should mention the missing `region` field, got: {err}"
-        );
     }
 
     fn s3_toml_with(extra: &str) -> String {

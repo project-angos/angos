@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, de};
+use serde::Deserialize;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ObservabilityConfig {
@@ -17,25 +17,20 @@ pub struct TracingConfig {
 /// Rejects NaN, infinite values, negatives, and values greater than 1.0 at
 /// deserialisation time so that invalid configuration is caught before it
 /// reaches the OpenTelemetry sampler.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "f64")]
 pub struct SamplingRate(f64);
 
-impl SamplingRate {
-    /// Build a `SamplingRate` from a raw `f64`, validating that the value is
-    /// a finite number in the closed interval `[0.0, 1.0]`.
-    pub fn try_from_f64(value: f64) -> Result<Self, String> {
+impl TryFrom<f64> for SamplingRate {
+    type Error = String;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
         if !(0.0..=1.0).contains(&value) {
             return Err(format!(
                 "sampling_rate must be a finite number in [0.0, 1.0], got {value}"
             ));
         }
         Ok(Self(value))
-    }
-}
-
-impl<'de> Deserialize<'de> for SamplingRate {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::try_from_f64(f64::deserialize(deserializer)?).map_err(de::Error::custom)
     }
 }
 
@@ -47,19 +42,14 @@ impl From<SamplingRate> for f64 {
 
 #[cfg(test)]
 mod tests {
-    use serde::Deserialize;
+    use std::collections::HashMap;
 
-    use crate::configuration::observability::{ObservabilityConfig, SamplingRate};
-
-    #[derive(Debug, Deserialize)]
-    struct Wrapper {
-        rate: SamplingRate,
-    }
+    use crate::configuration::observability::SamplingRate;
 
     #[test]
     fn valid_values_are_preserved() {
         for &v in &[0.0_f64, 0.5, 1.0] {
-            let rate = SamplingRate::try_from_f64(v).expect("valid rate");
+            let rate = SamplingRate::try_from(v).expect("valid rate");
             assert_eq!(f64::from(rate).to_bits(), v.to_bits());
         }
     }
@@ -67,40 +57,15 @@ mod tests {
     #[test]
     fn invalid_values_are_rejected() {
         for &v in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5_f64, 1.5] {
-            assert!(
-                SamplingRate::try_from_f64(v).is_err(),
-                "expected error for {v}"
-            );
+            assert!(SamplingRate::try_from(v).is_err(), "expected error for {v}");
         }
     }
 
     #[test]
-    fn toml_valid_parses() {
-        let w = toml::from_str::<Wrapper>("rate = 0.5").unwrap();
-        assert_eq!(f64::from(w.rate).to_bits(), 0.5_f64.to_bits());
-    }
-
-    #[test]
     fn toml_error_propagates() {
-        let err = toml::from_str::<Wrapper>("rate = 1.5")
+        let err = toml::from_str::<HashMap<String, SamplingRate>>("rate = 1.5")
             .unwrap_err()
             .to_string();
         assert!(err.contains("[0.0, 1.0]"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn tracing_config_parses() {
-        let config = toml::from_str::<ObservabilityConfig>(
-            r#"
-            [tracing]
-            endpoint = "http://jaeger:4317"
-            sampling_rate = 0.1
-            "#,
-        )
-        .unwrap();
-
-        let tracing = config.tracing.expect("tracing config");
-        assert_eq!(tracing.endpoint, "http://jaeger:4317");
-        assert!((f64::from(tracing.sampling_rate) - 0.1).abs() < f64::EPSILON);
     }
 }

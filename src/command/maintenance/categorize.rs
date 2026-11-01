@@ -9,18 +9,15 @@ use std::str::FromStr;
 
 use angos_oci::{Digest, Namespace, Tag, UploadSessionId};
 
-use crate::{
-    command::maintenance::action::LOST_AND_FOUND_PREFIX,
-    jobs::{JobState, Queue, store::JOBS_ROOT},
-    registry::{
-        keys::{
-            ATIME_COMPACTED, BLOBS_ROOT, CAT_ROOT, DigestKeys, GC_ROOT, LAYERS_ROOT, NS_ROOT,
-            REF_ROOT, REPOS_ROOT, TAG_CLAIM, TagEntry, parse_atime_entry, parse_digest,
-            parse_referrer_record, parse_revision_record, parse_sharded,
-        },
-        metadata_store::LinkKind,
-    },
+use crate::command::maintenance::action::LOST_AND_FOUND_PREFIX;
+use crate::jobs::store::JOBS_ROOT;
+use crate::jobs::{JobState, Queue};
+use crate::registry::keys::{
+    ATIME_COMPACTED, BLOBS_ROOT, CAT_ROOT, DigestExt, GC_ROOT, LAYERS_ROOT, NS_ROOT, REF_ROOT,
+    REPOS_ROOT, TAG_CLAIM, TagEntry, parse_atime_entry, parse_digest, parse_referrer_record,
+    parse_revision_record, parse_sharded,
 };
+use crate::registry::metadata_store::LinkKind;
 
 /// Everything a key in either store can be.
 #[derive(Debug, PartialEq, Eq)]
@@ -415,20 +412,14 @@ fn categorize_upload(namespace: String, tail: &[&str]) -> KeyCategory {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use chrono::DateTime;
 
     use angos_oci::{Namespace, Tag};
 
-    /// The epoch stamp, whose ordinal is the highest one a writer produces.
-    fn epoch() -> DateTime<Utc> {
-        DateTime::from_timestamp_millis(0).unwrap()
-    }
-
-    use crate::{
-        command::maintenance::categorize::*,
-        jobs::store::{LockKey, job_failed_path, job_lock_key_index_path, job_pending_path},
-        registry::{keys::NamespaceKeys, metadata_store::LinkKind},
-    };
+    use super::*;
+    use crate::jobs::store::{LockKey, job_failed_path, job_lock_key_index_path, job_pending_path};
+    use crate::registry::keys::{NamespaceExt, TagEntryKind};
+    use crate::registry::metadata_store::LinkKind;
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -537,7 +528,8 @@ mod tests {
     fn tag_entry_and_atime_paths_round_trip() {
         let ns = Namespace::new("org/app").unwrap();
         let tag = Tag::new("v1.0").unwrap();
-        let key = ns.tag_entry_path(&tag, epoch(), false, &digest_a());
+        // The epoch stamp, whose ordinal is the highest one a writer produces.
+        let key = ns.tag_entry_path(&tag, DateTime::UNIX_EPOCH, TagEntryKind::Set, &digest_a());
         assert_eq!(
             categorize(&key),
             KeyCategory::TagEntry {
@@ -559,7 +551,7 @@ mod tests {
     fn atime_entry_paths_round_trip() {
         let ns = Namespace::new("org/app").unwrap();
         let tag = Tag::new("v1.0").unwrap();
-        let at = chrono::DateTime::UNIX_EPOCH;
+        let at = DateTime::UNIX_EPOCH;
         let key = ns
             .atime_entry_path(&LinkKind::Tag(tag.clone()), at, "alice")
             .unwrap();
@@ -606,7 +598,8 @@ mod tests {
     fn tag_hist_paths_round_trip() {
         let ns = Namespace::new("org/app").unwrap();
         let tag = Tag::new("v1.0").unwrap();
-        let entry_key = ns.tag_entry_path(&tag, epoch(), false, &digest_a());
+        let entry_key =
+            ns.tag_entry_path(&tag, DateTime::UNIX_EPOCH, TagEntryKind::Set, &digest_a());
         let file = entry_key.rsplit_once('/').unwrap().1;
         assert_eq!(
             categorize(&ns.tag_hist_path(&tag, file)),
@@ -667,17 +660,16 @@ mod tests {
 
     const SESSION: &str = "067e6162-3b6f-4ae2-a171-2470b63dff00";
 
-    fn session() -> UploadSessionId {
-        UploadSessionId::from_str(SESSION).unwrap()
-    }
-
     #[test]
     fn upload_artifacts_round_trip() {
         let ns = namespace();
         let cases = [
-            (ns.upload_path(&session()), UploadArtifact::Data),
             (
-                ns.upload_session_path(&session()),
+                ns.upload_path(&UploadSessionId::from_str(SESSION).unwrap()),
+                UploadArtifact::Data,
+            ),
+            (
+                ns.upload_session_path(&UploadSessionId::from_str(SESSION).unwrap()),
                 UploadArtifact::SessionJson,
             ),
             (
@@ -711,7 +703,7 @@ mod tests {
             );
         }
         assert_eq!(
-            categorize(&ns.upload_path(&session())),
+            categorize(&ns.upload_path(&UploadSessionId::from_str(SESSION).unwrap())),
             KeyCategory::UploadArtifact {
                 namespace: "org/app".to_string(),
                 artifact: UploadArtifact::Data,
@@ -738,7 +730,7 @@ mod tests {
         assert_eq!(
             categorize(&job_lock_key_index_path(
                 "cache",
-                &LockKey::new("a/b:c").expect("lock key")
+                &LockKey::try_new("a/b:c").expect("lock key")
             )),
             KeyCategory::JobIndex {
                 queue: Queue::Cache,

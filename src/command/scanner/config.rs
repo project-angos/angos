@@ -5,8 +5,6 @@ use serde::Deserialize;
 use angos_mtls_client::BasicAuth;
 use angos_secret::Secret;
 
-const DEFAULT_MAX_CONCURRENT_SCANS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
-
 fn default_bind_address() -> String {
     "0.0.0.0".to_string()
 }
@@ -16,7 +14,7 @@ fn default_port() -> u16 {
 }
 
 fn default_max_concurrent_scans() -> NonZeroUsize {
-    DEFAULT_MAX_CONCURRENT_SCANS
+    NonZeroUsize::MIN.saturating_add(1)
 }
 
 /// The registry the scanner pulls images from: its URL, and the identity the

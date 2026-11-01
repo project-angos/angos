@@ -1,23 +1,22 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
+use serde_json::Value;
 use url::Url;
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use angos_mtls_client::ClientTls;
 use angos_oci::Namespace;
 
 use crate::cache_fill::handler::{CACHE_ACTOR, CacheFillJobHandler, build_envelope};
-use crate::{
-    event_webhook::{
-        config::{DeliveryPolicy, EventWebhookConfig},
-        dispatcher::EventDispatcher,
-        event::EventKind,
-    },
-    jobs::store::JobHandler,
-    registry::{
-        repository_resolver::RepositoryResolver,
-        test_utils::{FsTestStack, create_test_repositories, fs_test_stack, put_blob_body},
-    },
+use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
+use crate::event_webhook::dispatcher::EventDispatcher;
+use crate::event_webhook::event::EventKind;
+use crate::jobs::store::JobHandler;
+use crate::registry::repository_resolver::RepositoryResolver;
+use crate::registry::test_utils::{
+    FsTestStack, create_test_repositories, fs_test_stack, put_blob_direct,
 };
 
 /// The grant path (bytes already cached) makes the blob visible to the
@@ -54,7 +53,7 @@ async fn cache_fill_grant_emits_blob_push_with_internal_actor() {
             .expect("test repositories must not have overlapping prefixes"),
     );
     let namespace = Namespace::new("test-repo/cached").unwrap();
-    let digest = put_blob_body(blob_store.as_ref(), b"already cached bytes").await;
+    let digest = put_blob_direct(blob_store.as_ref(), b"already cached bytes").await;
 
     let handler = CacheFillJobHandler::new(
         resolver,
@@ -76,7 +75,7 @@ async fn cache_fill_grant_emits_blob_push_with_internal_actor() {
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1, "the fill must emit one event");
-    let event: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let event: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(event["kind"], "blob.push");
     assert_eq!(event["digest"], digest.to_string());
     assert_eq!(

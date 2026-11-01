@@ -2,10 +2,9 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use crate::{
-    configuration::{Configuration, Error, ServerConfig},
-    test_fixtures::configuration::{MINIMAL_CONFIG_TOML, config_toml},
-};
+use crate::configuration::{Configuration, Error, ServerConfig};
+use crate::registry::blob_store::BlobStoreConfig;
+use crate::test_fixtures::configuration::{MINIMAL_CONFIG_TOML, config_toml};
 
 /// Writes `documents` into a scratch directory and loads them as one merged
 /// configuration, in the order given.
@@ -91,7 +90,7 @@ fn overlay_supplies_credentials_the_base_omits() {
     let (_dir, result) = load_merged(&[base, overlay]);
     let config = result.expect("merged config loads");
 
-    let crate::registry::blob_store::BlobStoreConfig::S3(s3) = &config.blob_store else {
+    let BlobStoreConfig::S3(s3) = &config.blob_store else {
         panic!("expected an S3 blob store");
     };
     assert_eq!(s3.connection.access_key_id.expose(), "from-overlay");

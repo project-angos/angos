@@ -1,7 +1,10 @@
 //! The scan job handler: asks the scanner service for an image's report and
 //! attaches it as a SARIF referrer.
 
-use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -13,16 +16,15 @@ use angos_oci::request::{PutManifestRequest, StartUploadRequest, StartUploadTarg
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, Reference};
 use angos_secret::Secret;
 
-use crate::{
-    event_webhook::event::EventActor,
-    jobs::store::{Error, JobEnvelope, JobHandler},
-    registry::{
-        Registry, blob_store::BlobStore, manifest::read_manifest, metadata_store::MetadataStore,
-    },
-    scan::{
-        CREATED_ANNOTATION, EMPTY_CONFIG_BODY, SARIF_MEDIA_TYPE, SCAN_ACTOR, SCAN_IMAGE_KIND,
-        ScanConfig, ScanImagePayload, ScanSummary, reported_since, scan_reports,
-    },
+use crate::event_webhook::event::EventActor;
+use crate::jobs::store::{Error, JobEnvelope, JobHandler};
+use crate::registry::Registry;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::manifest::read_manifest;
+use crate::registry::metadata_store::MetadataStore;
+use crate::scan::{
+    CREATED_ANNOTATION, EMPTY_CONFIG_BODY, SARIF_MEDIA_TYPE, SCAN_ACTOR, SCAN_IMAGE_KIND,
+    ScanConfig, ScanImagePayload, ScanSummary, reported_since, scan_reports,
 };
 
 pub struct ScanJobHandler {

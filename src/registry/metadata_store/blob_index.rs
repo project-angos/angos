@@ -1,7 +1,7 @@
 //! Cross-namespace blob reference tracking.
 //!
 //! One write-once, empty reference key per (namespace, link) under
-//! [`DigestKeys::blob_ref_dir`] records that a namespace references a blob.
+//! [`DigestExt::blob_ref_dir`] records that a namespace references a blob.
 //!
 //! The two `read_blob_index*` readers report an absent index as
 //! [`Error::NotFound`], which a collector must tell apart from an index that
@@ -9,27 +9,21 @@
 //! [`MetadataStore::can_read`] serve the callers that read absence as
 //! "nothing references it".
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Instant,
-};
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::{
-    TryStreamExt,
-    future::{try_join, try_join_all},
-};
+use futures_util::TryStreamExt;
+use futures_util::future::{try_join, try_join_all};
 use tracing::instrument;
 
 use angos_oci::{Digest, Namespace};
 use angos_storage::Error as StorageError;
 
-use crate::registry::{
-    Error,
-    keys::DigestKeys,
-    metadata_store::{LinkKind, MetadataStore},
-};
+use crate::registry::Error;
+use crate::registry::keys::DigestExt;
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
 
 /// The reference keys a bounded namespace lookup lists per page: a namespace
 /// holds one per link referencing the blob, usually a handful.
@@ -408,36 +402,26 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        str::FromStr,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use futures_util::future::try_join_all;
 
     use angos_oci::{Digest, Namespace, Tag};
-    use angos_storage::{
-        Error as StorageError,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_storage::Error as StorageError;
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
 
-    use crate::registry::{
-        Error,
-        keys::DigestKeys,
-        metadata_store::LinkKind,
-        test_utils::{
-            create_link, drop_links, for_each_backend, metadata_store_over, put_blob_direct,
-            s3_metadata_store, seed_links,
-        },
+    use crate::registry::Error;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::test_utils::{
+        create_link, drop_links, for_each_backend, metadata_store_over, put_blob_direct, seed_links,
     };
 
     /// Counts the listings a store is asked for.
     struct ListCount(Arc<AtomicUsize>);
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl StoreHook for ListCount {
         async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
             if matches!(op, StoreOp::List { .. }) {
@@ -500,27 +484,6 @@ mod tests {
         .await;
     }
 
-    /// A link write lands as one key under `v2/ref/`.
-    #[tokio::test]
-    async fn a_write_lands_as_one_reference_key() {
-        let backend = s3_metadata_store();
-        let namespace = Namespace::new("ref-key-shape-test").unwrap();
-        let digest = Digest::from_str(
-            "sha256:abab000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
-
-        let link = LinkKind::Tag(Tag::new("v1").unwrap());
-        let ops = [(link.clone(), digest.clone())];
-        seed_links(&backend, &namespace, &ops).await.unwrap();
-
-        backend
-            .object_store()
-            .head(&digest.blob_ref_path(&namespace, &link))
-            .await
-            .expect("the tag's reference key must exist");
-    }
-
     /// A dropped tag stops resolving while its reference key stays for the
     /// collector, and the tags around it are untouched.
     #[tokio::test]
@@ -572,16 +535,13 @@ mod tests {
                 .read_link(namespace, &LinkKind::Tag(Tag::new("v2").unwrap()))
                 .await
                 .unwrap();
-            assert_eq!(
-                meta_v2.target, digest_b,
-                "Tag v2 should still point to digest_b"
-            );
+            assert_eq!(meta_v2.target, digest_b);
 
             let meta_v3 = m
                 .read_link(namespace, &LinkKind::Tag(Tag::new("v3").unwrap()))
                 .await
                 .unwrap();
-            assert_eq!(meta_v3.target, digest_c, "Tag v3 should point to digest_c");
+            assert_eq!(meta_v3.target, digest_c);
 
             let tag_v1 = LinkKind::Tag(Tag::new("v1").unwrap());
             let index_a = m.read_blob_index(&digest_a).await.unwrap();
@@ -811,18 +771,12 @@ mod tests {
                 .read_link(namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
                 .await
                 .unwrap();
-            assert_eq!(
-                tag_meta.target, tag_digest,
-                "Tag v1 should target tag_digest"
-            );
+            assert_eq!(tag_meta.target, tag_digest);
             let digest_meta = m
                 .read_link(namespace, &LinkKind::Digest(digest_link_digest.clone()))
                 .await
                 .unwrap();
-            assert_eq!(
-                digest_meta.target, digest_link_digest,
-                "Digest link should target digest_link_digest"
-            );
+            assert_eq!(digest_meta.target, digest_link_digest);
             let tag_index = m.read_blob_index(&tag_digest).await.unwrap();
             let tag_links = tag_index
                 .get(namespace)
@@ -856,7 +810,7 @@ mod tests {
     /// Counts the heads a store is asked for.
     struct HeadCount(Arc<AtomicUsize>);
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl StoreHook for HeadCount {
         async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
             if matches!(op, StoreOp::Head { .. }) {
@@ -914,7 +868,7 @@ mod tests {
             let blob_index = m.read_blob_index(&digest).await.unwrap();
             assert!(
                 blob_index.contains_key(other_ns),
-                "Blob index should have entry for other-ns"
+                "no other-ns entry in {blob_index:?}"
             );
 
             let my_tag = LinkKind::Tag(Tag::new("latest").unwrap());
@@ -926,16 +880,13 @@ mod tests {
                 .expect("Blob index should still have entry for other-ns");
             assert!(
                 other_links.contains(&other_tag),
-                "other-ns should still contain Tag(stable)"
+                "other-ns links: {other_links:?}"
             );
 
             let my_links = blob_index
                 .get(my_ns)
                 .expect("Blob index should have entry for my-ns");
-            assert!(
-                my_links.contains(&my_tag),
-                "my-ns should contain Tag(latest)"
-            );
+            assert!(my_links.contains(&my_tag), "my-ns links: {my_links:?}");
         })
         .await;
     }

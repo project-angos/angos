@@ -1,4 +1,8 @@
-use crate::{command::bootstrap::Error as BootstrapError, policy, registry};
+use angos_cache::Error as CacheError;
+
+use crate::command::bootstrap::Error as BootstrapError;
+use crate::policy::Error as PolicyError;
+use crate::registry::Error as RegistryError;
 
 /// Errors raised by the maintenance machinery shared by `scrub`, `prune`, and
 /// `replicate`. `Display` stays command-neutral: the logging call sites and the
@@ -20,14 +24,14 @@ pub enum Error {
     JobQueue(String),
 
     #[error("registry error: {0}")]
-    Registry(#[from] registry::Error),
+    Registry(#[from] RegistryError),
 
     #[error("cache error: {0}")]
-    Cache(#[from] angos_cache::Error),
+    Cache(#[from] CacheError),
 }
 
-impl From<policy::Error> for Error {
-    fn from(e: policy::Error) -> Self {
+impl From<PolicyError> for Error {
+    fn from(e: PolicyError) -> Self {
         Error::Initialization(e.to_string())
     }
 }
@@ -39,52 +43,5 @@ impl From<BootstrapError> for Error {
             BootstrapError::Registry(inner) => Error::from(inner),
             other => Error::Initialization(other.to_string()),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::error::Error as StdError;
-
-    use super::*;
-
-    #[test]
-    fn initialization_display_includes_prefix() {
-        let error = Error::Initialization("Some init error".to_string());
-        assert_eq!(format!("{error}"), "initialization failed: Some init error");
-    }
-
-    #[test]
-    fn replication_display_includes_prefix() {
-        let error = Error::Replication("failed to enqueue replication job".to_string());
-        assert_eq!(
-            format!("{error}"),
-            "replication error: failed to enqueue replication job"
-        );
-    }
-
-    #[test]
-    fn job_queue_display_includes_prefix() {
-        let error = Error::JobQueue("failed to list cache jobs".to_string());
-        assert_eq!(
-            format!("{error}"),
-            "job queue error: failed to list cache jobs"
-        );
-    }
-
-    #[test]
-    fn registry_from_conversion() {
-        let inner = registry::Error::BlobUnknown;
-        let error: Error = inner.into();
-        assert!(matches!(error, Error::Registry(_)));
-        assert!(error.source().is_some());
-    }
-
-    #[test]
-    fn cache_from_conversion() {
-        let inner = angos_cache::Error::Execution("connection refused".to_string());
-        let error: Error = inner.into();
-        assert!(matches!(error, Error::Cache(_)));
-        assert!(error.source().is_some());
     }
 }

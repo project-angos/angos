@@ -6,17 +6,14 @@
 //! HEAD-probed before transfer, child manifests land before the parent index,
 //! and a re-run of a converged manifest costs one no-op HEAD.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
-use futures_util::{
-    future::join,
-    stream::{self, StreamExt},
-};
-use tokio::{io::AsyncReadExt, sync::OnceCell};
+use futures_util::future::join;
+use futures_util::stream::{self, StreamExt};
+use tokio::io::AsyncReadExt;
+use tokio::sync::OnceCell;
 use tracing::{debug, info, instrument, warn};
 
 use angos_oci::manifest_accept_types;
@@ -28,14 +25,15 @@ use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome};
 use angos_oci::{Content, Digest, Manifest, Namespace, Reference, Tag};
 use angos_oci_client::{RegistryClient, UploadSession};
 
-use crate::{
-    registry::{
-        blob_store::BlobStore,
-        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        metadata_store::{LinkKind, MetadataStore},
-    },
-    replication::Error,
-    replication::ReplicationDownstream,
+use crate::registry::blob_store::BlobStore;
+use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
+use crate::replication::{Error, ReplicationDownstream};
+
+mod referrers_fallback;
+
+use self::referrers_fallback::{
+    deleted_referrer_subject, push_referrers_fallback, remove_referrers_fallback,
 };
 
 /// Deepest index nesting a replication push follows. Each level holds its
@@ -45,12 +43,6 @@ const MAX_INDEX_DEPTH: usize = 8;
 
 /// Child manifests a job has reached, each completed once its push succeeds.
 type Pushed = Mutex<HashMap<Digest, Arc<OnceCell<()>>>>;
-
-mod referrers_fallback;
-
-use self::referrers_fallback::{
-    deleted_referrer_subject, push_referrers_fallback, remove_referrers_fallback,
-};
 
 /// Outcome of a successful replication push or delete.
 ///
@@ -76,8 +68,8 @@ pub enum PushOutcome {
 /// which pushes into the same namespace.
 pub struct PushContext<'a> {
     pub downstream: &'a ReplicationDownstream,
-    pub blob_store: &'a Arc<BlobStore>,
-    pub metadata_store: &'a Arc<MetadataStore>,
+    pub blob_store: &'a BlobStore,
+    pub metadata_store: &'a MetadataStore,
     pub namespace: &'a Namespace,
     /// The remote namespace this push targets, derived by the handler via
     /// [`ReplicationDownstream::remote`].
@@ -358,7 +350,7 @@ async fn push_blobs(ctx: &PushContext<'_>, manifest: &Manifest) -> Result<(), Er
 /// sibling's location on the downstream. A sibling outside this repository, or
 /// any read error, yields `None` and the push falls back to a full upload.
 async fn mount_candidate(
-    metadata_store: &Arc<MetadataStore>,
+    metadata_store: &MetadataStore,
     namespace: &Namespace,
     digest: &Digest,
     downstream: &ReplicationDownstream,

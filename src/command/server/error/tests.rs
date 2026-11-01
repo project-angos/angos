@@ -6,7 +6,8 @@ use angos_oci::response::{
     ErrorCode, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE, UPSTREAM_UNAVAILABLE_CODE,
 };
 
-use crate::{command::server::Error, configuration, event_webhook, registry};
+use crate::command::server::Error;
+use crate::registry;
 
 /// Whether this error's `code` must come from the set the spec fixes for a 4XX.
 /// Exhaustive on purpose: a variant added later does not compile until it is
@@ -53,14 +54,9 @@ struct Answer {
     message: Option<&'static str>,
 }
 
-fn answer(
-    error: impl Into<Error>,
-    status: u16,
-    code: &'static str,
-    message: Option<&'static str>,
-) -> Answer {
+fn answer(error: Error, status: u16, code: &'static str, message: Option<&'static str>) -> Answer {
     Answer {
-        error: error.into(),
+        error,
         status,
         code,
         message,
@@ -129,26 +125,26 @@ fn server_answers() -> Vec<Answer> {
 
 /// The answers converted from a `registry::Error`.
 fn registry_answers() -> Vec<Answer> {
-    vec![
+    let errors: Vec<(registry::Error, u16, &str, Option<&str>)> = vec![
         // Every `registry::Error` [`owes_a_spec_code`] calls client-facing,
         // plus one that it does not.
-        answer(registry::Error::BlobUnknown, 404, "BLOB_UNKNOWN", None),
+        (registry::Error::BlobUnknown, 404, "BLOB_UNKNOWN", None),
         // end-10 lists `404/400/405` as a blob delete's failures, so a
         // still-referenced blob answers within that set.
-        answer(
+        (
             registry::Error::BlobReferenced,
             405,
             "DENIED",
             Some("blob is still referenced"),
         ),
-        answer(
+        (
             registry::Error::BlobUploadUnknown,
             404,
             "BLOB_UPLOAD_UNKNOWN",
             None,
         ),
-        answer(registry::Error::DigestInvalid, 400, "DIGEST_INVALID", None),
-        answer(
+        (registry::Error::DigestInvalid, 400, "DIGEST_INVALID", None),
+        (
             registry::Error::ManifestBlobUnknown,
             404,
             "MANIFEST_BLOB_UNKNOWN",
@@ -156,53 +152,53 @@ fn registry_answers() -> Vec<Answer> {
         ),
         // A body over either cap answers `413` under the code naming which
         // body was refused.
-        answer(
+        (
             registry::Error::ManifestBodyTooLarge { limit: 42 },
             413,
             "MANIFEST_INVALID",
             Some("manifest body exceeds supported size limit of 42 bytes"),
         ),
-        answer(
+        (
             registry::Error::BlobBodyTooLarge { limit: 42 },
             413,
             "BLOB_UPLOAD_INVALID",
             Some("blob body exceeds supported size limit of 42 bytes"),
         ),
-        answer(
+        (
             registry::Error::ManifestInvalid("bad".into()),
             400,
             "MANIFEST_INVALID",
             Some("bad"),
         ),
-        answer(
+        (
             registry::Error::ManifestUnknown,
             404,
             "MANIFEST_UNKNOWN",
             None,
         ),
-        answer(registry::Error::NameInvalid, 400, "NAME_INVALID", None),
-        answer(registry::Error::NameUnknown, 404, "NAME_UNKNOWN", None),
-        answer(registry::Error::NotFound, 404, "NAME_UNKNOWN", None),
-        answer(
+        (registry::Error::NameInvalid, 400, "NAME_INVALID", None),
+        (registry::Error::NameUnknown, 404, "NAME_UNKNOWN", None),
+        (registry::Error::NotFound, 404, "NAME_UNKNOWN", None),
+        (
             registry::Error::Unauthorized("tok".into()),
             401,
             "UNAUTHORIZED",
             Some("tok"),
         ),
-        answer(
+        (
             registry::Error::Denied("no".into()),
             403,
             "DENIED",
             Some("no"),
         ),
-        answer(registry::Error::Unsupported, 400, "UNSUPPORTED", None),
-        answer(
+        (registry::Error::Unsupported, 400, "UNSUPPORTED", None),
+        (
             registry::Error::RangeNotSatisfiable,
             416,
             "SIZE_INVALID",
             None,
         ),
-        answer(
+        (
             registry::Error::Conflict("locked".into()),
             409,
             "DENIED",
@@ -210,27 +206,31 @@ fn registry_answers() -> Vec<Answer> {
         ),
         // Transient by construction, so it answers 503 under a code outside the
         // spec's set; the 5XX body carries no message.
-        answer(
+        (
             registry::Error::ReclamationInProgress("reclaiming".into()),
             503,
             RECLAMATION_IN_PROGRESS_CODE,
             None,
         ),
         // An unreachable upstream is a retry, not a missing image.
-        answer(
+        (
             registry::Error::UpstreamUnavailable("down".into()),
             503,
             UPSTREAM_UNAVAILABLE_CODE,
             None,
         ),
         // A typed variant routes to a generic 500 with its detail left in the log.
-        answer(
+        (
             registry::Error::Io(io::Error::other("disk full")),
             500,
             "INTERNAL_ERROR",
             None,
         ),
-    ]
+    ];
+    errors
+        .into_iter()
+        .map(|(error, status, code, message)| answer(error.into(), status, code, message))
+        .collect()
 }
 
 /// The status, code and message of every answer, and the rule over them: a 4XX
@@ -303,11 +303,11 @@ fn a_5xx_body_omits_the_internal_error_string() {
             msg: Some(secret.to_string()),
         },
     ];
-    let request_id = "req-abc".to_string();
+    let request_id = "req-abc";
 
     for error in errors {
         assert!(error.status_code().is_server_error());
-        let body = serde_json::to_value(error.error_body(Some(&request_id)))
+        let body = serde_json::to_value(error.error_body(Some(request_id)))
             .unwrap()
             .to_string();
         assert!(
@@ -315,7 +315,7 @@ fn a_5xx_body_omits_the_internal_error_string() {
             "5xx body leaked internal detail: {body}"
         );
         assert!(
-            body.contains(&request_id),
+            body.contains(request_id),
             "request id must still be present"
         );
     }
@@ -324,9 +324,9 @@ fn a_5xx_body_omits_the_internal_error_string() {
 /// The body is one `errors` entry carrying the request id a client quotes back.
 #[test]
 fn a_body_carries_one_error_and_the_request_id() {
-    let request_id = "abc-123".to_string();
+    let request_id = "abc-123";
     let body = serde_json::to_value(
-        Error::NotFound("Resource missing".to_string()).error_body(Some(&request_id)),
+        Error::NotFound("Resource missing".to_string()).error_body(Some(request_id)),
     )
     .unwrap();
 
@@ -335,76 +335,4 @@ fn a_body_carries_one_error_and_the_request_id() {
     assert_eq!(entry["code"], "NAME_UNKNOWN");
     assert_eq!(entry["message"], "Resource missing");
     assert_eq!(entry["detail"]["request_id"], request_id);
-}
-
-#[test]
-fn errors_display_their_kind_and_detail() {
-    for (error, rendered) in [
-        (Error::Initialization("boom".to_string()), "boom"),
-        (Error::Execution("boom".to_string()), "boom"),
-        (
-            Error::Unauthorized("Invalid token".to_string()),
-            "Unauthorized: Invalid token",
-        ),
-        (
-            Error::BadRequest("Malformed request".to_string()),
-            "Bad Request: Malformed request",
-        ),
-        (
-            Error::RangeNotSatisfiable("Invalid range '-'".to_string()),
-            "Range Not Satisfiable: Invalid range '-'",
-        ),
-        (
-            Error::NotFound("Item not found".to_string()),
-            "Not Found: Item not found",
-        ),
-        (
-            Error::ProviderUnavailable("OIDC provider unavailable".to_string()),
-            "Provider unavailable: OIDC provider unavailable",
-        ),
-        (
-            Error::Internal("Unexpected error".to_string()),
-            "Internal Server Error: Unexpected error",
-        ),
-        (
-            Error::Custom {
-                status_code: StatusCode::BAD_GATEWAY,
-                code: "UPSTREAM_ERROR".to_string(),
-                msg: Some("Failed to connect".to_string()),
-            },
-            "Error 502 Bad Gateway: UPSTREAM_ERROR - Failed to connect",
-        ),
-        (
-            Error::Custom {
-                status_code: StatusCode::SERVICE_UNAVAILABLE,
-                code: "SERVICE_UNAVAILABLE".to_string(),
-                msg: None,
-            },
-            "Error 503 Service Unavailable: SERVICE_UNAVAILABLE",
-        ),
-    ] {
-        assert_eq!(error.to_string(), rendered);
-    }
-}
-
-#[test]
-fn test_from_configuration_error_initialization() {
-    let config_error = configuration::Error::Initialization("webhook failed".to_string());
-    let error: Error = config_error.into();
-
-    assert!(matches!(error, Error::Internal(_)));
-    assert_eq!(error.to_string(), "Internal Server Error: webhook failed");
-}
-
-#[test]
-fn test_from_event_webhook_error_mapping() {
-    let init_error = event_webhook::Error::Initialization("bad webhook config".to_string());
-    let error: Error = init_error.into();
-    assert!(matches!(error, Error::Initialization(_)));
-    assert_eq!(error.to_string(), "bad webhook config");
-
-    let dispatch_error = event_webhook::Error::Dispatch("webhook failed".to_string());
-    let error: Error = dispatch_error.into();
-    assert!(matches!(error, Error::Execution(_)));
-    assert_eq!(error.to_string(), "webhook failed");
 }

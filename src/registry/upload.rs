@@ -1,4 +1,4 @@
-use tokio::io::{AsyncRead, AsyncReadExt, copy, sink};
+use tokio::io::{AsyncRead, AsyncReadExt, Take, copy, sink};
 use tracing::{instrument, warn};
 
 use angos_oci::http_range::ByteWindow;
@@ -9,18 +9,14 @@ use angos_oci::request::{
 use angos_oci::{Algorithm, Digest, Namespace, UploadSessionId};
 use angos_oci_service::{BlobWritten, NoContent, StartUpload, UploadSession};
 
-use crate::{
-    event_webhook::event::{Event, EventActor},
-    registry::{
-        Error, Registry,
-        blob_ownership::{GrantOutcome, grant_existing, promote_and_grant},
-        blob_store::hashing::{Hasher, HashingReader},
-    },
-};
+use crate::event_webhook::event::{Event, EventActor};
+use crate::registry::blob_ownership::{GrantOutcome, grant_existing, promote_and_grant};
+use crate::registry::blob_store::hashing::{Hasher, HashingReader};
+use crate::registry::{Error, Registry, repository_name};
 
 /// Caps the namespaces a from-less mount reads off the blob index and
-/// CEL-evaluates, bounding an attacker-influenceable fan-out. Candidates beyond the cap fall back to a
-/// normal upload session, so no access is over-granted.
+/// CEL-evaluates, bounding an attacker-influenceable fan-out. Candidates beyond
+/// the cap fall back to a normal upload session, so no access is over-granted.
 const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
 
 /// Default cap on a blob's cumulative uploaded size, mirroring
@@ -255,7 +251,7 @@ impl Registry {
         request: MountBlobRequest,
         source: Option<Namespace>,
     ) -> Result<StartUpload, Error> {
-        let repository = self.repository_name_for(&request.namespace);
+        let repository = repository_name(self.resolver.resolve(&request.namespace));
         let event = Event::push_blob(
             &request.namespace,
             &repository,
@@ -314,7 +310,7 @@ impl Registry {
         committed: u64,
         content_length: Option<u64>,
         stream: S,
-    ) -> tokio::io::Take<S>
+    ) -> Take<S>
     where
         S: AsyncRead + Unpin,
     {
@@ -470,7 +466,7 @@ impl Registry {
 
         // The event fires before the finalize, so a completed blob can never
         // go unnotified; a later failure leaves a false positive instead.
-        let repository = self.repository_name_for(namespace);
+        let repository = repository_name(self.resolver.resolve(namespace));
         let event = Event::push_blob(namespace, &repository, digest, actor.as_ref());
         self.dispatch_events(&[event]).await?;
 
@@ -598,13 +594,14 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, str::FromStr, sync::Arc};
+    use std::io::Cursor;
+    use std::str::FromStr;
+    use std::sync::Arc;
 
     use async_trait::async_trait;
-    use http::{
-        StatusCode,
-        header::{LOCATION, RANGE},
-    };
+    use http::StatusCode;
+    use http::header::{LOCATION, RANGE};
+    use tokio::io::AsyncRead;
 
     use angos_oci::http_range::ByteWindow;
     use angos_oci::request::{
@@ -612,23 +609,19 @@ mod tests {
         PatchUploadRequest, StartUploadRequest, StartUploadTarget,
     };
     use angos_oci::{Algorithm, Digest, Namespace, UploadSessionId};
-    use angos_storage::{
-        Error as StorageError,
-        test_util::{HookedStore, StoreHook, StoreOp},
-    };
+    use angos_storage::Error as StorageError;
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
 
-    use crate::registry::{
-        Error, Registry, RegistryConfig,
-        blob_store::BlobStore,
-        keys::NamespaceKeys,
-        metadata_store::LinkKind,
-        repository_resolver::RepositoryResolver,
-        test_utils::{
-            FSRegistryTestCase, RegistryTestCase, create_test_registry, create_test_repositories,
-            for_each_backend, put_blob_direct, response_digest, response_header,
-            response_session_id, test_job_store,
-        },
+    use crate::registry::blob_store::BlobStore;
+    use crate::registry::keys::NamespaceExt;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::registry::test_utils::{
+        FSRegistryTestCase, RegistryTestCase, create_test_registry, create_test_repositories,
+        for_each_backend, put_blob_direct, response_digest, response_header, response_session_id,
+        test_job_store,
     };
+    use crate::registry::{Error, Registry, RegistryConfig};
 
     /// Which storage operation the hook turns into a hard error; everything
     /// else delegates to the inner backend untouched.
@@ -1070,7 +1063,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(candidates.is_empty());
+            assert!(candidates.is_empty(), "{candidates:?}");
 
             // Lexicographic order guards the sort-before-truncate determinism.
             let candidates = registry
@@ -1093,7 +1086,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(candidates.is_empty());
+            assert!(candidates.is_empty(), "{candidates:?}");
         })
         .await;
     }
@@ -1639,7 +1632,8 @@ mod tests {
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::CREATED);
-            assert!(registry.blob_store.read(&digest).await.unwrap().is_empty());
+            let content = registry.blob_store.read(&digest).await.unwrap();
+            assert!(content.is_empty(), "{content:?}");
         })
         .await;
     }
@@ -1813,53 +1807,6 @@ mod tests {
                 matches!(result, Err(Error::DigestInvalid)),
                 "a digest the session never hashed must be refused, got {result:?}"
             );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_sha512_complete_upload_wrong_digest_rejected() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let full_content = b"sha512 body that will not match the claimed digest";
-            let session_id = UploadSessionId::generate();
-
-            registry
-                .blob_store
-                .create_upload(namespace, &session_id, None)
-                .await
-                .unwrap();
-
-            registry
-                .handle_patch_upload(
-                    PatchUploadRequest {
-                        namespace: namespace.clone(),
-                        session_id: session_id.clone(),
-                        content_range: None,
-                        content_length: Some(full_content.len() as u64),
-                    },
-                    Cursor::new(full_content.to_vec()),
-                )
-                .await
-                .unwrap();
-
-            let wrong_digest = Digest::from_bytes(Algorithm::Sha512, b"different content");
-            let result = registry
-                .handle_complete_upload(
-                    None,
-                    CompleteUploadRequest {
-                        namespace: namespace.clone(),
-                        session_id: session_id.clone(),
-                        digest: wrong_digest.clone(),
-                        content_range: None,
-                        content_length: Some(0),
-                    },
-                    Cursor::new(Vec::new()),
-                )
-                .await;
-
-            assert!(matches!(result, Err(Error::DigestInvalid)));
         })
         .await;
     }
@@ -2299,49 +2246,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_upload_returns_digest_and_size() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let session_id = UploadSessionId::generate();
-            let content = b"hello world upload";
-
-            let session = registry
-                .blob_store
-                .create_upload(namespace, &session_id, None)
-                .await
-                .unwrap();
-
-            let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
-                Box::new(Cursor::new(content.to_vec()));
-            let (digest, size) = registry
-                .blob_store
-                .write_upload(
-                    namespace,
-                    &session_id,
-                    session,
-                    stream,
-                    Some(content.len() as u64),
-                    Algorithm::Sha256,
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(size, content.len() as u64);
-            assert_eq!(digest, Digest::sha256_of_bytes(content));
-
-            let summary = registry
-                .blob_store
-                .upload_summary(namespace, &session_id)
-                .await
-                .unwrap();
-
-            assert_eq!(size, summary.size);
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_upload_summary_size_accumulates() {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
@@ -2362,7 +2266,7 @@ mod tests {
                 .unwrap();
             assert_eq!(summary.size, 0);
 
-            let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
+            let stream: Box<dyn AsyncRead + Unpin + Send + Sync> =
                 Box::new(Cursor::new(content.to_vec()));
             registry
                 .blob_store

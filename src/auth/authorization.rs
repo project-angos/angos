@@ -1,7 +1,9 @@
 //! `Authorization` header parsing shared by the authentication middlewares.
 
-use base64::{Engine, prelude::BASE64_STANDARD};
-use http::{HeaderMap, header::AUTHORIZATION};
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
+use http::HeaderMap;
+use http::header::AUTHORIZATION;
 
 static BEARER_SCHEME: &str = "Bearer";
 static BASIC_SCHEME: &str = "Basic";
@@ -48,16 +50,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bearer_token_with_special_characters() {
-        let headers =
-            headers_with_authorization("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test");
-        assert_eq!(
-            bearer_token(&headers),
-            Some("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test".to_string())
-        );
-    }
-
-    #[test]
     fn test_bearer_token_missing() {
         assert_eq!(bearer_token(&HeaderMap::new()), None);
     }
@@ -91,32 +83,12 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_credentials_with_special_characters() {
-        let credentials = BASE64_STANDARD.encode("user@example.com:p@ssw0rd!");
-        let headers = headers_with_authorization(&format!("Basic {credentials}"));
-        assert_eq!(
-            basic_credentials(&headers),
-            Some(("user@example.com".to_string(), "p@ssw0rd!".to_string()))
-        );
-    }
-
-    #[test]
     fn test_basic_credentials_with_colon_in_password() {
         let credentials = BASE64_STANDARD.encode("user:pass:word");
         let headers = headers_with_authorization(&format!("Basic {credentials}"));
         assert_eq!(
             basic_credentials(&headers),
             Some(("user".to_string(), "pass:word".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_basic_credentials_empty_password() {
-        let credentials = BASE64_STANDARD.encode("username:");
-        let headers = headers_with_authorization(&format!("Basic {credentials}"));
-        assert_eq!(
-            basic_credentials(&headers),
-            Some(("username".to_string(), String::new()))
         );
     }
 

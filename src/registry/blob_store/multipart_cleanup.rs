@@ -3,17 +3,15 @@
 //! in-flight uploads, applies an age threshold, and spares any upload that
 //! still has a live session marker.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use futures_util::stream::{self, StreamExt};
 use tracing::warn;
 
 use angos_oci::{Namespace, UploadSessionId};
 
-use crate::registry::{
-    Error,
-    blob_store::BlobStore,
-    keys::{NamespaceKeys, REPOS_ROOT},
-};
+use crate::registry::Error;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::keys::{NamespaceExt, REPOS_ROOT};
 
 /// Fan-out for the per-upload session-marker probes.
 const ORPHAN_PROBE_CONCURRENCY: usize = 16;
@@ -24,17 +22,11 @@ pub struct OrphanMultipartUpload {
     pub upload_id: String,
 }
 
-/// Inverse of [`NamespaceKeys::upload_path`], parsing an upload's `data` key
+/// Inverse of [`NamespaceExt::upload_path`], parsing an upload's `data` key
 /// into `(namespace, uuid)`.
 pub fn parse_upload_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix(REPOS_ROOT)?.strip_prefix('/')?;
     rest.strip_suffix("/data")?.rsplit_once("/_uploads/")
-}
-
-/// Whether an upload initiated at `initiated` counts as orphaned, i.e. its age
-/// at `now` meets or exceeds `timeout`. A negative age (clock skew) never does.
-pub fn is_orphan(initiated: DateTime<Utc>, now: DateTime<Utc>, timeout: Duration) -> bool {
-    now.signed_duration_since(initiated) >= timeout
 }
 
 /// Orphan multipart-upload cleanup. Discovery and abort are split so a dry-run
@@ -59,7 +51,8 @@ impl BlobStore {
                 .await?;
 
             let candidates = page.uploads.into_iter().filter_map(|upload| {
-                if !is_orphan(upload.initiated_at, now, timeout) {
+                // A negative age (clock skew) never orphans.
+                if now.signed_duration_since(upload.initiated_at) < timeout {
                     return None;
                 }
                 let (namespace, session_id) = parse_upload_key(&upload.key)?;
@@ -133,25 +126,7 @@ mod tests {
         ObjectMeta, ObjectStore, Page, PendingMultipartUpload,
     };
 
-    use crate::registry::blob_store::multipart_cleanup::*;
-
-    #[test]
-    fn an_upload_orphans_once_its_age_reaches_the_timeout() {
-        let now = Utc::now();
-        let timeout = Duration::hours(1);
-        for (age, orphan, case) in [
-            (Duration::minutes(5), false, "younger than the timeout"),
-            (Duration::hours(2), true, "older than the timeout"),
-            (timeout, true, "at the boundary, since the check uses `>=`"),
-            (
-                -Duration::minutes(10),
-                false,
-                "initiated in the future by clock skew",
-            ),
-        ] {
-            assert_eq!(is_orphan(now - age, now, timeout), orphan, "{case}");
-        }
-    }
+    use super::*;
 
     #[test]
     fn an_upload_key_parses_to_its_namespace_and_session() {

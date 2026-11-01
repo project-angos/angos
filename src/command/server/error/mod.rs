@@ -1,5 +1,7 @@
 use hyper::StatusCode;
-use serde_json::json;
+use hyper::header::InvalidHeaderValue;
+use hyper::http::Error as HttpError;
+use serde_json::{Error as JsonError, json};
 
 use angos_oci::response::{
     ErrorCode, ErrorInfo, ErrorResponse, INTERNAL_ERROR_CODE, PROVIDER_UNAVAILABLE_CODE,
@@ -27,11 +29,11 @@ pub enum Error {
     #[error("Internal Server Error: {0}")]
     Internal(String),
     #[error("failed to build HTTP response: {0}")]
-    HttpBuild(#[from] hyper::http::Error),
+    HttpBuild(#[from] HttpError),
     #[error("Invalid header value: {0}")]
-    InvalidHeader(#[from] hyper::header::InvalidHeaderValue),
+    InvalidHeader(#[from] InvalidHeaderValue),
     #[error("failed to serialize response body: {0}")]
-    Serialization(#[from] serde_json::Error),
+    Serialization(#[from] JsonError),
     #[error("Error {status_code}: {code}{}", msg.as_deref().map(|m| format!(" - {m}")).unwrap_or_default())]
     Custom {
         status_code: StatusCode,
@@ -69,7 +71,7 @@ impl Error {
 
     /// The error answer's body. A 4XX `code` must come from the spec's fixed
     /// set, so each case picks the closest of those; a 5XX code is unconstrained.
-    pub fn error_body(&self, request_id: Option<&String>) -> ErrorResponse {
+    pub fn error_body(&self, request_id: Option<&str>) -> ErrorResponse {
         // A 5xx body carries no message: an internal error string must never
         // leak to the client, which gets the code plus a request id instead.
         let (code, message) = match self {

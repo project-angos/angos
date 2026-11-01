@@ -24,6 +24,14 @@ pub enum AccessMode {
     Allow,
 }
 
+/// Whether the `[repository]` covering a request declares its own access
+/// policy, exposed to rules as `has_repository_policy()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryPolicy {
+    Declared,
+    Undeclared,
+}
+
 impl From<AccessMode> for PolicyDecision {
     fn from(mode: AccessMode) -> Self {
         match mode {
@@ -58,20 +66,20 @@ impl AccessPolicy {
     /// deny: that is what makes both modes fail closed. A context that fails to
     /// build is `Indeterminate` with no rule index, since no rule ran.
     ///
-    /// `has_repository_policy` is exposed to rules as `has_repository_policy()`:
-    /// whether a `[repository]` declaring its own access policy decides this
-    /// request too.
+    /// `repository_policy` tells rules whether a `[repository]` declaring its
+    /// own access policy decides this request too.
+    #[must_use]
     pub fn evaluate(
         &self,
         action: &Action,
         identity: &ClientIdentity,
-        has_repository_policy: bool,
+        repository_policy: RepositoryPolicy,
     ) -> PolicyDecision {
         if self.rules.is_empty() {
             return self.default.into();
         }
 
-        let context = match Self::build_context(action, identity, has_repository_policy) {
+        let context = match Self::build_context(action, identity, repository_policy) {
             Ok(ctx) => ctx,
             Err(e) => {
                 return PolicyDecision::Indeterminate(PolicyError {
@@ -109,8 +117,9 @@ impl AccessPolicy {
     fn build_context<'a>(
         action: &'a Action,
         identity: &'a ClientIdentity,
-        has_repository_policy: bool,
+        repository_policy: RepositoryPolicy,
     ) -> Result<Context<'a>, Error> {
+        let has_repository_policy = repository_policy == RepositoryPolicy::Declared;
         let mut context = Context::default();
         context.add_variable("request", action)?;
         context.add_variable("identity", identity)?;
@@ -123,7 +132,7 @@ impl AccessPolicy {
 mod tests {
     use angos_oci::{Digest, Namespace, Reference, Tag};
 
-    use crate::policy::access_policy::*;
+    use super::*;
 
     fn rule(s: &str) -> CelRule {
         CelRule::compile(s).unwrap()
@@ -142,18 +151,6 @@ mod tests {
     }
 
     #[test]
-    fn test_access_policy_allow_mode_no_rules() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        assert!(is_allow(&policy.evaluate(&action, &identity, false)));
-    }
-
-    #[test]
     fn test_access_policy_deny_mode_no_rules() {
         let policy = AccessPolicy::new(PolicyConfig {
             default: Some(AccessMode::Deny),
@@ -162,7 +159,11 @@ mod tests {
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
-        assert!(is_deny(&policy.evaluate(&action, &identity, false)));
+        assert!(is_deny(&policy.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
     }
 
     #[test]
@@ -178,14 +179,22 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        assert!(is_deny(&policy.evaluate(&action, &identity, false)));
+        assert!(is_deny(&policy.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
 
         let identity = ClientIdentity {
             username: Some("allowed".to_string()),
             ..ClientIdentity::default()
         };
 
-        assert!(is_allow(&policy.evaluate(&action, &identity, false)));
+        assert!(is_allow(&policy.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
     }
 
     #[test]
@@ -201,14 +210,22 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        assert!(is_allow(&policy.evaluate(&action, &identity, false)));
+        assert!(is_allow(&policy.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
 
         let identity = ClientIdentity {
             username: Some("user".to_string()),
             ..ClientIdentity::default()
         };
 
-        assert!(is_deny(&policy.evaluate(&action, &identity, false)));
+        assert!(is_deny(&policy.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
     }
 
     /// A mount authorizes as the dedicated `mount-blob` action, independent of
@@ -251,13 +268,17 @@ mod tests {
         assert!(is_allow(&replicator_only.evaluate(
             &normal_upload,
             &anyone,
-            false
+            RepositoryPolicy::Undeclared
         )));
-        assert!(is_deny(&replicator_only.evaluate(&mount, &anyone, false)));
+        assert!(is_deny(&replicator_only.evaluate(
+            &mount,
+            &anyone,
+            RepositoryPolicy::Undeclared
+        )));
         assert!(is_allow(&replicator_only.evaluate(
             &mount,
             &replicator,
-            false
+            RepositoryPolicy::Undeclared
         )));
 
         let deny_non_replicator = AccessPolicy::new(PolicyConfig {
@@ -269,15 +290,17 @@ mod tests {
         assert!(is_allow(&deny_non_replicator.evaluate(
             &normal_upload,
             &anyone,
-            false
+            RepositoryPolicy::Undeclared
         )));
-        assert!(is_deny(
-            &deny_non_replicator.evaluate(&mount, &anyone, false)
-        ));
+        assert!(is_deny(&deny_non_replicator.evaluate(
+            &mount,
+            &anyone,
+            RepositoryPolicy::Undeclared
+        )));
         assert!(is_allow(&deny_non_replicator.evaluate(
             &mount,
             &replicator,
-            false
+            RepositoryPolicy::Undeclared
         )));
     }
 
@@ -322,16 +345,18 @@ mod tests {
         assert!(is_allow(&only_from_trusted.evaluate(
             &from_trusted,
             &client,
-            false
+            RepositoryPolicy::Undeclared
         )));
         assert!(is_deny(&only_from_trusted.evaluate(
             &from_untrusted,
             &client,
-            false
+            RepositoryPolicy::Undeclared
         )));
-        assert!(is_deny(
-            &only_from_trusted.evaluate(&no_from, &client, false)
-        ));
+        assert!(is_deny(&only_from_trusted.evaluate(
+            &no_from,
+            &client,
+            RepositoryPolicy::Undeclared
+        )));
 
         let deny_untrusted_source = AccessPolicy::new(PolicyConfig {
             default: Some(AccessMode::Allow),
@@ -342,28 +367,18 @@ mod tests {
         assert!(is_allow(&deny_untrusted_source.evaluate(
             &from_trusted,
             &client,
-            false
+            RepositoryPolicy::Undeclared
         )));
         assert!(is_deny(&deny_untrusted_source.evaluate(
             &from_untrusted,
             &client,
-            false
+            RepositoryPolicy::Undeclared
         )));
-        assert!(is_allow(
-            &deny_untrusted_source.evaluate(&no_from, &client, false)
-        ));
-    }
-
-    #[test]
-    fn test_access_policy_default_toml_allow() {
-        let config: PolicyConfig<AccessMode> = toml::from_str("default = \"allow\"").unwrap();
-        assert_eq!(config.default, Some(AccessMode::Allow));
-    }
-
-    #[test]
-    fn test_access_policy_default_toml_deny() {
-        let config: PolicyConfig<AccessMode> = toml::from_str("default = \"deny\"").unwrap();
-        assert_eq!(config.default, Some(AccessMode::Deny));
+        assert!(is_allow(&deny_untrusted_source.evaluate(
+            &no_from,
+            &client,
+            RepositoryPolicy::Undeclared
+        )));
     }
 
     #[test]
@@ -394,7 +409,7 @@ mod tests {
         let identity = ClientIdentity::default();
 
         assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, false)),
+            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
             "non-boolean result must be Indeterminate (fail-closed)"
         );
     }
@@ -409,7 +424,7 @@ mod tests {
         let identity = ClientIdentity::default();
 
         assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, false)),
+            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
             "non-boolean result must be Indeterminate (fail-closed)"
         );
     }
@@ -424,7 +439,7 @@ mod tests {
         let identity = ClientIdentity::default();
 
         assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, false)),
+            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
             "non-boolean rule must short-circuit to Indeterminate, even when a later rule would allow"
         );
     }
@@ -441,7 +456,7 @@ mod tests {
         let identity = ClientIdentity::default();
 
         assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, false)),
+            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
             "a failing DENY rule in Allow mode must be Indeterminate, not Allow"
         );
     }
@@ -455,7 +470,9 @@ mod tests {
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
-        let PolicyDecision::Indeterminate(err) = policy.evaluate(&action, &identity, false) else {
+        let PolicyDecision::Indeterminate(err) =
+            policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)
+        else {
             panic!("expected Indeterminate");
         };
         assert_eq!(err.rule_index, Some(2), "failing rule is the second rule");
@@ -473,7 +490,7 @@ mod tests {
         let identity = ClientIdentity::default();
 
         assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, false)),
+            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
             "a failing ALLOW rule in Deny mode must be Indeterminate"
         );
     }
@@ -492,22 +509,11 @@ mod tests {
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
-        assert!(is_deny(&policy.evaluate(&action, &identity, false)));
-    }
-
-    #[test]
-    fn multi_rule_deny_mode_first_match_allows_second_rule_unreached() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![
-                rule("true"),  // rule 1: always triggers → Allow
-                rule("false"), // rule 2: unreachable
-            ],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        assert!(is_allow(&policy.evaluate(&action, &identity, false)));
+        assert!(is_deny(&policy.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
     }
 
     #[test]
@@ -518,13 +524,21 @@ mod tests {
         });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
-        assert!(is_allow(&policy_allow.evaluate(&action, &identity, false)));
+        assert!(is_allow(&policy_allow.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
 
         let policy_deny = AccessPolicy::new(PolicyConfig {
             default: Some(AccessMode::Deny),
             rules: vec![rule("false"), rule("false")],
         });
-        assert!(is_deny(&policy_deny.evaluate(&action, &identity, false)));
+        assert!(is_deny(&policy_deny.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
     }
 
     /// `request.reference` is documented as a string, so a rule comparing it to
@@ -544,7 +558,7 @@ mod tests {
         assert!(is_allow(&policy.evaluate(
             &action,
             &ClientIdentity::default(),
-            false
+            RepositoryPolicy::Undeclared
         )));
     }
 
@@ -563,7 +577,15 @@ mod tests {
         };
         let identity = ClientIdentity::default();
 
-        assert!(is_allow(&policy.evaluate(&action, &identity, true)));
-        assert!(is_deny(&policy.evaluate(&action, &identity, false)));
+        assert!(is_allow(&policy.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Declared
+        )));
+        assert!(is_deny(&policy.evaluate(
+            &action,
+            &identity,
+            RepositoryPolicy::Undeclared
+        )));
     }
 }

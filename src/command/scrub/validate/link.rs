@@ -4,41 +4,22 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::{TryStreamExt, stream::TryChunksError};
+use futures_util::TryStreamExt;
+use futures_util::stream::TryChunksError;
 use tracing::{debug, warn};
 
 use angos_oci::{Digest, Manifest, Namespace, Tag};
 use angos_storage::Error as StorageError;
 
-use crate::registry::keys::{NamespaceKeys, TagEntry, atime_entry_name, parse_atime_entry};
-use crate::{
-    command::{
-        maintenance::{
-            Error,
-            action::{Action, AtimeCompaction, WalkedStore},
-        },
-        scrub::validate::Validator,
-    },
-    registry::{
-        Error as RegistryError,
-        content_discovery::holds_manifest_content,
-        manifest::referenced_digests,
-        metadata_store::{
-            AccessEntry, LIST_PAGE, LinkKind, PullHistoryConfig, access_time::ATIME_CHUNK_CAP,
-        },
-    },
-};
-
-/// What [`Validator::ensure_grant`] did about one (blob, link) pin.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GrantState {
-    /// The index records the entry, already or through this run's grant.
-    Recorded,
-    /// The blob has no bytes, so there is no pin to record.
-    Byteless,
-    /// A concurrent write took the decision; this run leaves it alone.
-    Declined,
-}
+use crate::command::maintenance::Error;
+use crate::command::maintenance::action::{Action, AtimeCompaction, WalkedStore};
+use crate::command::scrub::validate::Validator;
+use crate::registry::Error as RegistryError;
+use crate::registry::content_discovery::holds_manifest_content;
+use crate::registry::keys::{NamespaceExt, TagEntry, atime_entry_name, parse_atime_entry};
+use crate::registry::manifest::referenced_digests;
+use crate::registry::metadata_store::access_time::ATIME_CHUNK_CAP;
+use crate::registry::metadata_store::{AccessEntry, LIST_PAGE, LinkKind, PullHistoryConfig};
 
 impl Validator {
     /// One tag's entry directory, validated once per (namespace, tag): the
@@ -279,7 +260,9 @@ impl Validator {
             limit.saturating_sub(live),
         ));
         let mut total = live + head.len();
-        let mut covered = head.last().map(entry_name);
+        let mut covered = head
+            .last()
+            .map(|entry| atime_entry_name(entry.at, &entry.client));
         if !head.is_empty() || !retired.is_empty() {
             self.emit(Action::CompactAtime(AtimeCompaction {
                 chunks: chunk_writes(compacted, &head)?,
@@ -302,7 +285,9 @@ impl Validator {
             let Some(mut chunk) = self.read_chunk(&key).await? else {
                 continue;
             };
-            covered = chunk.last().map(entry_name);
+            covered = chunk
+                .last()
+                .map(|entry| atime_entry_name(entry.at, &entry.client));
             let fits = fitting(&chunk, now, max_age_secs, limit - total);
             total += fits;
             if fits < chunk.len() {
@@ -669,13 +654,13 @@ impl Validator {
         namespace: &Namespace,
         blob: &Digest,
         link: &LinkKind,
-    ) -> Result<GrantState, Error> {
+    ) -> Result<(), Error> {
         match self
             .metadata_store
             .read_blob_index_namespace(namespace, blob)
             .await
         {
-            Ok(links) if links.contains(link) => return Ok(GrantState::Recorded),
+            Ok(links) if links.contains(link) => return Ok(()),
             Ok(_) | Err(RegistryError::NotFound) => {}
             Err(e) => return Err(e.into()),
         }
@@ -684,7 +669,7 @@ impl Validator {
             Err(RegistryError::BlobUnknown | RegistryError::NotFound) => {
                 // A manifest referencing missing bytes is broken; granting it
                 // would only churn against the blob GC.
-                return Ok(GrantState::Byteless);
+                return Ok(());
             }
             Err(e) => return Err(e.into()),
         }
@@ -697,16 +682,16 @@ impl Validator {
             Err(RegistryError::NotFound) => false,
             Err(e) => return Err(e.into()),
         };
+        // A concurrent write took the decision; this run leaves it alone.
         if recorded {
-            return Ok(GrantState::Declined);
+            return Ok(());
         }
         self.emit(Action::GrantBlobIndexLink {
             namespace: namespace.clone(),
             blob: blob.clone(),
             link: link.clone(),
         })
-        .await?;
-        Ok(GrantState::Recorded)
+        .await
     }
 }
 
@@ -725,11 +710,6 @@ fn fitting(
         .min(room)
 }
 
-/// The key name `entry` was stored under while live.
-fn entry_name(entry: &AccessEntry) -> String {
-    atime_entry_name(entry.at, &entry.client)
-}
-
 /// `entries`, newest first, split into chunks of at most the cap and listed
 /// oldest first, so a run that fails midway never leaves a newer chunk past
 /// an unwritten older one. The remainder lands in the newest chunk, keeping
@@ -744,7 +724,10 @@ pub fn chunk_writes(
         .map(|(newest, chunk)| {
             let body = serde_json::to_vec(chunk).map_err(RegistryError::from)?;
             Ok((
-                format!("{compacted}/{}", entry_name(newest)),
+                format!(
+                    "{compacted}/{}",
+                    atime_entry_name(newest.at, &newest.client)
+                ),
                 Bytes::from(body),
             ))
         })

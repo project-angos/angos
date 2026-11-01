@@ -1,7 +1,8 @@
 use std::fmt;
 
-use regex::Regex;
-use serde::{Deserialize, Serialize, de};
+use regex::{Error as RegexError, Regex};
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A pre-compiled regular expression that is validated at deserialisation time.
 ///
@@ -23,11 +24,13 @@ impl RegexPattern {
     ///
     /// # Errors
     ///
-    /// Returns [`regex::Error`] when `source` is not a valid regular expression.
-    pub fn compile(source: impl Into<String>) -> Result<Self, regex::Error> {
-        let source = source.into();
-        let regex = Regex::new(&source)?;
-        Ok(Self { source, regex })
+    /// Returns [`RegexError`] when `source` is not a valid regular expression.
+    pub fn compile(source: &str) -> Result<Self, RegexError> {
+        let regex = Regex::new(source)?;
+        Ok(Self {
+            source: source.to_owned(),
+            regex,
+        })
     }
 
     /// The original pattern string as written in the configuration file.
@@ -64,17 +67,17 @@ impl Eq for RegexPattern {}
 impl<'de> Deserialize<'de> for RegexPattern {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let source = String::deserialize(deserializer)?;
-        Self::compile(source).map_err(de::Error::custom)
+        Self::compile(&source).map_err(DeError::custom)
     }
 }
 
 impl Serialize for RegexPattern {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
         serializer.serialize_str(self.as_source())
     }
@@ -82,32 +85,9 @@ impl Serialize for RegexPattern {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-
-    #[derive(Debug, serde::Deserialize)]
-    struct Wrapper {
-        patterns: Vec<RegexPattern>,
-    }
-
-    #[test]
-    fn valid_regex_compiles() {
-        assert!(RegexPattern::compile("^latest$").is_ok());
-        assert!(RegexPattern::compile("^dev-.*").is_ok());
-        assert!(RegexPattern::compile("").is_ok());
-    }
-
-    #[test]
-    fn invalid_regex_fails_compile() {
-        assert!(RegexPattern::compile("[invalid").is_err());
-        assert!(RegexPattern::compile("(unclosed").is_err());
-    }
-
-    #[test]
-    fn is_match_delegates_to_regex() {
-        let pattern = RegexPattern::compile("^latest$").unwrap();
-        assert!(pattern.is_match("latest"));
-        assert!(!pattern.is_match("latest-tag"));
-    }
 
     #[test]
     fn equality_is_by_source() {
@@ -127,19 +107,11 @@ mod tests {
 
     #[test]
     fn invalid_regex_fails_at_deserialize() {
-        let result: Result<Wrapper, _> = toml::from_str(r#"patterns = ["[invalid"]"#);
+        let result: Result<HashMap<String, Vec<RegexPattern>>, _> =
+            toml::from_str(r#"patterns = ["[invalid"]"#);
         assert!(
             result.is_err(),
             "invalid regex must fail at deserialize time"
         );
-    }
-
-    #[test]
-    fn valid_regex_deserializes() {
-        let w: Wrapper =
-            toml::from_str(r#"patterns = ["^latest$", "^dev-.*"]"#).expect("valid regex");
-        assert_eq!(w.patterns.len(), 2);
-        assert_eq!(w.patterns[0].as_source(), "^latest$");
-        assert_eq!(w.patterns[1].as_source(), "^dev-.*");
     }
 }

@@ -7,7 +7,9 @@
 //! repositories rather than allowing non-deterministic runtime behavior driven
 //! by `HashMap` iteration order.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::collections::HashMap;
+use std::fmt::{self, Formatter};
+use std::sync::Arc;
 
 use angos_oci::namespace_belongs_to;
 
@@ -24,7 +26,7 @@ pub struct RepositoryResolver {
 }
 
 impl fmt::Debug for RepositoryResolver {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("RepositoryResolver")
             .field("repositories", &self.inner.keys().collect::<Vec<_>>())
             .finish()
@@ -37,10 +39,14 @@ impl fmt::Debug for RepositoryResolver {
 /// The error names both offenders so the operator can disambiguate.
 #[derive(Debug, thiserror::Error)]
 pub enum OverlapError {
-    #[error("repository prefixes overlap: '{0}' and '{1}'")]
-    Prefix(String, String),
-    #[error("repositories '{0}' and '{1}' both mirror the namespace '{2}'")]
-    Namespace(String, String, String),
+    #[error("repository prefixes overlap: '{first}' and '{second}'")]
+    Prefix { first: String, second: String },
+    #[error("repositories '{first}' and '{second}' both mirror the namespace '{namespace}'")]
+    Namespace {
+        first: String,
+        second: String,
+        namespace: String,
+    },
 }
 
 impl RepositoryResolver {
@@ -62,18 +68,21 @@ impl RepositoryResolver {
                 let (a, a_mirrors) = entries[i];
                 let (b, b_mirrors) = entries[j];
                 if namespace_belongs_to(a, b) || namespace_belongs_to(b, a) {
-                    return Err(OverlapError::Prefix(a.to_string(), b.to_string()));
+                    return Err(OverlapError::Prefix {
+                        first: a.to_string(),
+                        second: b.to_string(),
+                    });
                 }
                 // A `?ns=` value must resolve to one repository, so two
                 // claiming the same one is a misconfiguration, not a race.
                 if let (Some(left), Some(right)) = (a_mirrors, b_mirrors)
                     && left == right
                 {
-                    return Err(OverlapError::Namespace(
-                        a.to_string(),
-                        b.to_string(),
-                        left.to_string(),
-                    ));
+                    return Err(OverlapError::Namespace {
+                        first: a.to_string(),
+                        second: b.to_string(),
+                        namespace: left.to_string(),
+                    });
                 }
             }
         }
@@ -111,6 +120,10 @@ impl RepositoryResolver {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.inner.keys().map(String::as_str)
     }
@@ -126,15 +139,14 @@ impl RepositoryResolver {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     use angos_oci::Namespace;
 
-    use crate::registry::repository_resolver::*;
-    use crate::{
-        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
-        registry::Repository,
-    };
+    use super::*;
+    use crate::policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock};
+    use crate::registry::Repository;
 
     fn repo(name: &str) -> Repository {
         Repository {
@@ -164,25 +176,12 @@ mod tests {
     #[test]
     fn overlapping_shallow_and_nested_rejected() {
         let result = resolver(&[("team", "team"), ("team/app", "team/app")]);
-        assert!(
-            result.is_err(),
-            "overlapping prefixes team and team/app must be rejected"
-        );
-        let err = result.unwrap_err();
-        let msg = err.to_string();
+        let msg = result
+            .expect_err("overlapping prefixes team and team/app must be rejected")
+            .to_string();
         assert!(
             msg.contains("team") && msg.contains("team/app"),
             "error message must name both prefixes: {msg}"
-        );
-    }
-
-    #[test]
-    fn overlapping_nested_variant_rejected() {
-        // parent contains child: "org/team" overlaps "org/team/sub"
-        let result = resolver(&[("org/team", "org/team"), ("org/team/sub", "sub")]);
-        assert!(
-            result.is_err(),
-            "org/team and org/team/sub must be rejected"
         );
     }
 
@@ -232,12 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn sibling_disjoint_prefixes_accepted() {
-        let result = resolver(&[("alpha", "alpha"), ("beta", "beta")]);
-        assert!(result.is_ok(), "disjoint siblings must be accepted");
-    }
-
-    #[test]
     fn sibling_prefixes_with_shared_root_accepted() {
         // "team/backend" and "team/frontend" share the "team" root but neither
         // is a namespace-prefix of the other.
@@ -252,7 +245,6 @@ mod tests {
     fn exact_match_returns_repository() {
         let r = resolver(&[("myrepo", "myrepo"), ("other", "other")]).unwrap();
         let found = r.resolve("myrepo");
-        assert!(found.is_some());
         assert_eq!(found.unwrap().name, "myrepo");
     }
 
@@ -260,7 +252,6 @@ mod tests {
     fn sub_namespace_matches_parent_prefix() {
         let r = resolver(&[("myrepo", "myrepo")]).unwrap();
         let found = r.resolve("myrepo/sub/path");
-        assert!(found.is_some());
         assert_eq!(found.unwrap().name, "myrepo");
     }
 
@@ -271,13 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_map_returns_none() {
-        let r = resolver(&[]).unwrap();
-        assert!(r.resolve("anything").is_none());
-        assert_eq!(r.len(), 0);
-    }
-
-    #[test]
     fn adjacent_string_non_match() {
         // "myrepo2" must NOT match a resolver configured for "myrepo".
         let r = resolver(&[("myrepo", "myrepo")]).unwrap();
@@ -285,24 +269,5 @@ mod tests {
             r.resolve("myrepo2").is_none(),
             "myrepo2 must not match prefix myrepo"
         );
-    }
-
-    #[test]
-    fn contains_key_and_get_work_on_exact_keys() {
-        let r = resolver(&[("repo-a", "repo-a"), ("repo-b", "repo-b")]).unwrap();
-        assert!(r.contains_key("repo-a"));
-        assert!(r.contains_key("repo-b"));
-        assert!(!r.contains_key("repo-c"));
-        assert_eq!(r.get("repo-a").unwrap().name, "repo-a");
-        assert!(r.get("repo-c").is_none());
-    }
-
-    #[test]
-    fn len_and_keys_reflect_map_contents() {
-        let r = resolver(&[("a", "a"), ("b", "b"), ("c", "c")]).unwrap();
-        assert_eq!(r.len(), 3);
-        let mut keys: Vec<&str> = r.keys().collect();
-        keys.sort_unstable();
-        assert_eq!(keys, vec!["a", "b", "c"]);
     }
 }

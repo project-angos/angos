@@ -1,9 +1,7 @@
-use std::{
-    collections::HashMap,
-    fmt,
-    num::NonZeroUsize,
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
+use std::fmt::{self, Formatter};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
 use tracing::{instrument, warn};
 
@@ -29,28 +27,25 @@ pub mod test_utils;
 pub mod upload;
 
 use angos_oci::{Digest, Namespace, Reference, Tag};
+use angos_oci_service::ApiVersion;
 
-use crate::{
-    configuration::RegexPattern,
-    event_webhook::{dispatcher::EventDispatcher, event::Event},
-    jobs::{
-        Queue,
-        store::{Error as JobError, JobEnvelope, JobStore},
-    },
-    metrics_provider::metrics_provider,
-    registry::{
-        admin::ManifestAnalysis, blob_store::BlobStore, metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
-    },
-};
+use crate::configuration::RegexPattern;
+use crate::configuration::global::RedirectConfig;
+use crate::event_webhook::dispatcher::EventDispatcher;
+use crate::event_webhook::event::Event;
+use crate::jobs::Queue;
+use crate::jobs::store::{Error as JobError, JobEnvelope, JobStore};
+use crate::metrics_provider::metrics_provider;
+use crate::registry::admin::ManifestAnalysis;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::MetadataStore;
+use crate::registry::repository_resolver::RepositoryResolver;
 pub use error::Error;
 pub use repository::Repository;
 
-#[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
     pub update_pull_time: bool,
-    pub enable_blob_redirect: bool,
-    pub enable_manifest_redirect: bool,
+    pub redirect: RedirectConfig,
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
@@ -83,8 +78,7 @@ impl RegistryConfig {
     pub fn new(job_queue: Arc<JobStore>) -> Self {
         Self {
             update_pull_time: false,
-            enable_blob_redirect: true,
-            enable_manifest_redirect: true,
+            redirect: RedirectConfig::default(),
             global_immutable_tags: false,
             global_immutable_tags_exclusions: Vec::new(),
             max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
@@ -112,7 +106,7 @@ pub struct Registry {
 }
 
 impl fmt::Debug for Registry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Registry").finish()
     }
 }
@@ -120,8 +114,8 @@ impl fmt::Debug for Registry {
 /// The OCI API version this registry speaks, served on `/v2/`, branded with
 /// `X-Powered-By: Angos`.
 #[must_use]
-pub fn api_version() -> angos_oci_service::ApiVersion {
-    angos_oci_service::ApiVersion {
+pub fn api_version() -> ApiVersion {
+    ApiVersion {
         powered_by: Some("Angos".to_string()),
     }
 }
@@ -239,18 +233,8 @@ impl Registry {
     }
 
     #[instrument]
-    pub fn get_repository_for_namespace(
-        &self,
-        namespace: &Namespace,
-    ) -> Result<&Repository, Error> {
+    pub fn repository_for_namespace(&self, namespace: &Namespace) -> Result<&Repository, Error> {
         self.resolver.resolve(namespace).ok_or(Error::NameUnknown)
-    }
-
-    /// The event `repository` field for `namespace`, empty when none matches.
-    /// Callers already holding the resolved repository use [`repository_name`]
-    /// instead, so a request never resolves the same namespace twice.
-    pub fn repository_name_for(&self, namespace: &Namespace) -> String {
-        repository_name(self.get_repository_for_namespace(namespace).ok())
     }
 
     /// Fire-and-forget enqueue of the follow-up work a write dispatches: a
@@ -310,23 +294,23 @@ pub fn repository_name(repository: Option<&Repository>) -> String {
 
 #[cfg(test)]
 mod immutable_tag_tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
-    use angos_oci::{Namespace, Reference, Tag};
-    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_oci::{Digest, Namespace, Reference, Tag};
+    use angos_storage::ObjectStore;
+    use angos_storage::fs::Backend as StorageFsBackend;
 
-    use crate::registry::{Registry, RegistryConfig};
-    use crate::{
-        configuration::RegexPattern,
-        registry::{
-            blob_store::BlobStore,
-            repository::Repository,
-            repository_resolver::RepositoryResolver,
-            test_utils::{metadata_store_over, repository_with_replication, test_job_store},
-        },
+    use crate::configuration::RegexPattern;
+    use crate::registry::blob_store::BlobStore;
+    use crate::registry::repository::Repository;
+    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::registry::test_utils::{
+        metadata_store_over, repository_with_replication, test_job_store,
     };
+    use crate::registry::{Registry, RegistryConfig};
 
     /// A registry whose sole `myrepo/*` repository carries the immutability
     /// settings under test, over the global ones.
@@ -362,16 +346,14 @@ mod immutable_tag_tests {
     fn patterns(sources: &[&str]) -> Vec<RegexPattern> {
         sources
             .iter()
-            .map(|source| RegexPattern::compile(*source).expect("test pattern must compile"))
+            .map(|source| RegexPattern::compile(source).expect("test pattern must compile"))
             .collect()
     }
 
-    fn namespace() -> Namespace {
-        Namespace::new("myrepo/app").unwrap()
-    }
-
     fn repository_of(registry: &Registry) -> Option<&Repository> {
-        registry.get_repository_for_namespace(&namespace()).ok()
+        registry
+            .repository_for_namespace(&Namespace::new("myrepo/app").unwrap())
+            .ok()
     }
 
     fn tag(name: &str) -> Tag {
@@ -414,9 +396,10 @@ mod immutable_tag_tests {
     #[tokio::test]
     async fn a_digest_reference_is_never_immutable() {
         let (registry, _dir) = registry_with(true, &[], true, &[]);
-        let digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            .parse()
-            .unwrap();
+        let digest: Digest =
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
 
         assert!(
             !registry.is_reference_immutable(repository_of(&registry), &Reference::Digest(digest))
@@ -430,6 +413,8 @@ mod immutable_tag_tests {
 
 #[cfg(test)]
 mod api_version_tests {
+    use http::header::HeaderName;
+
     use angos_oci::header::DOCKER_DISTRIBUTION_API_VERSION;
 
     use crate::registry::api_version;
@@ -443,7 +428,7 @@ mod api_version_tests {
             *response_header(&response, &DOCKER_DISTRIBUTION_API_VERSION),
             "registry/2.0"
         );
-        let powered_by = http::header::HeaderName::from_static("x-powered-by");
+        let powered_by = HeaderName::from_static("x-powered-by");
         assert_eq!(*response_header(&response, &powered_by), "Angos");
     }
 }

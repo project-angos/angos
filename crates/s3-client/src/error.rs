@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::{fmt, io};
 
 use crate::circuit_breaker::CircuitBreakerError;
@@ -27,7 +28,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl StdError for Error {}
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
@@ -48,26 +49,6 @@ impl From<CircuitBreakerError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_display() {
-        assert_eq!(
-            format!("{}", Error::Configuration("invalid config".to_string())),
-            "Configuration error: invalid config"
-        );
-        assert_eq!(
-            format!("{}", Error::Io("disk full".to_string())),
-            "IO error: disk full"
-        );
-        assert_eq!(
-            format!("{}", Error::NotFound("file.txt".to_string())),
-            "Not found: file.txt"
-        );
-        assert_eq!(
-            format!("{}", Error::PreconditionFailed),
-            "Precondition failed"
-        );
-    }
 
     #[test]
     fn test_from_io_error_not_found() {

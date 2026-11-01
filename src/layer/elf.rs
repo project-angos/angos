@@ -2,8 +2,6 @@
 //! from as few of its bytes as that takes: the dynamic section of a large
 //! binary lies tens of megabytes in.
 
-use std::future::Future;
-
 use angos_extension_service::ElfDetails;
 
 /// The header, and in practice the program headers, loader and notes after it.
@@ -267,7 +265,8 @@ where
     let size = if layout.wide { 16 } else { 8 };
     let (mut libraries, mut soname, mut table, mut table_size) = (Vec::new(), None, 0, 0);
     let mut bind_now = false;
-    for at in (0..dynamic.len() / size).map(|index| index * size) {
+    for index in 0..dynamic.len() / size {
+        let at = index * size;
         let (Some(tag), Some(value)) = (
             layout.word(dynamic, at),
             layout.word(dynamic, at + size / 2),

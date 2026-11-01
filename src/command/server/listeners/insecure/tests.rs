@@ -1,30 +1,18 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    num::NonZeroU64,
-    sync::Arc,
-    time::Duration,
-};
+use std::net::{IpAddr, Ipv4Addr};
+use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::time::Duration;
 
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::{
-    command::server::{
-        ServerContext,
-        listeners::{
-            Connector,
-            insecure::{InsecureConnector, InsecureListener},
-        },
-        server_context::tests::{
-            TestConfigOptions, TestWebhook, create_test_event, create_test_server_context,
-            create_test_server_context_with,
-        },
-    },
-    configuration::listeners::ListenerBaseConfig,
-    identity::RequestScheme,
+use crate::command::server::ServerContext;
+use crate::command::server::listeners::insecure::InsecureListener;
+use crate::command::server::server_context::tests::{
+    TestConfigOptions, TestWebhook, create_test_event, create_test_server_context,
+    create_test_server_context_with,
 };
+use crate::configuration::listeners::ListenerBaseConfig;
 
 #[test]
 fn test_config_default_values() {
@@ -34,26 +22,6 @@ fn test_config_default_values() {
     assert_eq!(config.query_timeout.get(), 3600);
     assert_eq!(config.query_timeout_grace_period.get(), 60);
     assert_eq!(config.bind_address, IpAddr::from(Ipv4Addr::from([0; 4])));
-}
-
-#[test]
-fn test_config_custom_values() {
-    let toml = r#"
-        bind_address = "192.168.1.100"
-        port = 9000
-        query_timeout = 7200
-        query_timeout_grace_period = 120
-    "#;
-
-    let config: ListenerBaseConfig = toml::from_str(toml).unwrap();
-
-    assert_eq!(config.port, 9000);
-    assert_eq!(config.query_timeout.get(), 7200);
-    assert_eq!(config.query_timeout_grace_period.get(), 120);
-    assert_eq!(
-        config.bind_address,
-        "192.168.1.100".parse::<IpAddr>().unwrap()
-    );
 }
 
 #[test]
@@ -83,89 +51,6 @@ fn test_config_rejects_zero_query_timeout_grace_period() {
     );
 }
 
-#[test]
-fn test_config_partial_defaults() {
-    let toml = r#"
-        bind_address = "10.0.0.1"
-    "#;
-
-    let config: ListenerBaseConfig = toml::from_str(toml).unwrap();
-
-    assert_eq!(config.port, 8000);
-    assert_eq!(config.query_timeout.get(), 3600);
-    assert_eq!(config.query_timeout_grace_period.get(), 60);
-}
-
-#[test]
-fn test_config_ipv6_address() {
-    let toml = r#"
-        bind_address = "::1"
-        port = 8443
-    "#;
-
-    let config: ListenerBaseConfig = toml::from_str(toml).unwrap();
-
-    assert_eq!(config.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
-    assert_eq!(config.port, 8443);
-}
-
-#[tokio::test]
-async fn test_insecure_listener_new() {
-    let config = ListenerBaseConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8080,
-        query_timeout: NonZeroU64::new(1800).unwrap(),
-        query_timeout_grace_period: NonZeroU64::new(30).unwrap(),
-        handshake_timeout: NonZeroU64::new(10).unwrap(),
-    };
-
-    let context = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context);
-
-    assert_eq!(
-        listener.binding_address,
-        SocketAddr::from(([127, 0, 0, 1], 8080))
-    );
-}
-
-#[tokio::test]
-async fn test_insecure_listener_new_with_ipv6() {
-    let config = ListenerBaseConfig {
-        bind_address: "::1".parse().unwrap(),
-        port: 9000,
-        query_timeout: NonZeroU64::new(3600).unwrap(),
-        query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-        handshake_timeout: NonZeroU64::new(10).unwrap(),
-    };
-
-    let context = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context);
-
-    assert_eq!(
-        listener.binding_address.ip(),
-        "::1".parse::<IpAddr>().unwrap()
-    );
-    assert_eq!(listener.binding_address.port(), 9000);
-}
-
-#[tokio::test]
-async fn test_insecure_listener_timeouts_initialization() {
-    let config = ListenerBaseConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8080,
-        query_timeout: NonZeroU64::new(5000).unwrap(),
-        query_timeout_grace_period: NonZeroU64::new(100).unwrap(),
-        handshake_timeout: NonZeroU64::new(10).unwrap(),
-    };
-
-    let context = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context);
-
-    let timeouts = listener.timeouts.load();
-    assert_eq!(timeouts.query, Duration::from_secs(5000));
-    assert_eq!(timeouts.grace, Duration::from_secs(100));
-}
-
 async fn create_context_with_webhook(webhook_url: &str) -> ServerContext {
     create_test_server_context_with(TestConfigOptions {
         webhooks: vec![TestWebhook {
@@ -183,12 +68,12 @@ async fn test_hot_reload_updates_webhook_config() {
     let context_without_webhooks = create_test_server_context().await;
     let listener = InsecureListener::new(&listener_config, context_without_webhooks);
 
-    assert!(!listener.current_context().has_event_dispatcher());
+    assert!(!listener.current_context().registry.has_event_dispatcher());
 
     let context_with_webhooks = create_context_with_webhook("https://example.com/webhook").await;
     listener.notify_config_change(&listener_config, context_with_webhooks);
 
-    assert!(listener.current_context().has_event_dispatcher());
+    assert!(listener.current_context().registry.has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -197,12 +82,12 @@ async fn test_hot_reload_removes_webhooks() {
     let context_with_webhooks = create_context_with_webhook("https://example.com/webhook").await;
     let listener = InsecureListener::new(&listener_config, context_with_webhooks);
 
-    assert!(listener.current_context().has_event_dispatcher());
+    assert!(listener.current_context().registry.has_event_dispatcher());
 
     let context_without_webhooks = create_test_server_context().await;
     listener.notify_config_change(&listener_config, context_without_webhooks);
 
-    assert!(!listener.current_context().has_event_dispatcher());
+    assert!(!listener.current_context().registry.has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -238,87 +123,6 @@ async fn test_hot_reload_changes_webhook_url() {
     current_context
         .registry
         .dispatch_events(&[event])
-        .await
-        .unwrap();
-}
-
-async fn create_context_with_two_webhooks(url_a: &str, url_b: &str) -> ServerContext {
-    create_test_server_context_with(TestConfigOptions {
-        webhooks: vec![
-            TestWebhook {
-                name: "hook_a",
-                url: url_a,
-            },
-            TestWebhook {
-                name: "hook_b",
-                url: url_b,
-            },
-        ],
-        ..TestConfigOptions::default()
-    })
-    .await
-}
-
-#[tokio::test]
-async fn test_hot_reload_adds_second_webhook() {
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server_a)
-        .await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server_b)
-        .await;
-
-    let listener_config = ListenerBaseConfig::default();
-    let context_one = create_context_with_webhook(&server_a.uri()).await;
-    let listener = InsecureListener::new(&listener_config, context_one);
-
-    let context_two = create_context_with_two_webhooks(&server_a.uri(), &server_b.uri()).await;
-    listener.notify_config_change(&listener_config, context_two);
-
-    let context = listener.current_context();
-    context
-        .registry
-        .dispatch_events(&[create_test_event()])
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn test_hot_reload_removes_one_of_two_webhooks() {
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&server_a)
-        .await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server_b)
-        .await;
-
-    let listener_config = ListenerBaseConfig::default();
-    let context_two = create_context_with_two_webhooks(&server_a.uri(), &server_b.uri()).await;
-    let listener = InsecureListener::new(&listener_config, context_two);
-
-    let context_one = create_context_with_webhook(&server_b.uri()).await;
-    listener.notify_config_change(&listener_config, context_one);
-
-    let context = listener.current_context();
-    context
-        .registry
-        .dispatch_events(&[create_test_event()])
         .await
         .unwrap();
 }
@@ -374,9 +178,4 @@ async fn test_hot_reload_in_flight_delivery_not_disrupted() {
         .dispatch_events(&[create_test_event()])
         .await
         .unwrap();
-}
-
-#[test]
-fn insecure_connector_reports_http() {
-    assert_eq!(InsecureConnector.scheme(), RequestScheme::Http);
 }

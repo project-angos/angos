@@ -55,6 +55,7 @@ const sidebars: SidebarsConfig = {
         'reference/ui',
         'reference/event-webhooks',
         'reference/metrics',
+        'reference/rust-style-guide',
       ],
     },
   ],

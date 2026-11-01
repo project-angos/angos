@@ -15,11 +15,9 @@
 //! symbol, the bit buffer and input cursor in locals, an 11-bit lookup with
 //! a bit-by-bit fallback. It decodes a real layer at `miniz_oxide`'s speed.
 
-use std::{
-    io::{self, Read},
-    mem,
-    sync::Arc,
-};
+use std::io::{self, Read};
+use std::mem;
+use std::sync::Arc;
 
 /// The LZ77 window a block may reference, and so what a checkpoint carries.
 pub const WINDOW: usize = 32 * 1024;
@@ -177,16 +175,10 @@ impl<R: Read> BitReader<R> {
         }
     }
 
-    /// Bytes of the chunk not yet moved into the bit buffer.
-    #[inline]
-    fn chunk_left(&self) -> usize {
-        self.len - self.pos
-    }
-
     /// Slides the chunk's unread tail to its front and reads more behind it,
     /// so [`FAST_INPUT`] bytes are ahead unless the input has ended.
     fn top_up(&mut self) -> io::Result<()> {
-        if self.chunk_left() >= FAST_INPUT || self.eof {
+        if self.len - self.pos >= FAST_INPUT || self.eof {
             return Ok(());
         }
         self.buf.copy_within(self.pos..self.len, 0);
@@ -581,7 +573,7 @@ impl<R: Read> Inflater<R> {
         }
         let (in_offset, bit) = self.bits.position();
         let len = usize::try_from(self.pos.min(WINDOW as u64)).unwrap_or(WINDOW);
-        let window = (0..len)
+        let window: Vec<u8> = (0..len)
             .map(|i| self.ring[slot(self.pos - len as u64 + i as u64)])
             .collect();
         self.checkpoints.push(Checkpoint {
@@ -938,7 +930,8 @@ impl<R: Read> Read for Inflater<R> {
 mod tests {
     use std::io::{Cursor, Read, Write};
 
-    use flate2::{Compression, write::GzEncoder};
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     use super::{Checkpoint, Inflater, WINDOW};
 

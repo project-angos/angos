@@ -6,7 +6,9 @@ use tracing::warn;
 
 use angos_oci::{Digest, Namespace, UploadSessionId};
 
-use crate::registry::{Error, blob_store::BlobStore, metadata_store::MetadataStore};
+use crate::registry::Error;
+use crate::registry::blob_store::BlobStore;
+use crate::registry::metadata_store::MetadataStore;
 
 /// Promote the upload session's staged bytes to the canonical blob path and
 /// grant `namespace` its reference. No lock is needed: fresh bytes and a fresh
