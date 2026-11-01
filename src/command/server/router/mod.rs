@@ -130,7 +130,6 @@ impl Route {
 }
 
 impl From<&Route> for Action {
-    #[allow(clippy::too_many_lines)]
     fn from(route: &Route) -> Self {
         match route {
             Route::UiAsset { path } => Action::UiAsset { path: path.clone() },
@@ -140,182 +139,192 @@ impl From<&Route> for Action {
             Route::Readyz => Action::Readyz,
             Route::Metrics => Action::Metrics,
 
-            Route::Oci(endpoint) => match endpoint {
-                OciEndpoint::CheckVersion => Action::ApiVersion,
-                OciEndpoint::GetManifest {
-                    namespace,
-                    reference,
-                } => Action::GetManifest {
-                    namespace: namespace.clone(),
-                    reference: reference.clone(),
-                },
-                OciEndpoint::HeadManifest {
-                    namespace,
-                    reference,
-                } => Action::HeadManifest {
-                    namespace: namespace.clone(),
-                    reference: reference.clone(),
-                },
-                OciEndpoint::PutManifest { namespace, target } => Action::PutManifest {
-                    namespace: namespace.clone(),
-                    target: target.clone(),
-                },
-                OciEndpoint::DeleteManifest {
-                    namespace,
-                    reference,
-                } => Action::DeleteManifest {
-                    namespace: namespace.clone(),
-                    reference: reference.clone(),
-                },
-                OciEndpoint::GetBlob { namespace, digest } => Action::GetBlob {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                },
-                OciEndpoint::HeadBlob { namespace, digest } => Action::HeadBlob {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                },
-                OciEndpoint::DeleteBlob { namespace, digest } => Action::DeleteBlob {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                },
-                OciEndpoint::StartUpload {
-                    namespace,
-                    digest,
-                    digest_algorithm,
-                } => Action::StartUpload {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                    digest_algorithm: *digest_algorithm,
-                },
-                OciEndpoint::MountBlob {
-                    namespace,
-                    digest,
-                    from,
-                } => Action::MountBlob {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                    from: from.clone(),
-                },
-                OciEndpoint::GetUpload {
-                    namespace,
-                    session_id,
-                } => Action::GetUpload {
-                    namespace: namespace.clone(),
-                    session_id: session_id.clone(),
-                },
-                OciEndpoint::PatchUpload {
-                    namespace,
-                    session_id,
-                } => Action::PatchUpload {
-                    namespace: namespace.clone(),
-                    session_id: session_id.clone(),
-                },
-                OciEndpoint::PutUpload {
-                    namespace,
-                    session_id,
-                    digest,
-                } => Action::PutUpload {
-                    namespace: namespace.clone(),
-                    session_id: session_id.clone(),
-                    digest: digest.clone(),
-                },
-                OciEndpoint::DeleteUpload {
-                    namespace,
-                    session_id,
-                } => Action::DeleteUpload {
-                    namespace: namespace.clone(),
-                    session_id: session_id.clone(),
-                },
-                OciEndpoint::ListTags { namespace, n, last } => Action::ListTags {
-                    namespace: namespace.clone(),
-                    n: *n,
-                    last: last.clone(),
-                },
-                OciEndpoint::GetReferrers {
-                    namespace,
-                    digest,
-                    artifact_type,
-                    last,
-                } => Action::GetReferrer {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                    artifact_type: artifact_type.clone(),
-                    last: last.clone(),
-                },
-            },
-
+            Route::Oci(endpoint) => Action::from(endpoint),
             Route::Docker(DockerEndpoint::ListCatalog { n, last }) => Action::ListCatalog {
                 n: *n,
                 last: last.clone(),
             },
+            Route::Angos(endpoint) => Action::from(endpoint),
+        }
+    }
+}
 
-            Route::Angos(endpoint) => match endpoint {
-                AngosEndpoint::ListRepositories { .. } => Action::ListRepositories,
-                AngosEndpoint::ListNamespaces(request) => Action::ListNamespaces {
-                    repository: request.repository.clone(),
-                },
-                AngosEndpoint::ListRevisions { namespace, .. } => Action::ListRevisions {
-                    namespace: namespace.clone(),
-                },
-                AngosEndpoint::ListUploads { namespace, .. } => Action::ListUploads {
-                    namespace: namespace.clone(),
-                },
-                AngosEndpoint::ListPulls {
-                    namespace,
-                    reference,
-                    ..
-                } => Action::ListPulls {
-                    namespace: namespace.clone(),
-                    reference: reference.clone(),
-                },
-                AngosEndpoint::ListLayerEntries { namespace, digest } => Action::ListLayerEntries {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                },
-                AngosEndpoint::GetLayerFile {
-                    namespace,
-                    digest,
-                    path,
-                    download,
-                } => Action::GetLayerFile {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                    path: path.clone(),
-                    download: *download,
-                },
-                AngosEndpoint::GetLayerFileDetails {
-                    namespace,
-                    digest,
-                    path,
-                } => Action::GetLayerFileDetails {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                    path: path.clone(),
-                },
-                AngosEndpoint::ListJobs { queue, n, after } => Action::ListJobs {
-                    queue: Queue::from(*queue),
-                    n: *n,
-                    after: after.clone(),
-                },
-                AngosEndpoint::ListFailedJobs { queue, n, after } => Action::ListFailedJobs {
-                    queue: Queue::from(*queue),
-                    n: *n,
-                    after: after.clone(),
-                },
-                AngosEndpoint::RetryJob { queue, storage_key } => Action::RetryJob {
-                    queue: Queue::from(*queue),
-                    storage_key: storage_key.clone(),
-                },
-                AngosEndpoint::DeleteJob {
-                    queue,
-                    state,
-                    storage_key,
-                } => Action::DeleteJob {
-                    queue: Queue::from(*queue),
-                    state: JobState::from(*state),
-                    storage_key: storage_key.clone(),
-                },
+impl From<&OciEndpoint> for Action {
+    fn from(endpoint: &OciEndpoint) -> Self {
+        match endpoint {
+            OciEndpoint::CheckVersion => Action::ApiVersion,
+            OciEndpoint::GetManifest {
+                namespace,
+                reference,
+            } => Action::GetManifest {
+                namespace: namespace.clone(),
+                reference: reference.clone(),
+            },
+            OciEndpoint::HeadManifest {
+                namespace,
+                reference,
+            } => Action::HeadManifest {
+                namespace: namespace.clone(),
+                reference: reference.clone(),
+            },
+            OciEndpoint::PutManifest { namespace, target } => Action::PutManifest {
+                namespace: namespace.clone(),
+                target: target.clone(),
+            },
+            OciEndpoint::DeleteManifest {
+                namespace,
+                reference,
+            } => Action::DeleteManifest {
+                namespace: namespace.clone(),
+                reference: reference.clone(),
+            },
+            OciEndpoint::GetBlob { namespace, digest } => Action::GetBlob {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+            },
+            OciEndpoint::HeadBlob { namespace, digest } => Action::HeadBlob {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+            },
+            OciEndpoint::DeleteBlob { namespace, digest } => Action::DeleteBlob {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+            },
+            OciEndpoint::StartUpload {
+                namespace,
+                digest,
+                digest_algorithm,
+            } => Action::StartUpload {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+                digest_algorithm: *digest_algorithm,
+            },
+            OciEndpoint::MountBlob {
+                namespace,
+                digest,
+                from,
+            } => Action::MountBlob {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+                from: from.clone(),
+            },
+            OciEndpoint::GetUpload {
+                namespace,
+                session_id,
+            } => Action::GetUpload {
+                namespace: namespace.clone(),
+                session_id: session_id.clone(),
+            },
+            OciEndpoint::PatchUpload {
+                namespace,
+                session_id,
+            } => Action::PatchUpload {
+                namespace: namespace.clone(),
+                session_id: session_id.clone(),
+            },
+            OciEndpoint::PutUpload {
+                namespace,
+                session_id,
+                digest,
+            } => Action::PutUpload {
+                namespace: namespace.clone(),
+                session_id: session_id.clone(),
+                digest: digest.clone(),
+            },
+            OciEndpoint::DeleteUpload {
+                namespace,
+                session_id,
+            } => Action::DeleteUpload {
+                namespace: namespace.clone(),
+                session_id: session_id.clone(),
+            },
+            OciEndpoint::ListTags { namespace, n, last } => Action::ListTags {
+                namespace: namespace.clone(),
+                n: *n,
+                last: last.clone(),
+            },
+            OciEndpoint::GetReferrers {
+                namespace,
+                digest,
+                artifact_type,
+                last,
+            } => Action::GetReferrer {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+                artifact_type: artifact_type.clone(),
+                last: last.clone(),
+            },
+        }
+    }
+}
+
+impl From<&AngosEndpoint> for Action {
+    fn from(endpoint: &AngosEndpoint) -> Self {
+        match endpoint {
+            AngosEndpoint::ListRepositories { .. } => Action::ListRepositories,
+            AngosEndpoint::ListNamespaces(request) => Action::ListNamespaces {
+                repository: request.repository.clone(),
+            },
+            AngosEndpoint::ListRevisions { namespace, .. } => Action::ListRevisions {
+                namespace: namespace.clone(),
+            },
+            AngosEndpoint::ListUploads { namespace, .. } => Action::ListUploads {
+                namespace: namespace.clone(),
+            },
+            AngosEndpoint::ListPulls {
+                namespace,
+                reference,
+                ..
+            } => Action::ListPulls {
+                namespace: namespace.clone(),
+                reference: reference.clone(),
+            },
+            AngosEndpoint::ListLayerEntries { namespace, digest } => Action::ListLayerEntries {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+            },
+            AngosEndpoint::GetLayerFile {
+                namespace,
+                digest,
+                path,
+                download,
+            } => Action::GetLayerFile {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+                path: path.clone(),
+                download: *download,
+            },
+            AngosEndpoint::GetLayerFileDetails {
+                namespace,
+                digest,
+                path,
+            } => Action::GetLayerFileDetails {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+                path: path.clone(),
+            },
+            AngosEndpoint::ListJobs { queue, n, after } => Action::ListJobs {
+                queue: Queue::from(*queue),
+                n: *n,
+                after: after.clone(),
+            },
+            AngosEndpoint::ListFailedJobs { queue, n, after } => Action::ListFailedJobs {
+                queue: Queue::from(*queue),
+                n: *n,
+                after: after.clone(),
+            },
+            AngosEndpoint::RetryJob { queue, storage_key } => Action::RetryJob {
+                queue: Queue::from(*queue),
+                storage_key: storage_key.clone(),
+            },
+            AngosEndpoint::DeleteJob {
+                queue,
+                state,
+                storage_key,
+            } => Action::DeleteJob {
+                queue: Queue::from(*queue),
+                state: JobState::from(*state),
+                storage_key: storage_key.clone(),
             },
         }
     }
