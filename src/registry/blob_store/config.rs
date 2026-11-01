@@ -105,12 +105,11 @@ impl Default for TransportFields {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum BlobStoreConfig {
     #[serde(rename = "fs")]
     FS(FsBackendConfig),
     #[serde(rename = "s3")]
-    S3(S3BackendConfig),
+    S3(Box<S3BackendConfig>),
 }
 
 impl BlobStoreConfig {
@@ -166,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn s3_backend_builds_with_presign() {
-        let config = BlobStoreConfig::S3(S3BackendConfig {
+        let config = BlobStoreConfig::S3(Box::new(S3BackendConfig {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("root".to_string()),
                 secret_key: Secret::new("roottoor".to_string()),
@@ -176,7 +175,7 @@ mod tests {
                 key_prefix: String::new(),
             },
             ..S3BackendConfig::default()
-        });
+        }));
         let backend = config.build_backend().unwrap();
         assert!(
             backend

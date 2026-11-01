@@ -12,7 +12,6 @@ use crate::registry::blob_store::{BlobStoreConfig, FsBackendConfig, S3BackendCon
 /// sub-tables taking the same keys as the blob store's; the default `Inherit`
 /// resolves to the blob-store configuration.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum RegistryStorageConfig {
     /// Inherit the whole blob-store configuration, transport knobs included,
     /// resolved via `Configuration::resolve_registry_storage` before any
@@ -22,16 +21,15 @@ pub enum RegistryStorageConfig {
     #[serde(rename = "fs")]
     FS(FsBackendConfig),
     #[serde(rename = "s3")]
-    S3(S3BackendConfig),
+    S3(Box<S3BackendConfig>),
 }
 
 /// A [`RegistryStorageConfig`] whose `Inherit` default has been resolved to a
 /// concrete backend, so consumers match without a dead `Inherit` arm.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum ResolvedStorageConfig {
     FS(FsBackendConfig),
-    S3(S3BackendConfig),
+    S3(Box<S3BackendConfig>),
 }
 
 impl ResolvedStorageConfig {
@@ -58,7 +56,7 @@ mod tests {
     /// only its connection.
     #[test]
     fn test_from_blob_store_s3_copies_connection_and_transport() {
-        let blob = BlobStoreConfig::S3(S3BackendConfig {
+        let blob = BlobStoreConfig::S3(Box::new(S3BackendConfig {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("key".to_string()),
                 secret_key: Secret::new("secret".to_string()),
@@ -72,7 +70,7 @@ mod tests {
                 operation_timeout_secs: 42,
                 ..TransportFields::default()
             },
-        });
+        }));
         match ResolvedStorageConfig::from_blob_store(&blob) {
             ResolvedStorageConfig::S3(c) => {
                 assert_eq!(c.transport.max_attempts, 7);

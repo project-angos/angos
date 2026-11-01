@@ -502,7 +502,7 @@ impl S3RegistryTestCase {
             },
         };
         let blob_store = Arc::new(
-            BlobStoreConfig::S3(s3_config)
+            BlobStoreConfig::S3(Box::new(s3_config))
                 .build_backend()
                 .expect("s3 blob backend"),
         );
