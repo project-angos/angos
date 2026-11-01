@@ -26,9 +26,33 @@ fn reference() -> Reference {
 /// they agree for every variant; `assert_action_variant_covered` fails to compile
 /// if a new variant is added without a case here.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn test_action_serialization_cel_compatibility() {
-    let cases: &[(&str, Action)] = &[
+    let cases = [
+        service_cases(),
+        blob_cases(),
+        manifest_cases(),
+        admin_cases(),
+    ]
+    .concat();
+
+    for (expected_action_str, action) in &cases {
+        assert_action_variant_covered(action);
+        let json = serde_json::to_value(action).unwrap();
+        assert_eq!(
+            json["action"], *expected_action_str,
+            "CEL action string mismatch for {action:?}"
+        );
+        assert_eq!(
+            action.action_name(),
+            *expected_action_str,
+            "action_name() mismatch for {action:?}"
+        );
+    }
+}
+
+/// UI, auth, probe and catalog actions.
+fn service_cases() -> Vec<(&'static str, Action)> {
+    vec![
         (
             "ui-asset",
             Action::UiAsset {
@@ -56,6 +80,12 @@ fn test_action_serialization_cel_compatibility() {
                 last: None,
             },
         ),
+    ]
+}
+
+/// Upload, blob and layer-browsing actions.
+fn blob_cases() -> Vec<(&'static str, Action)> {
+    vec![
         (
             "start-upload",
             Action::StartUpload {
@@ -116,45 +146,6 @@ fn test_action_serialization_cel_compatibility() {
             },
         ),
         (
-            "get-manifest",
-            Action::GetManifest {
-                namespace: ns(),
-                reference: reference(),
-            },
-        ),
-        (
-            "put-manifest",
-            Action::PutManifest {
-                namespace: ns(),
-                target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap()),
-            },
-        ),
-        (
-            "delete-manifest",
-            Action::DeleteManifest {
-                namespace: ns(),
-                reference: reference(),
-            },
-        ),
-        (
-            "get-referrers",
-            Action::GetReferrer {
-                namespace: ns(),
-                digest: digest(),
-                artifact_type: None,
-                last: None,
-            },
-        ),
-        ("list-revisions", Action::ListRevisions { namespace: ns() }),
-        ("list-uploads", Action::ListUploads { namespace: ns() }),
-        ("list-repositories", Action::ListRepositories),
-        (
-            "list-namespaces",
-            Action::ListNamespaces {
-                repository: Namespace::new("test").unwrap(),
-            },
-        ),
-        (
             "get-blob",
             Action::HeadBlob {
                 namespace: ns(),
@@ -185,11 +176,62 @@ fn test_action_serialization_cel_compatibility() {
                 path: "usr/bin/env".to_string(),
             },
         ),
+    ]
+}
+
+/// Manifest and referrer actions.
+fn manifest_cases() -> Vec<(&'static str, Action)> {
+    vec![
+        (
+            "get-manifest",
+            Action::GetManifest {
+                namespace: ns(),
+                reference: reference(),
+            },
+        ),
+        (
+            "put-manifest",
+            Action::PutManifest {
+                namespace: ns(),
+                target: ManifestPutTarget::Tag(Tag::new("v1.0.0").unwrap()),
+            },
+        ),
+        (
+            "delete-manifest",
+            Action::DeleteManifest {
+                namespace: ns(),
+                reference: reference(),
+            },
+        ),
+        (
+            "get-referrers",
+            Action::GetReferrer {
+                namespace: ns(),
+                digest: digest(),
+                artifact_type: None,
+                last: None,
+            },
+        ),
         (
             "get-manifest",
             Action::HeadManifest {
                 namespace: ns(),
                 reference: reference(),
+            },
+        ),
+    ]
+}
+
+/// Repository listing and job administration actions.
+fn admin_cases() -> Vec<(&'static str, Action)> {
+    vec![
+        ("list-revisions", Action::ListRevisions { namespace: ns() }),
+        ("list-uploads", Action::ListUploads { namespace: ns() }),
+        ("list-repositories", Action::ListRepositories),
+        (
+            "list-namespaces",
+            Action::ListNamespaces {
+                repository: Namespace::new("test").unwrap(),
             },
         ),
         (
@@ -223,21 +265,7 @@ fn test_action_serialization_cel_compatibility() {
                 storage_key: JobKey::try_from("0000018f-key".to_string()).unwrap(),
             },
         ),
-    ];
-
-    for (expected_action_str, action) in cases {
-        assert_action_variant_covered(action);
-        let json = serde_json::to_value(action).unwrap();
-        assert_eq!(
-            json["action"], *expected_action_str,
-            "CEL action string mismatch for {action:?}"
-        );
-        assert_eq!(
-            action.action_name(),
-            *expected_action_str,
-            "action_name() mismatch for {action:?}"
-        );
-    }
+    ]
 }
 
 /// Compile-time exhaustiveness guard for the drift check above: a new `Action`
