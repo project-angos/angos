@@ -88,10 +88,9 @@ impl ListenerBaseConfig {
         8000
     }
 
-    // Non-zero literals; the `unwrap`s are const-evaluated.
-    const DEFAULT_QUERY_TIMEOUT: NonZeroU64 = NonZeroU64::new(3600).unwrap();
-    const DEFAULT_QUERY_TIMEOUT_GRACE_PERIOD: NonZeroU64 = NonZeroU64::new(60).unwrap();
-    const DEFAULT_HANDSHAKE_TIMEOUT: NonZeroU64 = NonZeroU64::new(10).unwrap();
+    const DEFAULT_QUERY_TIMEOUT: NonZeroU64 = NonZeroU64::MIN.saturating_add(3600 - 1);
+    const DEFAULT_QUERY_TIMEOUT_GRACE_PERIOD: NonZeroU64 = NonZeroU64::MIN.saturating_add(60 - 1);
+    const DEFAULT_HANDSHAKE_TIMEOUT: NonZeroU64 = NonZeroU64::MIN.saturating_add(10 - 1);
 
     fn default_query_timeout() -> NonZeroU64 {
         Self::DEFAULT_QUERY_TIMEOUT

@@ -10,10 +10,10 @@ use angos_storage::Page;
 /// Fan-out for the concurrent namespace walk: up to this many directories are
 /// scanned at once, refilled from the backlog as scans complete, to hide
 /// per-request backend latency, which dominates on S3.
-pub const NAMESPACE_WALK_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(128).unwrap();
+pub const NAMESPACE_WALK_CONCURRENCY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(128 - 1);
 
 /// Concurrent reads an admin listing keeps in flight per request.
-pub const LISTING_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+pub const LISTING_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(16 - 1);
 
 /// One scanned directory: its namespace name when it holds the `marker` child,
 /// and the sub-directories to descend into.

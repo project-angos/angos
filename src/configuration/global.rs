@@ -12,22 +12,22 @@ use crate::registry::metadata_store::{DEFAULT_GC_GRACE_SECS, PullHistoryConfig};
 use crate::registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY};
 use crate::scan::ScanConfig;
 
-/// Default Tokio worker-thread count; the `unwrap` is const-evaluated.
-const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+/// Default Tokio worker-thread count.
+const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(64 - 1);
 
-/// Default cap on concurrent in-process cache-fill jobs; the `unwrap` is
-/// const-evaluated.
-pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Default cap on concurrent in-process cache-fill jobs.
+pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4 - 1);
 
-/// Default replication-worker concurrency; the `unwrap` is const-evaluated.
-pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Default replication-worker concurrency.
+pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(4 - 1);
 /// Worker concurrency for the scan queue; a scan is minutes of scanner work.
-pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(2 - 1);
 /// Worker concurrency for the index queue: opening an image asks for all its
 /// layers at once, each job inflating one on a core.
-pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4 - 1);
 /// Entries a layer listing may hold, about half a GiB of listing in memory.
-const DEFAULT_MAX_INDEX_ENTRIES: NonZeroUsize = NonZeroUsize::new(500_000).unwrap();
+const DEFAULT_MAX_INDEX_ENTRIES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(500_000 - 1);
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {

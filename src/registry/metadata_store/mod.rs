@@ -151,9 +151,8 @@ pub const DEFAULT_GC_GRACE_SECS: u64 = 300;
 /// compaction gate is configured.
 pub const DEFAULT_COMPACT_AFTER_SECS: u64 = 3600;
 
-/// Default number of pulls a target's history keeps; the `unwrap` is
-/// const-evaluated.
-pub const DEFAULT_MAX_PULLS: NonZeroU32 = NonZeroU32::new(1000).unwrap();
+/// Default number of pulls a target's history keeps.
+pub const DEFAULT_MAX_PULLS: NonZeroU32 = NonZeroU32::MIN.saturating_add(1000 - 1);
 
 /// `[global.pull_history]`: how each tag's and revision's pull history is
 /// kept. A superseded access entry older than `compact_after_secs` or ranked

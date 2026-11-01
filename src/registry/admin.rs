@@ -40,7 +40,8 @@ use crate::registry::{Error, Registry};
 const NAMESPACE_STAT_CONCURRENCY: usize = 32;
 
 /// Manifests whose analysis the revision listing keeps in memory per replica.
-pub const DEFAULT_REVISION_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(100_000).unwrap();
+pub const DEFAULT_REVISION_CACHE_ENTRIES: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(100_000 - 1);
 
 struct RepositoryConfig {
     pull_through_cache: bool,
