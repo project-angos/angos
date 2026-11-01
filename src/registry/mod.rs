@@ -30,6 +30,7 @@ use angos_oci::{Digest, Namespace, Reference, Tag};
 use angos_oci_service::ApiVersion;
 
 use crate::configuration::RegexPattern;
+use crate::configuration::global::RedirectConfig;
 use crate::event_webhook::dispatcher::EventDispatcher;
 use crate::event_webhook::event::Event;
 use crate::jobs::Queue;
@@ -42,11 +43,9 @@ use crate::registry::repository_resolver::RepositoryResolver;
 pub use error::Error;
 pub use repository::Repository;
 
-#[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
     pub update_pull_time: bool,
-    pub enable_blob_redirect: bool,
-    pub enable_manifest_redirect: bool,
+    pub redirect: RedirectConfig,
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
@@ -79,8 +78,7 @@ impl RegistryConfig {
     pub fn new(job_queue: Arc<JobStore>) -> Self {
         Self {
             update_pull_time: false,
-            enable_blob_redirect: true,
-            enable_manifest_redirect: true,
+            redirect: RedirectConfig::default(),
             global_immutable_tags: false,
             global_immutable_tags_exclusions: Vec::new(),
             max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,

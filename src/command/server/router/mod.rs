@@ -139,7 +139,7 @@ impl From<&Route> for Action {
             Route::Readyz => Action::Readyz,
             Route::Metrics => Action::Metrics,
 
-            Route::Oci(endpoint) => Action::from(endpoint),
+            Route::Oci(endpoint) => Action::from(endpoint.clone()),
             Route::Docker(DockerEndpoint::ListCatalog { n, last }) => Action::ListCatalog {
                 n: *n,
                 last: last.clone(),
@@ -149,110 +149,98 @@ impl From<&Route> for Action {
     }
 }
 
-impl From<&OciEndpoint> for Action {
-    fn from(endpoint: &OciEndpoint) -> Self {
+impl From<OciEndpoint> for Action {
+    fn from(endpoint: OciEndpoint) -> Self {
         match endpoint {
             OciEndpoint::CheckVersion => Action::ApiVersion,
             OciEndpoint::GetManifest {
                 namespace,
                 reference,
             } => Action::GetManifest {
-                namespace: namespace.clone(),
-                reference: reference.clone(),
+                namespace,
+                reference,
             },
             OciEndpoint::HeadManifest {
                 namespace,
                 reference,
             } => Action::HeadManifest {
-                namespace: namespace.clone(),
-                reference: reference.clone(),
+                namespace,
+                reference,
             },
-            OciEndpoint::PutManifest { namespace, target } => Action::PutManifest {
-                namespace: namespace.clone(),
-                target: target.clone(),
-            },
+            OciEndpoint::PutManifest { namespace, target } => {
+                Action::PutManifest { namespace, target }
+            }
             OciEndpoint::DeleteManifest {
                 namespace,
                 reference,
             } => Action::DeleteManifest {
-                namespace: namespace.clone(),
-                reference: reference.clone(),
+                namespace,
+                reference,
             },
-            OciEndpoint::GetBlob { namespace, digest } => Action::GetBlob {
-                namespace: namespace.clone(),
-                digest: digest.clone(),
-            },
-            OciEndpoint::HeadBlob { namespace, digest } => Action::HeadBlob {
-                namespace: namespace.clone(),
-                digest: digest.clone(),
-            },
-            OciEndpoint::DeleteBlob { namespace, digest } => Action::DeleteBlob {
-                namespace: namespace.clone(),
-                digest: digest.clone(),
-            },
+            OciEndpoint::GetBlob { namespace, digest } => Action::GetBlob { namespace, digest },
+            OciEndpoint::HeadBlob { namespace, digest } => Action::HeadBlob { namespace, digest },
+            OciEndpoint::DeleteBlob { namespace, digest } => {
+                Action::DeleteBlob { namespace, digest }
+            }
             OciEndpoint::StartUpload {
                 namespace,
                 digest,
                 digest_algorithm,
             } => Action::StartUpload {
-                namespace: namespace.clone(),
-                digest: digest.clone(),
-                digest_algorithm: *digest_algorithm,
+                namespace,
+                digest,
+                digest_algorithm,
             },
             OciEndpoint::MountBlob {
                 namespace,
                 digest,
                 from,
             } => Action::MountBlob {
-                namespace: namespace.clone(),
-                digest: digest.clone(),
-                from: from.clone(),
+                namespace,
+                digest,
+                from,
             },
             OciEndpoint::GetUpload {
                 namespace,
                 session_id,
             } => Action::GetUpload {
-                namespace: namespace.clone(),
-                session_id: session_id.clone(),
+                namespace,
+                session_id,
             },
             OciEndpoint::PatchUpload {
                 namespace,
                 session_id,
             } => Action::PatchUpload {
-                namespace: namespace.clone(),
-                session_id: session_id.clone(),
+                namespace,
+                session_id,
             },
             OciEndpoint::PutUpload {
                 namespace,
                 session_id,
                 digest,
             } => Action::PutUpload {
-                namespace: namespace.clone(),
-                session_id: session_id.clone(),
-                digest: digest.clone(),
+                namespace,
+                session_id,
+                digest,
             },
             OciEndpoint::DeleteUpload {
                 namespace,
                 session_id,
             } => Action::DeleteUpload {
-                namespace: namespace.clone(),
-                session_id: session_id.clone(),
+                namespace,
+                session_id,
             },
-            OciEndpoint::ListTags { namespace, n, last } => Action::ListTags {
-                namespace: namespace.clone(),
-                n: *n,
-                last: last.clone(),
-            },
+            OciEndpoint::ListTags { namespace, n, last } => Action::ListTags { namespace, n, last },
             OciEndpoint::GetReferrers {
                 namespace,
                 digest,
                 artifact_type,
                 last,
             } => Action::GetReferrer {
-                namespace: namespace.clone(),
-                digest: digest.clone(),
-                artifact_type: artifact_type.clone(),
-                last: last.clone(),
+                namespace,
+                digest,
+                artifact_type,
+                last,
             },
         }
     }

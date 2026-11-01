@@ -166,8 +166,7 @@ pub fn create_test_registry_with(
 
     let config = RegistryConfig {
         update_pull_time: global.update_pull_time,
-        enable_blob_redirect: global.enable_blob_redirect,
-        enable_manifest_redirect: global.enable_manifest_redirect,
+        redirect: global.redirect,
         max_manifest_size_bytes: global.max_manifest_size_bytes(),
         max_blob_size_bytes: global.max_blob_size_bytes(),
         validate_manifest_references,

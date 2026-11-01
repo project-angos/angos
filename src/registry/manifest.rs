@@ -521,7 +521,7 @@ impl Registry {
             ..
         } = request;
         if allow_redirect
-            && self.config.enable_manifest_redirect
+            && self.config.redirect.manifest
             && let Reference::Digest(digest) = reference
             && let Some(response) = self
                 .try_redirect_via_link(namespace, digest, client)
@@ -554,7 +554,7 @@ impl Registry {
             accepted_types,
         } = request;
         if allow_redirect
-            && self.config.enable_manifest_redirect
+            && self.config.redirect.manifest
             && let Reference::Digest(digest) = reference
             && let Some(response) = self
                 .try_redirect_via_link(namespace, digest, client)

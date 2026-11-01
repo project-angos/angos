@@ -235,7 +235,7 @@ impl Registry {
     ) -> Result<BlobGet<BoxedReader>, Error> {
         if request.range.is_none()
             && allow_redirect
-            && self.config.enable_blob_redirect
+            && self.config.redirect.blob
             && self.blob_store.size(&request.digest).await.is_ok()
             && let Ok(Some(location)) = self.blob_store.presigned_url(&request.digest, None).await
         {

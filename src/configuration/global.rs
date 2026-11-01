@@ -29,8 +29,6 @@ pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::new(4)
 /// Entries a layer listing may hold, about half a GiB of listing in memory.
 const DEFAULT_MAX_INDEX_ENTRIES: NonZeroUsize = NonZeroUsize::new(500_000).unwrap();
 
-// A config struct is naturally flag-heavy; the bool count is not an API smell.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
@@ -62,10 +60,8 @@ pub struct GlobalConfig {
     pub blob_stream_frame_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
     pub update_pull_time: bool,
-    #[serde(default = "default_redirect_enabled")]
-    pub enable_blob_redirect: bool,
-    #[serde(default = "default_redirect_enabled")]
-    pub enable_manifest_redirect: bool,
+    #[serde(flatten)]
+    pub redirect: RedirectConfig,
     #[serde(default)]
     pub access_policy: PolicyConfig<AccessMode>,
     #[serde(default)]
@@ -126,6 +122,28 @@ pub struct GlobalConfig {
     /// policies.
     #[serde(default)]
     pub trusted_proxies: Vec<TrustedProxy>,
+}
+
+/// Which responses may redirect the client to the storage backend; read from
+/// the `enable_*_redirect` keys of `[global]`.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct RedirectConfig {
+    #[serde(rename = "enable_blob_redirect", default = "default_redirect_enabled")]
+    pub blob: bool,
+    #[serde(
+        rename = "enable_manifest_redirect",
+        default = "default_redirect_enabled"
+    )]
+    pub manifest: bool,
+}
+
+impl Default for RedirectConfig {
+    fn default() -> Self {
+        Self {
+            blob: default_redirect_enabled(),
+            manifest: default_redirect_enabled(),
+        }
+    }
 }
 
 fn default_shutdown_drain_secs() -> u64 {
@@ -214,8 +232,7 @@ impl Default for GlobalConfig {
             max_blob_size: default_max_blob_size(),
             blob_stream_frame_size: default_blob_stream_frame_size(),
             update_pull_time: default_update_pull_time(),
-            enable_blob_redirect: default_redirect_enabled(),
-            enable_manifest_redirect: default_redirect_enabled(),
+            redirect: RedirectConfig::default(),
             access_policy: PolicyConfig::default(),
             retention_policy: RetentionPolicyConfig::default(),
             immutable_tags: false,

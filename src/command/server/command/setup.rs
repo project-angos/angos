@@ -225,8 +225,7 @@ pub async fn build_registry(
 
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
-        enable_blob_redirect: config.global.enable_blob_redirect,
-        enable_manifest_redirect: config.global.enable_manifest_redirect,
+        redirect: config.global.redirect,
         max_manifest_size_bytes,
         max_blob_size_bytes: config.global.max_blob_size_bytes(),
         blob_stream_frame_size: config.global.blob_stream_frame_size_bytes(),
