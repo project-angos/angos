@@ -400,7 +400,6 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
 /// The execute-time tag resolve must read the backend link, not the per-process
 /// cache: a worker's cache can lag a sibling's write by up to its TTL, and a
 /// stale resolve would replicate the old digest and complete the job.
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn execute_skips_blob_present_on_downstream() {
     metrics_provider::initialize_metrics();

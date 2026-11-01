@@ -281,7 +281,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use angos_oci::header::DOCKER_CONTENT_DIGEST;
-    use angos_oci::{Namespace, Tag};
+    use angos_oci::{Digest, Namespace, Tag};
     use angos_oci_client::RegistryClient;
 
     use super::{InProcessLoops, LoopCounts, spawn_in_process_loops};
@@ -358,10 +358,47 @@ mod tests {
         }
     }
 
+    /// Mounts a downstream that lacks `blobs` and accepts their upload, then the
+    /// manifest push under tag `v1`.
+    async fn mount_push_downstream(
+        mock_server: &MockServer,
+        manifest_digest: &Digest,
+        blobs: [&Digest; 2],
+    ) {
+        for blob in blobs {
+            Mock::given(method("HEAD"))
+                .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(mock_server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1")),
+            )
+            .mount(mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1..)
+            .mount(mock_server)
+            .await;
+    }
+
     /// The drained job runs the whole push pipeline (HEAD before PUT for each
     /// blob, then the manifest) against a wiremock downstream.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn the_in_process_loops_drain_a_replication_push() {
         let mock_server = MockServer::start().await;
         let client: Arc<RegistryClient> = downstream_client(&mock_server.uri());
@@ -371,35 +408,12 @@ mod tests {
         let (manifest_digest, config_digest, layer_digest) =
             seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
 
-        for blob in [&config_digest, &layer_digest] {
-            Mock::given(method("HEAD"))
-                .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(&mock_server)
-                .await;
-        }
-        Mock::given(method("POST"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
-            .respond_with(
-                ResponseTemplate::new(202)
-                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1")),
-            )
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
-            .respond_with(ResponseTemplate::new(201))
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-            )
-            .expect(1..)
-            .mount(&mock_server)
-            .await;
+        mount_push_downstream(
+            &mock_server,
+            &manifest_digest,
+            [&config_digest, &layer_digest],
+        )
+        .await;
 
         let repository = stack.registry.repository_for_namespace(&namespace).ok();
         let tag = Tag::new("v1").unwrap();
