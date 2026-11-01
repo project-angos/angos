@@ -2,8 +2,8 @@ use std::process::exit;
 use std::sync::LazyLock;
 
 use prometheus::{
-    Encoder, Error as PrometheusError, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
-    Registry as PrometheusRegistry, TextEncoder, register_histogram_vec_with_registry,
+    DEFAULT_BUCKETS, Encoder, Error as PrometheusError, HistogramVec, IntCounterVec, IntGauge,
+    IntGaugeVec, Registry as PrometheusRegistry, TextEncoder, register_histogram_vec_with_registry,
     register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry,
     register_int_gauge_with_registry,
 };
@@ -93,146 +93,150 @@ fn register_err(name: &'static str) -> impl FnOnce(PrometheusError) -> Error {
     }
 }
 
+/// A metric's name, help text and label names.
+struct MetricSpec {
+    name: &'static str,
+    help: &'static str,
+    labels: &'static [&'static str],
+}
+
+const HTTP_REQUESTS_TOTAL: MetricSpec = MetricSpec {
+    name: "http_requests_total",
+    help: "Total number of HTTP requests made.",
+    labels: &["method", "route", "status"],
+};
+const HTTP_REQUEST_DURATION: MetricSpec = MetricSpec {
+    name: "http_request_duration_ms",
+    help: "The HTTP request latencies in milliseconds.",
+    labels: &["method", "route"],
+};
+const HTTP_REQUESTS_IN_FLIGHT: MetricSpec = MetricSpec {
+    name: "http_requests_in_flight",
+    help: "The current number of in-flight HTTP requests.",
+    labels: &[],
+};
+const AUTH_ATTEMPTS: MetricSpec = MetricSpec {
+    name: "auth_attempts_total",
+    help: "Total number of authentication attempts",
+    labels: &["method", "result"],
+};
+const WEBHOOK_AUTH_REQUESTS: MetricSpec = MetricSpec {
+    name: "webhook_authorization_requests_total",
+    help: "Total webhook authorization requests",
+    labels: &["webhook", "result"],
+};
+const WEBHOOK_AUTH_DURATION: MetricSpec = MetricSpec {
+    name: "webhook_authorization_duration_seconds",
+    help: "Webhook authorization request duration",
+    labels: &["webhook"],
+};
+const EVENT_WEBHOOK_DELIVERIES: MetricSpec = MetricSpec {
+    name: "event_webhook_deliveries_total",
+    help: "Total event webhook deliveries",
+    labels: &["webhook", "event", "result"],
+};
+const EVENT_WEBHOOK_DELIVERY_DURATION: MetricSpec = MetricSpec {
+    name: "event_webhook_delivery_duration_seconds",
+    help: "Event webhook delivery duration",
+    labels: &["webhook", "event"],
+};
+const JOB_QUEUE_PENDING: MetricSpec = MetricSpec {
+    name: "angos_job_queue_pending",
+    help: "Number of jobs currently pending in the queue",
+    labels: &["queue"],
+};
+const JOB_QUEUE_FAILED: MetricSpec = MetricSpec {
+    name: "angos_job_queue_failed",
+    help: "Number of dead-lettered jobs currently in the queue",
+    labels: &["queue"],
+};
+const JOB_QUEUE_ENQUEUED: MetricSpec = MetricSpec {
+    name: "angos_job_queue_enqueued_total",
+    help: "Total jobs submitted to the queue",
+    labels: &["queue", "dedup"],
+};
+const JOB_QUEUE_ENQUEUE_FAILURES: MetricSpec = MetricSpec {
+    name: "angos_job_queue_enqueue_failures_total",
+    help: "Total enqueue attempts that did not land on the queue (envelope build or storage error)",
+    labels: &["queue"],
+};
+const REPLICATION_PUSH: MetricSpec = MetricSpec {
+    name: "angos_replication_push_total",
+    help: "Total replication pushes to a downstream, by outcome (pushed, converged, superseded, failed)",
+    labels: &["downstream", "outcome"],
+};
+const REPLICATION_LAST_SUCCESS: MetricSpec = MetricSpec {
+    name: "angos_replication_last_success_timestamp_seconds",
+    help: "Unix timestamp (seconds) of the last successful or superseded replication push per downstream",
+    labels: &["downstream"],
+};
+const REPLICATION_RECONCILE: MetricSpec = MetricSpec {
+    name: "angos_replication_reconcile_total",
+    help: "Total replication reconcile enqueues emitted by the scrub checker, by outcome",
+    labels: &["outcome"],
+};
+const PULL_THROUGH: MetricSpec = MetricSpec {
+    name: "angos_pull_through_total",
+    help: "Total pull-through cache lookups, by repository, content kind (manifest, blob) and outcome (hit, miss, refresh, stale)",
+    labels: &["repository", "kind", "outcome"],
+};
+
+impl MetricSpec {
+    fn counter_vec(&self, registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(self.name, self.help, self.labels, registry)
+            .map_err(register_err(self.name))
+    }
+
+    fn gauge_vec(&self, registry: &PrometheusRegistry) -> Result<IntGaugeVec, Error> {
+        register_int_gauge_vec_with_registry!(self.name, self.help, self.labels, registry)
+            .map_err(register_err(self.name))
+    }
+
+    fn gauge(&self, registry: &PrometheusRegistry) -> Result<IntGauge, Error> {
+        register_int_gauge_with_registry!(self.name, self.help, registry)
+            .map_err(register_err(self.name))
+    }
+
+    fn histogram_vec(
+        &self,
+        registry: &PrometheusRegistry,
+        buckets: &[f64],
+    ) -> Result<HistogramVec, Error> {
+        register_histogram_vec_with_registry!(
+            self.name,
+            self.help,
+            self.labels,
+            buckets.to_vec(),
+            registry
+        )
+        .map_err(register_err(self.name))
+    }
+}
+
 impl MetricsProvider {
-    // A flat list of metric declarations: length is the content, not logic.
-    #[allow(clippy::too_many_lines)]
     pub fn new() -> Result<Self, Error> {
         let registry = PrometheusRegistry::new();
-
-        let metric_http_request_total = register_int_counter_vec_with_registry!(
-            "http_requests_total",
-            "Total number of HTTP requests made.",
-            &["method", "route", "status"],
-            registry
-        )
-        .map_err(register_err("http_requests_total"))?;
-        let metric_http_request_duration = register_histogram_vec_with_registry!(
-            "http_request_duration_ms",
-            "The HTTP request latencies in milliseconds.",
-            &["method", "route"],
-            HTTP_DURATION_BUCKETS_MS.to_vec(),
-            registry
-        )
-        .map_err(register_err("http_request_duration_ms"))?;
-        let metric_http_request_in_flight = register_int_gauge_with_registry!(
-            "http_requests_in_flight",
-            "The current number of in-flight HTTP requests.",
-            registry
-        )
-        .map_err(register_err("http_requests_in_flight"))?;
-        let auth_attempts = register_int_counter_vec_with_registry!(
-            "auth_attempts_total",
-            "Total number of authentication attempts",
-            &["method", "result"],
-            registry
-        )
-        .map_err(register_err("auth_attempts_total"))?;
-        let webhook_auth_requests = register_int_counter_vec_with_registry!(
-            "webhook_authorization_requests_total",
-            "Total webhook authorization requests",
-            &["webhook", "result"],
-            registry
-        )
-        .map_err(register_err("webhook_authorization_requests_total"))?;
-        let webhook_auth_duration = register_histogram_vec_with_registry!(
-            "webhook_authorization_duration_seconds",
-            "Webhook authorization request duration",
-            &["webhook"],
-            registry
-        )
-        .map_err(register_err("webhook_authorization_duration_seconds"))?;
-        let event_webhook_deliveries = register_int_counter_vec_with_registry!(
-            "event_webhook_deliveries_total",
-            "Total event webhook deliveries",
-            &["webhook", "event", "result"],
-            registry
-        )
-        .map_err(register_err("event_webhook_deliveries_total"))?;
-        let event_webhook_delivery_duration = register_histogram_vec_with_registry!(
-            "event_webhook_delivery_duration_seconds",
-            "Event webhook delivery duration",
-            &["webhook", "event"],
-            registry
-        )
-        .map_err(register_err("event_webhook_delivery_duration_seconds"))?;
-        let job_queue_pending = register_int_gauge_vec_with_registry!(
-            "angos_job_queue_pending",
-            "Number of jobs currently pending in the queue",
-            &["queue"],
-            registry
-        )
-        .map_err(register_err("angos_job_queue_pending"))?;
-        let job_queue_failed = register_int_gauge_vec_with_registry!(
-            "angos_job_queue_failed",
-            "Number of dead-lettered jobs currently in the queue",
-            &["queue"],
-            registry
-        )
-        .map_err(register_err("angos_job_queue_failed"))?;
-        let job_queue_enqueued_total = register_int_counter_vec_with_registry!(
-            "angos_job_queue_enqueued_total",
-            "Total jobs submitted to the queue",
-            &["queue", "dedup"],
-            registry
-        )
-        .map_err(register_err("angos_job_queue_enqueued_total"))?;
-        let job_queue_enqueue_failures_total =
-            register_int_counter_vec_with_registry!(
-            "angos_job_queue_enqueue_failures_total",
-            "Total enqueue attempts that did not land on the queue (envelope build or storage error)",
-            &["queue"],
-            registry
-        )
-        .map_err(register_err("angos_job_queue_enqueue_failures_total"))?;
-        let replication_push_total = register_int_counter_vec_with_registry!(
-            "angos_replication_push_total",
-            "Total replication pushes to a downstream, by outcome (pushed, converged, superseded, failed)",
-            &["downstream", "outcome"],
-            registry
-        )
-        .map_err(register_err("angos_replication_push_total"))?;
-        let replication_last_success_timestamp =
-            register_int_gauge_vec_with_registry!(
-            "angos_replication_last_success_timestamp_seconds",
-            "Unix timestamp (seconds) of the last successful or superseded replication push per downstream",
-            &["downstream"],
-            registry
-        )
-        .map_err(register_err("angos_replication_last_success_timestamp_seconds"))?;
-        let replication_reconcile_total = register_int_counter_vec_with_registry!(
-            "angos_replication_reconcile_total",
-            "Total replication reconcile enqueues emitted by the scrub checker, by outcome",
-            &["outcome"],
-            registry
-        )
-        .map_err(register_err("angos_replication_reconcile_total"))?;
-
-        let pull_through_total = register_int_counter_vec_with_registry!(
-            "angos_pull_through_total",
-            "Total pull-through cache lookups, by repository, content kind (manifest, blob) and outcome (hit, miss, refresh, stale)",
-            &["repository", "kind", "outcome"],
-            registry
-        )
-        .map_err(register_err("angos_pull_through_total"))?;
-
         Ok(Self {
+            metric_http_request_total: HTTP_REQUESTS_TOTAL.counter_vec(&registry)?,
+            metric_http_request_duration: HTTP_REQUEST_DURATION
+                .histogram_vec(&registry, &HTTP_DURATION_BUCKETS_MS)?,
+            metric_http_request_in_flight: HTTP_REQUESTS_IN_FLIGHT.gauge(&registry)?,
+            auth_attempts: AUTH_ATTEMPTS.counter_vec(&registry)?,
+            webhook_auth_requests: WEBHOOK_AUTH_REQUESTS.counter_vec(&registry)?,
+            webhook_auth_duration: WEBHOOK_AUTH_DURATION
+                .histogram_vec(&registry, DEFAULT_BUCKETS)?,
+            event_webhook_deliveries: EVENT_WEBHOOK_DELIVERIES.counter_vec(&registry)?,
+            event_webhook_delivery_duration: EVENT_WEBHOOK_DELIVERY_DURATION
+                .histogram_vec(&registry, DEFAULT_BUCKETS)?,
+            job_queue_pending: JOB_QUEUE_PENDING.gauge_vec(&registry)?,
+            job_queue_failed: JOB_QUEUE_FAILED.gauge_vec(&registry)?,
+            job_queue_enqueued_total: JOB_QUEUE_ENQUEUED.counter_vec(&registry)?,
+            job_queue_enqueue_failures_total: JOB_QUEUE_ENQUEUE_FAILURES.counter_vec(&registry)?,
+            replication_push_total: REPLICATION_PUSH.counter_vec(&registry)?,
+            replication_last_success_timestamp: REPLICATION_LAST_SUCCESS.gauge_vec(&registry)?,
+            replication_reconcile_total: REPLICATION_RECONCILE.counter_vec(&registry)?,
+            pull_through_total: PULL_THROUGH.counter_vec(&registry)?,
             registry,
-            metric_http_request_total,
-            metric_http_request_duration,
-            metric_http_request_in_flight,
-            auth_attempts,
-            webhook_auth_requests,
-            webhook_auth_duration,
-            event_webhook_deliveries,
-            event_webhook_delivery_duration,
-            job_queue_pending,
-            job_queue_failed,
-            job_queue_enqueued_total,
-            job_queue_enqueue_failures_total,
-            replication_push_total,
-            replication_last_success_timestamp,
-            replication_reconcile_total,
-            pull_through_total,
         })
     }
 
