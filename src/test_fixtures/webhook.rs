@@ -60,14 +60,17 @@ static FIXTURES: LazyLock<WebhookFixtures> = LazyLock::new(|| {
     }
 });
 
+#[must_use]
 pub fn ca_bundle_pem() -> &'static str {
     &FIXTURES.ca_bundle
 }
 
+#[must_use]
 pub fn client_cert_pem() -> &'static str {
     &FIXTURES.client_cert
 }
 
+#[must_use]
 pub fn client_key_pem() -> &'static str {
     &FIXTURES.client_key
 }

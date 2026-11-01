@@ -40,18 +40,22 @@ fn generate_key() -> OidcKey {
 static PRIMARY: LazyLock<OidcKey> = LazyLock::new(generate_key);
 static ALT: LazyLock<OidcKey> = LazyLock::new(generate_key);
 
+#[must_use]
 pub fn private_key_pem() -> &'static str {
     &PRIMARY.pem
 }
 
+#[must_use]
 pub fn alt_private_key_pem() -> &'static str {
     &ALT.pem
 }
 
+#[must_use]
 pub fn jwk_x() -> &'static str {
     &PRIMARY.jwk_x
 }
 
+#[must_use]
 pub fn jwk_y() -> &'static str {
     &PRIMARY.jwk_y
 }

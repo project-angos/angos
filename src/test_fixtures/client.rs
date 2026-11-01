@@ -6,6 +6,7 @@ use angos_oci_client::RegistryClientConfig;
 /// The modal test client config: `url` plus defaults everywhere (no TLS
 /// material, no credentials, `max_redirect` 5). Tests needing a variant
 /// mutate the returned value.
+#[must_use]
 pub fn test_client_config(url: String) -> RegistryClientConfig {
     RegistryClientConfig {
         url,

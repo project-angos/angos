@@ -16,6 +16,7 @@ impl LogCapture {
     /// # Panics
     ///
     /// Panics if the captured bytes are not valid UTF-8.
+    #[must_use]
     pub fn contents(&self) -> String {
         let bytes = self.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()

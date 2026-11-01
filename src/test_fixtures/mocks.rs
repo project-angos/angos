@@ -11,6 +11,7 @@ use angos_oci::header::DOCKER_CONTENT_DIGEST;
 use crate::test_fixtures::oidc::{KID, jwk_x, jwk_y};
 
 /// The JWKS document advertising the `test_fixtures::oidc` primary key.
+#[must_use]
 pub fn static_jwks_response() -> Value {
     json!({
         "keys": [{

@@ -24,11 +24,13 @@ pub const MINIMAL_CONFIG_TOML: &str = r#"
 /// # Panics
 ///
 /// Panics if the built-in TOML fixture becomes invalid.
+#[must_use]
 pub fn minimal_config() -> Configuration {
     metrics_provider::initialize_metrics();
     Configuration::load_from_str(MINIMAL_CONFIG_TOML).unwrap()
 }
 
+#[must_use]
 pub fn config_toml(extra: &str) -> String {
     format!("{MINIMAL_CONFIG_TOML}\n{extra}")
 }
@@ -38,6 +40,7 @@ pub fn config_toml(extra: &str) -> String {
 /// # Panics
 ///
 /// Panics when the appended TOML makes the configuration invalid.
+#[must_use]
 pub fn load_config(extra: &str) -> Configuration {
     try_load_config(extra).unwrap()
 }

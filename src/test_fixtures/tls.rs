@@ -29,10 +29,12 @@ static SERVER: LazyLock<ServerIdentity> = LazyLock::new(|| {
     }
 });
 
+#[must_use]
 pub fn server_cert_pem() -> &'static str {
     &SERVER.cert_pem
 }
 
+#[must_use]
 pub fn server_key_pem() -> &'static str {
     &SERVER.key_pem
 }
