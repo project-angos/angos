@@ -24,7 +24,7 @@
 	$effect(() => {
 		const digest = layer?.digest;
 		if (!digest) {
-			error = 'The report has no SARIF layer';
+			error = 'The report has no SARIF layer.';
 			loading = false;
 			return;
 		}
@@ -33,7 +33,7 @@
 			if (result.data) {
 				report = parseSarif(result.data);
 			} else {
-				error = result.error ?? 'Failed to load the report';
+				error = `Could not load the report (${result.error}).`;
 			}
 			loading = false;
 		});

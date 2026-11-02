@@ -480,6 +480,19 @@ export function descendantNamespaces(
  * `null` when the path lies outside every repository, as an intermediate
  * segment does.
  */
+let started = false;
+
+/**
+ * Whether this is the first route load since the page loaded. It has no
+ * previous page to keep on screen, so it renders at once and shows its data
+ * when it arrives, where a navigation waits for the data instead.
+ */
+export function isFirstLoad(): boolean {
+	const first = !started;
+	started = true;
+	return first;
+}
+
 export function resolveRepository(names: string[], path: string): string | null {
 	let owner: string | null = null;
 	for (const name of names) {

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import '../app.css';
 	import { resolve } from '$app/paths';
-	import { page } from '$app/state';
+	import { navigating, page } from '$app/state';
 	import { onMount } from 'svelte';
 	import ThemeSwitcher from '#lib/components/ThemeSwitcher.svelte';
 	import SignIn from '#lib/components/SignIn.svelte';
@@ -51,6 +51,9 @@
 		<SignIn />
 		<ThemeSwitcher />
 	</div>
+	{#if navigating.to}
+		<div class="progress" aria-hidden="true"></div>
+	{/if}
 </header>
 
 <main>
@@ -73,6 +76,25 @@
 		padding: 0 0.875rem;
 		background: var(--surface);
 		border-bottom: 1px solid var(--border);
+	}
+	/* A navigation waiting on its data; a quick one never shows it. */
+	.progress {
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: -1px;
+		height: 2px;
+		background: var(--accent);
+		transform-origin: left;
+		animation: progress 10s cubic-bezier(0.1, 0.7, 0.2, 1) 0.2s both;
+	}
+	@keyframes progress {
+		from {
+			transform: scaleX(0);
+		}
+		to {
+			transform: scaleX(0.9);
+		}
 	}
 	main {
 		max-width: 75rem;

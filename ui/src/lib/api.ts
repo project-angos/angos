@@ -108,11 +108,11 @@ export interface NamespaceInfo {
 	upload_count: number;
 }
 
-interface RepositoriesResponse extends Paged {
+export interface RepositoriesResponse extends Paged {
 	repositories: RepositoryInfo[];
 }
 
-interface NamespacesResponse extends Paged {
+export interface NamespacesResponse extends Paged {
 	repository: string;
 	namespaces: NamespaceInfo[];
 	pull_through_cache: boolean;
@@ -122,12 +122,12 @@ interface NamespacesResponse extends Paged {
 }
 
 /** `total` counts the top-level revisions; `manifests` also holds what each one holds. */
-interface RevisionsResponse extends Paged {
+export interface RevisionsResponse extends Paged {
 	name: string;
 	manifests: ManifestEntry[];
 }
 
-interface UploadsResponse extends Paged {
+export interface UploadsResponse extends Paged {
 	name: string;
 	uploads: UploadEntry[];
 }
@@ -155,12 +155,12 @@ export interface FailedJobEntry {
 	last_error: string;
 }
 
-interface JobsResponse {
+export interface JobsResponse {
 	jobs: JobEntry[];
 	next?: string;
 }
 
-interface FailedJobsResponse {
+export interface FailedJobsResponse {
 	failed: FailedJobEntry[];
 	next?: string;
 }

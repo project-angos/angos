@@ -2,6 +2,7 @@
 	import { fetchManifest, type Manifest } from '#lib/api.js';
 	import { formatTimeAgo, manifestUrl } from '#lib/utils.js';
 	import DigestLink from './DigestLink.svelte';
+	import Card from './Card.svelte';
 	import ScanReport from './ScanReport.svelte';
 	import LoadingState from './LoadingState.svelte';
 	import ErrorState from './ErrorState.svelte';
@@ -83,10 +84,15 @@
 	</p>
 {/if}
 
-{#if error}
-	<ErrorState message={error} />
-{:else if loading}
-	<LoadingState message="Loading the report" />
+<!-- The same card the report fills, so loading it does not reflow the tab. -->
+{#if error || loading}
+	<Card title="Vulnerability report">
+		{#if error}
+			<ErrorState message="Could not load the report ({error})." />
+		{:else}
+			<LoadingState message="Loading the report" />
+		{/if}
+	</Card>
 {:else if manifest}
 	<ScanReport {namespace} {manifest} />
 {/if}

@@ -1511,6 +1511,14 @@ button.badge.fs-version.active {
 	padding: 1.5rem 0;
 	color: var(--muted);
 	font-size: 0.875rem;
+	/* Holds its place unseen at first, so a quick load never flashes it. */
+	animation: reveal 0s 0.3s both;
+}
+
+@keyframes reveal {
+	from {
+		visibility: hidden;
+	}
 }
 
 /* Inside a panel, a state keeps the panel's padding off the border. */
@@ -1539,8 +1547,7 @@ button.badge.fs-version.active {
 }
 
 .error,
-.notice,
-.action-error {
+.notice {
 	display: flex;
 	align-items: center;
 	gap: 0.5rem;
@@ -1561,12 +1568,6 @@ button.badge.fs-version.active {
 
 .error svg {
 	flex: none;
-}
-
-.action-error {
-	border-color: var(--warn-border);
-	background: var(--warn-bg);
-	color: var(--warn-fg);
 }
 
 /* ===== CHIPS ===== */

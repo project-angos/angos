@@ -12,11 +12,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Replication uploads each blob in its committing `PUT` instead of a `PATCH` followed by a `PUT`, and probes the downstream and the local mount source concurrently.
 - Replication pushes the child manifests of a top-level index concurrently, up to `max_concurrent_pushes`.
 - A blob existence or read check for a blob the namespace does not own costs one fewer storage round trip.
+- The web UI keeps the current page on screen while the next one loads, with a progress bar for a slow navigation, instead of blanking it behind a spinner.
+- The web UI shows every error, including an unknown page, in the same error box and wording.
 
 ### Fixed
 
 - Job workers in one process no longer contend for the same pending jobs, so queue draining scales with `max_concurrent_*_jobs`.
 - Job workers start each claim at a random point of the queue head, so several worker replicas rarely race for the same job.
+- The web UI's jobs page shows why a retry or delete failed, instead of clearing the error as it refreshes.
 
 ## 1.12.4
 
