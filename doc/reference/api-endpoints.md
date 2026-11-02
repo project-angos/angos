@@ -351,7 +351,8 @@ namespace emptied since its last write can therefore still be listed, with zero 
 Each namespace's counts are a full enumeration of its tags, revisions, and upload sessions, taken for
 the page's namespaces alone. The three are issued together per namespace, and the namespaces
 themselves are counted concurrently, so the page costs one round of enumerations rather than one
-after another.
+after another. With `namespace_counts = false` in `[global]` none of this is read, and each
+namespace is listed by its name alone, without the three count fields.
 
 **Response:**
 ```json

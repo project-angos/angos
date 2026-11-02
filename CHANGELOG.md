@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.12.5 - UNRELEASED
 
+### Added
+
+- `namespace_counts = false` in `[global]` makes the namespace listing skip each namespace's tag, manifest and upload counts, which the web UI's namespace pages then leave out, so they load fast on a large store.
+
 ### Changed
 
 - Outbound HTTPS trusts only the system CA bundle (`SSL_CERT_FILE`, else `/etc/ssl/certs/ca-certificates.crt`) and a section's `server_ca_bundle`, no longer going through the platform verifier.

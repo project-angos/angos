@@ -88,6 +88,9 @@
 	// a superseded load is discarded instead of overwriting the current view.
 	let loadToken = 0;
 
+	// The registry may be configured to skip the counts, which the table then drops.
+	const counted = $derived(children.some((child) => child.tag_count !== undefined));
+
 	// What the path holds, for the lede: a prefix has namespaces, a leaf has
 	// manifests, and a nested name may have both.
 	const summary = $derived.by(() => {
@@ -652,9 +655,11 @@
 							onsort={sortNamespaces}
 							disabled={data.repository === null}
 						/>
-						<th class="col-medium">Tags</th>
-						<th class="col-medium">Manifests</th>
-						<th class="col-medium">Uploads</th>
+						{#if counted}
+							<th class="col-medium">Tags</th>
+							<th class="col-medium">Manifests</th>
+							<th class="col-medium">Uploads</th>
+						{/if}
 					</tr>
 				</thead>
 				<tbody>
@@ -662,9 +667,11 @@
 						{@const href = pathUrl(child.path)}
 						<tr class="clickable" onclick={(event) => { if (!isInteractiveTarget(event)) goto(href); }}>
 							<td><a class="row-link" {href}>{child.label}</a></td>
-							<td>{child.tag_count ? child.tag_count : '-'}</td>
-							<td>{child.manifest_count ? child.manifest_count : '-'}</td>
-							<td>{child.upload_count ? child.upload_count : '-'}</td>
+							{#if counted}
+								<td>{child.tag_count ? child.tag_count : '-'}</td>
+								<td>{child.manifest_count ? child.manifest_count : '-'}</td>
+								<td>{child.upload_count ? child.upload_count : '-'}</td>
+							{/if}
 						</tr>
 					{/each}
 				</tbody>

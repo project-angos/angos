@@ -101,11 +101,12 @@ export interface RepositoryInfo {
 	immutable_tags: boolean;
 }
 
+/** The counts are absent when the registry is configured not to compute them. */
 export interface NamespaceInfo {
 	name: string;
-	tag_count: number;
-	manifest_count: number;
-	upload_count: number;
+	tag_count?: number;
+	manifest_count?: number;
+	upload_count?: number;
 }
 
 export interface RepositoriesResponse extends Paged {
