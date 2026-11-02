@@ -76,12 +76,16 @@ pub struct RepositoriesBody {
     pub next: Option<u32>,
 }
 
+/// The counts are absent when `namespace_counts` is off.
 #[derive(Serialize, Debug)]
 pub struct NamespaceInfo {
     pub name: String,
-    pub tag_count: usize,
-    pub manifest_count: usize,
-    pub upload_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_count: Option<usize>,
 }
 
 #[derive(Serialize, Debug)]

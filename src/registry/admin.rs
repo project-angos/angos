@@ -28,6 +28,7 @@ use angos_oci::{
 use angos_oci_service::NoContent;
 
 use crate::configuration::RegexPattern;
+use crate::configuration::global::NamespaceCounts;
 use crate::jobs::store::{Error as JobStoreError, parse_not_before};
 use crate::jobs::{JobState, Queue};
 use crate::registry::content_discovery::{DEFAULT_PAGE_SIZE, REFERRER_RESOLVE_CONCURRENCY};
@@ -380,8 +381,17 @@ impl Registry {
 
         // Counting the page alone is what paging saves: the counts are three
         // enumerations per namespace, the names one walk for the whole scope.
+        let counts = self.config.namespace_counts;
         let namespaces: Vec<NamespaceInfo> = stream::iter(visible.drain(range))
             .map(|name| async move {
+                if counts == NamespaceCounts::Omitted {
+                    return Ok(NamespaceInfo {
+                        name: name.to_string(),
+                        tag_count: None,
+                        manifest_count: None,
+                        upload_count: None,
+                    });
+                }
                 // The three counts read disjoint prefixes, so they go out together
                 // rather than paying one round trip after another per namespace.
                 let (tag_count, manifest_count, upload_count) = try_join!(
@@ -397,9 +407,9 @@ impl Registry {
                 )?;
                 Ok::<_, Error>(NamespaceInfo {
                     name: name.to_string(),
-                    tag_count,
-                    manifest_count,
-                    upload_count,
+                    tag_count: Some(tag_count),
+                    manifest_count: Some(manifest_count),
+                    upload_count: Some(upload_count),
                 })
             })
             .buffered(NAMESPACE_STAT_CONCURRENCY)
@@ -1139,6 +1149,7 @@ mod tests {
     use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
     use angos_storage::{Error as StorageError, ObjectStore};
 
+    use crate::configuration::global::NamespaceCounts;
     use crate::registry::admin::{
         ListPullsRequest, ListingInputs, ManifestAnalysis, analyze_manifest,
         extract_docker_referrer, parent_refs_for, select_revisions,
@@ -1149,11 +1160,12 @@ mod tests {
     use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
     use crate::registry::metadata_store::{AccessEntry, LinkKind, MetadataStore};
     use crate::registry::repository::{Config as RepositoryConfig, Repository};
+    use crate::registry::repository_resolver::RepositoryResolver;
     use crate::registry::test_utils::{
         FSRegistryTestCase, FsTestStack, RegistryTestCase, create_test_blob, create_test_registry,
-        create_test_registry_recording_pulls, for_each_backend, fs_test_stack, media_type,
-        metadata_store_over, put_blob_direct, response_json, seed_links, single_repo_resolver,
-        test_job_store,
+        create_test_registry_recording_pulls, create_test_repositories, for_each_backend,
+        fs_test_stack, media_type, metadata_store_over, put_blob_direct, response_json, seed_links,
+        single_repo_resolver, test_job_store,
     };
     use crate::registry::{Error as RegistryError, Registry, RegistryConfig};
     use crate::test_fixtures::client::test_client_config;
@@ -1590,6 +1602,55 @@ mod tests {
                 entry["manifest_count"], 0,
                 "the counts come from different sources: {entry}"
             );
+        })
+        .await;
+    }
+
+    /// With `namespace_counts` off, the listing names each namespace and
+    /// leaves its counts out rather than reporting zeros.
+    #[tokio::test]
+    async fn namespaces_info_omits_counts_when_disabled() {
+        for_each_backend(async |test_case| {
+            let metadata_store = test_case.metadata_store();
+            let registry = Registry::new(
+                test_case.blob_store(),
+                metadata_store.clone(),
+                Arc::new(RepositoryResolver::new(create_test_repositories()).unwrap()),
+                RegistryConfig {
+                    namespace_counts: NamespaceCounts::Omitted,
+                    ..RegistryConfig::new(test_job_store(&metadata_store))
+                },
+            );
+            let namespace = Namespace::new("test-repo/uncounted").unwrap();
+            let (digest, _) = create_test_blob(&registry, &namespace, b"uncounted").await;
+            seed_links(
+                &registry.metadata_store,
+                &namespace,
+                &[(LinkKind::Tag(Tag::new("v1").unwrap()), digest)],
+            )
+            .await
+            .unwrap();
+
+            let response = registry
+                .handle_list_namespaces(namespaces_of("test-repo"), &ALL_VISIBLE)
+                .await
+                .unwrap()
+                .into_response()
+                .unwrap();
+            let body = response_json(response).await;
+            let entry = body["namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|ns| ns["name"] == "test-repo/uncounted")
+                .expect("the namespace must still be listed");
+
+            for count in ["tag_count", "manifest_count", "upload_count"] {
+                assert!(
+                    entry.get(count).is_none(),
+                    "{count} must be omitted: {entry}"
+                );
+            }
         })
         .await;
     }

@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { getRegistryName } from '#lib/config.svelte.js';
-	import { PAGE, fetchRevision, fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, type FetchResult, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo, type RevisionSort, type SortOrder } from '#lib/api.js';
+	import { PAGE, fetchRevision, fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, type FetchResult, type ManifestResult, type NamespacesResponse, type RevisionsResponse, type UploadsResponse, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo, type RevisionSort, type SortOrder } from '#lib/api.js';
 	import { buildTree, buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, imageReference, isDigest, isInteractiveTarget, pathUrl, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '#lib/utils.js';
 	import LoadingState from '#lib/components/LoadingState.svelte';
 	import ErrorState from '#lib/components/ErrorState.svelte';
@@ -14,7 +14,7 @@
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import DeleteButton from '#lib/components/DeleteButton.svelte';
 	import SortHeader from '#lib/components/SortHeader.svelte';
-	import type { BrowseParams } from './+page';
+	import type { BrowseParams, InitialView } from './+page';
 
 	let { data }: { data: BrowseParams } = $props();
 
@@ -73,7 +73,8 @@
 	// The listing whose next page is loading.
 	let loadingMore: 'namespaces' | 'manifests' | 'uploads' | null = $state(null);
 
-	let loading = $state(true);
+	// Only on the first load, which renders before its data arrives.
+	let loading = $state(false);
 	let error: string | null = $state(null);
 	// Failures of an action taken on the current view, shown as a banner so the
 	// view itself survives; `error` stays reserved for a load that produced no
@@ -86,6 +87,9 @@
 	// Monotonic token: each load claims the next value, so a slow response from
 	// a superseded load is discarded instead of overwriting the current view.
 	let loadToken = 0;
+
+	// The registry may be configured to skip the counts, which the table then drops.
+	const counted = $derived(children.some((child) => child.tag_count !== undefined));
 
 	// What the path holds, for the lede: a prefix has namespaces, a leaf has
 	// manifests, and a nested name may have both.
@@ -107,55 +111,66 @@
 		expanded = newExpanded;
 	}
 
-	// Reloads on navigation only: a re-sort reloads on its own.
-	$effect(() => {
-		actionError = null;
-		const { path, reference } = data;
+	// A navigation: the route's load already fetched the new view, which
+	// replaces the old one whole; the first load's arrives after it renders.
+	// The listings start over in their default order.
+	$effect.pre(() => {
+		const { view } = data;
 		untrack(() => {
-			if (reference !== null) {
-				loadManifest(path, reference);
+			const token = ++loadToken;
+			actionError = null;
+			namespaceOrder = 'asc';
+			manifestSort = 'tag';
+			manifestOrder = 'asc';
+			if (view instanceof Promise) {
+				loading = true;
+				view.then((resolved) => {
+					if (token === loadToken) show(resolved);
+				});
 			} else {
-				loadBrowse(path);
+				show(view);
 			}
 		});
 	});
 
+	function show(view: InitialView) {
+		loading = false;
+		if (view.kind === 'manifest') {
+			tags = [];
+			referencedBy = [];
+			childReferrers = new Map();
+			childReferrersNext = new Map();
+			applyManifest(view.manifest, view.revision);
+		} else {
+			pullThroughCache = false;
+			immutableTags = false;
+			applyBrowse(view.revisions, view.uploads, view.namespaces, true);
+		}
+	}
+
 	function sortNamespaces() {
 		namespaceOrder = namespaceOrder === 'asc' ? 'desc' : 'asc';
 		sorting = 'namespaces';
-		loadBrowse(data.path, true, true);
+		loadBrowse(data.path, true);
 	}
 
 	function sortManifests(sort: RevisionSort) {
 		manifestOrder = sort === manifestSort && manifestOrder === 'asc' ? 'desc' : 'asc';
 		manifestSort = sort;
 		sorting = 'manifests';
-		loadBrowse(data.path, true);
+		loadBrowse(data.path);
 	}
 
-	// `background` refreshes without blanking the view, which is what an action
-	// taken on that view wants: swapping it for a spinner reads as the whole
-	// page reloading when only one row changed. `relist` fetches the namespace
-	// listing again, which a background refresh otherwise skips.
-	async function loadBrowse(namespace: string, background = false, relist = !background) {
+	// Refreshes the view in place, keeping as many rows as are loaded: blanking
+	// it would read as the whole page reloading when only one row changed.
+	// `relist` fetches the namespace listing again, which is otherwise skipped:
+	// it is by far the most expensive of the three calls, at one store walk plus
+	// three backend listings per namespace, and an action touches only this
+	// namespace, whose descendants it lists are all unaffected. Above every
+	// repository there is nothing to list but the names the route resolved.
+	async function loadBrowse(namespace: string, relist = false) {
 		const token = ++loadToken;
-		loading = !background;
-		error = null;
-		// Clearing keeps a navigation from showing the previous path's content
-		// behind the spinner. A background refresh has no spinner, so it holds
-		// what is on screen until the new data replaces it.
-		if (!background) {
-			children = [];
-			pullThroughCache = false;
-			immutableTags = false;
-		}
-		// Above every repository there is nothing to list but the repository
-		// names, which the route already resolved. An action's refresh skips the
-		// listing entirely: it is by far the most expensive of the three calls, at
-		// one store walk plus three backend listings per namespace, and the action
-		// that triggered it touched this namespace, whose descendants it lists are
-		// all unaffected. A background refresh keeps as many rows as are loaded.
-		const n = (loaded: number) => (background ? Math.max(loaded, PAGE) : PAGE);
+		const n = (loaded: number) => Math.max(loaded, PAGE);
 		const [revisionsResult, uploadsResult, namespacesResult] = await Promise.all([
 			fetchRevisions(namespace, manifestSort, manifestOrder, 0, n(rows.length)),
 			fetchUploads(namespace, 0, n(uploads.length)),
@@ -164,9 +179,17 @@
 				: fetchNamespaces(data.repository, namespace, namespaceOrder, 0, n(children.length))
 		]);
 		if (token !== loadToken) return;
-		if (revisionsResult.error) {
-			error = revisionsResult.error;
-		} else if (revisionsResult.data) {
+		applyBrowse(revisionsResult, uploadsResult, namespacesResult, relist);
+	}
+
+	function applyBrowse(
+		revisionsResult: FetchResult<RevisionsResponse>,
+		uploadsResult: FetchResult<UploadsResponse>,
+		namespacesResult: FetchResult<NamespacesResponse> | null,
+		relist: boolean
+	) {
+		error = revisionsResult.error;
+		if (revisionsResult.data) {
 			manifests = revisionsResult.data.manifests ?? [];
 			rows = buildTreeRows(buildTree(manifests));
 			manifestsNext = revisionsResult.data.next;
@@ -176,14 +199,14 @@
 		uploadsNext = uploadsResult.data?.next;
 		uploadsTotal = uploadsResult.data?.total ?? 0;
 		if (uploadsResult.error) {
-			actionError = `Could not list uploads (${uploadsResult.error}).`;
+			actionError = `Could not load the uploads (${uploadsResult.error}).`;
 		}
 		if (relist) {
 			children = descendantNamespaces(
 				namespacesResult
 					? (namespacesResult.data?.namespaces ?? [])
 					: data.repositoryNames.map((name) => ({ name })),
-				namespace
+				data.path
 			);
 			namespacesNext = namespacesResult?.data?.next;
 			namespacesTotal = namespacesResult?.data?.total ?? children.length;
@@ -199,7 +222,6 @@
 		selectedManifests = new Set();
 		sparedManifests = new Set();
 		selectingManifests = false;
-		loading = false;
 		sorting = null;
 		loadingMore = null;
 	}
@@ -219,7 +241,7 @@
 		if (result.data) {
 			append(result.data);
 		} else {
-			actionError = `Loading more ${listing} failed (${result.error}).`;
+			actionError = `Could not load more ${listing} (${result.error}).`;
 		}
 	}
 
@@ -269,31 +291,23 @@
 		);
 	}
 
-	async function loadManifest(namespace: string, reference: string, background = false) {
+	async function loadManifest(namespace: string, reference: string) {
 		const token = ++loadToken;
-		loading = !background;
-		error = null;
-		if (!background) {
-			tags = [];
-			referencedBy = [];
-			childReferrers = new Map();
-			childReferrersNext = new Map();
-		}
-
 		const result = await fetchManifest(namespace, reference);
 		if (token !== loadToken) return;
-		if (result.error) {
-			error = result.error;
-			loading = false;
-			return;
-		}
+		const revisionsResult = result.digest ? await fetchRevision(namespace, result.digest) : null;
+		if (token !== loadToken) return;
+		applyManifest(result, revisionsResult);
+	}
+
+	function applyManifest(result: ManifestResult, revisionsResult: FetchResult<RevisionsResponse> | null) {
+		error = result.error;
+		if (result.error) return;
 
 		manifest = result.manifest;
 		digest = result.digest;
 
-		if (digest) {
-			const revisionsResult = await fetchRevision(namespace, digest);
-			if (token !== loadToken) return;
+		if (digest && revisionsResult) {
 			if (revisionsResult.data) {
 				manifests = revisionsResult.data.manifests;
 				const entry = revisionsResult.data.manifests.find(m => m.digest === digest);
@@ -315,7 +329,6 @@
 				childReferrersNext = newChildReferrersNext;
 			}
 		}
-		loading = false;
 	}
 
 	// Append the next page of a manifest's referrers, keeping the cursor the
@@ -329,7 +342,7 @@
 		const result = await fetchReferrers(data.path, childDigest, last);
 		loadingReferrers = null;
 		if (result.error || !result.data) {
-			actionError = `Loading more referrers failed (${result.error}).`;
+			actionError = `Could not load more referrers (${result.error}).`;
 			return;
 		}
 
@@ -352,9 +365,9 @@
 	// for the namespace otherwise.
 	async function reloadAfterDelete(deletedReference: string) {
 		if (data.reference === null) {
-			await loadBrowse(data.path, true);
+			await loadBrowse(data.path);
 		} else if (data.reference !== deletedReference) {
-			await loadManifest(data.path, data.reference, true);
+			await loadManifest(data.path, data.reference);
 		} else if (digest && digest !== deletedReference) {
 			await goto(manifestUrl(data.path, digest));
 		} else {
@@ -424,7 +437,7 @@
 			deleteConfirm = null;
 			deleting = false;
 			if (failed > 0) {
-				actionError = `Failed to delete ${failed} of ${total} manifests.`;
+				actionError = `Could not delete ${failed} of ${total} manifests.`;
 			}
 			if (gone.has(reference)) {
 				await reloadAfterDelete(reference);
@@ -440,7 +453,7 @@
 		// soon as the registry has answered.
 		deleting = false;
 		if (err) {
-			actionError = `Delete failed (${err}).`;
+			actionError = `Could not delete ${reference} (${err}).`;
 			return;
 		}
 		deleteConfirm = null;
@@ -464,12 +477,12 @@
 		const { gone, failed, total } = await deleteWithCascade([digest]);
 		deleting = false;
 		if (!gone.has(digest)) {
-			actionError = `Delete failed.`;
+			actionError = `Could not delete the manifest.`;
 			return;
 		}
 		// The view leaves for the namespace; a cascade failure is reported there.
 		if (failed > 0) {
-			actionError = `Failed to delete ${failed} of ${total} manifests.`;
+			actionError = `Could not delete ${failed} of ${total} manifests.`;
 		}
 		await goto(pathUrl(data.path));
 	}
@@ -479,10 +492,10 @@
 		actionError = null;
 		const err = await apiCancelUpload(data.path, uuid);
 		if (err) {
-			actionError = `Cancel failed (${err}).`;
+			actionError = `Could not cancel the upload (${err}).`;
 		} else {
 			deleteConfirm = null;
-			await loadBrowse(data.path, true);
+			await loadBrowse(data.path);
 		}
 		deleting = false;
 	}
@@ -501,9 +514,9 @@
 		deleteConfirm = null;
 		deleting = false;
 		if (failed > 0) {
-			actionError = `Failed to delete ${failed} of ${total} manifests.`;
+			actionError = `Could not delete ${failed} of ${total} manifests.`;
 		}
-		await loadBrowse(data.path, true);
+		await loadBrowse(data.path);
 	}
 
 	async function cancelSelectedUploads() {
@@ -514,10 +527,10 @@
 			uuids.map((uuid) => apiCancelUpload(data.path, uuid))
 		);
 		deleteConfirm = null;
-		await loadBrowse(data.path, true);
+		await loadBrowse(data.path);
 		const failed = results.filter((err) => err !== null).length;
 		if (failed > 0) {
-			actionError = `Failed to cancel ${failed} of ${uuids.length} uploads.`;
+			actionError = `Could not cancel ${failed} of ${uuids.length} uploads.`;
 		}
 		deleting = false;
 	}
@@ -579,13 +592,13 @@
 {/if}
 
 {#if actionError}
-	<div class="action-error">{actionError}</div>
+	<ErrorState message={actionError} />
 {/if}
 
 {#if loading}
 	<LoadingState message={isManifestView ? 'Loading manifest' : 'Loading'} />
 {:else if error}
-	<ErrorState message={error} />
+	<ErrorState message={`Could not load the ${isManifestView ? 'manifest' : 'namespace'} (${error}).`} />
 {:else if data.reference !== null && manifest}
 	<ManifestView
 		path={data.path}
@@ -642,9 +655,11 @@
 							onsort={sortNamespaces}
 							disabled={data.repository === null}
 						/>
-						<th class="col-medium">Tags</th>
-						<th class="col-medium">Manifests</th>
-						<th class="col-medium">Uploads</th>
+						{#if counted}
+							<th class="col-medium">Tags</th>
+							<th class="col-medium">Manifests</th>
+							<th class="col-medium">Uploads</th>
+						{/if}
 					</tr>
 				</thead>
 				<tbody>
@@ -652,9 +667,11 @@
 						{@const href = pathUrl(child.path)}
 						<tr class="clickable" onclick={(event) => { if (!isInteractiveTarget(event)) goto(href); }}>
 							<td><a class="row-link" {href}>{child.label}</a></td>
-							<td>{child.tag_count ? child.tag_count : '-'}</td>
-							<td>{child.manifest_count ? child.manifest_count : '-'}</td>
-							<td>{child.upload_count ? child.upload_count : '-'}</td>
+							{#if counted}
+								<td>{child.tag_count ? child.tag_count : '-'}</td>
+								<td>{child.manifest_count ? child.manifest_count : '-'}</td>
+								<td>{child.upload_count ? child.upload_count : '-'}</td>
+							{/if}
 						</tr>
 					{/each}
 				</tbody>

@@ -11,6 +11,9 @@
 		JOB_QUEUES,
 		type JobEntry,
 		type FailedJobEntry,
+		type FailedJobsResponse,
+		type FetchResult,
+		type JobsResponse,
 		type JobState
 	} from '#lib/api.js';
 	import { formatTimeAgo } from '#lib/utils.js';
@@ -19,10 +22,9 @@
 	import LoadingState from '#lib/components/LoadingState.svelte';
 	import ErrorState from '#lib/components/ErrorState.svelte';
 	import DeleteButton from '#lib/components/DeleteButton.svelte';
-	import type { JobsParams } from './+page';
+	import type { JobLists, JobsParams } from './+page';
 
 	let { data }: { data: JobsParams } = $props();
-
 
 	const queue = $derived(data.queue);
 
@@ -31,7 +33,9 @@
 	let failed: FailedJobEntry[] = $state([]);
 	let failedNext: string | undefined = $state(undefined);
 
-	let loading = $state(true);
+	let loading = $state(false);
+	// Only on the first load, which renders before its data arrives.
+	let firstLoading = $state(false);
 	let error: string | null = $state(null);
 	let actionError: string | null = $state(null);
 
@@ -44,45 +48,69 @@
 	// storage_key whose delete is awaiting confirmation.
 	let confirmKey: string | null = $state(null);
 
-	async function loadPending(reset: boolean): Promise<void> {
+	// A failed first page leaves nothing to show; a failed next page keeps the list.
+	async function loadPending(reset: boolean, fetched?: FetchResult<JobsResponse>): Promise<void> {
 		const token = loadToken;
-		const result = await fetchJobs(queue, PAGE, reset ? undefined : pendingNext);
+		const result = fetched ?? (await fetchJobs(queue, PAGE, reset ? undefined : pendingNext));
 		if (token !== loadToken) return;
-		if (result.error) {
+		if (result.error && reset) {
 			error = result.error;
+		} else if (result.error) {
+			actionError = `Could not load more pending jobs (${result.error}).`;
 		} else if (result.data) {
 			pending = reset ? result.data.jobs : [...pending, ...result.data.jobs];
 			pendingNext = result.data.next;
 		}
 	}
 
-	async function loadFailed(reset: boolean): Promise<void> {
+	async function loadFailed(reset: boolean, fetched?: FetchResult<FailedJobsResponse>): Promise<void> {
 		const token = loadToken;
-		const result = await fetchFailedJobs(queue, PAGE, reset ? undefined : failedNext);
+		const result = fetched ?? (await fetchFailedJobs(queue, PAGE, reset ? undefined : failedNext));
 		if (token !== loadToken) return;
-		if (result.error) {
+		if (result.error && reset) {
 			error = result.error;
+		} else if (result.error) {
+			actionError = `Could not load more failed jobs (${result.error}).`;
 		} else if (result.data) {
 			failed = reset ? result.data.failed : [...failed, ...result.data.failed];
 			failedNext = result.data.next;
 		}
 	}
 
+	// Refreshes in place: the lists stay on screen until the new ones arrive.
 	async function refresh(): Promise<void> {
 		loadToken += 1;
 		loading = true;
 		error = null;
-		actionError = null;
 		confirmKey = null;
 		await Promise.all([loadPending(true), loadFailed(true)]);
 		loading = false;
 	}
 
-	// Loads the queue the URL names, again whenever it changes.
-	$effect(() => {
-		void data.queue;
-		untrack(() => void refresh());
+	// The route's load fetched the queue the URL names.
+	$effect.pre(() => {
+		const { lists } = data;
+		untrack(() => {
+			const token = ++loadToken;
+			error = null;
+			actionError = null;
+			confirmKey = null;
+			if (lists instanceof Promise) {
+				firstLoading = true;
+				lists.then((resolved) => {
+					if (token === loadToken) show(resolved);
+				});
+			} else {
+				show(lists);
+			}
+		});
 	});
+
+	function show(lists: JobLists) {
+		firstLoading = false;
+		loadPending(true, lists.pending);
+		loadFailed(true, lists.failed);
+	}
 
 	async function onRetry(key: string): Promise<void> {
 		busyKey = key;
@@ -90,7 +118,7 @@
 		const err = await retryJob(queue, key);
 		busyKey = null;
 		if (err) {
-			actionError = `Retry failed (${err}); list refreshed.`;
+			actionError = `Could not retry the job (${err}).`;
 		}
 		await refresh();
 	}
@@ -101,7 +129,7 @@
 		const err = await deleteJob(queue, state, key);
 		busyKey = null;
 		if (err) {
-			actionError = `Delete failed (${err}); list refreshed.`;
+			actionError = `Could not delete the job (${err}).`;
 		}
 		await refresh();
 	}
@@ -138,19 +166,17 @@
 			<a href={resolve('/jobs/[queue]', { queue: name })} aria-current={queue === name ? 'page' : undefined}>{name}</a>
 		{/each}
 	</nav>
-	<button class="secondary" onclick={refresh} disabled={loading}>
-		{loading ? 'Refreshing...' : 'Refresh'}
-	</button>
+	<button class="secondary" onclick={refresh} disabled={loading}>Refresh</button>
 </div>
 
 {#if actionError}
-	<div class="action-error">{actionError}</div>
+	<ErrorState message={actionError} />
 {/if}
 
-{#if loading && pending.length === 0 && failed.length === 0}
+{#if firstLoading}
 	<LoadingState message="Loading jobs" />
 {:else if error}
-	<ErrorState message={error} />
+	<ErrorState message="Could not load the jobs ({error})." />
 {:else}
 	<Card title="Pending & In-flight Jobs" count={pending.length}>
 		<table>

@@ -30,7 +30,7 @@ use angos_oci::{Digest, Namespace, Reference, Tag};
 use angos_oci_service::ApiVersion;
 
 use crate::configuration::RegexPattern;
-use crate::configuration::global::RedirectConfig;
+use crate::configuration::global::{NamespaceCounts, RedirectConfig};
 use crate::event_webhook::dispatcher::EventDispatcher;
 use crate::event_webhook::event::Event;
 use crate::jobs::Queue;
@@ -63,6 +63,8 @@ pub struct RegistryConfig {
     pub listing_read_concurrency: NonZeroUsize,
     /// Manifests whose analysis the revision listing keeps in memory.
     pub revision_cache_entries: NonZeroUsize,
+    /// Whether the namespace listing counts each namespace's content.
+    pub namespace_counts: NamespaceCounts,
     /// The queue every cache-fill and replication job is enqueued to. Who
     /// drains it is the caller's business: the registry only enqueues, and
     /// starts nothing of its own.
@@ -90,6 +92,7 @@ impl RegistryConfig {
             validate_manifest_references: true,
             listing_read_concurrency: pagination::LISTING_READ_CONCURRENCY,
             revision_cache_entries: admin::DEFAULT_REVISION_CACHE_ENTRIES,
+            namespace_counts: NamespaceCounts::Counted,
             job_queue,
             event_dispatcher: None,
         }

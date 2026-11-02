@@ -107,6 +107,10 @@ pub struct GlobalConfig {
     /// the revision listing reads a namespace's manifest bodies once.
     #[serde(default = "default_revision_cache_entries")]
     pub revision_cache_entries: NonZeroUsize,
+    /// Whether the namespace listing counts each namespace's tags, manifests
+    /// and uploads, three enumerations per namespace it returns.
+    #[serde(default)]
+    pub namespace_counts: NamespaceCounts,
     /// Reclamation grace period in seconds: scrub leaves unreferenced blobs,
     /// dangling reference keys and stale index entries younger than this alone,
     /// so it cannot race an in-flight push or upload. Lower it only for offline
@@ -122,6 +126,26 @@ pub struct GlobalConfig {
     /// policies.
     #[serde(default)]
     pub trusted_proxies: Vec<TrustedProxy>,
+}
+
+/// Whether the namespace listing counts each namespace's content; read from
+/// the `namespace_counts` bool of `[global]`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(from = "bool")]
+pub enum NamespaceCounts {
+    #[default]
+    Counted,
+    Omitted,
+}
+
+impl From<bool> for NamespaceCounts {
+    fn from(counted: bool) -> Self {
+        if counted {
+            Self::Counted
+        } else {
+            Self::Omitted
+        }
+    }
 }
 
 /// Which responses may redirect the client to the storage backend; read from
@@ -247,6 +271,7 @@ impl Default for GlobalConfig {
             namespace_walk_concurrency: default_namespace_walk_concurrency(),
             listing_read_concurrency: default_listing_read_concurrency(),
             revision_cache_entries: default_revision_cache_entries(),
+            namespace_counts: NamespaceCounts::default(),
             gc_grace_secs: default_gc_grace_secs(),
             pull_history: PullHistoryConfig::default(),
             trusted_proxies: Vec::new(),

@@ -1,18 +1,22 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { getRegistryName } from '#lib/config.svelte.js';
-	import { PAGE, fetchRepositories, type RepositoryInfo, type SortOrder } from '#lib/api.js';
+	import { PAGE, fetchRepositories, type FetchResult, type RepositoriesResponse, type RepositoryInfo, type SortOrder } from '#lib/api.js';
 	import { isInteractiveTarget, pathUrl } from '#lib/utils.js';
 	import Card from '#lib/components/Card.svelte';
 	import LoadingState from '#lib/components/LoadingState.svelte';
 	import ErrorState from '#lib/components/ErrorState.svelte';
 	import Breadcrumb from '#lib/components/Breadcrumb.svelte';
 	import SortHeader from '#lib/components/SortHeader.svelte';
+	import type { RepositoriesParams } from './+page';
+
+	let { data }: { data: RepositoriesParams } = $props();
 
 	let repositories: RepositoryInfo[] = $state([]);
-	let loading = $state(true);
+	// Only on the first load, which renders before its data arrives.
+	let loading = $state(false);
 	let error: string | null = $state(null);
 	let order: SortOrder = $state('asc');
 	let sorting = $state(false);
@@ -21,19 +25,39 @@
 	// Monotonic token: a re-sort's response supersedes any still in flight.
 	let loadToken = 0;
 
+	// The route's load fetched the first page, in the default order.
+	$effect.pre(() => {
+		const result = data.repositories;
+		untrack(() => {
+			const token = ++loadToken;
+			order = 'asc';
+			if (result instanceof Promise) {
+				loading = true;
+				result.then((resolved) => {
+					if (token === loadToken) apply(resolved);
+				});
+			} else {
+				apply(result);
+			}
+		});
+	});
+
 	// A re-sort keeps as many rows as are on screen.
 	async function load() {
 		const token = ++loadToken;
 		const result = await fetchRepositories(order, 0, Math.max(repositories.length, PAGE));
 		if (token !== loadToken) return;
+		apply(result);
+	}
+
+	function apply(result: FetchResult<RepositoriesResponse>) {
+		loading = false;
 		sorting = false;
-		if (result.error) {
-			error = result.error;
-		} else if (result.data) {
+		error = result.error && `Could not load the repositories (${result.error}).`;
+		if (result.data) {
 			repositories = result.data.repositories;
 			next = result.data.next;
 		}
-		loading = false;
 	}
 
 	async function loadMore() {
@@ -44,14 +68,12 @@
 		loadingMore = false;
 		if (token !== loadToken) return;
 		if (result.error) {
-			error = result.error;
+			error = `Could not load more repositories (${result.error}).`;
 		} else if (result.data) {
 			repositories = [...repositories, ...result.data.repositories];
 			next = result.data.next;
 		}
 	}
-
-	onMount(load);
 
 	function sort() {
 		order = order === 'asc' ? 'desc' : 'asc';
